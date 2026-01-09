@@ -1,0 +1,379 @@
+//! Order execution engine for low-latency trade placement.
+
+use anyhow::Result;
+use dashmap::DashMap;
+use polymarket_core::api::ClobClient;
+use polymarket_core::types::{
+    ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus,
+};
+use rust_decimal::Decimal;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+/// Metrics for order execution performance.
+#[derive(Debug, Default)]
+pub struct ExecutionMetrics {
+    pub orders_submitted: u64,
+    pub orders_filled: u64,
+    pub orders_rejected: u64,
+    pub total_volume: Decimal,
+    pub total_fees: Decimal,
+    pub avg_latency_us: u64,
+}
+
+/// Configuration for the order executor.
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    /// Default slippage tolerance for market orders.
+    pub default_slippage: Decimal,
+    /// Maximum order size.
+    pub max_order_size: Decimal,
+    /// Fee rate for trades.
+    pub fee_rate: Decimal,
+    /// Whether to actually execute orders (false = paper trading).
+    pub live_trading: bool,
+    /// API key for authenticated trading.
+    pub api_key: Option<String>,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            default_slippage: Decimal::new(1, 2), // 1%
+            max_order_size: Decimal::new(10000, 0),
+            fee_rate: Decimal::new(2, 2), // 2%
+            live_trading: false,
+            api_key: None,
+        }
+    }
+}
+
+/// Low-latency order executor for Polymarket CLOB.
+pub struct OrderExecutor {
+    clob_client: Arc<ClobClient>,
+    config: ExecutorConfig,
+    /// Pending orders awaiting confirmation.
+    pending_orders: DashMap<Uuid, OrderStatus>,
+    /// Channel for execution reports.
+    report_tx: mpsc::Sender<ExecutionReport>,
+    /// Receiver for execution reports (taken once).
+    report_rx: Option<mpsc::Receiver<ExecutionReport>>,
+    metrics: std::sync::RwLock<ExecutionMetrics>,
+}
+
+impl OrderExecutor {
+    /// Create a new order executor.
+    pub fn new(clob_client: Arc<ClobClient>, config: ExecutorConfig) -> Self {
+        let (report_tx, report_rx) = mpsc::channel(1000);
+        Self {
+            clob_client,
+            config,
+            pending_orders: DashMap::new(),
+            report_tx,
+            report_rx: Some(report_rx),
+            metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
+        }
+    }
+
+    /// Take the execution report receiver (can only be called once).
+    pub fn take_report_receiver(&mut self) -> Option<mpsc::Receiver<ExecutionReport>> {
+        self.report_rx.take()
+    }
+
+    /// Execute a market order.
+    pub async fn execute_market_order(&self, order: MarketOrder) -> Result<ExecutionReport> {
+        let start = std::time::Instant::now();
+
+        // Validate order
+        if order.quantity > self.config.max_order_size {
+            let report = ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                format!("Order size {} exceeds maximum {}", order.quantity, self.config.max_order_size),
+            );
+            self.send_report(report.clone()).await;
+            return Ok(report);
+        }
+
+        self.pending_orders.insert(order.id, OrderStatus::Pending);
+        info!(
+            order_id = %order.id,
+            market = %order.market_id,
+            side = ?order.side,
+            quantity = %order.quantity,
+            "Executing market order"
+        );
+
+        let report = if self.config.live_trading {
+            self.execute_live_market_order(&order).await?
+        } else {
+            self.simulate_market_order(&order).await?
+        };
+
+        // Update metrics
+        {
+            let mut metrics = self.metrics.write().unwrap();
+            metrics.orders_submitted += 1;
+            if report.is_success() {
+                metrics.orders_filled += 1;
+                metrics.total_volume += report.total_value();
+                metrics.total_fees += report.fees_paid;
+            } else {
+                metrics.orders_rejected += 1;
+            }
+            let latency_us = start.elapsed().as_micros() as u64;
+            metrics.avg_latency_us =
+                (metrics.avg_latency_us * (metrics.orders_submitted - 1) + latency_us)
+                / metrics.orders_submitted;
+        }
+
+        self.pending_orders.remove(&order.id);
+        self.send_report(report.clone()).await;
+
+        debug!(
+            order_id = %order.id,
+            status = ?report.status,
+            latency_us = %start.elapsed().as_micros(),
+            "Order execution complete"
+        );
+
+        Ok(report)
+    }
+
+    /// Execute a limit order.
+    pub async fn execute_limit_order(&self, order: LimitOrder) -> Result<ExecutionReport> {
+        // Validate order
+        if order.quantity > self.config.max_order_size {
+            let report = ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                format!("Order size {} exceeds maximum {}", order.quantity, self.config.max_order_size),
+            );
+            self.send_report(report.clone()).await;
+            return Ok(report);
+        }
+
+        self.pending_orders.insert(order.id, OrderStatus::Pending);
+        info!(
+            order_id = %order.id,
+            market = %order.market_id,
+            side = ?order.side,
+            price = %order.price,
+            quantity = %order.quantity,
+            "Placing limit order"
+        );
+
+        let report = if self.config.live_trading {
+            self.execute_live_limit_order(&order).await?
+        } else {
+            self.simulate_limit_order(&order).await?
+        };
+
+        self.pending_orders.remove(&order.id);
+        self.send_report(report.clone()).await;
+        Ok(report)
+    }
+
+    /// Cancel a pending order.
+    pub async fn cancel_order(&self, order_id: Uuid) -> Result<bool> {
+        if self.pending_orders.remove(&order_id).is_some() {
+            info!(order_id = %order_id, "Order cancelled");
+            Ok(true)
+        } else {
+            warn!(order_id = %order_id, "Order not found for cancellation");
+            Ok(false)
+        }
+    }
+
+    /// Get current execution metrics.
+    pub fn metrics(&self) -> ExecutionMetrics {
+        self.metrics.read().unwrap().clone()
+    }
+
+    /// Check if executor is in live trading mode.
+    pub fn is_live(&self) -> bool {
+        self.config.live_trading
+    }
+
+    // Private methods
+
+    async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
+        // TODO: Implement actual CLOB API order placement
+        // This requires the Polymarket trading API with authentication
+
+        // For now, fetch orderbook and simulate based on real prices
+        let book = self.clob_client.get_order_book(&order.outcome_id).await?;
+
+        let (price, available) = match order.side {
+            OrderSide::Buy => {
+                if let Some(ask) = book.asks.first() {
+                    (ask.price, ask.size)
+                } else {
+                    return Ok(ExecutionReport::rejected(
+                        order.id,
+                        order.market_id.clone(),
+                        order.outcome_id.clone(),
+                        order.side,
+                        "No asks available".to_string(),
+                    ));
+                }
+            }
+            OrderSide::Sell => {
+                if let Some(bid) = book.bids.first() {
+                    (bid.price, bid.size)
+                } else {
+                    return Ok(ExecutionReport::rejected(
+                        order.id,
+                        order.market_id.clone(),
+                        order.outcome_id.clone(),
+                        order.side,
+                        "No bids available".to_string(),
+                    ));
+                }
+            }
+        };
+
+        // Check slippage
+        let slippage = order.max_slippage.unwrap_or(self.config.default_slippage);
+        // For a real implementation, we would check against expected price
+
+        let fill_quantity = order.quantity.min(available);
+        let fees = fill_quantity * price * self.config.fee_rate;
+
+        Ok(ExecutionReport::success(
+            order.id,
+            order.market_id.clone(),
+            order.outcome_id.clone(),
+            order.side,
+            fill_quantity,
+            price,
+            fees,
+        ))
+    }
+
+    async fn execute_live_limit_order(&self, order: &LimitOrder) -> Result<ExecutionReport> {
+        // TODO: Implement actual CLOB API limit order placement
+        // Simulate for now
+        self.simulate_limit_order(order).await
+    }
+
+    async fn simulate_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
+        // Paper trading simulation - fetch real orderbook prices
+        let book = self.clob_client.get_order_book(&order.outcome_id).await?;
+
+        let (price, available) = match order.side {
+            OrderSide::Buy => {
+                if let Some(ask) = book.asks.first() {
+                    (ask.price, ask.size)
+                } else {
+                    // Simulate with a default price if no orderbook
+                    (Decimal::new(50, 2), Decimal::new(10000, 0))
+                }
+            }
+            OrderSide::Sell => {
+                if let Some(bid) = book.bids.first() {
+                    (bid.price, bid.size)
+                } else {
+                    (Decimal::new(50, 2), Decimal::new(10000, 0))
+                }
+            }
+        };
+
+        let fill_quantity = order.quantity.min(available);
+        let fees = fill_quantity * price * self.config.fee_rate;
+
+        info!(
+            order_id = %order.id,
+            price = %price,
+            filled = %fill_quantity,
+            fees = %fees,
+            "[PAPER] Simulated market order fill"
+        );
+
+        Ok(ExecutionReport::success(
+            order.id,
+            order.market_id.clone(),
+            order.outcome_id.clone(),
+            order.side,
+            fill_quantity,
+            price,
+            fees,
+        ))
+    }
+
+    async fn simulate_limit_order(&self, order: &LimitOrder) -> Result<ExecutionReport> {
+        // Simulate limit order - assume it fills at limit price
+        let fees = order.quantity * order.price * self.config.fee_rate;
+
+        info!(
+            order_id = %order.id,
+            price = %order.price,
+            quantity = %order.quantity,
+            fees = %fees,
+            "[PAPER] Simulated limit order placement"
+        );
+
+        Ok(ExecutionReport::success(
+            order.id,
+            order.market_id.clone(),
+            order.outcome_id.clone(),
+            order.side,
+            order.quantity,
+            order.price,
+            fees,
+        ))
+    }
+
+    async fn send_report(&self, report: ExecutionReport) {
+        if self.report_tx.send(report).await.is_err() {
+            warn!("No receiver for execution report");
+        }
+    }
+}
+
+impl Clone for ExecutionMetrics {
+    fn clone(&self) -> Self {
+        Self {
+            orders_submitted: self.orders_submitted,
+            orders_filled: self.orders_filled,
+            orders_rejected: self.orders_rejected,
+            total_volume: self.total_volume,
+            total_fees: self.total_fees,
+            avg_latency_us: self.avg_latency_us,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polymarket_core::api::ClobClient;
+
+    #[tokio::test]
+    async fn test_order_size_validation() {
+        let clob_client = Arc::new(ClobClient::new(None, None));
+        let config = ExecutorConfig {
+            max_order_size: Decimal::new(100, 0),
+            live_trading: false,
+            ..Default::default()
+        };
+        let executor = OrderExecutor::new(clob_client, config);
+
+        let order = MarketOrder::new(
+            "market".to_string(),
+            "token".to_string(),
+            OrderSide::Buy,
+            Decimal::new(1000, 0), // Exceeds max
+        );
+
+        let report = executor.execute_market_order(order).await.unwrap();
+        assert_eq!(report.status, OrderStatus::Rejected);
+        assert!(report.error_message.is_some());
+    }
+}

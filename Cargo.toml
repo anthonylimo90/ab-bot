@@ -2,8 +2,11 @@
 resolver = "2"
 members = [
     "crates/arb-monitor",
+    "crates/auth",
     "crates/bot-scanner",
     "crates/polymarket-core",
+    "crates/risk-manager",
+    "crates/trading-engine",
 ]
 
 [workspace.package]
@@ -53,5 +56,17 @@ dotenvy = "0.15"
 tokio-test = "0.4"
 mockall = "0.12"
 
+# Concurrent data structures
+dashmap = "5.5"
+
+# Encoding
+hex = "0.4"
+
+# Async traits
+async-trait = "0.1"
+
 # Internal crates
 polymarket-core = { path = "crates/polymarket-core" }
+trading-engine = { path = "crates/trading-engine" }
+risk-manager = { path = "crates/risk-manager" }
+auth = { path = "crates/auth" }

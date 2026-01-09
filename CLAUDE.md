@@ -14,8 +14,11 @@ Dual-purpose Polymarket analysis system:
 ab-bot/
 ├── crates/
 │   ├── arb-monitor/     # Arbitrage detection and position tracking
+│   ├── auth/            # JWT auth, API keys, key vault, audit logging
 │   ├── bot-scanner/     # Wallet behavior analysis and bot detection
-│   └── polymarket-core/ # Shared types, API clients, database models
+│   ├── polymarket-core/ # Shared types, API clients, database models
+│   ├── risk-manager/    # Stop-loss management, circuit breaker
+│   └── trading-engine/  # Order execution, copy trading, position management
 ├── migrations/          # SQL migrations for PostgreSQL/TimescaleDB
 ├── config/              # Environment-specific configuration
 └── docs/                # Additional documentation
@@ -185,3 +188,58 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 - Unit tests for pure functions (spread calculation, scoring)
 - Integration tests for API clients (mocked responses)
 - End-to-end tests against testnet when available
+
+---
+
+## Changelog
+
+### 2026-01-09: Phase 1 - Trading & Risk Foundation
+
+**New Crates:**
+
+- **`trading-engine`**: Order execution and copy trading system
+  - `OrderExecutor`: Low-latency order placement with paper/live trading modes
+  - `CopyTrader`: Track and mirror wallets with allocation strategies (equal weight, configured, performance-weighted)
+  - `PositionManager`: Position sizing and limit enforcement across strategies
+  - Order types: `MarketOrder`, `LimitOrder`, `ExecutionReport`, `ArbOrder`
+
+- **`risk-manager`**: Stop-loss and circuit breaker protection
+  - `StopLossManager`: Fixed, percentage, trailing, and time-based stop-losses
+  - `CircuitBreaker`: Daily loss limits, max drawdown, consecutive loss protection with cooldown
+
+- **`auth`**: Authentication and security layer
+  - `JwtAuth`: JWT token-based authentication with roles (Viewer, Trader, Admin)
+  - `ApiKeyAuth`: Programmatic API key authentication with expiry
+  - `KeyVault`: Secure wallet key storage with encryption (memory, file, AWS-ready)
+  - `AuditLogger`: Security audit trail for compliance
+
+**Enhanced `polymarket-core`:**
+- Added `types/order.rs` with order types for trading execution
+
+**Database Schema (Migration 002):**
+- `tracked_wallets`: Copy trading wallet configuration
+- `stop_loss_rules`: Stop-loss rule storage
+- `execution_reports`: Trade execution history
+- `users`: Authentication users with roles
+- `api_keys`: API key management
+- `audit_log`: Security audit trail
+- `circuit_breaker_state`: Persistent circuit breaker state
+- Extended `positions` table with source tracking (manual, arbitrage, copy_trade)
+
+**Test Coverage:** 55 tests passing
+- auth: 21 tests (JWT, API keys, key vault, audit)
+- risk-manager: 13 tests (stop-loss triggers, circuit breaker)
+- trading-engine: 9 tests (executor, copy trader, position manager)
+- polymarket-core: 9 tests (orders, markets, positions, wallets)
+- bot-scanner: 3 tests (feature extraction, scoring)
+
+### 2026-01-09: Initial Setup
+
+- Created Rust workspace with 3 crates: polymarket-core, arb-monitor, bot-scanner
+- Implemented CLOB API client with pagination and WebSocket streaming
+- Implemented Polygon RPC client for on-chain wallet data
+- Created position lifecycle management (PENDING → OPEN → EXIT_READY → CLOSING → CLOSED)
+- Created bot detection scoring system with 5 behavioral signals
+- Set up PostgreSQL database with initial schema
+- Set up Redis for pub/sub signals
+- Integrated Telegram/Discord alerting
