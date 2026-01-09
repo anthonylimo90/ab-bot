@@ -7,6 +7,7 @@ members = [
     "crates/polymarket-core",
     "crates/risk-manager",
     "crates/trading-engine",
+    "crates/wallet-tracker",
 ]
 
 [workspace.package]
@@ -70,3 +71,4 @@ polymarket-core = { path = "crates/polymarket-core" }
 trading-engine = { path = "crates/trading-engine" }
 risk-manager = { path = "crates/risk-manager" }
 auth = { path = "crates/auth" }
+wallet-tracker = { path = "crates/wallet-tracker" }

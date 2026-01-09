@@ -1,0 +1,45 @@
+[package]
+name = "wallet-tracker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+polymarket-core.workspace = true
+
+# Async
+tokio.workspace = true
+futures-util.workspace = true
+
+# HTTP
+reqwest.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Types
+chrono.workspace = true
+uuid.workspace = true
+rust_decimal.workspace = true
+
+# Concurrent data structures
+dashmap.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# Statistics
+statrs = "0.16"
+
+[dev-dependencies]
+tokio-test.workspace = true
+mockall.workspace = true
