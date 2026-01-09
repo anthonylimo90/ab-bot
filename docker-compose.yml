@@ -1,0 +1,165 @@
+services:
+  # ===========================================================================
+  # Database Services
+  # ===========================================================================
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: ab-bot-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-abbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-abbot_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-ab_bot}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-abbot} -d ${POSTGRES_DB:-ab_bot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ab-bot-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: ab-bot-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ab-bot-network
+
+  # ===========================================================================
+  # Application Services
+  # ===========================================================================
+  api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api-server
+    container_name: ab-bot-api
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
+      REDIS_URL: redis://redis:6379
+      API_HOST: 0.0.0.0
+      API_PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      CORS_PERMISSIVE: ${CORS_PERMISSIVE:-true}
+      RUST_LOG: ${RUST_LOG:-api_server=info,tower_http=info}
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ab-bot-network
+    restart: unless-stopped
+
+  arb-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: arb-monitor
+    container_name: ab-bot-arb-monitor
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
+      REDIS_URL: redis://redis:6379
+      RUST_LOG: ${RUST_LOG:-arb_monitor=info}
+      POLYMARKET_API_URL: ${POLYMARKET_API_URL:-https://clob.polymarket.com}
+      POLLING_INTERVAL_MS: ${POLLING_INTERVAL_MS:-1000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ab-bot-network
+    restart: unless-stopped
+
+  bot-scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: bot-scanner
+    container_name: ab-bot-scanner
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
+      RUST_LOG: ${RUST_LOG:-bot_scanner=info}
+      POLYGON_RPC_URL: ${POLYGON_RPC_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ab-bot-network
+    restart: unless-stopped
+    profiles:
+      - full  # Only run with --profile full
+
+  # ===========================================================================
+  # Monitoring Services (optional)
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ab-bot-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    networks:
+      - ab-bot-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ab-bot-grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - ab-bot-network
+    profiles:
+      - monitoring
+
+# ===========================================================================
+# Networks & Volumes
+# ===========================================================================
+networks:
+  ab-bot-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
