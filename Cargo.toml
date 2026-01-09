@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/arb-monitor",
     "crates/auth",
+    "crates/backtester",
     "crates/bot-scanner",
     "crates/polymarket-core",
     "crates/risk-manager",
@@ -72,3 +73,4 @@ trading-engine = { path = "crates/trading-engine" }
 risk-manager = { path = "crates/risk-manager" }
 auth = { path = "crates/auth" }
 wallet-tracker = { path = "crates/wallet-tracker" }
+backtester = { path = "crates/backtester" }
