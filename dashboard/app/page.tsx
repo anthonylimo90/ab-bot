@@ -4,11 +4,13 @@ import { useState } from 'react';
 import { useModeStore } from '@/stores/mode-store';
 import { usePortfolioStats } from '@/hooks/usePortfolioStats';
 import { useActivity } from '@/hooks/useActivity';
+import { useToastStore } from '@/stores/toast-store';
 import { MetricCard } from '@/components/shared/MetricCard';
 import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
 import { LiveIndicator } from '@/components/shared/LiveIndicator';
 import { PortfolioChart } from '@/components/charts/PortfolioChart';
 import { AllocationPie } from '@/components/charts/AllocationPie';
+import { CopyWalletModal } from '@/components/modals/CopyWalletModal';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import {
@@ -23,6 +25,7 @@ import {
 import Link from 'next/link';
 import { formatCurrency, shortenAddress, formatTimeAgo } from '@/lib/utils';
 import { cn } from '@/lib/utils';
+import type { CopyBehavior } from '@/types/api';
 
 const mockAllocations = [
   { name: 'Wallet A', value: 30, color: '#3b82f6' },
@@ -61,14 +64,51 @@ const activityIcons: Record<string, React.ReactNode> = {
   POSITION_CLOSED: <AlertCircle className="h-4 w-4 text-muted-foreground" />,
 };
 
+interface SelectedWallet {
+  address: string;
+  roi30d?: number;
+  sharpe?: number;
+  winRate?: number;
+  trades?: number;
+  confidence?: number;
+}
+
 export default function DashboardPage() {
   const { mode } = useModeStore();
+  const toast = useToastStore();
   const isDemo = mode === 'demo';
   const [selectedPeriod, setSelectedPeriod] = useState<Period>('30D');
+  const [copyModalOpen, setCopyModalOpen] = useState(false);
+  const [selectedWallet, setSelectedWallet] = useState<SelectedWallet | null>(null);
+
+  // Mock roster count - in real app this would come from roster store
+  const [rosterCount] = useState(2);
 
   // Real-time data hooks
   const { stats, history, status: portfolioStatus } = usePortfolioStats(selectedPeriod);
   const { activities, status: activityStatus, unreadCount } = useActivity();
+
+  const handleCopyClick = (wallet: SelectedWallet) => {
+    setSelectedWallet(wallet);
+    setCopyModalOpen(true);
+  };
+
+  const handleCopyConfirm = (settings: {
+    address: string;
+    allocation_pct: number;
+    copy_behavior: CopyBehavior;
+    max_position_size: number;
+    tier: 'active' | 'bench';
+  }) => {
+    // In real app, this would call the API
+    const tierLabel = settings.tier === 'active' ? 'Active 5' : 'Bench';
+    toast.success(
+      `Wallet added to ${tierLabel}`,
+      `${shortenAddress(settings.address)} is now being ${settings.tier === 'active' ? 'copied' : 'monitored'}`
+    );
+    setCopyModalOpen(false);
+    setSelectedWallet(null);
+  };
 
   // Convert history to chart format
   const chartData = history.map((h) => ({
@@ -279,7 +319,20 @@ export default function DashboardPage() {
                       <p className="font-medium">{rec.winRate}%</p>
                     </div>
                   </div>
-                  <Button className="w-full" variant="demo" size="sm">
+                  <Button
+                    className="w-full"
+                    variant="demo"
+                    size="sm"
+                    onClick={() =>
+                      handleCopyClick({
+                        address: rec.wallet,
+                        roi30d: rec.roi,
+                        sharpe: rec.sharpe,
+                        winRate: rec.winRate,
+                        confidence: rec.confidence,
+                      })
+                    }
+                  >
                     <Copy className="mr-2 h-4 w-4" />
                     Copy Wallet
                   </Button>
@@ -289,6 +342,18 @@ export default function DashboardPage() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Copy Wallet Modal */}
+      <CopyWalletModal
+        wallet={selectedWallet}
+        isOpen={copyModalOpen}
+        onClose={() => {
+          setCopyModalOpen(false);
+          setSelectedWallet(null);
+        }}
+        onConfirm={handleCopyConfirm}
+        rosterCount={rosterCount}
+      />
     </div>
   );
 }

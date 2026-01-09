@@ -1,24 +1,117 @@
 'use client';
 
+import { useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { useModeStore } from '@/stores/mode-store';
+import { useSettingsStore, Theme } from '@/stores/settings-store';
+import { useToastStore } from '@/stores/toast-store';
 import { formatCurrency } from '@/lib/utils';
-import { RefreshCw, Wallet, Bell, Shield, Palette } from 'lucide-react';
+import {
+  RefreshCw,
+  Wallet,
+  Bell,
+  Shield,
+  Palette,
+  Save,
+  Check,
+  AlertTriangle,
+} from 'lucide-react';
 
 export default function SettingsPage() {
   const { mode, setMode, demoBalance, resetDemoBalance } = useModeStore();
+  const toast = useToastStore();
+  const {
+    risk,
+    notifications,
+    appearance,
+    isDirty,
+    updateRisk,
+    updateNotifications,
+    updateAppearance,
+    markClean,
+    resetToDefaults,
+  } = useSettingsStore();
+
   const isDemo = mode === 'demo';
+  const [connectWalletOpen, setConnectWalletOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    // Simulate API call
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    markClean();
+    toast.success('Settings saved', 'Your preferences have been updated');
+    setIsSaving(false);
+  };
+
+  const handleReset = () => {
+    resetToDefaults();
+    toast.info('Settings reset', 'All settings have been restored to defaults');
+  };
+
+  const themeButtons: { value: Theme; label: string }[] = [
+    { value: 'light', label: 'Light' },
+    { value: 'dark', label: 'Dark' },
+    { value: 'system', label: 'System' },
+  ];
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       {/* Page Header */}
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
-        <p className="text-muted-foreground">
-          Manage your account and preferences
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
+          <p className="text-muted-foreground">
+            Manage your account and preferences
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {isDirty && (
+            <span className="text-sm text-yellow-500 flex items-center gap-1">
+              <AlertTriangle className="h-4 w-4" />
+              Unsaved changes
+            </span>
+          )}
+          <Button
+            variant="outline"
+            onClick={handleReset}
+            disabled={isSaving}
+          >
+            Reset to Defaults
+          </Button>
+          <Button
+            onClick={handleSave}
+            disabled={!isDirty || isSaving}
+          >
+            {isSaving ? (
+              <>
+                <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                Saving...
+              </>
+            ) : isDirty ? (
+              <>
+                <Save className="mr-2 h-4 w-4" />
+                Save Changes
+              </>
+            ) : (
+              <>
+                <Check className="mr-2 h-4 w-4" />
+                Saved
+              </>
+            )}
+          </Button>
+        </div>
       </div>
 
       {/* Account */}
@@ -79,7 +172,9 @@ export default function SettingsPage() {
               <p className="text-sm text-muted-foreground mb-4">
                 No wallet connected
               </p>
-              <Button>Connect Wallet</Button>
+              <Button onClick={() => setConnectWalletOpen(true)}>
+                Connect Wallet
+              </Button>
             </div>
           )}
         </CardContent>
@@ -107,8 +202,13 @@ export default function SettingsPage() {
             <div className="flex items-center gap-2">
               <input
                 type="number"
-                defaultValue={15}
+                value={risk.defaultStopLoss}
+                onChange={(e) =>
+                  updateRisk({ defaultStopLoss: Number(e.target.value) })
+                }
                 className="w-20 rounded border bg-background px-3 py-1 text-right"
+                min={1}
+                max={50}
               />
               <span className="text-muted-foreground">%</span>
             </div>
@@ -125,8 +225,35 @@ export default function SettingsPage() {
               <span className="text-muted-foreground">$</span>
               <input
                 type="number"
-                defaultValue={500}
+                value={risk.maxPositionSize}
+                onChange={(e) =>
+                  updateRisk({ maxPositionSize: Number(e.target.value) })
+                }
                 className="w-24 rounded border bg-background px-3 py-1 text-right"
+                min={10}
+                max={10000}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium">Daily Loss Limit</p>
+              <p className="text-sm text-muted-foreground">
+                Maximum daily loss before circuit breaker triggers
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-muted-foreground">$</span>
+              <input
+                type="number"
+                value={risk.dailyLossLimit}
+                onChange={(e) =>
+                  updateRisk({ dailyLossLimit: Number(e.target.value) })
+                }
+                className="w-24 rounded border bg-background px-3 py-1 text-right"
+                min={100}
+                max={50000}
               />
             </div>
           </div>
@@ -138,7 +265,12 @@ export default function SettingsPage() {
                 Pause trading after daily loss exceeds threshold
               </p>
             </div>
-            <Switch defaultChecked />
+            <Switch
+              checked={risk.circuitBreakerEnabled}
+              onCheckedChange={(checked) =>
+                updateRisk({ circuitBreakerEnabled: checked })
+              }
+            />
           </div>
         </CardContent>
       </Card>
@@ -162,9 +294,19 @@ export default function SettingsPage() {
                 Receive trade notifications via Telegram
               </p>
             </div>
-            <Button variant="outline" size="sm">
-              Connect
-            </Button>
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={notifications.telegramEnabled}
+                onCheckedChange={(checked) =>
+                  updateNotifications({ telegramEnabled: checked })
+                }
+              />
+              {notifications.telegramEnabled && (
+                <Button variant="outline" size="sm">
+                  Configure
+                </Button>
+              )}
+            </div>
           </div>
 
           <div className="flex items-center justify-between">
@@ -174,9 +316,19 @@ export default function SettingsPage() {
                 Post updates to a Discord channel
               </p>
             </div>
-            <Button variant="outline" size="sm">
-              Configure
-            </Button>
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={notifications.discordEnabled}
+                onCheckedChange={(checked) =>
+                  updateNotifications({ discordEnabled: checked })
+                }
+              />
+              {notifications.discordEnabled && (
+                <Button variant="outline" size="sm">
+                  Configure
+                </Button>
+              )}
+            </div>
           </div>
 
           <div className="flex items-center justify-between">
@@ -186,7 +338,12 @@ export default function SettingsPage() {
                 Daily summary and important alerts
               </p>
             </div>
-            <Switch />
+            <Switch
+              checked={notifications.emailEnabled}
+              onCheckedChange={(checked) =>
+                updateNotifications({ emailEnabled: checked })
+              }
+            />
           </div>
         </CardContent>
       </Card>
@@ -211,19 +368,51 @@ export default function SettingsPage() {
               </p>
             </div>
             <div className="flex gap-2">
-              <Button variant="outline" size="sm">
-                Light
-              </Button>
-              <Button variant="default" size="sm">
-                Dark
-              </Button>
-              <Button variant="outline" size="sm">
-                System
-              </Button>
+              {themeButtons.map(({ value, label }) => (
+                <Button
+                  key={value}
+                  variant={appearance.theme === value ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => updateAppearance({ theme: value })}
+                >
+                  {label}
+                </Button>
+              ))}
             </div>
           </div>
         </CardContent>
       </Card>
+
+      {/* Connect Wallet Modal */}
+      <Dialog open={connectWalletOpen} onOpenChange={setConnectWalletOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Connect Wallet</DialogTitle>
+            <DialogDescription>
+              Connect your wallet to enable live trading
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-6 space-y-4">
+            <p className="text-sm text-muted-foreground text-center">
+              Wallet connection is not yet implemented. This feature will allow
+              you to connect your Polygon wallet for live trading.
+            </p>
+            <div className="flex flex-col gap-2">
+              <Button variant="outline" disabled className="w-full">
+                MetaMask (Coming Soon)
+              </Button>
+              <Button variant="outline" disabled className="w-full">
+                WalletConnect (Coming Soon)
+              </Button>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConnectWalletOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

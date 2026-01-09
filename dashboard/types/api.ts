@@ -273,6 +273,39 @@ export interface Recommendation {
   expires_at?: string;
 }
 
+// Trade classification types (Event vs Arb)
+export type TradeClassification = 'event' | 'arbitrage' | 'mixed';
+export type TradingStyle = 'event_trader' | 'arb_trader' | 'mixed';
+export type CopyBehavior = 'copy_all' | 'events_only' | 'arb_threshold';
+export type WalletTier = 'active' | 'bench' | 'untracked';
+
+// Copy settings for a wallet
+export interface CopySettings {
+  copy_behavior: CopyBehavior;
+  allocation_pct: number;
+  max_position_size: number;
+  arb_threshold_pct?: number; // Min spread % for arb replication
+}
+
+// Decision Brief for wallet strategy profiling
+export interface DecisionBrief {
+  trading_style: TradingStyle;
+  slippage_tolerance: 'tight' | 'moderate' | 'loose';
+  preferred_categories: string[];
+  typical_hold_time: string;
+  event_trade_ratio: number;
+  arb_trade_ratio: number;
+  fitness_score: number;
+  fitness_reasons: string[];
+}
+
+// Extended wallet with roster info
+export interface RosterWallet extends Wallet {
+  tier: WalletTier;
+  copy_settings?: CopySettings;
+  decision_brief?: DecisionBrief;
+}
+
 // Demo mode types
 export interface DemoBalance {
   balance: number;
