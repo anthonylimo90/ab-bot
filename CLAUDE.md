@@ -196,6 +196,58 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 
 ## Changelog
 
+### 2026-01-09: Phase 5 - Advanced Features
+
+**Enhanced Modules:**
+
+- **`risk-manager`**: Advanced stop-loss strategies
+  - `advanced_stops.rs`: New sophisticated stop mechanisms
+    - `CompoundStop`: Combine multiple conditions (AND/OR/AtLeast logic)
+    - `StopCondition`: 9 condition types (price, percentage, loss, time, volatility, volume, market hours, consecutive candles, support levels)
+    - `VolatilityStop`: ATR-based dynamic stops with configurable period/multiplier
+    - `StepTrailingStop`: Stepped trailing with configurable step size
+    - `BreakEvenStop`: Auto-move to break-even after target profit
+    - `TimeDecayStop`: Tighten stops as deadline approaches
+    - `SessionStop`: Market hours awareness with prime-time adjustments
+
+- **`wallet-tracker`**: Ensemble prediction models
+  - `advanced_predictor.rs`: Multi-model prediction system
+    - `EnsemblePrediction`: Combines 4 models with configurable weights
+    - `PredictionFeatures`: 25+ features including risk metrics, time-series, behavioral
+    - `MarketConditionAnalyzer`: Detect market regime (Bull/Bear, Volatile/Calm)
+    - Models: Statistical, Momentum, Risk-Adjusted, Behavioral
+    - Market regime adjustments for context-aware predictions
+
+- **`auth`**: Role-Based Access Control (RBAC)
+  - `rbac.rs`: Comprehensive permission system
+    - `Permission`: Resource + Action with optional conditions
+    - `Resource`: 14 resource types (Position, Order, Market, Wallet, StopLoss, etc.)
+    - `Action`: 10 action types (Create, Read, Update, Delete, Execute, etc.)
+    - `Role`: Named permission sets with inheritance
+    - `DefaultRoles`: Viewer, Trader, Admin, CopyTrader, RiskManager
+    - `RbacManager`: Async permission checking with role inheritance
+    - `TimeWindow`: Time-based permission restrictions
+    - `PermissionConditions`: IP whitelist, max amount, MFA requirements
+
+- **`trading-engine`**: Recommendation engine
+  - `recommendation.rs`: Personalized trading recommendations
+    - `RecommendationEngine`: Generate context-aware suggestions
+    - `RecommendationType`: 6 types (CopyWallet, EnterPosition, AdjustPosition, Arbitrage, RiskAction, StrategyChange)
+    - `RecommendedAction`: Detailed action specifications
+    - `RiskProfile`: User preferences (tolerance, limits, holding period)
+    - `Evidence`: Supporting factors for each recommendation
+    - Recommendations: Wallet copying, arbitrage, position management, risk alerts
+
+**Key Features:**
+- Compound stop conditions with flexible logic
+- Volatility-aware position protection
+- Ensemble ML-style predictions without ML frameworks
+- Market regime detection and adjustment
+- Fine-grained RBAC with time/IP/amount conditions
+- Role inheritance for flexible permission management
+- Context-aware trading recommendations
+- Risk profile-based personalization
+
 ### 2026-01-09: Phase 4 - API Server
 
 **New Crates:**

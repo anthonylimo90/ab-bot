@@ -5,7 +5,12 @@
 pub mod copy_trader;
 pub mod executor;
 pub mod position_manager;
+pub mod recommendation;
 
 pub use copy_trader::CopyTrader;
 pub use executor::OrderExecutor;
 pub use position_manager::PositionManager;
+pub use recommendation::{
+    Evidence, HoldingPeriod, RecommendationEngine, RecommendationType,
+    RecommendedAction, Recommendation, RiskLevel, RiskProfile, Urgency,
+};
