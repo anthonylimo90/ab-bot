@@ -31,18 +31,39 @@ impl ClobClient {
 
     /// Fetch list of active markets.
     pub async fn get_markets(&self) -> Result<Vec<Market>> {
-        let url = format!("{}/markets", self.base_url);
-        let response = self.http_client.get(&url).send().await?;
+        let mut all_markets = Vec::new();
+        let mut cursor: Option<String> = None;
 
-        if !response.status().is_success() {
-            return Err(Error::Api {
-                message: format!("Failed to fetch markets: {}", response.status()),
-                status: Some(response.status().as_u16()),
-            });
+        loop {
+            let url = match &cursor {
+                Some(c) => format!("{}/markets?next_cursor={}", self.base_url, c),
+                None => format!("{}/markets", self.base_url),
+            };
+
+            let response = self.http_client.get(&url).send().await?;
+
+            if !response.status().is_success() {
+                return Err(Error::Api {
+                    message: format!("Failed to fetch markets: {}", response.status()),
+                    status: Some(response.status().as_u16()),
+                });
+            }
+
+            let page: MarketsResponse = response.json().await?;
+            all_markets.extend(page.data.into_iter().map(Into::into));
+
+            match page.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+
+            // Limit to avoid infinite loops (max ~5000 markets)
+            if all_markets.len() > 5000 {
+                break;
+            }
         }
 
-        let markets: Vec<ClobMarket> = response.json().await?;
-        Ok(markets.into_iter().map(Into::into).collect())
+        Ok(all_markets)
     }
 
     /// Fetch order book for a specific token.
@@ -148,22 +169,37 @@ pub struct OrderBookUpdate {
 // Internal API response types
 
 #[derive(Debug, Deserialize)]
+struct MarketsResponse {
+    data: Vec<ClobMarket>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClobMarket {
     condition_id: String,
     question: String,
     description: Option<String>,
     tokens: Vec<ClobToken>,
-    volume: String,
-    liquidity: String,
+    #[serde(default)]
+    volume: Option<String>,
+    #[serde(default)]
+    liquidity: Option<String>,
+    #[serde(alias = "end_date_iso")]
     end_date: Option<String>,
+    #[serde(default)]
     closed: bool,
-    resolved: bool,
+    #[serde(default)]
+    active: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ClobToken {
     token_id: String,
     outcome: String,
+    #[serde(default)]
+    price: Option<f64>,
+    #[serde(default)]
+    winner: Option<bool>,
 }
 
 impl From<ClobMarket> for Market {
@@ -181,10 +217,10 @@ impl From<ClobMarket> for Market {
                     token_id: t.token_id,
                 })
                 .collect(),
-            volume: m.volume.parse().unwrap_or_default(),
-            liquidity: m.liquidity.parse().unwrap_or_default(),
+            volume: m.volume.and_then(|v| v.parse().ok()).unwrap_or_default(),
+            liquidity: m.liquidity.and_then(|v| v.parse().ok()).unwrap_or_default(),
             end_date: m.end_date.and_then(|s| s.parse().ok()),
-            resolved: m.resolved,
+            resolved: m.closed && !m.active,
             resolution: None,
         }
     }
