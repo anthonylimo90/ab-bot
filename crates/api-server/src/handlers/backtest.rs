@@ -5,6 +5,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -13,7 +14,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// Request to run a backtest.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RunBacktestRequest {
     /// Strategy to backtest.
     pub strategy: StrategyConfig,
@@ -184,6 +185,63 @@ fn default_limit() -> i64 {
     20
 }
 
+#[derive(Debug, FromRow)]
+struct BacktestRow {
+    id: Uuid,
+    strategy: serde_json::Value,
+    start_date: DateTime<Utc>,
+    end_date: DateTime<Utc>,
+    initial_capital: Decimal,
+    final_value: Option<Decimal>,
+    total_return: Option<Decimal>,
+    total_return_pct: Option<Decimal>,
+    annualized_return: Option<Decimal>,
+    sharpe_ratio: Option<Decimal>,
+    sortino_ratio: Option<Decimal>,
+    max_drawdown: Option<Decimal>,
+    max_drawdown_pct: Option<Decimal>,
+    total_trades: Option<i64>,
+    winning_trades: Option<i64>,
+    losing_trades: Option<i64>,
+    win_rate: Option<Decimal>,
+    avg_win: Option<Decimal>,
+    avg_loss: Option<Decimal>,
+    profit_factor: Option<Decimal>,
+    total_fees: Option<Decimal>,
+    status: String,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct BacktestRowWithCurve {
+    id: Uuid,
+    strategy: serde_json::Value,
+    start_date: DateTime<Utc>,
+    end_date: DateTime<Utc>,
+    initial_capital: Decimal,
+    final_value: Option<Decimal>,
+    total_return: Option<Decimal>,
+    total_return_pct: Option<Decimal>,
+    annualized_return: Option<Decimal>,
+    sharpe_ratio: Option<Decimal>,
+    sortino_ratio: Option<Decimal>,
+    max_drawdown: Option<Decimal>,
+    max_drawdown_pct: Option<Decimal>,
+    total_trades: Option<i64>,
+    winning_trades: Option<i64>,
+    losing_trades: Option<i64>,
+    win_rate: Option<Decimal>,
+    avg_win: Option<Decimal>,
+    avg_loss: Option<Decimal>,
+    profit_factor: Option<Decimal>,
+    total_fees: Option<Decimal>,
+    status: String,
+    error: Option<String>,
+    equity_curve: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+}
+
 /// Run a backtest.
 #[utoipa::path(
     post,
@@ -223,22 +281,22 @@ pub async fn run_backtest(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Insert backtest record
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO backtest_results
         (id, strategy, start_date, end_date, initial_capital, slippage_model,
          fee_pct, status, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
         "#,
-        result_id,
-        strategy_json,
-        request.start_date,
-        request.end_date,
-        request.initial_capital,
-        slippage_json,
-        request.fee_pct,
-        now
     )
+    .bind(result_id)
+    .bind(&strategy_json)
+    .bind(request.start_date)
+    .bind(request.end_date)
+    .bind(request.initial_capital)
+    .bind(&slippage_json)
+    .bind(request.fee_pct)
+    .bind(now)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -290,7 +348,7 @@ pub async fn list_backtest_results(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListBacktestQuery>,
 ) -> ApiResult<Json<Vec<BacktestResultResponse>>> {
-    let rows = sqlx::query!(
+    let rows: Vec<BacktestRow> = sqlx::query_as(
         r#"
         SELECT id, strategy, start_date, end_date, initial_capital,
                final_value, total_return, total_return_pct, annualized_return,
@@ -303,10 +361,10 @@ pub async fn list_backtest_results(
         ORDER BY created_at DESC
         LIMIT $2 OFFSET $3
         "#,
-        query.status,
-        query.limit,
-        query.offset
     )
+    .bind(&query.status)
+    .bind(query.limit)
+    .bind(query.offset)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -370,7 +428,7 @@ pub async fn get_backtest_result(
     State(state): State<Arc<AppState>>,
     Path(result_id): Path<Uuid>,
 ) -> ApiResult<Json<BacktestResultResponse>> {
-    let row = sqlx::query!(
+    let row: Option<BacktestRowWithCurve> = sqlx::query_as(
         r#"
         SELECT id, strategy, start_date, end_date, initial_capital,
                final_value, total_return, total_return_pct, annualized_return,
@@ -381,8 +439,8 @@ pub async fn get_backtest_result(
         FROM backtest_results
         WHERE id = $1
         "#,
-        result_id
     )
+    .bind(result_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;

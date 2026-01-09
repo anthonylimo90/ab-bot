@@ -3,7 +3,7 @@
 //! Enhanced stop-loss mechanisms including compound conditions,
 //! volatility-based stops, and intelligent exit strategies.
 
-use chrono::{DateTime, Utc, Weekday};
+use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;

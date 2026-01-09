@@ -5,6 +5,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
@@ -100,6 +101,21 @@ fn default_limit() -> i64 {
     50
 }
 
+#[derive(Debug, FromRow)]
+struct MarketRow {
+    id: String,
+    question: String,
+    description: Option<String>,
+    category: String,
+    end_date: DateTime<Utc>,
+    active: bool,
+    yes_price: Decimal,
+    no_price: Decimal,
+    volume_24h: Decimal,
+    liquidity: Decimal,
+    created_at: DateTime<Utc>,
+}
+
 /// List markets.
 #[utoipa::path(
     get,
@@ -112,27 +128,9 @@ fn default_limit() -> i64 {
     )
 )]
 pub async fn list_markets(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<ListMarketsQuery>,
+    State(_state): State<Arc<AppState>>,
+    Query(_query): Query<ListMarketsQuery>,
 ) -> ApiResult<Json<Vec<MarketResponse>>> {
-    let mut sql = String::from(
-        "SELECT id, question, description, category, end_date, active,
-                yes_price, no_price, volume_24h, liquidity, created_at
-         FROM markets WHERE 1=1"
-    );
-
-    if query.category.is_some() {
-        sql.push_str(" AND category = $1");
-    }
-    if query.active.is_some() {
-        sql.push_str(" AND active = $2");
-    }
-    if query.min_volume.is_some() {
-        sql.push_str(" AND volume_24h >= $3");
-    }
-
-    sql.push_str(" ORDER BY volume_24h DESC LIMIT $4 OFFSET $5");
-
     // For now, return mock data since we don't have the full schema
     // In production, this would query the actual database
     let markets = vec![
@@ -172,16 +170,15 @@ pub async fn get_market(
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<MarketResponse>> {
     // Query the database for the market
-    let result = sqlx::query_as!(
-        MarketRow,
+    let result: Option<MarketRow> = sqlx::query_as(
         r#"
         SELECT id, question, description, category, end_date, active,
                yes_price, no_price, volume_24h, liquidity, created_at
         FROM markets
         WHERE id = $1
         "#,
-        market_id
     )
+    .bind(&market_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -204,21 +201,6 @@ pub async fn get_market(
     }
 }
 
-#[derive(Debug)]
-struct MarketRow {
-    id: String,
-    question: String,
-    description: Option<String>,
-    category: String,
-    end_date: DateTime<Utc>,
-    active: bool,
-    yes_price: Decimal,
-    no_price: Decimal,
-    volume_24h: Decimal,
-    liquidity: Decimal,
-    created_at: DateTime<Utc>,
-}
-
 /// Get market orderbook.
 #[utoipa::path(
     get,
@@ -233,7 +215,7 @@ struct MarketRow {
     )
 )]
 pub async fn get_market_orderbook(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<OrderbookResponse>> {
     // In production, this would fetch from the orderbook cache or API

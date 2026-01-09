@@ -5,6 +5,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -52,7 +53,7 @@ pub struct PositionResponse {
 }
 
 /// Request to close a position.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ClosePositionRequest {
     /// Quantity to close (None = close all).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +91,25 @@ fn default_limit() -> i64 {
     50
 }
 
+#[derive(Debug, FromRow)]
+struct PositionRow {
+    id: Uuid,
+    market_id: String,
+    outcome: String,
+    side: String,
+    quantity: Decimal,
+    entry_price: Decimal,
+    current_price: Decimal,
+    unrealized_pnl: Decimal,
+    stop_loss: Option<Decimal>,
+    take_profit: Option<Decimal>,
+    is_copy_trade: bool,
+    source_wallet: Option<String>,
+    opened_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    is_open: bool,
+}
+
 /// List positions.
 #[utoipa::path(
     get,
@@ -111,8 +131,7 @@ pub async fn list_positions(
         _ => None,
     };
 
-    let rows = sqlx::query_as!(
-        PositionRow,
+    let rows: Vec<PositionRow> = sqlx::query_as(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
@@ -125,13 +144,13 @@ pub async fn list_positions(
         ORDER BY opened_at DESC
         LIMIT $5 OFFSET $6
         "#,
-        query.market_id,
-        query.outcome,
-        query.copy_trades_only,
-        status_filter,
-        query.limit,
-        query.offset
     )
+    .bind(&query.market_id)
+    .bind(&query.outcome)
+    .bind(query.copy_trades_only)
+    .bind(status_filter)
+    .bind(query.limit)
+    .bind(query.offset)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -170,25 +189,6 @@ pub async fn list_positions(
     Ok(Json(positions))
 }
 
-#[derive(Debug)]
-struct PositionRow {
-    id: Uuid,
-    market_id: String,
-    outcome: String,
-    side: String,
-    quantity: Decimal,
-    entry_price: Decimal,
-    current_price: Decimal,
-    unrealized_pnl: Decimal,
-    stop_loss: Option<Decimal>,
-    take_profit: Option<Decimal>,
-    is_copy_trade: bool,
-    source_wallet: Option<String>,
-    opened_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    is_open: bool,
-}
-
 /// Get a specific position.
 #[utoipa::path(
     get,
@@ -206,8 +206,7 @@ pub async fn get_position(
     State(state): State<Arc<AppState>>,
     Path(position_id): Path<Uuid>,
 ) -> ApiResult<Json<PositionResponse>> {
-    let row = sqlx::query_as!(
-        PositionRow,
+    let row: Option<PositionRow> = sqlx::query_as(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
@@ -215,8 +214,8 @@ pub async fn get_position(
         FROM positions
         WHERE id = $1
         "#,
-        position_id
     )
+    .bind(position_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -274,8 +273,7 @@ pub async fn close_position(
     Json(request): Json<ClosePositionRequest>,
 ) -> ApiResult<Json<PositionResponse>> {
     // First, fetch the position
-    let row = sqlx::query_as!(
-        PositionRow,
+    let row: Option<PositionRow> = sqlx::query_as(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
@@ -283,8 +281,8 @@ pub async fn close_position(
         FROM positions
         WHERE id = $1 AND is_open = true
         "#,
-        position_id
     )
+    .bind(position_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -306,16 +304,16 @@ pub async fn close_position(
     let remaining = row.quantity - close_quantity;
     let is_fully_closed = remaining == Decimal::ZERO;
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         UPDATE positions
         SET quantity = $1, is_open = $2, updated_at = NOW()
         WHERE id = $3
         "#,
-        remaining,
-        !is_fully_closed,
-        position_id
     )
+    .bind(remaining)
+    .bind(!is_fully_closed)
+    .bind(position_id)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;

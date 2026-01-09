@@ -7,10 +7,26 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
-use std::collections::HashMap;
+use sqlx::{FromRow, PgPool};
 use tracing::{debug, info};
 use uuid::Uuid;
+
+/// Row type for wallet metrics query.
+#[derive(Debug, FromRow)]
+struct WalletMetricsRow {
+    address: String,
+    roi_30d: Decimal,
+    sharpe_30d: Decimal,
+    win_rate_30d: Decimal,
+    predicted_success_prob: Decimal,
+    tracked_id: Option<Uuid>,
+}
+
+/// Convert Decimal to f64.
+fn decimal_to_f64(d: Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    d.to_f64().unwrap_or(0.0)
+}
 
 /// Recommendation type categories.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -284,7 +300,7 @@ impl RecommendationEngine {
         let mut recommendations = Vec::new();
 
         // Find top performing wallets not already being copied
-        let wallets = sqlx::query!(
+        let wallets: Vec<WalletMetricsRow> = sqlx::query_as(
             r#"
             SELECT
                 wsm.address,
@@ -300,8 +316,8 @@ impl RecommendationEngine {
             ORDER BY wsm.predicted_success_prob DESC
             LIMIT 5
             "#,
-            self.min_wallet_score
         )
+        .bind(self.min_wallet_score)
         .fetch_all(&self.pool)
         .await?;
 
@@ -311,9 +327,10 @@ impl RecommendationEngine {
                 continue;
             }
 
-            let success_prob = wallet.predicted_success_prob as f64;
-            let roi = wallet.roi_30d as f64;
-            let sharpe = wallet.sharpe_30d as f64;
+            let success_prob = decimal_to_f64(wallet.predicted_success_prob);
+            let roi = decimal_to_f64(wallet.roi_30d);
+            let sharpe = decimal_to_f64(wallet.sharpe_30d);
+            let win_rate = decimal_to_f64(wallet.win_rate_30d);
 
             // Calculate suggested allocation based on risk profile
             let base_allocation = match profile.risk_tolerance {
@@ -341,9 +358,9 @@ impl RecommendationEngine {
                 },
                 Evidence {
                     factor: "Win Rate".to_string(),
-                    value: format!("{:.1}%", wallet.win_rate_30d as f64 * 100.0),
+                    value: format!("{:.1}%", win_rate * 100.0),
                     weight: 0.25,
-                    is_positive: wallet.win_rate_30d as f64 > 0.55,
+                    is_positive: win_rate > 0.55,
                 },
                 Evidence {
                     factor: "Prediction Score".to_string(),
@@ -360,7 +377,7 @@ impl RecommendationEngine {
                 description: format!(
                     "This wallet has shown strong performance with {:.1}% ROI and {:.1}% win rate over 30 days.",
                     roi * 100.0,
-                    wallet.win_rate_30d as f64 * 100.0
+                    win_rate * 100.0
                 ),
                 confidence: success_prob,
                 expected_return: Some(Decimal::from_f64_retain(roi * 0.7).unwrap_or(Decimal::ZERO)),

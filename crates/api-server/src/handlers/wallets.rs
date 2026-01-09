@@ -5,9 +5,9 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
-use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -42,7 +42,7 @@ pub struct TrackedWalletResponse {
 }
 
 /// Request to add a tracked wallet.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddWalletRequest {
     /// Wallet address.
     pub address: String,
@@ -129,6 +129,34 @@ fn default_limit() -> i64 {
     50
 }
 
+#[derive(Debug, FromRow)]
+struct WalletRow {
+    address: String,
+    label: Option<String>,
+    copy_enabled: bool,
+    allocation_pct: Decimal,
+    max_position_size: Decimal,
+    success_score: Decimal,
+    total_pnl: Decimal,
+    win_rate: Decimal,
+    total_trades: i64,
+    added_at: DateTime<Utc>,
+    last_activity: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromRow)]
+struct MetricsRow {
+    roi: Decimal,
+    sharpe_ratio: Decimal,
+    max_drawdown: Decimal,
+    avg_trade_size: Decimal,
+    avg_hold_time_hours: f64,
+    profit_factor: Decimal,
+    recent_pnl_30d: Decimal,
+    category_win_rates: serde_json::Value,
+    calculated_at: DateTime<Utc>,
+}
+
 /// List tracked wallets.
 #[utoipa::path(
     get,
@@ -144,8 +172,7 @@ pub async fn list_tracked_wallets(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListWalletsQuery>,
 ) -> ApiResult<Json<Vec<TrackedWalletResponse>>> {
-    let rows = sqlx::query_as!(
-        WalletRow,
+    let rows: Vec<WalletRow> = sqlx::query_as(
         r#"
         SELECT address, label, copy_enabled, allocation_pct, max_position_size,
                success_score, total_pnl, win_rate, total_trades, added_at, last_activity
@@ -155,11 +182,11 @@ pub async fn list_tracked_wallets(
         ORDER BY success_score DESC
         LIMIT $3 OFFSET $4
         "#,
-        query.copy_enabled,
-        query.min_score,
-        query.limit,
-        query.offset
     )
+    .bind(query.copy_enabled)
+    .bind(query.min_score)
+    .bind(query.limit)
+    .bind(query.offset)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -184,21 +211,6 @@ pub async fn list_tracked_wallets(
     Ok(Json(wallets))
 }
 
-#[derive(Debug)]
-struct WalletRow {
-    address: String,
-    label: Option<String>,
-    copy_enabled: bool,
-    allocation_pct: Decimal,
-    max_position_size: Decimal,
-    success_score: Decimal,
-    total_pnl: Decimal,
-    win_rate: Decimal,
-    total_trades: i64,
-    added_at: DateTime<Utc>,
-    last_activity: Option<DateTime<Utc>>,
-}
-
 /// Add a wallet to track.
 #[utoipa::path(
     post,
@@ -221,34 +233,34 @@ pub async fn add_tracked_wallet(
     }
 
     // Check if already tracked
-    let existing = sqlx::query_scalar!(
+    let existing: Option<(i64,)> = sqlx::query_as(
         "SELECT COUNT(*) FROM tracked_wallets WHERE address = $1",
-        request.address
     )
-    .fetch_one(&state.pool)
+    .bind(&request.address)
+    .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    if existing.unwrap_or(0) > 0 {
+    if existing.map(|r| r.0).unwrap_or(0) > 0 {
         return Err(ApiError::Conflict("Wallet already tracked".to_string()));
     }
 
     // Insert new tracked wallet
     let now = Utc::now();
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO tracked_wallets
         (address, label, copy_enabled, allocation_pct, max_position_size,
          success_score, total_pnl, win_rate, total_trades, added_at)
         VALUES ($1, $2, $3, $4, $5, 0, 0, 0, 0, $6)
         "#,
-        request.address,
-        request.label,
-        request.copy_enabled,
-        request.allocation_pct,
-        request.max_position_size,
-        now
     )
+    .bind(&request.address)
+    .bind(&request.label)
+    .bind(request.copy_enabled)
+    .bind(request.allocation_pct)
+    .bind(request.max_position_size)
+    .bind(now)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -285,16 +297,15 @@ pub async fn get_wallet(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> ApiResult<Json<TrackedWalletResponse>> {
-    let row = sqlx::query_as!(
-        WalletRow,
+    let row: Option<WalletRow> = sqlx::query_as(
         r#"
         SELECT address, label, copy_enabled, allocation_pct, max_position_size,
                success_score, total_pnl, win_rate, total_trades, added_at, last_activity
         FROM tracked_wallets
         WHERE address = $1
         "#,
-        address
     )
+    .bind(&address)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -337,16 +348,15 @@ pub async fn update_wallet(
     Json(request): Json<UpdateWalletRequest>,
 ) -> ApiResult<Json<TrackedWalletResponse>> {
     // Check if wallet exists
-    let existing = sqlx::query_as!(
-        WalletRow,
+    let existing: Option<WalletRow> = sqlx::query_as(
         r#"
         SELECT address, label, copy_enabled, allocation_pct, max_position_size,
                success_score, total_pnl, win_rate, total_trades, added_at, last_activity
         FROM tracked_wallets
         WHERE address = $1
         "#,
-        address
     )
+    .bind(&address)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -362,18 +372,18 @@ pub async fn update_wallet(
     let allocation_pct = request.allocation_pct.unwrap_or(existing.allocation_pct);
     let max_position_size = request.max_position_size.unwrap_or(existing.max_position_size);
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         UPDATE tracked_wallets
         SET label = $1, copy_enabled = $2, allocation_pct = $3, max_position_size = $4
         WHERE address = $5
         "#,
-        label,
-        copy_enabled,
-        allocation_pct,
-        max_position_size,
-        address
     )
+    .bind(&label)
+    .bind(copy_enabled)
+    .bind(allocation_pct)
+    .bind(max_position_size)
+    .bind(&address)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -410,10 +420,10 @@ pub async fn remove_wallet(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> ApiResult<()> {
-    let result = sqlx::query!(
+    let result = sqlx::query(
         "DELETE FROM tracked_wallets WHERE address = $1",
-        address
     )
+    .bind(&address)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -443,20 +453,20 @@ pub async fn get_wallet_metrics(
     Path(address): Path<String>,
 ) -> ApiResult<Json<WalletMetricsResponse>> {
     // Check wallet exists
-    let exists = sqlx::query_scalar!(
+    let exists: Option<(i64,)> = sqlx::query_as(
         "SELECT COUNT(*) FROM tracked_wallets WHERE address = $1",
-        address
     )
-    .fetch_one(&state.pool)
+    .bind(&address)
+    .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    if exists.unwrap_or(0) == 0 {
+    if exists.map(|r| r.0).unwrap_or(0) == 0 {
         return Err(ApiError::NotFound(format!("Wallet {} not tracked", address)));
     }
 
     // Try to get cached metrics
-    let metrics = sqlx::query!(
+    let metrics: Option<MetricsRow> = sqlx::query_as(
         r#"
         SELECT roi, sharpe_ratio, max_drawdown, avg_trade_size,
                avg_hold_time_hours, profit_factor, recent_pnl_30d,
@@ -466,8 +476,8 @@ pub async fn get_wallet_metrics(
         ORDER BY calculated_at DESC
         LIMIT 1
         "#,
-        address
     )
+    .bind(&address)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;

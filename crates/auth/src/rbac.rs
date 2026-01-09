@@ -3,7 +3,7 @@
 //! Comprehensive permission management with roles, resources, and actions.
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -141,9 +141,9 @@ pub struct PermissionConditions {
     /// IP restrictions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_whitelist: Option<Vec<String>>,
-    /// Maximum amount for trading operations.
+    /// Maximum amount for trading operations (in cents/smallest unit).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_amount: Option<f64>,
+    pub max_amount_cents: Option<i64>,
     /// Require MFA for this permission.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub require_mfa: Option<bool>,

@@ -5,6 +5,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -44,7 +45,7 @@ pub enum OrderStatus {
 }
 
 /// Request to place an order.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PlaceOrderRequest {
     /// Market identifier.
     pub market_id: String,
@@ -118,6 +119,26 @@ pub struct OrderResponse {
     pub filled_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, FromRow)]
+struct OrderRow {
+    id: Uuid,
+    client_order_id: Option<String>,
+    market_id: String,
+    outcome: String,
+    side: String,
+    order_type: String,
+    status: String,
+    quantity: Decimal,
+    filled_quantity: Decimal,
+    price: Option<Decimal>,
+    avg_fill_price: Option<Decimal>,
+    stop_price: Option<Decimal>,
+    time_in_force: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    filled_at: Option<DateTime<Utc>>,
+}
+
 /// Place a new order.
 #[utoipa::path(
     post,
@@ -142,7 +163,7 @@ pub async fn place_order(
     let now = Utc::now();
 
     // Insert order into database
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO orders
         (id, client_order_id, market_id, outcome, side, order_type, status,
@@ -150,19 +171,19 @@ pub async fn place_order(
          created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, $11, $12, $12)
         "#,
-        order_id,
-        request.client_order_id,
-        request.market_id,
-        request.outcome,
-        format!("{:?}", request.side).to_lowercase(),
-        format!("{:?}", request.order_type).to_lowercase(),
-        "pending",
-        request.quantity,
-        request.price,
-        request.stop_price,
-        request.time_in_force,
-        now
     )
+    .bind(order_id)
+    .bind(&request.client_order_id)
+    .bind(&request.market_id)
+    .bind(&request.outcome)
+    .bind(format!("{:?}", request.side).to_lowercase())
+    .bind(format!("{:?}", request.order_type).to_lowercase())
+    .bind("pending")
+    .bind(request.quantity)
+    .bind(request.price)
+    .bind(request.stop_price)
+    .bind(&request.time_in_force)
+    .bind(now)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -251,7 +272,7 @@ pub async fn get_order_status(
     State(state): State<Arc<AppState>>,
     Path(order_id): Path<Uuid>,
 ) -> ApiResult<Json<OrderResponse>> {
-    let row = sqlx::query!(
+    let row: Option<OrderRow> = sqlx::query_as(
         r#"
         SELECT id, client_order_id, market_id, outcome, side, order_type, status,
                quantity, filled_quantity, price, avg_fill_price, stop_price,
@@ -259,8 +280,8 @@ pub async fn get_order_status(
         FROM orders
         WHERE id = $1
         "#,
-        order_id
     )
+    .bind(order_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -339,7 +360,7 @@ pub async fn cancel_order(
     Path(order_id): Path<Uuid>,
 ) -> ApiResult<Json<OrderResponse>> {
     // First, fetch the order
-    let row = sqlx::query!(
+    let row: Option<OrderRow> = sqlx::query_as(
         r#"
         SELECT id, client_order_id, market_id, outcome, side, order_type, status,
                quantity, filled_quantity, price, avg_fill_price, stop_price,
@@ -347,8 +368,8 @@ pub async fn cancel_order(
         FROM orders
         WHERE id = $1
         "#,
-        order_id
     )
+    .bind(order_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -369,11 +390,11 @@ pub async fn cancel_order(
 
     // Update order status
     let now = Utc::now();
-    sqlx::query!(
+    sqlx::query(
         "UPDATE orders SET status = 'cancelled', updated_at = $1 WHERE id = $2",
-        now,
-        order_id
     )
+    .bind(now)
+    .bind(order_id)
     .execute(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
