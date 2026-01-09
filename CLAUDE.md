@@ -15,6 +15,7 @@ ab-bot/
 ├── crates/
 │   ├── arb-monitor/     # Arbitrage detection and position tracking
 │   ├── auth/            # JWT auth, API keys, key vault, audit logging
+│   ├── backtester/      # Historical backtesting with TimescaleDB
 │   ├── bot-scanner/     # Wallet behavior analysis and bot detection
 │   ├── polymarket-core/ # Shared types, API clients, database models
 │   ├── risk-manager/    # Stop-loss management, circuit breaker
@@ -193,6 +194,40 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 ---
 
 ## Changelog
+
+### 2026-01-09: Phase 3 - Backtesting Framework
+
+**New Crates:**
+
+- **`backtester`**: Historical simulation framework for strategy testing
+  - `strategy.rs`: Pluggable Strategy trait with built-in implementations
+    - `Strategy` trait: Async interface with initialize/on_data/on_fill/finalize lifecycle
+    - `Signal`: Trade signal with entry price, stop loss, take profit, confidence
+    - `StrategyContext`: Portfolio state, positions, market data for decision making
+    - `ArbitrageStrategy`: Trades mispriced yes/no outcomes
+    - `MomentumStrategy`: Follows price trends with configurable lookback
+    - `MeanReversionStrategy`: Trades z-score deviations from moving average
+  - `data_store.rs`: TimescaleDB-backed historical data storage
+    - `MarketSnapshot`: Point-in-time orderbook state (bid/ask/depth/spread)
+    - `HistoricalTrade`: Trade records with price/quantity/side/fee
+    - `DataQuery`: Flexible time-bucketed queries with aggregation
+    - `TimeResolution`: Second to daily aggregation levels
+  - `simulator.rs`: Full backtest engine with realistic execution
+    - `BacktestSimulator`: Run strategies against historical data
+    - `SlippageModel`: None, Fixed, VolumeBased, SpreadBased models
+    - `SimulatorConfig`: Fees, margin, position limits, reinvestment
+    - `BacktestResult`: Comprehensive metrics (Sharpe, Sortino, drawdown, win rate)
+
+**Database Schema (Migration 004 - TimescaleDB):**
+- `orderbook_snapshots` hypertable with automatic compression (7 days)
+- `historical_trades` hypertable for trade history
+- `backtest_results` for storing simulation outputs
+- `strategy_configs` for saved strategy parameters
+- Continuous aggregates: 5-minute, hourly, daily OHLCV
+- Retention policy: 1 year automatic data cleanup
+
+**Test Coverage:** 85 tests passing (+15 new)
+- backtester: 15 tests (strategy, data_store, simulator)
 
 ### 2026-01-09: Phase 2 - Wallet Tracking & Copy Trading
 
