@@ -18,7 +18,8 @@ ab-bot/
 │   ├── bot-scanner/     # Wallet behavior analysis and bot detection
 │   ├── polymarket-core/ # Shared types, API clients, database models
 │   ├── risk-manager/    # Stop-loss management, circuit breaker
-│   └── trading-engine/  # Order execution, copy trading, position management
+│   ├── trading-engine/  # Order execution, copy trading, position management
+│   └── wallet-tracker/  # Wallet discovery, profitability analysis, success prediction
 ├── migrations/          # SQL migrations for PostgreSQL/TimescaleDB
 ├── config/              # Environment-specific configuration
 └── docs/                # Additional documentation
@@ -192,6 +193,40 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 ---
 
 ## Changelog
+
+### 2026-01-09: Phase 2 - Wallet Tracking & Copy Trading
+
+**New Crates:**
+
+- **`wallet-tracker`**: Wallet discovery and success prediction system
+  - `discovery.rs`: Find profitable wallets via configurable criteria (min trades, win rate, volume, ROI)
+    - `DiscoveryCriteria`: Builder pattern for filter configuration
+    - `DiscoveredWallet`: Wallet data with computed metrics
+    - `WalletDiscovery`: Service for discovering and caching profitable wallets
+    - `RankingMetric`: Sort by ROI, win rate, volume, PnL, trade count, or consistency
+  - `profitability.rs`: Comprehensive financial metrics calculation
+    - `WalletMetrics`: 15+ metrics including Sharpe ratio, Sortino ratio, max drawdown, volatility
+    - `ProfitabilityAnalyzer`: Calculates metrics from trade history using statrs
+    - `TimePeriod`: Day, week, month, quarter, year, all-time analysis windows
+  - `success_predictor.rs`: Rule-based success prediction models
+    - `SuccessPredictor`: Predict future performance from historical metrics
+    - `PredictionModel`: RuleBased, Linear, WeightedAverage models
+    - `SuccessPrediction`: Probability, confidence, and factor breakdown
+    - `PredictionCategory`: HighPotential, Moderate, LowPotential, Uncertain
+  - `trade_monitor.rs`: Real-time wallet trade monitoring
+    - `TradeMonitor`: Monitor wallets for new trades with broadcast channels
+    - `WalletTrade`: Trade detection with market, price, quantity, value
+    - `MonitorConfig`: Poll interval, min trade value, max trade age
+
+**Database Schema (Migration 003):**
+- `wallet_success_metrics`: Computed profitability and prediction scores
+- `discovered_wallets`: Historical wallet discovery snapshots
+- `copy_trade_history`: Full copy trading audit trail
+- `wallet_trade_signals`: Real-time trade detection queue
+- Extended `tracked_wallets` with performance metrics
+
+**Test Coverage:** 70 tests passing (+15 new)
+- wallet-tracker: 15 tests (discovery, profitability, prediction, monitoring)
 
 ### 2026-01-09: Phase 1 - Trading & Risk Foundation
 
