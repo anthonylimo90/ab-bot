@@ -1,0 +1,49 @@
+[package]
+name = "arb-monitor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Arbitrage detection and position tracking for Polymarket"
+
+[[bin]]
+name = "arb-monitor"
+path = "src/main.rs"
+
+[dependencies]
+# Internal
+polymarket-core = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+futures-util = { workspace = true }
+
+# HTTP
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+redis = { workspace = true }
+
+# Types
+chrono = { workspace = true }
+uuid = { workspace = true }
+rust_decimal = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Configuration
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
