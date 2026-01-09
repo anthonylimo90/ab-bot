@@ -1,0 +1,122 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Run latency benchmarks
+        run: cargo bench --bench latency -- --noplot
+
+      - name: Run throughput benchmarks
+        run: cargo bench --bench throughput -- --noplot
+
+      - name: Store benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: target/criterion
+          retention-days: 30
+
+  benchmark-compare:
+    name: Benchmark Comparison
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install critcmp
+        run: cargo install critcmp
+
+      - name: Checkout base branch
+        run: git checkout ${{ github.base_ref }}
+
+      - name: Run base benchmarks
+        run: |
+          cargo bench --bench latency -- --noplot --save-baseline base
+          cargo bench --bench throughput -- --noplot --save-baseline base
+
+      - name: Checkout PR branch
+        run: git checkout ${{ github.head_ref }}
+
+      - name: Run PR benchmarks
+        run: |
+          cargo bench --bench latency -- --noplot --save-baseline pr
+          cargo bench --bench throughput -- --noplot --save-baseline pr
+
+      - name: Compare benchmarks
+        run: |
+          echo "## Latency Benchmark Comparison" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          critcmp base pr 2>&1 | head -100 >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  latency-check:
+    name: Latency Regression Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run latency benchmarks with regression check
+        run: |
+          # Run benchmarks and check for significant regressions (>10%)
+          cargo bench --bench latency -- --noplot 2>&1 | tee bench_output.txt
+
+          # Check for performance regressions
+          if grep -q "Performance has regressed" bench_output.txt; then
+            echo "::warning::Performance regression detected in benchmarks"
+          fi
