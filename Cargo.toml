@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/api-server",
     "crates/arb-monitor",
     "crates/auth",
     "crates/backtester",
@@ -67,6 +68,15 @@ hex = "0.4"
 # Async traits
 async-trait = "0.1"
 
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+tower = "0.4"
+
+# OpenAPI documentation
+utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "6", features = ["axum"] }
+
 # Internal crates
 polymarket-core = { path = "crates/polymarket-core" }
 trading-engine = { path = "crates/trading-engine" }
@@ -74,3 +84,4 @@ risk-manager = { path = "crates/risk-manager" }
 auth = { path = "crates/auth" }
 wallet-tracker = { path = "crates/wallet-tracker" }
 backtester = { path = "crates/backtester" }
+api-server = { path = "crates/api-server" }

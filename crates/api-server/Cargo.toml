@@ -1,0 +1,51 @@
+[package]
+name = "api-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Internal crates
+polymarket-core.workspace = true
+trading-engine.workspace = true
+risk-manager.workspace = true
+auth.workspace = true
+wallet-tracker.workspace = true
+backtester.workspace = true
+
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower = { version = "0.4", features = ["util", "timeout"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
+
+# Async
+tokio.workspace = true
+futures-util.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Types
+chrono.workspace = true
+uuid.workspace = true
+rust_decimal.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Database
+sqlx.workspace = true
+
+# OpenAPI documentation
+utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "6", features = ["axum"] }
+
+[dev-dependencies]
+tokio-test.workspace = true

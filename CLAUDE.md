@@ -13,6 +13,7 @@ Dual-purpose Polymarket analysis system:
 ```
 ab-bot/
 ├── crates/
+│   ├── api-server/      # REST/WebSocket API with OpenAPI docs (Axum)
 │   ├── arb-monitor/     # Arbitrage detection and position tracking
 │   ├── auth/            # JWT auth, API keys, key vault, audit logging
 │   ├── backtester/      # Historical backtesting with TimescaleDB
@@ -194,6 +195,52 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 ---
 
 ## Changelog
+
+### 2026-01-09: Phase 4 - API Server
+
+**New Crates:**
+
+- **`api-server`**: REST and WebSocket API for the trading platform (Axum)
+  - `lib.rs`: ApiServer with ServerConfig, middleware setup (CORS, tracing)
+  - `error.rs`: Comprehensive error handling with ApiError enum and HTTP status mapping
+  - `state.rs`: Shared AppState with database pool and broadcast channels
+  - `routes.rs`: Complete route definitions with OpenAPI documentation
+  - `websocket.rs`: Real-time WebSocket handlers
+    - `OrderbookUpdate`: Live orderbook changes with arbitrage spread
+    - `PositionUpdate`: Position open/close/price change events
+    - `SignalUpdate`: Trading signals (arbitrage, copy trade, stop-loss)
+    - Four endpoints: `/ws/orderbook`, `/ws/positions`, `/ws/signals`, `/ws/all`
+  - `handlers/`: RESTful API handlers
+    - `health.rs`: `/health` and `/ready` endpoints with database check
+    - `markets.rs`: Market data (`/api/v1/markets`, orderbook)
+    - `positions.rs`: Position CRUD (`/api/v1/positions`, close)
+    - `wallets.rs`: Wallet tracking (`/api/v1/wallets`, metrics)
+    - `trading.rs`: Order execution (`/api/v1/orders`, cancel)
+    - `backtest.rs`: Backtesting (`/api/v1/backtest`, results)
+
+**API Endpoints:**
+- Health: `GET /health`, `GET /ready`
+- Markets: `GET /api/v1/markets`, `GET /api/v1/markets/:id`, `GET /api/v1/markets/:id/orderbook`
+- Positions: `GET /api/v1/positions`, `GET /api/v1/positions/:id`, `POST /api/v1/positions/:id/close`
+- Wallets: `GET/POST /api/v1/wallets`, `GET/PUT/DELETE /api/v1/wallets/:address`, `GET /api/v1/wallets/:address/metrics`
+- Trading: `POST /api/v1/orders`, `GET /api/v1/orders/:id`, `POST /api/v1/orders/:id/cancel`
+- Backtest: `POST /api/v1/backtest`, `GET /api/v1/backtest/results`, `GET /api/v1/backtest/results/:id`
+- Docs: Swagger UI at `/swagger-ui`
+
+**Database Schema (Migration 005):**
+- `markets`: Market data with pricing, volume, liquidity
+- `orders`: Order management with status tracking
+- `backtest_results`: Backtest outputs with equity curve
+- Extended `positions` with outcome, side, stop-loss, take-profit
+- Extended `tracked_wallets` with copy trading settings
+- Extended `wallet_success_metrics` with additional analytics
+
+**Key Features:**
+- OpenAPI 3.0 documentation with utoipa
+- Swagger UI for interactive API exploration
+- WebSocket support with tokio broadcast channels
+- Type-safe request/response handling
+- Comprehensive error responses with codes
 
 ### 2026-01-09: Phase 3 - Backtesting Framework
 
