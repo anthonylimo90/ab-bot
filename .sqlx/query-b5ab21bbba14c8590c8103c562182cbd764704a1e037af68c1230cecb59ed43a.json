@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, market_id, unrealized_pnl, entry_timestamp, quantity,\n                   yes_entry_price, no_entry_price, state\n            FROM positions\n            WHERE state IN (1, 2)\n            ORDER BY unrealized_pnl ASC\n            LIMIT 10\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "market_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "unrealized_pnl",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "entry_timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "quantity",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "yes_entry_price",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "no_entry_price",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "state",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b5ab21bbba14c8590c8103c562182cbd764704a1e037af68c1230cecb59ed43a"
+}

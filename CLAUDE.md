@@ -140,6 +140,116 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo check --all
 ```
 
+## Docker Deployment
+
+### Quick Start
+
+```bash
+# Start all services (PostgreSQL, Redis, API Server)
+docker compose up -d
+
+# Check status
+docker compose ps
+
+# View logs
+docker compose logs -f api-server
+
+# Stop services
+docker compose down
+```
+
+### Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| PostgreSQL (TimescaleDB) | 5432 | Database with time-series extensions |
+| Redis | 6379 | Caching and pub/sub |
+| API Server | 3000 | REST/WebSocket API |
+| Dashboard | 3002 | Next.js frontend (run separately) |
+
+### Building Docker Images
+
+```bash
+# Build all images
+docker compose build
+
+# Build specific service
+docker compose build api-server
+
+# Force rebuild without cache
+docker compose build --no-cache
+```
+
+### Running the Dashboard
+
+The dashboard runs separately from Docker:
+
+```bash
+cd dashboard
+npm install
+npm run dev
+# Dashboard starts on http://localhost:3002 (or 3001 if 3002 is busy)
+```
+
+Configure the dashboard to connect to the API by editing `dashboard/.env.local`:
+
+```bash
+NEXT_PUBLIC_API_URL=http://localhost:3000
+NEXT_PUBLIC_WS_URL=ws://localhost:3000
+```
+
+### Optional Services
+
+```bash
+# Start with monitoring stack (Prometheus + Grafana)
+docker compose --profile monitoring up -d
+
+# Start with all services including bot-scanner
+docker compose --profile full up -d
+```
+
+### Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# Database
+POSTGRES_USER=abbot
+POSTGRES_PASSWORD=abbot_secret
+POSTGRES_DB=ab_bot
+
+# API
+JWT_SECRET=your-secret-key-here
+CORS_PERMISSIVE=true
+
+# External APIs (for live mode)
+POLYMARKET_API_URL=https://clob.polymarket.com
+POLYGON_RPC_URL=https://polygon-rpc.com
+
+# Logging
+RUST_LOG=api_server=info,tower_http=info
+```
+
+### Troubleshooting
+
+**SQLx compile-time errors:**
+The project uses SQLx offline mode for Docker builds. If you modify queries:
+
+```bash
+# Regenerate .sqlx cache (requires running database)
+DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prepare --workspace
+```
+
+**Migration conflicts:**
+Migrations are run by PostgreSQL on first boot via init scripts. The API server has `SKIP_MIGRATIONS=true` to avoid conflicts.
+
+**Port conflicts:**
+If ports are in use, modify `docker-compose.yml` or use environment variables:
+
+```bash
+API_PORT=3001 POSTGRES_PORT=5433 docker compose up -d
+```
+
 ## Environment Variables
 
 Required environment variables (set in `.env` for local development):
@@ -195,6 +305,50 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 ---
 
 ## Changelog
+
+### 2026-01-09: Phase 6.1 - Docker Deployment Fixes
+
+**Issues Fixed:**
+
+- **Chrono API compatibility**: Fixed `num_hours()` method calls that don't work on `DateTime` subtraction results
+  - Changed `(dt1 - dt2).num_hours()` to `dt1.signed_duration_since(dt2).num_hours()`
+  - Affected files: `trading-engine/src/recommendation.rs`, `backtester/src/simulator.rs`, `risk-manager/src/advanced_stops.rs`
+
+- **`home` crate version**: Pinned to v0.5.9 (v0.5.12 requires unreleased Rust 1.88)
+  - Added `cargo update home --precise 0.5.9` to Dockerfile
+
+- **SQLx offline mode**: Enabled for Docker builds without database connection
+  - Set `SQLX_OFFLINE=true` environment variable
+  - Generated `.sqlx/` cache directory with query metadata
+
+- **Migration conflicts**: Resolved race condition between PostgreSQL init and API server
+  - Added `SKIP_MIGRATIONS=true` to API server environment
+  - PostgreSQL init runs migrations via `/docker-entrypoint-initdb.d/`
+
+- **Migration ordering**: Made migration 006 idempotent
+  - Added `IF EXISTS` checks for out-of-order execution safety
+  - Fixed reserved word `timestamp` → `snapshot_time` in TimescaleDB function
+
+- **Dockerfile simplification**: Removed cargo-chef (incompatible with edition2024)
+  - Updated from Rust 1.75 to Rust 1.85
+  - Single-stage build with workspace compilation
+
+**Files Modified:**
+- `Dockerfile` - Simplified build, added SQLX_OFFLINE, home crate pinning
+- `docker-compose.yml` - Added SKIP_MIGRATIONS, migrations volume mount
+- `Cargo.toml` - Added home crate version pin
+- `.dockerignore` - Removed benches/ exclusion
+- `crates/api-server/src/main.rs` - Added SKIP_MIGRATIONS support
+- `crates/trading-engine/src/recommendation.rs` - Fixed chrono API
+- `crates/backtester/src/simulator.rs` - Fixed chrono API
+- `crates/risk-manager/src/advanced_stops.rs` - Fixed chrono API
+- `migrations/20260109_004_timescale.sql` - Fixed reserved word
+- `migrations/20260109_005_api_server_tables.sql` - Changed to ALTER TABLE
+- `migrations/20260109_006_add_spread_column.sql` - Made idempotent
+
+**New Files:**
+- `.sqlx/` - SQLx offline cache (4 JSON files)
+- `dashboard/` - Next.js frontend application
 
 ### 2026-01-09: Phase 5 - Advanced Features
 

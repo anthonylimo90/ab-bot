@@ -27,11 +27,19 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
 
-    // Run migrations
-    tracing::info!("Running database migrations...");
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await?;
+    // Run migrations (can be disabled via SKIP_MIGRATIONS=true for manual migration management)
+    let skip_migrations = std::env::var("SKIP_MIGRATIONS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    if !skip_migrations {
+        tracing::info!("Running database migrations...");
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await?;
+    } else {
+        tracing::info!("Skipping migrations (SKIP_MIGRATIONS=true)");
+    }
 
     // Create server config from environment
     let config = ServerConfig::from_env();

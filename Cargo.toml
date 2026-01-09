@@ -119,3 +119,6 @@ auth = { path = "crates/auth" }
 wallet-tracker = { path = "crates/wallet-tracker" }
 backtester = { path = "crates/backtester" }
 api-server = { path = "crates/api-server" }
+
+# Pin home crate to version compatible with Rust 1.85
+home = "=0.5.9"

@@ -35,8 +35,7 @@ coverage/
 *.profraw
 *.profdata
 
-# Benchmarks
-benches/
+# Benchmark output (keep bench source files)
 target/criterion/
 
 # OS files

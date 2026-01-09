@@ -1,21 +1,9 @@
 # ==============================================================================
-# Stage 1: Chef - Prepare recipe for dependency caching
+# Stage 1: Builder - Build application
 # ==============================================================================
-FROM rust:1.75-bookworm AS chef
-RUN cargo install cargo-chef
+FROM rust:1.85-bookworm AS builder
+
 WORKDIR /app
-
-# ==============================================================================
-# Stage 2: Planner - Generate dependency recipe
-# ==============================================================================
-FROM chef AS planner
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-# ==============================================================================
-# Stage 3: Builder - Build dependencies and application
-# ==============================================================================
-FROM chef AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -24,18 +12,20 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build dependencies (cached layer)
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
-
-# Build application
+# Copy source code
 COPY . .
 
-# Build all binaries
+# Pin home crate to version compatible with Rust 1.85
+RUN cargo update home --precise 0.5.9
+
+# Enable sqlx offline mode (uses pre-generated .sqlx cache)
+ENV SQLX_OFFLINE=true
+
+# Build all binaries in release mode
 RUN cargo build --release --workspace
 
 # ==============================================================================
-# Stage 4: Runtime - Minimal production image
+# Stage 2: Runtime - Minimal production image
 # ==============================================================================
 FROM debian:bookworm-slim AS runtime
 

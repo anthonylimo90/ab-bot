@@ -759,7 +759,7 @@ impl BacktestSimulator {
         let total_hours: i64 = closed_trades
             .iter()
             .map(|t| {
-                (t.exit_time.unwrap() - t.entry_time).num_hours()
+                t.exit_time.unwrap().signed_duration_since(t.entry_time).num_hours()
             })
             .sum();
 

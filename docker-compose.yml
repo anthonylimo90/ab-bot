@@ -55,6 +55,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       CORS_PERMISSIVE: ${CORS_PERMISSIVE:-true}
       RUST_LOG: ${RUST_LOG:-api_server=info,tower_http=info}
+      SKIP_MIGRATIONS: "true"
     ports:
       - "${API_PORT:-3000}:3000"
     depends_on:

@@ -60,51 +60,30 @@ CREATE INDEX idx_orders_created ON orders(created_at);
 CREATE UNIQUE INDEX idx_orders_client_id_unique ON orders(client_order_id) WHERE client_order_id IS NOT NULL;
 
 -- ===================
--- Backtest Results Table
+-- Extend Backtest Results Table (created in timescale migration)
 -- ===================
 
-CREATE TABLE IF NOT EXISTS backtest_results (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    strategy JSONB NOT NULL,
-    start_date TIMESTAMPTZ NOT NULL,
-    end_date TIMESTAMPTZ NOT NULL,
-    initial_capital DECIMAL(18, 8) NOT NULL,
-    slippage_model JSONB,
-    fee_pct DECIMAL(8, 6) NOT NULL DEFAULT 0.001,
+-- Add missing columns to backtest_results if they don't exist
+ALTER TABLE backtest_results
+ADD COLUMN IF NOT EXISTS strategy JSONB,
+ADD COLUMN IF NOT EXISTS start_date TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS end_date TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS initial_capital_api DECIMAL(18, 8),
+ADD COLUMN IF NOT EXISTS slippage_model JSONB,
+ADD COLUMN IF NOT EXISTS fee_pct DECIMAL(8, 6) DEFAULT 0.001,
+ADD COLUMN IF NOT EXISTS final_value_api DECIMAL(18, 8),
+ADD COLUMN IF NOT EXISTS total_return_api DECIMAL(18, 8),
+ADD COLUMN IF NOT EXISTS total_return_pct DECIMAL(10, 4),
+ADD COLUMN IF NOT EXISTS max_drawdown_api DECIMAL(18, 8),
+ADD COLUMN IF NOT EXISTS max_drawdown_pct DECIMAL(10, 4),
+ADD COLUMN IF NOT EXISTS avg_win DECIMAL(18, 8),
+ADD COLUMN IF NOT EXISTS avg_loss DECIMAL(18, 8),
+ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'completed',
+ADD COLUMN IF NOT EXISTS error TEXT,
+ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
 
-    -- Results (populated after completion)
-    final_value DECIMAL(18, 8),
-    total_return DECIMAL(18, 8),
-    total_return_pct DECIMAL(10, 4),
-    annualized_return DECIMAL(10, 4),
-    sharpe_ratio DECIMAL(10, 4),
-    sortino_ratio DECIMAL(10, 4),
-    max_drawdown DECIMAL(18, 8),
-    max_drawdown_pct DECIMAL(10, 4),
-    total_trades BIGINT,
-    winning_trades BIGINT,
-    losing_trades BIGINT,
-    win_rate DECIMAL(6, 4),
-    avg_win DECIMAL(18, 8),
-    avg_loss DECIMAL(18, 8),
-    profit_factor DECIMAL(10, 4),
-    total_fees DECIMAL(18, 8),
-
-    -- Equity curve
-    equity_curve JSONB,
-
-    -- Status
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    error TEXT,
-
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-
-    CONSTRAINT valid_backtest_status CHECK (status IN ('pending', 'running', 'completed', 'failed'))
-);
-
-CREATE INDEX idx_backtest_status ON backtest_results(status);
-CREATE INDEX idx_backtest_created ON backtest_results(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_status ON backtest_results(status);
+CREATE INDEX IF NOT EXISTS idx_backtest_created ON backtest_results(created_at DESC);
 
 -- ===================
 -- Extend Positions for API

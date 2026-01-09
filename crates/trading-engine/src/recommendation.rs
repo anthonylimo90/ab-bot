@@ -512,7 +512,8 @@ impl RecommendationEngine {
 
         for pos in positions {
             let pnl = pos.unrealized_pnl;
-            let hours_held = (Utc::now() - pos.entry_timestamp).num_hours();
+            let duration = Utc::now().signed_duration_since(pos.entry_timestamp);
+            let hours_held = duration.num_hours();
 
             // Recommend closing losing positions held too long
             if pnl < Decimal::ZERO && hours_held > 72 {

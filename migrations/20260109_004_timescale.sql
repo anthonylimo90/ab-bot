@@ -308,7 +308,7 @@ CREATE OR REPLACE FUNCTION find_arbitrage_opportunities(
 )
 RETURNS TABLE (
     market_id VARCHAR(255),
-    timestamp TIMESTAMPTZ,
+    snapshot_time TIMESTAMPTZ,
     yes_ask DECIMAL,
     no_ask DECIMAL,
     spread DECIMAL
@@ -317,7 +317,7 @@ LANGUAGE SQL
 AS $$
     SELECT
         market_id,
-        timestamp,
+        timestamp AS snapshot_time,
         yes_ask,
         no_ask,
         (1 - yes_ask - no_ask) AS spread

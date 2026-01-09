@@ -451,7 +451,7 @@ impl TimeDecayStop {
     /// Get current stop level based on time decay.
     pub fn current_stop_level(&self) -> Decimal {
         let now = Utc::now();
-        let hours_to_deadline = (self.deadline - now).num_hours();
+        let hours_to_deadline = self.deadline.signed_duration_since(now).num_hours();
 
         let decay_factor = if hours_to_deadline >= self.decay_start_hours {
             Decimal::ONE
