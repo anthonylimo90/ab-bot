@@ -310,6 +310,109 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 
 ## Changelog
 
+### 2026-01-10: Phase 9 - Live API Integration & Demo Mode
+
+**Demo Mode Implementation:**
+
+- **`demo-portfolio-store.ts`**: Zustand store for tracking simulated positions
+  - `DemoPosition`: Track wallet copies with entry/current price, quantity
+  - `balance`: Demo balance (default $10,000)
+  - `addPosition()`, `closePosition()`, `updatePrices()`, `reset()`
+  - Automatic P&L calculation on position changes
+
+- **`wallet-store.ts`**: Connected wallet management for live mode
+  - `ConnectedWallet`: User's trading wallets from KeyVault
+  - `fetchWallets()`, `connectWallet()`, `disconnectWallet()`
+  - `setPrimary()`: Set primary wallet for trading
+  - Selector pattern to avoid HMR issues
+
+- **`ModeToggle` Component**: Functional demo/live mode switching
+  - Shows demo balance when in demo mode
+  - Shows connected wallet or "Connect" button in live mode
+  - Persisted mode preference
+
+**API Server - New Endpoints:**
+
+- **`/api/v1/recommendations/rotation`**: Rotation recommendations
+  - Analyzes tracked wallets for alpha decay, consistent losses, high risk
+  - Identifies bench wallets outperforming Active roster
+  - Returns prioritized recommendations with evidence
+  - Query params: `urgency`, `limit`
+
+- **`/api/v1/recommendations/:id/dismiss`**: Dismiss recommendation
+- **`/api/v1/recommendations/:id/accept`**: Accept recommendation
+
+- **`/api/v1/vault/wallets`**: Secure wallet key management
+  - Store encrypted wallet credentials in KeyVault
+  - List connected wallets, set primary wallet
+  - Database-backed user-wallet mapping
+
+**Dashboard - Pages Connected to Real API:**
+
+- **Bench Page (Discover Tab)**:
+  - Fetches from `/api/v1/discover/wallets`
+  - Loading skeletons, error states, refresh button
+  - Real wallet metrics (ROI, Sharpe, win rate, drawdown)
+
+- **Rotation Page**:
+  - Fetches from `/api/v1/recommendations/rotation`
+  - Accept/dismiss mutations with optimistic updates
+  - Auto-refresh every minute
+
+- **Roster Page (Active 5)**:
+  - Fetches from `/api/v1/wallets` with `copy_enabled: true`
+  - Transforms API data to RosterWallet format
+  - Loading skeletons, error handling
+
+- **Allocate Page**:
+  - Functional "Activate" button
+  - Creates demo positions from selected strategies
+  - Deducts from demo balance
+  - Shows activation success state
+
+- **Portfolio Page**:
+  - Shows demo positions when in demo mode
+  - Real-time balance from demo-portfolio-store
+
+**New Query Hooks:**
+
+- `useRotationRecommendationsQuery()`: Fetch rotation recommendations
+- `useDismissRecommendation()`: Mutation for dismissing
+- `useAcceptRecommendation()`: Mutation for accepting
+
+**API Client Improvements:**
+
+- Added generic `get<T>()`, `post<T>()`, `put<T>()`, `delete<T>()` methods
+- Enables flexible API calls without dedicated methods
+
+**Database Migrations:**
+
+- `20260110_007_add_user_name.sql`: Add name column to users
+- `20260110_008_user_wallets.sql`: User-wallet mapping for vault
+
+**Files Created:**
+- `crates/api-server/src/handlers/recommendations.rs`
+- `crates/api-server/src/handlers/vault.rs`
+- `crates/api-server/src/handlers/auth.rs`
+- `dashboard/stores/demo-portfolio-store.ts`
+- `dashboard/stores/wallet-store.ts`
+- `dashboard/stores/auth-store.ts`
+- `dashboard/hooks/queries/useRecommendationsQuery.ts`
+- `dashboard/components/wallet/ConnectWalletModal.tsx`
+- `dashboard/app/(auth)/login/page.tsx`
+- `dashboard/app/(auth)/signup/page.tsx`
+
+**Files Modified:**
+- `crates/api-server/src/routes.rs` - Add recommendation routes
+- `crates/api-server/src/handlers/mod.rs` - Export new modules
+- `dashboard/app/bench/page.tsx` - Connect to discover API
+- `dashboard/app/rotation/page.tsx` - Connect to recommendations API
+- `dashboard/app/roster/page.tsx` - Connect to wallets API
+- `dashboard/app/allocate/page.tsx` - Implement activation flow
+- `dashboard/app/portfolio/page.tsx` - Show demo positions
+- `dashboard/components/layout/ModeToggle.tsx` - Functional toggle
+- `dashboard/lib/api.ts` - Add generic HTTP methods
+
 ### 2026-01-10: Phase 8 - Discovery & Demo Dashboard
 
 **New API Endpoints:**
