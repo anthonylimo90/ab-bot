@@ -4,6 +4,7 @@ import { Header } from '@/components/layout/Header';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { ToastProvider } from '@/components/shared/ToastProvider';
+import { QueryProvider } from '@/providers/QueryProvider';
 import './globals.css';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -21,18 +22,20 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={inter.className}>
-        <TooltipProvider>
-          <div className="relative min-h-screen bg-background">
-            <Header />
-            <Sidebar />
-            <main className="md:pl-64">
-              <div className="container mx-auto p-4 md:p-6 lg:p-8">
-                {children}
-              </div>
-            </main>
-          </div>
-          <ToastProvider />
-        </TooltipProvider>
+        <QueryProvider>
+          <TooltipProvider>
+            <div className="relative min-h-screen bg-background">
+              <Header />
+              <Sidebar />
+              <main className="md:pl-64">
+                <div className="container mx-auto p-4 md:p-6 lg:p-8">
+                  {children}
+                </div>
+              </main>
+            </div>
+            <ToastProvider />
+          </TooltipProvider>
+        </QueryProvider>
       </body>
     </html>
   );

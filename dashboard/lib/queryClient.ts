@@ -1,0 +1,80 @@
+import { QueryClient } from '@tanstack/react-query';
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      // Data considered fresh for 30 seconds
+      staleTime: 30 * 1000,
+      // Cache data for 5 minutes
+      gcTime: 5 * 60 * 1000,
+      // Refetch when window regains focus
+      refetchOnWindowFocus: true,
+      // Retry failed requests twice
+      retry: 2,
+      // Exponential backoff for retries
+      retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000),
+    },
+    mutations: {
+      // Retry mutations once
+      retry: 1,
+    },
+  },
+});
+
+// Query key factory for consistent key management
+export const queryKeys = {
+  // Positions
+  positions: {
+    all: ['positions'] as const,
+    list: (filters?: { status?: string; market?: string }) =>
+      [...queryKeys.positions.all, 'list', filters] as const,
+    detail: (id: string) => [...queryKeys.positions.all, 'detail', id] as const,
+  },
+
+  // Wallets
+  wallets: {
+    all: ['wallets'] as const,
+    roster: () => [...queryKeys.wallets.all, 'roster'] as const,
+    bench: () => [...queryKeys.wallets.all, 'bench'] as const,
+    detail: (address: string) =>
+      [...queryKeys.wallets.all, 'detail', address] as const,
+    metrics: (address: string) =>
+      [...queryKeys.wallets.all, 'metrics', address] as const,
+  },
+
+  // Markets
+  markets: {
+    all: ['markets'] as const,
+    list: (filters?: { category?: string; active?: boolean }) =>
+      [...queryKeys.markets.all, 'list', filters] as const,
+    detail: (id: string) => [...queryKeys.markets.all, 'detail', id] as const,
+    orderbook: (id: string) =>
+      [...queryKeys.markets.all, 'orderbook', id] as const,
+  },
+
+  // Discovery
+  discover: {
+    all: ['discover'] as const,
+    wallets: (filters?: {
+      minRoi?: number;
+      minWinRate?: number;
+      minTrades?: number;
+    }) => [...queryKeys.discover.all, 'wallets', filters] as const,
+    leaderboard: () => [...queryKeys.discover.all, 'leaderboard'] as const,
+  },
+
+  // Portfolio
+  portfolio: {
+    all: ['portfolio'] as const,
+    stats: () => [...queryKeys.portfolio.all, 'stats'] as const,
+    history: (period: string) =>
+      [...queryKeys.portfolio.all, 'history', period] as const,
+  },
+
+  // Backtest
+  backtest: {
+    all: ['backtest'] as const,
+    results: () => [...queryKeys.backtest.all, 'results'] as const,
+    detail: (id: string) => [...queryKeys.backtest.all, 'detail', id] as const,
+  },
+} as const;

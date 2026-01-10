@@ -1,14 +1,14 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
-import { createChart, ColorType, IChartApi } from 'lightweight-charts';
+import { useEffect, useRef, memo, useCallback } from 'react';
+import { createChart, ColorType, IChartApi, ISeriesApi } from 'lightweight-charts';
 import { cn } from '@/lib/utils';
 
 // Chart colors (hex values for TradingView compatibility)
 const CHART_COLORS = {
-  profit: '#22c55e',      // green-500
-  loss: '#ef4444',        // red-500
-};
+  profit: '#22c55e', // green-500
+  loss: '#ef4444', // red-500
+} as const;
 
 interface EquityCurveProps {
   data: { time: string; value: number }[];
@@ -17,7 +17,7 @@ interface EquityCurveProps {
   showAxes?: boolean;
 }
 
-export function EquityCurve({
+export const EquityCurve = memo(function EquityCurve({
   data,
   height = 60,
   className,
@@ -25,9 +25,11 @@ export function EquityCurve({
 }: EquityCurveProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<ISeriesApi<'Line'> | null>(null);
 
+  // Initialize chart only once
   useEffect(() => {
-    if (!chartContainerRef.current || data.length === 0) return;
+    if (!chartContainerRef.current) return;
 
     // Create minimal chart for sparkline effect
     const chart = createChart(chartContainerRef.current, {
@@ -61,32 +63,21 @@ export function EquityCurve({
 
     chartRef.current = chart;
 
-    // Calculate if overall trend is positive
-    const isPositive = data[data.length - 1].value >= data[0].value;
-
-    // Add line series (simpler than area for small charts)
+    // Create line series
     const lineSeries = chart.addLineSeries({
-      color: isPositive ? CHART_COLORS.profit : CHART_COLORS.loss,
       lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: false,
     });
 
-    // Format data
-    const chartData = data.map((d) => ({
-      time: d.time,
-      value: d.value,
-    }));
-
-    lineSeries.setData(chartData as any);
-
-    // Fit content
-    chart.timeScale().fitContent();
+    seriesRef.current = lineSeries;
 
     // Handle resize
     const handleResize = () => {
-      if (chartContainerRef.current) {
-        chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+      if (chartContainerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+        });
       }
     };
 
@@ -95,13 +86,42 @@ export function EquityCurve({
     return () => {
       window.removeEventListener('resize', handleResize);
       chart.remove();
+      chartRef.current = null;
+      seriesRef.current = null;
     };
-  }, [data, height, showAxes]);
+  }, [height, showAxes]); // Only recreate on height/showAxes change
+
+  // Update data without recreating chart
+  useEffect(() => {
+    if (!seriesRef.current || !chartRef.current || data.length === 0) return;
+
+    // Calculate if overall trend is positive
+    const isPositive = data[data.length - 1].value >= data[0].value;
+
+    // Update series color based on trend
+    seriesRef.current.applyOptions({
+      color: isPositive ? CHART_COLORS.profit : CHART_COLORS.loss,
+    });
+
+    // Update data
+    const chartData = data.map((d) => ({
+      time: d.time,
+      value: d.value,
+    }));
+
+    seriesRef.current.setData(chartData as any);
+
+    // Fit content
+    chartRef.current.timeScale().fitContent();
+  }, [data]);
 
   if (data.length === 0) {
     return (
       <div
-        className={cn('flex items-center justify-center text-muted-foreground text-xs', className)}
+        className={cn(
+          'flex items-center justify-center text-muted-foreground text-xs',
+          className
+        )}
         style={{ height }}
       >
         No data
@@ -110,4 +130,4 @@ export function EquityCurve({
   }
 
   return <div ref={chartContainerRef} className={cn('', className)} />;
-}
+});
