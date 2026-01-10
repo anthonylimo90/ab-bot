@@ -1,12 +1,13 @@
 'use client';
 
-import { useState } from 'react';
 import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
 import { useRosterStore, RosterWallet } from '@/stores/roster-store';
 import { useToastStore } from '@/stores/toast-store';
-import { shortenAddress, formatCurrency } from '@/lib/utils';
+import { useRosterWallets } from '@/hooks/queries';
+import { shortenAddress } from '@/lib/utils';
 import {
   Users,
   Plus,
@@ -16,47 +17,9 @@ import {
   Settings,
   ChevronDown,
   AlertTriangle,
+  RefreshCw,
+  AlertCircle,
 } from 'lucide-react';
-
-// Mock data for demo - in real app this would come from store
-const mockActiveWallets: RosterWallet[] = [
-  {
-    address: '0x1234567890abcdef1234567890abcdef12345678',
-    label: 'Alpha Trader',
-    tier: 'active',
-    copySettings: {
-      copy_behavior: 'events_only',
-      allocation_pct: 25,
-      max_position_size: 200,
-    },
-    roi30d: 47.3,
-    sharpe: 2.4,
-    winRate: 71,
-    trades: 156,
-    maxDrawdown: -8.2,
-    confidence: 85,
-    addedAt: '2026-01-01T00:00:00Z',
-    lastActivity: '2026-01-09T14:30:00Z',
-  },
-  {
-    address: '0xabcdef1234567890abcdef1234567890abcdef12',
-    label: 'Event Specialist',
-    tier: 'active',
-    copySettings: {
-      copy_behavior: 'copy_all',
-      allocation_pct: 20,
-      max_position_size: 150,
-    },
-    roi30d: 38.1,
-    sharpe: 1.9,
-    winRate: 68,
-    trades: 89,
-    maxDrawdown: -12.1,
-    confidence: 72,
-    addedAt: '2026-01-03T00:00:00Z',
-    lastActivity: '2026-01-09T12:15:00Z',
-  },
-];
 
 const copyBehaviorLabels = {
   copy_all: 'All Trades',
@@ -117,7 +80,7 @@ function RosterCard({ wallet }: { wallet: RosterWallet }) {
           </div>
           <div className="flex items-center gap-2">
             <span className="text-xs px-2 py-1 rounded-full bg-primary/10 text-primary">
-              {copyBehaviorLabels[wallet.copySettings.copy_behavior]}
+              {wallet.copySettings ? copyBehaviorLabels[wallet.copySettings.copy_behavior] : 'All Trades'}
             </span>
             <Button variant="ghost" size="icon" className="h-8 w-8">
               <Settings className="h-4 w-4" />
@@ -152,12 +115,12 @@ function RosterCard({ wallet }: { wallet: RosterWallet }) {
         <div className="space-y-1">
           <div className="flex items-center justify-between text-xs">
             <span className="text-muted-foreground">Allocation</span>
-            <span className="font-medium">{wallet.copySettings.allocation_pct}%</span>
+            <span className="font-medium">{wallet.copySettings?.allocation_pct || 0}%</span>
           </div>
           <div className="w-full bg-muted rounded-full h-2">
             <div
               className="bg-primary h-2 rounded-full transition-all"
-              style={{ width: `${wallet.copySettings.allocation_pct}%` }}
+              style={{ width: `${wallet.copySettings?.allocation_pct || 0}%` }}
             />
           </div>
         </div>
@@ -181,15 +144,38 @@ function RosterCard({ wallet }: { wallet: RosterWallet }) {
 }
 
 export default function RosterPage() {
-  const { activeWallets } = useRosterStore();
+  const { activeWallets: storeWallets, demoteToBench } = useRosterStore();
   const toast = useToastStore();
 
-  // Use mock data if store is empty (demo mode)
-  const displayWallets = activeWallets.length > 0 ? activeWallets : mockActiveWallets;
+  // Fetch active wallets from API
+  const { rosterWallets: apiWallets, isLoading, error, refetch } = useRosterWallets();
+
+  // Transform API wallets to RosterWallet format for display
+  const apiRosterWallets: RosterWallet[] = (apiWallets || []).map((w) => ({
+    address: w.address,
+    label: w.label,
+    tier: 'active' as const,
+    copySettings: {
+      copy_behavior: 'copy_all' as const,
+      allocation_pct: w.allocation_pct,
+      max_position_size: w.max_position_size,
+    },
+    roi30d: 0, // Will be enriched from metrics
+    sharpe: 0,
+    winRate: w.win_rate,
+    trades: w.total_trades,
+    maxDrawdown: 0,
+    confidence: Math.round(w.success_score * 100),
+    addedAt: w.added_at,
+    lastActivity: w.last_activity,
+  }));
+
+  // Merge API data with store data (store takes priority for local changes)
+  const displayWallets = storeWallets.length > 0 ? storeWallets : apiRosterWallets;
   const emptySlots = 5 - displayWallets.length;
 
   const totalAllocation = displayWallets.reduce(
-    (sum, w) => sum + w.copySettings.allocation_pct,
+    (sum, w) => sum + (w.copySettings?.allocation_pct || 0),
     0
   );
 
@@ -206,83 +192,150 @@ export default function RosterPage() {
             Your top-tier wallets being actively copied
           </p>
         </div>
-        <Link href="/bench">
-          <Button>
-            <Plus className="mr-2 h-4 w-4" />
-            Add from Bench
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={() => refetch()} disabled={isLoading}>
+            <RefreshCw className={`mr-2 h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} />
+            Refresh
           </Button>
-        </Link>
+          <Link href="/bench">
+            <Button>
+              <Plus className="mr-2 h-4 w-4" />
+              Add from Bench
+            </Button>
+          </Link>
+        </div>
       </div>
+
+      {/* Error State */}
+      {error && (
+        <Card className="border-destructive">
+          <CardContent className="p-6 text-center">
+            <AlertCircle className="h-8 w-8 mx-auto mb-2 text-destructive" />
+            <p className="text-destructive font-medium">Failed to load roster</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              {error instanceof Error ? error.message : 'Please try again'}
+            </p>
+            <Button variant="outline" size="sm" className="mt-4" onClick={() => refetch()}>
+              Retry
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Loading State */}
+      {isLoading && !error && (
+        <div className="space-y-4">
+          <div className="grid gap-4 md:grid-cols-4">
+            {[1, 2, 3, 4].map((i) => (
+              <Card key={i}>
+                <CardContent className="p-4 flex items-center gap-3">
+                  <Skeleton className="h-10 w-10 rounded-full" />
+                  <div className="space-y-2">
+                    <Skeleton className="h-4 w-24" />
+                    <Skeleton className="h-6 w-16" />
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {[1, 2, 3].map((i) => (
+              <Card key={i}>
+                <CardContent className="p-6">
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-3">
+                      <Skeleton className="h-10 w-10 rounded-full" />
+                      <div className="space-y-2">
+                        <Skeleton className="h-4 w-24" />
+                        <Skeleton className="h-3 w-32" />
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-4 gap-2">
+                      {[1, 2, 3, 4].map((j) => (
+                        <Skeleton key={j} className="h-10 w-full" />
+                      ))}
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Summary Stats */}
-      <div className="grid gap-4 md:grid-cols-4">
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
-                <Users className="h-5 w-5 text-primary" />
+      {!isLoading && !error && (
+        <div className="grid gap-4 md:grid-cols-4">
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
+                  <Users className="h-5 w-5 text-primary" />
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Active Wallets</p>
+                  <p className="text-2xl font-bold">{displayWallets.length}/5</p>
+                </div>
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Active Wallets</p>
-                <p className="text-2xl font-bold">{displayWallets.length}/5</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-full bg-profit/10 flex items-center justify-center">
+                  <TrendingUp className="h-5 w-5 text-profit" />
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Avg. ROI (30d)</p>
+                  <p className="text-2xl font-bold text-profit">
+                    +{(displayWallets.length > 0 ? displayWallets.reduce((sum, w) => sum + (Number(w.roi30d) || 0), 0) / displayWallets.length : 0).toFixed(1)}%
+                  </p>
+                </div>
               </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-full bg-profit/10 flex items-center justify-center">
-                <TrendingUp className="h-5 w-5 text-profit" />
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-full bg-demo/10 flex items-center justify-center">
+                  <TrendingDown className="h-5 w-5 text-demo" />
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Total Allocation</p>
+                  <p className="text-2xl font-bold">{totalAllocation}%</p>
+                </div>
               </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Avg. ROI (30d)</p>
-                <p className="text-2xl font-bold text-profit">
-                  +{(displayWallets.reduce((sum, w) => sum + w.roi30d, 0) / displayWallets.length || 0).toFixed(1)}%
-                </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-full bg-yellow-500/10 flex items-center justify-center">
+                  <AlertTriangle className="h-5 w-5 text-yellow-500" />
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Avg. Max DD</p>
+                  <p className="text-2xl font-bold text-loss">
+                    {(displayWallets.length > 0 ? displayWallets.reduce((sum, w) => sum + (Number(w.maxDrawdown) || 0), 0) / displayWallets.length : 0).toFixed(1)}%
+                  </p>
+                </div>
               </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-full bg-demo/10 flex items-center justify-center">
-                <TrendingDown className="h-5 w-5 text-demo" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Total Allocation</p>
-                <p className="text-2xl font-bold">{totalAllocation}%</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-full bg-yellow-500/10 flex items-center justify-center">
-                <AlertTriangle className="h-5 w-5 text-yellow-500" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Avg. Max DD</p>
-                <p className="text-2xl font-bold text-loss">
-                  {(displayWallets.reduce((sum, w) => sum + w.maxDrawdown, 0) / displayWallets.length || 0).toFixed(1)}%
-                </p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* Roster Grid */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {displayWallets.map((wallet) => (
-          <RosterCard key={wallet.address} wallet={wallet} />
-        ))}
-        {Array.from({ length: emptySlots }).map((_, i) => (
-          <EmptySlotCard key={`empty-${i}`} slotNumber={displayWallets.length + i + 1} />
-        ))}
-      </div>
+      {!isLoading && !error && (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {displayWallets.map((wallet) => (
+            <RosterCard key={wallet.address} wallet={wallet} />
+          ))}
+          {Array.from({ length: emptySlots }).map((_, i) => (
+            <EmptySlotCard key={`empty-${i}`} slotNumber={displayWallets.length + i + 1} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

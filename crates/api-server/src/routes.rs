@@ -7,7 +7,7 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::handlers::{health, markets, positions, wallets, trading, backtest, discover};
+use crate::handlers::{auth, health, markets, positions, recommendations, wallets, trading, backtest, discover, vault};
 use crate::middleware::{require_auth, require_trader};
 use crate::state::AppState;
 use crate::websocket;
@@ -23,6 +23,10 @@ use crate::websocket;
     paths(
         health::health_check,
         health::readiness,
+        auth::register,
+        auth::login,
+        auth::refresh_token,
+        auth::get_current_user,
         markets::list_markets,
         markets::get_market,
         markets::get_market_orderbook,
@@ -44,10 +48,22 @@ use crate::websocket;
         discover::get_live_trades,
         discover::discover_wallets,
         discover::simulate_demo_pnl,
+        vault::store_wallet,
+        vault::list_wallets,
+        vault::get_wallet,
+        vault::remove_wallet,
+        vault::set_primary_wallet,
+        recommendations::get_rotation_recommendations,
+        recommendations::dismiss_recommendation,
+        recommendations::accept_recommendation,
     ),
     components(
         schemas(
             crate::error::ErrorResponse,
+            auth::RegisterRequest,
+            auth::LoginRequest,
+            auth::AuthResponse,
+            auth::UserInfo,
             crate::websocket::OrderbookUpdate,
             crate::websocket::PositionUpdate,
             crate::websocket::SignalUpdate,
@@ -80,9 +96,16 @@ use crate::websocket;
             discover::DemoPnlSimulation,
             discover::WalletSimulation,
             discover::EquityPoint,
+            vault::StoreWalletRequest,
+            vault::WalletInfo,
+            recommendations::RotationRecommendation,
+            recommendations::RecommendationType,
+            recommendations::RecommendationReason,
+            recommendations::Urgency,
         )
     ),
     tags(
+        (name = "auth", description = "Authentication endpoints"),
         (name = "health", description = "Health check endpoints"),
         (name = "markets", description = "Market data endpoints"),
         (name = "positions", description = "Position management"),
@@ -90,6 +113,8 @@ use crate::websocket;
         (name = "trading", description = "Order execution"),
         (name = "backtest", description = "Backtesting operations"),
         (name = "discover", description = "Wallet discovery and live trade monitoring"),
+        (name = "vault", description = "Secure wallet key management"),
+        (name = "recommendations", description = "AI-powered rotation recommendations"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -101,10 +126,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/health", get(health::health_check))
         .route("/ready", get(health::readiness))
+        // Auth endpoints (public)
+        .route("/api/v1/auth/register", post(auth::register))
+        .route("/api/v1/auth/login", post(auth::login))
         // Discovery/demo endpoints (public for demo purposes)
         .route("/api/v1/discover/trades", get(discover::get_live_trades))
         .route("/api/v1/discover/wallets", get(discover::discover_wallets))
         .route("/api/v1/discover/simulate", get(discover::simulate_demo_pnl))
+        // Recommendations (public for demo purposes)
+        .route("/api/v1/recommendations/rotation", get(recommendations::get_rotation_recommendations))
+        .route("/api/v1/recommendations/:id/dismiss", post(recommendations::dismiss_recommendation))
+        .route("/api/v1/recommendations/:id/accept", post(recommendations::accept_recommendation))
         // WebSocket endpoints (auth handled via query param or message)
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))
@@ -113,6 +145,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     // Protected read-only routes - require authentication (any role)
     let protected_routes = Router::new()
+        // Auth endpoints (protected)
+        .route("/api/v1/auth/refresh", post(auth::refresh_token))
+        .route("/api/v1/auth/me", get(auth::get_current_user))
         // Market endpoints (read-only)
         .route("/api/v1/markets", get(markets::list_markets))
         .route("/api/v1/markets/:market_id", get(markets::get_market))
@@ -124,6 +159,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/wallets", get(wallets::list_tracked_wallets))
         .route("/api/v1/wallets/:address", get(wallets::get_wallet))
         .route("/api/v1/wallets/:address/metrics", get(wallets::get_wallet_metrics))
+        // Vault endpoints (read-only)
+        .route("/api/v1/vault/wallets", get(vault::list_wallets))
+        .route("/api/v1/vault/wallets/:address", get(vault::get_wallet))
         // Order endpoints (read-only)
         .route("/api/v1/orders/:order_id", get(trading::get_order_status))
         // Backtest endpoints (read-only)
@@ -145,6 +183,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/wallets/:address", delete(wallets::remove_wallet))
         // Backtest operations
         .route("/api/v1/backtest", post(backtest::run_backtest))
+        // Vault operations (write)
+        .route("/api/v1/vault/wallets", post(vault::store_wallet))
+        .route("/api/v1/vault/wallets/:address", delete(vault::remove_wallet))
+        .route("/api/v1/vault/wallets/:address/primary", put(vault::set_primary_wallet))
         // Apply trader check first, then auth
         .layer(axum_middleware::from_fn_with_state(state.clone(), require_trader))
         .layer(axum_middleware::from_fn_with_state(state.clone(), require_auth));

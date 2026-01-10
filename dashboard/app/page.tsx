@@ -1,9 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { useModeStore } from '@/stores/mode-store';
 import { usePortfolioStats } from '@/hooks/usePortfolioStats';
 import { useActivity } from '@/hooks/useActivity';
+import { useWalletsQuery, useRecommendationsQuery } from '@/hooks/queries/useWalletsQuery';
 import { useToastStore } from '@/stores/toast-store';
 import { MetricCard } from '@/components/shared/MetricCard';
 import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
@@ -27,32 +27,6 @@ import { formatCurrency, shortenAddress, formatTimeAgo } from '@/lib/utils';
 import { cn } from '@/lib/utils';
 import type { CopyBehavior } from '@/types/api';
 
-const mockAllocations = [
-  { name: 'Wallet A', value: 30, color: '#3b82f6' },
-  { name: 'Wallet B', value: 25, color: '#22c55e' },
-  { name: 'Arbitrage', value: 25, color: '#a855f7' },
-  { name: 'Manual', value: 20, color: '#f97316' },
-];
-
-const mockRecommendations = [
-  {
-    id: '1',
-    wallet: '0x1234567890abcdef1234567890abcdef12345678',
-    confidence: 85,
-    roi: 34,
-    sharpe: 2.1,
-    winRate: 72,
-  },
-  {
-    id: '2',
-    wallet: '0xabcdef1234567890abcdef1234567890abcdef12',
-    confidence: 78,
-    roi: 28,
-    sharpe: 1.8,
-    winRate: 69,
-  },
-];
-
 type Period = '1D' | '7D' | '30D' | 'ALL';
 
 const activityIcons: Record<string, React.ReactNode> = {
@@ -74,19 +48,29 @@ interface SelectedWallet {
 }
 
 export default function DashboardPage() {
-  const { mode } = useModeStore();
   const toast = useToastStore();
-  const isDemo = mode === 'demo';
   const [selectedPeriod, setSelectedPeriod] = useState<Period>('30D');
   const [copyModalOpen, setCopyModalOpen] = useState(false);
   const [selectedWallet, setSelectedWallet] = useState<SelectedWallet | null>(null);
 
-  // Mock roster count - in real app this would come from roster store
-  const [rosterCount] = useState(2);
-
   // Real-time data hooks
   const { stats, history, status: portfolioStatus } = usePortfolioStats(selectedPeriod);
   const { activities, status: activityStatus, unreadCount } = useActivity();
+
+  // Query hooks for wallets and recommendations
+  const { data: wallets = [] } = useWalletsQuery({ copyEnabled: true });
+  const { data: recommendations = [] } = useRecommendationsQuery();
+
+  // Compute roster count from wallets with copy_enabled
+  const rosterCount = wallets.filter(w => w.copy_enabled).length;
+
+  // Build allocations from active wallets
+  const COLORS = ['#3b82f6', '#22c55e', '#a855f7', '#f97316', '#ec4899'];
+  const allocations = wallets.slice(0, 5).map((w, i) => ({
+    name: shortenAddress(w.address),
+    value: w.allocation_pct || 20,
+    color: COLORS[i % COLORS.length],
+  }));
 
   const handleCopyClick = (wallet: SelectedWallet) => {
     setSelectedWallet(wallet);
@@ -124,9 +108,7 @@ export default function DashboardPage() {
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Dashboard</h1>
             <p className="text-muted-foreground">
-              {isDemo
-                ? 'Testing with simulated funds'
-                : 'Live trading dashboard'}
+              Live trading dashboard
             </p>
           </div>
           <LiveIndicator />
@@ -201,7 +183,7 @@ export default function DashboardPage() {
             <CardTitle>Strategy Allocation</CardTitle>
           </CardHeader>
           <CardContent>
-            <AllocationPie data={mockAllocations} />
+            <AllocationPie data={allocations.length > 0 ? allocations : [{ name: 'No allocations', value: 100, color: '#6b7280' }]} />
             <Link href="/allocate">
               <Button variant="outline" className="w-full mt-4">
                 Manage Allocations
@@ -289,55 +271,61 @@ export default function DashboardPage() {
           </CardHeader>
           <CardContent>
             <div className="space-y-4">
-              {mockRecommendations.map((rec) => (
-                <div
-                  key={rec.id}
-                  className="rounded-lg border p-4 space-y-3 hover:border-primary transition-colors"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <Wallet className="h-4 w-4" />
-                      <span className="font-medium">
-                        {shortenAddress(rec.wallet)}
+              {recommendations.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-4">
+                  No recommendations available. Check the Discover page for top wallets.
+                </p>
+              ) : (
+                recommendations.slice(0, 2).map((rec) => (
+                  <div
+                    key={rec.address}
+                    className="rounded-lg border p-4 space-y-3 hover:border-primary transition-colors"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Wallet className="h-4 w-4" />
+                        <span className="font-medium">
+                          {shortenAddress(rec.address)}
+                        </span>
+                      </div>
+                      <span className="text-sm bg-live/10 text-live px-2 py-1 rounded-full">
+                        {rec.confidence}% confidence
                       </span>
                     </div>
-                    <span className="text-sm bg-demo/10 text-demo px-2 py-1 rounded-full">
-                      {rec.confidence}% confidence
-                    </span>
+                    <div className="grid grid-cols-3 gap-4 text-sm">
+                      <div>
+                        <p className="text-muted-foreground">ROI</p>
+                        <p className="font-medium text-profit">+{Number(rec.roi_30d || 0).toFixed(1)}%</p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Sharpe</p>
+                        <p className="font-medium">{Number(rec.sharpe_ratio || 0).toFixed(2)}</p>
+                      </div>
+                      <div>
+                        <p className="text-muted-foreground">Win Rate</p>
+                        <p className="font-medium">{Number(rec.win_rate || 0).toFixed(1)}%</p>
+                      </div>
+                    </div>
+                    <Button
+                      className="w-full"
+                      variant="default"
+                      size="sm"
+                      onClick={() =>
+                        handleCopyClick({
+                          address: rec.address,
+                          roi30d: rec.roi_30d,
+                          sharpe: rec.sharpe_ratio,
+                          winRate: rec.win_rate,
+                          confidence: rec.confidence,
+                        })
+                      }
+                    >
+                      <Copy className="mr-2 h-4 w-4" />
+                      Copy Wallet
+                    </Button>
                   </div>
-                  <div className="grid grid-cols-3 gap-4 text-sm">
-                    <div>
-                      <p className="text-muted-foreground">ROI</p>
-                      <p className="font-medium text-profit">+{rec.roi}%</p>
-                    </div>
-                    <div>
-                      <p className="text-muted-foreground">Sharpe</p>
-                      <p className="font-medium">{rec.sharpe}</p>
-                    </div>
-                    <div>
-                      <p className="text-muted-foreground">Win Rate</p>
-                      <p className="font-medium">{rec.winRate}%</p>
-                    </div>
-                  </div>
-                  <Button
-                    className="w-full"
-                    variant="demo"
-                    size="sm"
-                    onClick={() =>
-                      handleCopyClick({
-                        address: rec.wallet,
-                        roi30d: rec.roi,
-                        sharpe: rec.sharpe,
-                        winRate: rec.winRate,
-                        confidence: rec.confidence,
-                      })
-                    }
-                  >
-                    <Copy className="mr-2 h-4 w-4" />
-                    Copy Wallet
-                  </Button>
-                </div>
-              ))}
+                ))
+              )}
             </div>
           </CardContent>
         </Card>

@@ -1,73 +1,94 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
+import { useWalletsQuery, useRecommendationsQuery } from '@/hooks/queries/useWalletsQuery';
 import { useModeStore } from '@/stores/mode-store';
+import { useWalletStore, selectHasConnectedWallet } from '@/stores/wallet-store';
+import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import { formatCurrency, shortenAddress } from '@/lib/utils';
-import { ChevronLeft, ChevronRight, Check, Rocket } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Check, Rocket, TestTube2, Wallet, CheckCircle2, ArrowRight } from 'lucide-react';
+import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
 
-// Mock data
-const mockStrategies = [
-  {
-    id: 'wallet-1',
-    type: 'WALLET' as const,
-    address: '0x1234567890abcdef1234567890abcdef12345678',
-    roi: 47.3,
-    sharpe: 2.4,
-    recommended: true,
-  },
-  {
-    id: 'wallet-2',
-    type: 'WALLET' as const,
-    address: '0xabcdef1234567890abcdef1234567890abcdef12',
-    roi: 38.1,
-    sharpe: 1.9,
-    recommended: true,
-  },
-  {
-    id: 'arbitrage',
-    type: 'ARBITRAGE' as const,
-    roi: 12.0,
-    sharpe: 3.2,
-    recommended: true,
-    label: 'Arbitrage Bot',
-  },
-  {
-    id: 'wallet-3',
-    type: 'WALLET' as const,
-    address: '0x5678901234abcdef5678901234abcdef56789012',
-    roi: 29.4,
-    sharpe: 1.5,
-    recommended: false,
-  },
-  {
-    id: 'wallet-4',
-    type: 'WALLET' as const,
-    address: '0x9999888877776666555544443333222211110000',
-    roi: 22.1,
-    sharpe: 1.2,
-    recommended: false,
-  },
-];
+interface Strategy {
+  id: string;
+  type: 'WALLET' | 'ARBITRAGE';
+  address?: string;
+  roi: number;
+  sharpe: number;
+  recommended: boolean;
+  label?: string;
+}
 
 const QUICK_AMOUNTS = [25, 50, 100, 500];
 
 export default function AllocatePage() {
-  const { mode, demoBalance } = useModeStore();
-  const isDemo = mode === 'demo';
-
+  const router = useRouter();
   const [step, setStep] = useState(1);
   const [budget, setBudget] = useState(100);
-  const [selectedIds, setSelectedIds] = useState<string[]>(['wallet-1', 'wallet-2', 'arbitrage']);
-  const [allocations, setAllocations] = useState<Record<string, number>>({
-    'wallet-1': 40,
-    'wallet-2': 30,
-    'arbitrage': 30,
-  });
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [allocations, setAllocations] = useState<Record<string, number>>({});
+  const [isActivating, setIsActivating] = useState(false);
+  const [isActivated, setIsActivated] = useState(false);
+  const [showConnectModal, setShowConnectModal] = useState(false);
 
-  const selectedStrategies = mockStrategies.filter((s) =>
+  // Mode and wallet state
+  const { mode } = useModeStore();
+  const hasConnectedWallet = useWalletStore(selectHasConnectedWallet);
+  const { addPosition, balance: demoBalance } = useDemoPortfolioStore();
+  const isDemo = mode === 'demo';
+
+  // Fetch wallets and recommendations from API
+  const { data: trackedWallets = [] } = useWalletsQuery();
+  const { data: recommendedWallets = [] } = useRecommendationsQuery();
+
+  // Build strategies list from live data
+  const strategies: Strategy[] = useMemo(() => {
+    const result: Strategy[] = [];
+
+    // Add tracked wallets (TrackedWallet has win_rate and total_pnl directly)
+    trackedWallets.forEach((w) => {
+      result.push({
+        id: w.address,
+        type: 'WALLET',
+        address: w.address,
+        roi: w.win_rate, // Use win_rate as a proxy for performance
+        sharpe: w.success_score / 50, // Convert score to approximate Sharpe
+        recommended: w.copy_enabled || false,
+      });
+    });
+
+    // Add recommended wallets that aren't already tracked
+    recommendedWallets.forEach((w) => {
+      if (!result.some((r) => r.address === w.address)) {
+        result.push({
+          id: w.address,
+          type: 'WALLET',
+          address: w.address,
+          roi: w.roi_30d,
+          sharpe: w.sharpe_ratio,
+          recommended: w.confidence > 70,
+        });
+      }
+    });
+
+    // Add arbitrage strategy
+    result.push({
+      id: 'arbitrage',
+      type: 'ARBITRAGE',
+      roi: 12.0,
+      sharpe: 3.2,
+      recommended: true,
+      label: 'Arbitrage Bot',
+    });
+
+    return result;
+  }, [trackedWallets, recommendedWallets]);
+
+  const selectedStrategies = strategies.filter((s) =>
     selectedIds.includes(s.id)
   );
 
@@ -116,6 +137,150 @@ export default function AllocatePage() {
     return sum + calculateExpectedReturn(s.roi, allocation);
   }, 0);
 
+  // Handle activation
+  const handleActivate = async () => {
+    if (isDemo) {
+      // Demo mode: Create demo positions and update balance
+      setIsActivating(true);
+
+      // Simulate a brief delay for UX
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Create demo positions for each selected strategy
+      selectedStrategies.forEach((strategy) => {
+        const allocation = allocations[strategy.id] || 0;
+        const amount = budget * (allocation / 100);
+
+        if (strategy.type === 'WALLET' && strategy.address) {
+          // Create a position for wallet copy trading
+          // Simulate buying YES shares at a reasonable price
+          const entryPrice = 0.55 + Math.random() * 0.2; // Random price between 0.55-0.75
+          const quantity = Math.floor(amount / entryPrice);
+
+          addPosition({
+            walletAddress: strategy.address,
+            walletLabel: strategy.label,
+            marketId: `market-${strategy.id.slice(0, 8)}`,
+            marketQuestion: `Copy trade from ${shortenAddress(strategy.address)}`,
+            outcome: 'yes',
+            quantity,
+            entryPrice,
+            currentPrice: entryPrice,
+            openedAt: new Date().toISOString(),
+          });
+        } else if (strategy.type === 'ARBITRAGE') {
+          // Create an arbitrage position
+          const entryPrice = 0.48;
+          const quantity = Math.floor(amount / entryPrice);
+
+          addPosition({
+            walletAddress: 'arbitrage-bot',
+            walletLabel: 'Arbitrage Bot',
+            marketId: 'arb-strategy',
+            marketQuestion: 'Arbitrage Strategy Position',
+            outcome: 'yes',
+            quantity,
+            entryPrice,
+            currentPrice: entryPrice,
+            openedAt: new Date().toISOString(),
+          });
+        }
+      });
+
+      // Note: Balance is already updated in addPosition via the store
+      // But we allocated the full budget, so positions cost less than budget
+      // The remaining goes back to balance (handled by store)
+
+      setIsActivating(false);
+      setIsActivated(true);
+    } else {
+      // Live mode: Check if wallet is connected
+      if (!hasConnectedWallet) {
+        setShowConnectModal(true);
+        return;
+      }
+
+      // TODO: Call live API to activate allocation
+      setIsActivating(true);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      setIsActivating(false);
+      setIsActivated(true);
+    }
+  };
+
+  // If activated, show success screen
+  if (isActivated) {
+    return (
+      <div className="max-w-3xl mx-auto space-y-6">
+        <Card className="border-profit/20 bg-profit/5">
+          <CardContent className="py-12 text-center space-y-6">
+            <div className="flex justify-center">
+              <div className="h-16 w-16 rounded-full bg-profit/20 flex items-center justify-center">
+                <CheckCircle2 className="h-10 w-10 text-profit" />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <h2 className="text-2xl font-bold">Allocation Activated!</h2>
+              <p className="text-muted-foreground">
+                {isDemo ? (
+                  <>Your demo allocation of <strong>{formatCurrency(budget)}</strong> is now active.</>
+                ) : (
+                  <>Your allocation of <strong>{formatCurrency(budget)}</strong> has been activated.</>
+                )}
+              </p>
+            </div>
+
+            {isDemo && (
+              <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-demo/10 text-demo text-sm">
+                <TestTube2 className="h-4 w-4" />
+                Demo Mode - No real funds used
+              </div>
+            )}
+
+            <div className="border rounded-lg p-4 bg-background/50 text-left">
+              <p className="text-sm font-medium mb-3">Allocation Summary:</p>
+              <div className="space-y-2">
+                {selectedStrategies.map((strategy) => {
+                  const allocation = allocations[strategy.id] || 0;
+                  const amount = budget * (allocation / 100);
+                  return (
+                    <div key={strategy.id} className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">
+                        {strategy.type === 'WALLET'
+                          ? shortenAddress(strategy.address!)
+                          : strategy.label}
+                      </span>
+                      <span className="tabular-nums font-medium">
+                        {formatCurrency(amount)} ({allocation}%)
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-center">
+              <Button variant="outline" onClick={() => {
+                setIsActivated(false);
+                setStep(1);
+                setSelectedIds([]);
+                setAllocations({});
+                setBudget(100);
+              }}>
+                Create Another
+              </Button>
+              <Button onClick={() => router.push('/portfolio')}>
+                View Portfolio
+                <ArrowRight className="ml-2 h-4 w-4" />
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       {/* Progress */}
@@ -142,6 +307,12 @@ export default function AllocatePage() {
             <CardTitle>How much would you like to allocate?</CardTitle>
           </CardHeader>
           <CardContent className="space-y-6">
+            {isDemo && (
+              <div className="text-center text-sm text-muted-foreground">
+                Available demo balance: <span className="font-medium text-foreground">{formatCurrency(demoBalance)}</span>
+              </div>
+            )}
+
             <div className="flex items-center justify-center">
               <div className="relative">
                 <span className="absolute left-4 top-1/2 -translate-y-1/2 text-2xl text-muted-foreground">
@@ -151,20 +322,23 @@ export default function AllocatePage() {
                   type="number"
                   value={budget}
                   onChange={(e) => setBudget(Number(e.target.value))}
-                  className="w-48 rounded-lg border bg-background px-4 py-3 pl-10 text-3xl font-bold text-center"
+                  max={isDemo ? demoBalance : undefined}
+                  className={`w-48 rounded-lg border bg-background px-4 py-3 pl-10 text-3xl font-bold text-center ${
+                    isDemo && budget > demoBalance ? 'border-destructive text-destructive' : ''
+                  }`}
                 />
               </div>
             </div>
 
-            {isDemo && (
-              <p className="text-center text-sm text-demo">
-                Demo Mode: Using simulated funds
+            {isDemo && budget > demoBalance && (
+              <p className="text-center text-sm text-destructive">
+                Amount exceeds available demo balance
               </p>
             )}
 
             <div className="flex items-center justify-center gap-2">
               <span className="text-sm text-muted-foreground">Quick amounts:</span>
-              {QUICK_AMOUNTS.map((amount) => (
+              {QUICK_AMOUNTS.filter(a => !isDemo || a <= demoBalance).map((amount) => (
                 <Button
                   key={amount}
                   variant={budget === amount ? 'default' : 'outline'}
@@ -186,7 +360,7 @@ export default function AllocatePage() {
             <CardTitle>Select strategies to include (max 5)</CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
-            {mockStrategies.map((strategy) => {
+            {strategies.map((strategy) => {
               const isSelected = selectedIds.includes(strategy.id);
               return (
                 <button
@@ -352,14 +526,27 @@ export default function AllocatePage() {
               * Based on historical performance. Past returns do not guarantee
               future results.
             </p>
-
-            {isDemo && (
-              <p className="text-sm text-demo text-center">
-                Demo Mode: No real funds will be used
-              </p>
-            )}
           </CardContent>
         </Card>
+      )}
+
+      {/* Mode indicator */}
+      {isDemo && (
+        <div className="flex items-center justify-center">
+          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-demo/10 text-demo text-sm">
+            <TestTube2 className="h-4 w-4" />
+            Demo Mode - Using simulated funds
+          </div>
+        </div>
+      )}
+
+      {!isDemo && !hasConnectedWallet && (
+        <div className="flex items-center justify-center">
+          <div className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/10 text-amber-500 text-sm">
+            <Wallet className="h-4 w-4" />
+            Connect a wallet to activate live trading
+          </div>
+        </div>
       )}
 
       {/* Navigation */}
@@ -385,12 +572,28 @@ export default function AllocatePage() {
             <ChevronRight className="ml-2 h-4 w-4" />
           </Button>
         ) : (
-          <Button variant="demo">
-            <Rocket className="mr-2 h-4 w-4" />
-            Activate
+          <Button
+            onClick={handleActivate}
+            disabled={isActivating || (isDemo && budget > demoBalance)}
+            className={isDemo ? 'bg-demo hover:bg-demo/90' : ''}
+          >
+            {isActivating ? (
+              <>
+                <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                Activating...
+              </>
+            ) : (
+              <>
+                <Rocket className="mr-2 h-4 w-4" />
+                {isDemo ? 'Activate Demo' : 'Activate'}
+              </>
+            )}
           </Button>
         )}
       </div>
+
+      {/* Connect Wallet Modal for live mode */}
+      <ConnectWalletModal open={showConnectModal} onOpenChange={setShowConnectModal} />
     </div>
   );
 }

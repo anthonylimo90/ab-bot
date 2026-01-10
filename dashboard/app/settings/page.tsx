@@ -12,10 +12,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { useModeStore } from '@/stores/mode-store';
 import { useSettingsStore, Theme } from '@/stores/settings-store';
 import { useToastStore } from '@/stores/toast-store';
-import { formatCurrency } from '@/lib/utils';
 import {
   RefreshCw,
   Wallet,
@@ -28,7 +26,6 @@ import {
 } from 'lucide-react';
 
 export default function SettingsPage() {
-  const { mode, setMode, demoBalance, resetDemoBalance } = useModeStore();
   const toast = useToastStore();
   const {
     risk,
@@ -42,7 +39,6 @@ export default function SettingsPage() {
     resetToDefaults,
   } = useSettingsStore();
 
-  const isDemo = mode === 'demo';
   const [connectWalletOpen, setConnectWalletOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -122,61 +118,19 @@ export default function SettingsPage() {
             Account
           </CardTitle>
           <CardDescription>
-            Trading mode and wallet configuration
+            Wallet configuration for live trading
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="font-medium">Trading Mode</p>
-              <p className="text-sm text-muted-foreground">
-                {isDemo
-                  ? 'Paper trading with simulated funds'
-                  : 'Live trading with real funds'}
-              </p>
-            </div>
-            <div className="flex items-center gap-3">
-              <span className={isDemo ? 'text-demo' : 'text-muted-foreground'}>
-                Demo
-              </span>
-              <Switch
-                checked={!isDemo}
-                onCheckedChange={(checked) => setMode(checked ? 'live' : 'demo')}
-              />
-              <span className={!isDemo ? 'text-live' : 'text-muted-foreground'}>
-                Live
-              </span>
-            </div>
+          <div className="rounded-lg border p-4">
+            <p className="font-medium mb-2">Connected Wallet</p>
+            <p className="text-sm text-muted-foreground mb-4">
+              No wallet connected
+            </p>
+            <Button onClick={() => setConnectWalletOpen(true)}>
+              Connect Wallet
+            </Button>
           </div>
-
-          {isDemo && (
-            <div className="rounded-lg border p-4 bg-muted/30">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="font-medium">Demo Balance</p>
-                  <p className="text-2xl font-bold tabular-nums">
-                    {formatCurrency(demoBalance)}
-                  </p>
-                </div>
-                <Button variant="outline" onClick={resetDemoBalance}>
-                  <RefreshCw className="mr-2 h-4 w-4" />
-                  Reset Balance
-                </Button>
-              </div>
-            </div>
-          )}
-
-          {!isDemo && (
-            <div className="rounded-lg border p-4">
-              <p className="font-medium mb-2">Connected Wallet</p>
-              <p className="text-sm text-muted-foreground mb-4">
-                No wallet connected
-              </p>
-              <Button onClick={() => setConnectWalletOpen(true)}>
-                Connect Wallet
-              </Button>
-            </div>
-          )}
         </CardContent>
       </Card>
 

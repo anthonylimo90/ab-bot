@@ -7,26 +7,79 @@ import { MetricCard } from '@/components/shared/MetricCard';
 import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
 import { LiveIndicator } from '@/components/shared/LiveIndicator';
 import { usePositions } from '@/hooks/usePositions';
+import { useModeStore } from '@/stores/mode-store';
+import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import { formatCurrency, shortenAddress } from '@/lib/utils';
-import { Download, Filter, X, TrendingUp, TrendingDown, RefreshCw } from 'lucide-react';
+import { Download, Filter, X, TrendingUp, TrendingDown, RefreshCw, TestTube2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export default function PortfolioPage() {
+  const { mode } = useModeStore();
+  const isDemo = mode === 'demo';
+
+  // Live mode hooks
   const {
-    openPositions,
-    closedPositions,
+    openPositions: liveOpenPositions,
+    closedPositions: liveClosedPositions,
     status,
-    totalUnrealizedPnl,
+    totalUnrealizedPnl: liveTotalUnrealizedPnl,
     refresh,
-    closePosition,
+    closePosition: closeLivePosition,
   } = usePositions();
 
-  const totalValue = openPositions.reduce(
-    (sum, p) => sum + p.quantity * p.current_price,
-    0
-  );
-  const totalFees = -45.67; // Mock for now
-  const totalRealizedPnl = 0; // Would come from closed positions API
+  // Demo mode hooks
+  const {
+    positions: demoPositions,
+    closedPositions: demoClosedPositions,
+    closePosition: closeDemoPosition,
+    getTotalPnl,
+    getTotalValue,
+    balance,
+  } = useDemoPortfolioStore();
+
+  // Select data based on mode
+  const openPositions = isDemo
+    ? demoPositions.map((p) => ({
+        id: p.id,
+        market_id: p.marketId,
+        outcome: p.outcome,
+        side: 'long' as const,
+        quantity: p.quantity,
+        entry_price: p.entryPrice,
+        current_price: p.currentPrice,
+        unrealized_pnl: (p.currentPrice - p.entryPrice) * p.quantity,
+        unrealized_pnl_pct: ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100,
+        is_copy_trade: !!p.walletAddress,
+        source_wallet: p.walletAddress,
+        opened_at: p.openedAt,
+        updated_at: p.openedAt,
+        stop_loss: undefined,
+        take_profit: undefined,
+      }))
+    : liveOpenPositions;
+
+  const closedPositions = isDemo ? demoClosedPositions : liveClosedPositions;
+  const totalUnrealizedPnl = isDemo ? getTotalPnl() : liveTotalUnrealizedPnl;
+
+  const closePosition = (id: string) => {
+    if (isDemo) {
+      // For demo, we need a price - use current price from position
+      const position = demoPositions.find((p) => p.id === id);
+      if (position) {
+        closeDemoPosition(id, position.currentPrice);
+      }
+    } else {
+      closeLivePosition(id);
+    }
+  };
+
+  const totalValue = isDemo
+    ? getTotalValue()
+    : openPositions.reduce((sum, p) => sum + p.quantity * p.current_price, 0);
+  const totalFees = isDemo ? 0 : -45.67; // No fees in demo mode
+  const totalRealizedPnl = isDemo
+    ? demoClosedPositions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0)
+    : 0;
 
   const sourceBreakdown = [
     {
@@ -54,17 +107,30 @@ export default function PortfolioPage() {
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Portfolio</h1>
             <p className="text-muted-foreground">
-              Manage your positions and track performance
+              {isDemo
+                ? 'Demo portfolio - simulated positions'
+                : 'Manage your positions and track performance'}
             </p>
           </div>
-          <LiveIndicator />
-          <ConnectionStatus status={status} showLabel />
+          {isDemo ? (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-demo/10 text-demo text-sm font-medium">
+              <TestTube2 className="h-4 w-4" />
+              Demo Mode
+            </div>
+          ) : (
+            <>
+              <LiveIndicator />
+              <ConnectionStatus status={status} showLabel />
+            </>
+          )}
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={refresh}>
-            <RefreshCw className="mr-2 h-4 w-4" />
-            Refresh
-          </Button>
+          {!isDemo && (
+            <Button variant="outline" size="sm" onClick={refresh}>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Refresh
+            </Button>
+          )}
           <Button variant="outline">
             <Filter className="mr-2 h-4 w-4" />
             Filters
@@ -79,7 +145,7 @@ export default function PortfolioPage() {
       {/* Stats */}
       <div className="grid gap-4 md:grid-cols-4">
         <MetricCard
-          title="Total Value"
+          title={isDemo ? 'Demo Portfolio Value' : 'Total Value'}
           value={formatCurrency(totalValue)}
           trend="neutral"
         />
@@ -93,11 +159,19 @@ export default function PortfolioPage() {
           value={formatCurrency(totalRealizedPnl, { showSign: true })}
           trend={totalRealizedPnl >= 0 ? 'up' : 'down'}
         />
-        <MetricCard
-          title="Total Fees"
-          value={formatCurrency(totalFees)}
-          trend="down"
-        />
+        {isDemo ? (
+          <MetricCard
+            title="Available Balance"
+            value={formatCurrency(balance)}
+            trend="neutral"
+          />
+        ) : (
+          <MetricCard
+            title="Total Fees"
+            value={formatCurrency(totalFees)}
+            trend="down"
+          />
+        )}
       </div>
 
       {/* Positions */}
@@ -219,7 +293,16 @@ export default function PortfolioPage() {
                     {openPositions.length === 0 && (
                       <tr>
                         <td colSpan={7} className="p-8 text-center text-muted-foreground">
-                          No open positions
+                          {isDemo ? (
+                            <div className="space-y-2">
+                              <p>No demo positions yet</p>
+                              <p className="text-sm">
+                                Go to the <a href="/discover" className="text-primary underline">Discover</a> page to copy trades from top wallets
+                              </p>
+                            </div>
+                          ) : (
+                            'No open positions'
+                          )}
                         </td>
                       </tr>
                     )}

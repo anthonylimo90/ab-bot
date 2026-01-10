@@ -14,6 +14,10 @@ import type {
   LiveTrade,
   DiscoveredWallet,
   DemoPnlSimulation,
+  User,
+  AuthResponse,
+  ConnectedWallet,
+  StoreWalletRequest,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -32,6 +36,31 @@ class ApiClient {
 
   clearToken() {
     this.token = undefined;
+  }
+
+  // Generic HTTP methods for flexibility
+  async get<T>(endpoint: string): Promise<T> {
+    return this.request<T>(endpoint);
+  }
+
+  async post<T>(endpoint: string, body: unknown): Promise<T> {
+    return this.request<T>(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async put<T>(endpoint: string, body: unknown): Promise<T> {
+    return this.request<T>(endpoint, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async delete<T>(endpoint: string): Promise<T> {
+    return this.request<T>(endpoint, {
+      method: 'DELETE',
+    });
   }
 
   private async request<T>(
@@ -75,6 +104,37 @@ class ApiClient {
 
   async readyCheck(): Promise<HealthResponse> {
     return this.request<HealthResponse>('/ready');
+  }
+
+  // Auth
+  async login(email: string, password: string): Promise<AuthResponse> {
+    const response = await this.request<AuthResponse>('/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+    this.setToken(response.token);
+    return response;
+  }
+
+  async signup(email: string, password: string, name?: string): Promise<AuthResponse> {
+    const response = await this.request<AuthResponse>('/api/v1/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, name }),
+    });
+    this.setToken(response.token);
+    return response;
+  }
+
+  async refreshToken(): Promise<AuthResponse> {
+    const response = await this.request<AuthResponse>('/api/v1/auth/refresh', {
+      method: 'POST',
+    });
+    this.setToken(response.token);
+    return response;
+  }
+
+  async getCurrentUser(): Promise<User> {
+    return this.request<User>('/api/v1/auth/me');
   }
 
   // Markets
@@ -279,6 +339,34 @@ class ApiClient {
     if (params?.wallets) searchParams.set('wallets', params.wallets);
     const query = searchParams.toString();
     return this.request<DemoPnlSimulation>(`/api/v1/discover/simulate${query ? `?${query}` : ''}`);
+  }
+
+  // Vault (Connected Wallets for Live Trading)
+  async getConnectedWallets(): Promise<ConnectedWallet[]> {
+    return this.request<ConnectedWallet[]>('/api/v1/vault/wallets');
+  }
+
+  async getConnectedWallet(address: string): Promise<ConnectedWallet> {
+    return this.request<ConnectedWallet>(`/api/v1/vault/wallets/${address}`);
+  }
+
+  async connectWallet(params: StoreWalletRequest): Promise<ConnectedWallet> {
+    return this.request<ConnectedWallet>('/api/v1/vault/wallets', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async disconnectWallet(address: string): Promise<void> {
+    return this.request<void>(`/api/v1/vault/wallets/${address}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async setPrimaryWallet(address: string): Promise<ConnectedWallet> {
+    return this.request<ConnectedWallet>(`/api/v1/vault/wallets/${address}/primary`, {
+      method: 'PUT',
+    });
   }
 }
 

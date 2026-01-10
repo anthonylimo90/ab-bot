@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useWebSocket, ConnectionStatus } from './useWebSocket';
-import { useModeStore } from '@/stores/mode-store';
 import { api } from '@/lib/api';
 import type { Position, PositionUpdate, WebSocketMessage } from '@/types/api';
 
@@ -18,70 +17,13 @@ interface UsePositionsReturn {
   closePosition: (positionId: string) => Promise<void>;
 }
 
-// Mock positions for demo mode
-const mockPositions: Position[] = [
-  {
-    id: '1',
-    market_id: 'btc-100k-2024',
-    outcome: 'yes',
-    side: 'long',
-    quantity: 100,
-    entry_price: 0.65,
-    current_price: 0.72,
-    stop_loss: 0.55,
-    unrealized_pnl: 7.0,
-    unrealized_pnl_pct: 10.77,
-    is_copy_trade: true,
-    source_wallet: '0x1234567890abcdef',
-    opened_at: new Date(Date.now() - 3600000).toISOString(),
-    updated_at: new Date().toISOString(),
-  },
-  {
-    id: '2',
-    market_id: 'eth-5k-2024',
-    outcome: 'no',
-    side: 'long',
-    quantity: 50,
-    entry_price: 0.40,
-    current_price: 0.38,
-    unrealized_pnl: 1.0,
-    unrealized_pnl_pct: 5.0,
-    is_copy_trade: false,
-    opened_at: new Date(Date.now() - 7200000).toISOString(),
-    updated_at: new Date().toISOString(),
-  },
-  {
-    id: '3',
-    market_id: 'trump-2024',
-    outcome: 'yes',
-    side: 'long',
-    quantity: 200,
-    entry_price: 0.52,
-    current_price: 0.58,
-    unrealized_pnl: 12.0,
-    unrealized_pnl_pct: 11.54,
-    is_copy_trade: false,
-    opened_at: new Date(Date.now() - 86400000).toISOString(),
-    updated_at: new Date().toISOString(),
-  },
-];
-
 export function usePositions(): UsePositionsReturn {
-  const { mode } = useModeStore();
   const [positions, setPositions] = useState<Position[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const isLiveMode = mode === 'live';
-
   // Fetch positions from API
   const fetchPositions = useCallback(async () => {
-    if (!isLiveMode) {
-      setPositions(mockPositions);
-      setIsLoading(false);
-      return;
-    }
-
     try {
       setIsLoading(true);
       setError(null);
@@ -93,7 +35,7 @@ export function usePositions(): UsePositionsReturn {
     } finally {
       setIsLoading(false);
     }
-  }, [isLiveMode]);
+  }, []);
 
   // Handle WebSocket position updates
   const handleMessage = useCallback((message: WebSocketMessage) => {
@@ -137,38 +79,8 @@ export function usePositions(): UsePositionsReturn {
   const { status } = useWebSocket({
     channel: 'positions',
     onMessage: handleMessage,
-    enabled: isLiveMode,
+    enabled: true,
   });
-
-  // Demo mode: simulate price updates
-  useEffect(() => {
-    if (isLiveMode) return;
-
-    const interval = setInterval(() => {
-      setPositions((prev) =>
-        prev.map((p) => {
-          // Random price movement
-          const change = (Math.random() - 0.5) * 0.02;
-          const newPrice = Math.max(0.01, Math.min(0.99, p.current_price + change));
-          const priceDiff = p.side === 'long'
-            ? newPrice - p.entry_price
-            : p.entry_price - newPrice;
-          const pnl = priceDiff * p.quantity;
-          const pnlPct = (priceDiff / p.entry_price) * 100;
-
-          return {
-            ...p,
-            current_price: Math.round(newPrice * 100) / 100,
-            unrealized_pnl: Math.round(pnl * 100) / 100,
-            unrealized_pnl_pct: Math.round(pnlPct * 100) / 100,
-            updated_at: new Date().toISOString(),
-          };
-        })
-      );
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [isLiveMode]);
 
   // Initial fetch
   useEffect(() => {
@@ -177,11 +89,6 @@ export function usePositions(): UsePositionsReturn {
 
   // Close position
   const closePosition = useCallback(async (positionId: string) => {
-    if (!isLiveMode) {
-      setPositions((prev) => prev.filter((p) => p.id !== positionId));
-      return;
-    }
-
     try {
       await api.closePosition(positionId);
       setPositions((prev) => prev.filter((p) => p.id !== positionId));
@@ -189,7 +96,7 @@ export function usePositions(): UsePositionsReturn {
       console.error('Failed to close position:', err);
       throw err;
     }
-  }, [isLiveMode]);
+  }, []);
 
   const openPositions = positions;
   const closedPositions: Position[] = []; // Would need separate API call
@@ -199,7 +106,7 @@ export function usePositions(): UsePositionsReturn {
     positions,
     openPositions,
     closedPositions,
-    status: isLiveMode ? status : 'connected',
+    status,
     totalUnrealizedPnl,
     isLoading,
     error,

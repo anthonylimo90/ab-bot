@@ -1,10 +1,10 @@
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
-import { Header } from '@/components/layout/Header';
-import { Sidebar } from '@/components/layout/Sidebar';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { ToastProvider } from '@/components/shared/ToastProvider';
 import { QueryProvider } from '@/providers/QueryProvider';
+import { AuthGuard } from '@/components/auth/AuthGuard';
+import { AppShell } from '@/components/layout/AppShell';
 import './globals.css';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -24,15 +24,9 @@ export default function RootLayout({
       <body className={inter.className}>
         <QueryProvider>
           <TooltipProvider>
-            <div className="relative min-h-screen bg-background">
-              <Header />
-              <Sidebar />
-              <main className="md:pl-64">
-                <div className="container mx-auto p-4 md:p-6 lg:p-8">
-                  {children}
-                </div>
-              </main>
-            </div>
+            <AuthGuard>
+              <AppShell>{children}</AppShell>
+            </AuthGuard>
             <ToastProvider />
           </TooltipProvider>
         </QueryProvider>

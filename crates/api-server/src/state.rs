@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use auth::jwt::{JwtAuth, JwtConfig};
+use auth::key_vault::KeyVault;
 use polymarket_core::api::ClobClient;
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::executor::ExecutorConfig;
@@ -21,6 +22,8 @@ pub struct AppState {
     pub jwt_secret: String,
     /// JWT authentication handler.
     pub jwt_auth: Arc<JwtAuth>,
+    /// Key vault for secure wallet key storage.
+    pub key_vault: Arc<KeyVault>,
     /// CLOB API client for Polymarket.
     pub clob_client: Arc<ClobClient>,
     /// Order execution engine.
@@ -53,6 +56,20 @@ impl AppState {
         };
         let jwt_auth = Arc::new(JwtAuth::new(jwt_config));
 
+        // Create KeyVault from environment or with default config
+        let key_vault = match KeyVault::from_env() {
+            Ok(vault) => Arc::new(vault),
+            Err(e) => {
+                tracing::warn!("Failed to initialize KeyVault from env: {}. Using in-memory vault.", e);
+                // Fall back to in-memory vault with a default key
+                let default_key = jwt_secret.as_bytes().to_vec();
+                Arc::new(KeyVault::new(
+                    auth::key_vault::KeyVaultProvider::Memory,
+                    default_key,
+                ))
+            }
+        };
+
         // Create CLOB client
         let clob_url = std::env::var("POLYMARKET_CLOB_URL").ok();
         let clob_client = Arc::new(ClobClient::new(clob_url, None));
@@ -75,6 +92,7 @@ impl AppState {
             pool,
             jwt_secret,
             jwt_auth,
+            key_vault,
             clob_client,
             order_executor,
             circuit_breaker,

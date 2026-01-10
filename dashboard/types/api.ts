@@ -1,3 +1,30 @@
+// Auth types
+export type UserRole = 'Viewer' | 'Trader' | 'Admin';
+
+export interface User {
+  id: string;
+  email: string;
+  name?: string;
+  role: UserRole;
+  created_at: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  user: User;
+}
+
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+export interface SignupRequest {
+  email: string;
+  password: string;
+  name?: string;
+}
+
 // Position types
 export type PositionSide = 'long' | 'short';
 export type PositionOutcome = 'yes' | 'no';
@@ -312,6 +339,21 @@ export interface DemoBalance {
   initial_balance: number;
   pnl: number;
   pnl_percent: number;
+}
+
+// Vault types (connected user wallets for live trading)
+export interface ConnectedWallet {
+  id: string;
+  address: string;
+  label?: string;
+  is_primary: boolean;
+  created_at: string;
+}
+
+export interface StoreWalletRequest {
+  address: string;
+  private_key: string;
+  label?: string;
 }
 
 // Health check

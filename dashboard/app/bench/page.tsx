@@ -13,23 +13,26 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Skeleton } from '@/components/ui/skeleton';
 import { EquityCurve } from '@/components/charts/EquityCurve';
 import { CopyWalletModal } from '@/components/modals/CopyWalletModal';
 import { useRosterStore, createRosterWallet } from '@/stores/roster-store';
 import { useToastStore } from '@/stores/toast-store';
+import { useDiscoverWalletsQuery } from '@/hooks/queries/useDiscoverQuery';
 import { shortenAddress } from '@/lib/utils';
 import {
   UserCheck,
   Search,
   Plus,
-  Check,
   ChevronUp,
   Loader2,
   Star,
   Trash2,
   ArrowRight,
+  RefreshCw,
+  AlertCircle,
 } from 'lucide-react';
-import type { CopyBehavior } from '@/types/api';
+import type { CopyBehavior, DiscoveredWallet, PredictionCategory } from '@/types/api';
 
 // Generate mock equity curve data
 function generateEquityCurve(days: number, roi: number) {
@@ -51,50 +54,18 @@ function generateEquityCurve(days: number, roi: number) {
   return data;
 }
 
-// Mock discovery data
-const discoverableWallets = [
-  {
-    address: '0x5678901234abcdef5678901234abcdef56789012',
-    roi30d: 29.4,
-    sharpe: 1.5,
-    trades: 234,
-    winRate: 64,
-    maxDrawdown: -15.3,
-    confidence: 65,
-    prediction: 'MODERATE' as const,
-  },
-  {
-    address: '0x9876543210fedcba9876543210fedcba98765432',
-    roi30d: 22.8,
-    sharpe: 1.3,
-    trades: 78,
-    winRate: 61,
-    maxDrawdown: -18.5,
-    confidence: 52,
-    prediction: 'LOW_POTENTIAL' as const,
-  },
-  {
-    address: '0xfedcba9876543210fedcba9876543210fedcba98',
-    roi30d: 52.1,
-    sharpe: 2.6,
-    trades: 45,
-    winRate: 73,
-    maxDrawdown: -9.2,
-    confidence: 88,
-    prediction: 'HIGH_POTENTIAL' as const,
-  },
-];
-
-const predictionColors = {
+const predictionColors: Record<PredictionCategory, string> = {
   HIGH_POTENTIAL: 'text-profit bg-profit/10',
   MODERATE: 'text-yellow-500 bg-yellow-500/10',
   LOW_POTENTIAL: 'text-loss bg-loss/10',
+  INSUFFICIENT_DATA: 'text-muted-foreground bg-muted',
 };
 
-const predictionLabels = {
+const predictionLabels: Record<PredictionCategory, string> = {
   HIGH_POTENTIAL: 'High Potential',
   MODERATE: 'Moderate',
   LOW_POTENTIAL: 'Low Potential',
+  INSUFFICIENT_DATA: 'Insufficient Data',
 };
 
 type SortField = 'roi' | 'sharpe' | 'winRate' | 'trades';
@@ -117,16 +88,30 @@ export default function BenchPage() {
 
   // Modal state
   const [copyModalOpen, setCopyModalOpen] = useState(false);
-  const [selectedWallet, setSelectedWallet] = useState<typeof discoverableWallets[0] | null>(null);
+  const [selectedWallet, setSelectedWallet] = useState<DiscoveredWallet | null>(null);
+
+  // Fetch discovered wallets from API
+  const {
+    data: discoveredWallets = [],
+    isLoading: isLoadingDiscover,
+    error: discoverError,
+    refetch: refetchDiscover,
+  } = useDiscoverWalletsQuery({
+    sortBy,
+    period: '30d',
+    minWinRate: minWinRate ? 55 : undefined,
+    limit: 20,
+  });
 
   // Equity curves
   const equityCurves = useMemo(() => {
-    const all = [...benchWallets, ...discoverableWallets];
+    const all = [...benchWallets, ...discoveredWallets];
     return all.reduce((acc, w) => {
-      acc[w.address] = generateEquityCurve(30, w.roi30d);
+      const roi = 'roi30d' in w ? w.roi30d : w.roi_30d;
+      acc[w.address] = generateEquityCurve(30, roi);
       return acc;
     }, {} as Record<string, { time: string; value: number }[]>);
-  }, [benchWallets]);
+  }, [benchWallets, discoveredWallets]);
 
   // Filter discoverable wallets (exclude already tracked)
   const filteredDiscoverable = useMemo(() => {
@@ -135,37 +120,21 @@ export default function BenchPage() {
       ...benchWallets.map((w) => w.address),
     ]);
 
-    let result = discoverableWallets.filter(
+    return discoveredWallets.filter(
       (w) => !trackedAddresses.has(w.address)
     );
+  }, [discoveredWallets, activeWallets, benchWallets]);
 
-    if (minWinRate) {
-      result = result.filter((w) => w.winRate >= 55);
-    }
-
-    result.sort((a, b) => {
-      switch (sortBy) {
-        case 'roi': return b.roi30d - a.roi30d;
-        case 'sharpe': return b.sharpe - a.sharpe;
-        case 'winRate': return b.winRate - a.winRate;
-        case 'trades': return b.trades - a.trades;
-        default: return 0;
-      }
-    });
-
-    return result;
-  }, [sortBy, minWinRate, activeWallets, benchWallets]);
-
-  const handleAddToBench = async (wallet: typeof discoverableWallets[0]) => {
+  const handleAddToBench = async (wallet: DiscoveredWallet) => {
     setLoadingStates((prev) => ({ ...prev, [wallet.address]: true }));
     await new Promise((r) => setTimeout(r, 500));
 
     const rosterWallet = createRosterWallet(wallet.address, {
-      roi30d: wallet.roi30d,
-      sharpe: wallet.sharpe,
-      winRate: wallet.winRate,
-      trades: wallet.trades,
-      maxDrawdown: wallet.maxDrawdown,
+      roi30d: wallet.roi_30d,
+      sharpe: wallet.sharpe_ratio,
+      winRate: wallet.win_rate,
+      trades: wallet.total_trades,
+      maxDrawdown: wallet.max_drawdown,
       confidence: wallet.confidence,
     });
 
@@ -193,7 +162,7 @@ export default function BenchPage() {
     toast.info('Removed', `${shortenAddress(address)} removed from Bench`);
   };
 
-  const handleCopyClick = (wallet: typeof discoverableWallets[0]) => {
+  const handleCopyClick = (wallet: DiscoveredWallet) => {
     setSelectedWallet(wallet);
     setCopyModalOpen(true);
   };
@@ -211,11 +180,11 @@ export default function BenchPage() {
     const rosterWallet = createRosterWallet(
       wallet.address,
       {
-        roi30d: wallet.roi30d,
-        sharpe: wallet.sharpe,
-        winRate: wallet.winRate,
-        trades: wallet.trades,
-        maxDrawdown: wallet.maxDrawdown,
+        roi30d: wallet.roi_30d,
+        sharpe: wallet.sharpe_ratio,
+        winRate: wallet.win_rate,
+        trades: wallet.total_trades,
+        maxDrawdown: wallet.max_drawdown,
         confidence: wallet.confidence,
       },
       settings.tier,
@@ -383,118 +352,170 @@ export default function BenchPage() {
                     </SelectContent>
                   </Select>
                 </div>
-                <div className="ml-auto flex items-center gap-2">
+                <div className="flex items-center gap-2">
                   <Switch checked={minWinRate} onCheckedChange={setMinWinRate} />
                   <span className="text-sm">Min win rate 55%</span>
                 </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => refetchDiscover()}
+                  disabled={isLoadingDiscover}
+                  className="ml-auto"
+                >
+                  <RefreshCw className={`mr-2 h-4 w-4 ${isLoadingDiscover ? 'animate-spin' : ''}`} />
+                  Refresh
+                </Button>
               </div>
             </CardContent>
           </Card>
 
-          {/* Discoverable Wallets */}
-          <div className="space-y-4">
-            <div className="flex items-center gap-2">
-              <Star className="h-5 w-5 text-yellow-500" />
-              <h2 className="text-xl font-semibold">Top Performers</h2>
-              <span className="text-sm text-muted-foreground">
-                ({filteredDiscoverable.length} wallets)
-              </span>
-            </div>
+          {/* Error State */}
+          {discoverError && (
+            <Card className="border-destructive">
+              <CardContent className="p-6 text-center">
+                <AlertCircle className="h-8 w-8 mx-auto mb-2 text-destructive" />
+                <p className="text-destructive font-medium">Failed to load wallets</p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  {discoverError instanceof Error ? discoverError.message : 'Please try again'}
+                </p>
+                <Button variant="outline" size="sm" className="mt-4" onClick={() => refetchDiscover()}>
+                  Retry
+                </Button>
+              </CardContent>
+            </Card>
+          )}
 
-            <div className="grid gap-4">
-              {filteredDiscoverable.map((wallet, index) => {
-                const equityCurve = equityCurves[wallet.address];
-
-                return (
-                  <Card key={wallet.address} className="hover:border-primary transition-colors">
-                    <CardContent className="p-6">
-                      <div className="flex flex-col gap-6">
-                        <div className="flex flex-col lg:flex-row lg:items-center gap-6">
-                          {/* Rank & Address */}
-                          <div className="flex items-center gap-4">
-                            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-primary-foreground font-bold">
-                              #{index + 1}
-                            </div>
-                            <div>
-                              <p className="font-medium font-mono">{shortenAddress(wallet.address)}</p>
-                              <span className={`text-xs px-2 py-0.5 rounded-full ${predictionColors[wallet.prediction]}`}>
-                                {predictionLabels[wallet.prediction]} ({wallet.confidence}%)
-                              </span>
-                            </div>
-                          </div>
-
-                          {/* Metrics */}
-                          <div className="grid grid-cols-4 gap-4 flex-1 text-sm">
-                            <div>
-                              <p className="text-xs text-muted-foreground">ROI (30d)</p>
-                              <p className={`font-medium ${wallet.roi30d >= 0 ? 'text-profit' : 'text-loss'}`}>
-                                {wallet.roi30d >= 0 ? '+' : ''}{wallet.roi30d}%
-                              </p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-muted-foreground">Sharpe</p>
-                              <p className="font-medium">{wallet.sharpe}</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-muted-foreground">Win Rate</p>
-                              <p className="font-medium">{wallet.winRate}%</p>
-                            </div>
-                            <div>
-                              <p className="text-xs text-muted-foreground">Max DD</p>
-                              <p className="font-medium text-loss">{wallet.maxDrawdown}%</p>
-                            </div>
-                          </div>
-
-                          {/* Actions */}
-                          <div className="flex gap-2">
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              onClick={() => handleAddToBench(wallet)}
-                              disabled={loadingStates[wallet.address]}
-                            >
-                              {loadingStates[wallet.address] ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                <>
-                                  <Plus className="mr-1 h-4 w-4" />
-                                  Add to Bench
-                                </>
-                              )}
-                            </Button>
-                            <Button
-                              variant="default"
-                              size="sm"
-                              onClick={() => handleCopyClick(wallet)}
-                            >
-                              Copy Now
-                            </Button>
-                          </div>
-                        </div>
-
-                        {/* Equity Curve */}
-                        {equityCurve && (
-                          <div className="border rounded-lg p-2 bg-muted/20">
-                            <EquityCurve data={equityCurve} height={80} />
-                          </div>
-                        )}
+          {/* Loading State */}
+          {isLoadingDiscover && !discoverError && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <Star className="h-5 w-5 text-yellow-500" />
+                <h2 className="text-xl font-semibold">Top Performers</h2>
+              </div>
+              {[1, 2, 3].map((i) => (
+                <Card key={i}>
+                  <CardContent className="p-6">
+                    <div className="flex items-center gap-4">
+                      <Skeleton className="h-10 w-10 rounded-full" />
+                      <div className="flex-1 space-y-2">
+                        <Skeleton className="h-4 w-32" />
+                        <Skeleton className="h-3 w-24" />
                       </div>
-                    </CardContent>
-                  </Card>
-                );
-              })}
-
-              {filteredDiscoverable.length === 0 && (
-                <Card>
-                  <CardContent className="p-12 text-center">
-                    <p className="text-muted-foreground">
-                      No wallets match your filters. Try adjusting the criteria.
-                    </p>
+                      <Skeleton className="h-8 w-24" />
+                    </div>
                   </CardContent>
                 </Card>
-              )}
+              ))}
             </div>
-          </div>
+          )}
+
+          {/* Discoverable Wallets */}
+          {!isLoadingDiscover && !discoverError && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <Star className="h-5 w-5 text-yellow-500" />
+                <h2 className="text-xl font-semibold">Top Performers</h2>
+                <span className="text-sm text-muted-foreground">
+                  ({filteredDiscoverable.length} wallets)
+                </span>
+              </div>
+
+              <div className="grid gap-4">
+                {filteredDiscoverable.map((wallet, index) => {
+                  const equityCurve = equityCurves[wallet.address];
+
+                  return (
+                    <Card key={wallet.address} className="hover:border-primary transition-colors">
+                      <CardContent className="p-6">
+                        <div className="flex flex-col gap-6">
+                          <div className="flex flex-col lg:flex-row lg:items-center gap-6">
+                            {/* Rank & Address */}
+                            <div className="flex items-center gap-4">
+                              <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-primary-foreground font-bold">
+                                #{wallet.rank || index + 1}
+                              </div>
+                              <div>
+                                <p className="font-medium font-mono">{shortenAddress(wallet.address)}</p>
+                                <span className={`text-xs px-2 py-0.5 rounded-full ${predictionColors[wallet.prediction]}`}>
+                                  {predictionLabels[wallet.prediction]} ({wallet.confidence}%)
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Metrics */}
+                            <div className="grid grid-cols-4 gap-4 flex-1 text-sm">
+                              <div>
+                                <p className="text-xs text-muted-foreground">ROI (30d)</p>
+                                <p className={`font-medium ${wallet.roi_30d >= 0 ? 'text-profit' : 'text-loss'}`}>
+                                  {wallet.roi_30d >= 0 ? '+' : ''}{Number(wallet.roi_30d).toFixed(1)}%
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-muted-foreground">Sharpe</p>
+                                <p className="font-medium">{Number(wallet.sharpe_ratio).toFixed(2)}</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-muted-foreground">Win Rate</p>
+                                <p className="font-medium">{Number(wallet.win_rate).toFixed(1)}%</p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-muted-foreground">Max DD</p>
+                                <p className="font-medium text-loss">{Number(wallet.max_drawdown).toFixed(1)}%</p>
+                              </div>
+                            </div>
+
+                            {/* Actions */}
+                            <div className="flex gap-2">
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                onClick={() => handleAddToBench(wallet)}
+                                disabled={loadingStates[wallet.address]}
+                              >
+                                {loadingStates[wallet.address] ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <>
+                                    <Plus className="mr-1 h-4 w-4" />
+                                    Add to Bench
+                                  </>
+                                )}
+                              </Button>
+                              <Button
+                                variant="default"
+                                size="sm"
+                                onClick={() => handleCopyClick(wallet)}
+                              >
+                                Copy Now
+                              </Button>
+                            </div>
+                          </div>
+
+                          {/* Equity Curve */}
+                          {equityCurve && (
+                            <div className="border rounded-lg p-2 bg-muted/20">
+                              <EquityCurve data={equityCurve} height={80} />
+                            </div>
+                          )}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+
+                {filteredDiscoverable.length === 0 && (
+                  <Card>
+                    <CardContent className="p-12 text-center">
+                      <p className="text-muted-foreground">
+                        No wallets match your filters. Try adjusting the criteria.
+                      </p>
+                    </CardContent>
+                  </Card>
+                )}
+              </div>
+            </div>
+          )}
         </TabsContent>
       </Tabs>
 
@@ -502,10 +523,10 @@ export default function BenchPage() {
       <CopyWalletModal
         wallet={selectedWallet ? {
           address: selectedWallet.address,
-          roi30d: selectedWallet.roi30d,
-          sharpe: selectedWallet.sharpe,
-          winRate: selectedWallet.winRate,
-          trades: selectedWallet.trades,
+          roi30d: selectedWallet.roi_30d,
+          sharpe: selectedWallet.sharpe_ratio,
+          winRate: selectedWallet.win_rate,
+          trades: selectedWallet.total_trades,
           confidence: selectedWallet.confidence,
         } : null}
         isOpen={copyModalOpen}

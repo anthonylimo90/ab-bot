@@ -26,3 +26,14 @@ export {
   useDemoPnlSimulationQuery,
   useLeaderboardQuery,
 } from './useDiscoverQuery';
+
+// Recommendations queries
+export {
+  useRotationRecommendationsQuery,
+  useDismissRecommendation,
+  useAcceptRecommendation,
+  type RotationRecommendation,
+  type RecommendationType,
+  type RecommendationReason,
+  type Urgency,
+} from './useRecommendationsQuery';

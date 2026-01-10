@@ -1,0 +1,393 @@
+//! Vault handlers for wallet key management.
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Extension;
+use axum::Json;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use auth::jwt::Claims;
+
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
+
+/// Request to store a wallet.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct StoreWalletRequest {
+    /// Ethereum wallet address (0x...).
+    pub address: String,
+    /// Wallet private key (will be encrypted).
+    pub private_key: String,
+    /// Optional label for the wallet.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Response for wallet info (no private key).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WalletInfo {
+    /// Wallet ID.
+    pub id: String,
+    /// Ethereum wallet address.
+    pub address: String,
+    /// Optional label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Whether this is the primary wallet.
+    pub is_primary: bool,
+    /// When the wallet was added.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Database row for user wallet.
+#[derive(Debug, sqlx::FromRow)]
+struct UserWalletRow {
+    id: Uuid,
+    address: String,
+    label: Option<String>,
+    is_primary: bool,
+    created_at: DateTime<Utc>,
+}
+
+impl From<UserWalletRow> for WalletInfo {
+    fn from(row: UserWalletRow) -> Self {
+        Self {
+            id: row.id.to_string(),
+            address: row.address,
+            label: row.label,
+            is_primary: row.is_primary,
+            created_at: row.created_at,
+        }
+    }
+}
+
+/// Store a wallet's private key in the vault.
+#[utoipa::path(
+    post,
+    path = "/api/v1/vault/wallets",
+    request_body = StoreWalletRequest,
+    responses(
+        (status = 201, description = "Wallet stored successfully", body = WalletInfo),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 409, description = "Wallet already exists"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "vault"
+)]
+pub async fn store_wallet(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<StoreWalletRequest>,
+) -> ApiResult<(StatusCode, Json<WalletInfo>)> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    // Validate address format (basic check)
+    let address = req.address.to_lowercase();
+    if !address.starts_with("0x") || address.len() != 42 {
+        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+
+    // Validate private key format
+    let private_key = req.private_key.trim();
+    let key_bytes = if private_key.starts_with("0x") {
+        hex::decode(&private_key[2..])
+            .map_err(|_| ApiError::BadRequest("Invalid private key format".into()))?
+    } else {
+        hex::decode(private_key)
+            .map_err(|_| ApiError::BadRequest("Invalid private key format".into()))?
+    };
+
+    if key_bytes.len() != 32 {
+        return Err(ApiError::BadRequest("Private key must be 32 bytes".into()));
+    }
+
+    // Check if wallet already exists for this user
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM user_wallets WHERE user_id = $1 AND address = $2"
+    )
+    .bind(user_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if existing.is_some() {
+        return Err(ApiError::Conflict("Wallet already connected".into()));
+    }
+
+    // Store the private key in the KeyVault
+    state
+        .key_vault
+        .store_wallet_key(&address, &key_bytes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to store key: {}", e)))?;
+
+    // Check if this is the first wallet (will be primary)
+    let wallet_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM user_wallets WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let is_primary = wallet_count.0 == 0;
+
+    // Save wallet metadata to database
+    let wallet_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO user_wallets (id, user_id, address, label, is_primary, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $6)
+        "#,
+    )
+    .bind(wallet_id)
+    .bind(user_id)
+    .bind(&address)
+    .bind(&req.label)
+    .bind(is_primary)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(WalletInfo {
+            id: wallet_id.to_string(),
+            address,
+            label: req.label,
+            is_primary,
+            created_at: now,
+        }),
+    ))
+}
+
+/// List all connected wallets for the current user.
+#[utoipa::path(
+    get,
+    path = "/api/v1/vault/wallets",
+    responses(
+        (status = 200, description = "List of connected wallets", body = Vec<WalletInfo>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "vault"
+)]
+pub async fn list_wallets(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult<Json<Vec<WalletInfo>>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let wallets: Vec<UserWalletRow> = sqlx::query_as(
+        r#"
+        SELECT id, address, label, is_primary, created_at
+        FROM user_wallets
+        WHERE user_id = $1
+        ORDER BY is_primary DESC, created_at ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let wallet_infos: Vec<WalletInfo> = wallets.into_iter().map(Into::into).collect();
+    Ok(Json(wallet_infos))
+}
+
+/// Check if a specific wallet is connected.
+#[utoipa::path(
+    get,
+    path = "/api/v1/vault/wallets/{address}",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Wallet info", body = WalletInfo),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Wallet not found"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "vault"
+)]
+pub async fn get_wallet(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> ApiResult<Json<WalletInfo>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let address = address.to_lowercase();
+
+    let wallet: Option<UserWalletRow> = sqlx::query_as(
+        r#"
+        SELECT id, address, label, is_primary, created_at
+        FROM user_wallets
+        WHERE user_id = $1 AND address = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match wallet {
+        Some(w) => Ok(Json(w.into())),
+        None => Err(ApiError::NotFound("Wallet not connected".into())),
+    }
+}
+
+/// Remove a wallet from the vault.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/vault/wallets/{address}",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 204, description = "Wallet removed"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Wallet not found"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "vault"
+)]
+pub async fn remove_wallet(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> ApiResult<StatusCode> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let address = address.to_lowercase();
+
+    // Check if wallet exists
+    let wallet: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT id, is_primary FROM user_wallets WHERE user_id = $1 AND address = $2"
+    )
+    .bind(user_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (wallet_id, was_primary) = match wallet {
+        Some(w) => w,
+        None => return Err(ApiError::NotFound("Wallet not connected".into())),
+    };
+
+    // Remove from KeyVault
+    let _ = state.key_vault.remove_wallet_key(&address).await;
+
+    // Remove from database
+    sqlx::query("DELETE FROM user_wallets WHERE id = $1")
+        .bind(wallet_id)
+        .execute(&state.pool)
+        .await?;
+
+    // If this was the primary wallet, make another one primary
+    if was_primary {
+        sqlx::query(
+            r#"
+            UPDATE user_wallets
+            SET is_primary = true, updated_at = NOW()
+            WHERE id = (
+                SELECT id FROM user_wallets
+                WHERE user_id = $1
+                ORDER BY created_at ASC
+                LIMIT 1
+            )
+            "#,
+        )
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Set a wallet as the primary wallet.
+#[utoipa::path(
+    put,
+    path = "/api/v1/vault/wallets/{address}/primary",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Wallet set as primary", body = WalletInfo),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Wallet not found"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "vault"
+)]
+pub async fn set_primary_wallet(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> ApiResult<Json<WalletInfo>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let address = address.to_lowercase();
+
+    // Check if wallet exists
+    let wallet: Option<UserWalletRow> = sqlx::query_as(
+        r#"
+        SELECT id, address, label, is_primary, created_at
+        FROM user_wallets
+        WHERE user_id = $1 AND address = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let wallet = match wallet {
+        Some(w) => w,
+        None => return Err(ApiError::NotFound("Wallet not connected".into())),
+    };
+
+    // Unset all other wallets as primary
+    sqlx::query(
+        "UPDATE user_wallets SET is_primary = false, updated_at = NOW() WHERE user_id = $1"
+    )
+    .bind(user_id)
+    .execute(&state.pool)
+    .await?;
+
+    // Set this wallet as primary
+    sqlx::query(
+        "UPDATE user_wallets SET is_primary = true, updated_at = NOW() WHERE id = $1"
+    )
+    .bind(wallet.id)
+    .execute(&state.pool)
+    .await?;
+
+    Ok(Json(WalletInfo {
+        id: wallet.id.to_string(),
+        address: wallet.address,
+        label: wallet.label,
+        is_primary: true,
+        created_at: wallet.created_at,
+    }))
+}
