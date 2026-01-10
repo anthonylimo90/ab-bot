@@ -7,7 +7,7 @@ use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::handlers::{health, markets, positions, wallets, trading, backtest};
+use crate::handlers::{health, markets, positions, wallets, trading, backtest, discover};
 use crate::middleware::{require_auth, require_trader};
 use crate::state::AppState;
 use crate::websocket;
@@ -41,6 +41,9 @@ use crate::websocket;
         backtest::run_backtest,
         backtest::list_backtest_results,
         backtest::get_backtest_result,
+        discover::get_live_trades,
+        discover::discover_wallets,
+        discover::simulate_demo_pnl,
     ),
     components(
         schemas(
@@ -71,6 +74,12 @@ use crate::websocket;
             backtest::StrategyConfig,
             backtest::SlippageModel,
             backtest::EquityPoint,
+            discover::LiveTrade,
+            discover::DiscoveredWallet,
+            discover::PredictionCategory,
+            discover::DemoPnlSimulation,
+            discover::WalletSimulation,
+            discover::EquityPoint,
         )
     ),
     tags(
@@ -80,6 +89,7 @@ use crate::websocket;
         (name = "wallets", description = "Wallet tracking for copy trading"),
         (name = "trading", description = "Order execution"),
         (name = "backtest", description = "Backtesting operations"),
+        (name = "discover", description = "Wallet discovery and live trade monitoring"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -91,6 +101,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/health", get(health::health_check))
         .route("/ready", get(health::readiness))
+        // Discovery/demo endpoints (public for demo purposes)
+        .route("/api/v1/discover/trades", get(discover::get_live_trades))
+        .route("/api/v1/discover/wallets", get(discover::discover_wallets))
+        .route("/api/v1/discover/simulate", get(discover::simulate_demo_pnl))
         // WebSocket endpoints (auth handled via query param or message)
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))

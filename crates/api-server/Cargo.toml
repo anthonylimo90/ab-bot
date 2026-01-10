@@ -40,6 +40,9 @@ chrono.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
 
+# Random (for demo data generation)
+rand = "0.8"
+
 # Error handling
 thiserror.workspace = true
 anyhow.workspace = true

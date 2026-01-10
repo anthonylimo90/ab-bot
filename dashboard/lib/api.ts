@@ -11,6 +11,9 @@ import type {
   BacktestResult,
   HealthResponse,
   ApiError,
+  LiveTrade,
+  DiscoveredWallet,
+  DemoPnlSimulation,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -232,6 +235,50 @@ class ApiClient {
 
   async getBacktestResult(resultId: string): Promise<BacktestResult> {
     return this.request<BacktestResult>(`/api/v1/backtest/results/${resultId}`);
+  }
+
+  // Discovery
+  async getLiveTrades(params?: {
+    wallet?: string;
+    limit?: number;
+    min_value?: number;
+  }): Promise<LiveTrade[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.wallet) searchParams.set('wallet', params.wallet);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.min_value) searchParams.set('min_value', String(params.min_value));
+    const query = searchParams.toString();
+    return this.request<LiveTrade[]>(`/api/v1/discover/trades${query ? `?${query}` : ''}`);
+  }
+
+  async discoverWallets(params?: {
+    sort_by?: 'roi' | 'sharpe' | 'winRate' | 'trades';
+    period?: '7d' | '30d' | '90d';
+    min_trades?: number;
+    min_win_rate?: number;
+    limit?: number;
+  }): Promise<DiscoveredWallet[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.sort_by) searchParams.set('sort_by', params.sort_by);
+    if (params?.period) searchParams.set('period', params.period);
+    if (params?.min_trades) searchParams.set('min_trades', String(params.min_trades));
+    if (params?.min_win_rate) searchParams.set('min_win_rate', String(params.min_win_rate));
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    const query = searchParams.toString();
+    return this.request<DiscoveredWallet[]>(`/api/v1/discover/wallets${query ? `?${query}` : ''}`);
+  }
+
+  async simulateDemoPnl(params?: {
+    amount?: number;
+    period?: '7d' | '30d' | '90d';
+    wallets?: string;
+  }): Promise<DemoPnlSimulation> {
+    const searchParams = new URLSearchParams();
+    if (params?.amount) searchParams.set('amount', String(params.amount));
+    if (params?.period) searchParams.set('period', params.period);
+    if (params?.wallets) searchParams.set('wallets', params.wallets);
+    const query = searchParams.toString();
+    return this.request<DemoPnlSimulation>(`/api/v1/discover/simulate${query ? `?${query}` : ''}`);
   }
 }
 

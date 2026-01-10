@@ -266,6 +266,10 @@ REDIS_URL=                 # Redis connection string
 # Polymarket
 POLYMARKET_CLOB_URL=       # CLOB API base URL
 
+# Live Trading (optional)
+WALLET_PRIVATE_KEY=        # 64-char hex private key for order signing (with or without 0x prefix)
+LIVE_TRADING=              # Set to "true" to enable live order execution
+
 # Alerts (optional)
 TELEGRAM_BOT_TOKEN=        # For alert notifications
 DISCORD_WEBHOOK_URL=       # For alert notifications
@@ -305,6 +309,116 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 ---
 
 ## Changelog
+
+### 2026-01-10: Phase 8 - Discovery & Demo Dashboard
+
+**New API Endpoints:**
+
+- **`/api/v1/discover/trades`**: Get live trades from monitored wallets
+  - Query params: `wallet`, `limit`, `min_value`
+  - Returns: `LiveTrade[]` with wallet, market, price, quantity, direction
+
+- **`/api/v1/discover/wallets`**: Discover top-performing wallets
+  - Query params: `sort_by` (roi/sharpe/winRate/trades), `period` (7d/30d/90d), `min_trades`, `min_win_rate`, `limit`
+  - Returns: `DiscoveredWallet[]` with ROI, Sharpe ratio, win rate, prediction category
+
+- **`/api/v1/discover/simulate`**: Run demo P&L simulation
+  - Query params: `amount`, `period`, `wallets`
+  - Returns: `DemoPnlSimulation` with equity curve and wallet breakdown
+
+**New Dashboard Components:**
+
+- **`LiveActivityFeed`**: Real-time feed of wallet trades
+  - Auto-refresh every 10 seconds
+  - Shows wallet, market, direction, value, price
+  - Color-coded buy/sell indicators
+
+- **`WalletLeaderboard`**: Top wallets discovery
+  - Sort by ROI, Sharpe, win rate, or activity
+  - Filter by time period (7d/30d/90d)
+  - Track wallet functionality
+  - Prediction badges (High/Moderate/Low potential)
+
+- **`DemoPnlCalculator`**: What-if P&L simulator
+  - Preset amounts ($100, $500, $1000, $5000)
+  - Period selection (7d/30d/90d)
+  - Visual equity curve
+  - Per-wallet breakdown
+
+**Files Created:**
+- `crates/api-server/src/handlers/discover.rs` - Discovery API handlers
+- `dashboard/components/discover/LiveActivityFeed.tsx`
+- `dashboard/components/discover/WalletLeaderboard.tsx`
+- `dashboard/components/discover/DemoPnlCalculator.tsx`
+- `dashboard/components/discover/index.ts`
+
+**Files Modified:**
+- `crates/api-server/src/handlers/mod.rs` - Export discover module
+- `crates/api-server/src/routes.rs` - Add discover routes and OpenAPI docs
+- `crates/api-server/Cargo.toml` - Add rand dependency
+- `dashboard/lib/api.ts` - Add discovery API methods
+- `dashboard/types/api.ts` - Add discovery types
+
+### 2026-01-10: Phase 7 - Live Wallet Integration
+
+**New Modules:**
+
+- **`auth/wallet.rs`**: Trading wallet management
+  - `TradingWallet::from_env()` - Load from `WALLET_PRIVATE_KEY` env var
+  - `TradingWallet::from_private_key()` - Parse hex key with/without 0x prefix
+  - `address()`, `address_string()` - Get wallet address
+  - `sign_message()`, `sign_message_hex()` - EIP-191 signing
+
+- **`polymarket-core/signing/`**: EIP-712 order signing
+  - `domain.rs`: EIP-712 domain separators for CTF Exchange
+  - `order_types.rs`: `OrderData`, `SignedOrder`, `OrderBuilder`
+  - `signer.rs`: `OrderSigner` with `sign_order()`, `sign_auth_message()`
+
+- **`polymarket-core/api/clob.rs`**: Authenticated CLOB client
+  - `ApiCredentials`: API key, secret, passphrase storage
+  - `AuthenticatedClobClient`: Wrapper with wallet signing
+  - `derive_api_key()`: L1 auth to get API credentials
+  - `create_order()`, `post_order()`: Order creation and submission
+  - `cancel_order()`, `get_open_orders()`: Order management
+  - `sign_l2_request()`: HMAC-SHA256 for authenticated requests
+
+- **`trading-engine/executor.rs`**: Live trading integration
+  - `OrderExecutor::new_with_wallet()` - Constructor with wallet
+  - `initialize_live_trading()` - Derive API credentials
+  - `is_live_ready()`, `wallet_address()` - Status checks
+  - Live order execution methods
+
+**Test Wallet Example:**
+
+```bash
+# Test wallet connection
+WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
+```
+
+Tests: wallet loading, signer creation, message signing, CLOB API connection
+
+**Dependencies Added:**
+- `alloy-primitives`, `alloy-sol-types`, `alloy-signer`, `alloy-signer-local` - Ethereum signing
+- `hmac` - HMAC-SHA256 for L2 auth
+
+**Files Created:**
+- `crates/auth/src/wallet.rs`
+- `crates/polymarket-core/src/signing/mod.rs`
+- `crates/polymarket-core/src/signing/domain.rs`
+- `crates/polymarket-core/src/signing/order_types.rs`
+- `crates/polymarket-core/src/signing/signer.rs`
+- `examples/test_wallet.rs`
+
+**Files Modified:**
+- `Cargo.toml` - Workspace dependencies for alloy/hmac
+- `crates/auth/Cargo.toml` - alloy-signer dependencies
+- `crates/auth/src/lib.rs` - Export wallet module
+- `crates/polymarket-core/Cargo.toml` - Signing dependencies
+- `crates/polymarket-core/src/lib.rs` - Export signing module
+- `crates/polymarket-core/src/api/clob.rs` - AuthenticatedClobClient
+- `crates/polymarket-core/src/error.rs` - Signing errors
+- `crates/trading-engine/Cargo.toml` - Add auth dependency
+- `crates/trading-engine/src/executor.rs` - Live trading methods
 
 ### 2026-01-09: Phase 6.1 - Docker Deployment Fixes
 

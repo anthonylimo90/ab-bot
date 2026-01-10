@@ -380,3 +380,53 @@ export type WebSocketMessage =
   | { type: 'Error'; code: string; message: string }
   | { type: 'Ping' }
   | { type: 'Pong' };
+
+// Discovery/Live trades types
+export type PredictionCategory = 'HIGH_POTENTIAL' | 'MODERATE' | 'LOW_POTENTIAL' | 'INSUFFICIENT_DATA';
+
+export interface LiveTrade {
+  wallet_address: string;
+  wallet_label?: string;
+  tx_hash: string;
+  timestamp: string;
+  market_id: string;
+  market_question?: string;
+  outcome: string;
+  direction: 'buy' | 'sell';
+  price: number;
+  quantity: number;
+  value: number;
+}
+
+export interface DiscoveredWallet {
+  address: string;
+  rank: number;
+  roi_7d: number;
+  roi_30d: number;
+  roi_90d: number;
+  sharpe_ratio: number;
+  total_trades: number;
+  win_rate: number;
+  max_drawdown: number;
+  prediction: PredictionCategory;
+  confidence: number;
+  is_tracked: boolean;
+  trades_24h: number;
+  total_pnl: number;
+}
+
+export interface WalletSimulation {
+  address: string;
+  allocation_pct: number;
+  pnl: number;
+  trades: number;
+}
+
+export interface DemoPnlSimulation {
+  initial_amount: number;
+  current_value: number;
+  pnl: number;
+  pnl_pct: number;
+  equity_curve: { date: string; value: number }[];
+  wallets: WalletSimulation[];
+}

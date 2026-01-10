@@ -9,6 +9,9 @@ A high-performance Polymarket trading platform built in Rust, featuring arbitrag
 - **Copy Trading** - Mirror successful wallets with configurable allocation strategies
 - **Risk Management** - Advanced stop-loss strategies and circuit breakers
 - **Backtesting** - Historical simulation framework with realistic execution models
+- **Live Wallet Integration** - EIP-712 signing for real order execution on Polymarket
+- **Wallet Discovery** - Find and track top-performing wallets with success predictions
+- **Demo P&L Simulator** - See potential returns from copy trading strategies
 - **REST/WebSocket API** - Full-featured API with OpenAPI documentation
 - **Dashboard** - Next.js frontend with Demo and Live trading modes
 
@@ -81,9 +84,20 @@ POSTGRES_DB=ab_bot
 # API
 JWT_SECRET=your-secret-key-here
 
-# External APIs (for live trading)
+# External APIs
 POLYMARKET_API_URL=https://clob.polymarket.com
 POLYGON_RPC_URL=https://polygon-rpc.com
+
+# Live Trading (optional)
+WALLET_PRIVATE_KEY=0x...  # 64-char hex private key for order signing
+LIVE_TRADING=true         # Enable live order execution
+```
+
+### Testing Wallet Connection
+
+```bash
+# Test that your wallet can connect to Polymarket
+WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
 ```
 
 ## API Endpoints
@@ -114,6 +128,11 @@ POLYGON_RPC_URL=https://polygon-rpc.com
 ### Backtesting
 - `POST /api/v1/backtest` - Run backtest
 - `GET /api/v1/backtest/results` - List backtest results
+
+### Discovery
+- `GET /api/v1/discover/trades` - Live trades from monitored wallets
+- `GET /api/v1/discover/wallets` - Top-performing wallets leaderboard
+- `GET /api/v1/discover/simulate` - Demo P&L simulation
 
 ### WebSocket Streams
 - `WS /ws/orderbook` - Live orderbook updates
