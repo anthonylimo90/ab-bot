@@ -62,7 +62,7 @@ impl Config {
         Ok(Self {
             database: DatabaseConfig {
                 url: env::var("DATABASE_URL")
-                    .map_err(|_| Error::Config(config::ConfigError::NotFound("DATABASE_URL".into())))?,
+                    .map_err(|_| Error::Config { message: "DATABASE_URL environment variable not set".to_string() })?,
                 max_connections: env::var("DATABASE_MAX_CONNECTIONS")
                     .ok()
                     .and_then(|s| s.parse().ok())

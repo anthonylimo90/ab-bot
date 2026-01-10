@@ -1,14 +1,17 @@
 //! Order execution engine for low-latency trade placement.
 
 use anyhow::Result;
+use auth::TradingWallet;
 use dashmap::DashMap;
+use polymarket_core::api::clob::{ApiCredentials, AuthenticatedClobClient, OrderType};
 use polymarket_core::api::ClobClient;
+use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
 use polymarket_core::types::{
     ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus,
 };
 use rust_decimal::Decimal;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -61,10 +64,12 @@ pub struct OrderExecutor {
     /// Receiver for execution reports (taken once).
     report_rx: Option<mpsc::Receiver<ExecutionReport>>,
     metrics: std::sync::RwLock<ExecutionMetrics>,
+    /// Authenticated client for live trading (optional).
+    auth_client: Option<Arc<RwLock<AuthenticatedClobClient>>>,
 }
 
 impl OrderExecutor {
-    /// Create a new order executor.
+    /// Create a new order executor (paper trading mode).
     pub fn new(clob_client: Arc<ClobClient>, config: ExecutorConfig) -> Self {
         let (report_tx, report_rx) = mpsc::channel(1000);
         Self {
@@ -74,6 +79,98 @@ impl OrderExecutor {
             report_tx,
             report_rx: Some(report_rx),
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
+            auth_client: None,
+        }
+    }
+
+    /// Create a new order executor for live trading with wallet authentication.
+    ///
+    /// # Arguments
+    ///
+    /// * `clob_client` - Base CLOB client for market data
+    /// * `wallet` - Trading wallet with private key for signing
+    /// * `config` - Executor configuration (should have `live_trading: true`)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use auth::TradingWallet;
+    ///
+    /// let wallet = TradingWallet::from_env()?;
+    /// let config = ExecutorConfig {
+    ///     live_trading: true,
+    ///     ..Default::default()
+    /// };
+    /// let executor = OrderExecutor::new_with_wallet(clob_client, wallet, config);
+    /// ```
+    pub fn new_with_wallet(
+        clob_client: Arc<ClobClient>,
+        wallet: TradingWallet,
+        config: ExecutorConfig,
+    ) -> Self {
+        let (report_tx, report_rx) = mpsc::channel(1000);
+
+        // Create the order signer from the wallet
+        let signer = OrderSigner::new(wallet.into_signer());
+
+        // Create authenticated client
+        let client = ClobClient::new(None, None);
+        let auth_client = AuthenticatedClobClient::new(client, signer);
+
+        info!(
+            address = %auth_client.address(),
+            live_trading = %config.live_trading,
+            "Created order executor with wallet authentication"
+        );
+
+        Self {
+            clob_client,
+            config,
+            pending_orders: DashMap::new(),
+            report_tx,
+            report_rx: Some(report_rx),
+            metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
+            auth_client: Some(Arc::new(RwLock::new(auth_client))),
+        }
+    }
+
+    /// Initialize the authenticated client by deriving API credentials.
+    ///
+    /// This must be called before executing live orders.
+    pub async fn initialize_live_trading(&self) -> Result<()> {
+        let auth_client = self.auth_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("No authenticated client - use new_with_wallet() for live trading")
+        })?;
+
+        let mut client = auth_client.write().await;
+        client.derive_api_key().await.map_err(|e| {
+            anyhow::anyhow!("Failed to derive API credentials: {}", e)
+        })?;
+
+        info!("Live trading initialized - API credentials derived");
+        Ok(())
+    }
+
+    /// Check if live trading is initialized and ready.
+    pub async fn is_live_ready(&self) -> bool {
+        if !self.config.live_trading {
+            return false;
+        }
+        if let Some(auth_client) = &self.auth_client {
+            let client = auth_client.read().await;
+            client.has_credentials()
+        } else {
+            false
+        }
+    }
+
+    /// Get the trading wallet address (if available).
+    pub async fn wallet_address(&self) -> Option<String> {
+        if let Some(auth_client) = &self.auth_client {
+            let client = auth_client.read().await;
+            Some(client.address())
+        } else {
+            None
         }
     }
 
@@ -204,16 +301,22 @@ impl OrderExecutor {
     // Private methods
 
     async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
-        // TODO: Implement actual CLOB API order placement
-        // This requires the Polymarket trading API with authentication
+        // Check if we have an authenticated client
+        let auth_client = match &self.auth_client {
+            Some(client) => client,
+            None => {
+                warn!("No authenticated client for live trading - falling back to simulation");
+                return self.simulate_market_order(order).await;
+            }
+        };
 
-        // For now, fetch orderbook and simulate based on real prices
+        // Get the best price from orderbook
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
 
-        let (price, available) = match order.side {
+        let price = match order.side {
             OrderSide::Buy => {
                 if let Some(ask) = book.asks.first() {
-                    (ask.price, ask.size)
+                    ask.price
                 } else {
                     return Ok(ExecutionReport::rejected(
                         order.id,
@@ -226,7 +329,7 @@ impl OrderExecutor {
             }
             OrderSide::Sell => {
                 if let Some(bid) = book.bids.first() {
-                    (bid.price, bid.size)
+                    bid.price
                 } else {
                     return Ok(ExecutionReport::rejected(
                         order.id,
@@ -239,28 +342,125 @@ impl OrderExecutor {
             }
         };
 
-        // Check slippage
-        let slippage = order.max_slippage.unwrap_or(self.config.default_slippage);
-        // For a real implementation, we would check against expected price
+        // Convert order side to signing order side
+        let signing_side = match order.side {
+            OrderSide::Buy => SigningOrderSide::Buy,
+            OrderSide::Sell => SigningOrderSide::Sell,
+        };
 
-        let fill_quantity = order.quantity.min(available);
-        let fees = fill_quantity * price * self.config.fee_rate;
+        // Create and sign the order
+        let client = auth_client.read().await;
 
+        if !client.has_credentials() {
+            return Err(anyhow::anyhow!(
+                "Live trading not initialized - call initialize_live_trading() first"
+            ));
+        }
+
+        // Create signed order (1 hour expiration for market orders)
+        let signed_order = client
+            .create_order(
+                &order.outcome_id,
+                signing_side,
+                price,
+                order.quantity,
+                3600, // 1 hour expiration
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
+
+        // Post the order (FOK for market orders)
+        let response = client
+            .post_order(signed_order, OrderType::Fok)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to post order: {}", e))?;
+
+        info!(
+            order_id = %order.id,
+            clob_order_id = %response.order_id,
+            status = %response.status,
+            "Live market order submitted"
+        );
+
+        // Calculate fees
+        let fees = order.quantity * price * self.config.fee_rate;
+
+        // Return success (actual fill status would come from webhook/polling)
         Ok(ExecutionReport::success(
             order.id,
             order.market_id.clone(),
             order.outcome_id.clone(),
             order.side,
-            fill_quantity,
+            order.quantity,
             price,
             fees,
         ))
     }
 
     async fn execute_live_limit_order(&self, order: &LimitOrder) -> Result<ExecutionReport> {
-        // TODO: Implement actual CLOB API limit order placement
-        // Simulate for now
-        self.simulate_limit_order(order).await
+        // Check if we have an authenticated client
+        let auth_client = match &self.auth_client {
+            Some(client) => client,
+            None => {
+                warn!("No authenticated client for live trading - falling back to simulation");
+                return self.simulate_limit_order(order).await;
+            }
+        };
+
+        // Convert order side to signing order side
+        let signing_side = match order.side {
+            OrderSide::Buy => SigningOrderSide::Buy,
+            OrderSide::Sell => SigningOrderSide::Sell,
+        };
+
+        let client = auth_client.read().await;
+
+        if !client.has_credentials() {
+            return Err(anyhow::anyhow!(
+                "Live trading not initialized - call initialize_live_trading() first"
+            ));
+        }
+
+        // Create signed order (use configured expiration or default 24 hours)
+        let expiration_secs = 24 * 3600; // 24 hours for limit orders
+        let signed_order = client
+            .create_order(
+                &order.outcome_id,
+                signing_side,
+                order.price,
+                order.quantity,
+                expiration_secs,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
+
+        // Post the order (GTC for limit orders)
+        let response = client
+            .post_order(signed_order, OrderType::Gtc)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to post order: {}", e))?;
+
+        info!(
+            order_id = %order.id,
+            clob_order_id = %response.order_id,
+            status = %response.status,
+            price = %order.price,
+            quantity = %order.quantity,
+            "Live limit order submitted"
+        );
+
+        // Calculate fees
+        let fees = order.quantity * order.price * self.config.fee_rate;
+
+        Ok(ExecutionReport::success(
+            order.id,
+            order.market_id.clone(),
+            order.outcome_id.clone(),
+            order.side,
+            order.quantity,
+            order.price,
+            fees,
+        ))
     }
 
     async fn simulate_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {

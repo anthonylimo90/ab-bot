@@ -22,8 +22,11 @@ pub enum Error {
     #[error("Redis error: {0}")]
     Redis(#[from] redis::RedisError),
 
-    #[error("Configuration error: {0}")]
-    Config(#[from] config::ConfigError),
+    #[error("Configuration file error: {0}")]
+    ConfigFile(#[from] config::ConfigError),
+
+    #[error("Configuration error: {message}")]
+    Config { message: String },
 
     #[error("Invalid market data: {0}")]
     InvalidMarket(String),
@@ -33,6 +36,15 @@ pub enum Error {
 
     #[error("API error: {message}")]
     Api { message: String, status: Option<u16> },
+
+    #[error("Signing error: {message}")]
+    Signing { message: String },
+
+    #[error("Order error: {message}")]
+    Order { message: String },
+
+    #[error("Authentication error: {message}")]
+    Auth { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -7,6 +7,7 @@ pub mod audit;
 pub mod jwt;
 pub mod key_vault;
 pub mod rbac;
+pub mod wallet;
 
 pub use api_key::ApiKeyAuth;
 pub use audit::{AuditAction, AuditEvent, AuditLogger};
@@ -16,3 +17,4 @@ pub use rbac::{
     Action, DefaultRoles, Permission, PermissionConditions, RbacManager,
     Resource, Role, TimeWindow,
 };
+pub use wallet::TradingWallet;

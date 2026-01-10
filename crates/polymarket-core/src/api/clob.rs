@@ -1,9 +1,19 @@
 //! Polymarket CLOB API client.
+//!
+//! This module provides both read-only and authenticated access to the
+//! Polymarket CLOB API for order book data and order management.
 
+use crate::signing::{OrderData, OrderSigner, SignedOrder};
 use crate::types::{Market, OrderBook, Outcome, PriceLevel};
 use crate::{Error, Result};
+use alloy_primitives::U256;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use hmac::{Hmac, Mac};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -311,5 +321,612 @@ impl WsMessage {
             }),
             WsMessage::Other => None,
         }
+    }
+}
+
+// ============================================================================
+// Authenticated CLOB Client
+// ============================================================================
+
+/// API credentials for authenticated CLOB requests.
+#[derive(Debug, Clone)]
+pub struct ApiCredentials {
+    /// API key (derived from wallet).
+    pub api_key: String,
+    /// API secret for HMAC signing.
+    pub api_secret: String,
+    /// Passphrase for additional security.
+    pub api_passphrase: String,
+}
+
+impl ApiCredentials {
+    /// Create new API credentials.
+    pub fn new(api_key: String, api_secret: String, api_passphrase: String) -> Self {
+        Self {
+            api_key,
+            api_secret,
+            api_passphrase,
+        }
+    }
+
+    /// Load from environment variables.
+    pub fn from_env() -> Result<Self> {
+        let api_key = std::env::var("POLY_API_KEY").map_err(|_| Error::Config {
+            message: "POLY_API_KEY environment variable not set".to_string(),
+        })?;
+        let api_secret = std::env::var("POLY_API_SECRET").map_err(|_| Error::Config {
+            message: "POLY_API_SECRET environment variable not set".to_string(),
+        })?;
+        let api_passphrase = std::env::var("POLY_API_PASSPHRASE").map_err(|_| Error::Config {
+            message: "POLY_API_PASSPHRASE environment variable not set".to_string(),
+        })?;
+
+        Ok(Self {
+            api_key,
+            api_secret,
+            api_passphrase,
+        })
+    }
+}
+
+/// Order type for submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderType {
+    /// Good-till-cancelled limit order.
+    Gtc,
+    /// Fill-or-kill market order.
+    Fok,
+    /// Good-till-date limit order.
+    Gtd,
+}
+
+impl Default for OrderType {
+    fn default() -> Self {
+        Self::Gtc
+    }
+}
+
+/// Request body for posting an order.
+#[derive(Debug, Clone, Serialize)]
+pub struct PostOrderRequest {
+    pub order: SignedOrder,
+    #[serde(rename = "orderType")]
+    pub order_type: OrderType,
+}
+
+/// Response from posting an order.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PostOrderResponse {
+    /// Order ID assigned by the CLOB.
+    #[serde(rename = "orderID")]
+    pub order_id: String,
+    /// Status of the order.
+    pub status: String,
+    /// Transaction hash if applicable.
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: Option<String>,
+}
+
+/// Open order information.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenOrder {
+    pub id: String,
+    pub asset_id: String,
+    pub market: String,
+    pub side: String,
+    pub price: String,
+    pub size: String,
+    pub status: String,
+    pub created_at: Option<String>,
+}
+
+/// Response from deriving API credentials.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeriveApiKeyResponse {
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
+}
+
+/// Authenticated CLOB client for order management.
+///
+/// Wraps `ClobClient` with signing capabilities for authenticated requests.
+pub struct AuthenticatedClobClient {
+    /// Base read-only client.
+    pub client: ClobClient,
+    /// Order signer for EIP-712 signing.
+    signer: OrderSigner,
+    /// API credentials for L2 authentication (optional until derived).
+    credentials: Option<ApiCredentials>,
+}
+
+impl AuthenticatedClobClient {
+    /// Create a new authenticated client.
+    pub fn new(client: ClobClient, signer: OrderSigner) -> Self {
+        Self {
+            client,
+            signer,
+            credentials: None,
+        }
+    }
+
+    /// Create with pre-existing API credentials.
+    pub fn with_credentials(
+        client: ClobClient,
+        signer: OrderSigner,
+        credentials: ApiCredentials,
+    ) -> Self {
+        Self {
+            client,
+            signer,
+            credentials: Some(credentials),
+        }
+    }
+
+    /// Get the wallet address.
+    pub fn address(&self) -> String {
+        format!("{:?}", self.signer.address())
+    }
+
+    /// Derive API credentials from wallet signature (L1 authentication).
+    ///
+    /// This authenticates with Polymarket using your wallet signature
+    /// and returns API credentials for subsequent requests.
+    pub async fn derive_api_key(&mut self) -> Result<ApiCredentials> {
+        let timestamp = current_timestamp();
+
+        // Sign the auth message with timestamp
+        let signature = self
+            .signer
+            .sign_auth_message_with_timestamp(timestamp)
+            .await
+            .map_err(|e| Error::Signing {
+                message: format!("Failed to sign auth message: {}", e),
+            })?;
+
+        let url = format!("{}/auth/derive-api-key", self.client.base_url);
+
+        let body = serde_json::json!({
+            "address": self.address(),
+            "signature": signature,
+            "timestamp": timestamp,
+            "nonce": 0
+        });
+
+        let response = self
+            .client
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to derive API key: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        let derive_response: DeriveApiKeyResponse = response.json().await?;
+
+        let credentials = ApiCredentials::new(
+            derive_response.api_key,
+            derive_response.secret,
+            derive_response.passphrase,
+        );
+
+        self.credentials = Some(credentials.clone());
+        info!("Successfully derived API credentials");
+
+        Ok(credentials)
+    }
+
+    /// Set API credentials directly (if already have them).
+    pub fn set_credentials(&mut self, credentials: ApiCredentials) {
+        self.credentials = Some(credentials);
+    }
+
+    /// Check if credentials are available.
+    pub fn has_credentials(&self) -> bool {
+        self.credentials.is_some()
+    }
+
+    /// Create and sign an order.
+    pub async fn create_order(
+        &self,
+        token_id: &str,
+        side: crate::signing::OrderSide,
+        price: Decimal,
+        size: Decimal,
+        expiration_secs: u64,
+    ) -> Result<SignedOrder> {
+        let order = self
+            .signer
+            .order_builder()
+            .token_id_str(token_id)
+            .side(side)
+            .price(price)
+            .size(size)
+            .expires_in(expiration_secs)
+            .build()
+            .ok_or_else(|| Error::Order {
+                message: "Failed to build order - missing required fields".to_string(),
+            })?;
+
+        let signed = self
+            .signer
+            .sign_order(&order)
+            .await
+            .map_err(|e| Error::Signing {
+                message: format!("Failed to sign order: {}", e),
+            })?;
+
+        Ok(signed)
+    }
+
+    /// Post a signed order to the CLOB.
+    pub async fn post_order(
+        &self,
+        signed_order: SignedOrder,
+        order_type: OrderType,
+    ) -> Result<PostOrderResponse> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set - call derive_api_key() first".to_string(),
+        })?;
+
+        let url = format!("{}/order", self.client.base_url);
+        let timestamp = current_timestamp().to_string();
+        let method = "POST";
+        let path = "/order";
+
+        let request = PostOrderRequest {
+            order: signed_order,
+            order_type,
+        };
+
+        let body = serde_json::to_string(&request)?;
+
+        // Sign the request with L2 HMAC
+        let signature = sign_l2_request(
+            credentials,
+            method,
+            path,
+            &timestamp,
+            Some(&body),
+        )?;
+
+        let response = self
+            .client
+            .http_client
+            .post(&url)
+            .header("POLY-ADDRESS", self.address())
+            .header("POLY-SIGNATURE", signature)
+            .header("POLY-TIMESTAMP", &timestamp)
+            .header("POLY-API-KEY", &credentials.api_key)
+            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to post order: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        let result: PostOrderResponse = response.json().await?;
+        info!(order_id = %result.order_id, "Order posted successfully");
+
+        Ok(result)
+    }
+
+    /// Cancel an order by ID.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set - call derive_api_key() first".to_string(),
+        })?;
+
+        let url = format!("{}/order/{}", self.client.base_url, order_id);
+        let timestamp = current_timestamp().to_string();
+        let method = "DELETE";
+        let path = format!("/order/{}", order_id);
+
+        let signature = sign_l2_request(
+            credentials,
+            method,
+            &path,
+            &timestamp,
+            None,
+        )?;
+
+        let response = self
+            .client
+            .http_client
+            .delete(&url)
+            .header("POLY-ADDRESS", self.address())
+            .header("POLY-SIGNATURE", signature)
+            .header("POLY-TIMESTAMP", &timestamp)
+            .header("POLY-API-KEY", &credentials.api_key)
+            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to cancel order: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        info!(order_id = %order_id, "Order cancelled successfully");
+        Ok(())
+    }
+
+    /// Get open orders for the authenticated user.
+    pub async fn get_open_orders(&self, market: Option<&str>) -> Result<Vec<OpenOrder>> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set - call derive_api_key() first".to_string(),
+        })?;
+
+        let path = match market {
+            Some(m) => format!("/orders?market={}", m),
+            None => "/orders".to_string(),
+        };
+        let url = format!("{}{}", self.client.base_url, path);
+        let timestamp = current_timestamp().to_string();
+        let method = "GET";
+
+        let signature = sign_l2_request(
+            credentials,
+            method,
+            &path,
+            &timestamp,
+            None,
+        )?;
+
+        let response = self
+            .client
+            .http_client
+            .get(&url)
+            .header("POLY-ADDRESS", self.address())
+            .header("POLY-SIGNATURE", signature)
+            .header("POLY-TIMESTAMP", &timestamp)
+            .header("POLY-API-KEY", &credentials.api_key)
+            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to get open orders: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        let orders: Vec<OpenOrder> = response.json().await?;
+        Ok(orders)
+    }
+
+    /// Cancel all open orders.
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set - call derive_api_key() first".to_string(),
+        })?;
+
+        let url = format!("{}/orders", self.client.base_url);
+        let timestamp = current_timestamp().to_string();
+        let method = "DELETE";
+        let path = "/orders";
+
+        let signature = sign_l2_request(
+            credentials,
+            method,
+            path,
+            &timestamp,
+            None,
+        )?;
+
+        let response = self
+            .client
+            .http_client
+            .delete(&url)
+            .header("POLY-ADDRESS", self.address())
+            .header("POLY-SIGNATURE", signature)
+            .header("POLY-TIMESTAMP", &timestamp)
+            .header("POLY-API-KEY", &credentials.api_key)
+            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to cancel all orders: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        info!("All orders cancelled successfully");
+        Ok(())
+    }
+}
+
+/// Get current Unix timestamp in seconds.
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Sign a request with HMAC-SHA256 for L2 authentication.
+fn sign_l2_request(
+    credentials: &ApiCredentials,
+    method: &str,
+    path: &str,
+    timestamp: &str,
+    body: Option<&str>,
+) -> Result<String> {
+    // Build the message: timestamp + method + path + body
+    let message = match body {
+        Some(b) => format!("{}{}{}{}", timestamp, method, path, b),
+        None => format!("{}{}{}", timestamp, method, path),
+    };
+
+    // Decode the secret (it's base64 encoded)
+    let secret_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&credentials.api_secret)
+        .map_err(|e| Error::Signing {
+            message: format!("Invalid API secret encoding: {}", e),
+        })?;
+
+    // Create HMAC-SHA256
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes).map_err(|e| Error::Signing {
+        message: format!("Failed to create HMAC: {}", e),
+    })?;
+
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+
+    // Return as base64
+    Ok(base64::engine::general_purpose::STANDARD.encode(result.into_bytes()))
+}
+
+impl std::fmt::Debug for AuthenticatedClobClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthenticatedClobClient")
+            .field("address", &self.address())
+            .field("has_credentials", &self.has_credentials())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod authenticated_tests {
+    use super::*;
+    use alloy_signer_local::PrivateKeySigner;
+    use std::str::FromStr;
+
+    const TEST_PRIVATE_KEY: &str =
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    fn test_auth_client() -> AuthenticatedClobClient {
+        let client = ClobClient::new(None, None);
+        let signer = PrivateKeySigner::from_str(TEST_PRIVATE_KEY).unwrap();
+        let order_signer = OrderSigner::new(signer);
+        AuthenticatedClobClient::new(client, order_signer)
+    }
+
+    #[test]
+    fn test_authenticated_client_creation() {
+        let auth_client = test_auth_client();
+        assert!(!auth_client.has_credentials());
+        assert!(auth_client.address().starts_with("0x"));
+    }
+
+    #[test]
+    fn test_set_credentials() {
+        let mut auth_client = test_auth_client();
+        assert!(!auth_client.has_credentials());
+
+        auth_client.set_credentials(ApiCredentials::new(
+            "key".to_string(),
+            "c2VjcmV0".to_string(), // "secret" in base64
+            "pass".to_string(),
+        ));
+
+        assert!(auth_client.has_credentials());
+    }
+
+    #[tokio::test]
+    async fn test_create_order() {
+        let auth_client = test_auth_client();
+
+        let signed = auth_client
+            .create_order(
+                "12345",
+                crate::signing::OrderSide::Buy,
+                Decimal::new(50, 2), // 0.50
+                Decimal::from(100),  // 100 USDC
+                3600,                // 1 hour
+            )
+            .await
+            .unwrap();
+
+        assert!(signed.signature.starts_with("0x"));
+        assert_eq!(signed.side, "BUY");
+    }
+
+    #[test]
+    fn test_sign_l2_request() {
+        let credentials = ApiCredentials::new(
+            "test-key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode("test-secret"),
+            "test-passphrase".to_string(),
+        );
+
+        let signature = sign_l2_request(
+            &credentials,
+            "POST",
+            "/order",
+            "1700000000",
+            Some(r#"{"order":"data"}"#),
+        )
+        .unwrap();
+
+        // Should be valid base64
+        assert!(base64::engine::general_purpose::STANDARD
+            .decode(&signature)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_sign_l2_request_no_body() {
+        let credentials = ApiCredentials::new(
+            "test-key".to_string(),
+            base64::engine::general_purpose::STANDARD.encode("test-secret"),
+            "test-passphrase".to_string(),
+        );
+
+        let signature = sign_l2_request(
+            &credentials,
+            "GET",
+            "/orders",
+            "1700000000",
+            None,
+        )
+        .unwrap();
+
+        assert!(base64::engine::general_purpose::STANDARD
+            .decode(&signature)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_debug_does_not_expose_credentials() {
+        let mut auth_client = test_auth_client();
+        auth_client.set_credentials(ApiCredentials::new(
+            "secret-key".to_string(),
+            "c2VjcmV0".to_string(),
+            "secret-pass".to_string(),
+        ));
+
+        let debug_str = format!("{:?}", auth_client);
+        assert!(!debug_str.contains("secret-key"));
+        assert!(!debug_str.contains("secret-pass"));
     }
 }
