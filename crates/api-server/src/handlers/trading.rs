@@ -7,11 +7,18 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::sync::Arc;
+use tracing::info;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use polymarket_core::types::{
+    LimitOrder as CoreLimitOrder, MarketOrder as CoreMarketOrder,
+    OrderSide as CoreOrderSide, OrderStatus as CoreOrderStatus,
+};
+
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::websocket::{SignalType, SignalUpdate};
 
 /// Order side.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -156,13 +163,187 @@ pub async fn place_order(
     State(state): State<Arc<AppState>>,
     Json(request): Json<PlaceOrderRequest>,
 ) -> ApiResult<Json<OrderResponse>> {
+    // Check circuit breaker before processing any orders
+    if !state.circuit_breaker.can_trade().await {
+        let cb_state = state.circuit_breaker.state().await;
+        return Err(ApiError::ServiceUnavailable(format!(
+            "Trading halted: {:?}. Resumes at {:?}",
+            cb_state.trip_reason.unwrap_or(risk_manager::circuit_breaker::TripReason::Manual),
+            cb_state.resume_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "unknown".to_string())
+        )));
+    }
+
     // Validate the order request
     validate_order_request(&request)?;
 
-    let order_id = Uuid::new_v4();
     let now = Utc::now();
 
-    // Insert order into database
+    // Convert to core types
+    let core_side = match request.side {
+        OrderSide::Buy => CoreOrderSide::Buy,
+        OrderSide::Sell => CoreOrderSide::Sell,
+    };
+
+    // Execute based on order type
+    let report = match request.order_type {
+        OrderType::Market => {
+            let order = CoreMarketOrder::new(
+                request.market_id.clone(),
+                request.outcome.clone(),
+                core_side,
+                request.quantity,
+            );
+            state
+                .order_executor
+                .execute_market_order(order)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Execution error: {}", e)))?
+        }
+        OrderType::Limit => {
+            let price = request
+                .price
+                .ok_or(ApiError::BadRequest("Limit orders require a price".into()))?;
+            let order = CoreLimitOrder::new(
+                request.market_id.clone(),
+                request.outcome.clone(),
+                core_side,
+                price,
+                request.quantity,
+            );
+            state
+                .order_executor
+                .execute_limit_order(order)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Execution error: {}", e)))?
+        }
+        OrderType::StopLoss | OrderType::TakeProfit => {
+            // Stop-loss and take-profit orders are handled by the risk manager
+            // For now, just store them as pending orders
+            return store_conditional_order(&state, &request, now).await;
+        }
+    };
+
+    // Determine final status from execution report
+    let (status, filled_qty, avg_price, filled_at) = match report.status {
+        CoreOrderStatus::Filled => (
+            OrderStatus::Filled,
+            report.filled_quantity,
+            Some(report.average_price),
+            Some(report.executed_at),
+        ),
+        CoreOrderStatus::PartiallyFilled => (
+            OrderStatus::PartiallyFilled,
+            report.filled_quantity,
+            Some(report.average_price),
+            Some(report.executed_at),
+        ),
+        CoreOrderStatus::Rejected => {
+            return Err(ApiError::BadRequest(
+                report.error_message.unwrap_or("Order rejected".into()),
+            ));
+        }
+        _ => (OrderStatus::Pending, Decimal::ZERO, None, None),
+    };
+
+    let order_id = report.order_id;
+
+    // Insert order into database with execution results
+    sqlx::query(
+        r#"
+        INSERT INTO orders
+        (id, client_order_id, market_id, outcome, side, order_type, status,
+         quantity, filled_quantity, price, avg_fill_price, stop_price, time_in_force,
+         created_at, updated_at, filled_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, $15)
+        "#,
+    )
+    .bind(order_id)
+    .bind(&request.client_order_id)
+    .bind(&request.market_id)
+    .bind(&request.outcome)
+    .bind(format!("{:?}", request.side).to_lowercase())
+    .bind(format!("{:?}", request.order_type).to_lowercase())
+    .bind(format!("{:?}", status).to_lowercase())
+    .bind(request.quantity)
+    .bind(filled_qty)
+    .bind(request.price)
+    .bind(avg_price)
+    .bind(request.stop_price)
+    .bind(&request.time_in_force)
+    .bind(now)
+    .bind(filled_at)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Log execution
+    info!(
+        order_id = %order_id,
+        market = %request.market_id,
+        status = ?status,
+        filled = %filled_qty,
+        live = %state.order_executor.is_live(),
+        "Order executed"
+    );
+
+    // Record trade for circuit breaker tracking
+    // Note: PnL is calculated as: total_value for buys (cost), negative for sells (proceeds)
+    // This is a simplified approximation - real PnL requires position tracking
+    if report.is_success() {
+        let trade_value = report.total_value();
+        // For now, we don't have realized PnL without position tracking
+        // Just record the trade value to track volume; actual PnL tracking needs position manager
+        let _ = state.circuit_breaker.record_trade(Decimal::ZERO, true).await;
+    }
+
+    // Publish signal for successful fills
+    if report.is_success() {
+        let _ = state.publish_signal(SignalUpdate {
+            signal_id: Uuid::new_v4(),
+            signal_type: SignalType::Alert,
+            market_id: request.market_id.clone(),
+            outcome_id: request.outcome.clone(),
+            action: format!("order_{}", format!("{:?}", status).to_lowercase()),
+            confidence: 1.0,
+            timestamp: now,
+            metadata: serde_json::json!({
+                "order_id": order_id,
+                "side": format!("{:?}", request.side).to_lowercase(),
+                "filled_quantity": filled_qty,
+                "avg_price": avg_price,
+            }),
+        });
+    }
+
+    Ok(Json(OrderResponse {
+        id: order_id,
+        client_order_id: request.client_order_id,
+        market_id: request.market_id,
+        outcome: request.outcome,
+        side: request.side,
+        order_type: request.order_type,
+        status,
+        quantity: request.quantity,
+        filled_quantity: filled_qty,
+        remaining_quantity: request.quantity - filled_qty,
+        price: request.price,
+        avg_fill_price: avg_price,
+        stop_price: request.stop_price,
+        time_in_force: request.time_in_force,
+        created_at: now,
+        updated_at: now,
+        filled_at,
+    }))
+}
+
+/// Store a conditional order (stop-loss/take-profit) without immediate execution.
+async fn store_conditional_order(
+    state: &Arc<AppState>,
+    request: &PlaceOrderRequest,
+    now: DateTime<Utc>,
+) -> ApiResult<Json<OrderResponse>> {
+    let order_id = Uuid::new_v4();
+
     sqlx::query(
         r#"
         INSERT INTO orders
@@ -188,14 +369,18 @@ pub async fn place_order(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // In a real implementation, this would submit to the order execution engine
-    // For now, we just return the created order
+    info!(
+        order_id = %order_id,
+        order_type = ?request.order_type,
+        stop_price = ?request.stop_price,
+        "Conditional order stored"
+    );
 
     Ok(Json(OrderResponse {
         id: order_id,
-        client_order_id: request.client_order_id,
-        market_id: request.market_id,
-        outcome: request.outcome,
+        client_order_id: request.client_order_id.clone(),
+        market_id: request.market_id.clone(),
+        outcome: request.outcome.clone(),
         side: request.side,
         order_type: request.order_type,
         status: OrderStatus::Pending,
@@ -205,7 +390,7 @@ pub async fn place_order(
         price: request.price,
         avg_fill_price: None,
         stop_price: request.stop_price,
-        time_in_force: request.time_in_force,
+        time_in_force: request.time_in_force.clone(),
         created_at: now,
         updated_at: now,
         filled_at: None,

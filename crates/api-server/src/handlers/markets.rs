@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::sync::Arc;
+use tracing::warn;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::error::{ApiError, ApiResult};
@@ -128,28 +129,105 @@ struct MarketRow {
     )
 )]
 pub async fn list_markets(
-    State(_state): State<Arc<AppState>>,
-    Query(_query): Query<ListMarketsQuery>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListMarketsQuery>,
 ) -> ApiResult<Json<Vec<MarketResponse>>> {
-    // For now, return mock data since we don't have the full schema
-    // In production, this would query the actual database
-    let markets = vec![
-        MarketResponse {
-            id: "market_1".to_string(),
-            question: "Will BTC reach $100k by end of 2026?".to_string(),
-            description: Some("Bitcoin price prediction market".to_string()),
-            category: "crypto".to_string(),
-            end_date: Utc::now() + chrono::Duration::days(365),
-            active: true,
-            yes_price: Decimal::new(65, 2),
-            no_price: Decimal::new(35, 2),
-            volume_24h: Decimal::new(1000000, 2),
-            liquidity: Decimal::new(5000000, 2),
-            created_at: Utc::now(),
-        },
-    ];
+    // Fetch markets from ClobClient
+    let clob_markets = state
+        .clob_client
+        .get_markets()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Failed to fetch markets from CLOB");
+            ApiError::Internal(format!("Failed to fetch markets: {}", e))
+        })?;
+
+    // Filter and transform to response format
+    let now = Utc::now();
+    let mut markets: Vec<MarketResponse> = clob_markets
+        .into_iter()
+        .filter(|m| {
+            // Filter by active status (not resolved)
+            let active = !m.resolved;
+            if let Some(q_active) = query.active {
+                if active != q_active {
+                    return false;
+                }
+            }
+
+            // Filter by minimum volume
+            if let Some(min_vol) = query.min_volume {
+                if m.volume < min_vol {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .map(|m| {
+            // Calculate yes/no prices from outcomes if available
+            let (yes_price, no_price) = if m.outcomes.len() >= 2 {
+                // Best estimate: complement each other to ~1.0
+                (Decimal::new(50, 2), Decimal::new(50, 2))
+            } else {
+                (Decimal::ZERO, Decimal::ZERO)
+            };
+
+            // Determine category from question content
+            let category = infer_category(&m.question);
+
+            MarketResponse {
+                id: m.id,
+                question: m.question,
+                description: m.description,
+                category,
+                end_date: m.end_date.unwrap_or(now + chrono::Duration::days(365)),
+                active: !m.resolved,
+                yes_price,
+                no_price,
+                volume_24h: m.volume,
+                liquidity: m.liquidity,
+                created_at: now, // CLOB doesn't provide created_at
+            }
+        })
+        .collect();
+
+    // Apply category filter
+    if let Some(ref cat) = query.category {
+        markets.retain(|m| m.category.to_lowercase().contains(&cat.to_lowercase()));
+    }
+
+    // Apply pagination
+    let total = markets.len();
+    let offset = query.offset as usize;
+    let limit = query.limit as usize;
+
+    if offset < total {
+        markets = markets.into_iter().skip(offset).take(limit).collect();
+    } else {
+        markets = Vec::new();
+    }
 
     Ok(Json(markets))
+}
+
+/// Infer category from market question.
+fn infer_category(question: &str) -> String {
+    let q = question.to_lowercase();
+
+    if q.contains("bitcoin") || q.contains("btc") || q.contains("ethereum") || q.contains("crypto") {
+        "crypto".to_string()
+    } else if q.contains("president") || q.contains("election") || q.contains("congress") || q.contains("senate") {
+        "politics".to_string()
+    } else if q.contains("nfl") || q.contains("nba") || q.contains("world cup") || q.contains("super bowl") {
+        "sports".to_string()
+    } else if q.contains("stock") || q.contains("s&p") || q.contains("nasdaq") || q.contains("fed") {
+        "finance".to_string()
+    } else if q.contains("ai") || q.contains("openai") || q.contains("google") || q.contains("apple") {
+        "tech".to_string()
+    } else {
+        "other".to_string()
+    }
 }
 
 /// Get a specific market.
@@ -215,38 +293,113 @@ pub async fn get_market(
     )
 )]
 pub async fn get_market_orderbook(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<OrderbookResponse>> {
-    // In production, this would fetch from the orderbook cache or API
-    // For now, return mock data
+    // First, get the market to find outcome token IDs
+    let markets = state
+        .clob_client
+        .get_markets()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch markets: {}", e)))?;
+
+    let market = markets
+        .iter()
+        .find(|m| m.id == market_id)
+        .ok_or_else(|| ApiError::NotFound(format!("Market {} not found", market_id)))?;
+
+    // Get token IDs for yes/no outcomes
+    let (yes_token, no_token) = if market.outcomes.len() >= 2 {
+        let yes = market.outcomes.iter().find(|o| o.name.to_lowercase().contains("yes"));
+        let no = market.outcomes.iter().find(|o| o.name.to_lowercase().contains("no"));
+        (
+            yes.map(|o| o.token_id.clone()),
+            no.map(|o| o.token_id.clone()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let now = Utc::now();
+
+    // Fetch orderbooks for both outcomes
+    let (yes_bids, yes_asks) = if let Some(token_id) = yes_token {
+        match state.clob_client.get_order_book(&token_id).await {
+            Ok(book) => (
+                book.bids.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
+                book.asks.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
+            ),
+            Err(e) => {
+                warn!(error = %e, token_id = %token_id, "Failed to fetch yes orderbook");
+                (Vec::new(), Vec::new())
+            }
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let (no_bids, no_asks) = if let Some(token_id) = no_token {
+        match state.clob_client.get_order_book(&token_id).await {
+            Ok(book) => (
+                book.bids.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
+                book.asks.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
+            ),
+            Err(e) => {
+                warn!(error = %e, token_id = %token_id, "Failed to fetch no orderbook");
+                (Vec::new(), Vec::new())
+            }
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // Calculate spreads
+    let yes_spread = calculate_spread(&yes_bids, &yes_asks);
+    let no_spread = calculate_spread(&no_bids, &no_asks);
+    let arb_spread = calculate_arb_spread(&yes_asks, &no_asks);
+
     let orderbook = OrderbookResponse {
-        market_id: market_id.clone(),
-        timestamp: Utc::now(),
-        yes_bids: vec![
-            PriceLevel { price: Decimal::new(64, 2), size: Decimal::new(1000, 0) },
-            PriceLevel { price: Decimal::new(63, 2), size: Decimal::new(2000, 0) },
-        ],
-        yes_asks: vec![
-            PriceLevel { price: Decimal::new(65, 2), size: Decimal::new(1500, 0) },
-            PriceLevel { price: Decimal::new(66, 2), size: Decimal::new(2500, 0) },
-        ],
-        no_bids: vec![
-            PriceLevel { price: Decimal::new(34, 2), size: Decimal::new(1000, 0) },
-            PriceLevel { price: Decimal::new(33, 2), size: Decimal::new(2000, 0) },
-        ],
-        no_asks: vec![
-            PriceLevel { price: Decimal::new(35, 2), size: Decimal::new(1500, 0) },
-            PriceLevel { price: Decimal::new(36, 2), size: Decimal::new(2500, 0) },
-        ],
+        market_id,
+        timestamp: now,
+        yes_bids,
+        yes_asks,
+        no_bids,
+        no_asks,
         spread: SpreadInfo {
-            yes_spread: Decimal::new(1, 2),
-            no_spread: Decimal::new(1, 2),
-            arb_spread: None,
+            yes_spread,
+            no_spread,
+            arb_spread,
         },
     };
 
     Ok(Json(orderbook))
+}
+
+/// Calculate bid-ask spread.
+fn calculate_spread(bids: &[PriceLevel], asks: &[PriceLevel]) -> Decimal {
+    let best_bid = bids.first().map(|p| p.price).unwrap_or(Decimal::ZERO);
+    let best_ask = asks.first().map(|p| p.price).unwrap_or(Decimal::ZERO);
+
+    if best_bid > Decimal::ZERO && best_ask > Decimal::ZERO {
+        best_ask - best_bid
+    } else {
+        Decimal::ZERO
+    }
+}
+
+/// Calculate arbitrage spread (if buying both outcomes costs less than $1).
+fn calculate_arb_spread(yes_asks: &[PriceLevel], no_asks: &[PriceLevel]) -> Option<Decimal> {
+    let yes_ask = yes_asks.first().map(|p| p.price)?;
+    let no_ask = no_asks.first().map(|p| p.price)?;
+
+    let total_cost = yes_ask + no_ask;
+
+    // If total cost < 1.0, there's profit potential
+    if total_cost < Decimal::ONE {
+        Some(Decimal::ONE - total_cost)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

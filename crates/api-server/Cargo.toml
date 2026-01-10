@@ -50,6 +50,9 @@ tracing.workspace = true
 # Database
 sqlx.workspace = true
 
+# Redis
+redis.workspace = true
+
 # OpenAPI documentation
 utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "6", features = ["axum"] }

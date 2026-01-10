@@ -19,13 +19,18 @@
 //! server.run().await?;
 //! ```
 
+pub mod copy_trading;
 pub mod error;
 pub mod handlers;
+pub mod middleware;
+pub mod redis_forwarder;
 pub mod routes;
 pub mod state;
 pub mod websocket;
 
+pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use error::ApiError;
+pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
 
@@ -147,6 +152,14 @@ impl ApiServer {
 
     /// Run the server.
     pub async fn run(self) -> anyhow::Result<()> {
+        // Spawn Redis forwarder for signal bridging
+        let redis_config = RedisForwarderConfig::from_env();
+        spawn_redis_forwarder(
+            redis_config,
+            self.state.signal_tx.clone(),
+            self.state.orderbook_tx.clone(),
+        );
+
         let addr = self.config.socket_addr();
         info!(address = %addr, "Starting API server");
 

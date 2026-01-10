@@ -5,10 +5,17 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
+use tracing::{error, info};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
+
+use backtester::{
+    ArbitrageStrategy, BacktestSimulator, DataQuery, HistoricalDataStore,
+    MeanReversionStrategy, MomentumStrategy, SimulatorConfig, Strategy,
+    SlippageModel as BacktesterSlippageModel,
+};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -280,13 +287,13 @@ pub async fn run_backtest(
     let slippage_json = serde_json::to_value(&request.slippage_model)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Insert backtest record
+    // Insert backtest record with 'running' status
     sqlx::query(
         r#"
         INSERT INTO backtest_results
         (id, strategy, start_date, end_date, initial_capital, slippage_model,
          fee_pct, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', $8)
         "#,
     )
     .bind(result_id)
@@ -301,8 +308,30 @@ pub async fn run_backtest(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // In a real implementation, this would spawn a background task to run the backtest
-    // For now, we return the pending result
+    // Spawn background task to run the backtest
+    let pool = state.pool.clone();
+    let strategy_config = request.strategy.clone();
+    let start_date = request.start_date;
+    let end_date = request.end_date;
+    let initial_capital = request.initial_capital;
+    let fee_pct = request.fee_pct;
+    let slippage_model = request.slippage_model.clone();
+
+    tokio::spawn(async move {
+        run_backtest_task(
+            pool,
+            result_id,
+            strategy_config,
+            start_date,
+            end_date,
+            initial_capital,
+            fee_pct,
+            slippage_model,
+        )
+        .await;
+    });
+
+    info!(backtest_id = %result_id, "Backtest task spawned");
 
     Ok(Json(BacktestResultResponse {
         id: result_id,
@@ -327,10 +356,178 @@ pub async fn run_backtest(
         profit_factor: Decimal::ZERO,
         total_fees: Decimal::ZERO,
         created_at: now,
-        status: "pending".to_string(),
+        status: "running".to_string(),
         error: None,
         equity_curve: None,
     }))
+}
+
+/// Background task to run the backtest.
+async fn run_backtest_task(
+    pool: PgPool,
+    result_id: Uuid,
+    strategy_config: StrategyConfig,
+    start_date: DateTime<Utc>,
+    end_date: DateTime<Utc>,
+    initial_capital: Decimal,
+    fee_pct: Decimal,
+    slippage_model: SlippageModel,
+) {
+    info!(backtest_id = %result_id, "Starting backtest execution");
+
+    // Create data store
+    let data_store = HistoricalDataStore::new(pool.clone());
+
+    // Convert slippage model
+    let backtester_slippage = match slippage_model {
+        SlippageModel::None => BacktesterSlippageModel::None,
+        SlippageModel::Fixed { pct } => BacktesterSlippageModel::Fixed(pct),
+        SlippageModel::VolumeBased { base_pct, volume_factor } => {
+            BacktesterSlippageModel::VolumeBased {
+                base_pct,
+                size_impact: volume_factor,
+            }
+        }
+    };
+
+    // Configure simulator
+    let simulator_config = SimulatorConfig {
+        initial_capital,
+        trading_fee_pct: fee_pct,
+        slippage_model: backtester_slippage,
+        ..Default::default()
+    };
+
+    let simulator = BacktestSimulator::new(data_store, simulator_config);
+
+    // Create strategy from config
+    let result = match strategy_config {
+        StrategyConfig::Arbitrage { min_spread, max_position } => {
+            // ArbitrageStrategy::new takes (min_spread, position_size, max_positions)
+            let mut strategy = ArbitrageStrategy::new(min_spread, max_position, 10);
+            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+        }
+        StrategyConfig::Momentum { lookback_hours, threshold, position_size } => {
+            // MomentumStrategy uses Default with field assignment
+            let mut strategy = MomentumStrategy {
+                lookback_periods: lookback_hours as usize,
+                momentum_threshold: threshold,
+                position_size,
+            };
+            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+        }
+        StrategyConfig::MeanReversion { window_hours, std_threshold, position_size } => {
+            // MeanReversionStrategy uses Default with field assignment
+            let mut strategy = MeanReversionStrategy {
+                lookback_periods: window_hours as usize,
+                entry_std_devs: std_threshold.to_string().parse().unwrap_or(2.0),
+                position_size,
+            };
+            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+        }
+        StrategyConfig::CopyTrading { .. } => {
+            // Copy trading strategy requires wallet tracking - not supported in backtest yet
+            Err(anyhow::anyhow!("Copy trading strategy not supported in backtests"))
+        }
+    };
+
+    // Update database with results
+    match result {
+        Ok(backtest_result) => {
+            // Serialize equity curve
+            let equity_curve: Vec<EquityPoint> = backtest_result
+                .equity_curve
+                .iter()
+                .map(|(timestamp, value)| EquityPoint {
+                    timestamp: *timestamp,
+                    value: *value,
+                    drawdown_pct: Decimal::ZERO, // Simplified
+                })
+                .collect();
+            let equity_json = serde_json::to_value(&equity_curve).ok();
+
+            let update_result = sqlx::query(
+                r#"
+                UPDATE backtest_results SET
+                    status = 'completed',
+                    final_value = $2,
+                    total_return = $3,
+                    total_return_pct = $4,
+                    annualized_return = $5,
+                    sharpe_ratio = $6,
+                    sortino_ratio = $7,
+                    max_drawdown = $8,
+                    max_drawdown_pct = $8,
+                    total_trades = $9,
+                    winning_trades = $10,
+                    losing_trades = $11,
+                    win_rate = $12,
+                    profit_factor = $13,
+                    total_fees = $14,
+                    equity_curve = $15
+                WHERE id = $1
+                "#,
+            )
+            .bind(result_id)
+            .bind(backtest_result.final_value)
+            .bind(backtest_result.total_return)
+            .bind(Decimal::try_from(backtest_result.return_pct).unwrap_or(Decimal::ZERO))
+            .bind(Decimal::try_from(backtest_result.annualized_return).unwrap_or(Decimal::ZERO))
+            .bind(Decimal::try_from(backtest_result.sharpe_ratio).unwrap_or(Decimal::ZERO))
+            .bind(Decimal::try_from(backtest_result.sortino_ratio).unwrap_or(Decimal::ZERO))
+            .bind(Decimal::try_from(backtest_result.max_drawdown).unwrap_or(Decimal::ZERO))
+            .bind(backtest_result.total_trades as i64)
+            .bind(backtest_result.winning_trades as i64)
+            .bind(backtest_result.losing_trades as i64)
+            .bind(Decimal::try_from(backtest_result.win_rate).unwrap_or(Decimal::ZERO))
+            .bind(Decimal::try_from(backtest_result.profit_factor).unwrap_or(Decimal::ZERO))
+            .bind(backtest_result.total_fees)
+            .bind(equity_json)
+            .execute(&pool)
+            .await;
+
+            match update_result {
+                Ok(_) => {
+                    info!(
+                        backtest_id = %result_id,
+                        final_value = %backtest_result.final_value,
+                        return_pct = %backtest_result.return_pct,
+                        "Backtest completed successfully"
+                    );
+                }
+                Err(e) => {
+                    error!(backtest_id = %result_id, error = %e, "Failed to update backtest results");
+                }
+            }
+        }
+        Err(e) => {
+            let error_msg = e.to_string();
+            let update_result = sqlx::query(
+                "UPDATE backtest_results SET status = 'failed', error = $2 WHERE id = $1",
+            )
+            .bind(result_id)
+            .bind(&error_msg)
+            .execute(&pool)
+            .await;
+
+            if let Err(db_err) = update_result {
+                error!(backtest_id = %result_id, error = %db_err, "Failed to update backtest error");
+            }
+
+            error!(backtest_id = %result_id, error = %error_msg, "Backtest failed");
+        }
+    }
+}
+
+/// Run a strategy through the simulator.
+async fn run_strategy<S: Strategy>(
+    simulator: &BacktestSimulator,
+    strategy: &mut S,
+    start_date: DateTime<Utc>,
+    end_date: DateTime<Utc>,
+) -> anyhow::Result<backtester::BacktestResult> {
+    let query = DataQuery::range(start_date, end_date);
+    simulator.run(strategy, query).await
 }
 
 /// List backtest results.
