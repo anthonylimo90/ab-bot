@@ -26,7 +26,6 @@ target/
 !.env.example
 
 # Docker
-Dockerfile*
 docker-compose*.yml
 .dockerignore
 
@@ -45,6 +44,3 @@ Thumbs.db
 # Logs
 *.log
 logs/
-
-# Dashboard (built separately)
-dashboard/
