@@ -50,6 +50,12 @@ COPY --from=builder /app/target/release/bot-scanner /app/bot-scanner
 # Copy migrations
 COPY --from=builder /app/migrations /app/migrations
 
+# Create entrypoint script that reads SERVICE env var
+RUN echo '#!/bin/bash\n\
+SERVICE=${SERVICE:-api-server}\n\
+echo "Starting service: $SERVICE"\n\
+exec ./$SERVICE' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
 # Set ownership
 RUN chown -R appuser:appuser /app
 
@@ -59,15 +65,9 @@ USER appuser
 ENV RUST_LOG=info
 ENV API_HOST=0.0.0.0
 ENV API_PORT=3000
+ENV SERVICE=api-server
 
 EXPOSE 3000
 
-# Health check disabled - Railway handles healthchecks
-# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-#     CMD curl -f http://localhost:3000/health || exit 1
-
-# Default command - API server
-# For other services, override with RAILWAY_START_COMMAND environment variable:
-#   arb-monitor: RAILWAY_START_COMMAND=./arb-monitor
-#   bot-scanner: RAILWAY_START_COMMAND=./bot-scanner
-CMD ["./api-server"]
+# Use entrypoint script
+ENTRYPOINT ["/app/entrypoint.sh"]
