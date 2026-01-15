@@ -1,19 +1,43 @@
 # Railway Configuration for AB-Bot Trading Platform
 # https://docs.railway.com/reference/config-as-code
 
-[build]
-# Use Dockerfile for building
+# ============================================
+# API Server Service
+# ============================================
+[services.api-server.build]
 builder = "dockerfile"
 dockerfilePath = "./Dockerfile"
 
-[deploy]
-# Health check endpoint
+[services.api-server.deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 120
-
-# Restart on failure
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
+numReplicas = 1
 
-# Resource limits (adjust based on Railway plan)
+# ============================================
+# Arb Monitor Service
+# ============================================
+[services.arb-monitor.build]
+builder = "dockerfile"
+dockerfilePath = "./Dockerfile.arb-monitor"
+
+[services.arb-monitor.deploy]
+healthcheckPath = ""
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+numReplicas = 1
+
+# ============================================
+# Dashboard Service
+# ============================================
+[services.dashboard.build]
+builder = "dockerfile"
+dockerfilePath = "./Dockerfile.dashboard"
+
+[services.dashboard.deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
 numReplicas = 1
