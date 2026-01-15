@@ -310,6 +310,53 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 
 ## Changelog
 
+### 2026-01-15: Phase 11 - Railway Deployment Pipeline
+
+**Deployment Configuration:**
+
+- **`railway.toml`**: Railway service configuration
+  - Docker builder with existing multi-target Dockerfile
+  - Health check on `/health` endpoint
+  - Restart on failure with 5 max retries
+  - Single replica configuration
+
+- **`Dockerfile.dashboard`**: Next.js standalone containerization
+  - Multi-stage build (deps → builder → runner)
+  - Build-time environment variables via ARG
+  - Non-root user (nextjs:nodejs) for security
+  - Health check with wget
+  - Optimized for Railway deployment
+
+- **`.github/workflows/deploy.yml`**: CI/CD pipeline
+  - Triggers on push to main or manual workflow_dispatch
+  - Environment selection (production/staging)
+  - Runs CI checks before deployment
+  - Parallel deployment of api-server, arb-monitor, dashboard
+  - Post-deployment health verification with retry logic
+  - Deployment summary with commit info
+
+**Services Deployed:**
+- API Server (Rust/Axum) - Port 3000
+- Arb Monitor (Rust background worker)
+- Dashboard (Next.js) - Port 3000
+- TimescaleDB (Railway template)
+- Redis (Railway template)
+
+**Environment Variables:**
+```bash
+DATABASE_URL=${{timescaledb.DATABASE_URL}}
+REDIS_URL=${{redis.REDIS_URL}}
+JWT_SECRET=<secret>
+SKIP_MIGRATIONS=true
+NEXT_PUBLIC_API_URL=https://api-server.railway.app
+NEXT_PUBLIC_WS_URL=wss://api-server.railway.app
+```
+
+**Files Created:**
+- `railway.toml`
+- `Dockerfile.dashboard`
+- `.github/workflows/deploy.yml`
+
 ### 2026-01-15: Phase 10 - Resilience & Recovery
 
 **Position Failure States & Recovery:**

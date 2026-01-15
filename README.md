@@ -175,6 +175,57 @@ DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot sqlx migrate ru
 DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prepare --workspace
 ```
 
+## Deployment
+
+### Railway (Recommended)
+
+The project includes a GitHub Actions workflow for deploying to [Railway](https://railway.app).
+
+**Prerequisites:**
+1. Create a Railway project with the following services:
+   - TimescaleDB (from template)
+   - Redis (from template)
+   - api-server (Dockerfile)
+   - arb-monitor (Dockerfile)
+   - dashboard (Dockerfile.dashboard)
+
+2. Add the `RAILWAY_TOKEN` secret to your GitHub repository
+
+3. Set Railway environment variables:
+   ```bash
+   DATABASE_URL=${{timescaledb.DATABASE_URL}}
+   REDIS_URL=${{redis.REDIS_URL}}
+   JWT_SECRET=<generate-a-secret>
+   CORS_PERMISSIVE=false
+   SKIP_MIGRATIONS=true
+   ```
+
+4. Set dashboard build args:
+   ```bash
+   NEXT_PUBLIC_API_URL=https://your-api-server.railway.app
+   NEXT_PUBLIC_WS_URL=wss://your-api-server.railway.app
+   ```
+
+**Deployment Workflow:**
+- Push to `main` triggers automatic deployment
+- Manual deployment via GitHub Actions workflow dispatch
+- Supports staging and production environments
+
+**Configuration Files:**
+- `railway.toml` - Railway service configuration
+- `Dockerfile.dashboard` - Next.js containerization
+- `.github/workflows/deploy.yml` - CI/CD pipeline
+
+### Initial Database Migration
+
+Run migrations once after first deployment:
+
+```bash
+DATABASE_URL=$RAILWAY_DATABASE_URL cargo sqlx migrate run
+```
+
+Then set `SKIP_MIGRATIONS=true` on the API server to prevent migration conflicts.
+
 ## Dashboard Features
 
 ### Demo Mode

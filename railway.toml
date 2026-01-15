@@ -1,0 +1,19 @@
+# Railway Configuration for AB-Bot Trading Platform
+# https://docs.railway.com/reference/config-as-code
+
+[build]
+# Use existing multi-target Dockerfile
+builder = "dockerfile"
+dockerfilePath = "./Dockerfile"
+
+[deploy]
+# Health check endpoint
+healthcheckPath = "/health"
+healthcheckTimeout = 10
+
+# Restart on failure
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# Resource limits (adjust based on Railway plan)
+numReplicas = 1
