@@ -66,21 +66,8 @@ EXPOSE 3000
 # HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 #     CMD curl -f http://localhost:3000/health || exit 1
 
-# Default command
+# Default command - API server
+# For other services, override with RAILWAY_START_COMMAND environment variable:
+#   arb-monitor: RAILWAY_START_COMMAND=./arb-monitor
+#   bot-scanner: RAILWAY_START_COMMAND=./bot-scanner
 CMD ["./api-server"]
-
-# ==============================================================================
-# Alternative targets for specific services
-# ==============================================================================
-
-# API Server target
-FROM runtime AS api-server
-CMD ["./api-server"]
-
-# Arb Monitor target
-FROM runtime AS arb-monitor
-CMD ["./arb-monitor"]
-
-# Bot Scanner target
-FROM runtime AS bot-scanner
-CMD ["./bot-scanner"]

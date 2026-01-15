@@ -2,10 +2,9 @@
 # https://docs.railway.com/reference/config-as-code
 
 [build]
-# Use existing multi-target Dockerfile
+# Use Dockerfile for building
 builder = "dockerfile"
 dockerfilePath = "./Dockerfile"
-dockerfileTarget = "api-server"
 
 [deploy]
 # Health check endpoint
