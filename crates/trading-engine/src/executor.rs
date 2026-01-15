@@ -6,9 +6,7 @@ use dashmap::DashMap;
 use polymarket_core::api::clob::{ApiCredentials, AuthenticatedClobClient, OrderType};
 use polymarket_core::api::ClobClient;
 use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
-use polymarket_core::types::{
-    ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus,
-};
+use polymarket_core::types::{ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -39,6 +37,14 @@ pub struct ExecutorConfig {
     pub live_trading: bool,
     /// API key for authenticated trading.
     pub api_key: Option<String>,
+    /// Timeout for order execution in milliseconds.
+    pub timeout_ms: u64,
+    /// Maximum number of retry attempts for transient failures.
+    pub max_retries: u32,
+    /// Base delay between retries in milliseconds (exponential backoff).
+    pub retry_base_delay_ms: u64,
+    /// Maximum delay between retries in milliseconds.
+    pub retry_max_delay_ms: u64,
 }
 
 impl Default for ExecutorConfig {
@@ -49,8 +55,43 @@ impl Default for ExecutorConfig {
             fee_rate: Decimal::new(2, 2), // 2%
             live_trading: false,
             api_key: None,
+            timeout_ms: 30000,        // 30 seconds default timeout
+            max_retries: 3,           // 3 retry attempts
+            retry_base_delay_ms: 100, // 100ms initial delay
+            retry_max_delay_ms: 5000, // 5 second max delay
         }
     }
+}
+
+/// Result of a retry operation.
+#[derive(Debug, Clone)]
+pub enum RetryOutcome<T> {
+    /// Operation succeeded.
+    Success(T),
+    /// Operation failed after all retries.
+    Failed { last_error: String, attempts: u32 },
+    /// Operation timed out.
+    Timeout { elapsed_ms: u64 },
+}
+
+/// Determines if an error should trigger a retry.
+fn is_retryable_error(error: &str) -> bool {
+    let retryable_patterns = [
+        "timeout",
+        "connection",
+        "network",
+        "temporarily unavailable",
+        "rate limit",
+        "503",
+        "502",
+        "504",
+        "etimedout",
+        "econnreset",
+        "econnrefused",
+    ];
+
+    let error_lower = error.to_lowercase();
+    retryable_patterns.iter().any(|p| error_lower.contains(p))
 }
 
 /// Low-latency order executor for Polymarket CLOB.
@@ -143,9 +184,10 @@ impl OrderExecutor {
         })?;
 
         let mut client = auth_client.write().await;
-        client.derive_api_key().await.map_err(|e| {
-            anyhow::anyhow!("Failed to derive API credentials: {}", e)
-        })?;
+        client
+            .derive_api_key()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to derive API credentials: {}", e))?;
 
         info!("Live trading initialized - API credentials derived");
         Ok(())
@@ -179,7 +221,7 @@ impl OrderExecutor {
         self.report_rx.take()
     }
 
-    /// Execute a market order.
+    /// Execute a market order with timeout and retry logic.
     pub async fn execute_market_order(&self, order: MarketOrder) -> Result<ExecutionReport> {
         let start = std::time::Instant::now();
 
@@ -190,7 +232,10 @@ impl OrderExecutor {
                 order.market_id.clone(),
                 order.outcome_id.clone(),
                 order.side,
-                format!("Order size {} exceeds maximum {}", order.quantity, self.config.max_order_size),
+                format!(
+                    "Order size {} exceeds maximum {}",
+                    order.quantity, self.config.max_order_size
+                ),
             );
             self.send_report(report.clone()).await;
             return Ok(report);
@@ -205,11 +250,22 @@ impl OrderExecutor {
             "Executing market order"
         );
 
-        let report = if self.config.live_trading {
-            self.execute_live_market_order(&order).await?
-        } else {
-            self.simulate_market_order(&order).await?
-        };
+        // Execute with retry logic
+        let report = self
+            .execute_with_retry(
+                || async {
+                    if self.config.live_trading {
+                        self.execute_live_market_order(&order).await
+                    } else {
+                        self.simulate_market_order(&order).await
+                    }
+                },
+                &order.id,
+                &order.market_id,
+                &order.outcome_id,
+                order.side,
+            )
+            .await;
 
         // Update metrics
         {
@@ -223,8 +279,8 @@ impl OrderExecutor {
                 metrics.orders_rejected += 1;
             }
             let latency_us = start.elapsed().as_micros() as u64;
-            metrics.avg_latency_us =
-                (metrics.avg_latency_us * (metrics.orders_submitted - 1) + latency_us)
+            metrics.avg_latency_us = (metrics.avg_latency_us * (metrics.orders_submitted - 1)
+                + latency_us)
                 / metrics.orders_submitted;
         }
 
@@ -241,7 +297,121 @@ impl OrderExecutor {
         Ok(report)
     }
 
-    /// Execute a limit order.
+    /// Execute an operation with timeout and exponential backoff retry.
+    async fn execute_with_retry<F, Fut>(
+        &self,
+        operation: F,
+        order_id: &Uuid,
+        market_id: &str,
+        outcome_id: &str,
+        side: OrderSide,
+    ) -> ExecutionReport
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<ExecutionReport>>,
+    {
+        let timeout = std::time::Duration::from_millis(self.config.timeout_ms);
+        let mut attempts = 0u32;
+        let mut last_error = String::new();
+
+        while attempts <= self.config.max_retries {
+            attempts += 1;
+
+            // Execute with timeout
+            let result = tokio::time::timeout(timeout, operation()).await;
+
+            match result {
+                Ok(Ok(report)) => {
+                    if attempts > 1 {
+                        info!(
+                            order_id = %order_id,
+                            attempts = attempts,
+                            "Order succeeded after retry"
+                        );
+                    }
+                    return report;
+                }
+                Ok(Err(e)) => {
+                    last_error = e.to_string();
+
+                    // Check if this is a retryable error
+                    if !is_retryable_error(&last_error) {
+                        warn!(
+                            order_id = %order_id,
+                            error = %last_error,
+                            "Non-retryable error, failing immediately"
+                        );
+                        return ExecutionReport::rejected(
+                            *order_id,
+                            market_id.to_string(),
+                            outcome_id.to_string(),
+                            side,
+                            last_error,
+                        );
+                    }
+
+                    if attempts <= self.config.max_retries {
+                        // Calculate exponential backoff delay
+                        let delay_ms = std::cmp::min(
+                            self.config.retry_base_delay_ms * (2_u64.pow(attempts - 1)),
+                            self.config.retry_max_delay_ms,
+                        );
+
+                        warn!(
+                            order_id = %order_id,
+                            attempt = attempts,
+                            max_attempts = self.config.max_retries + 1,
+                            error = %last_error,
+                            retry_delay_ms = delay_ms,
+                            "Retryable error, will retry"
+                        );
+
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+                Err(_) => {
+                    // Timeout
+                    last_error = format!("Operation timed out after {}ms", self.config.timeout_ms);
+
+                    if attempts <= self.config.max_retries {
+                        let delay_ms = std::cmp::min(
+                            self.config.retry_base_delay_ms * (2_u64.pow(attempts - 1)),
+                            self.config.retry_max_delay_ms,
+                        );
+
+                        warn!(
+                            order_id = %order_id,
+                            attempt = attempts,
+                            max_attempts = self.config.max_retries + 1,
+                            timeout_ms = self.config.timeout_ms,
+                            retry_delay_ms = delay_ms,
+                            "Operation timed out, will retry"
+                        );
+
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        // All retries exhausted
+        error!(
+            order_id = %order_id,
+            attempts = attempts,
+            last_error = %last_error,
+            "Order failed after all retry attempts"
+        );
+
+        ExecutionReport::rejected(
+            *order_id,
+            market_id.to_string(),
+            outcome_id.to_string(),
+            side,
+            format!("Failed after {} attempts: {}", attempts, last_error),
+        )
+    }
+
+    /// Execute a limit order with timeout and retry logic.
     pub async fn execute_limit_order(&self, order: LimitOrder) -> Result<ExecutionReport> {
         // Validate order
         if order.quantity > self.config.max_order_size {
@@ -250,7 +420,10 @@ impl OrderExecutor {
                 order.market_id.clone(),
                 order.outcome_id.clone(),
                 order.side,
-                format!("Order size {} exceeds maximum {}", order.quantity, self.config.max_order_size),
+                format!(
+                    "Order size {} exceeds maximum {}",
+                    order.quantity, self.config.max_order_size
+                ),
             );
             self.send_report(report.clone()).await;
             return Ok(report);
@@ -266,11 +439,22 @@ impl OrderExecutor {
             "Placing limit order"
         );
 
-        let report = if self.config.live_trading {
-            self.execute_live_limit_order(&order).await?
-        } else {
-            self.simulate_limit_order(&order).await?
-        };
+        // Execute with retry logic
+        let report = self
+            .execute_with_retry(
+                || async {
+                    if self.config.live_trading {
+                        self.execute_live_limit_order(&order).await
+                    } else {
+                        self.simulate_limit_order(&order).await
+                    }
+                },
+                &order.id,
+                &order.market_id,
+                &order.outcome_id,
+                order.side,
+            )
+            .await;
 
         self.pending_orders.remove(&order.id);
         self.send_report(report.clone()).await;
@@ -575,5 +759,72 @@ mod tests {
         let report = executor.execute_market_order(order).await.unwrap();
         assert_eq!(report.status, OrderStatus::Rejected);
         assert!(report.error_message.is_some());
+    }
+
+    #[test]
+    fn test_is_retryable_error() {
+        // Retryable errors
+        assert!(is_retryable_error("connection refused"));
+        assert!(is_retryable_error("Network timeout"));
+        assert!(is_retryable_error("temporarily unavailable"));
+        assert!(is_retryable_error("rate limit exceeded"));
+        assert!(is_retryable_error("503 Service Unavailable"));
+        assert!(is_retryable_error("502 Bad Gateway"));
+        assert!(is_retryable_error("ETIMEDOUT"));
+        assert!(is_retryable_error("ECONNRESET"));
+
+        // Non-retryable errors
+        assert!(!is_retryable_error("invalid order"));
+        assert!(!is_retryable_error("insufficient funds"));
+        assert!(!is_retryable_error("market closed"));
+        assert!(!is_retryable_error("unauthorized"));
+    }
+
+    #[test]
+    fn test_executor_config_defaults() {
+        let config = ExecutorConfig::default();
+
+        assert_eq!(config.timeout_ms, 30000);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.retry_base_delay_ms, 100);
+        assert_eq!(config.retry_max_delay_ms, 5000);
+        assert!(!config.live_trading);
+    }
+
+    #[test]
+    fn test_exponential_backoff_calculation() {
+        let config = ExecutorConfig {
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
+            ..Default::default()
+        };
+
+        // First retry: 100 * 2^0 = 100ms
+        let delay1 = std::cmp::min(
+            config.retry_base_delay_ms * (2_u64.pow(0)),
+            config.retry_max_delay_ms,
+        );
+        assert_eq!(delay1, 100);
+
+        // Second retry: 100 * 2^1 = 200ms
+        let delay2 = std::cmp::min(
+            config.retry_base_delay_ms * (2_u64.pow(1)),
+            config.retry_max_delay_ms,
+        );
+        assert_eq!(delay2, 200);
+
+        // Third retry: 100 * 2^2 = 400ms
+        let delay3 = std::cmp::min(
+            config.retry_base_delay_ms * (2_u64.pow(2)),
+            config.retry_max_delay_ms,
+        );
+        assert_eq!(delay3, 400);
+
+        // Large attempt should cap at max
+        let delay_max = std::cmp::min(
+            config.retry_base_delay_ms * (2_u64.pow(10)), // Would be 102400
+            config.retry_max_delay_ms,
+        );
+        assert_eq!(delay_max, 5000);
     }
 }

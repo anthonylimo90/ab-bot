@@ -6,11 +6,14 @@ use dashmap::DashMap;
 use polymarket_core::types::{BinaryMarketBook, ExecutionReport, MarketOrder, OrderSide};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 use uuid::Uuid;
+
+use crate::stop_loss_repo::StopLossRepository;
 
 /// Type of stop-loss trigger.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,7 +35,9 @@ pub enum StopType {
 impl StopType {
     /// Create a fixed price stop-loss.
     pub fn fixed(price: Decimal) -> Self {
-        Self::Fixed { trigger_price: price }
+        Self::Fixed {
+            trigger_price: price,
+        }
     }
 
     /// Create a percentage-based stop-loss.
@@ -128,7 +133,10 @@ impl StopLossRule {
                 let loss = (self.entry_price - current_price) / self.entry_price;
                 loss >= *loss_pct
             }
-            StopType::Trailing { offset_pct, peak_price } => {
+            StopType::Trailing {
+                offset_pct,
+                peak_price,
+            } => {
                 if *peak_price <= Decimal::ZERO {
                     return false;
                 }
@@ -141,7 +149,10 @@ impl StopLossRule {
 
     /// Update trailing stop with new peak price.
     pub fn update_peak(&mut self, current_price: Decimal) {
-        if let StopType::Trailing { ref mut peak_price, .. } = self.stop_type {
+        if let StopType::Trailing {
+            ref mut peak_price, ..
+        } = self.stop_type
+        {
             if current_price > *peak_price {
                 *peak_price = current_price;
                 debug!(
@@ -160,7 +171,10 @@ impl StopLossRule {
             StopType::Percentage { loss_pct } => {
                 Some(self.entry_price * (Decimal::ONE - *loss_pct))
             }
-            StopType::Trailing { offset_pct, peak_price } => {
+            StopType::Trailing {
+                offset_pct,
+                peak_price,
+            } => {
                 if *peak_price > Decimal::ZERO {
                     Some(*peak_price * (Decimal::ONE - *offset_pct))
                 } else {
@@ -186,6 +200,58 @@ pub struct TriggeredStop {
     pub current_price: Decimal,
 }
 
+/// Reason why a stop-loss rule check was skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckSkipReason {
+    /// Market data not available.
+    MarketDataMissing,
+    /// No bids available for the outcome.
+    NoBidsAvailable,
+    /// Rule is not activated.
+    RuleNotActive,
+    /// Rule already executed.
+    RuleAlreadyExecuted,
+    /// Trailing stop has no peak set.
+    TrailingNoPeak,
+}
+
+/// Result of checking a single stop-loss rule.
+#[derive(Debug, Clone)]
+pub struct RuleCheckResult {
+    pub rule_id: Uuid,
+    pub position_id: Uuid,
+    pub market_id: String,
+    pub outcome: RuleCheckOutcome,
+}
+
+/// Outcome of checking a stop-loss rule.
+#[derive(Debug, Clone)]
+pub enum RuleCheckOutcome {
+    /// Rule was triggered.
+    Triggered {
+        trigger_price: Decimal,
+        current_price: Decimal,
+    },
+    /// Rule was checked but not triggered.
+    NotTriggered { current_price: Decimal },
+    /// Rule check was skipped for a reason.
+    Skipped { reason: CheckSkipReason },
+}
+
+/// Summary of check_triggers results.
+#[derive(Debug, Clone, Default)]
+pub struct CheckTriggersSummary {
+    pub total_rules: usize,
+    pub triggered: usize,
+    pub not_triggered: usize,
+    pub skipped_market_missing: usize,
+    pub skipped_no_bids: usize,
+    pub skipped_not_active: usize,
+    pub skipped_already_executed: usize,
+    pub skipped_trailing_no_peak: usize,
+}
+
 /// Manager for stop-loss rules.
 pub struct StopLossManager {
     /// Active stop-loss rules keyed by rule ID.
@@ -194,6 +260,8 @@ pub struct StopLossManager {
     rules_by_position: DashMap<Uuid, Vec<Uuid>>,
     /// Order executor for exit orders.
     executor: Arc<OrderExecutor>,
+    /// Database repository for persistence.
+    repo: Option<StopLossRepository>,
     /// Channel for triggered stop notifications.
     trigger_tx: mpsc::Sender<TriggeredStop>,
     /// Receiver for triggered stops (taken once).
@@ -201,16 +269,61 @@ pub struct StopLossManager {
 }
 
 impl StopLossManager {
-    /// Create a new stop-loss manager.
+    /// Create a new stop-loss manager without database persistence.
     pub fn new(executor: Arc<OrderExecutor>) -> Self {
         let (trigger_tx, trigger_rx) = mpsc::channel(1000);
         Self {
             rules: DashMap::new(),
             rules_by_position: DashMap::new(),
             executor,
+            repo: None,
             trigger_tx,
             trigger_rx: Some(trigger_rx),
         }
+    }
+
+    /// Create a new stop-loss manager with database persistence.
+    pub fn with_persistence(executor: Arc<OrderExecutor>, pool: PgPool) -> Self {
+        let (trigger_tx, trigger_rx) = mpsc::channel(1000);
+        Self {
+            rules: DashMap::new(),
+            rules_by_position: DashMap::new(),
+            executor,
+            repo: Some(StopLossRepository::new(pool)),
+            trigger_tx,
+            trigger_rx: Some(trigger_rx),
+        }
+    }
+
+    /// Load active rules from database on startup.
+    /// This should be called once during initialization.
+    pub async fn load_active_rules(&self) -> Result<usize> {
+        let repo = match &self.repo {
+            Some(r) => r,
+            None => {
+                warn!("Cannot load rules: no database connection configured");
+                return Ok(0);
+            }
+        };
+
+        let rules = repo.get_active().await?;
+        let count = rules.len();
+
+        for rule in rules {
+            // Index by position
+            self.rules_by_position
+                .entry(rule.position_id)
+                .or_default()
+                .push(rule.id);
+
+            self.rules.insert(rule.id, rule);
+        }
+
+        info!(
+            count = count,
+            "Recovered active stop-loss rules from database"
+        );
+        Ok(count)
     }
 
     /// Take the trigger receiver (can only be called once).
@@ -219,7 +332,7 @@ impl StopLossManager {
     }
 
     /// Add a new stop-loss rule.
-    pub fn add_rule(&self, mut rule: StopLossRule) {
+    pub async fn add_rule(&self, mut rule: StopLossRule) -> Result<()> {
         rule.activate();
         info!(
             rule_id = %rule.id,
@@ -228,6 +341,11 @@ impl StopLossManager {
             "Adding stop-loss rule"
         );
 
+        // Persist to database if configured
+        if let Some(repo) = &self.repo {
+            repo.insert(&rule).await?;
+        }
+
         // Index by position
         self.rules_by_position
             .entry(rule.position_id)
@@ -235,24 +353,31 @@ impl StopLossManager {
             .push(rule.id);
 
         self.rules.insert(rule.id, rule);
+        Ok(())
     }
 
     /// Remove a stop-loss rule.
-    pub fn remove_rule(&self, rule_id: Uuid) -> Option<StopLossRule> {
+    pub async fn remove_rule(&self, rule_id: Uuid) -> Result<Option<StopLossRule>> {
         if let Some((_, rule)) = self.rules.remove(&rule_id) {
             // Remove from position index
             if let Some(mut rules) = self.rules_by_position.get_mut(&rule.position_id) {
                 rules.retain(|&id| id != rule_id);
             }
+
+            // Delete from database if configured
+            if let Some(repo) = &self.repo {
+                repo.delete(rule_id).await?;
+            }
+
             info!(rule_id = %rule_id, "Removed stop-loss rule");
-            Some(rule)
+            Ok(Some(rule))
         } else {
-            None
+            Ok(None)
         }
     }
 
     /// Remove all rules for a position.
-    pub fn remove_rules_for_position(&self, position_id: Uuid) -> Vec<StopLossRule> {
+    pub async fn remove_rules_for_position(&self, position_id: Uuid) -> Result<Vec<StopLossRule>> {
         let mut removed = Vec::new();
         if let Some((_, rule_ids)) = self.rules_by_position.remove(&position_id) {
             for rule_id in rule_ids {
@@ -261,7 +386,13 @@ impl StopLossManager {
                 }
             }
         }
-        removed
+
+        // Delete from database if configured
+        if let Some(repo) = &self.repo {
+            repo.delete_by_position(position_id).await?;
+        }
+
+        Ok(removed)
     }
 
     /// Get a rule by ID.
@@ -291,55 +422,210 @@ impl StopLossManager {
     }
 
     /// Check all rules against current market prices.
+    /// Returns triggered stops for backward compatibility.
     pub async fn check_triggers(
         &self,
         market_prices: &std::collections::HashMap<String, BinaryMarketBook>,
     ) -> Vec<TriggeredStop> {
+        let (triggered, _) = self.check_triggers_detailed(market_prices).await;
+        triggered
+    }
+
+    /// Check all rules against current market prices with detailed results.
+    /// Returns both triggered stops and a summary of all check outcomes.
+    pub async fn check_triggers_detailed(
+        &self,
+        market_prices: &std::collections::HashMap<String, BinaryMarketBook>,
+    ) -> (Vec<TriggeredStop>, CheckTriggersSummary) {
         let mut triggered = Vec::new();
+        let mut rules_to_update = Vec::new();
+        let mut summary = CheckTriggersSummary::default();
 
         for entry in self.rules.iter() {
             let rule = entry.value();
-            if !rule.activated || rule.executed {
+            summary.total_rules += 1;
+
+            // Check if rule is in a checkable state
+            if !rule.activated {
+                debug!(
+                    rule_id = %rule.id,
+                    position_id = %rule.position_id,
+                    "Skipping rule check: not activated"
+                );
+                summary.skipped_not_active += 1;
                 continue;
             }
 
-            // Get current price for this rule's market/outcome
-            let current_price = match market_prices.get(&rule.market_id) {
-                Some(book) => {
-                    // Use best bid as exit price
-                    if rule.outcome_id == book.yes_book.outcome_id {
-                        book.yes_book.bids.first().map(|l| l.price)
-                    } else {
-                        book.no_book.bids.first().map(|l| l.price)
-                    }
+            if rule.executed {
+                debug!(
+                    rule_id = %rule.id,
+                    position_id = %rule.position_id,
+                    "Skipping rule check: already executed"
+                );
+                summary.skipped_already_executed += 1;
+                continue;
+            }
+
+            // Get market data
+            let book = match market_prices.get(&rule.market_id) {
+                Some(b) => b,
+                None => {
+                    warn!(
+                        rule_id = %rule.id,
+                        position_id = %rule.position_id,
+                        market_id = %rule.market_id,
+                        "Cannot check stop-loss: market data missing"
+                    );
+                    summary.skipped_market_missing += 1;
+                    continue;
                 }
-                None => None,
+            };
+
+            // Get current price for this rule's outcome
+            let current_price = if rule.outcome_id == book.yes_book.outcome_id {
+                book.yes_book.bids.first().map(|l| l.price)
+            } else if rule.outcome_id == book.no_book.outcome_id {
+                book.no_book.bids.first().map(|l| l.price)
+            } else {
+                warn!(
+                    rule_id = %rule.id,
+                    position_id = %rule.position_id,
+                    market_id = %rule.market_id,
+                    outcome_id = %rule.outcome_id,
+                    "Cannot check stop-loss: outcome ID doesn't match market"
+                );
+                summary.skipped_market_missing += 1;
+                continue;
             };
 
             let current_price = match current_price {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    warn!(
+                        rule_id = %rule.id,
+                        position_id = %rule.position_id,
+                        market_id = %rule.market_id,
+                        outcome_id = %rule.outcome_id,
+                        "Cannot check stop-loss: no bids available for outcome"
+                    );
+                    summary.skipped_no_bids += 1;
+                    continue;
+                }
             };
 
             // Update trailing stop peak
-            if matches!(rule.stop_type, StopType::Trailing { .. }) {
+            if let StopType::Trailing { peak_price, .. } = &rule.stop_type {
+                // Check if trailing stop has a valid peak
+                if *peak_price <= Decimal::ZERO && current_price <= rule.entry_price {
+                    // First update - set peak to current price or entry price
+                    if let Some(mut rule_mut) = self.rules.get_mut(&rule.id) {
+                        rule_mut.update_peak(current_price.max(rule.entry_price));
+                        rules_to_update.push(rule_mut.clone());
+                    }
+                }
+
                 if let Some(mut rule_mut) = self.rules.get_mut(&rule.id) {
+                    let old_peak = match &rule_mut.stop_type {
+                        StopType::Trailing { peak_price, .. } => *peak_price,
+                        _ => Decimal::ZERO,
+                    };
                     rule_mut.update_peak(current_price);
+                    // Track if peak was updated for persistence
+                    let new_peak = match &rule_mut.stop_type {
+                        StopType::Trailing { peak_price, .. } => *peak_price,
+                        _ => Decimal::ZERO,
+                    };
+                    if new_peak > old_peak {
+                        rules_to_update.push(rule_mut.clone());
+                    }
                 }
             }
 
             // Check if triggered
             if rule.is_triggered(current_price) {
                 let trigger_price = rule.current_trigger_price().unwrap_or(current_price);
+                info!(
+                    rule_id = %rule.id,
+                    position_id = %rule.position_id,
+                    market_id = %rule.market_id,
+                    trigger_price = %trigger_price,
+                    current_price = %current_price,
+                    stop_type = ?rule.stop_type,
+                    "Stop-loss triggered"
+                );
                 triggered.push(TriggeredStop {
                     rule: rule.clone(),
                     trigger_price,
                     current_price,
                 });
+                summary.triggered += 1;
+            } else {
+                debug!(
+                    rule_id = %rule.id,
+                    position_id = %rule.position_id,
+                    current_price = %current_price,
+                    trigger_price = ?rule.current_trigger_price(),
+                    "Stop-loss not triggered"
+                );
+                summary.not_triggered += 1;
             }
         }
 
-        triggered
+        // Persist trailing stop peak updates to database
+        if let Some(repo) = &self.repo {
+            for rule in rules_to_update {
+                if let Err(e) = repo.update(&rule).await {
+                    error!(rule_id = %rule.id, error = %e, "Failed to persist trailing stop peak update");
+                }
+            }
+        }
+
+        // Log summary if there were any issues
+        let total_skipped = summary.skipped_market_missing
+            + summary.skipped_no_bids
+            + summary.skipped_not_active
+            + summary.skipped_already_executed
+            + summary.skipped_trailing_no_peak;
+
+        if total_skipped > 0 {
+            warn!(
+                total = summary.total_rules,
+                triggered = summary.triggered,
+                not_triggered = summary.not_triggered,
+                skipped_market_missing = summary.skipped_market_missing,
+                skipped_no_bids = summary.skipped_no_bids,
+                skipped_not_active = summary.skipped_not_active,
+                skipped_already_executed = summary.skipped_already_executed,
+                "Stop-loss check completed with skipped rules"
+            );
+        } else if summary.total_rules > 0 {
+            debug!(
+                total = summary.total_rules,
+                triggered = summary.triggered,
+                not_triggered = summary.not_triggered,
+                "Stop-loss check completed"
+            );
+        }
+
+        (triggered, summary)
+    }
+
+    /// Get all rules that couldn't be checked due to missing market data.
+    pub fn rules_missing_market_data(
+        &self,
+        market_prices: &std::collections::HashMap<String, BinaryMarketBook>,
+    ) -> Vec<StopLossRule> {
+        self.rules
+            .iter()
+            .filter(|entry| {
+                let rule = entry.value();
+                if !rule.activated || rule.executed {
+                    return false;
+                }
+                !market_prices.contains_key(&rule.market_id)
+            })
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// Execute a triggered stop-loss.
@@ -365,6 +651,13 @@ impl StopLossManager {
         // Mark rule as executed
         if let Some(mut rule) = self.rules.get_mut(&stop.rule.id) {
             rule.mark_executed();
+
+            // Persist executed state to database
+            if let Some(repo) = &self.repo {
+                if let Err(e) = repo.update(&rule).await {
+                    error!(rule_id = %rule.id, error = %e, "Failed to persist stop-loss execution");
+                }
+            }
         }
 
         // Send notification
@@ -398,6 +691,13 @@ impl StopLossManager {
                 Ok(report) => {
                     if let Some(mut r) = self.rules.get_mut(&rule.id) {
                         r.mark_executed();
+
+                        // Persist executed state to database
+                        if let Some(repo) = &self.repo {
+                            if let Err(e) = repo.update(&r).await {
+                                error!(rule_id = %r.id, error = %e, "Failed to persist manual exit execution");
+                            }
+                        }
                     }
                     reports.push(report);
                 }
@@ -416,9 +716,8 @@ impl StopLossManager {
         let active = rules.iter().filter(|r| r.activated && !r.executed).count();
         let executed = rules.iter().filter(|r| r.executed).count();
 
-        let by_type = |is_type: fn(&StopType) -> bool| {
-            rules.iter().filter(|r| is_type(&r.stop_type)).count()
-        };
+        let by_type =
+            |is_type: fn(&StopType) -> bool| rules.iter().filter(|r| is_type(&r.stop_type)).count();
 
         StopLossStats {
             total_rules: rules.len(),
@@ -552,5 +851,30 @@ mod tests {
 
         // Already executed - should never trigger again
         assert!(!rule.is_triggered(Decimal::new(1, 2)));
+    }
+
+    #[test]
+    fn test_check_triggers_summary_default() {
+        let summary = super::CheckTriggersSummary::default();
+        assert_eq!(summary.total_rules, 0);
+        assert_eq!(summary.triggered, 0);
+        assert_eq!(summary.not_triggered, 0);
+        assert_eq!(summary.skipped_market_missing, 0);
+        assert_eq!(summary.skipped_no_bids, 0);
+        assert_eq!(summary.skipped_not_active, 0);
+        assert_eq!(summary.skipped_already_executed, 0);
+    }
+
+    #[test]
+    fn test_check_skip_reason_serialization() {
+        use super::CheckSkipReason;
+
+        let reason = CheckSkipReason::MarketDataMissing;
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(json, "\"market_data_missing\"");
+
+        let reason2 = CheckSkipReason::NoBidsAvailable;
+        let json2 = serde_json::to_string(&reason2).unwrap();
+        assert_eq!(json2, "\"no_bids_available\"");
     }
 }
