@@ -13,19 +13,25 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "api_server=debug,tower_http=debug,axum=debug".into()),
+                .unwrap_or_else(|_| "api_server=info,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    tracing::info!("API Server starting up...");
+
     // Get database URL
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    tracing::info!("Connecting to database...");
 
     // Create database connection pool
     let pool = PgPoolOptions::new()
         .max_connections(20)
+        .acquire_timeout(std::time::Duration::from_secs(30))
         .connect(&database_url)
         .await?;
+
+    tracing::info!("Database connection established");
 
     // Run migrations (can be disabled via SKIP_MIGRATIONS=true for manual migration management)
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
@@ -41,8 +47,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Create server config from environment
     let config = ServerConfig::from_env();
+    tracing::info!(
+        host = %config.host,
+        port = %config.port,
+        "Server configuration loaded"
+    );
 
     // Create and run server
+    tracing::info!("Starting API server...");
     let server = ApiServer::new(config, pool).await?;
     server.run().await?;
 

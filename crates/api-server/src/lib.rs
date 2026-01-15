@@ -75,7 +75,9 @@ impl ServerConfig {
     pub fn from_env() -> Self {
         Self {
             host: std::env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
-            port: std::env::var("API_PORT")
+            // Check PORT first (Railway), then API_PORT, then default to 3000
+            port: std::env::var("PORT")
+                .or_else(|_| std::env::var("API_PORT"))
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3000),
