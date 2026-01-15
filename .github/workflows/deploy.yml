@@ -41,9 +41,7 @@ jobs:
         run: npm install -g @railway/cli
 
       - name: Deploy API Server
-        run: |
-          railway link --environment ${{ github.event.inputs.environment || 'production' }}
-          railway up --service api-server --detach
+        run: railway up --service api-server --detach
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
@@ -65,9 +63,7 @@ jobs:
         run: npm install -g @railway/cli
 
       - name: Deploy Arb Monitor
-        run: |
-          railway link --environment ${{ github.event.inputs.environment || 'production' }}
-          railway up --service arb-monitor --detach
+        run: railway up --service arb-monitor --detach
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
@@ -87,9 +83,7 @@ jobs:
         run: npm install -g @railway/cli
 
       - name: Deploy Dashboard
-        run: |
-          railway link --environment ${{ github.event.inputs.environment || 'production' }}
-          railway up --service dashboard --detach
+        run: railway up --service dashboard --detach
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
