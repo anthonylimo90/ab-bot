@@ -179,52 +179,29 @@ DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prep
 
 ### Railway (Recommended)
 
-The project includes a GitHub Actions workflow for deploying to [Railway](https://railway.app).
+Deploy to [Railway](https://railway.app) using GitHub integration.
 
-**Prerequisites:**
-1. Create a Railway project with the following services:
-   - TimescaleDB (from template)
-   - Redis (from template)
-   - api-server (Dockerfile)
-   - arb-monitor (Dockerfile)
-   - dashboard (Dockerfile.dashboard)
+**Services:**
 
-2. Add the `RAILWAY_TOKEN` secret to your GitHub repository
+| Service | Dockerfile | Description |
+|---------|------------|-------------|
+| api-server | `Dockerfile` | REST/WebSocket API |
+| arb-monitor | `Dockerfile.arb-monitor` | Market monitoring worker |
+| dashboard | `Dockerfile.dashboard` | Next.js frontend |
 
-3. Set Railway environment variables:
-   ```bash
-   DATABASE_URL=${{timescaledb.DATABASE_URL}}
-   REDIS_URL=${{redis.REDIS_URL}}
-   JWT_SECRET=<generate-a-secret>
-   CORS_PERMISSIVE=false
-   SKIP_MIGRATIONS=true
-   ```
+**Quick Setup:**
+1. Create Railway project with TimescaleDB and Redis
+2. Enable uuid-ossp extension: `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`
+3. Connect GitHub repo to create each service
+4. Configure environment variables per service
+5. Deploy
 
-4. Set dashboard build args:
-   ```bash
-   NEXT_PUBLIC_API_URL=https://your-api-server.railway.app
-   NEXT_PUBLIC_WS_URL=wss://your-api-server.railway.app
-   ```
-
-**Deployment Workflow:**
-- Push to `main` triggers automatic deployment
-- Manual deployment via GitHub Actions workflow dispatch
-- Supports staging and production environments
+See [docs/DEPLOY.md](docs/DEPLOY.md) for complete step-by-step instructions.
 
 **Configuration Files:**
-- `railway.toml` - Railway service configuration
-- `Dockerfile.dashboard` - Next.js containerization
-- `.github/workflows/deploy.yml` - CI/CD pipeline
-
-### Initial Database Migration
-
-Run migrations once after first deployment:
-
-```bash
-DATABASE_URL=$RAILWAY_DATABASE_URL cargo sqlx migrate run
-```
-
-Then set `SKIP_MIGRATIONS=true` on the API server to prevent migration conflicts.
+- `railway.toml` - Service-specific build and deploy settings
+- `Dockerfile.*` - Service-specific container builds
+- `.dockerignore` - Build context optimization
 
 ## Dashboard Features
 
