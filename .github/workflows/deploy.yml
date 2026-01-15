@@ -1,137 +1,39 @@
-name: Deploy to Railway
+name: Deploy
+
+# Railway handles deployments automatically via GitHub integration.
+# This workflow just runs CI checks and notifies on deployment.
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Deployment environment'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
-
-env:
-  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
 jobs:
-  # ==========================================================================
-  # Run CI checks first
-  # ==========================================================================
+  # Run CI checks before Railway deploys
   ci:
     name: CI Checks
     uses: ./.github/workflows/ci.yml
 
-  # ==========================================================================
-  # Deploy Backend Services
-  # ==========================================================================
-  deploy-api-server:
-    name: Deploy API Server
+  # Notify that deployment will be handled by Railway
+  notify:
+    name: Deployment Status
     needs: ci
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'production' }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy API Server
-        run: railway up --service api-server --detach
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-
-      - name: Verify deployment
-        run: |
-          echo "API Server deployment initiated"
-          echo "Check Railway dashboard for deployment status"
-
-  deploy-arb-monitor:
-    name: Deploy Arb Monitor
-    needs: ci
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'production' }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy Arb Monitor
-        run: railway up --service arb-monitor --detach
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-
-  # ==========================================================================
-  # Deploy Dashboard
-  # ==========================================================================
-  deploy-dashboard:
-    name: Deploy Dashboard
-    needs: ci
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'production' }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy Dashboard
-        run: railway up --service dashboard --detach
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
-          NEXT_PUBLIC_WS_URL: ${{ vars.NEXT_PUBLIC_WS_URL }}
-
-  # ==========================================================================
-  # Post-Deployment Verification
-  # ==========================================================================
-  verify-deployment:
-    name: Verify Deployment
-    needs: [deploy-api-server, deploy-arb-monitor, deploy-dashboard]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wait for services to start
-        run: sleep 30
-
-      - name: Check API health
-        run: |
-          API_URL="${{ vars.API_SERVER_URL || 'https://api-server-production.up.railway.app' }}"
-          echo "Checking API health at $API_URL/health"
-
-          # Retry health check up to 5 times
-          for i in {1..5}; do
-            if curl -sf "$API_URL/health" > /dev/null; then
-              echo "API Server is healthy!"
-              exit 0
-            fi
-            echo "Attempt $i failed, waiting 10 seconds..."
-            sleep 10
-          done
-
-          echo "API Server health check failed after 5 attempts"
-          exit 1
-        continue-on-error: true
-
-      - name: Deployment summary
+      - name: Deployment info
         run: |
           echo "=========================================="
-          echo "Deployment Summary"
+          echo "CI Checks Passed - Railway Deploying"
           echo "=========================================="
-          echo "Environment: ${{ github.event.inputs.environment || 'production' }}"
+          echo ""
           echo "Commit: ${{ github.sha }}"
           echo "Branch: ${{ github.ref_name }}"
+          echo "Author: ${{ github.actor }}"
+          echo ""
+          echo "Railway will automatically deploy:"
+          echo "  - api-server"
+          echo "  - arb-monitor"
+          echo "  - dashboard"
+          echo ""
+          echo "Monitor deployments at: https://railway.app/dashboard"
           echo "=========================================="
-          echo ""
-          echo "Services deployed:"
-          echo "  - API Server"
-          echo "  - Arb Monitor"
-          echo "  - Dashboard"
-          echo ""
-          echo "Check Railway dashboard for detailed status"
