@@ -60,7 +60,10 @@ impl AppState {
         let key_vault = match KeyVault::from_env() {
             Ok(vault) => Arc::new(vault),
             Err(e) => {
-                tracing::warn!("Failed to initialize KeyVault from env: {}. Using in-memory vault.", e);
+                tracing::warn!(
+                    "Failed to initialize KeyVault from env: {}. Using in-memory vault.",
+                    e
+                );
                 // Fall back to in-memory vault with a default key
                 let default_key = jwt_secret.as_bytes().to_vec();
                 Arc::new(KeyVault::new(
@@ -118,17 +121,26 @@ impl AppState {
     }
 
     /// Publish an orderbook update.
-    pub fn publish_orderbook(&self, update: OrderbookUpdate) -> Result<usize, broadcast::error::SendError<OrderbookUpdate>> {
+    pub fn publish_orderbook(
+        &self,
+        update: OrderbookUpdate,
+    ) -> Result<usize, broadcast::error::SendError<OrderbookUpdate>> {
         self.orderbook_tx.send(update)
     }
 
     /// Publish a position update.
-    pub fn publish_position(&self, update: PositionUpdate) -> Result<usize, broadcast::error::SendError<PositionUpdate>> {
+    pub fn publish_position(
+        &self,
+        update: PositionUpdate,
+    ) -> Result<usize, broadcast::error::SendError<PositionUpdate>> {
         self.position_tx.send(update)
     }
 
     /// Publish a signal update.
-    pub fn publish_signal(&self, update: SignalUpdate) -> Result<usize, broadcast::error::SendError<SignalUpdate>> {
+    pub fn publish_signal(
+        &self,
+        update: SignalUpdate,
+    ) -> Result<usize, broadcast::error::SendError<SignalUpdate>> {
         self.signal_tx.send(update)
     }
 }

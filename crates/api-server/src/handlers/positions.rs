@@ -248,7 +248,10 @@ pub async fn get_position(
                 updated_at: row.updated_at,
             }))
         }
-        None => Err(ApiError::NotFound(format!("Position {} not found", position_id))),
+        None => Err(ApiError::NotFound(format!(
+            "Position {} not found",
+            position_id
+        ))),
     }
 }
 
@@ -289,7 +292,12 @@ pub async fn close_position(
 
     let row = match row {
         Some(r) => r,
-        None => return Err(ApiError::NotFound(format!("Open position {} not found", position_id))),
+        None => {
+            return Err(ApiError::NotFound(format!(
+                "Open position {} not found",
+                position_id
+            )))
+        }
     };
 
     let close_quantity = request.quantity.unwrap_or(row.quantity);

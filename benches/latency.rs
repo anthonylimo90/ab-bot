@@ -2,15 +2,13 @@
 //!
 //! Run with: `cargo bench --bench latency`
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use chrono::Utc;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
 // Re-export types from polymarket-core
-use polymarket_core::types::{
-    ArbOpportunity, BinaryMarketBook, OrderBook, PriceLevel,
-};
+use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, OrderBook, PriceLevel};
 
 /// Generate a synthetic orderbook with the specified depth.
 fn generate_orderbook(market_id: &str, outcome_id: &str, depth: usize) -> OrderBook {
@@ -40,7 +38,12 @@ fn generate_orderbook(market_id: &str, outcome_id: &str, depth: usize) -> OrderB
 }
 
 /// Generate a binary market book with potential arbitrage.
-fn generate_arb_market(market_id: &str, yes_ask: i64, no_ask: i64, depth: usize) -> BinaryMarketBook {
+fn generate_arb_market(
+    market_id: &str,
+    yes_ask: i64,
+    no_ask: i64,
+    depth: usize,
+) -> BinaryMarketBook {
     let mut yes_book = generate_orderbook(market_id, "yes", depth);
     let mut no_book = generate_orderbook(market_id, "no", depth);
 
@@ -74,9 +77,7 @@ fn bench_arb_detection(c: &mut Criterion) {
             BenchmarkId::new("calculate", depth),
             &market,
             |b, market| {
-                b.iter(|| {
-                    black_box(ArbOpportunity::calculate(black_box(market), black_box(fee)))
-                })
+                b.iter(|| black_box(ArbOpportunity::calculate(black_box(market), black_box(fee))))
             },
         );
     }
@@ -92,21 +93,13 @@ fn bench_orderbook_lookups(c: &mut Criterion) {
         let book = generate_orderbook("market", "yes", *depth);
 
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new("best_bid", depth),
-            &book,
-            |b, book| {
-                b.iter(|| black_box(book.best_bid()))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("best_bid", depth), &book, |b, book| {
+            b.iter(|| black_box(book.best_bid()))
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("best_ask", depth),
-            &book,
-            |b, book| {
-                b.iter(|| black_box(book.best_ask()))
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("best_ask", depth), &book, |b, book| {
+            b.iter(|| black_box(book.best_ask()))
+        });
     }
 
     group.finish();
@@ -123,9 +116,7 @@ fn bench_entry_cost(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("calculate", depth),
             &market,
-            |b, market| {
-                b.iter(|| black_box(market.entry_cost()))
-            },
+            |b, market| b.iter(|| black_box(market.entry_cost())),
         );
     }
 
@@ -161,9 +152,7 @@ fn bench_signal_serialization(c: &mut Criterion) {
 
 /// Benchmark UUID generation (used for order IDs).
 fn bench_uuid_generation(c: &mut Criterion) {
-    c.bench_function("uuid_v4", |b| {
-        b.iter(|| black_box(Uuid::new_v4()))
-    });
+    c.bench_function("uuid_v4", |b| b.iter(|| black_box(Uuid::new_v4())));
 }
 
 /// Benchmark Decimal arithmetic (critical for price calculations).
@@ -210,9 +199,7 @@ fn bench_stop_loss_check(c: &mut Criterion) {
     fixed_rule.activate();
 
     group.bench_function("fixed_trigger_check", |b| {
-        b.iter(|| {
-            black_box(fixed_rule.is_triggered(black_box(Decimal::new(38, 2))))
-        })
+        b.iter(|| black_box(fixed_rule.is_triggered(black_box(Decimal::new(38, 2)))))
     });
 
     // Percentage stop
@@ -227,9 +214,7 @@ fn bench_stop_loss_check(c: &mut Criterion) {
     pct_rule.activate();
 
     group.bench_function("percentage_trigger_check", |b| {
-        b.iter(|| {
-            black_box(pct_rule.is_triggered(black_box(Decimal::new(38, 2))))
-        })
+        b.iter(|| black_box(pct_rule.is_triggered(black_box(Decimal::new(38, 2)))))
     });
 
     // Trailing stop
@@ -245,9 +230,7 @@ fn bench_stop_loss_check(c: &mut Criterion) {
     trailing_rule.update_peak(Decimal::new(60, 2));
 
     group.bench_function("trailing_trigger_check", |b| {
-        b.iter(|| {
-            black_box(trailing_rule.is_triggered(black_box(Decimal::new(52, 2))))
-        })
+        b.iter(|| black_box(trailing_rule.is_triggered(black_box(Decimal::new(52, 2)))))
     });
 
     group.bench_function("trailing_peak_update", |b| {
@@ -284,16 +267,10 @@ fn bench_dashmap_operations(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("get", |b| {
-        b.iter(|| {
-            black_box(map.get(&known_key))
-        })
-    });
+    group.bench_function("get", |b| b.iter(|| black_box(map.get(&known_key))));
 
     group.bench_function("contains", |b| {
-        b.iter(|| {
-            black_box(map.contains_key(&known_key))
-        })
+        b.iter(|| black_box(map.contains_key(&known_key)))
     });
 
     group.finish();

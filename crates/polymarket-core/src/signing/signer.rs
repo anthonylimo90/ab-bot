@@ -204,7 +204,10 @@ mod tests {
     async fn test_sign_auth_message_with_timestamp() {
         let signer = test_signer();
         let timestamp = 1700000000u64;
-        let signature = signer.sign_auth_message_with_timestamp(timestamp).await.unwrap();
+        let signature = signer
+            .sign_auth_message_with_timestamp(timestamp)
+            .await
+            .unwrap();
 
         assert!(signature.starts_with("0x"));
         assert_eq!(signature.len(), 132);

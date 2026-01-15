@@ -110,13 +110,12 @@ pub async fn store_wallet(
     }
 
     // Check if wallet already exists for this user
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM user_wallets WHERE user_id = $1 AND address = $2"
-    )
-    .bind(user_id)
-    .bind(&address)
-    .fetch_optional(&state.pool)
-    .await?;
+    let existing: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM user_wallets WHERE user_id = $1 AND address = $2")
+            .bind(user_id)
+            .bind(&address)
+            .fetch_optional(&state.pool)
+            .await?;
 
     if existing.is_some() {
         return Err(ApiError::Conflict("Wallet already connected".into()));
@@ -130,12 +129,11 @@ pub async fn store_wallet(
         .map_err(|e| ApiError::Internal(format!("Failed to store key: {}", e)))?;
 
     // Check if this is the first wallet (will be primary)
-    let wallet_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM user_wallets WHERE user_id = $1"
-    )
-    .bind(user_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let wallet_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM user_wallets WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await?;
     let is_primary = wallet_count.0 == 0;
 
     // Save wallet metadata to database
@@ -279,7 +277,7 @@ pub async fn remove_wallet(
 
     // Check if wallet exists
     let wallet: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT id, is_primary FROM user_wallets WHERE user_id = $1 AND address = $2"
+        "SELECT id, is_primary FROM user_wallets WHERE user_id = $1 AND address = $2",
     )
     .bind(user_id)
     .bind(&address)
@@ -369,19 +367,17 @@ pub async fn set_primary_wallet(
 
     // Unset all other wallets as primary
     sqlx::query(
-        "UPDATE user_wallets SET is_primary = false, updated_at = NOW() WHERE user_id = $1"
+        "UPDATE user_wallets SET is_primary = false, updated_at = NOW() WHERE user_id = $1",
     )
     .bind(user_id)
     .execute(&state.pool)
     .await?;
 
     // Set this wallet as primary
-    sqlx::query(
-        "UPDATE user_wallets SET is_primary = true, updated_at = NOW() WHERE id = $1"
-    )
-    .bind(wallet.id)
-    .execute(&state.pool)
-    .await?;
+    sqlx::query("UPDATE user_wallets SET is_primary = true, updated_at = NOW() WHERE id = $1")
+        .bind(wallet.id)
+        .execute(&state.pool)
+        .await?;
 
     Ok(Json(WalletInfo {
         id: wallet.id.to_string(),

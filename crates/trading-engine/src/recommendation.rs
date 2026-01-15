@@ -340,8 +340,8 @@ impl RecommendationEngine {
                 RiskLevel::Speculative => Decimal::new(20, 0),
             };
 
-            let adjusted_allocation = base_allocation
-                * Decimal::from_f64_retain(success_prob).unwrap_or(Decimal::ONE);
+            let adjusted_allocation =
+                base_allocation * Decimal::from_f64_retain(success_prob).unwrap_or(Decimal::ONE);
 
             let evidence = vec![
                 Evidence {
@@ -524,7 +524,10 @@ impl RecommendationEngine {
                     description: format!(
                         "Position in {} is down {:.2}% and has been held for {} hours.",
                         pos.market_id,
-                        (pnl / pos.quantity * Decimal::new(100, 0)).to_string().parse::<f64>().unwrap_or(0.0),
+                        (pnl / pos.quantity * Decimal::new(100, 0))
+                            .to_string()
+                            .parse::<f64>()
+                            .unwrap_or(0.0),
                         hours_held
                     ),
                     confidence: 0.7,
@@ -571,7 +574,10 @@ impl RecommendationEngine {
                     description: format!(
                         "Position in {} is up {:.2}%. Consider taking partial or full profit.",
                         pos.market_id,
-                        (pnl / pos.quantity * Decimal::new(100, 0)).to_string().parse::<f64>().unwrap_or(0.0)
+                        (pnl / pos.quantity * Decimal::new(100, 0))
+                            .to_string()
+                            .parse::<f64>()
+                            .unwrap_or(0.0)
                     ),
                     confidence: 0.65,
                     expected_return: Some(pnl),
@@ -582,14 +588,12 @@ impl RecommendationEngine {
                         reason: "Take profit opportunity".to_string(),
                         suggested_exit_price: None,
                     },
-                    evidence: vec![
-                        Evidence {
-                            factor: "Unrealized P&L".to_string(),
-                            value: format!("${:.2}", pnl),
-                            weight: 0.6,
-                            is_positive: true,
-                        },
-                    ],
+                    evidence: vec![Evidence {
+                        factor: "Unrealized P&L".to_string(),
+                        value: format!("${:.2}", pnl),
+                        weight: 0.6,
+                        is_positive: true,
+                    }],
                     valid_until: Utc::now() + chrono::Duration::hours(24),
                     created_at: Utc::now(),
                     target_risk_tolerance: profile.risk_tolerance,
@@ -622,10 +626,7 @@ impl RecommendationEngine {
         .await?;
 
         if let Some(top) = concentration.first() {
-            let total_portfolio: Decimal = concentration
-                .iter()
-                .filter_map(|c| c.total_value)
-                .sum();
+            let total_portfolio: Decimal = concentration.iter().filter_map(|c| c.total_value).sum();
 
             if total_portfolio > Decimal::ZERO {
                 let concentration_pct = top.total_value.unwrap_or(Decimal::ZERO) / total_portfolio;

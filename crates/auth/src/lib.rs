@@ -14,7 +14,6 @@ pub use audit::{AuditAction, AuditEvent, AuditLogger};
 pub use jwt::{Claims, JwtAuth, UserRole};
 pub use key_vault::{KeyVault, KeyVaultProvider, WalletKey};
 pub use rbac::{
-    Action, DefaultRoles, Permission, PermissionConditions, RbacManager,
-    Resource, Role, TimeWindow,
+    Action, DefaultRoles, Permission, PermissionConditions, RbacManager, Resource, Role, TimeWindow,
 };
 pub use wallet::TradingWallet;

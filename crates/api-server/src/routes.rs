@@ -1,13 +1,15 @@
 //! API route definitions.
 
 use axum::middleware as axum_middleware;
-use axum::routing::{get, post, put, delete};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::handlers::{auth, health, markets, positions, recommendations, wallets, trading, backtest, discover, vault};
+use crate::handlers::{
+    auth, backtest, discover, health, markets, positions, recommendations, trading, vault, wallets,
+};
 use crate::middleware::{require_auth, require_trader};
 use crate::state::AppState;
 use crate::websocket;
@@ -132,11 +134,23 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Discovery/demo endpoints (public for demo purposes)
         .route("/api/v1/discover/trades", get(discover::get_live_trades))
         .route("/api/v1/discover/wallets", get(discover::discover_wallets))
-        .route("/api/v1/discover/simulate", get(discover::simulate_demo_pnl))
+        .route(
+            "/api/v1/discover/simulate",
+            get(discover::simulate_demo_pnl),
+        )
         // Recommendations (public for demo purposes)
-        .route("/api/v1/recommendations/rotation", get(recommendations::get_rotation_recommendations))
-        .route("/api/v1/recommendations/:id/dismiss", post(recommendations::dismiss_recommendation))
-        .route("/api/v1/recommendations/:id/accept", post(recommendations::accept_recommendation))
+        .route(
+            "/api/v1/recommendations/rotation",
+            get(recommendations::get_rotation_recommendations),
+        )
+        .route(
+            "/api/v1/recommendations/:id/dismiss",
+            post(recommendations::dismiss_recommendation),
+        )
+        .route(
+            "/api/v1/recommendations/:id/accept",
+            post(recommendations::accept_recommendation),
+        )
         // WebSocket endpoints (auth handled via query param or message)
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))
@@ -151,32 +165,56 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Market endpoints (read-only)
         .route("/api/v1/markets", get(markets::list_markets))
         .route("/api/v1/markets/:market_id", get(markets::get_market))
-        .route("/api/v1/markets/:market_id/orderbook", get(markets::get_market_orderbook))
+        .route(
+            "/api/v1/markets/:market_id/orderbook",
+            get(markets::get_market_orderbook),
+        )
         // Position endpoints (read-only)
         .route("/api/v1/positions", get(positions::list_positions))
-        .route("/api/v1/positions/:position_id", get(positions::get_position))
+        .route(
+            "/api/v1/positions/:position_id",
+            get(positions::get_position),
+        )
         // Wallet endpoints (read-only)
         .route("/api/v1/wallets", get(wallets::list_tracked_wallets))
         .route("/api/v1/wallets/:address", get(wallets::get_wallet))
-        .route("/api/v1/wallets/:address/metrics", get(wallets::get_wallet_metrics))
+        .route(
+            "/api/v1/wallets/:address/metrics",
+            get(wallets::get_wallet_metrics),
+        )
         // Vault endpoints (read-only)
         .route("/api/v1/vault/wallets", get(vault::list_wallets))
         .route("/api/v1/vault/wallets/:address", get(vault::get_wallet))
         // Order endpoints (read-only)
         .route("/api/v1/orders/:order_id", get(trading::get_order_status))
         // Backtest endpoints (read-only)
-        .route("/api/v1/backtest/results", get(backtest::list_backtest_results))
-        .route("/api/v1/backtest/results/:result_id", get(backtest::get_backtest_result))
+        .route(
+            "/api/v1/backtest/results",
+            get(backtest::list_backtest_results),
+        )
+        .route(
+            "/api/v1/backtest/results/:result_id",
+            get(backtest::get_backtest_result),
+        )
         // Apply auth middleware
-        .layer(axum_middleware::from_fn_with_state(state.clone(), require_auth));
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
 
     // Trader routes - require Trader or Admin role
     let trader_routes = Router::new()
         // Trading operations
         .route("/api/v1/orders", post(trading::place_order))
-        .route("/api/v1/orders/:order_id/cancel", post(trading::cancel_order))
+        .route(
+            "/api/v1/orders/:order_id/cancel",
+            post(trading::cancel_order),
+        )
         // Position operations
-        .route("/api/v1/positions/:position_id/close", post(positions::close_position))
+        .route(
+            "/api/v1/positions/:position_id/close",
+            post(positions::close_position),
+        )
         // Wallet management
         .route("/api/v1/wallets", post(wallets::add_tracked_wallet))
         .route("/api/v1/wallets/:address", put(wallets::update_wallet))
@@ -185,11 +223,23 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/backtest", post(backtest::run_backtest))
         // Vault operations (write)
         .route("/api/v1/vault/wallets", post(vault::store_wallet))
-        .route("/api/v1/vault/wallets/:address", delete(vault::remove_wallet))
-        .route("/api/v1/vault/wallets/:address/primary", put(vault::set_primary_wallet))
+        .route(
+            "/api/v1/vault/wallets/:address",
+            delete(vault::remove_wallet),
+        )
+        .route(
+            "/api/v1/vault/wallets/:address/primary",
+            put(vault::set_primary_wallet),
+        )
         // Apply trader check first, then auth
-        .layer(axum_middleware::from_fn_with_state(state.clone(), require_trader))
-        .layer(axum_middleware::from_fn_with_state(state.clone(), require_auth));
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_trader,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
 
     Router::new()
         .merge(public_routes)

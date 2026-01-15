@@ -52,14 +52,9 @@ pub async fn health_check() -> Json<HealthResponse> {
         (status = 503, description = "Service is not ready")
     )
 )]
-pub async fn readiness(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<HealthResponse>> {
+pub async fn readiness(State(state): State<Arc<AppState>>) -> ApiResult<Json<HealthResponse>> {
     // Check database connection
-    let db_status = match sqlx::query("SELECT 1")
-        .fetch_one(&state.pool)
-        .await
-    {
+    let db_status = match sqlx::query("SELECT 1").fetch_one(&state.pool).await {
         Ok(_) => "connected".to_string(),
         Err(e) => format!("error: {}", e),
     };

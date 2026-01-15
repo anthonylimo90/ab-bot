@@ -144,22 +144,30 @@ impl CopyTrader {
             allocation = %wallet.allocation_pct,
             "Adding tracked wallet"
         );
-        self.tracked_wallets.insert(wallet.address.to_lowercase(), wallet);
+        self.tracked_wallets
+            .insert(wallet.address.to_lowercase(), wallet);
     }
 
     /// Remove a wallet from tracking.
     pub fn remove_tracked_wallet(&self, address: &str) -> Option<TrackedWallet> {
-        self.tracked_wallets.remove(&address.to_lowercase()).map(|(_, w)| w)
+        self.tracked_wallets
+            .remove(&address.to_lowercase())
+            .map(|(_, w)| w)
     }
 
     /// Get a tracked wallet by address.
     pub fn get_tracked_wallet(&self, address: &str) -> Option<TrackedWallet> {
-        self.tracked_wallets.get(&address.to_lowercase()).map(|w| w.clone())
+        self.tracked_wallets
+            .get(&address.to_lowercase())
+            .map(|w| w.clone())
     }
 
     /// Get all tracked wallets.
     pub fn list_tracked_wallets(&self) -> Vec<TrackedWallet> {
-        self.tracked_wallets.iter().map(|e| e.value().clone()).collect()
+        self.tracked_wallets
+            .iter()
+            .map(|e| e.value().clone())
+            .collect()
     }
 
     /// Get only enabled tracked wallets.
@@ -198,13 +206,19 @@ impl CopyTrader {
     }
 
     /// Process a detected trade and generate copy order.
-    pub async fn process_detected_trade(&self, trade: &DetectedTrade) -> Result<Option<ExecutionReport>> {
+    pub async fn process_detected_trade(
+        &self,
+        trade: &DetectedTrade,
+    ) -> Result<Option<ExecutionReport>> {
         if !self.active {
             debug!("Copy trading is paused, skipping trade");
             return Ok(None);
         }
 
-        let wallet = match self.tracked_wallets.get(&trade.wallet_address.to_lowercase()) {
+        let wallet = match self
+            .tracked_wallets
+            .get(&trade.wallet_address.to_lowercase())
+        {
             Some(w) if w.enabled => w.clone(),
             Some(_) => {
                 debug!(
@@ -229,7 +243,7 @@ impl CopyTrader {
 
         // Calculate position size based on allocation
         let allocated_capital = self.calculate_allocated_capital(&wallet);
-        let copy_quantity = self.calculate_copy_quantity(&trade, &wallet, allocated_capital);
+        let copy_quantity = self.calculate_copy_quantity(trade, &wallet, allocated_capital);
 
         if copy_quantity <= Decimal::ZERO {
             warn!(
@@ -260,7 +274,10 @@ impl CopyTrader {
 
         // Update wallet stats
         if report.is_success() {
-            if let Some(mut wallet) = self.tracked_wallets.get_mut(&trade.wallet_address.to_lowercase()) {
+            if let Some(mut wallet) = self
+                .tracked_wallets
+                .get_mut(&trade.wallet_address.to_lowercase())
+            {
                 wallet.last_copied_trade = Some(Utc::now());
                 wallet.total_copied_value += report.total_value();
             }
@@ -286,7 +303,8 @@ impl CopyTrader {
             AllocationStrategy::PerformanceWeighted => {
                 // Weight by historical ROI
                 let wallets = self.enabled_wallets();
-                let total_pnl: Decimal = wallets.iter().map(|w| w.total_pnl.max(Decimal::ONE)).sum();
+                let total_pnl: Decimal =
+                    wallets.iter().map(|w| w.total_pnl.max(Decimal::ONE)).sum();
                 if total_pnl <= Decimal::ZERO {
                     self.total_capital / Decimal::from(wallets.len().max(1))
                 } else {
@@ -317,7 +335,8 @@ impl CopyTrader {
         };
 
         // Apply limits
-        trade.quantity
+        trade
+            .quantity
             .min(wallet.max_position_size)
             .min(max_affordable)
     }
@@ -371,8 +390,8 @@ pub struct CopyTradingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polymarket_core::api::ClobClient;
     use crate::executor::ExecutorConfig;
+    use polymarket_core::api::ClobClient;
 
     fn create_test_executor() -> Arc<OrderExecutor> {
         let clob_client = Arc::new(ClobClient::new(None, None));
@@ -385,12 +404,9 @@ mod tests {
 
     #[test]
     fn test_tracked_wallet_creation() {
-        let wallet = TrackedWallet::new(
-            "0x1234".to_string(),
-            Decimal::new(20, 0),
-        )
-        .with_alias("Top Trader")
-        .with_delay(100);
+        let wallet = TrackedWallet::new("0x1234".to_string(), Decimal::new(20, 0))
+            .with_alias("Top Trader")
+            .with_delay(100);
 
         assert_eq!(wallet.allocation_pct, Decimal::new(20, 0));
         assert_eq!(wallet.alias, Some("Top Trader".to_string()));
@@ -403,8 +419,10 @@ mod tests {
         let executor = create_test_executor();
         let copy_trader = CopyTrader::new(executor, Decimal::new(10000, 0));
 
-        copy_trader.add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(50, 0)));
-        copy_trader.add_tracked_wallet(TrackedWallet::new("0xBBB".to_string(), Decimal::new(50, 0)));
+        copy_trader
+            .add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(50, 0)));
+        copy_trader
+            .add_tracked_wallet(TrackedWallet::new("0xBBB".to_string(), Decimal::new(50, 0)));
 
         let wallets = copy_trader.list_tracked_wallets();
         assert_eq!(wallets.len(), 2);
@@ -429,7 +447,8 @@ mod tests {
         let executor = create_test_executor();
         let copy_trader = CopyTrader::new(executor, Decimal::new(10000, 0));
 
-        copy_trader.add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(50, 0)));
+        copy_trader
+            .add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(50, 0)));
 
         assert!(copy_trader.set_wallet_enabled("0xAAA", false));
         let wallet = copy_trader.get_tracked_wallet("0xAAA").unwrap();

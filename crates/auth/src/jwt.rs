@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// User roles for authorization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     /// Read-only access to dashboards and data.
+    #[default]
     Viewer,
     /// Can execute trades and manage positions.
     Trader,
@@ -32,12 +33,6 @@ impl UserRole {
     /// Check if this role can view data.
     pub fn can_view(&self) -> bool {
         true // All roles can view
-    }
-}
-
-impl Default for UserRole {
-    fn default() -> Self {
-        UserRole::Viewer
     }
 }
 
@@ -240,19 +235,37 @@ mod tests {
         let viewer_token = auth.create_token("viewer", UserRole::Viewer).unwrap();
 
         // Admin can do everything
-        assert!(auth.check_permission(&admin_token, UserRole::Viewer).unwrap());
-        assert!(auth.check_permission(&admin_token, UserRole::Trader).unwrap());
-        assert!(auth.check_permission(&admin_token, UserRole::Admin).unwrap());
+        assert!(auth
+            .check_permission(&admin_token, UserRole::Viewer)
+            .unwrap());
+        assert!(auth
+            .check_permission(&admin_token, UserRole::Trader)
+            .unwrap());
+        assert!(auth
+            .check_permission(&admin_token, UserRole::Admin)
+            .unwrap());
 
         // Trader can trade and view
-        assert!(auth.check_permission(&trader_token, UserRole::Viewer).unwrap());
-        assert!(auth.check_permission(&trader_token, UserRole::Trader).unwrap());
-        assert!(!auth.check_permission(&trader_token, UserRole::Admin).unwrap());
+        assert!(auth
+            .check_permission(&trader_token, UserRole::Viewer)
+            .unwrap());
+        assert!(auth
+            .check_permission(&trader_token, UserRole::Trader)
+            .unwrap());
+        assert!(!auth
+            .check_permission(&trader_token, UserRole::Admin)
+            .unwrap());
 
         // Viewer can only view
-        assert!(auth.check_permission(&viewer_token, UserRole::Viewer).unwrap());
-        assert!(!auth.check_permission(&viewer_token, UserRole::Trader).unwrap());
-        assert!(!auth.check_permission(&viewer_token, UserRole::Admin).unwrap());
+        assert!(auth
+            .check_permission(&viewer_token, UserRole::Viewer)
+            .unwrap());
+        assert!(!auth
+            .check_permission(&viewer_token, UserRole::Trader)
+            .unwrap());
+        assert!(!auth
+            .check_permission(&viewer_token, UserRole::Admin)
+            .unwrap());
     }
 
     #[test]

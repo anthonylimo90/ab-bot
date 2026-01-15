@@ -2,16 +2,14 @@
 //!
 //! Run with: `cargo bench --bench throughput`
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use chrono::Utc;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::Rng;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use polymarket_core::types::{
-    ArbOpportunity, BinaryMarketBook, OrderBook, PriceLevel,
-};
+use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, OrderBook, PriceLevel};
 
 /// Generate a random orderbook with specified depth.
 fn generate_random_orderbook(
@@ -116,8 +114,7 @@ fn bench_parallel_arb_scan(c: &mut Criterion) {
                     let opportunities: Vec<_> = markets
                         .par_iter()
                         .filter_map(|market| {
-                            ArbOpportunity::calculate(market, fee)
-                                .filter(|arb| arb.is_profitable())
+                            ArbOpportunity::calculate(market, fee).filter(|arb| arb.is_profitable())
                         })
                         .collect();
                     black_box(opportunities)
@@ -147,7 +144,10 @@ fn bench_bulk_stop_check(c: &mut Criterion) {
                 1 => StopType::percentage(Decimal::new(rng.gen_range(10..30), 2)),
                 _ => {
                     let mut stop = StopType::trailing(Decimal::new(rng.gen_range(5..15), 2));
-                    if let StopType::Trailing { ref mut peak_price, .. } = stop {
+                    if let StopType::Trailing {
+                        ref mut peak_price, ..
+                    } = stop
+                    {
                         *peak_price = entry_price + Decimal::new(10, 2);
                     }
                     stop

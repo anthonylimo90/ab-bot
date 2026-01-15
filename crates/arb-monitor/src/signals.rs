@@ -70,11 +70,8 @@ impl SignalPublisher {
             .publish(channels::EXIT, payload.to_string())
             .await?;
 
-        self.send_alerts(&format!(
-            "ARB EXIT: {} | Profit: {:.4}",
-            market_id, profit
-        ))
-        .await?;
+        self.send_alerts(&format!("ARB EXIT: {} | Profit: {:.4}", market_id, profit))
+            .await?;
 
         Ok(())
     }

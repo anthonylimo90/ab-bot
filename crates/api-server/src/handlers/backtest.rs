@@ -12,9 +12,8 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use backtester::{
-    ArbitrageStrategy, BacktestSimulator, DataQuery, HistoricalDataStore,
-    MeanReversionStrategy, MomentumStrategy, SimulatorConfig, Strategy,
-    SlippageModel as BacktesterSlippageModel,
+    ArbitrageStrategy, BacktestSimulator, DataQuery, HistoricalDataStore, MeanReversionStrategy,
+    MomentumStrategy, SimulatorConfig, SlippageModel as BacktesterSlippageModel, Strategy,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -282,8 +281,8 @@ pub async fn run_backtest(
     let now = Utc::now();
 
     // Serialize strategy config
-    let strategy_json = serde_json::to_value(&request.strategy)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let strategy_json =
+        serde_json::to_value(&request.strategy).map_err(|e| ApiError::Internal(e.to_string()))?;
     let slippage_json = serde_json::to_value(&request.slippage_model)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -382,12 +381,13 @@ async fn run_backtest_task(
     let backtester_slippage = match slippage_model {
         SlippageModel::None => BacktesterSlippageModel::None,
         SlippageModel::Fixed { pct } => BacktesterSlippageModel::Fixed(pct),
-        SlippageModel::VolumeBased { base_pct, volume_factor } => {
-            BacktesterSlippageModel::VolumeBased {
-                base_pct,
-                size_impact: volume_factor,
-            }
-        }
+        SlippageModel::VolumeBased {
+            base_pct,
+            volume_factor,
+        } => BacktesterSlippageModel::VolumeBased {
+            base_pct,
+            size_impact: volume_factor,
+        },
     };
 
     // Configure simulator
@@ -402,20 +402,28 @@ async fn run_backtest_task(
 
     // Create strategy from config
     let result = match strategy_config {
-        StrategyConfig::Arbitrage { min_spread, max_position } => {
+        StrategyConfig::Arbitrage {
+            min_spread,
+            max_position,
+        } => {
             // ArbitrageStrategy::new takes (min_spread, position_size, max_positions)
             let mut strategy = ArbitrageStrategy::new(min_spread, max_position, 10);
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
-        StrategyConfig::Momentum { lookback_hours, threshold, position_size } => {
-            let mut strategy = MomentumStrategy::new(
-                lookback_hours as usize,
-                threshold,
-                position_size,
-            );
+        StrategyConfig::Momentum {
+            lookback_hours,
+            threshold,
+            position_size,
+        } => {
+            let mut strategy =
+                MomentumStrategy::new(lookback_hours as usize, threshold, position_size);
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
-        StrategyConfig::MeanReversion { window_hours, std_threshold, position_size } => {
+        StrategyConfig::MeanReversion {
+            window_hours,
+            std_threshold,
+            position_size,
+        } => {
             let mut strategy = MeanReversionStrategy::new(
                 window_hours as usize,
                 std_threshold.to_string().parse().unwrap_or(2.0),
@@ -425,7 +433,9 @@ async fn run_backtest_task(
         }
         StrategyConfig::CopyTrading { .. } => {
             // Copy trading strategy requires wallet tracking - not supported in backtest yet
-            Err(anyhow::anyhow!("Copy trading strategy not supported in backtests"))
+            Err(anyhow::anyhow!(
+                "Copy trading strategy not supported in backtests"
+            ))
         }
     };
 
@@ -567,8 +577,8 @@ pub async fn list_backtest_results(
     let results: Vec<BacktestResultResponse> = rows
         .into_iter()
         .map(|row| {
-            let strategy: StrategyConfig = serde_json::from_value(row.strategy)
-                .unwrap_or(StrategyConfig::Arbitrage {
+            let strategy: StrategyConfig =
+                serde_json::from_value(row.strategy).unwrap_or(StrategyConfig::Arbitrage {
                     min_spread: Decimal::new(1, 2),
                     max_position: Decimal::new(1000, 0),
                 });
@@ -642,8 +652,8 @@ pub async fn get_backtest_result(
 
     match row {
         Some(row) => {
-            let strategy: StrategyConfig = serde_json::from_value(row.strategy)
-                .unwrap_or(StrategyConfig::Arbitrage {
+            let strategy: StrategyConfig =
+                serde_json::from_value(row.strategy).unwrap_or(StrategyConfig::Arbitrage {
                     min_spread: Decimal::new(1, 2),
                     max_position: Decimal::new(1000, 0),
                 });
@@ -680,7 +690,10 @@ pub async fn get_backtest_result(
                 equity_curve,
             }))
         }
-        None => Err(ApiError::NotFound(format!("Backtest result {} not found", result_id))),
+        None => Err(ApiError::NotFound(format!(
+            "Backtest result {} not found",
+            result_id
+        ))),
     }
 }
 

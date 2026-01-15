@@ -11,6 +11,6 @@ pub use copy_trader::CopyTrader;
 pub use executor::OrderExecutor;
 pub use position_manager::PositionManager;
 pub use recommendation::{
-    Evidence, HoldingPeriod, RecommendationEngine, RecommendationType,
-    RecommendedAction, Recommendation, RiskLevel, RiskProfile, Urgency,
+    Evidence, HoldingPeriod, Recommendation, RecommendationEngine, RecommendationType,
+    RecommendedAction, RiskLevel, RiskProfile, Urgency,
 };

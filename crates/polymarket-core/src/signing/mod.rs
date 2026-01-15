@@ -49,9 +49,8 @@ pub mod order_types;
 pub mod signer;
 
 pub use domain::{
-    Eip712Domain, OrderSide, SignatureType,
-    CTF_EXCHANGE_ADDRESS, NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS,
-    POLYGON_AMOY_CHAIN_ID, POLYGON_CHAIN_ID, USDC_ADDRESS,
+    Eip712Domain, OrderSide, SignatureType, CTF_EXCHANGE_ADDRESS, NEG_RISK_ADAPTER_ADDRESS,
+    NEG_RISK_CTF_EXCHANGE_ADDRESS, POLYGON_AMOY_CHAIN_ID, POLYGON_CHAIN_ID, USDC_ADDRESS,
 };
 
 pub use order_types::{OrderBuilder, OrderData, SignedOrder};

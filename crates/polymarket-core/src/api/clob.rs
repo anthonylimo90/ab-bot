@@ -3,10 +3,9 @@
 //! This module provides both read-only and authenticated access to the
 //! Polymarket CLOB API for order book data and order management.
 
-use crate::signing::{OrderData, OrderSigner, SignedOrder};
+use crate::signing::{OrderSigner, SignedOrder};
 use crate::types::{Market, OrderBook, Outcome, PriceLevel};
 use crate::{Error, Result};
-use alloy_primitives::U256;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -132,21 +131,19 @@ impl ClobClient {
         // Process incoming messages
         while let Some(msg) = read.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<WsMessage>(&text) {
-                        Ok(ws_msg) => {
-                            if let Some(update) = ws_msg.into_update() {
-                                if tx.send(update).await.is_err() {
-                                    warn!("Receiver dropped, closing WebSocket");
-                                    break;
-                                }
+                Ok(Message::Text(text)) => match serde_json::from_str::<WsMessage>(&text) {
+                    Ok(ws_msg) => {
+                        if let Some(update) = ws_msg.into_update() {
+                            if tx.send(update).await.is_err() {
+                                warn!("Receiver dropped, closing WebSocket");
+                                break;
                             }
                         }
-                        Err(e) => {
-                            debug!("Failed to parse WebSocket message: {} - {}", e, text);
-                        }
                     }
-                }
+                    Err(e) => {
+                        debug!("Failed to parse WebSocket message: {} - {}", e, text);
+                    }
+                },
                 Ok(Message::Ping(data)) => {
                     write.send(Message::Pong(data)).await?;
                 }
@@ -203,6 +200,7 @@ struct ClobMarket {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ClobToken {
     token_id: String,
     outcome: String,
@@ -350,6 +348,7 @@ impl ApiCredentials {
     }
 
     /// Load from environment variables.
+    #[allow(clippy::result_large_err)]
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("POLY_API_KEY").map_err(|_| Error::Config {
             message: "POLY_API_KEY environment variable not set".to_string(),
@@ -370,21 +369,16 @@ impl ApiCredentials {
 }
 
 /// Order type for submission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderType {
     /// Good-till-cancelled limit order.
+    #[default]
     Gtc,
     /// Fill-or-kill market order.
     Fok,
     /// Good-till-date limit order.
     Gtd,
-}
-
-impl Default for OrderType {
-    fn default() -> Self {
-        Self::Gtc
-    }
 }
 
 /// Request body for posting an order.
@@ -592,13 +586,7 @@ impl AuthenticatedClobClient {
         let body = serde_json::to_string(&request)?;
 
         // Sign the request with L2 HMAC
-        let signature = sign_l2_request(
-            credentials,
-            method,
-            path,
-            &timestamp,
-            Some(&body),
-        )?;
+        let signature = sign_l2_request(credentials, method, path, &timestamp, Some(&body))?;
 
         let response = self
             .client
@@ -640,13 +628,7 @@ impl AuthenticatedClobClient {
         let method = "DELETE";
         let path = format!("/order/{}", order_id);
 
-        let signature = sign_l2_request(
-            credentials,
-            method,
-            &path,
-            &timestamp,
-            None,
-        )?;
+        let signature = sign_l2_request(credentials, method, &path, &timestamp, None)?;
 
         let response = self
             .client
@@ -687,13 +669,7 @@ impl AuthenticatedClobClient {
         let timestamp = current_timestamp().to_string();
         let method = "GET";
 
-        let signature = sign_l2_request(
-            credentials,
-            method,
-            &path,
-            &timestamp,
-            None,
-        )?;
+        let signature = sign_l2_request(credentials, method, &path, &timestamp, None)?;
 
         let response = self
             .client
@@ -731,13 +707,7 @@ impl AuthenticatedClobClient {
         let method = "DELETE";
         let path = "/orders";
 
-        let signature = sign_l2_request(
-            credentials,
-            method,
-            path,
-            &timestamp,
-            None,
-        )?;
+        let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
 
         let response = self
             .client
@@ -774,6 +744,7 @@ fn current_timestamp() -> u64 {
 }
 
 /// Sign a request with HMAC-SHA256 for L2 authentication.
+#[allow(clippy::result_large_err)]
 fn sign_l2_request(
     credentials: &ApiCredentials,
     method: &str,
@@ -902,14 +873,8 @@ mod authenticated_tests {
             "test-passphrase".to_string(),
         );
 
-        let signature = sign_l2_request(
-            &credentials,
-            "GET",
-            "/orders",
-            "1700000000",
-            None,
-        )
-        .unwrap();
+        let signature =
+            sign_l2_request(&credentials, "GET", "/orders", "1700000000", None).unwrap();
 
         assert!(base64::engine::general_purpose::STANDARD
             .decode(&signature)

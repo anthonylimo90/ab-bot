@@ -33,14 +33,12 @@ pub mod strategy;
 
 // Re-exports
 pub use data_store::{
-    DataQuery, HistoricalDataStore, HistoricalTrade, MarketSnapshot,
-    TimeResolution, TradeSide,
+    DataQuery, HistoricalDataStore, HistoricalTrade, MarketSnapshot, TimeResolution, TradeSide,
 };
 pub use simulator::{
-    BacktestResult, BacktestSimulator, SimulatorConfig, SlippageModel,
-    TradeRecord, TradeType,
+    BacktestResult, BacktestSimulator, SimulatorConfig, SlippageModel, TradeRecord, TradeType,
 };
 pub use strategy::{
-    ArbitrageStrategy, MeanReversionStrategy, MomentumStrategy,
-    Position, Signal, SignalType, Strategy, StrategyContext,
+    ArbitrageStrategy, MeanReversionStrategy, MomentumStrategy, Position, Signal, SignalType,
+    Strategy, StrategyContext,
 };

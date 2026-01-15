@@ -35,7 +35,10 @@ pub enum Error {
     Position(String),
 
     #[error("API error: {message}")]
-    Api { message: String, status: Option<u16> },
+    Api {
+        message: String,
+        status: Option<u16>,
+    },
 
     #[error("Signing error: {message}")]
     Signing { message: String },

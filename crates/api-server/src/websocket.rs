@@ -105,11 +105,18 @@ pub enum WsMessage {
     /// Trading signal.
     Signal(SignalUpdate),
     /// Subscription confirmation.
-    Subscribed { channel: String },
+    Subscribed {
+        channel: String,
+    },
     /// Unsubscription confirmation.
-    Unsubscribed { channel: String },
+    Unsubscribed {
+        channel: String,
+    },
     /// Error message.
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
     /// Ping/pong for keepalive.
     Ping,
     Pong,
@@ -121,7 +128,10 @@ pub enum WsMessage {
 pub enum WsRequest {
     /// Subscribe to a channel.
     #[serde(rename = "subscribe")]
-    Subscribe { channel: String, filters: Option<serde_json::Value> },
+    Subscribe {
+        channel: String,
+        filters: Option<serde_json::Value>,
+    },
     /// Unsubscribe from a channel.
     #[serde(rename = "unsubscribe")]
     Unsubscribe { channel: String },
@@ -155,10 +165,7 @@ pub async fn ws_signals_handler(
 }
 
 /// WebSocket upgrade handler for all updates (multiplexed).
-pub async fn ws_all_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn ws_all_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     ws.on_upgrade(move |socket| handle_all_socket(socket, state))
 }
 
@@ -169,7 +176,9 @@ async fn handle_orderbook_socket(socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket client connected to orderbook channel");
 
     // Send subscription confirmation
-    let msg = WsMessage::Subscribed { channel: "orderbook".to_string() };
+    let msg = WsMessage::Subscribed {
+        channel: "orderbook".to_string(),
+    };
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = sender.send(Message::Text(json)).await;
     }
@@ -224,7 +233,9 @@ async fn handle_positions_socket(socket: WebSocket, state: Arc<AppState>) {
 
     info!("WebSocket client connected to positions channel");
 
-    let msg = WsMessage::Subscribed { channel: "positions".to_string() };
+    let msg = WsMessage::Subscribed {
+        channel: "positions".to_string(),
+    };
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = sender.send(Message::Text(json)).await;
     }
@@ -266,7 +277,9 @@ async fn handle_signals_socket(socket: WebSocket, state: Arc<AppState>) {
 
     info!("WebSocket client connected to signals channel");
 
-    let msg = WsMessage::Subscribed { channel: "signals".to_string() };
+    let msg = WsMessage::Subscribed {
+        channel: "signals".to_string(),
+    };
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = sender.send(Message::Text(json)).await;
     }
@@ -310,7 +323,9 @@ async fn handle_all_socket(socket: WebSocket, state: Arc<AppState>) {
 
     info!("WebSocket client connected to all channels");
 
-    let msg = WsMessage::Subscribed { channel: "all".to_string() };
+    let msg = WsMessage::Subscribed {
+        channel: "all".to_string(),
+    };
     if let Ok(json) = serde_json::to_string(&msg) {
         let _ = sender.send(Message::Text(json)).await;
     }

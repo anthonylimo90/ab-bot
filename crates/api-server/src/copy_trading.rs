@@ -30,7 +30,7 @@ impl Default for CopyTradingConfig {
     fn default() -> Self {
         Self {
             min_trade_value: Decimal::new(10, 0), // $10 minimum
-            max_latency_secs: 60,                  // 1 minute max latency
+            max_latency_secs: 60,                 // 1 minute max latency
             enabled: true,
         }
     }

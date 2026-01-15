@@ -230,6 +230,7 @@ impl StopLossRepository {
     }
 
     /// Decompose StopType into database columns.
+    #[allow(clippy::type_complexity)]
     fn decompose_stop_type(
         stop_type: &StopType,
     ) -> (

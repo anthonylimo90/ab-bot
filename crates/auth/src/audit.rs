@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
 
 /// Types of auditable actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,7 +348,11 @@ impl AuditLogger {
     /// Log a login event.
     pub fn log_login(&self, user_id: &str, ip: Option<IpAddr>, success: bool) {
         let mut builder = AuditEvent::builder(
-            if success { AuditAction::Login } else { AuditAction::LoginFailed },
+            if success {
+                AuditAction::Login
+            } else {
+                AuditAction::LoginFailed
+            },
             format!("user/{}", user_id),
         )
         .user(user_id);
@@ -366,7 +369,13 @@ impl AuditLogger {
     }
 
     /// Log a trade action.
-    pub fn log_trade(&self, user_id: &str, action: AuditAction, position_id: &str, details: serde_json::Value) {
+    pub fn log_trade(
+        &self,
+        user_id: &str,
+        action: AuditAction,
+        position_id: &str,
+        details: serde_json::Value,
+    ) {
         let event = AuditEvent::builder(action, format!("position/{}", position_id))
             .user(user_id)
             .details(details)
@@ -376,14 +385,21 @@ impl AuditLogger {
     }
 
     /// Log a configuration change.
-    pub fn log_config_change(&self, user_id: &str, config_key: &str, old_value: serde_json::Value, new_value: serde_json::Value) {
-        let event = AuditEvent::builder(AuditAction::ConfigChange, format!("config/{}", config_key))
-            .user(user_id)
-            .details(serde_json::json!({
-                "old": old_value,
-                "new": new_value,
-            }))
-            .build();
+    pub fn log_config_change(
+        &self,
+        user_id: &str,
+        config_key: &str,
+        old_value: serde_json::Value,
+        new_value: serde_json::Value,
+    ) {
+        let event =
+            AuditEvent::builder(AuditAction::ConfigChange, format!("config/{}", config_key))
+                .user(user_id)
+                .details(serde_json::json!({
+                    "old": old_value,
+                    "new": new_value,
+                }))
+                .build();
 
         self.log(event);
     }
@@ -427,11 +443,19 @@ mod tests {
         let storage = MemoryAuditStorage::new();
 
         storage
-            .store(&AuditEvent::builder(AuditAction::Login, "user/1").user("user1").build())
+            .store(
+                &AuditEvent::builder(AuditAction::Login, "user/1")
+                    .user("user1")
+                    .build(),
+            )
             .await
             .unwrap();
         storage
-            .store(&AuditEvent::builder(AuditAction::Login, "user/2").user("user2").build())
+            .store(
+                &AuditEvent::builder(AuditAction::Login, "user/2")
+                    .user("user2")
+                    .build(),
+            )
             .await
             .unwrap();
 

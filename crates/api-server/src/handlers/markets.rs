@@ -133,14 +133,10 @@ pub async fn list_markets(
     Query(query): Query<ListMarketsQuery>,
 ) -> ApiResult<Json<Vec<MarketResponse>>> {
     // Fetch markets from ClobClient
-    let clob_markets = state
-        .clob_client
-        .get_markets()
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "Failed to fetch markets from CLOB");
-            ApiError::Internal(format!("Failed to fetch markets: {}", e))
-        })?;
+    let clob_markets = state.clob_client.get_markets().await.map_err(|e| {
+        warn!(error = %e, "Failed to fetch markets from CLOB");
+        ApiError::Internal(format!("Failed to fetch markets: {}", e))
+    })?;
 
     // Filter and transform to response format
     let now = Utc::now();
@@ -215,15 +211,29 @@ pub async fn list_markets(
 fn infer_category(question: &str) -> String {
     let q = question.to_lowercase();
 
-    if q.contains("bitcoin") || q.contains("btc") || q.contains("ethereum") || q.contains("crypto") {
+    if q.contains("bitcoin") || q.contains("btc") || q.contains("ethereum") || q.contains("crypto")
+    {
         "crypto".to_string()
-    } else if q.contains("president") || q.contains("election") || q.contains("congress") || q.contains("senate") {
+    } else if q.contains("president")
+        || q.contains("election")
+        || q.contains("congress")
+        || q.contains("senate")
+    {
         "politics".to_string()
-    } else if q.contains("nfl") || q.contains("nba") || q.contains("world cup") || q.contains("super bowl") {
+    } else if q.contains("nfl")
+        || q.contains("nba")
+        || q.contains("world cup")
+        || q.contains("super bowl")
+    {
         "sports".to_string()
-    } else if q.contains("stock") || q.contains("s&p") || q.contains("nasdaq") || q.contains("fed") {
+    } else if q.contains("stock") || q.contains("s&p") || q.contains("nasdaq") || q.contains("fed")
+    {
         "finance".to_string()
-    } else if q.contains("ai") || q.contains("openai") || q.contains("google") || q.contains("apple") {
+    } else if q.contains("ai")
+        || q.contains("openai")
+        || q.contains("google")
+        || q.contains("apple")
+    {
         "tech".to_string()
     } else {
         "other".to_string()
@@ -275,7 +285,10 @@ pub async fn get_market(
             liquidity: row.liquidity,
             created_at: row.created_at,
         })),
-        None => Err(ApiError::NotFound(format!("Market {} not found", market_id))),
+        None => Err(ApiError::NotFound(format!(
+            "Market {} not found",
+            market_id
+        ))),
     }
 }
 
@@ -310,8 +323,14 @@ pub async fn get_market_orderbook(
 
     // Get token IDs for yes/no outcomes
     let (yes_token, no_token) = if market.outcomes.len() >= 2 {
-        let yes = market.outcomes.iter().find(|o| o.name.to_lowercase().contains("yes"));
-        let no = market.outcomes.iter().find(|o| o.name.to_lowercase().contains("no"));
+        let yes = market
+            .outcomes
+            .iter()
+            .find(|o| o.name.to_lowercase().contains("yes"));
+        let no = market
+            .outcomes
+            .iter()
+            .find(|o| o.name.to_lowercase().contains("no"));
         (
             yes.map(|o| o.token_id.clone()),
             no.map(|o| o.token_id.clone()),
@@ -326,8 +345,20 @@ pub async fn get_market_orderbook(
     let (yes_bids, yes_asks) = if let Some(token_id) = yes_token {
         match state.clob_client.get_order_book(&token_id).await {
             Ok(book) => (
-                book.bids.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
-                book.asks.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
+                book.bids
+                    .into_iter()
+                    .map(|p| PriceLevel {
+                        price: p.price,
+                        size: p.size,
+                    })
+                    .collect(),
+                book.asks
+                    .into_iter()
+                    .map(|p| PriceLevel {
+                        price: p.price,
+                        size: p.size,
+                    })
+                    .collect(),
             ),
             Err(e) => {
                 warn!(error = %e, token_id = %token_id, "Failed to fetch yes orderbook");
@@ -341,8 +372,20 @@ pub async fn get_market_orderbook(
     let (no_bids, no_asks) = if let Some(token_id) = no_token {
         match state.clob_client.get_order_book(&token_id).await {
             Ok(book) => (
-                book.bids.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
-                book.asks.into_iter().map(|p| PriceLevel { price: p.price, size: p.size }).collect(),
+                book.bids
+                    .into_iter()
+                    .map(|p| PriceLevel {
+                        price: p.price,
+                        size: p.size,
+                    })
+                    .collect(),
+                book.asks
+                    .into_iter()
+                    .map(|p| PriceLevel {
+                        price: p.price,
+                        size: p.size,
+                    })
+                    .collect(),
             ),
             Err(e) => {
                 warn!(error = %e, token_id = %token_id, "Failed to fetch no orderbook");
@@ -432,8 +475,14 @@ mod tests {
         let orderbook = OrderbookResponse {
             market_id: "market1".to_string(),
             timestamp: Utc::now(),
-            yes_bids: vec![PriceLevel { price: Decimal::new(50, 2), size: Decimal::new(100, 0) }],
-            yes_asks: vec![PriceLevel { price: Decimal::new(51, 2), size: Decimal::new(100, 0) }],
+            yes_bids: vec![PriceLevel {
+                price: Decimal::new(50, 2),
+                size: Decimal::new(100, 0),
+            }],
+            yes_asks: vec![PriceLevel {
+                price: Decimal::new(51, 2),
+                size: Decimal::new(100, 0),
+            }],
             no_bids: vec![],
             no_asks: vec![],
             spread: SpreadInfo {

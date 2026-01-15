@@ -105,7 +105,7 @@ fn rand_salt() -> u128 {
         .unwrap()
         .as_nanos();
     // Mix with random bytes if available
-    timestamp as u128 ^ (std::process::id() as u128) << 64
+    timestamp ^ (std::process::id() as u128) << 64
 }
 
 /// A signed order ready for submission.
@@ -275,7 +275,14 @@ impl OrderBuilder {
         // For a SELL: maker provides tokens, receives USDC
         let (maker_amount, taker_amount) = calculate_amounts(self.side, price, size);
 
-        let mut order = OrderData::new(maker, token_id, self.side, maker_amount, taker_amount, expiration);
+        let mut order = OrderData::new(
+            maker,
+            token_id,
+            self.side,
+            maker_amount,
+            taker_amount,
+            expiration,
+        );
         order.nonce = self.nonce;
         order.fee_rate_bps = self.fee_rate_bps;
 
@@ -309,8 +316,13 @@ fn calculate_amounts(side: OrderSide, price: Decimal, size: Decimal) -> (U256, U
             } else {
                 Decimal::ZERO
             };
-            let taker_amount =
-                U256::from((token_amount * usdc_decimals).round().to_string().parse::<u128>().unwrap_or(0));
+            let taker_amount = U256::from(
+                (token_amount * usdc_decimals)
+                    .round()
+                    .to_string()
+                    .parse::<u128>()
+                    .unwrap_or(0),
+            );
             (maker_amount, taker_amount)
         }
         OrderSide::Sell => {
@@ -320,8 +332,13 @@ fn calculate_amounts(side: OrderSide, price: Decimal, size: Decimal) -> (U256, U
             } else {
                 Decimal::ZERO
             };
-            let maker_amount =
-                U256::from((token_amount * usdc_decimals).round().to_string().parse::<u128>().unwrap_or(0));
+            let maker_amount = U256::from(
+                (token_amount * usdc_decimals)
+                    .round()
+                    .to_string()
+                    .parse::<u128>()
+                    .unwrap_or(0),
+            );
             let taker_amount = U256::from(size_base.to_string().parse::<u128>().unwrap_or(0));
             (maker_amount, taker_amount)
         }

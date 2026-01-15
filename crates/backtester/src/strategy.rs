@@ -256,7 +256,12 @@ pub trait Strategy: Send + Sync {
     async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>>;
 
     /// Called when an order is filled.
-    async fn on_fill(&mut self, _signal: &Signal, _fill_price: Decimal, _quantity: Decimal) -> Result<()> {
+    async fn on_fill(
+        &mut self,
+        _signal: &Signal,
+        _fill_price: Decimal,
+        _quantity: Decimal,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -374,18 +379,19 @@ impl ArbitrageStrategy {
         }
 
         let mean: f64 = spreads.iter().sum::<f64>() / spreads.len() as f64;
-        let variance: f64 = spreads.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / spreads.len() as f64;
+        let variance: f64 =
+            spreads.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / spreads.len() as f64;
         let volatility = variance.sqrt();
 
         // Adjust threshold: higher volatility = higher threshold (more conservative)
-        let adjustment = Decimal::try_from(volatility * self.volatility_multiplier).unwrap_or(Decimal::ZERO);
+        let adjustment =
+            Decimal::try_from(volatility * self.volatility_multiplier).unwrap_or(Decimal::ZERO);
         self.effective_min_spread + adjustment
     }
 
     /// Check if depth is sufficient for the trade.
     fn has_sufficient_depth(&self, snapshot: &MarketSnapshot) -> bool {
-        snapshot.yes_ask_depth >= self.min_depth
-            && snapshot.no_ask_depth >= self.min_depth
+        snapshot.yes_ask_depth >= self.min_depth && snapshot.no_ask_depth >= self.min_depth
     }
 }
 
@@ -462,13 +468,25 @@ impl Strategy for ArbitrageStrategy {
 
     fn parameters(&self) -> HashMap<String, String> {
         let mut params = HashMap::new();
-        params.insert("base_min_spread".to_string(), self.base_min_spread.to_string());
-        params.insert("trading_fee_pct".to_string(), self.trading_fee_pct.to_string());
-        params.insert("effective_min_spread".to_string(), self.effective_min_spread.to_string());
+        params.insert(
+            "base_min_spread".to_string(),
+            self.base_min_spread.to_string(),
+        );
+        params.insert(
+            "trading_fee_pct".to_string(),
+            self.trading_fee_pct.to_string(),
+        );
+        params.insert(
+            "effective_min_spread".to_string(),
+            self.effective_min_spread.to_string(),
+        );
         params.insert("position_size".to_string(), self.position_size.to_string());
         params.insert("max_positions".to_string(), self.max_positions.to_string());
         params.insert("min_depth".to_string(), self.min_depth.to_string());
-        params.insert("use_dynamic_threshold".to_string(), self.use_dynamic_threshold.to_string());
+        params.insert(
+            "use_dynamic_threshold".to_string(),
+            self.use_dynamic_threshold.to_string(),
+        );
         params
     }
 }
@@ -508,10 +526,10 @@ impl Default for MomentumStrategy {
         Self {
             lookback_periods: 10,
             momentum_threshold: Decimal::new(5, 2), // 5%
-            position_size: Decimal::new(10, 2), // 10%
+            position_size: Decimal::new(10, 2),     // 10%
             require_volume_confirmation: false,
             volume_multiplier: Decimal::new(15, 1), // 1.5x
-            min_trend_strength: 0.0, // Disabled by default
+            min_trend_strength: 0.0,                // Disabled by default
             use_multi_timeframe: false,
             long_term_lookback: 50,
             trailing_stop_pct: None,
@@ -522,7 +540,11 @@ impl Default for MomentumStrategy {
 
 impl MomentumStrategy {
     /// Create with basic parameters.
-    pub fn new(lookback_periods: usize, momentum_threshold: Decimal, position_size: Decimal) -> Self {
+    pub fn new(
+        lookback_periods: usize,
+        momentum_threshold: Decimal,
+        position_size: Decimal,
+    ) -> Self {
         Self {
             lookback_periods,
             momentum_threshold,
@@ -620,7 +642,10 @@ impl MomentumStrategy {
             return true;
         }
 
-        let current_volume = snapshots.last().map(|s| s.volume_24h).unwrap_or(Decimal::ZERO);
+        let current_volume = snapshots
+            .last()
+            .map(|s| s.volume_24h)
+            .unwrap_or(Decimal::ZERO);
 
         // Calculate average volume over lookback
         let avg_volume: Decimal = snapshots.iter().map(|s| s.volume_24h).sum::<Decimal>()
@@ -630,12 +655,19 @@ impl MomentumStrategy {
     }
 
     /// Check multi-timeframe alignment.
-    fn multi_timeframe_aligned(&self, short_momentum: Decimal, snapshots: &[&MarketSnapshot]) -> bool {
+    fn multi_timeframe_aligned(
+        &self,
+        short_momentum: Decimal,
+        snapshots: &[&MarketSnapshot],
+    ) -> bool {
         if !self.use_multi_timeframe || snapshots.len() < self.long_term_lookback {
             return true;
         }
 
-        let first_price = snapshots.first().map(|s| s.yes_bid).unwrap_or(Decimal::ZERO);
+        let first_price = snapshots
+            .first()
+            .map(|s| s.yes_bid)
+            .unwrap_or(Decimal::ZERO);
         let last_price = snapshots.last().map(|s| s.yes_bid).unwrap_or(Decimal::ZERO);
 
         if first_price == Decimal::ZERO {
@@ -709,16 +741,20 @@ impl Strategy for MomentumStrategy {
             if context.has_position(market_id) {
                 // Check trailing stop
                 if self.check_trailing_stop(market_id, last_price) {
-                    signals.push(Signal::close(market_id, "yes")
-                        .with_metadata("exit_reason", "trailing_stop"));
+                    signals.push(
+                        Signal::close(market_id, "yes")
+                            .with_metadata("exit_reason", "trailing_stop"),
+                    );
                     self.peak_prices.remove(market_id);
                     continue;
                 }
 
                 // Negative momentum - close position
                 if momentum < -self.momentum_threshold {
-                    signals.push(Signal::close(market_id, "yes")
-                        .with_metadata("exit_reason", "momentum_reversal"));
+                    signals.push(
+                        Signal::close(market_id, "yes")
+                            .with_metadata("exit_reason", "momentum_reversal"),
+                    );
                     self.peak_prices.remove(market_id);
                 }
             } else {
@@ -730,13 +766,15 @@ impl Strategy for MomentumStrategy {
                     }
 
                     // Check multi-timeframe alignment
-                    let long_snapshots = context.recent_snapshots(market_id, self.long_term_lookback);
+                    let long_snapshots =
+                        context.recent_snapshots(market_id, self.long_term_lookback);
                     if !self.multi_timeframe_aligned(momentum, &long_snapshots) {
                         continue;
                     }
 
                     // Calculate confidence based on momentum and trend strength
-                    let confidence = (momentum.to_string().parse::<f64>().unwrap_or(0.0) * trend_strength)
+                    let confidence = (momentum.to_string().parse::<f64>().unwrap_or(0.0)
+                        * trend_strength)
                         .clamp(0.1, 1.0);
 
                     signals.push(
@@ -757,12 +795,27 @@ impl Strategy for MomentumStrategy {
 
     fn parameters(&self) -> HashMap<String, String> {
         let mut params = HashMap::new();
-        params.insert("lookback_periods".to_string(), self.lookback_periods.to_string());
-        params.insert("momentum_threshold".to_string(), self.momentum_threshold.to_string());
+        params.insert(
+            "lookback_periods".to_string(),
+            self.lookback_periods.to_string(),
+        );
+        params.insert(
+            "momentum_threshold".to_string(),
+            self.momentum_threshold.to_string(),
+        );
         params.insert("position_size".to_string(), self.position_size.to_string());
-        params.insert("require_volume_confirmation".to_string(), self.require_volume_confirmation.to_string());
-        params.insert("min_trend_strength".to_string(), format!("{:.2}", self.min_trend_strength));
-        params.insert("use_multi_timeframe".to_string(), self.use_multi_timeframe.to_string());
+        params.insert(
+            "require_volume_confirmation".to_string(),
+            self.require_volume_confirmation.to_string(),
+        );
+        params.insert(
+            "min_trend_strength".to_string(),
+            format!("{:.2}", self.min_trend_strength),
+        );
+        params.insert(
+            "use_multi_timeframe".to_string(),
+            self.use_multi_timeframe.to_string(),
+        );
         if let Some(stop) = self.trailing_stop_pct {
             params.insert("trailing_stop_pct".to_string(), stop.to_string());
         }
@@ -977,7 +1030,8 @@ impl Strategy for MeanReversionStrategy {
             }
 
             let mean: f64 = prices.iter().sum::<f64>() / prices.len() as f64;
-            let variance: f64 = prices.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / prices.len() as f64;
+            let variance: f64 =
+                prices.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / prices.len() as f64;
             let std_dev = variance.sqrt();
 
             let current_price: f64 = prices.last().copied().unwrap_or(0.0);
@@ -1009,9 +1063,11 @@ impl Strategy for MeanReversionStrategy {
                 }
 
                 if should_exit {
-                    signals.push(Signal::close(market_id, "yes")
-                        .with_metadata("exit_reason", exit_reason)
-                        .with_metadata("z_score", &format!("{:.2}", z_score)));
+                    signals.push(
+                        Signal::close(market_id, "yes")
+                            .with_metadata("exit_reason", exit_reason)
+                            .with_metadata("z_score", &format!("{:.2}", z_score)),
+                    );
                     self.entry_periods.remove(market_id);
                 }
 
@@ -1049,7 +1105,8 @@ impl Strategy for MeanReversionStrategy {
                         .with_metadata("bb_width", &format!("{:.3}", bb_width)),
                 );
 
-                self.entry_periods.insert(market_id.clone(), self.current_period);
+                self.entry_periods
+                    .insert(market_id.clone(), self.current_period);
             }
         }
 
@@ -1058,14 +1115,35 @@ impl Strategy for MeanReversionStrategy {
 
     fn parameters(&self) -> HashMap<String, String> {
         let mut params = HashMap::new();
-        params.insert("lookback_periods".to_string(), self.lookback_periods.to_string());
-        params.insert("entry_std_devs".to_string(), format!("{:.2}", self.entry_std_devs));
+        params.insert(
+            "lookback_periods".to_string(),
+            self.lookback_periods.to_string(),
+        );
+        params.insert(
+            "entry_std_devs".to_string(),
+            format!("{:.2}", self.entry_std_devs),
+        );
         params.insert("position_size".to_string(), self.position_size.to_string());
-        params.insert("use_regime_detection".to_string(), self.use_regime_detection.to_string());
-        params.insert("use_dynamic_threshold".to_string(), self.use_dynamic_threshold.to_string());
-        params.insert("min_bb_width".to_string(), format!("{:.3}", self.min_bb_width));
-        params.insert("max_bb_width".to_string(), format!("{:.3}", self.max_bb_width));
-        params.insert("exit_z_score".to_string(), format!("{:.2}", self.exit_z_score));
+        params.insert(
+            "use_regime_detection".to_string(),
+            self.use_regime_detection.to_string(),
+        );
+        params.insert(
+            "use_dynamic_threshold".to_string(),
+            self.use_dynamic_threshold.to_string(),
+        );
+        params.insert(
+            "min_bb_width".to_string(),
+            format!("{:.3}", self.min_bb_width),
+        );
+        params.insert(
+            "max_bb_width".to_string(),
+            format!("{:.3}", self.max_bb_width),
+        );
+        params.insert(
+            "exit_z_score".to_string(),
+            format!("{:.2}", self.exit_z_score),
+        );
         if let Some(max) = self.max_hold_periods {
             params.insert("max_hold_periods".to_string(), max.to_string());
         }
@@ -1103,8 +1181,8 @@ impl Default for GridStrategy {
         Self {
             center_price: None,
             grid_levels: 5,
-            grid_spacing_pct: Decimal::new(2, 2), // 2%
-            order_size: Decimal::new(5, 2), // 5% per level
+            grid_spacing_pct: Decimal::new(2, 2),   // 2%
+            order_size: Decimal::new(5, 2),         // 5% per level
             max_position_size: Decimal::new(50, 2), // 50% max
             use_dynamic_center: true,
             center_lookback: 20,
@@ -1213,7 +1291,8 @@ impl Strategy for GridStrategy {
             // Determine center price
             let center = if self.use_dynamic_center {
                 let recent = context.recent_snapshots(&market_id, self.center_lookback);
-                self.calculate_dynamic_center(&recent).unwrap_or(current_price)
+                self.calculate_dynamic_center(&recent)
+                    .unwrap_or(current_price)
             } else {
                 self.center_price.unwrap_or(current_price)
             };
@@ -1229,7 +1308,8 @@ impl Strategy for GridStrategy {
                 self.filled_levels.insert(market_id.clone(), Vec::new());
             }
             if !self.level_quantities.contains_key(&market_id) {
-                self.level_quantities.insert(market_id.clone(), HashMap::new());
+                self.level_quantities
+                    .insert(market_id.clone(), HashMap::new());
             }
 
             // Check if we should buy at this level (negative levels = below center)
@@ -1247,8 +1327,14 @@ impl Strategy for GridStrategy {
                     );
 
                     // Update state
-                    self.filled_levels.get_mut(&market_id).unwrap().push(current_level);
-                    self.level_quantities.get_mut(&market_id).unwrap().insert(current_level, self.order_size);
+                    self.filled_levels
+                        .get_mut(&market_id)
+                        .unwrap()
+                        .push(current_level);
+                    self.level_quantities
+                        .get_mut(&market_id)
+                        .unwrap()
+                        .insert(current_level, self.order_size);
                 }
             }
 
@@ -1275,8 +1361,14 @@ impl Strategy for GridStrategy {
                     );
 
                     // Update state
-                    self.filled_levels.get_mut(&market_id).unwrap().retain(|&l| l != level);
-                    self.level_quantities.get_mut(&market_id).unwrap().remove(&level);
+                    self.filled_levels
+                        .get_mut(&market_id)
+                        .unwrap()
+                        .retain(|&l| l != level);
+                    self.level_quantities
+                        .get_mut(&market_id)
+                        .unwrap()
+                        .remove(&level);
                 }
             }
         }
@@ -1287,10 +1379,19 @@ impl Strategy for GridStrategy {
     fn parameters(&self) -> HashMap<String, String> {
         let mut params = HashMap::new();
         params.insert("grid_levels".to_string(), self.grid_levels.to_string());
-        params.insert("grid_spacing_pct".to_string(), self.grid_spacing_pct.to_string());
+        params.insert(
+            "grid_spacing_pct".to_string(),
+            self.grid_spacing_pct.to_string(),
+        );
         params.insert("order_size".to_string(), self.order_size.to_string());
-        params.insert("max_position_size".to_string(), self.max_position_size.to_string());
-        params.insert("use_dynamic_center".to_string(), self.use_dynamic_center.to_string());
+        params.insert(
+            "max_position_size".to_string(),
+            self.max_position_size.to_string(),
+        );
+        params.insert(
+            "use_dynamic_center".to_string(),
+            self.use_dynamic_center.to_string(),
+        );
         if let Some(center) = self.center_price {
             params.insert("center_price".to_string(), center.to_string());
         }
@@ -1354,11 +1455,7 @@ mod tests {
 
     #[test]
     fn test_strategy_parameters() {
-        let strategy = ArbitrageStrategy::new(
-            Decimal::new(3, 2),
-            Decimal::new(15, 2),
-            10,
-        );
+        let strategy = ArbitrageStrategy::new(Decimal::new(3, 2), Decimal::new(15, 2), 10);
 
         let params = strategy.parameters();
         assert_eq!(params.get("base_min_spread"), Some(&"0.03".to_string()));
@@ -1386,8 +1483,8 @@ mod tests {
 
     #[test]
     fn test_mean_reversion_regime_detection() {
-        let strategy = MeanReversionStrategy::new(20, 2.0, Decimal::new(10, 2))
-            .with_regime_detection(0.6);
+        let strategy =
+            MeanReversionStrategy::new(20, 2.0, Decimal::new(10, 2)).with_regime_detection(0.6);
 
         // Test that regime detection returns a valid regime
         let prices: Vec<f64> = vec![0.50, 0.51, 0.49, 0.50, 0.52, 0.48, 0.50, 0.51, 0.49, 0.50];

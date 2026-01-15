@@ -16,7 +16,11 @@ impl WalletRepository {
 
     /// Insert or update wallet features.
     pub async fn upsert_features(&self, features: &WalletFeatures) -> Result<()> {
-        let hourly_dist: Vec<i64> = features.hourly_distribution.iter().map(|&x| x as i64).collect();
+        let hourly_dist: Vec<i64> = features
+            .hourly_distribution
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
 
         sqlx::query(
             r#"

@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 /// Source/strategy that originated a position.
@@ -106,6 +106,7 @@ pub struct PositionManager {
     /// Position limits.
     limits: Arc<RwLock<PositionLimits>>,
     /// Total unrealized P&L.
+    #[allow(dead_code)]
     total_unrealized_pnl: Arc<RwLock<Decimal>>,
     /// Total realized P&L.
     total_realized_pnl: Arc<RwLock<Decimal>>,
@@ -128,7 +129,10 @@ impl PositionManager {
 
         // Check limits
         if self.positions.len() >= limits.max_total_positions {
-            anyhow::bail!("Maximum total positions ({}) reached", limits.max_total_positions);
+            anyhow::bail!(
+                "Maximum total positions ({}) reached",
+                limits.max_total_positions
+            );
         }
 
         let market_positions = self.positions_for_market(&position.position.market_id);
@@ -299,14 +303,16 @@ impl PositionManager {
     /// Get summary statistics.
     pub async fn stats(&self) -> PositionManagerStats {
         let positions = self.all_positions();
-        let active: Vec<_> = positions.iter().filter(|p| p.position.is_active()).collect();
+        let active: Vec<_> = positions
+            .iter()
+            .filter(|p| p.position.is_active())
+            .collect();
 
         let total_unrealized: Decimal = active.iter().map(|p| p.position.unrealized_pnl).sum();
         let total_realized = *self.total_realized_pnl.read().await;
 
-        let by_source = |source: &PositionSource| {
-            positions.iter().filter(|p| &p.source == source).count()
-        };
+        let by_source =
+            |source: &PositionSource| positions.iter().filter(|p| &p.source == source).count();
 
         PositionManagerStats {
             total_positions: positions.len(),
@@ -315,7 +321,10 @@ impl PositionManager {
             total_unrealized_pnl: total_unrealized,
             total_realized_pnl: total_realized,
             arbitrage_positions: by_source(&PositionSource::Arbitrage),
-            copy_trade_positions: positions.iter().filter(|p| matches!(&p.source, PositionSource::CopyTrade { .. })).count(),
+            copy_trade_positions: positions
+                .iter()
+                .filter(|p| matches!(&p.source, PositionSource::CopyTrade { .. }))
+                .count(),
             manual_positions: by_source(&PositionSource::Manual),
         }
     }
@@ -325,25 +334,40 @@ impl PositionManager {
         let limits = self.limits.read().await;
 
         if self.positions.len() >= limits.max_total_positions {
-            return Err(format!("Max positions ({}) reached", limits.max_total_positions));
+            return Err(format!(
+                "Max positions ({}) reached",
+                limits.max_total_positions
+            ));
         }
 
         if self.positions_for_market(market_id).len() >= limits.max_per_market {
-            return Err(format!("Max positions per market ({}) reached", limits.max_per_market));
+            return Err(format!(
+                "Max positions per market ({}) reached",
+                limits.max_per_market
+            ));
         }
 
         if size > limits.max_position_size {
-            return Err(format!("Size {} exceeds max {}", size, limits.max_position_size));
+            return Err(format!(
+                "Size {} exceeds max {}",
+                size, limits.max_position_size
+            ));
         }
 
         let new_total = self.total_exposure() + size;
         if new_total > limits.max_total_exposure {
-            return Err(format!("Total exposure {} would exceed max {}", new_total, limits.max_total_exposure));
+            return Err(format!(
+                "Total exposure {} would exceed max {}",
+                new_total, limits.max_total_exposure
+            ));
         }
 
         let new_market = self.market_exposure(market_id) + size;
         if new_market > limits.max_market_exposure {
-            return Err(format!("Market exposure {} would exceed max {}", new_market, limits.max_market_exposure));
+            return Err(format!(
+                "Market exposure {} would exceed max {}",
+                new_market, limits.max_market_exposure
+            ));
         }
 
         Ok(())
@@ -432,7 +456,10 @@ mod tests {
         let managed = ManagedPosition::new(position, PositionSource::Arbitrage);
 
         manager.add_position(managed).await.unwrap();
-        manager.close_position(id, Decimal::new(10, 0)).await.unwrap();
+        manager
+            .close_position(id, Decimal::new(10, 0))
+            .await
+            .unwrap();
 
         let stats = manager.stats().await;
         assert_eq!(stats.total_realized_pnl, Decimal::new(10, 0));

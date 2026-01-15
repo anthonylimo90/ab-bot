@@ -7,8 +7,8 @@ use chrono::{DateTime, Duration, Utc};
 use polymarket_core::types::{
     DetectedStrategy, StrategyClassification, StrategyEvidence, StrategySignal, WalletFeatures,
 };
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -289,7 +289,11 @@ impl StrategyClassifier {
         }
 
         if score > 0.0 {
-            Some(StrategySignal::new(DetectedStrategy::Arbitrage, score, evidence))
+            Some(StrategySignal::new(
+                DetectedStrategy::Arbitrage,
+                score,
+                evidence,
+            ))
         } else {
             None
         }
@@ -333,7 +337,11 @@ impl StrategyClassifier {
         }
 
         if score > 0.0 {
-            Some(StrategySignal::new(DetectedStrategy::Momentum, score, evidence))
+            Some(StrategySignal::new(
+                DetectedStrategy::Momentum,
+                score,
+                evidence,
+            ))
         } else {
             None
         }
@@ -381,7 +389,11 @@ impl StrategyClassifier {
         }
 
         if score > 0.0 {
-            Some(StrategySignal::new(DetectedStrategy::MeanReversion, score, evidence))
+            Some(StrategySignal::new(
+                DetectedStrategy::MeanReversion,
+                score,
+                evidence,
+            ))
         } else {
             None
         }
@@ -424,7 +436,11 @@ impl StrategyClassifier {
         }
 
         if score > 0.0 {
-            Some(StrategySignal::new(DetectedStrategy::GridTrading, score, evidence))
+            Some(StrategySignal::new(
+                DetectedStrategy::GridTrading,
+                score,
+                evidence,
+            ))
         } else {
             None
         }
@@ -479,7 +495,11 @@ impl StrategyClassifier {
         }
 
         if score > 0.0 {
-            Some(StrategySignal::new(DetectedStrategy::MarketMaking, score, evidence))
+            Some(StrategySignal::new(
+                DetectedStrategy::MarketMaking,
+                score,
+                evidence,
+            ))
         } else {
             None
         }
@@ -519,7 +539,11 @@ impl StrategyClassifier {
         }
 
         if score > 0.0 {
-            Some(StrategySignal::new(DetectedStrategy::CopyTrading, score, evidence))
+            Some(StrategySignal::new(
+                DetectedStrategy::CopyTrading,
+                score,
+                evidence,
+            ))
         } else {
             None
         }

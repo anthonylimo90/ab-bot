@@ -56,13 +56,15 @@ pub struct AlertsConfig {
 
 impl Config {
     /// Load configuration from environment variables.
+    #[allow(clippy::result_large_err)]
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
         Ok(Self {
             database: DatabaseConfig {
-                url: env::var("DATABASE_URL")
-                    .map_err(|_| Error::Config { message: "DATABASE_URL environment variable not set".to_string() })?,
+                url: env::var("DATABASE_URL").map_err(|_| Error::Config {
+                    message: "DATABASE_URL environment variable not set".to_string(),
+                })?,
                 max_connections: env::var("DATABASE_MAX_CONNECTIONS")
                     .ok()
                     .and_then(|s| s.parse().ok())

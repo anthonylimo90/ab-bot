@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use statrs::statistics::{Data, Distribution};
@@ -180,8 +180,14 @@ impl ProfitabilityAnalyzer {
         let downside_dev = self.calculate_downside_deviation(&daily_returns);
 
         // Calculate trade metrics
-        let winning_trades: Vec<&TradeRecord> = trades.iter().filter(|t| t.pnl.map(|p| p > Decimal::ZERO).unwrap_or(false)).collect();
-        let losing_trades: Vec<&TradeRecord> = trades.iter().filter(|t| t.pnl.map(|p| p < Decimal::ZERO).unwrap_or(false)).collect();
+        let winning_trades: Vec<&TradeRecord> = trades
+            .iter()
+            .filter(|t| t.pnl.map(|p| p > Decimal::ZERO).unwrap_or(false))
+            .collect();
+        let losing_trades: Vec<&TradeRecord> = trades
+            .iter()
+            .filter(|t| t.pnl.map(|p| p < Decimal::ZERO).unwrap_or(false))
+            .collect();
 
         let win_count = winning_trades.len() as u64;
         let loss_count = losing_trades.len() as u64;
@@ -201,16 +207,21 @@ impl ProfitabilityAnalyzer {
         };
 
         let avg_loss = if !losing_trades.is_empty() {
-            losing_trades.iter().filter_map(|t| t.pnl).sum::<Decimal>().abs()
+            losing_trades
+                .iter()
+                .filter_map(|t| t.pnl)
+                .sum::<Decimal>()
+                .abs()
                 / Decimal::from(losing_trades.len())
         } else {
             Decimal::ZERO
         };
 
         let profit_factor = if avg_loss > Decimal::ZERO {
-            (avg_win * Decimal::from(win_count as i64) / (avg_loss * Decimal::from(loss_count.max(1) as i64)))
-                .to_f64()
-                .unwrap_or(0.0)
+            (avg_win * Decimal::from(win_count as i64)
+                / (avg_loss * Decimal::from(loss_count.max(1) as i64)))
+            .to_f64()
+            .unwrap_or(0.0)
         } else {
             f64::INFINITY
         };
@@ -219,13 +230,18 @@ impl ProfitabilityAnalyzer {
             - (avg_loss * Decimal::try_from(1.0 - win_rate).unwrap_or_default());
 
         // Calculate position metrics
-        let position_sizes: Vec<Decimal> = trades.iter().map(|t| t.quantity * t.entry_price).collect();
+        let position_sizes: Vec<Decimal> =
+            trades.iter().map(|t| t.quantity * t.entry_price).collect();
         let avg_position = if !position_sizes.is_empty() {
             position_sizes.iter().sum::<Decimal>() / Decimal::from(position_sizes.len())
         } else {
             Decimal::ZERO
         };
-        let max_position = position_sizes.iter().max().cloned().unwrap_or(Decimal::ZERO);
+        let max_position = position_sizes
+            .iter()
+            .max()
+            .cloned()
+            .unwrap_or(Decimal::ZERO);
 
         // Calculate consistency
         let consistency = self.calculate_consistency_score(&trade_pnls);
@@ -456,7 +472,8 @@ impl ProfitabilityAnalyzer {
             return f64::INFINITY;
         }
 
-        let downside_dev = (downside_returns.iter().sum::<f64>() / downside_returns.len() as f64).sqrt();
+        let downside_dev =
+            (downside_returns.iter().sum::<f64>() / downside_returns.len() as f64).sqrt();
 
         if downside_dev == 0.0 {
             return f64::INFINITY;
@@ -521,7 +538,8 @@ impl ProfitabilityAnalyzer {
             return 0.0;
         }
 
-        (negative_returns.iter().sum::<f64>() / negative_returns.len() as f64).sqrt() * (252.0_f64).sqrt()
+        (negative_returns.iter().sum::<f64>() / negative_returns.len() as f64).sqrt()
+            * (252.0_f64).sqrt()
     }
 
     fn calculate_consistency_score(&self, pnls: &[f64]) -> f64 {
@@ -640,7 +658,7 @@ mod tests {
             total_return: Decimal::new(1000, 0),
             roi_percentage: 0.20, // 20% ROI -> 20 points (capped at 30)
             annualized_return: 0.0,
-            sharpe_ratio: 2.0,    // 2.0 Sharpe -> 20 points (capped at 25)
+            sharpe_ratio: 2.0, // 2.0 Sharpe -> 20 points (capped at 25)
             sortino_ratio: 0.0,
             max_drawdown: 0.1,
             max_drawdown_duration_days: 5,
@@ -649,7 +667,7 @@ mod tests {
             total_trades: 100,
             winning_trades: 60,
             losing_trades: 40,
-            win_rate: 0.60,       // 60% win rate -> 15 points
+            win_rate: 0.60, // 60% win rate -> 15 points
             avg_win: Decimal::ZERO,
             avg_loss: Decimal::ZERO,
             profit_factor: 1.5,

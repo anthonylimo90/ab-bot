@@ -238,7 +238,8 @@ pub async fn discover_wallets(
         "sharpe" => wallets.sort_by(|a, b| b.sharpe_ratio.partial_cmp(&a.sharpe_ratio).unwrap()),
         "winRate" => wallets.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap()),
         "trades" => wallets.sort_by(|a, b| b.total_trades.cmp(&a.total_trades)),
-        _ => { // Default: roi
+        _ => {
+            // Default: roi
             match query.period.as_str() {
                 "7d" => wallets.sort_by(|a, b| b.roi_7d.partial_cmp(&a.roi_7d).unwrap()),
                 "90d" => wallets.sort_by(|a, b| b.roi_90d.partial_cmp(&a.roi_90d).unwrap()),
@@ -281,10 +282,19 @@ fn generate_mock_trades(count: usize, min_value: Option<Decimal>) -> Vec<LiveTra
     let mut rng = rand::thread_rng();
 
     let wallets = [
-        ("0x1234567890abcdef1234567890abcdef12345678", Some("WhaleTrader")),
-        ("0xabcdef1234567890abcdef1234567890abcdef12", Some("SharpBettor")),
+        (
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Some("WhaleTrader"),
+        ),
+        (
+            "0xabcdef1234567890abcdef1234567890abcdef12",
+            Some("SharpBettor"),
+        ),
         ("0x5678901234abcdef5678901234abcdef56789012", None),
-        ("0x9876543210fedcba9876543210fedcba98765432", Some("PoliticsGuru")),
+        (
+            "0x9876543210fedcba9876543210fedcba98765432",
+            Some("PoliticsGuru"),
+        ),
         ("0xfedcba9876543210fedcba9876543210fedcba98", None),
     ];
 
@@ -316,7 +326,8 @@ fn generate_mock_trades(count: usize, min_value: Option<Decimal>) -> Vec<LiveTra
                 wallet_address: wallet.to_string(),
                 wallet_label: label.map(String::from),
                 tx_hash: format!("0x{:064x}", rng.gen::<u64>()),
-                timestamp: now - chrono::Duration::seconds(rng.gen_range(0..3600) + (i as i64 * 60)),
+                timestamp: now
+                    - chrono::Duration::seconds(rng.gen_range(0..3600) + (i as i64 * 60)),
                 market_id: market_id.to_string(),
                 market_question: Some(question.to_string()),
                 outcome: if rng.gen_bool(0.5) { "Yes" } else { "No" }.to_string(),
@@ -336,7 +347,8 @@ fn generate_mock_wallets(count: usize) -> Vec<DiscoveredWallet> {
     (0..count)
         .map(|i| {
             let base_roi = 50.0 - (i as f64 * 3.0) + rng.gen_range(-5.0..5.0);
-            let roi_30d = Decimal::from_f64_retain(base_roi.max(5.0)).unwrap_or(Decimal::new(20, 0));
+            let roi_30d =
+                Decimal::from_f64_retain(base_roi.max(5.0)).unwrap_or(Decimal::new(20, 0));
             let roi_7d = roi_30d * Decimal::new(30, 2); // ~30% of monthly
             let roi_90d = roi_30d * Decimal::new(250, 2); // ~2.5x monthly
 
@@ -357,7 +369,10 @@ fn generate_mock_wallets(count: usize) -> Vec<DiscoveredWallet> {
             };
 
             DiscoveredWallet {
-                address: format!("0x{:040x}", rng.gen::<u64>() as u128 * rng.gen::<u64>() as u128),
+                address: format!(
+                    "0x{:040x}",
+                    rng.gen::<u64>() as u128 * rng.gen::<u64>() as u128
+                ),
                 rank: (i + 1) as i32,
                 roi_7d,
                 roi_30d,
@@ -376,11 +391,7 @@ fn generate_mock_wallets(count: usize) -> Vec<DiscoveredWallet> {
         .collect()
 }
 
-fn generate_simulation(
-    amount: Decimal,
-    period: &str,
-    _wallets: Option<&str>,
-) -> DemoPnlSimulation {
+fn generate_simulation(amount: Decimal, period: &str, _wallets: Option<&str>) -> DemoPnlSimulation {
     use rand::Rng;
     let mut rng = rand::thread_rng();
 
@@ -404,7 +415,8 @@ fn generate_simulation(
             .to_string();
 
         let random_factor = 1.0 + (rng.gen::<f64>() - 0.5) * volatility * 2.0;
-        value = value * Decimal::from_f64_retain(1.0 + daily_return).unwrap()
+        value = value
+            * Decimal::from_f64_retain(1.0 + daily_return).unwrap()
             * Decimal::from_f64_retain(random_factor).unwrap();
 
         equity_curve.push(EquityPoint {

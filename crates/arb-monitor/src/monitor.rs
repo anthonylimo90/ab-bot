@@ -80,7 +80,8 @@ impl ArbMonitor {
                         market.outcomes[0].token_id.clone(),
                     )
                 };
-                self.market_outcomes.insert(market.id.clone(), (yes_id, no_id));
+                self.market_outcomes
+                    .insert(market.id.clone(), (yes_id, no_id));
             }
         }
 
@@ -116,9 +117,10 @@ impl ArbMonitor {
             let yes_key = (update.market_id.clone(), yes_id.clone());
             let no_key = (update.market_id.clone(), no_id.clone());
 
-            if let (Some(yes_book), Some(no_book)) =
-                (self.order_books.get(&yes_key), self.order_books.get(&no_key))
-            {
+            if let (Some(yes_book), Some(no_book)) = (
+                self.order_books.get(&yes_key),
+                self.order_books.get(&no_key),
+            ) {
                 let binary_book = BinaryMarketBook {
                     market_id: update.market_id.clone(),
                     timestamp: update.timestamp,

@@ -10,10 +10,10 @@ pub mod success_predictor;
 pub mod trade_monitor;
 
 pub use advanced_predictor::{
-    AdvancedPredictor, EnsemblePrediction, MarketConditionAnalyzer,
-    MarketRegime, PredictionFeatures,
+    AdvancedPredictor, EnsemblePrediction, MarketConditionAnalyzer, MarketRegime,
+    PredictionFeatures,
 };
-pub use discovery::{DiscoveryCriteria, DiscoveredWallet, WalletDiscovery};
+pub use discovery::{DiscoveredWallet, DiscoveryCriteria, WalletDiscovery};
 pub use profitability::{ProfitabilityAnalyzer, WalletMetrics};
 pub use strategy_classifier::{ClassifierConfig, ExtendedFeatures, StrategyClassifier};
 pub use success_predictor::{PredictionModel, SuccessPredictor};

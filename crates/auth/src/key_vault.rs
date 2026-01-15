@@ -115,7 +115,7 @@ impl WalletKey {
 }
 
 /// Provider for key storage backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum KeyVaultProvider {
     /// Store keys in environment variables (development only).
@@ -123,18 +123,13 @@ pub enum KeyVaultProvider {
     /// Store keys in encrypted file.
     EncryptedFile { path: PathBuf },
     /// Store keys in memory (testing only).
+    #[default]
     Memory,
     /// AWS Secrets Manager (production).
     #[serde(rename = "aws")]
     AwsSecretsManager { region: String },
     /// HashiCorp Vault.
     HashicorpVault { address: String },
-}
-
-impl Default for KeyVaultProvider {
-    fn default() -> Self {
-        Self::Memory
-    }
 }
 
 /// Secure vault for storing wallet keys and secrets.

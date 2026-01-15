@@ -96,7 +96,11 @@ pub struct StrategySignal {
 
 impl StrategySignal {
     /// Create a new strategy signal.
-    pub fn new(strategy: DetectedStrategy, confidence: f64, evidence: Vec<StrategyEvidence>) -> Self {
+    pub fn new(
+        strategy: DetectedStrategy,
+        confidence: f64,
+        evidence: Vec<StrategyEvidence>,
+    ) -> Self {
         Self {
             strategy,
             confidence: confidence.clamp(0.0, 1.0),
@@ -121,16 +125,10 @@ impl StrategySignal {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StrategyEvidence {
     /// Opposing positions detected (arbitrage indicator).
-    OpposingPositions {
-        count: u64,
-        weight: f64,
-    },
+    OpposingPositions { count: u64, weight: f64 },
 
     /// Low latency trades (arbitrage/market-making indicator).
-    LowLatency {
-        avg_ms: f64,
-        weight: f64,
-    },
+    LowLatency { avg_ms: f64, weight: f64 },
 
     /// High win rate (arbitrage indicator).
     HighWinRate {
@@ -140,40 +138,22 @@ pub enum StrategyEvidence {
     },
 
     /// Trend-following pattern (momentum indicator).
-    TrendFollowing {
-        correlation: f64,
-        weight: f64,
-    },
+    TrendFollowing { correlation: f64, weight: f64 },
 
     /// Counter-trend pattern (mean reversion indicator).
-    CounterTrend {
-        reversion_rate: f64,
-        weight: f64,
-    },
+    CounterTrend { reversion_rate: f64, weight: f64 },
 
     /// Regular trade intervals (grid trading indicator).
-    RegularIntervals {
-        interval_cv: f64,
-        weight: f64,
-    },
+    RegularIntervals { interval_cv: f64, weight: f64 },
 
     /// Symmetric buy/sell activity (grid/market-making indicator).
-    SymmetricActivity {
-        buy_sell_ratio: f64,
-        weight: f64,
-    },
+    SymmetricActivity { buy_sell_ratio: f64, weight: f64 },
 
     /// High frequency trading (market-making indicator).
-    HighFrequency {
-        trades_per_day: f64,
-        weight: f64,
-    },
+    HighFrequency { trades_per_day: f64, weight: f64 },
 
     /// Delayed execution (copy trading indicator).
-    DelayedExecution {
-        avg_delay_seconds: f64,
-        weight: f64,
-    },
+    DelayedExecution { avg_delay_seconds: f64, weight: f64 },
 
     /// Correlation with leader wallets (copy trading indicator).
     LeaderCorrelation {
@@ -183,10 +163,7 @@ pub enum StrategyEvidence {
     },
 
     /// Hold time pattern.
-    HoldTime {
-        avg_hours: f64,
-        weight: f64,
-    },
+    HoldTime { avg_hours: f64, weight: f64 },
 }
 
 impl StrategyEvidence {
@@ -216,7 +193,9 @@ impl StrategyEvidence {
             StrategyEvidence::LowLatency { avg_ms, .. } => {
                 format!("Average latency: {:.0}ms", avg_ms)
             }
-            StrategyEvidence::HighWinRate { rate, trade_count, .. } => {
+            StrategyEvidence::HighWinRate {
+                rate, trade_count, ..
+            } => {
                 format!("{:.1}% win rate over {} trades", rate * 100.0, trade_count)
             }
             StrategyEvidence::TrendFollowing { correlation, .. } => {
@@ -234,11 +213,21 @@ impl StrategyEvidence {
             StrategyEvidence::HighFrequency { trades_per_day, .. } => {
                 format!("{:.0} trades/day", trades_per_day)
             }
-            StrategyEvidence::DelayedExecution { avg_delay_seconds, .. } => {
+            StrategyEvidence::DelayedExecution {
+                avg_delay_seconds, ..
+            } => {
                 format!("Avg delay: {:.1}s", avg_delay_seconds)
             }
-            StrategyEvidence::LeaderCorrelation { correlation, leader_address, .. } => {
-                format!("Correlation {:.2} with {}", correlation, &leader_address[..8])
+            StrategyEvidence::LeaderCorrelation {
+                correlation,
+                leader_address,
+                ..
+            } => {
+                format!(
+                    "Correlation {:.2} with {}",
+                    correlation,
+                    &leader_address[..8]
+                )
             }
             StrategyEvidence::HoldTime { avg_hours, .. } => {
                 format!("Avg hold time: {:.1}h", avg_hours)
@@ -264,7 +253,11 @@ impl StrategyClassification {
     /// Create a new classification result.
     pub fn new(address: String, mut signals: Vec<StrategySignal>) -> Self {
         // Sort by confidence descending
-        signals.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        signals.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let primary_strategy = signals
             .first()
@@ -307,8 +300,15 @@ mod tests {
     #[test]
     fn test_strategy_signal_creation() {
         let evidence = vec![
-            StrategyEvidence::OpposingPositions { count: 10, weight: 0.3 },
-            StrategyEvidence::HighWinRate { rate: 0.92, trade_count: 150, weight: 0.4 },
+            StrategyEvidence::OpposingPositions {
+                count: 10,
+                weight: 0.3,
+            },
+            StrategyEvidence::HighWinRate {
+                rate: 0.92,
+                trade_count: 150,
+                weight: 0.4,
+            },
         ];
 
         let signal = StrategySignal::new(DetectedStrategy::Arbitrage, 0.85, evidence);

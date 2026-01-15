@@ -90,10 +90,7 @@ impl PolygonClient {
         let response: JsonRpcResponse<AssetTransfersResponse> =
             self.rpc_call("alchemy_getAssetTransfers", params).await?;
 
-        Ok(response
-            .result
-            .map(|r| r.transfers)
-            .unwrap_or_default())
+        Ok(response.result.map(|r| r.transfers).unwrap_or_default())
     }
 
     async fn rpc_call<T: for<'de> Deserialize<'de>>(
@@ -141,6 +138,7 @@ struct JsonRpcResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcError {
     code: i64,
     message: String,
@@ -180,6 +178,7 @@ pub struct TransferMetadata {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AssetTransfersResponse {
     transfers: Vec<AssetTransfer>,
     #[serde(rename = "pageKey")]

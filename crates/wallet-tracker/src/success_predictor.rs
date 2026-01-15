@@ -211,7 +211,11 @@ impl SuccessPredictor {
     }
 
     /// Get top N wallets by predicted success.
-    pub async fn get_top_predicted(&self, addresses: &[String], n: usize) -> Result<Vec<SuccessPrediction>> {
+    pub async fn get_top_predicted(
+        &self,
+        addresses: &[String],
+        n: usize,
+    ) -> Result<Vec<SuccessPrediction>> {
         let mut predictions = self.predict_batch(addresses).await?;
         predictions.truncate(n);
         Ok(predictions)
@@ -274,11 +278,7 @@ impl SuccessPredictor {
 
         // ROI factor (capped at 50% monthly)
         let roi_score = (metrics.roi_percentage / 0.5).min(1.0).max(0.0);
-        factors.push(PredictionFactor::new(
-            "roi",
-            roi_score,
-            self.weights.roi,
-        ));
+        factors.push(PredictionFactor::new("roi", roi_score, self.weights.roi));
         total_score += roi_score * self.weights.roi;
         total_weight += self.weights.roi;
 

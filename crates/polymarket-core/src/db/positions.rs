@@ -4,7 +4,7 @@ use crate::types::{ExitStrategy, FailureReason, Position, PositionState, Positio
 use crate::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
-use sqlx::{FromRow, PgPool, Row};
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 /// Repository for position data.

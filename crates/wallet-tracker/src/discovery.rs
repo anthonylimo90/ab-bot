@@ -164,7 +164,11 @@ impl WalletDiscovery {
             .collect();
 
         // Sort by ROI (descending)
-        discovered.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+        discovered.sort_by(|a, b| {
+            b.roi
+                .partial_cmp(&a.roi)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Apply limit
         discovered.truncate(criteria.limit);
@@ -175,10 +179,7 @@ impl WalletDiscovery {
                 .insert(wallet.address.to_lowercase(), wallet.clone());
         }
 
-        info!(
-            count = discovered.len(),
-            "Discovered profitable wallets"
-        );
+        info!(count = discovered.len(), "Discovered profitable wallets");
 
         Ok(discovered)
     }
@@ -195,10 +196,18 @@ impl WalletDiscovery {
         // Sort by specified metric
         match metric {
             RankingMetric::Roi => {
-                wallets.sort_by(|a, b| b.roi.partial_cmp(&a.roi).unwrap_or(std::cmp::Ordering::Equal));
+                wallets.sort_by(|a, b| {
+                    b.roi
+                        .partial_cmp(&a.roi)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             RankingMetric::WinRate => {
-                wallets.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap_or(std::cmp::Ordering::Equal));
+                wallets.sort_by(|a, b| {
+                    b.win_rate
+                        .partial_cmp(&a.win_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             RankingMetric::Volume => {
                 wallets.sort_by(|a, b| b.total_volume.cmp(&a.total_volume));
@@ -214,7 +223,9 @@ impl WalletDiscovery {
                 wallets.sort_by(|a, b| {
                     let score_a = a.win_rate * (a.total_trades as f64).ln();
                     let score_b = b.win_rate * (b.total_trades as f64).ln();
-                    score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+                    score_b
+                        .partial_cmp(&score_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 });
             }
         }

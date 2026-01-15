@@ -167,11 +167,26 @@ impl BotScore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BotSignal {
-    ConsistentIntervals { cv: f64, points: u32 },
-    HighWinRate { win_rate: f64, trade_count: u64, points: u32 },
-    OpposingPositions { count: u64, points: u32 },
-    FastLatency { avg_ms: f64, points: u32 },
-    AlwaysActive { points: u32 },
+    ConsistentIntervals {
+        cv: f64,
+        points: u32,
+    },
+    HighWinRate {
+        win_rate: f64,
+        trade_count: u64,
+        points: u32,
+    },
+    OpposingPositions {
+        count: u64,
+        points: u32,
+    },
+    FastLatency {
+        avg_ms: f64,
+        points: u32,
+    },
+    AlwaysActive {
+        points: u32,
+    },
 }
 
 /// Wallet classification based on bot score.
@@ -192,9 +207,9 @@ mod tests {
         let features = WalletFeatures {
             address: "0x123".to_string(),
             total_trades: 150,
-            interval_cv: Some(0.05), // Very consistent = +30
-            win_rate: Some(0.95),    // High win rate = +25
-            avg_latency_ms: Some(100.0), // Fast = +15
+            interval_cv: Some(0.05),      // Very consistent = +30
+            win_rate: Some(0.95),         // High win rate = +25
+            avg_latency_ms: Some(100.0),  // Fast = +15
             has_opposing_positions: true, // Arb signature = +20
             opposing_position_count: 10,
             hourly_distribution: [1; 24], // 24/7 = +10
@@ -214,8 +229,8 @@ mod tests {
         let features = WalletFeatures {
             address: "0x456".to_string(),
             total_trades: 50,
-            interval_cv: Some(0.8), // Variable timing
-            win_rate: Some(0.55),   // Normal win rate
+            interval_cv: Some(0.8),       // Variable timing
+            win_rate: Some(0.55),         // Normal win rate
             avg_latency_ms: Some(5000.0), // Slow (human)
             has_opposing_positions: false,
             opposing_position_count: 0,

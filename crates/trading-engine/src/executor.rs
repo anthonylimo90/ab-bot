@@ -3,7 +3,7 @@
 use anyhow::Result;
 use auth::TradingWallet;
 use dashmap::DashMap;
-use polymarket_core::api::clob::{ApiCredentials, AuthenticatedClobClient, OrderType};
+use polymarket_core::api::clob::{AuthenticatedClobClient, OrderType};
 use polymarket_core::api::ClobClient;
 use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
 use polymarket_core::types::{ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus};

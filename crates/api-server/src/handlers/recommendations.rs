@@ -170,7 +170,10 @@ pub async fn get_rotation_recommendations(
 
     // Calculate average active wallet performance
     let avg_active_roi = if !active_wallets.is_empty() {
-        active_wallets.iter().map(|w| decimal_to_f64(w.roi_30d)).sum::<f64>()
+        active_wallets
+            .iter()
+            .map(|w| decimal_to_f64(w.roi_30d))
+            .sum::<f64>()
             / active_wallets.len() as f64
     } else {
         0.0
@@ -194,7 +197,10 @@ pub async fn get_rotation_recommendations(
                 wallet_label: wallet.label.clone(),
                 reason: RecommendationReason::AlphaDecay,
                 evidence: vec![
-                    format!("30-day ROI dropped from +{:.1}% to +{:.1}%", roi_30d, roi_7d),
+                    format!(
+                        "30-day ROI dropped from +{:.1}% to +{:.1}%",
+                        roi_30d, roi_7d
+                    ),
                     format!("Performance decay of {:.0}%", decay_pct),
                     if sharpe < 1.0 {
                         format!("Sharpe ratio below 1.0 ({:.2})", sharpe)
@@ -202,7 +208,11 @@ pub async fn get_rotation_recommendations(
                         format!("Sharpe ratio: {:.2}", sharpe)
                     },
                 ],
-                urgency: if decay_pct > 50.0 { Urgency::High } else { Urgency::Medium },
+                urgency: if decay_pct > 50.0 {
+                    Urgency::High
+                } else {
+                    Urgency::Medium
+                },
                 suggested_action: "Demote to Bench for monitoring".to_string(),
                 created_at: Utc::now().to_rfc3339(),
             });

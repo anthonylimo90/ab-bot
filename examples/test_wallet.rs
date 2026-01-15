@@ -13,9 +13,7 @@ use polymarket_core::signing::OrderSigner;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     println!("=== Wallet Connection Test ===\n");
 
@@ -45,7 +43,11 @@ async fn main() -> anyhow::Result<()> {
     println!("\n3. Testing message signing...");
     let auth_signature = signer.sign_auth_message().await?;
     println!("   ✓ Auth message signed");
-    println!("   Signature: {}...{}", &auth_signature[..10], &auth_signature[auth_signature.len()-8..]);
+    println!(
+        "   Signature: {}...{}",
+        &auth_signature[..10],
+        &auth_signature[auth_signature.len() - 8..]
+    );
 
     // Step 4: Create authenticated client
     println!("\n4. Creating authenticated CLOB client...");
@@ -61,7 +63,10 @@ async fn main() -> anyhow::Result<()> {
     match auth_client.derive_api_key().await {
         Ok(creds) => {
             println!("   ✓ API credentials derived successfully!");
-            println!("   API Key: {}...", &creds.api_key[..12.min(creds.api_key.len())]);
+            println!(
+                "   API Key: {}...",
+                &creds.api_key[..12.min(creds.api_key.len())]
+            );
             println!("\n   === LIVE TRADING READY ===");
         }
         Err(e) => {

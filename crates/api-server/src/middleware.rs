@@ -39,7 +39,9 @@ pub async fn require_auth(
     let token = match auth_header.strip_prefix("Bearer ") {
         Some(t) => t,
         None => {
-            return unauthorized_response("Invalid authorization format, expected 'Bearer <token>'");
+            return unauthorized_response(
+                "Invalid authorization format, expected 'Bearer <token>'",
+            );
         }
     };
 

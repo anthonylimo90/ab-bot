@@ -1,6 +1,5 @@
 //! API key authentication for programmatic access.
 
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -131,12 +130,7 @@ impl ApiKeyAuth {
     }
 
     /// Create a new API key for a user.
-    pub async fn create_key(
-        &self,
-        user_id: &str,
-        name: &str,
-        role: UserRole,
-    ) -> (ApiKey, String) {
+    pub async fn create_key(&self, user_id: &str, name: &str, role: UserRole) -> (ApiKey, String) {
         let (api_key, plain_key) = ApiKey::new(user_id.to_string(), name.to_string(), role);
 
         // Store by hash
@@ -195,9 +189,7 @@ impl ApiKeyAuth {
             .get(user_id)
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|id| {
-                        keys.values().find(|k| &k.id == id).cloned()
-                    })
+                    .filter_map(|id| keys.values().find(|k| &k.id == id).cloned())
                     .collect()
             })
             .unwrap_or_default()

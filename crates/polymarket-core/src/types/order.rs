@@ -60,12 +60,7 @@ pub struct MarketOrder {
 }
 
 impl MarketOrder {
-    pub fn new(
-        market_id: String,
-        outcome_id: String,
-        side: OrderSide,
-        quantity: Decimal,
-    ) -> Self {
+    pub fn new(market_id: String, outcome_id: String, side: OrderSide, quantity: Decimal) -> Self {
         Self {
             id: Uuid::new_v4(),
             market_id,
@@ -194,7 +189,13 @@ impl ExecutionReport {
         }
     }
 
-    pub fn rejected(order_id: Uuid, market_id: String, outcome_id: String, side: OrderSide, error: String) -> Self {
+    pub fn rejected(
+        order_id: Uuid,
+        market_id: String,
+        outcome_id: String,
+        side: OrderSide,
+        error: String,
+    ) -> Self {
         Self {
             order_id,
             exchange_order_id: None,
@@ -253,18 +254,9 @@ impl ArbOrder {
         expected_yes_price: Decimal,
         expected_no_price: Decimal,
     ) -> Self {
-        let yes_order = MarketOrder::new(
-            market_id.clone(),
-            yes_outcome_id,
-            OrderSide::Buy,
-            quantity,
-        );
-        let no_order = MarketOrder::new(
-            market_id.clone(),
-            no_outcome_id,
-            OrderSide::Buy,
-            quantity,
-        );
+        let yes_order =
+            MarketOrder::new(market_id.clone(), yes_outcome_id, OrderSide::Buy, quantity);
+        let no_order = MarketOrder::new(market_id.clone(), no_outcome_id, OrderSide::Buy, quantity);
         let expected_cost = (expected_yes_price + expected_no_price) * quantity;
         let expected_profit = quantity - expected_cost;
 

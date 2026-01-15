@@ -229,17 +229,18 @@ pub async fn add_tracked_wallet(
 ) -> ApiResult<Json<TrackedWalletResponse>> {
     // Validate address format (basic check)
     if !request.address.starts_with("0x") || request.address.len() != 42 {
-        return Err(ApiError::BadRequest("Invalid wallet address format".to_string()));
+        return Err(ApiError::BadRequest(
+            "Invalid wallet address format".to_string(),
+        ));
     }
 
     // Check if already tracked
-    let existing: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM tracked_wallets WHERE address = $1",
-    )
-    .bind(&request.address)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let existing: Option<(i64,)> =
+        sqlx::query_as("SELECT COUNT(*) FROM tracked_wallets WHERE address = $1")
+            .bind(&request.address)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if existing.map(|r| r.0).unwrap_or(0) > 0 {
         return Err(ApiError::Conflict("Wallet already tracked".to_string()));
@@ -324,7 +325,10 @@ pub async fn get_wallet(
             added_at: row.added_at,
             last_activity: row.last_activity,
         })),
-        None => Err(ApiError::NotFound(format!("Wallet {} not tracked", address))),
+        None => Err(ApiError::NotFound(format!(
+            "Wallet {} not tracked",
+            address
+        ))),
     }
 }
 
@@ -363,14 +367,21 @@ pub async fn update_wallet(
 
     let existing = match existing {
         Some(w) => w,
-        None => return Err(ApiError::NotFound(format!("Wallet {} not tracked", address))),
+        None => {
+            return Err(ApiError::NotFound(format!(
+                "Wallet {} not tracked",
+                address
+            )))
+        }
     };
 
     // Apply updates
     let label = request.label.or(existing.label);
     let copy_enabled = request.copy_enabled.unwrap_or(existing.copy_enabled);
     let allocation_pct = request.allocation_pct.unwrap_or(existing.allocation_pct);
-    let max_position_size = request.max_position_size.unwrap_or(existing.max_position_size);
+    let max_position_size = request
+        .max_position_size
+        .unwrap_or(existing.max_position_size);
 
     sqlx::query(
         r#"
@@ -420,16 +431,17 @@ pub async fn remove_wallet(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> ApiResult<()> {
-    let result = sqlx::query(
-        "DELETE FROM tracked_wallets WHERE address = $1",
-    )
-    .bind(&address)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let result = sqlx::query("DELETE FROM tracked_wallets WHERE address = $1")
+        .bind(&address)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound(format!("Wallet {} not tracked", address)));
+        return Err(ApiError::NotFound(format!(
+            "Wallet {} not tracked",
+            address
+        )));
     }
 
     Ok(())
@@ -453,16 +465,18 @@ pub async fn get_wallet_metrics(
     Path(address): Path<String>,
 ) -> ApiResult<Json<WalletMetricsResponse>> {
     // Check wallet exists
-    let exists: Option<(i64,)> = sqlx::query_as(
-        "SELECT COUNT(*) FROM tracked_wallets WHERE address = $1",
-    )
-    .bind(&address)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let exists: Option<(i64,)> =
+        sqlx::query_as("SELECT COUNT(*) FROM tracked_wallets WHERE address = $1")
+            .bind(&address)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     if exists.map(|r| r.0).unwrap_or(0) == 0 {
-        return Err(ApiError::NotFound(format!("Wallet {} not tracked", address)));
+        return Err(ApiError::NotFound(format!(
+            "Wallet {} not tracked",
+            address
+        )));
     }
 
     // Try to get cached metrics

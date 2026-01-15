@@ -14,7 +14,11 @@ pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
     report.push_str(&format!("Total Volume: ${}\n", features.total_volume));
 
     if let (Some(first), Some(last)) = (&features.first_trade, &features.last_trade) {
-        report.push_str(&format!("Active Period: {} to {}\n", first.date_naive(), last.date_naive()));
+        report.push_str(&format!(
+            "Active Period: {} to {}\n",
+            first.date_naive(),
+            last.date_naive()
+        ));
     }
 
     report.push_str(&format!("\n--- Behavioral Features ---\n"));
@@ -42,7 +46,11 @@ pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
         } else {
             "Normal"
         };
-        report.push_str(&format!("Win Rate: {:.1}% - {}\n", wr * 100.0, wr_assessment));
+        report.push_str(&format!(
+            "Win Rate: {:.1}% - {}\n",
+            wr * 100.0,
+            wr_assessment
+        ));
     }
 
     if let Some(latency) = features.avg_latency_ms {

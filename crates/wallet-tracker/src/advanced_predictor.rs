@@ -78,21 +78,21 @@ pub struct PredictionFeatures {
 
     // Risk metrics
     pub volatility: f64,
-    pub var_95: f64,  // Value at Risk 95%
+    pub var_95: f64, // Value at Risk 95%
     pub calmar_ratio: f64,
 
     // Time-based features
     pub recent_performance_7d: f64,
     pub recent_performance_30d: f64,
-    pub performance_trend: f64,  // Slope of performance over time
+    pub performance_trend: f64, // Slope of performance over time
 
     // Market correlation
     pub correlation_to_market: f64,
-    pub alpha: f64,  // Excess return vs market
-    pub beta: f64,   // Market sensitivity
+    pub alpha: f64, // Excess return vs market
+    pub beta: f64,  // Market sensitivity
 
     // Behavioral features
-    pub timing_score: f64,  // Entry/exit timing quality
+    pub timing_score: f64, // Entry/exit timing quality
     pub position_sizing_score: f64,
     pub diversification_score: f64,
 
@@ -150,7 +150,8 @@ impl AdvancedPredictor {
 
     /// Predict using ensemble of models.
     pub async fn predict_ensemble(&self, address: &str) -> Result<EnsemblePrediction> {
-        let metrics = self.profitability_analyzer
+        let metrics = self
+            .profitability_analyzer
             .calculate_metrics(address, TimePeriod::Month)
             .await?;
 
@@ -171,15 +172,15 @@ impl AdvancedPredictor {
         let var_95 = metrics.volatility * 1.645; // 95% confidence
 
         // Get recent performance
-        let recent_7d = self.get_recent_performance(
-            &metrics.address,
-            Duration::days(7),
-        ).await.unwrap_or(0.0);
+        let recent_7d = self
+            .get_recent_performance(&metrics.address, Duration::days(7))
+            .await
+            .unwrap_or(0.0);
 
-        let recent_30d = self.get_recent_performance(
-            &metrics.address,
-            Duration::days(30),
-        ).await.unwrap_or(0.0);
+        let recent_30d = self
+            .get_recent_performance(&metrics.address, Duration::days(30))
+            .await
+            .unwrap_or(0.0);
 
         // Performance trend (simplified slope)
         let trend = if recent_30d != 0.0 {
@@ -246,10 +247,16 @@ impl AdvancedPredictor {
         // Position sizing score based on drawdown and consistency
         let drawdown_penalty = metrics.max_drawdown.min(0.5);
         let consistency_bonus = metrics.consistency_score * 0.5;
-        (0.5 + consistency_bonus - drawdown_penalty).max(0.0).min(1.0)
+        (0.5 + consistency_bonus - drawdown_penalty)
+            .max(0.0)
+            .min(1.0)
     }
 
-    fn ensemble_predict(&self, address: &str, features: &PredictionFeatures) -> Result<EnsemblePrediction> {
+    fn ensemble_predict(
+        &self,
+        address: &str,
+        features: &PredictionFeatures,
+    ) -> Result<EnsemblePrediction> {
         let mut predictions = Vec::new();
         let mut weighted_sum = 0.0;
         let mut total_weight = 0.0;
@@ -262,7 +269,9 @@ impl AdvancedPredictor {
             probability: stat_pred,
             weight: stat_weight,
             features_used: vec!["sharpe_ratio", "sortino_ratio", "win_rate", "consistency"]
-                .into_iter().map(String::from).collect(),
+                .into_iter()
+                .map(String::from)
+                .collect(),
         });
         weighted_sum += stat_pred * stat_weight;
         total_weight += stat_weight;
@@ -274,8 +283,14 @@ impl AdvancedPredictor {
             model_name: "momentum".to_string(),
             probability: mom_pred,
             weight: mom_weight,
-            features_used: vec!["recent_performance_7d", "recent_performance_30d", "performance_trend"]
-                .into_iter().map(String::from).collect(),
+            features_used: vec![
+                "recent_performance_7d",
+                "recent_performance_30d",
+                "performance_trend",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         });
         weighted_sum += mom_pred * mom_weight;
         total_weight += mom_weight;
@@ -288,7 +303,9 @@ impl AdvancedPredictor {
             probability: risk_pred,
             weight: risk_weight,
             features_used: vec!["calmar_ratio", "var_95", "max_drawdown", "volatility"]
-                .into_iter().map(String::from).collect(),
+                .into_iter()
+                .map(String::from)
+                .collect(),
         });
         weighted_sum += risk_pred * risk_weight;
         total_weight += risk_weight;
@@ -301,7 +318,9 @@ impl AdvancedPredictor {
             probability: behav_pred,
             weight: behav_weight,
             features_used: vec!["timing_score", "position_sizing_score", "trade_frequency"]
-                .into_iter().map(String::from).collect(),
+                .into_iter()
+                .map(String::from)
+                .collect(),
         });
         weighted_sum += behav_pred * behav_weight;
         total_weight += behav_weight;
@@ -310,7 +329,10 @@ impl AdvancedPredictor {
         let mut probability = weighted_sum / total_weight;
 
         // Apply market regime adjustment
-        let regime_adj = *self.regime_adjustments.get(&self.market_regime).unwrap_or(&1.0);
+        let regime_adj = *self
+            .regime_adjustments
+            .get(&self.market_regime)
+            .unwrap_or(&1.0);
         probability = (probability * regime_adj).max(0.0).min(1.0);
 
         // Calculate confidence from model agreement
@@ -358,7 +380,8 @@ impl AdvancedPredictor {
         };
 
         let trend_score = (features.performance_trend * 0.5 + 0.5).max(0.0).min(1.0);
-        let acceleration = if features.recent_performance_7d > features.recent_performance_30d / 4.0 {
+        let acceleration = if features.recent_performance_7d > features.recent_performance_30d / 4.0
+        {
             0.6 // Accelerating
         } else {
             0.4 // Decelerating
@@ -393,7 +416,9 @@ impl AdvancedPredictor {
         let frequency_score = frequency_score.max(0.0).min(1.0);
 
         // Experience score
-        let experience_score = ((features.total_trades as f64).ln() / 5.0).min(1.0).max(0.0);
+        let experience_score = ((features.total_trades as f64).ln() / 5.0)
+            .min(1.0)
+            .max(0.0);
 
         0.3 * timing + 0.3 * sizing + 0.2 * frequency_score + 0.2 * experience_score
     }
@@ -433,7 +458,11 @@ impl AdvancedPredictor {
     }
 
     /// Get top wallets by ensemble prediction.
-    pub async fn get_top_wallets(&self, addresses: &[String], n: usize) -> Result<Vec<EnsemblePrediction>> {
+    pub async fn get_top_wallets(
+        &self,
+        addresses: &[String],
+        n: usize,
+    ) -> Result<Vec<EnsemblePrediction>> {
         let mut predictions = Vec::new();
 
         for address in addresses {
@@ -445,7 +474,9 @@ impl AdvancedPredictor {
 
         // Sort by probability descending
         predictions.sort_by(|a, b| {
-            b.probability.partial_cmp(&a.probability).unwrap_or(std::cmp::Ordering::Equal)
+            b.probability
+                .partial_cmp(&a.probability)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         predictions.truncate(n);
@@ -466,7 +497,10 @@ impl AdvancedPredictor {
         }
 
         // Add regime factor
-        let regime_adj = *self.regime_adjustments.get(&self.market_regime).unwrap_or(&1.0);
+        let regime_adj = *self
+            .regime_adjustments
+            .get(&self.market_regime)
+            .unwrap_or(&1.0);
         factors.push(PredictionFactor::new(
             "market_regime",
             regime_adj,

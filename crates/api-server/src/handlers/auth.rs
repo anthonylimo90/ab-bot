@@ -126,13 +126,10 @@ pub async fn register(
     }
 
     // Check if email already exists
-    let existing: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM users WHERE email = $1"
-    )
-    .bind(&req.email)
-    .fetch_optional(&state.pool)
-    .await
-    ?;
+    let existing: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM users WHERE email = $1")
+        .bind(&req.email)
+        .fetch_optional(&state.pool)
+        .await?;
 
     if existing.is_some() {
         return Err(ApiError::Conflict("Email already registered".into()));
@@ -164,8 +161,7 @@ pub async fn register(
     .bind(&req.name)
     .bind(now)
     .execute(&state.pool)
-    .await
-    ?;
+    .await?;
 
     // Generate JWT token
     let token = state
@@ -212,8 +208,7 @@ pub async fn login(
     )
     .bind(&req.email)
     .fetch_optional(&state.pool)
-    .await
-    ?;
+    .await?;
 
     let user = user.ok_or_else(|| ApiError::Unauthorized("Invalid credentials".into()))?;
 
@@ -286,8 +281,7 @@ pub async fn refresh_token(
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    ?
+    .await?
     .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
     // Compute role before moving user fields
@@ -343,8 +337,7 @@ pub async fn get_current_user(
     )
     .bind(user_id)
     .fetch_optional(&state.pool)
-    .await
-    ?
+    .await?
     .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
     // Compute role before moving user fields

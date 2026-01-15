@@ -71,7 +71,10 @@ pub enum Resource {
     Reports,
 
     // Wildcard for specific resource ID
-    Specific { resource_type: String, resource_id: String },
+    Specific {
+        resource_type: String,
+        resource_id: String,
+    },
 
     // All resources
     All,
@@ -92,9 +95,14 @@ impl Resource {
             (Resource::All, _) => true,
             (_, Resource::All) => true,
             (a, b) if a == b => true,
-            (Resource::Specific { resource_type: t1, .. }, Resource::Specific { resource_type: t2, .. }) => {
-                t1 == t2
-            }
+            (
+                Resource::Specific {
+                    resource_type: t1, ..
+                },
+                Resource::Specific {
+                    resource_type: t2, ..
+                },
+            ) => t1 == t2,
             _ => false,
         }
     }
@@ -175,7 +183,8 @@ impl TimeWindow {
             hour >= self.start_hour || hour < self.end_hour
         };
 
-        let in_days = self.allowed_days
+        let in_days = self
+            .allowed_days
             .as_ref()
             .map(|days| days.contains(&day))
             .unwrap_or(true);
@@ -247,8 +256,8 @@ pub struct DefaultRoles;
 impl DefaultRoles {
     /// Create the Viewer role.
     pub fn viewer() -> Role {
-        let mut role = Role::new("viewer", "Read-only access to dashboards and data")
-            .as_system_role();
+        let mut role =
+            Role::new("viewer", "Read-only access to dashboards and data").as_system_role();
 
         // Read access to most resources
         role.add_permission(Permission::new(Resource::Position, Action::Read));
@@ -263,8 +272,8 @@ impl DefaultRoles {
 
     /// Create the Trader role.
     pub fn trader() -> Role {
-        let mut role = Role::new("trader", "Can execute trades and manage positions")
-            .as_system_role();
+        let mut role =
+            Role::new("trader", "Can execute trades and manage positions").as_system_role();
 
         role.inherit_from("viewer");
 
@@ -288,8 +297,7 @@ impl DefaultRoles {
 
     /// Create the Admin role.
     pub fn admin() -> Role {
-        let mut role = Role::new("admin", "Full access including configuration")
-            .as_system_role();
+        let mut role = Role::new("admin", "Full access including configuration").as_system_role();
 
         role.inherit_from("trader");
 
@@ -577,12 +585,24 @@ mod tests {
         manager.assign_role("user1", "viewer").await.unwrap();
 
         // Check permissions
-        assert!(manager.has_permission("user1", &Resource::Position, &Action::Read).await);
-        assert!(!manager.has_permission("user1", &Resource::Position, &Action::Create).await);
+        assert!(
+            manager
+                .has_permission("user1", &Resource::Position, &Action::Read)
+                .await
+        );
+        assert!(
+            !manager
+                .has_permission("user1", &Resource::Position, &Action::Create)
+                .await
+        );
 
         // Assign trader role
         manager.assign_role("user1", "trader").await.unwrap();
-        assert!(manager.has_permission("user1", &Resource::Position, &Action::Create).await);
+        assert!(
+            manager
+                .has_permission("user1", &Resource::Position, &Action::Create)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -591,9 +611,21 @@ mod tests {
         manager.assign_role("admin_user", "admin").await.unwrap();
 
         // Admin should have viewer and trader permissions through inheritance
-        assert!(manager.has_permission("admin_user", &Resource::Position, &Action::Read).await);
-        assert!(manager.has_permission("admin_user", &Resource::Order, &Action::Execute).await);
-        assert!(manager.has_permission("admin_user", &Resource::SystemConfig, &Action::Configure).await);
+        assert!(
+            manager
+                .has_permission("admin_user", &Resource::Position, &Action::Read)
+                .await
+        );
+        assert!(
+            manager
+                .has_permission("admin_user", &Resource::Order, &Action::Execute)
+                .await
+        );
+        assert!(
+            manager
+                .has_permission("admin_user", &Resource::SystemConfig, &Action::Configure)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -608,9 +640,21 @@ mod tests {
         manager.add_role(custom).await.unwrap();
         manager.assign_role("analyst1", "analyst").await.unwrap();
 
-        assert!(manager.has_permission("analyst1", &Resource::Analytics, &Action::Read).await);
-        assert!(manager.has_permission("analyst1", &Resource::Reports, &Action::Export).await);
-        assert!(!manager.has_permission("analyst1", &Resource::Position, &Action::Read).await);
+        assert!(
+            manager
+                .has_permission("analyst1", &Resource::Analytics, &Action::Read)
+                .await
+        );
+        assert!(
+            manager
+                .has_permission("analyst1", &Resource::Reports, &Action::Export)
+                .await
+        );
+        assert!(
+            !manager
+                .has_permission("analyst1", &Resource::Position, &Action::Read)
+                .await
+        );
     }
 
     #[tokio::test]

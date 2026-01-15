@@ -367,7 +367,10 @@ impl HistoricalDataStore {
                 {}
                 "#,
                 query.resolution.to_pg_interval(),
-                query.limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default()
+                query
+                    .limit
+                    .map(|l| format!("LIMIT {}", l))
+                    .unwrap_or_default()
             )
         } else {
             format!(
@@ -396,7 +399,10 @@ impl HistoricalDataStore {
                 {}
                 "#,
                 query.resolution.to_pg_interval(),
-                query.limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default()
+                query
+                    .limit
+                    .map(|l| format!("LIMIT {}", l))
+                    .unwrap_or_default()
             )
         };
 
@@ -512,7 +518,10 @@ impl HistoricalDataStore {
     }
 
     /// Get data range for a market.
-    pub async fn get_data_range(&self, market_id: &str) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    pub async fn get_data_range(
+        &self,
+        market_id: &str,
+    ) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
         let row = sqlx::query(
             r#"
             SELECT MIN(timestamp) as min_ts, MAX(timestamp) as max_ts
@@ -601,9 +610,15 @@ pub struct DataGap {
 
 impl DataGap {
     /// Create a new data gap.
-    pub fn new(market_id: &str, start: DateTime<Utc>, end: DateTime<Utc>, resolution: &TimeResolution) -> Self {
+    pub fn new(
+        market_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        resolution: &TimeResolution,
+    ) -> Self {
         let duration = end - start;
-        let expected_points = (duration.num_seconds() / resolution.to_duration().num_seconds()) as usize;
+        let expected_points =
+            (duration.num_seconds() / resolution.to_duration().num_seconds()) as usize;
         Self {
             market_id: market_id.to_string(),
             start,
@@ -719,7 +734,11 @@ impl Default for DataQualityChecker {
 
 impl DataQualityChecker {
     /// Create a new data quality checker with custom settings.
-    pub fn new(min_gap_duration: Duration, max_staleness: Duration, resolution: TimeResolution) -> Self {
+    pub fn new(
+        min_gap_duration: Duration,
+        max_staleness: Duration,
+        resolution: TimeResolution,
+    ) -> Self {
         Self {
             min_gap_duration,
             max_staleness,
@@ -881,7 +900,8 @@ impl DataQualityChecker {
 
         // Deduct for staleness (up to 20 points)
         if report.stale_markets > 0 {
-            let staleness_ratio = report.stale_markets as f64 / report.markets_analyzed.max(1) as f64;
+            let staleness_ratio =
+                report.stale_markets as f64 / report.markets_analyzed.max(1) as f64;
             score -= staleness_ratio * 20.0;
         }
 
@@ -1003,9 +1023,30 @@ mod tests {
     #[test]
     fn test_group_by_market() {
         let snapshots = vec![
-            MarketSnapshot::new("market1", Utc::now(), Decimal::ONE, Decimal::ONE, Decimal::ONE, Decimal::ONE),
-            MarketSnapshot::new("market2", Utc::now(), Decimal::ONE, Decimal::ONE, Decimal::ONE, Decimal::ONE),
-            MarketSnapshot::new("market1", Utc::now(), Decimal::ONE, Decimal::ONE, Decimal::ONE, Decimal::ONE),
+            MarketSnapshot::new(
+                "market1",
+                Utc::now(),
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+            ),
+            MarketSnapshot::new(
+                "market2",
+                Utc::now(),
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+            ),
+            MarketSnapshot::new(
+                "market1",
+                Utc::now(),
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+                Decimal::ONE,
+            ),
         ];
 
         let grouped = HistoricalDataStore::group_by_market(&snapshots);
@@ -1021,11 +1062,39 @@ mod tests {
 
         // Create snapshots with a 30-minute gap (should be detected)
         let snapshots = vec![
-            MarketSnapshot::new("market1", base_time, Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
-            MarketSnapshot::new("market1", base_time + Duration::minutes(5), Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
+            MarketSnapshot::new(
+                "market1",
+                base_time,
+                Decimal::new(50, 2),
+                Decimal::new(52, 2),
+                Decimal::new(48, 2),
+                Decimal::new(50, 2),
+            ),
+            MarketSnapshot::new(
+                "market1",
+                base_time + Duration::minutes(5),
+                Decimal::new(50, 2),
+                Decimal::new(52, 2),
+                Decimal::new(48, 2),
+                Decimal::new(50, 2),
+            ),
             // 30-minute gap here
-            MarketSnapshot::new("market1", base_time + Duration::minutes(35), Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
-            MarketSnapshot::new("market1", base_time + Duration::minutes(40), Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
+            MarketSnapshot::new(
+                "market1",
+                base_time + Duration::minutes(35),
+                Decimal::new(50, 2),
+                Decimal::new(52, 2),
+                Decimal::new(48, 2),
+                Decimal::new(50, 2),
+            ),
+            MarketSnapshot::new(
+                "market1",
+                base_time + Duration::minutes(40),
+                Decimal::new(50, 2),
+                Decimal::new(52, 2),
+                Decimal::new(48, 2),
+                Decimal::new(50, 2),
+            ),
         ];
 
         let gaps = checker.detect_gaps(&snapshots);
@@ -1098,7 +1167,7 @@ mod tests {
             &TimeResolution::Minute5,
         );
 
-        assert!(gap.is_significant(Duration::hours(1)));  // 2h > 1h
+        assert!(gap.is_significant(Duration::hours(1))); // 2h > 1h
         assert!(!gap.is_significant(Duration::hours(3))); // 2h < 3h
     }
 }

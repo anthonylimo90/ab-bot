@@ -46,15 +46,15 @@ impl Default for AdvancedStopConfig {
     fn default() -> Self {
         Self {
             break_even_enabled: true,
-            break_even_trigger_pct: Decimal::new(5, 2),  // 5% profit
-            break_even_buffer_pct: Decimal::new(1, 3),   // 0.1% buffer
+            break_even_trigger_pct: Decimal::new(5, 2), // 5% profit
+            break_even_buffer_pct: Decimal::new(1, 3),  // 0.1% buffer
 
             step_trailing_enabled: false,
-            step_size: Decimal::new(5, 2),              // $0.05 steps
-            step_offset_pct: Decimal::new(3, 2),        // 3% offset
+            step_size: Decimal::new(5, 2),       // $0.05 steps
+            step_offset_pct: Decimal::new(3, 2), // 3% offset
 
             volatility_adjusted: true,
-            atr_multiplier: Decimal::new(2, 0),         // 2x ATR
+            atr_multiplier: Decimal::new(2, 0), // 2x ATR
             atr_period: 14,
 
             time_decay_enabled: true,
@@ -104,7 +104,10 @@ pub enum StopCondition {
     /// Volatility exceeds threshold.
     VolatilityExceeds { threshold: Decimal },
     /// Volume drops below threshold.
-    VolumeBelowAvg { threshold_pct: Decimal, avg_volume: Decimal },
+    VolumeBelowAvg {
+        threshold_pct: Decimal,
+        avg_volume: Decimal,
+    },
     /// Market hours condition.
     OutsideMarketHours { allowed_hours: Vec<(u8, u8)> },
     /// Consecutive losing candles.
@@ -138,7 +141,9 @@ impl CompoundStop {
             return false;
         }
 
-        let results: Vec<bool> = self.conditions.iter()
+        let results: Vec<bool> = self
+            .conditions
+            .iter()
             .map(|c| c.evaluate(context))
             .collect();
 
@@ -161,15 +166,22 @@ impl StopCondition {
             }
             StopCondition::LossExceeds { amount } => ctx.unrealized_pnl <= -*amount,
             StopCondition::TimeReached { deadline } => Utc::now() >= *deadline,
-            StopCondition::VolatilityExceeds { threshold } => {
-                ctx.current_volatility.map(|v| v >= *threshold).unwrap_or(false)
-            }
-            StopCondition::VolumeBelowAvg { threshold_pct, avg_volume } => {
-                ctx.current_volume.map(|v| v < *avg_volume * *threshold_pct).unwrap_or(false)
-            }
+            StopCondition::VolatilityExceeds { threshold } => ctx
+                .current_volatility
+                .map(|v| v >= *threshold)
+                .unwrap_or(false),
+            StopCondition::VolumeBelowAvg {
+                threshold_pct,
+                avg_volume,
+            } => ctx
+                .current_volume
+                .map(|v| v < *avg_volume * *threshold_pct)
+                .unwrap_or(false),
             StopCondition::OutsideMarketHours { allowed_hours } => {
                 let hour = Utc::now().time().hour() as u8;
-                !allowed_hours.iter().any(|(start, end)| hour >= *start && hour < *end)
+                !allowed_hours
+                    .iter()
+                    .any(|(start, end)| hour >= *start && hour < *end)
             }
             StopCondition::ConsecutiveDownCandles { count, current } => current >= count,
             StopCondition::SupportBroken { level } => ctx.current_price < *level,
@@ -260,7 +272,8 @@ impl VolatilityStop {
 
     /// Get the current volatility-based stop level.
     pub fn get_stop_level(&self, entry_price: Decimal) -> Option<Decimal> {
-        self.current_atr.map(|atr| entry_price - (atr * self.multiplier))
+        self.current_atr
+            .map(|atr| entry_price - (atr * self.multiplier))
     }
 
     /// Get current ATR value.
@@ -572,8 +585,12 @@ mod tests {
     #[test]
     fn test_compound_stop_and_logic() {
         let conditions = vec![
-            StopCondition::PriceBelow { price: Decimal::new(45, 2) },
-            StopCondition::LossExceeds { amount: Decimal::new(100, 0) },
+            StopCondition::PriceBelow {
+                price: Decimal::new(45, 2),
+            },
+            StopCondition::LossExceeds {
+                amount: Decimal::new(100, 0),
+            },
         ];
 
         let mut stop = CompoundStop::new(Uuid::new_v4(), conditions, CompoundLogic::And);
@@ -603,8 +620,12 @@ mod tests {
     #[test]
     fn test_compound_stop_or_logic() {
         let conditions = vec![
-            StopCondition::PriceBelow { price: Decimal::new(45, 2) },
-            StopCondition::LossExceeds { amount: Decimal::new(100, 0) },
+            StopCondition::PriceBelow {
+                price: Decimal::new(45, 2),
+            },
+            StopCondition::LossExceeds {
+                amount: Decimal::new(100, 0),
+            },
         ];
 
         let mut stop = CompoundStop::new(Uuid::new_v4(), conditions, CompoundLogic::Or);
@@ -708,11 +729,11 @@ mod tests {
         let deadline = Utc::now() + chrono::Duration::hours(12);
         let stop = TimeDecayStop::new(
             Uuid::new_v4(),
-            Decimal::new(50, 2),  // Entry at 0.50
-            Decimal::new(10, 2),  // 10% base stop
+            Decimal::new(50, 2), // Entry at 0.50
+            Decimal::new(10, 2), // 10% base stop
             deadline,
-            24,                   // Start decay 24h before
-            Decimal::new(5, 1),   // Final 0.5x multiplier
+            24,                 // Start decay 24h before
+            Decimal::new(5, 1), // Final 0.5x multiplier
         );
 
         // Since we're 12 hours out and decay starts at 24h, we should have some decay

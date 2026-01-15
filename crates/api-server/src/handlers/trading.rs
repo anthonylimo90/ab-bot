@@ -12,8 +12,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use polymarket_core::types::{
-    LimitOrder as CoreLimitOrder, MarketOrder as CoreMarketOrder,
-    OrderSide as CoreOrderSide, OrderStatus as CoreOrderStatus,
+    LimitOrder as CoreLimitOrder, MarketOrder as CoreMarketOrder, OrderSide as CoreOrderSide,
+    OrderStatus as CoreOrderStatus,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -168,8 +168,13 @@ pub async fn place_order(
         let cb_state = state.circuit_breaker.state().await;
         return Err(ApiError::ServiceUnavailable(format!(
             "Trading halted: {:?}. Resumes at {:?}",
-            cb_state.trip_reason.unwrap_or(risk_manager::circuit_breaker::TripReason::Manual),
-            cb_state.resume_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "unknown".to_string())
+            cb_state
+                .trip_reason
+                .unwrap_or(risk_manager::circuit_breaker::TripReason::Manual),
+            cb_state
+                .resume_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "unknown".to_string())
         )));
     }
 
@@ -293,7 +298,10 @@ pub async fn place_order(
         let trade_value = report.total_value();
         // For now, we don't have realized PnL without position tracking
         // Just record the trade value to track volume; actual PnL tracking needs position manager
-        let _ = state.circuit_breaker.record_trade(Decimal::ZERO, true).await;
+        let _ = state
+            .circuit_breaker
+            .record_trade(Decimal::ZERO, true)
+            .await;
     }
 
     // Publish signal for successful fills
@@ -575,14 +583,12 @@ pub async fn cancel_order(
 
     // Update order status
     let now = Utc::now();
-    sqlx::query(
-        "UPDATE orders SET status = 'cancelled', updated_at = $1 WHERE id = $2",
-    )
-    .bind(now)
-    .bind(order_id)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    sqlx::query("UPDATE orders SET status = 'cancelled', updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(order_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(OrderResponse {
         id: row.id,

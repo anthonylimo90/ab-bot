@@ -11,15 +11,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tracing
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "api_server=debug,tower_http=debug,axum=debug".into()
-        }))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "api_server=debug,tower_http=debug,axum=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Get database URL
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set");
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     // Create database connection pool
     let pool = PgPoolOptions::new()
@@ -34,9 +34,7 @@ async fn main() -> anyhow::Result<()> {
 
     if !skip_migrations {
         tracing::info!("Running database migrations...");
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await?;
+        sqlx::migrate!("../../migrations").run(&pool).await?;
     } else {
         tracing::info!("Skipping migrations (SKIP_MIGRATIONS=true)");
     }
