@@ -584,6 +584,367 @@ impl HistoricalDataStore {
     }
 }
 
+/// A detected gap in the data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataGap {
+    /// Market ID.
+    pub market_id: String,
+    /// Start of the gap.
+    pub start: DateTime<Utc>,
+    /// End of the gap.
+    pub end: DateTime<Utc>,
+    /// Duration of the gap.
+    pub duration: Duration,
+    /// Expected data points missing.
+    pub expected_points: usize,
+}
+
+impl DataGap {
+    /// Create a new data gap.
+    pub fn new(market_id: &str, start: DateTime<Utc>, end: DateTime<Utc>, resolution: &TimeResolution) -> Self {
+        let duration = end - start;
+        let expected_points = (duration.num_seconds() / resolution.to_duration().num_seconds()) as usize;
+        Self {
+            market_id: market_id.to_string(),
+            start,
+            end,
+            duration,
+            expected_points,
+        }
+    }
+
+    /// Check if this gap is significant (more than threshold).
+    pub fn is_significant(&self, threshold: Duration) -> bool {
+        self.duration > threshold
+    }
+}
+
+/// Data staleness information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StalenessInfo {
+    /// Market ID.
+    pub market_id: String,
+    /// Last update timestamp.
+    pub last_update: DateTime<Utc>,
+    /// Time since last update.
+    pub age: Duration,
+    /// Whether the data is considered stale.
+    pub is_stale: bool,
+}
+
+/// Data quality report for a market or query result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataQualityReport {
+    /// Markets analyzed.
+    pub markets_analyzed: usize,
+    /// Total data points.
+    pub total_points: usize,
+    /// Data range start.
+    pub data_start: Option<DateTime<Utc>>,
+    /// Data range end.
+    pub data_end: Option<DateTime<Utc>>,
+    /// Coverage percentage (actual vs expected points).
+    pub coverage_pct: f64,
+    /// Number of significant gaps.
+    pub gap_count: usize,
+    /// Total gap duration.
+    pub total_gap_duration: Duration,
+    /// Individual gaps.
+    pub gaps: Vec<DataGap>,
+    /// Staleness info per market.
+    pub staleness: Vec<StalenessInfo>,
+    /// Markets with stale data.
+    pub stale_markets: usize,
+    /// Overall quality score (0-100).
+    pub quality_score: f64,
+    /// Quality issues found.
+    pub issues: Vec<String>,
+}
+
+impl DataQualityReport {
+    /// Create a new empty report.
+    pub fn new() -> Self {
+        Self {
+            markets_analyzed: 0,
+            total_points: 0,
+            data_start: None,
+            data_end: None,
+            coverage_pct: 0.0,
+            gap_count: 0,
+            total_gap_duration: Duration::zero(),
+            gaps: vec![],
+            staleness: vec![],
+            stale_markets: 0,
+            quality_score: 100.0,
+            issues: vec![],
+        }
+    }
+
+    /// Check if data quality is acceptable.
+    pub fn is_acceptable(&self, min_score: f64) -> bool {
+        self.quality_score >= min_score
+    }
+
+    /// Add an issue to the report.
+    pub fn add_issue(&mut self, issue: String) {
+        self.issues.push(issue);
+    }
+}
+
+impl Default for DataQualityReport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Data quality checker for validating historical data.
+pub struct DataQualityChecker {
+    /// Minimum gap duration to report (smaller gaps are ignored).
+    pub min_gap_duration: Duration,
+    /// Maximum data age before considered stale.
+    pub max_staleness: Duration,
+    /// Expected data interval.
+    pub expected_resolution: TimeResolution,
+}
+
+impl Default for DataQualityChecker {
+    fn default() -> Self {
+        Self {
+            min_gap_duration: Duration::minutes(15), // Report gaps > 15 minutes
+            max_staleness: Duration::hours(1),       // Data older than 1 hour is stale
+            expected_resolution: TimeResolution::Minute5,
+        }
+    }
+}
+
+impl DataQualityChecker {
+    /// Create a new data quality checker with custom settings.
+    pub fn new(min_gap_duration: Duration, max_staleness: Duration, resolution: TimeResolution) -> Self {
+        Self {
+            min_gap_duration,
+            max_staleness,
+            expected_resolution: resolution,
+        }
+    }
+
+    /// Detect gaps in a sorted list of snapshots for a single market.
+    pub fn detect_gaps(&self, snapshots: &[MarketSnapshot]) -> Vec<DataGap> {
+        if snapshots.len() < 2 {
+            return vec![];
+        }
+
+        let market_id = &snapshots[0].market_id;
+        let expected_interval = self.expected_resolution.to_duration();
+        let mut gaps = vec![];
+
+        for window in snapshots.windows(2) {
+            let time_diff = window[1].timestamp - window[0].timestamp;
+
+            // If the gap is larger than 2x the expected interval, it's a gap
+            if time_diff > expected_interval * 2 {
+                let gap = DataGap::new(
+                    market_id,
+                    window[0].timestamp,
+                    window[1].timestamp,
+                    &self.expected_resolution,
+                );
+
+                if gap.is_significant(self.min_gap_duration) {
+                    gaps.push(gap);
+                }
+            }
+        }
+
+        gaps
+    }
+
+    /// Check staleness for a list of snapshots.
+    pub fn check_staleness(&self, snapshots: &[MarketSnapshot]) -> Vec<StalenessInfo> {
+        let now = Utc::now();
+        let mut staleness = vec![];
+
+        // Group by market and find latest timestamp for each
+        let grouped = HistoricalDataStore::group_by_market(snapshots);
+
+        for (market_id, market_snapshots) in grouped {
+            if let Some(last) = market_snapshots.last() {
+                let age = now - last.timestamp;
+                let is_stale = age > self.max_staleness;
+
+                staleness.push(StalenessInfo {
+                    market_id,
+                    last_update: last.timestamp,
+                    age,
+                    is_stale,
+                });
+            }
+        }
+
+        staleness
+    }
+
+    /// Generate a comprehensive data quality report.
+    pub fn generate_report(&self, snapshots: &[MarketSnapshot]) -> DataQualityReport {
+        let mut report = DataQualityReport::new();
+
+        if snapshots.is_empty() {
+            report.add_issue("No data points available".to_string());
+            report.quality_score = 0.0;
+            return report;
+        }
+
+        // Group by market
+        let grouped = HistoricalDataStore::group_by_market(snapshots);
+        report.markets_analyzed = grouped.len();
+        report.total_points = snapshots.len();
+
+        // Find overall data range
+        let timestamps: Vec<_> = snapshots.iter().map(|s| s.timestamp).collect();
+        report.data_start = timestamps.iter().min().copied();
+        report.data_end = timestamps.iter().max().copied();
+
+        // Check gaps for each market
+        for (market_id, market_snapshots) in &grouped {
+            let gaps = self.detect_gaps(market_snapshots);
+            for gap in gaps {
+                report.total_gap_duration = report.total_gap_duration + gap.duration;
+                report.gaps.push(gap);
+            }
+        }
+        report.gap_count = report.gaps.len();
+
+        // Check staleness
+        report.staleness = self.check_staleness(snapshots);
+        report.stale_markets = report.staleness.iter().filter(|s| s.is_stale).count();
+
+        // Calculate coverage
+        if let (Some(start), Some(end)) = (report.data_start, report.data_end) {
+            let total_duration = end - start;
+            let expected_interval = self.expected_resolution.to_duration();
+            let expected_points = total_duration.num_seconds() / expected_interval.num_seconds();
+
+            if expected_points > 0 {
+                // Account for multiple markets
+                let expected_total = expected_points as usize * report.markets_analyzed;
+                report.coverage_pct = (report.total_points as f64 / expected_total as f64) * 100.0;
+                report.coverage_pct = report.coverage_pct.min(100.0); // Cap at 100%
+            }
+        }
+
+        // Calculate quality score
+        report.quality_score = self.calculate_quality_score(&report);
+
+        // Generate issues list
+        if report.gap_count > 0 {
+            report.add_issue(format!(
+                "Found {} data gaps totaling {}",
+                report.gap_count,
+                format_duration(report.total_gap_duration)
+            ));
+        }
+
+        if report.stale_markets > 0 {
+            report.add_issue(format!(
+                "{} of {} markets have stale data",
+                report.stale_markets, report.markets_analyzed
+            ));
+        }
+
+        if report.coverage_pct < 90.0 {
+            report.add_issue(format!(
+                "Data coverage is only {:.1}% (below 90% threshold)",
+                report.coverage_pct
+            ));
+        }
+
+        // Check for price anomalies
+        let anomalies = self.detect_price_anomalies(snapshots);
+        if anomalies > 0 {
+            report.add_issue(format!("Found {} potential price anomalies", anomalies));
+            report.quality_score -= anomalies as f64 * 2.0;
+        }
+
+        report.quality_score = report.quality_score.max(0.0); // Floor at 0
+
+        report
+    }
+
+    /// Calculate overall quality score (0-100).
+    fn calculate_quality_score(&self, report: &DataQualityReport) -> f64 {
+        let mut score = 100.0;
+
+        // Deduct for gaps (up to 30 points)
+        if report.gap_count > 0 {
+            let gap_penalty = (report.gap_count as f64 * 3.0).min(30.0);
+            score -= gap_penalty;
+        }
+
+        // Deduct for staleness (up to 20 points)
+        if report.stale_markets > 0 {
+            let staleness_ratio = report.stale_markets as f64 / report.markets_analyzed.max(1) as f64;
+            score -= staleness_ratio * 20.0;
+        }
+
+        // Deduct for low coverage (up to 30 points)
+        if report.coverage_pct < 100.0 {
+            let coverage_penalty = ((100.0 - report.coverage_pct) / 100.0) * 30.0;
+            score -= coverage_penalty;
+        }
+
+        // Deduct for small dataset (up to 10 points)
+        if report.total_points < 100 {
+            score -= 10.0;
+        }
+
+        score.max(0.0)
+    }
+
+    /// Detect potential price anomalies (spikes, invalid values).
+    fn detect_price_anomalies(&self, snapshots: &[MarketSnapshot]) -> usize {
+        let mut anomalies = 0;
+
+        for snapshot in snapshots {
+            // Check for invalid prices (should be between 0 and 1 for prediction markets)
+            if snapshot.yes_bid < Decimal::ZERO || snapshot.yes_ask > Decimal::ONE {
+                anomalies += 1;
+            }
+            if snapshot.no_bid < Decimal::ZERO || snapshot.no_ask > Decimal::ONE {
+                anomalies += 1;
+            }
+
+            // Check for crossed markets (bid > ask)
+            if snapshot.yes_bid > snapshot.yes_ask {
+                anomalies += 1;
+            }
+            if snapshot.no_bid > snapshot.no_ask {
+                anomalies += 1;
+            }
+
+            // Check for extreme spreads (> 50%)
+            if snapshot.yes_spread > Decimal::new(50, 2) {
+                anomalies += 1;
+            }
+            if snapshot.no_spread > Decimal::new(50, 2) {
+                anomalies += 1;
+            }
+        }
+
+        anomalies
+    }
+}
+
+/// Format a duration for display.
+fn format_duration(duration: Duration) -> String {
+    let hours = duration.num_hours();
+    let minutes = duration.num_minutes() % 60;
+
+    if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else {
+        format!("{}m", minutes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +1012,93 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped.get("market1").map(|v| v.len()), Some(2));
         assert_eq!(grouped.get("market2").map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn test_data_gap_detection() {
+        let checker = DataQualityChecker::default();
+        let base_time = Utc::now();
+
+        // Create snapshots with a 30-minute gap (should be detected)
+        let snapshots = vec![
+            MarketSnapshot::new("market1", base_time, Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
+            MarketSnapshot::new("market1", base_time + Duration::minutes(5), Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
+            // 30-minute gap here
+            MarketSnapshot::new("market1", base_time + Duration::minutes(35), Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
+            MarketSnapshot::new("market1", base_time + Duration::minutes(40), Decimal::new(50, 2), Decimal::new(52, 2), Decimal::new(48, 2), Decimal::new(50, 2)),
+        ];
+
+        let gaps = checker.detect_gaps(&snapshots);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].market_id, "market1");
+        assert!(gaps[0].duration > Duration::minutes(15)); // Should be ~30 minutes
+    }
+
+    #[test]
+    fn test_data_quality_report() {
+        let checker = DataQualityChecker::default();
+        let base_time = Utc::now();
+
+        // Create good quality data
+        let mut snapshots = vec![];
+        for i in 0..20 {
+            snapshots.push(MarketSnapshot::new(
+                "market1",
+                base_time + Duration::minutes(i * 5),
+                Decimal::new(50, 2),
+                Decimal::new(52, 2),
+                Decimal::new(48, 2),
+                Decimal::new(50, 2),
+            ));
+        }
+
+        let report = checker.generate_report(&snapshots);
+
+        assert_eq!(report.markets_analyzed, 1);
+        assert_eq!(report.total_points, 20);
+        assert_eq!(report.gap_count, 0);
+        assert!(report.quality_score > 50.0); // Should be reasonable quality
+    }
+
+    #[test]
+    fn test_price_anomaly_detection() {
+        let checker = DataQualityChecker::default();
+
+        // Create snapshot with anomaly (crossed market: bid > ask)
+        let anomalous = MarketSnapshot::new(
+            "market1",
+            Utc::now(),
+            Decimal::new(55, 2), // bid = 0.55
+            Decimal::new(50, 2), // ask = 0.50 - CROSSED!
+            Decimal::new(48, 2),
+            Decimal::new(50, 2),
+        );
+
+        let anomalies = checker.detect_price_anomalies(&[anomalous]);
+        assert!(anomalies > 0); // Should detect the crossed market
+    }
+
+    #[test]
+    fn test_quality_report_acceptable() {
+        let report = DataQualityReport {
+            quality_score: 85.0,
+            ..Default::default()
+        };
+
+        assert!(report.is_acceptable(80.0));
+        assert!(!report.is_acceptable(90.0));
+    }
+
+    #[test]
+    fn test_data_gap_significance() {
+        let gap = DataGap::new(
+            "market1",
+            Utc::now(),
+            Utc::now() + Duration::hours(2),
+            &TimeResolution::Minute5,
+        );
+
+        assert!(gap.is_significant(Duration::hours(1)));  // 2h > 1h
+        assert!(!gap.is_significant(Duration::hours(3))); // 2h < 3h
     }
 }

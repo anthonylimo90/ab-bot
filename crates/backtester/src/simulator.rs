@@ -1,7 +1,7 @@
 //! Backtest simulator with slippage and fee models.
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -16,10 +16,14 @@ use crate::strategy::{Position, Signal, SignalType, Strategy, StrategyContext};
 pub struct SimulatorConfig {
     /// Initial portfolio value.
     pub initial_capital: Decimal,
-    /// Trading fee percentage (e.g., 0.02 for 2%).
+    /// Trading fee percentage (e.g., 0.02 for 2%). Deprecated: use fee_model instead.
     pub trading_fee_pct: Decimal,
     /// Slippage model to use.
     pub slippage_model: SlippageModel,
+    /// Fee model to use for trading costs.
+    pub fee_model: FeeModel,
+    /// Partial fill model to use.
+    pub partial_fill_model: PartialFillModel,
     /// Whether to allow margin/leverage.
     pub allow_margin: bool,
     /// Maximum leverage if margin is allowed.
@@ -30,19 +34,24 @@ pub struct SimulatorConfig {
     pub min_position_size: Decimal,
     /// Maximum single position size as fraction of portfolio.
     pub max_position_pct: Decimal,
+    /// Maximum spread to allow fills (wider spreads may be rejected).
+    pub max_spread_for_fill: Decimal,
 }
 
 impl Default for SimulatorConfig {
     fn default() -> Self {
         Self {
             initial_capital: Decimal::new(10000, 0),
-            trading_fee_pct: Decimal::new(2, 2), // 2%
+            trading_fee_pct: Decimal::new(2, 2), // 2% (deprecated)
             slippage_model: SlippageModel::Fixed(Decimal::new(1, 3)), // 0.1%
+            fee_model: FeeModel::Fixed(Decimal::new(2, 2)), // 2%
+            partial_fill_model: PartialFillModel::FullFill,
             allow_margin: false,
             max_leverage: Decimal::ONE,
             reinvest_profits: true,
             min_position_size: Decimal::new(10, 0),
             max_position_pct: Decimal::new(20, 2), // 20%
+            max_spread_for_fill: Decimal::new(10, 2), // 10% max spread
         }
     }
 }
@@ -67,11 +76,39 @@ pub enum SlippageModel {
         /// Multiplier for spread.
         spread_multiplier: Decimal,
     },
+    /// Depth-based slippage (uses orderbook depth).
+    DepthBased {
+        /// Base slippage percentage.
+        base_pct: Decimal,
+        /// Multiplier for depth impact.
+        depth_multiplier: Decimal,
+    },
+    /// Time-of-day adjusted slippage.
+    TimeAdjusted {
+        /// Base slippage percentage.
+        base_pct: Decimal,
+        /// Prime time multiplier (lower = less slippage during active hours).
+        prime_time_multiplier: Decimal,
+        /// Off-hours multiplier (higher = more slippage during quiet hours).
+        off_hours_multiplier: Decimal,
+    },
 }
 
 impl SlippageModel {
     /// Calculate slippage amount.
     pub fn calculate(&self, price: Decimal, quantity: Decimal, spread: Decimal) -> Decimal {
+        self.calculate_with_depth(price, quantity, spread, Decimal::ZERO, 12)
+    }
+
+    /// Calculate slippage with depth information.
+    pub fn calculate_with_depth(
+        &self,
+        price: Decimal,
+        quantity: Decimal,
+        spread: Decimal,
+        depth: Decimal,
+        hour: u32,
+    ) -> Decimal {
         match self {
             SlippageModel::None => Decimal::ZERO,
             SlippageModel::Fixed(pct) => price * pct,
@@ -82,7 +119,154 @@ impl SlippageModel {
             SlippageModel::SpreadBased { spread_multiplier } => {
                 spread * spread_multiplier / Decimal::TWO
             }
+            SlippageModel::DepthBased { base_pct, depth_multiplier } => {
+                // More slippage when depth is low relative to quantity
+                let depth_ratio = if depth > Decimal::ZERO {
+                    quantity / depth
+                } else {
+                    Decimal::ONE // Max slippage if no depth
+                };
+                let impact = depth_ratio * *depth_multiplier;
+                price * (*base_pct + impact)
+            }
+            SlippageModel::TimeAdjusted {
+                base_pct,
+                prime_time_multiplier,
+                off_hours_multiplier,
+            } => {
+                // Prime time: 9am-5pm (hours 9-17)
+                let time_mult = if hour >= 9 && hour <= 17 {
+                    *prime_time_multiplier
+                } else {
+                    *off_hours_multiplier
+                };
+                price * *base_pct * time_mult
+            }
         }
+    }
+}
+
+/// Fee model for simulating trading costs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeModel {
+    /// Fixed percentage fee.
+    Fixed(Decimal),
+    /// Maker/taker fee structure.
+    MakerTaker {
+        /// Fee for maker orders (add liquidity).
+        maker_fee: Decimal,
+        /// Fee for taker orders (remove liquidity).
+        taker_fee: Decimal,
+    },
+    /// Volume-tiered fees.
+    VolumeTiered {
+        /// Volume thresholds and corresponding fees.
+        /// Each tuple is (volume_threshold, fee_pct).
+        tiers: Vec<(Decimal, Decimal)>,
+        /// Default fee if no tier matches.
+        default_fee: Decimal,
+    },
+}
+
+impl Default for FeeModel {
+    fn default() -> Self {
+        FeeModel::Fixed(Decimal::new(2, 2)) // 2%
+    }
+}
+
+impl FeeModel {
+    /// Calculate fee for a trade.
+    pub fn calculate(&self, value: Decimal, is_maker: bool, cumulative_volume: Decimal) -> Decimal {
+        match self {
+            FeeModel::Fixed(pct) => value * pct,
+            FeeModel::MakerTaker { maker_fee, taker_fee } => {
+                let fee_pct = if is_maker { *maker_fee } else { *taker_fee };
+                value * fee_pct
+            }
+            FeeModel::VolumeTiered { tiers, default_fee } => {
+                // Find applicable tier based on cumulative volume
+                let fee_pct = tiers
+                    .iter()
+                    .filter(|(threshold, _)| cumulative_volume >= *threshold)
+                    .map(|(_, fee)| *fee)
+                    .last()
+                    .unwrap_or(*default_fee);
+                value * fee_pct
+            }
+        }
+    }
+}
+
+/// Model for simulating partial fills based on market liquidity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialFillModel {
+    /// Always fill the entire order (instant fill assumption).
+    FullFill,
+    /// Fill based on orderbook depth.
+    DepthBased {
+        /// Maximum fill as percentage of available depth (e.g., 0.5 = 50% of depth).
+        max_depth_pct: Decimal,
+    },
+    /// Probabilistic fill based on order size relative to typical volume.
+    Probabilistic {
+        /// Base fill probability for small orders.
+        base_fill_pct: Decimal,
+        /// Size threshold above which fill probability decreases.
+        size_threshold: Decimal,
+        /// Decay rate for fill probability as size increases.
+        decay_rate: Decimal,
+    },
+    /// Fixed percentage fill (useful for testing).
+    Fixed(Decimal),
+}
+
+impl Default for PartialFillModel {
+    fn default() -> Self {
+        PartialFillModel::FullFill
+    }
+}
+
+impl PartialFillModel {
+    /// Calculate fill quantity based on the model.
+    /// Returns the quantity that will be filled.
+    pub fn calculate_fill(
+        &self,
+        requested_quantity: Decimal,
+        available_depth: Decimal,
+        spread: Decimal,
+    ) -> Decimal {
+        match self {
+            PartialFillModel::FullFill => requested_quantity,
+            PartialFillModel::DepthBased { max_depth_pct } => {
+                // Fill is limited by available depth
+                let max_fill = available_depth * *max_depth_pct;
+                requested_quantity.min(max_fill)
+            }
+            PartialFillModel::Probabilistic {
+                base_fill_pct,
+                size_threshold,
+                decay_rate,
+            } => {
+                if requested_quantity <= *size_threshold {
+                    // Small orders get full fill
+                    requested_quantity * *base_fill_pct
+                } else {
+                    // Larger orders have reduced fill probability
+                    let size_ratio = requested_quantity / *size_threshold;
+                    let fill_pct = *base_fill_pct / (Decimal::ONE + size_ratio * *decay_rate);
+                    requested_quantity * fill_pct
+                }
+            }
+            PartialFillModel::Fixed(pct) => requested_quantity * *pct,
+        }
+    }
+
+    /// Check if the order can be filled at all given current market conditions.
+    pub fn can_fill(&self, spread: Decimal, max_spread: Decimal) -> bool {
+        // Wide spreads indicate low liquidity - may not be able to fill
+        spread <= max_spread
     }
 }
 
@@ -137,6 +321,31 @@ pub struct BacktestResult {
     pub trades: Vec<TradeRecord>,
     /// Computed at timestamp.
     pub computed_at: DateTime<Utc>,
+
+    // New metrics (Phase 3)
+
+    /// Calmar ratio (annualized return / max drawdown).
+    pub calmar_ratio: f64,
+    /// Value at Risk at 95% confidence level.
+    pub var_95: f64,
+    /// Conditional VaR (Expected Shortfall) at 95%.
+    pub cvar_95: f64,
+    /// Recovery factor (net profit / max drawdown).
+    pub recovery_factor: f64,
+    /// Best single trade return.
+    pub best_trade_return: f64,
+    /// Worst single trade return.
+    pub worst_trade_return: f64,
+    /// Maximum consecutive wins.
+    pub max_consecutive_wins: usize,
+    /// Maximum consecutive losses.
+    pub max_consecutive_losses: usize,
+    /// Average winning trade return.
+    pub avg_win: f64,
+    /// Average losing trade return.
+    pub avg_loss: f64,
+    /// Expectancy (average profit per trade).
+    pub expectancy: f64,
 }
 
 impl BacktestResult {
@@ -429,13 +638,63 @@ impl BacktestSimulator {
             snapshot.no_spread
         };
 
-        let quantity = position_value / base_price;
-        let slippage = self.config.slippage_model.calculate(base_price, quantity, spread);
+        // For buying, we use ask depth (liquidity available to buy)
+        let depth = if signal.outcome_id == "yes" {
+            snapshot.yes_ask_depth
+        } else {
+            snapshot.no_ask_depth
+        };
+
+        // Check if spread is acceptable for filling
+        if !self.config.partial_fill_model.can_fill(spread, self.config.max_spread_for_fill) {
+            debug!(
+                market = %signal.market_id,
+                spread = %spread,
+                max_spread = %self.config.max_spread_for_fill,
+                "Spread too wide, skipping trade"
+            );
+            return Ok(None);
+        }
+
+        // Calculate requested quantity
+        let requested_quantity = position_value / base_price;
+
+        // Apply partial fill model
+        let fill_quantity = self.config.partial_fill_model.calculate_fill(
+            requested_quantity,
+            depth,
+            spread,
+        );
+
+        // Skip if fill is too small
+        if fill_quantity < self.config.min_position_size / base_price {
+            debug!(
+                market = %signal.market_id,
+                requested = %requested_quantity,
+                fill = %fill_quantity,
+                "Partial fill too small, skipping"
+            );
+            return Ok(None);
+        }
+
+        // Calculate slippage with depth and time information
+        let hour = snapshot.timestamp.hour();
+        let slippage = self.config.slippage_model.calculate_with_depth(
+            base_price,
+            fill_quantity,
+            spread,
+            depth,
+            hour,
+        );
         let execution_price = base_price + slippage;
 
-        // Calculate fees
-        let trade_value = quantity * execution_price;
-        let fees = trade_value * self.config.trading_fee_pct;
+        // Calculate fees using the new fee model
+        let trade_value = fill_quantity * execution_price;
+        let fees = self.config.fee_model.calculate(
+            trade_value,
+            false, // taker order
+            state.total_fees, // cumulative volume for tiered fees
+        );
 
         // Check if we have enough cash
         let total_cost = trade_value + fees;
@@ -452,13 +711,13 @@ impl BacktestSimulator {
         // Execute trade
         state.cash -= total_cost;
         state.total_fees += fees;
-        state.total_slippage += slippage * quantity;
+        state.total_slippage += slippage * fill_quantity;
 
         // Create or add to position
         let position = Position {
             market_id: signal.market_id.clone(),
             outcome_id: signal.outcome_id.clone(),
-            quantity,
+            quantity: fill_quantity,
             entry_price: execution_price,
             opened_at: context.timestamp,
             unrealized_pnl: Decimal::ZERO,
@@ -478,9 +737,9 @@ impl BacktestSimulator {
             exit_time: None,
             entry_price: execution_price,
             exit_price: None,
-            quantity,
+            quantity: fill_quantity,
             fees,
-            slippage: slippage * quantity,
+            slippage: slippage * fill_quantity,
             pnl: None,
             return_pct: None,
         };
@@ -523,12 +782,31 @@ impl BacktestSimulator {
             snapshot.no_spread
         };
 
-        let slippage = self.config.slippage_model.calculate(base_price, position.quantity, spread);
+        // For selling/closing, we use bid depth (liquidity available to sell into)
+        let depth = if position.outcome_id == "yes" {
+            snapshot.yes_bid_depth
+        } else {
+            snapshot.no_bid_depth
+        };
+
+        // Calculate slippage with depth and time information
+        let hour = snapshot.timestamp.hour();
+        let slippage = self.config.slippage_model.calculate_with_depth(
+            base_price,
+            position.quantity,
+            spread,
+            depth,
+            hour,
+        );
         let execution_price = base_price - slippage;
 
-        // Calculate proceeds and fees
+        // Calculate proceeds and fees using the new fee model
         let trade_value = position.quantity * execution_price;
-        let fees = trade_value * self.config.trading_fee_pct;
+        let fees = self.config.fee_model.calculate(
+            trade_value,
+            false, // taker order
+            state.total_fees, // cumulative volume for tiered fees
+        );
         let proceeds = trade_value - fees;
 
         // Calculate P&L
@@ -646,6 +924,63 @@ impl BacktestSimulator {
         // Calculate average trade duration
         let avg_duration = self.calculate_avg_trade_duration(&state.trades);
 
+        // Calculate new metrics (Phase 3)
+
+        // Calmar ratio
+        let calmar_ratio = if max_drawdown > 0.0 {
+            annualized_return / max_drawdown
+        } else if annualized_return > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+
+        // Recovery factor
+        let recovery_factor = if max_drawdown > 0.0 {
+            return_pct / max_drawdown
+        } else if return_pct > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+
+        // VaR and CVaR
+        let (var_95, cvar_95) = self.calculate_var_cvar(&state.equity_curve);
+
+        // Trade-level metrics
+        let trade_returns: Vec<f64> = state.trades
+            .iter()
+            .filter_map(|t| t.return_pct)
+            .collect();
+
+        let best_trade_return = trade_returns.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let worst_trade_return = trade_returns.iter().cloned().fold(f64::INFINITY, f64::min);
+
+        let best_trade_return = if best_trade_return == f64::NEG_INFINITY { 0.0 } else { best_trade_return };
+        let worst_trade_return = if worst_trade_return == f64::INFINITY { 0.0 } else { worst_trade_return };
+
+        // Consecutive wins/losses
+        let (max_consecutive_wins, max_consecutive_losses) = self.calculate_consecutive_streaks(&state.trades);
+
+        // Average win/loss
+        let winning_returns: Vec<f64> = trade_returns.iter().filter(|&&r| r > 0.0).copied().collect();
+        let losing_returns: Vec<f64> = trade_returns.iter().filter(|&&r| r < 0.0).copied().collect();
+
+        let avg_win = if !winning_returns.is_empty() {
+            winning_returns.iter().sum::<f64>() / winning_returns.len() as f64
+        } else {
+            0.0
+        };
+
+        let avg_loss = if !losing_returns.is_empty() {
+            losing_returns.iter().sum::<f64>() / losing_returns.len() as f64
+        } else {
+            0.0
+        };
+
+        // Expectancy
+        let expectancy = (win_rate * avg_win) + ((1.0 - win_rate) * avg_loss);
+
         BacktestResult {
             strategy_name: strategy.name().to_string(),
             strategy_params: strategy.parameters(),
@@ -671,7 +1006,89 @@ impl BacktestSimulator {
             equity_curve: state.equity_curve.clone(),
             trades: state.trades.clone(),
             computed_at: Utc::now(),
+            // New metrics
+            calmar_ratio,
+            var_95,
+            cvar_95,
+            recovery_factor,
+            best_trade_return,
+            worst_trade_return,
+            max_consecutive_wins,
+            max_consecutive_losses,
+            avg_win,
+            avg_loss,
+            expectancy,
         }
+    }
+
+    /// Calculate VaR and CVaR at 95% confidence.
+    fn calculate_var_cvar(&self, equity_curve: &[(DateTime<Utc>, Decimal)]) -> (f64, f64) {
+        if equity_curve.len() < 2 {
+            return (0.0, 0.0);
+        }
+
+        // Calculate daily returns
+        let mut returns: Vec<f64> = equity_curve
+            .windows(2)
+            .map(|w| {
+                let prev = w[0].1;
+                let curr = w[1].1;
+                if prev == Decimal::ZERO {
+                    0.0
+                } else {
+                    ((curr - prev) / prev).to_f64().unwrap_or(0.0)
+                }
+            })
+            .collect();
+
+        if returns.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        // Sort returns for percentile calculation
+        returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // VaR at 95% (5th percentile of returns)
+        let var_index = (returns.len() as f64 * 0.05).ceil() as usize;
+        let var_95 = if var_index < returns.len() {
+            -returns[var_index] // Negate because losses are negative
+        } else {
+            0.0
+        };
+
+        // CVaR (average of returns below VaR)
+        let tail_returns: Vec<f64> = returns.iter().take(var_index.max(1)).copied().collect();
+        let cvar_95 = if !tail_returns.is_empty() {
+            -(tail_returns.iter().sum::<f64>() / tail_returns.len() as f64)
+        } else {
+            0.0
+        };
+
+        (var_95, cvar_95)
+    }
+
+    /// Calculate maximum consecutive wins and losses.
+    fn calculate_consecutive_streaks(&self, trades: &[TradeRecord]) -> (usize, usize) {
+        let mut max_wins = 0;
+        let mut max_losses = 0;
+        let mut current_wins = 0;
+        let mut current_losses = 0;
+
+        for trade in trades {
+            if let Some(pnl) = trade.pnl {
+                if pnl > Decimal::ZERO {
+                    current_wins += 1;
+                    current_losses = 0;
+                    max_wins = max_wins.max(current_wins);
+                } else if pnl < Decimal::ZERO {
+                    current_losses += 1;
+                    current_wins = 0;
+                    max_losses = max_losses.max(current_losses);
+                }
+            }
+        }
+
+        (max_wins, max_losses)
     }
 
     fn calculate_max_drawdown(&self, equity_curve: &[(DateTime<Utc>, Decimal)]) -> f64 {
@@ -897,9 +1314,222 @@ mod tests {
             equity_curve: vec![],
             trades: vec![],
             computed_at: Utc::now(),
+            // New Phase 3 metrics
+            calmar_ratio: 2.0,        // 10% return / 5% drawdown
+            var_95: 0.02,             // 2% VaR
+            cvar_95: 0.03,            // 3% CVaR
+            recovery_factor: 2.0,     // 10% profit / 5% drawdown
+            best_trade_return: 0.15,  // 15% best trade
+            worst_trade_return: -0.05, // 5% worst trade
+            max_consecutive_wins: 4,
+            max_consecutive_losses: 2,
+            avg_win: 0.08,            // 8% avg win
+            avg_loss: 0.03,           // 3% avg loss
+            expectancy: 0.03,         // 3% expected return per trade
         };
 
         assert!(result.is_profitable());
         assert!(result.is_risk_adjusted_profitable());
+    }
+
+    #[test]
+    fn test_fee_model_fixed() {
+        let model = FeeModel::Fixed(Decimal::new(2, 2)); // 2%
+        let fee = model.calculate(Decimal::new(100, 0), false, Decimal::ZERO);
+        assert_eq!(fee, Decimal::new(2, 0)); // $2 fee on $100
+    }
+
+    #[test]
+    fn test_fee_model_maker_taker() {
+        let model = FeeModel::MakerTaker {
+            maker_fee: Decimal::new(1, 3), // 0.1%
+            taker_fee: Decimal::new(3, 3), // 0.3%
+        };
+
+        // Maker fee
+        let maker_fee = model.calculate(Decimal::new(1000, 0), true, Decimal::ZERO);
+        assert_eq!(maker_fee, Decimal::ONE); // $1 on $1000
+
+        // Taker fee
+        let taker_fee = model.calculate(Decimal::new(1000, 0), false, Decimal::ZERO);
+        assert_eq!(taker_fee, Decimal::new(3, 0)); // $3 on $1000
+    }
+
+    #[test]
+    fn test_fee_model_volume_tiered() {
+        let model = FeeModel::VolumeTiered {
+            tiers: vec![
+                (Decimal::new(10000, 0), Decimal::new(15, 3)),   // 1.5% above $10k
+                (Decimal::new(100000, 0), Decimal::new(10, 3)),  // 1.0% above $100k
+            ],
+            default_fee: Decimal::new(2, 2), // 2% default
+        };
+
+        // Below first tier
+        let fee_low = model.calculate(Decimal::new(100, 0), false, Decimal::new(5000, 0));
+        assert_eq!(fee_low, Decimal::new(2, 0)); // 2% = $2
+
+        // Above first tier
+        let fee_mid = model.calculate(Decimal::new(100, 0), false, Decimal::new(50000, 0));
+        assert_eq!(fee_mid, Decimal::new(15, 1)); // 1.5% = $1.5
+
+        // Above second tier
+        let fee_high = model.calculate(Decimal::new(100, 0), false, Decimal::new(200000, 0));
+        assert_eq!(fee_high, Decimal::ONE); // 1.0% = $1
+    }
+
+    #[test]
+    fn test_slippage_model_depth_based() {
+        let model = SlippageModel::DepthBased {
+            base_pct: Decimal::new(5, 3),      // 0.5%
+            depth_multiplier: Decimal::new(2, 2), // 2% per depth ratio
+        };
+
+        // Low depth (high slippage)
+        let slippage_low_depth = model.calculate_with_depth(
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+            Decimal::ZERO,
+            Decimal::new(50, 0), // 100/50 = 2.0 ratio
+            12,
+        );
+        // 100 * (0.005 + 2.0 * 0.02) = 100 * 0.045 = 4.5
+        assert_eq!(slippage_low_depth, Decimal::new(45, 1));
+
+        // High depth (low slippage)
+        let slippage_high_depth = model.calculate_with_depth(
+            Decimal::new(100, 0),
+            Decimal::new(100, 0),
+            Decimal::ZERO,
+            Decimal::new(1000, 0), // 100/1000 = 0.1 ratio
+            12,
+        );
+        // 100 * (0.005 + 0.1 * 0.02) = 100 * 0.007 = 0.7
+        assert_eq!(slippage_high_depth, Decimal::new(7, 1));
+    }
+
+    #[test]
+    fn test_slippage_model_time_adjusted() {
+        let model = SlippageModel::TimeAdjusted {
+            base_pct: Decimal::new(1, 2), // 1%
+            prime_time_multiplier: Decimal::new(5, 1), // 0.5x during prime time
+            off_hours_multiplier: Decimal::new(15, 1), // 1.5x during off hours
+        };
+
+        // Prime time (hour 12)
+        let slippage_prime = model.calculate_with_depth(
+            Decimal::new(100, 0),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            12,
+        );
+        // 100 * 0.01 * 0.5 = 0.5
+        assert_eq!(slippage_prime, Decimal::new(5, 1));
+
+        // Off hours (hour 3)
+        let slippage_off = model.calculate_with_depth(
+            Decimal::new(100, 0),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            3,
+        );
+        // 100 * 0.01 * 1.5 = 1.5
+        assert_eq!(slippage_off, Decimal::new(15, 1));
+    }
+
+    #[test]
+    fn test_partial_fill_full() {
+        let model = PartialFillModel::FullFill;
+        let fill = model.calculate_fill(
+            Decimal::new(100, 0),
+            Decimal::new(1000, 0),
+            Decimal::ZERO,
+        );
+        assert_eq!(fill, Decimal::new(100, 0)); // Full fill
+    }
+
+    #[test]
+    fn test_partial_fill_depth_based() {
+        let model = PartialFillModel::DepthBased {
+            max_depth_pct: Decimal::new(5, 1), // 50% of depth
+        };
+
+        // Order smaller than available depth
+        let fill_small = model.calculate_fill(
+            Decimal::new(100, 0),  // request 100
+            Decimal::new(1000, 0), // 1000 depth available
+            Decimal::ZERO,
+        );
+        assert_eq!(fill_small, Decimal::new(100, 0)); // Full fill (100 < 500)
+
+        // Order larger than max fill from depth
+        let fill_large = model.calculate_fill(
+            Decimal::new(1000, 0), // request 1000
+            Decimal::new(500, 0),  // 500 depth available
+            Decimal::ZERO,
+        );
+        // Max fill = 500 * 0.5 = 250
+        assert_eq!(fill_large, Decimal::new(250, 0)); // Partial fill
+    }
+
+    #[test]
+    fn test_partial_fill_probabilistic() {
+        let model = PartialFillModel::Probabilistic {
+            base_fill_pct: Decimal::ONE,          // 100% base fill for small orders
+            size_threshold: Decimal::new(100, 0), // Threshold at 100 units
+            decay_rate: Decimal::ONE,             // Linear decay
+        };
+
+        // Small order (below threshold) - full fill
+        let fill_small = model.calculate_fill(
+            Decimal::new(50, 0),
+            Decimal::new(1000, 0),
+            Decimal::ZERO,
+        );
+        assert_eq!(fill_small, Decimal::new(50, 0)); // 50 * 1.0 = 50
+
+        // Large order (above threshold) - reduced fill
+        let fill_large = model.calculate_fill(
+            Decimal::new(200, 0), // request 200
+            Decimal::new(1000, 0),
+            Decimal::ZERO,
+        );
+        // size_ratio = 200/100 = 2.0
+        // fill_pct = 1.0 / (1.0 + 2.0 * 1.0) = 1/3 = 0.333...
+        // fill = 200 * 0.333... ≈ 66.67
+        // Use range check due to decimal precision
+        assert!(fill_large > Decimal::new(66, 0)); // > 66
+        assert!(fill_large < Decimal::new(67, 0)); // < 67
+    }
+
+    #[test]
+    fn test_partial_fill_fixed() {
+        let model = PartialFillModel::Fixed(Decimal::new(75, 2)); // 75%
+
+        let fill = model.calculate_fill(
+            Decimal::new(100, 0),
+            Decimal::new(1000, 0),
+            Decimal::ZERO,
+        );
+        assert_eq!(fill, Decimal::new(75, 0)); // 100 * 0.75 = 75
+    }
+
+    #[test]
+    fn test_partial_fill_can_fill() {
+        let model = PartialFillModel::FullFill;
+
+        // Narrow spread - can fill
+        assert!(model.can_fill(
+            Decimal::new(2, 2),  // 2% spread
+            Decimal::new(10, 2) // 10% max
+        ));
+
+        // Wide spread - cannot fill
+        assert!(!model.can_fill(
+            Decimal::new(15, 2), // 15% spread
+            Decimal::new(10, 2) // 10% max
+        ));
     }
 }

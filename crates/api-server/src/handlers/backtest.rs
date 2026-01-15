@@ -408,21 +408,19 @@ async fn run_backtest_task(
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
         StrategyConfig::Momentum { lookback_hours, threshold, position_size } => {
-            // MomentumStrategy uses Default with field assignment
-            let mut strategy = MomentumStrategy {
-                lookback_periods: lookback_hours as usize,
-                momentum_threshold: threshold,
+            let mut strategy = MomentumStrategy::new(
+                lookback_hours as usize,
+                threshold,
                 position_size,
-            };
+            );
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
         StrategyConfig::MeanReversion { window_hours, std_threshold, position_size } => {
-            // MeanReversionStrategy uses Default with field assignment
-            let mut strategy = MeanReversionStrategy {
-                lookback_periods: window_hours as usize,
-                entry_std_devs: std_threshold.to_string().parse().unwrap_or(2.0),
+            let mut strategy = MeanReversionStrategy::new(
+                window_hours as usize,
+                std_threshold.to_string().parse().unwrap_or(2.0),
                 position_size,
-            };
+            );
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
         StrategyConfig::CopyTrading { .. } => {
