@@ -26,15 +26,17 @@ RUN cargo build --release --workspace
 
 # ==============================================================================
 # Stage 2: Runtime - Minimal production image
+# Cache bust: 2026-01-15-v2
 # ==============================================================================
 FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies
+# Install runtime dependencies (cache bust: v2)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libpq5 \
     curl \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
