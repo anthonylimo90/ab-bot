@@ -5,6 +5,7 @@
 # Use existing multi-target Dockerfile
 builder = "dockerfile"
 dockerfilePath = "./Dockerfile"
+dockerfileTarget = "api-server"
 
 [deploy]
 # Health check endpoint
