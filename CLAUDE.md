@@ -310,6 +310,114 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 
 ## Changelog
 
+### 2026-01-15: Phase 10 - Resilience & Recovery
+
+**Position Failure States & Recovery:**
+
+- **`PositionState`**: New failure states added
+  - `EntryFailed`: Position entry order failed
+  - `ExitFailed`: Position exit order failed
+  - `FailureReason` enum: `OrderRejected`, `InsufficientFunds`, `OrderTimeout`, `MarketClosed`, `ConnectivityError`, `Unknown`
+  - `retry_count`, `max_retries`, `failure_reason` fields on Position
+  - `can_retry()`, `mark_entry_failed()`, `mark_exit_failed()` methods
+
+- **`PositionTracker`**: Reconciliation on startup
+  - `reconcile_on_startup()`: Detect and recover interrupted positions
+  - `ReconciliationResult`: Tracks healthy, stale pending, interrupted closing positions
+  - `PositionSummary`: Overview of position states
+  - `age_secs()` helper on Position for staleness detection
+
+**Circuit Breaker Gradual Recovery Mode:**
+
+- **`CircuitBreakerConfig`**: New recovery options
+  - `gradual_recovery_enabled`: Enable staged recovery (default: false)
+  - `recovery_stages`: Number of stages (default: 4 = 25%, 50%, 75%, 100%)
+  - `recovery_stage_minutes`: Time between stages (default: 15)
+  - `require_profit_to_advance`: Require profitable trade before advancing (default: true)
+
+- **`RecoveryState`**: Track recovery progression
+  - `current_stage`, `total_stages`, `capacity_pct()`
+  - `had_profit_this_stage`, `trades_this_stage`, `recovery_pnl`
+  - `is_fully_recovered()` check
+
+- **`CircuitBreaker`**: Recovery methods
+  - `trading_capacity()`: Returns current capacity (0.25 to 1.0)
+  - `is_in_recovery()`, `recovery_state()`: Query recovery status
+  - `try_advance_recovery()`: Advance to next stage when conditions met
+  - `exit_recovery()`: Force exit from recovery mode
+  - Re-tripping with scaled thresholds during recovery
+
+- **`CircuitBreakerRepository`**: Database persistence
+  - `load()`, `save()`: Persist state across restarts
+  - `get_last_reset_date()`, `update_last_reset_date()`: Daily reset tracking
+
+**Stop-Loss Improvements:**
+
+- **`StopLossRepository`**: Database persistence
+  - `insert()`, `update()`, `delete()`, `delete_by_position()`
+  - `get_active()`: Load active rules on startup
+
+- **`StopLossManager`**: Enhanced monitoring
+  - `with_persistence()`: Constructor with database connection
+  - `load_active_rules()`: Recover rules on startup
+  - `check_triggers_detailed()`: Returns `(Vec<TriggeredStop>, CheckTriggersSummary)`
+  - `rules_missing_market_data()`: Identify rules that couldn't be checked
+
+- **`CheckTriggersSummary`**: Visibility into check results
+  - Counts: `total_rules`, `triggered`, `not_triggered`
+  - Skip reasons: `skipped_market_missing`, `skipped_no_bids`, `skipped_not_active`, `skipped_already_executed`
+
+- **`CheckSkipReason`**: Why a rule was skipped
+  - `MarketDataMissing`, `NoBidsAvailable`, `RuleNotActive`, `RuleAlreadyExecuted`, `TrailingNoPeak`
+
+**AES-256-GCM Encryption in KeyVault:**
+
+- Replaced XOR encryption with authenticated encryption
+- 12-byte random nonce per encryption operation
+- Tamper detection via GCM authentication tag
+- Ciphertext randomness (same plaintext produces different ciphertext)
+
+**Order Executor Resilience:**
+
+- **`ExecutorConfig`**: Retry configuration
+  - `timeout_ms`: Order timeout (default: 30000ms)
+  - `max_retries`: Maximum retry attempts (default: 3)
+  - `retry_base_delay_ms`: Initial backoff delay (default: 100ms)
+  - `retry_max_delay_ms`: Maximum backoff delay (default: 5000ms)
+
+- **`OrderExecutor`**: Retry logic
+  - `execute_with_retry()`: Exponential backoff with jitter
+  - `is_retryable_error()`: Detect transient errors (timeout, connection, rate limit, 502/503/504)
+
+**Integration Tests:**
+
+- 17 tests in `tests/integration_tests.rs`
+- Coverage: ExecutorConfig, CircuitBreaker, StopLossRule, trailing stops
+- Position state transitions, failure states, P&L calculations
+- RBAC permissions, KeyVault encryption, JWT auth
+- Compound stops, volatility stops, break-even stops
+
+**Database Migrations:**
+
+- `20260110_009_position_failure_states.sql`: Add failure columns to positions
+
+**Files Created:**
+- `crates/risk-manager/src/circuit_breaker_repo.rs`
+- `crates/risk-manager/src/stop_loss_repo.rs`
+- `migrations/20260110_009_position_failure_states.sql`
+- `tests/integration_tests.rs`
+
+**Files Modified:**
+- `crates/arb-monitor/src/position_tracker.rs` - Reconciliation logic
+- `crates/auth/Cargo.toml` - Add aes-gcm dependency
+- `crates/auth/src/key_vault.rs` - AES-GCM encryption
+- `crates/polymarket-core/src/db/positions.rs` - Failure state queries
+- `crates/polymarket-core/src/types/position.rs` - Failure states and retry logic
+- `crates/risk-manager/src/circuit_breaker.rs` - Gradual recovery mode
+- `crates/risk-manager/src/lib.rs` - Export new types
+- `crates/risk-manager/src/stop_loss.rs` - Detailed check reporting
+- `crates/trading-engine/src/executor.rs` - Timeout and retry logic
+
 ### 2026-01-10: Phase 9 - Live API Integration & Demo Mode
 
 **Demo Mode Implementation:**
