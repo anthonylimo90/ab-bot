@@ -6,6 +6,8 @@ use tokio::sync::broadcast;
 
 use auth::jwt::{JwtAuth, JwtConfig};
 use auth::key_vault::KeyVault;
+use auth::rbac::RbacManager;
+use auth::{AuditLogger, AuditStorage, PostgresAuditStorage};
 use polymarket_core::api::ClobClient;
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::executor::ExecutorConfig;
@@ -22,8 +24,12 @@ pub struct AppState {
     pub jwt_secret: String,
     /// JWT authentication handler.
     pub jwt_auth: Arc<JwtAuth>,
+    /// RBAC manager for fine-grained permission checking.
+    pub rbac: Arc<RbacManager>,
     /// Key vault for secure wallet key storage.
     pub key_vault: Arc<KeyVault>,
+    /// Audit logger for security and compliance logging.
+    pub audit_logger: Arc<AuditLogger>,
     /// CLOB API client for Polymarket.
     pub clob_client: Arc<ClobClient>,
     /// Order execution engine.
@@ -56,6 +62,9 @@ impl AppState {
         };
         let jwt_auth = Arc::new(JwtAuth::new(jwt_config));
 
+        // Create RBAC manager with default roles
+        let rbac = Arc::new(RbacManager::new());
+
         // Create KeyVault from environment or with default config
         let key_vault = match KeyVault::from_env() {
             Ok(vault) => Arc::new(vault),
@@ -72,6 +81,10 @@ impl AppState {
                 ))
             }
         };
+
+        // Create audit logger with PostgreSQL storage
+        let audit_storage: Arc<dyn AuditStorage> = Arc::new(PostgresAuditStorage::new(pool.clone()));
+        let audit_logger = Arc::new(AuditLogger::new(audit_storage));
 
         // Create CLOB client
         let clob_url = std::env::var("POLYMARKET_CLOB_URL").ok();
@@ -95,7 +108,9 @@ impl AppState {
             pool,
             jwt_secret,
             jwt_auth,
+            rbac,
             key_vault,
+            audit_logger,
             clob_client,
             order_executor,
             circuit_breaker,

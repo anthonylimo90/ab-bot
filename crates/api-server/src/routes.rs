@@ -1,16 +1,18 @@
 //! API route definitions.
 
 use axum::middleware as axum_middleware;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use std::sync::Arc;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    auth, backtest, discover, health, markets, positions, recommendations, trading, vault, wallets,
+    auth, backtest, discover, health, markets, positions, recommendations, trading, users, vault,
+    wallets,
 };
-use crate::middleware::{require_auth, require_trader};
+use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
 use crate::websocket;
 
@@ -58,6 +60,11 @@ use crate::websocket;
         recommendations::get_rotation_recommendations,
         recommendations::dismiss_recommendation,
         recommendations::accept_recommendation,
+        users::list_users,
+        users::create_user,
+        users::get_user,
+        users::update_user,
+        users::delete_user,
     ),
     components(
         schemas(
@@ -104,6 +111,9 @@ use crate::websocket;
             recommendations::RecommendationType,
             recommendations::RecommendationReason,
             recommendations::Urgency,
+            users::UserListItem,
+            users::CreateUserRequest,
+            users::UpdateUserRequest,
         )
     ),
     tags(
@@ -117,6 +127,7 @@ use crate::websocket;
         (name = "discover", description = "Wallet discovery and live trade monitoring"),
         (name = "vault", description = "Secure wallet key management"),
         (name = "recommendations", description = "AI-powered rotation recommendations"),
+        (name = "users", description = "User management (admin only)"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -124,13 +135,34 @@ pub struct ApiDoc;
 
 /// Create the main router with all routes.
 pub fn create_router(state: Arc<AppState>) -> Router {
+    // Rate limiter for auth endpoints: 5 requests per 60 seconds per IP
+    // This helps prevent brute force attacks on login
+    let auth_rate_limit_config = GovernorConfigBuilder::default()
+        .per_second(60)
+        .burst_size(5)
+        .finish()
+        .expect("Failed to create auth rate limiter config");
+
+    // Rate limiter for admin endpoints: 10 requests per 60 seconds per IP
+    // Lower burst for admin operations as they're low-frequency
+    let admin_rate_limit_config = GovernorConfigBuilder::default()
+        .per_second(60)
+        .burst_size(10)
+        .finish()
+        .expect("Failed to create admin rate limiter config");
+
+    // Auth routes with rate limiting (separate so we can apply the layer)
+    let auth_routes = Router::new()
+        .route("/api/v1/auth/register", post(auth::register))
+        .route("/api/v1/auth/login", post(auth::login))
+        .layer(GovernorLayer {
+            config: Arc::new(auth_rate_limit_config),
+        });
+
     // Public routes - no authentication required
     let public_routes = Router::new()
         .route("/health", get(health::health_check))
         .route("/ready", get(health::readiness))
-        // Auth endpoints (public)
-        .route("/api/v1/auth/register", post(auth::register))
-        .route("/api/v1/auth/login", post(auth::login))
         // Discovery/demo endpoints (public for demo purposes)
         .route("/api/v1/discover/trades", get(discover::get_live_trades))
         .route("/api/v1/discover/wallets", get(discover::discover_wallets))
@@ -241,10 +273,34 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             require_auth,
         ));
 
+    // Admin routes - require Admin role with rate limiting
+    let admin_routes = Router::new()
+        // User management
+        .route("/api/v1/users", get(users::list_users))
+        .route("/api/v1/users", post(users::create_user))
+        .route("/api/v1/users/:user_id", get(users::get_user))
+        .route("/api/v1/users/:user_id", patch(users::update_user))
+        .route("/api/v1/users/:user_id", delete(users::delete_user))
+        // Apply rate limiting first (outermost layer runs last)
+        .layer(GovernorLayer {
+            config: Arc::new(admin_rate_limit_config),
+        })
+        // Apply admin check, then auth
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
+
     Router::new()
+        .merge(auth_routes)
         .merge(public_routes)
         .merge(protected_routes)
         .merge(trader_routes)
+        .merge(admin_routes)
         // Swagger UI (public for development)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         // Add state

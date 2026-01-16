@@ -19,6 +19,12 @@ pub enum AuditAction {
     ApiKeyCreated,
     ApiKeyRevoked,
 
+    // User Management
+    UserCreated,
+    UserUpdated,
+    UserDeleted,
+    UserViewed,
+
     // Trading
     CreatePosition,
     ClosePosition,
@@ -400,6 +406,22 @@ impl AuditLogger {
                     "new": new_value,
                 }))
                 .build();
+
+        self.log(event);
+    }
+
+    /// Log a user management action.
+    pub fn log_user_action(
+        &self,
+        admin_user_id: &str,
+        action: AuditAction,
+        target_user_id: &str,
+        details: serde_json::Value,
+    ) {
+        let event = AuditEvent::builder(action, format!("user/{}", target_user_id))
+            .user(admin_user_id)
+            .details(details)
+            .build();
 
         self.log(event);
     }

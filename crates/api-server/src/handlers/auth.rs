@@ -15,7 +15,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use auth::jwt::Claims;
-use auth::UserRole;
+use auth::{AuditAction, AuditEvent, UserRole};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -163,6 +163,17 @@ pub async fn register(
     .execute(&state.pool)
     .await?;
 
+    // Log user registration
+    let audit_event = AuditEvent::builder(AuditAction::UserCreated, format!("user/{}", user_id))
+        .user(user_id.to_string())
+        .details(serde_json::json!({
+            "email": &req.email,
+            "role": "Trader",
+            "source": "self_registration"
+        }))
+        .build();
+    state.audit_logger.log(audit_event);
+
     // Generate JWT token
     let token = state
         .jwt_auth
@@ -210,15 +221,27 @@ pub async fn login(
     .fetch_optional(&state.pool)
     .await?;
 
-    let user = user.ok_or_else(|| ApiError::Unauthorized("Invalid credentials".into()))?;
+    let user = match user {
+        Some(u) => u,
+        None => {
+            // Log failed login attempt (user not found)
+            state.audit_logger.log_login(&req.email, None, false);
+            return Err(ApiError::Unauthorized("Invalid credentials".into()));
+        }
+    };
 
     // Verify password
     let parsed_hash = PasswordHash::new(&user.password_hash)
         .map_err(|_| ApiError::Internal("Invalid password hash in database".into()))?;
 
-    Argon2::default()
+    if Argon2::default()
         .verify_password(req.password.as_bytes(), &parsed_hash)
-        .map_err(|_| ApiError::Unauthorized("Invalid credentials".into()))?;
+        .is_err()
+    {
+        // Log failed login attempt (wrong password)
+        state.audit_logger.log_login(&user.id.to_string(), None, false);
+        return Err(ApiError::Unauthorized("Invalid credentials".into()));
+    }
 
     // Update last login
     let _ = sqlx::query("UPDATE users SET last_login = $1 WHERE id = $2")
@@ -226,6 +249,9 @@ pub async fn login(
         .bind(user.id)
         .execute(&state.pool)
         .await;
+
+    // Log successful login
+    state.audit_logger.log_login(&user.id.to_string(), None, true);
 
     // Compute role before moving user fields
     let role = user.role_string();
