@@ -310,6 +310,68 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
 
 ## Changelog
 
+### 2026-01-16: Phase 12 - Rate Limiting & Audit Logging
+
+**Admin Rate Limiting:**
+
+- **`routes.rs`**: Rate limiting for admin endpoints
+  - 10 requests per 60 seconds per IP for `/api/v1/users/*` routes
+  - Uses `tower_governor` middleware
+  - Returns HTTP 429 with `Retry-After` header when exceeded
+
+**PostgreSQL Audit Storage:**
+
+- **`audit_storage_pg.rs`**: New persistent audit log storage
+  - `PostgresAuditStorage`: Implements `AuditStorage` trait
+  - `store()`: INSERT audit events into `audit_log` table
+  - `query()`: Dynamic filtering by user, action, resource, time range, success
+  - `count()`: Count matching events with same filters
+  - Bidirectional `AuditAction` <-> string conversion
+
+**User Management Audit Actions:**
+
+- **`audit.rs`**: New audit action types
+  - `UserCreated`: User account created (self-registration or admin)
+  - `UserUpdated`: User profile/role/password modified
+  - `UserDeleted`: User account removed
+  - `UserViewed`: User data accessed (single or list)
+  - `log_user_action()`: Convenience method for user management events
+
+**AppState Integration:**
+
+- **`state.rs`**: Audit logger added to shared state
+  - `audit_logger: Arc<AuditLogger>` field
+  - Initialized with `PostgresAuditStorage` backend
+  - Available to all handlers via `State(state)`
+
+**Auth Handler Audit Logging:**
+
+- **`handlers/auth.rs`**: Login and registration auditing
+  - Successful login: `AuditAction::Login` with user ID
+  - Failed login (user not found): `AuditAction::LoginFailed` with email
+  - Failed login (wrong password): `AuditAction::LoginFailed` with user ID
+  - Registration: `AuditAction::UserCreated` with source "self_registration"
+
+**User Management Handler Audit Logging:**
+
+- **`handlers/users.rs`**: Full CRUD auditing
+  - `list_users()`: `UserViewed` with count of users returned
+  - `create_user()`: `UserCreated` with email, role, admin who created
+  - `get_user()`: `UserViewed` with target user email
+  - `update_user()`: `UserUpdated` with list of fields changed
+  - `delete_user()`: `UserDeleted` with target email and admin who deleted
+
+**Files Created:**
+- `crates/auth/src/audit_storage_pg.rs`
+
+**Files Modified:**
+- `crates/auth/src/audit.rs` - Added user management actions
+- `crates/auth/src/lib.rs` - Export new types
+- `crates/api-server/src/state.rs` - Added audit_logger
+- `crates/api-server/src/routes.rs` - Added admin rate limiting
+- `crates/api-server/src/handlers/auth.rs` - Added audit logging
+- `crates/api-server/src/handlers/users.rs` - Added audit logging with Claims extraction
+
 ### 2026-01-15: Phase 11 - Railway Deployment Pipeline
 
 **Deployment Configuration:**
