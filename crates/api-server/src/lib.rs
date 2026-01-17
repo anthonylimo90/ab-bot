@@ -134,11 +134,15 @@ impl ApiServer {
         let router = router
             .layer(
                 TraceLayer::new_for_http()
-                    // Don't log request starts
-                    .on_request(|_request: &Request<_>, _span: &tracing::Span| {
-                        // Intentionally empty - don't log every request
+                    // Log request starts for debugging (temporarily at ERROR level to see them)
+                    .on_request(|request: &Request<_>, _span: &tracing::Span| {
+                        tracing::info!(
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            "Incoming request"
+                        );
                     })
-                    // Only log responses at ERROR level for failures
+                    // Only log responses at DEBUG level
                     .on_response(DefaultOnResponse::new().level(Level::DEBUG))
                     // Log failures at ERROR level with request details
                     .on_failure(
