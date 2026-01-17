@@ -19,10 +19,27 @@ export interface LoginRequest {
   password: string;
 }
 
-export interface SignupRequest {
+// User management types (admin)
+export interface UserListItem {
+  id: string;
+  email: string;
+  name?: string;
+  role: UserRole;
+  created_at: string;
+  last_login?: string;
+}
+
+export interface CreateUserRequest {
   email: string;
   password: string;
   name?: string;
+  role?: UserRole;
+}
+
+export interface UpdateUserRequest {
+  name?: string;
+  role?: UserRole;
+  password?: string;
 }
 
 // Position types

@@ -18,6 +18,9 @@ import type {
   AuthResponse,
   ConnectedWallet,
   StoreWalletRequest,
+  UserListItem,
+  CreateUserRequest,
+  UpdateUserRequest,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -111,15 +114,6 @@ class ApiClient {
     const response = await this.request<AuthResponse>('/api/v1/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
-    });
-    this.setToken(response.token);
-    return response;
-  }
-
-  async signup(email: string, password: string, name?: string): Promise<AuthResponse> {
-    const response = await this.request<AuthResponse>('/api/v1/auth/register', {
-      method: 'POST',
-      body: JSON.stringify({ email, password, name }),
     });
     this.setToken(response.token);
     return response;
@@ -366,6 +360,35 @@ class ApiClient {
   async setPrimaryWallet(address: string): Promise<ConnectedWallet> {
     return this.request<ConnectedWallet>(`/api/v1/vault/wallets/${address}/primary`, {
       method: 'PUT',
+    });
+  }
+
+  // User Management (Admin only)
+  async listUsers(): Promise<UserListItem[]> {
+    return this.request<UserListItem[]>('/api/v1/users');
+  }
+
+  async createUser(params: CreateUserRequest): Promise<UserListItem> {
+    return this.request<UserListItem>('/api/v1/users', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async getUser(userId: string): Promise<UserListItem> {
+    return this.request<UserListItem>(`/api/v1/users/${userId}`);
+  }
+
+  async updateUser(userId: string, params: UpdateUserRequest): Promise<UserListItem> {
+    return this.request<UserListItem>(`/api/v1/users/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async deleteUser(userId: string): Promise<void> {
+    return this.request<void>(`/api/v1/users/${userId}`, {
+      method: 'DELETE',
     });
   }
 }

@@ -23,10 +23,15 @@ import {
   Save,
   Check,
   AlertTriangle,
+  Users,
+  ChevronRight,
 } from 'lucide-react';
+import { useAuthStore } from '@/stores/auth-store';
+import Link from 'next/link';
 
 export default function SettingsPage() {
   const toast = useToastStore();
+  const { user } = useAuthStore();
   const {
     risk,
     notifications,
@@ -133,6 +138,34 @@ export default function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* User Management (Admin Only) */}
+      {user?.role === 'Admin' && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Users className="h-5 w-5" />
+              User Management
+            </CardTitle>
+            <CardDescription>
+              Manage user accounts and permissions
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Link href="/settings/users">
+              <div className="flex items-center justify-between p-4 rounded-lg border hover:bg-muted/50 transition-colors cursor-pointer">
+                <div>
+                  <p className="font-medium">Manage Users</p>
+                  <p className="text-sm text-muted-foreground">
+                    Create, edit, and delete user accounts
+                  </p>
+                </div>
+                <ChevronRight className="h-5 w-5 text-muted-foreground" />
+              </div>
+            </Link>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Risk Management */}
       <Card>
