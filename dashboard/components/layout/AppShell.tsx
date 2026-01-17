@@ -5,7 +5,7 @@ import { Header } from './Header';
 import { Sidebar } from './Sidebar';
 
 // Routes that should not show the app shell (header/sidebar)
-const AUTH_ROUTES = ['/login', '/signup'];
+const AUTH_ROUTES = ['/login', '/signup', '/forgot-password', '/reset-password'];
 
 interface AppShellProps {
   children: React.ReactNode;
