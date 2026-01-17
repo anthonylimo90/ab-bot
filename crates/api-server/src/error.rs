@@ -1,5 +1,6 @@
 //! API error types and handling.
 
+use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -69,6 +70,9 @@ pub enum ApiError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Invalid JSON: {0}")]
+    JsonRejection(String),
 }
 
 impl ApiError {
@@ -86,6 +90,7 @@ impl ApiError {
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::JsonRejection(_) => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -103,7 +108,15 @@ impl ApiError {
             ApiError::Internal(_) => "INTERNAL_ERROR",
             ApiError::Database(_) => "DATABASE_ERROR",
             ApiError::Serialization(_) => "SERIALIZATION_ERROR",
+            ApiError::JsonRejection(_) => "INVALID_JSON",
         }
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        tracing::warn!(error = %rejection, "JSON parsing failed");
+        ApiError::JsonRejection(rejection.body_text())
     }
 }
 
