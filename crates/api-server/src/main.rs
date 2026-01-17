@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "api_server=info,tower_http=info,polymarket_core=warn,auth=info,sqlx=warn,hyper=warn,tungstenite=warn".into()
+                "api_server=info,tower_http=error,polymarket_core=warn,auth=info,sqlx=warn,hyper=warn,tungstenite=warn,h2=warn".into()
             }),
         )
         .with(tracing_subscriber::fmt::layer())

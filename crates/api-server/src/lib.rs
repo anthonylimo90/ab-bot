@@ -34,14 +34,15 @@ pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
 
+use axum::http::Request;
 use axum::Router;
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
-use tracing::info;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::{info, Level};
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -128,9 +129,30 @@ impl ApiServer {
         // Build router
         let router = create_router(state.clone());
 
-        // Add middleware
+        // Add middleware - use minimal tracing to avoid log spam
+        // Only log errors (not every request) to stay under Railway's 500 logs/sec limit
         let router = router
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http()
+                    // Don't log request starts
+                    .on_request(|_request: &Request<_>, _span: &tracing::Span| {
+                        // Intentionally empty - don't log every request
+                    })
+                    // Only log responses at ERROR level for failures
+                    .on_response(DefaultOnResponse::new().level(Level::DEBUG))
+                    // Log failures at ERROR level with request details
+                    .on_failure(
+                        |error: tower_http::classify::ServerErrorsFailureClass,
+                         latency: std::time::Duration,
+                         _span: &tracing::Span| {
+                            tracing::error!(
+                                error = %error,
+                                latency_ms = latency.as_millis(),
+                                "Request failed"
+                            );
+                        },
+                    ),
+            )
             .layer(if config.cors_permissive {
                 CorsLayer::permissive()
             } else {
