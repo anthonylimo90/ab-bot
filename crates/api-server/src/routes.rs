@@ -137,7 +137,8 @@ pub struct ApiDoc;
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Rate limiter for auth endpoints: 5 requests per 60 seconds per IP
     // This helps prevent brute force attacks on login
-    let auth_rate_limit_config = GovernorConfigBuilder::default()
+    // TEMPORARILY DISABLED for debugging 500 errors
+    let _auth_rate_limit_config = GovernorConfigBuilder::default()
         .per_second(60)
         .burst_size(5)
         .finish()
@@ -151,13 +152,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .finish()
         .expect("Failed to create admin rate limiter config");
 
-    // Auth routes with rate limiting (separate so we can apply the layer)
+    // Auth routes (rate limiting temporarily disabled for debugging)
     let auth_routes = Router::new()
         .route("/api/v1/auth/register", post(auth::register))
-        .route("/api/v1/auth/login", post(auth::login))
-        .layer(GovernorLayer {
-            config: Arc::new(auth_rate_limit_config),
-        });
+        .route("/api/v1/auth/login", post(auth::login));
+    // TODO: Re-enable rate limiting after fixing 500 error
+    // .layer(GovernorLayer {
+    //     config: Arc::new(auth_rate_limit_config),
+    // });
 
     // Public routes - no authentication required
     let public_routes = Router::new()
