@@ -110,6 +110,16 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+
+        // Log 500 errors for debugging (these indicate bugs or infrastructure issues)
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(
+                error_code = self.error_code(),
+                error = %self,
+                "Internal server error"
+            );
+        }
+
         let body = ErrorResponse::new(self.error_code(), self.to_string());
 
         (status, Json(body)).into_response()

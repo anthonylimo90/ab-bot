@@ -9,11 +9,13 @@ async fn main() -> anyhow::Result<()> {
     // Load environment variables from .env file
     dotenvy::dotenv().ok();
 
-    // Initialize tracing
+    // Initialize tracing with production-friendly defaults
+    // Filter out noisy crates to avoid hitting Railway's 500 logs/sec limit
     tracing_subscriber::registry()
         .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "api_server=info,tower_http=info".into()),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "api_server=info,tower_http=info,polymarket_core=warn,auth=info,sqlx=warn,hyper=warn,tungstenite=warn".into()
+            }),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

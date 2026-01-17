@@ -15,7 +15,7 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Polymarket CLOB API client for order book data.
 pub struct ClobClient {
@@ -102,7 +102,7 @@ impl ClobClient {
 
         tokio::spawn(async move {
             if let Err(e) = Self::ws_loop(ws_url, market_ids, tx).await {
-                error!("WebSocket error: {}", e);
+                warn!("WebSocket connection ended: {}", e);
             }
         });
 
@@ -152,7 +152,7 @@ impl ClobClient {
                     break;
                 }
                 Err(e) => {
-                    error!("WebSocket error: {}", e);
+                    warn!("WebSocket receive error: {}", e);
                     break;
                 }
                 _ => {}
