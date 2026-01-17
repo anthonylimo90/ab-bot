@@ -302,3 +302,74 @@ DATABASE_URL=$(railway variables get DATABASE_URL -s TimescaleDB) cargo sqlx mig
 | **Total** | **~$25-75/month** |
 
 *Costs vary based on usage. Railway charges for compute time and resources.*
+
+## Multiple Environments (Staging + Production)
+
+Railway supports multiple environments within a single project, allowing you to run staging and production side-by-side.
+
+### Setting Up Staging Environment
+
+1. **Create the environment:**
+   - Go to Railway Dashboard → your project
+   - Click the environment dropdown (top-left, shows "production")
+   - Click **"+ New Environment"**
+   - Name it `staging`
+
+2. **Add databases to staging:**
+   - Switch to **Staging** environment (dropdown)
+   - Click **"+ New"** → **Database** → **TimescaleDB**
+   - Click **"+ New"** → **Database** → **Redis**
+   - Initialize database:
+     ```bash
+     psql "<staging-database-url>"
+     CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+     ```
+
+3. **Configure branch triggers:**
+   - **Production:** Settings → Deploy → Branch: `main`
+   - **Staging:** Settings → Deploy → Branch: `develop`
+
+4. **Update staging variables:**
+
+   | Service | Variable | Staging Value |
+   |---------|----------|---------------|
+   | api-server | `DATABASE_URL` | `${{TimescaleDB.DATABASE_URL}}` |
+   | api-server | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
+   | api-server | `JWT_SECRET` | New unique 32+ char secret |
+   | api-server | `RUST_LOG` | `debug,api_server=debug` |
+   | dashboard | `NEXT_PUBLIC_API_URL` | `https://<staging-api>.railway.app` |
+
+### Development Workflow
+
+```
+feature-branch → develop (staging) → main (production)
+       ↓              ↓                    ↓
+   Local dev     Auto-deploy          Auto-deploy
+                 to staging           to production
+```
+
+1. Develop features on feature branches
+2. Merge to `develop` → auto-deploys to staging
+3. Test on staging environment
+4. Merge `develop` to `main` → auto-deploys to production
+
+### Running Migrations Per Environment
+
+```bash
+# Install Railway CLI
+npm install -g @railway/cli
+
+# Staging
+railway environment staging
+railway run -s api-server -- cargo sqlx migrate run
+
+# Production
+railway environment production
+railway run -s api-server -- cargo sqlx migrate run
+```
+
+### Cost Impact
+
+Adding staging roughly doubles costs (~$60-100/month total) due to separate database instances. Reduce staging costs by:
+- Stopping staging services when not in use
+- Using smaller database instances for staging

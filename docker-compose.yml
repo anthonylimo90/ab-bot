@@ -52,7 +52,8 @@ services:
       REDIS_URL: redis://redis:6379
       API_HOST: 0.0.0.0
       API_PORT: 3000
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      # JWT_SECRET is required - generate with: openssl rand -base64 32
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set to a secure value (min 32 chars)}
       CORS_PERMISSIVE: ${CORS_PERMISSIVE:-true}
       RUST_LOG: ${RUST_LOG:-api_server=info,tower_http=info}
       SKIP_MIGRATIONS: "true"

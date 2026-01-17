@@ -20,6 +20,19 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("API Server starting up...");
 
+    // Validate JWT_SECRET for security
+    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+    if jwt_secret.is_empty() || jwt_secret == "development-secret-change-in-production" {
+        tracing::error!("JWT_SECRET must be set to a secure value (not the default)");
+        tracing::error!("Generate a secure secret: openssl rand -base64 32");
+        anyhow::bail!("JWT_SECRET environment variable must be set to a secure value");
+    }
+    if jwt_secret.len() < 32 {
+        tracing::error!("JWT_SECRET must be at least 32 characters long (current: {})", jwt_secret.len());
+        anyhow::bail!("JWT_SECRET must be at least 32 characters long");
+    }
+    tracing::info!("JWT secret validation passed");
+
     // Get database URL
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     tracing::info!("Connecting to database...");

@@ -10,7 +10,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use auth::jwt::Claims;
+use auth::jwt::{Claims, UserRole};
 
 use crate::error::ErrorResponse;
 use crate::state::AppState;
@@ -56,6 +56,17 @@ pub async fn require_auth(
 
     // Log successful authentication
     tracing::debug!(user_id = %claims.sub, role = ?claims.role, "Authenticated request");
+
+    // Sync RBAC roles with JWT role
+    // This ensures RBAC permissions are available for fine-grained checks
+    let rbac_role = match claims.role {
+        UserRole::Viewer => "viewer",
+        UserRole::Trader => "trader",
+        UserRole::Admin => "admin",
+    };
+
+    // Assign the role to the user in RBAC (idempotent operation)
+    let _ = state.rbac.assign_role(&claims.sub, rbac_role).await;
 
     // Inject claims into request extensions
     request.extensions_mut().insert(claims);
