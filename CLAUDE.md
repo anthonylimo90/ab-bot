@@ -361,16 +361,82 @@ DISCORD_WEBHOOK_URL=       # For alert notifications
   - `update_user()`: `UserUpdated` with list of fields changed
   - `delete_user()`: `UserDeleted` with target email and admin who deleted
 
+**Admin User Management Dashboard:**
+
+- **`/settings/users`**: Full admin user CRUD interface
+  - List all users with email, role, created date, last login
+  - Create new users with email, password, name, role
+  - Edit user name, role, or reset password
+  - Delete users with confirmation dialog
+  - Role badges (Viewer, Trader, Admin)
+  - Search and filter functionality
+
+- **`/settings`**: User Management section for admins
+  - Conditional display based on user role
+  - Link to user management page
+
+- **Self-signup removal**: Admin-only user creation
+  - Removed `/signup` page and route
+  - Login page directs to admin contact
+  - Removed signup validation schema
+  - Updated AuthGuard public routes
+
+**Dashboard API Integration:**
+
+- **`lib/api.ts`**: User management methods
+  - `listUsers()`, `createUser()`, `getUser()`
+  - `updateUser()`, `deleteUser()`
+
+- **`types/api.ts`**: User management types
+  - `UserListItem`, `CreateUserRequest`, `UpdateUserRequest`
+
+**JWT Security & RBAC:**
+
+- **`main.rs`**: JWT secret validation on startup
+  - Minimum 32 characters required
+  - Rejects default/empty values
+  - Clear error messages with generation instructions
+
+- **`middleware.rs`**: RBAC role syncing
+  - Syncs JWT role claims to RBAC manager
+  - Enables fine-grained permission checks
+  - Idempotent role assignment
+
+- **`docker-compose.yml`**: Enforced JWT_SECRET
+  - Required environment variable (fails if not set)
+  - Documentation for secure secret generation
+
+- **`.env.example`**: Security documentation
+  - JWT_SECRET requirements and generation command
+  - Environment variable documentation
+
 **Files Created:**
 - `crates/auth/src/audit_storage_pg.rs`
+- `dashboard/app/settings/users/page.tsx`
 
 **Files Modified:**
 - `crates/auth/src/audit.rs` - Added user management actions
 - `crates/auth/src/lib.rs` - Export new types
 - `crates/api-server/src/state.rs` - Added audit_logger
 - `crates/api-server/src/routes.rs` - Added admin rate limiting
+- `crates/api-server/src/handlers/mod.rs` - Export users module
 - `crates/api-server/src/handlers/auth.rs` - Added audit logging
 - `crates/api-server/src/handlers/users.rs` - Added audit logging with Claims extraction
+- `crates/api-server/src/main.rs` - JWT secret validation
+- `crates/api-server/src/middleware.rs` - RBAC role syncing
+- `crates/api-server/Cargo.toml` - Added tower_governor
+- `dashboard/app/(auth)/login/page.tsx` - Removed signup link
+- `dashboard/app/settings/page.tsx` - Added user management section
+- `dashboard/components/auth/AuthGuard.tsx` - Removed /signup route
+- `dashboard/lib/api.ts` - Added user management methods
+- `dashboard/lib/validations.ts` - Removed signup schema
+- `dashboard/types/api.ts` - Added user management types
+- `docker-compose.yml` - JWT_SECRET enforcement
+- `.env.example` - Security documentation
+- `docs/DEPLOY.md` - Updated deployment docs
+
+**Files Deleted:**
+- `dashboard/app/(auth)/signup/page.tsx`
 
 ### 2026-01-15: Phase 11 - Railway Deployment Pipeline
 
