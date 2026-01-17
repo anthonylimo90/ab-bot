@@ -85,6 +85,7 @@ impl EmailClient {
             .map_err(|e| EmailError::SmtpConnection(e.to_string()))?
             .port(config.smtp_port)
             .credentials(creds)
+            .timeout(Some(std::time::Duration::from_secs(10)))
             .build();
 
         let from_mailbox = format!("{} <{}>", config.from_name, config.from_email)
