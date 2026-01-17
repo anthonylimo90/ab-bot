@@ -4,6 +4,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Extension;
@@ -111,8 +112,14 @@ impl UserRow {
 )]
 pub async fn register(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<RegisterRequest>,
+    payload: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<AuthResponse>)> {
+    // Handle JSON parsing errors explicitly
+    let Json(req) = payload.map_err(|e| {
+        tracing::warn!(error = %e, "Register request JSON parsing failed");
+        ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
+    })?;
+
     // Validate email format
     if !req.email.contains('@') || req.email.len() < 5 {
         return Err(ApiError::BadRequest("Invalid email address".into()));
@@ -207,8 +214,14 @@ pub async fn register(
 )]
 pub async fn login(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<LoginRequest>,
+    payload: Result<Json<LoginRequest>, JsonRejection>,
 ) -> ApiResult<Json<AuthResponse>> {
+    // Handle JSON parsing errors explicitly
+    let Json(req) = payload.map_err(|e| {
+        tracing::warn!(error = %e, "Login request JSON parsing failed");
+        ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
+    })?;
+
     // Find user by email
     let user: Option<UserRow> = sqlx::query_as(
         r#"
