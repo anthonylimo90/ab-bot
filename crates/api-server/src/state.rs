@@ -13,6 +13,7 @@ use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
 
+use crate::email::{EmailClient, EmailConfig};
 use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 
 /// Shared application state.
@@ -30,6 +31,8 @@ pub struct AppState {
     pub key_vault: Arc<KeyVault>,
     /// Audit logger for security and compliance logging.
     pub audit_logger: Arc<AuditLogger>,
+    /// Email client for sending transactional emails.
+    pub email_client: Option<Arc<EmailClient>>,
     /// CLOB API client for Polymarket.
     pub clob_client: Arc<ClobClient>,
     /// Order execution engine.
@@ -83,7 +86,8 @@ impl AppState {
         };
 
         // Create audit logger with PostgreSQL storage
-        let audit_storage: Arc<dyn AuditStorage> = Arc::new(PostgresAuditStorage::new(pool.clone()));
+        let audit_storage: Arc<dyn AuditStorage> =
+            Arc::new(PostgresAuditStorage::new(pool.clone()));
         let audit_logger = Arc::new(AuditLogger::new(audit_storage));
 
         // Create CLOB client
@@ -104,6 +108,20 @@ impl AppState {
         let circuit_breaker_config = CircuitBreakerConfig::default();
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
 
+        // Create email client if configured
+        let email_client = EmailConfig::from_env().and_then(|config| {
+            match EmailClient::new(config) {
+                Ok(client) => {
+                    tracing::info!("Email client initialized successfully");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize email client: {}. Password reset emails will not be sent.", e);
+                    None
+                }
+            }
+        });
+
         Self {
             pool,
             jwt_secret,
@@ -111,6 +129,7 @@ impl AppState {
             rbac,
             key_vault,
             audit_logger,
+            email_client,
             clob_client,
             order_executor,
             circuit_breaker,

@@ -30,7 +30,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("JWT_SECRET environment variable must be set to a secure value");
     }
     if jwt_secret.len() < 32 {
-        tracing::error!("JWT_SECRET must be at least 32 characters long (current: {})", jwt_secret.len());
+        tracing::error!(
+            "JWT_SECRET must be at least 32 characters long (current: {})",
+            jwt_secret.len()
+        );
         anyhow::bail!("JWT_SECRET must be at least 32 characters long");
     }
     tracing::info!("JWT secret validation passed");

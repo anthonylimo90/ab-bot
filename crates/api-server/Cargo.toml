@@ -48,6 +48,12 @@ rand = "0.8"
 # Password hashing
 argon2 = "0.5"
 
+# Email
+lettre = { version = "0.11", features = ["tokio1-native-tls"] }
+
+# Hashing (for password reset tokens)
+sha2 = "0.10"
+
 # Error handling
 thiserror.workspace = true
 anyhow.workspace = true

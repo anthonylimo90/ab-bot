@@ -20,6 +20,7 @@
 //! ```
 
 pub mod copy_trading;
+pub mod email;
 pub mod error;
 pub mod handlers;
 pub mod middleware;

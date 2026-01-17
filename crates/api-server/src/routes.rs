@@ -33,6 +33,8 @@ use crate::websocket;
         auth::login,
         auth::refresh_token,
         auth::get_current_user,
+        auth::forgot_password,
+        auth::reset_password,
         markets::list_markets,
         markets::get_market,
         markets::get_market_orderbook,
@@ -75,6 +77,10 @@ use crate::websocket;
             auth::LoginRequest,
             auth::AuthResponse,
             auth::UserInfo,
+            auth::ForgotPasswordRequest,
+            auth::ForgotPasswordResponse,
+            auth::ResetPasswordRequest,
+            auth::ResetPasswordResponse,
             crate::websocket::OrderbookUpdate,
             crate::websocket::PositionUpdate,
             crate::websocket::SignalUpdate,
@@ -159,6 +165,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let auth_routes = Router::new()
         .route("/api/v1/auth/register", post(auth::register))
         .route("/api/v1/auth/login", post(auth::login))
+        .route("/api/v1/auth/forgot-password", post(auth::forgot_password))
+        .route("/api/v1/auth/reset-password", post(auth::reset_password))
         .layer(GovernorLayer {
             config: Arc::new(auth_rate_limit_config),
         });

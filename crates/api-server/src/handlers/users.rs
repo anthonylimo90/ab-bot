@@ -407,10 +407,7 @@ pub async fn update_user(
     let now = Utc::now();
 
     // Execute update with dynamic query
-    let query = format!(
-        "UPDATE users SET {} WHERE id = $1",
-        updates.join(", ")
-    );
+    let query = format!("UPDATE users SET {} WHERE id = $1", updates.join(", "));
 
     let mut query_builder = sqlx::query(&query).bind(user_id);
     for param in &params {
