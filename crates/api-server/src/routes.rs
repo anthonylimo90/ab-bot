@@ -4,7 +4,9 @@ use axum::middleware as axum_middleware;
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use std::sync::Arc;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{
+    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
+};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -136,30 +138,30 @@ pub struct ApiDoc;
 /// Create the main router with all routes.
 pub fn create_router(state: Arc<AppState>) -> Router {
     // Rate limiter for auth endpoints: 5 requests per 60 seconds per IP
-    // This helps prevent brute force attacks on login
-    // TEMPORARILY DISABLED for debugging 500 errors
-    let _auth_rate_limit_config = GovernorConfigBuilder::default()
+    // Uses SmartIpKeyExtractor to handle X-Forwarded-For from Railway's proxy
+    let auth_rate_limit_config = GovernorConfigBuilder::default()
         .per_second(60)
         .burst_size(5)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .expect("Failed to create auth rate limiter config");
 
     // Rate limiter for admin endpoints: 10 requests per 60 seconds per IP
-    // Lower burst for admin operations as they're low-frequency
+    // Uses SmartIpKeyExtractor to handle X-Forwarded-For from Railway's proxy
     let admin_rate_limit_config = GovernorConfigBuilder::default()
         .per_second(60)
         .burst_size(10)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .expect("Failed to create admin rate limiter config");
 
-    // Auth routes (rate limiting temporarily disabled for debugging)
+    // Auth routes with rate limiting (SmartIpKeyExtractor handles proxy IPs)
     let auth_routes = Router::new()
         .route("/api/v1/auth/register", post(auth::register))
-        .route("/api/v1/auth/login", post(auth::login));
-    // TODO: Re-enable rate limiting after fixing 500 error
-    // .layer(GovernorLayer {
-    //     config: Arc::new(auth_rate_limit_config),
-    // });
+        .route("/api/v1/auth/login", post(auth::login))
+        .layer(GovernorLayer {
+            config: Arc::new(auth_rate_limit_config),
+        });
 
     // Public routes - no authentication required
     let public_routes = Router::new()

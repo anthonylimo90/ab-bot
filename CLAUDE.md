@@ -80,8 +80,8 @@ DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prep
 
 **500 errors with 0ms latency:**
 - Usually indicates middleware failure before handler runs
-- Check `tower_governor` rate limiter - can cause silent 500s
-- Auth rate limiter currently disabled due to this issue (see `routes.rs`)
+- `tower_governor` rate limiter needs `SmartIpKeyExtractor` behind proxies (Railway, etc.)
+- Default `PeerIpKeyExtractor` fails when proxy IP != client IP
 
 **Debugging API errors:**
 - Request logging: `INFO api_server: Incoming request method=X uri=Y`
