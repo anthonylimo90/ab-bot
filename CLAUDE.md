@@ -71,6 +71,23 @@ After modifying SQL queries, regenerate the cache:
 DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prepare --workspace
 ```
 
+## Troubleshooting
+
+**Railway log rate limiting (500 logs/sec):**
+- Set `RUST_LOG=api_server=info,tower_http=error,polymarket_core=warn,sqlx=warn`
+- Avoid DEBUG level logging in production
+- WebSocket errors should be WARN not ERROR level
+
+**500 errors with 0ms latency:**
+- Usually indicates middleware failure before handler runs
+- Check `tower_governor` rate limiter - can cause silent 500s
+- Auth rate limiter currently disabled due to this issue (see `routes.rs`)
+
+**Debugging API errors:**
+- Request logging: `INFO api_server: Incoming request method=X uri=Y`
+- JSON parse errors: `WARN api_server::handlers::auth: ... JSON parsing failed`
+- 500 errors: `ERROR api_server::error: Internal server error`
+
 ## External Docs
 
 - Polymarket CLOB: https://docs.polymarket.com
