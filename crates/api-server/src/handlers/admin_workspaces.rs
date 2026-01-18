@@ -4,9 +4,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use rand::Rng;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -15,6 +17,20 @@ use auth::{AuditAction, AuditEvent, Claims};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+
+/// Generate a secure random invite token.
+fn generate_invite_token() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    hex::encode(bytes)
+}
+
+/// Hash a token using SHA256.
+fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// Workspace list response for admin view.
 #[derive(Debug, Serialize, ToSchema)]
@@ -194,16 +210,16 @@ pub async fn list_workspaces(
 }
 
 /// Create a new workspace (admin only).
+/// If the owner email doesn't exist, an invite will be sent to that email.
 #[utoipa::path(
     post,
     path = "/api/v1/admin/workspaces",
     request_body = CreateWorkspaceRequest,
     responses(
-        (status = 201, description = "Workspace created", body = WorkspaceDetailResponse),
+        (status = 201, description = "Workspace created (owner added or invite sent)", body = WorkspaceDetailResponse),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - Admin role required"),
-        (status = 404, description = "Owner user not found"),
     ),
     security(("bearer_auth" = [])),
     tag = "admin_workspaces"
@@ -225,17 +241,16 @@ pub async fn create_workspace(
         ));
     }
 
-    // Find owner by email
+    // Validate email format
+    if !req.owner_email.contains('@') || req.owner_email.len() < 5 {
+        return Err(ApiError::BadRequest("Invalid email address".into()));
+    }
+
+    // Find owner by email (may not exist)
     let owner: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
         .bind(&req.owner_email)
         .fetch_optional(&state.pool)
         .await?;
-
-    let owner_id = owner
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("User with email '{}' not found", req.owner_email))
-        })?
-        .0;
 
     let admin_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid admin ID".into()))?;
@@ -261,36 +276,97 @@ pub async fn create_workspace(
     .execute(&mut *tx)
     .await?;
 
-    // Add owner as workspace member
-    sqlx::query(
-        r#"
-        INSERT INTO workspace_members (workspace_id, user_id, role, joined_at)
-        VALUES ($1, $2, 'owner', $3)
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(owner_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
+    // If owner exists, add them directly; otherwise create an invite
+    let invite_token = if let Some((owner_id,)) = owner {
+        // Add owner as workspace member
+        sqlx::query(
+            r#"
+            INSERT INTO workspace_members (workspace_id, user_id, role, joined_at)
+            VALUES ($1, $2, 'owner', $3)
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(owner_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
-    // Create user settings if not exists and set default workspace
-    sqlx::query(
-        r#"
-        INSERT INTO user_settings (user_id, default_workspace_id, created_at, updated_at)
-        VALUES ($1, $2, $3, $3)
-        ON CONFLICT (user_id) DO UPDATE SET
-            default_workspace_id = COALESCE(user_settings.default_workspace_id, $2),
-            updated_at = $3
-        "#,
-    )
-    .bind(owner_id)
-    .bind(workspace_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
+        // Create user settings if not exists and set default workspace
+        sqlx::query(
+            r#"
+            INSERT INTO user_settings (user_id, default_workspace_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $3)
+            ON CONFLICT (user_id) DO UPDATE SET
+                default_workspace_id = COALESCE(user_settings.default_workspace_id, $2),
+                updated_at = $3
+            "#,
+        )
+        .bind(owner_id)
+        .bind(workspace_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        None
+    } else {
+        // Owner doesn't exist - create an invite with owner role
+        let token = generate_invite_token();
+        let token_hash = hash_token(&token);
+        let expires_at = Utc::now() + Duration::days(7);
+        let invite_id = Uuid::new_v4();
+
+        sqlx::query(
+            r#"
+            INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, invited_by, expires_at, created_at)
+            VALUES ($1, $2, $3, 'owner', $4, $5, $6, $7)
+            "#,
+        )
+        .bind(invite_id)
+        .bind(workspace_id)
+        .bind(&req.owner_email)
+        .bind(&token_hash)
+        .bind(admin_id)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        Some(token)
+    };
 
     tx.commit().await?;
+
+    // Send invite email if owner doesn't exist
+    if let Some(ref token) = invite_token {
+        if let Some(email_client) = &state.email_client {
+            let invite_link = format!(
+                "{}/invite/{}",
+                std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "http://localhost:3002".to_string()),
+                token
+            );
+
+            let subject = format!("You've been invited to own {} on AB-Bot", req.name);
+            let body = format!(
+                "You've been invited to be the owner of the workspace '{}'.\n\n\
+                Click the link below to accept and create your account:\n{}\n\n\
+                This invite expires in 7 days.",
+                req.name, invite_link
+            );
+
+            if let Err(e) = email_client.send_simple(&req.owner_email, &subject, &body).await {
+                tracing::error!(error = %e, "Failed to send workspace owner invite email");
+            } else {
+                tracing::info!(email = %req.owner_email, workspace = %req.name, "Workspace owner invite email sent");
+            }
+        } else {
+            tracing::info!(
+                token = %token,
+                email = %req.owner_email,
+                workspace = %req.name,
+                "Workspace created with owner invite (email not configured)"
+            );
+        }
+    }
 
     // Audit log
     let event = AuditEvent::builder(
@@ -301,7 +377,7 @@ pub async fn create_workspace(
     .details(serde_json::json!({
         "name": &req.name,
         "owner_email": &req.owner_email,
-        "owner_id": owner_id.to_string(),
+        "owner_invited": invite_token.is_some(),
         "created_by_admin": &claims.sub
     }))
     .build();
