@@ -1,5 +1,226 @@
 # Changelog
 
+## 2026-01-18: Phase 13 - Automated Wallet Management & Multi-Tenant Workspaces
+
+**Multi-Tenant Workspace System:**
+
+- **`workspaces` table**: Isolated trading environments
+  - Per-workspace budgets, rosters, and settings
+  - `setup_mode`: 'automatic' or 'manual' wallet selection
+  - `auto_optimize_enabled`, `auto_select_enabled`, `auto_demote_enabled` flags
+  - Configurable thresholds: `min_roi_30d`, `min_sharpe`, `min_win_rate`, `min_trades_30d`, `max_drawdown_pct`
+
+- **`workspace_members` table**: Role-based team access
+  - Roles: `owner`, `manager`, `trader`, `viewer`
+  - Owners can manage members and settings
+  - Managers can manage roster and trading
+  - Traders can view and trade
+  - Viewers have read-only access
+
+- **`workspace_invites` table**: Email-based invitations
+  - Token-based invite links with expiration
+  - Resend email integration for delivery
+  - Accept/decline flow with workspace joining
+
+**Automated Wallet Selection System:**
+
+- **`auto_optimizer.rs`**: Event-driven automation service
+  - `AutomationEvent`: PositionClosed, CircuitBreakerTripped, MetricsUpdated, WorkspaceCreated
+  - Hourly scheduled optimization cycle
+  - Redis pub/sub for real-time event handling
+
+- **Auto-Select (Promotion)**:
+  - Fills empty Active slots (max 5) with best candidates
+  - Composite scoring: ROI (30%) + Sharpe (25%) + Win Rate (25%) + Consistency (20%)
+  - `rank_candidates()`: Scores and sorts by total_score
+  - `fill_empty_slots()`: Queries `wallet_success_metrics` for qualifying wallets
+
+- **Auto-Drop (Demotion)**:
+  - Immediate triggers: 5+ consecutive losses, drawdown > 30%, circuit breaker trip
+  - Grace period triggers: ROI < 0% for 48h, Sharpe < 0.5 for 24h, no trades in 14 days
+  - `DemotionTrigger` enum with `is_immediate()` and `grace_period_hours()`
+  - `check_demotion_triggers()`: Evaluates wallet against thresholds
+
+- **Probation System**:
+  - New wallets start with 7-day probation at 50% allocation
+  - `probation_until`, `probation_allocation_pct` columns
+  - `process_probation_graduations()`: Graduate or demote after probation
+  - Must maintain criteria throughout probation period
+
+- **Confidence-Weighted Allocation**:
+  - `AllocationStrategy` enum: Equal, ConfidenceWeighted, Performance
+  - `calculate_confidence_weighted_allocations()`: 0.5x to 1.5x multiplier based on confidence
+  - `calculate_data_confidence()`: Based on trade count, sharpe, win rate
+  - Allocation caps: min 10%, max 35% per wallet
+
+- **Pin/Ban Support**:
+  - `pin_wallet()`, `unpin_wallet()`: Prevent auto-demotion (max 3 pins)
+  - `ban_wallet()`, `unban_wallet()`: Prevent auto-promotion
+  - `workspace_wallet_bans` table with optional expiration
+
+- **Rotation History & Undo**:
+  - `auto_rotation_history` table: Full audit trail of all actions
+  - `undo_rotation()`: Revert actions within 1-hour window
+  - `get_automation_preview()`: Preview next automation actions
+
+**Wallet Roster System:**
+
+- **`workspace_wallet_allocations` table**: Active/Bench tiered management
+  - `tier`: 'active' (max 5) or 'bench' (unlimited)
+  - `allocation_pct`: Percentage of portfolio
+  - `pinned`, `pinned_at`, `pinned_by`: User override protection
+  - `consecutive_losses`, `last_loss_at`: Loss streak tracking
+  - `grace_period_started_at`, `grace_period_reason`: Grace period tracking
+  - `auto_assigned`, `auto_assigned_reason`: Track automated vs manual additions
+
+- **`handlers/allocations.rs`**: Roster management API
+  - `list_allocations()`: Get workspace roster
+  - `add_allocation()`: Add wallet to roster
+  - `update_allocation()`: Modify allocation percentage
+  - `remove_allocation()`: Remove from roster
+  - `promote_allocation()`: Move from Bench to Active
+  - `demote_allocation()`: Move from Active to Bench
+
+**Onboarding System:**
+
+- **`handlers/onboarding.rs`**: Guided workspace setup
+  - `get_status()`: Check onboarding progress
+  - `set_mode()`: Choose automatic or manual setup
+  - `set_budget()`: Configure portfolio budget
+  - `auto_setup()`: Automatically select top wallets
+  - `complete_onboarding()`: Finalize setup
+
+- **Setup Modes**:
+  - `automatic`: System selects and manages wallets
+  - `manual`: User has full control over roster
+
+**Demo Trading System:**
+
+- **`handlers/demo.rs`**: Paper trading API
+  - `list_positions()`: Get demo positions
+  - `create_position()`: Open simulated position
+  - `update_position()`: Modify position
+  - `close_position()`: Close with P&L calculation
+  - `get_balance()`: Check demo balance
+  - `update_balance()`: Adjust demo capital
+  - `reset_portfolio()`: Reset to initial state
+
+- **`demo_positions` table**: Simulated position tracking
+  - Links to workspace and user
+  - Full position lifecycle (entry, current price, P&L)
+  - Closed position history with realized P&L
+
+- **`demo_balances` table**: Per-workspace demo capital
+  - Default $10,000 starting balance
+  - Tracks available and invested amounts
+
+**Dashboard Updates:**
+
+- **Trading Page** (`/trading`): Unified copy trading interface
+  - Active tab: Active roster wallets with positions
+  - Bench tab: Bench wallets ready for promotion
+  - Positions tab: Manual position management
+  - History tab: Closed positions log
+  - Automation tab: Auto-optimizer controls
+
+- **`AutomationPanel` component**: Automation controls
+  - ON/OFF toggles for auto-select and auto-demote
+  - Threshold sliders (ROI, Sharpe, Win Rate, Trades, Drawdown)
+  - Live rotation history feed
+  - Manual trigger button for immediate optimization
+  - Status indicator (last run, next run)
+
+- **`WalletCard` component**: Enhanced wallet display
+  - Pin/unpin button with visual indicator
+  - Probation badge with days remaining
+  - Confidence score display
+  - Quick actions: Promote, Demote, Remove, Ban
+
+- **`PortfolioSummary` component**: Portfolio overview
+  - Total value, P&L, allocation breakdown
+  - Active vs Bench wallet counts
+
+- **Stores**:
+  - `roster-store.ts`: Workspace roster state management
+  - `demo-portfolio-store.ts`: Demo positions and balance
+
+**New API Endpoints:**
+
+- `GET /api/v1/workspaces` - List user's workspaces
+- `GET /api/v1/workspaces/current` - Get current workspace
+- `GET /api/v1/workspaces/:id` - Get workspace details
+- `PUT /api/v1/workspaces/:id` - Update workspace settings
+- `POST /api/v1/workspaces/switch/:id` - Switch to workspace
+- `GET /api/v1/workspaces/:id/members` - List workspace members
+- `GET /api/v1/workspaces/:id/optimizer-status` - Get automation status
+- `GET /api/v1/invites` - List pending invites
+- `POST /api/v1/invites` - Create invite
+- `DELETE /api/v1/invites/:id` - Revoke invite
+- `GET /api/v1/invites/:token/info` - Get invite info (public)
+- `POST /api/v1/invites/:token/accept` - Accept invite
+- `GET /api/v1/allocations` - List wallet allocations
+- `POST /api/v1/allocations` - Add wallet to roster
+- `PUT /api/v1/allocations/:address` - Update allocation
+- `DELETE /api/v1/allocations/:address` - Remove from roster
+- `POST /api/v1/allocations/:address/promote` - Promote to Active
+- `POST /api/v1/allocations/:address/demote` - Demote to Bench
+- `PUT /api/v1/allocations/:address/pin` - Pin wallet
+- `DELETE /api/v1/allocations/:address/pin` - Unpin wallet
+- `POST /api/v1/allocations/bans` - Ban wallet
+- `DELETE /api/v1/allocations/bans/:address` - Unban wallet
+- `GET /api/v1/allocations/bans` - List banned wallets
+- `GET /api/v1/auto-rotation/history` - Get rotation history
+- `POST /api/v1/auto-rotation/history/:id/acknowledge` - Acknowledge entry
+- `POST /api/v1/auto-rotation/trigger` - Trigger optimization manually
+- `GET /api/v1/onboarding/status` - Get onboarding status
+- `POST /api/v1/onboarding/mode` - Set workspace mode
+- `POST /api/v1/onboarding/budget` - Set budget
+- `POST /api/v1/onboarding/auto-setup` - Run auto-setup
+- `POST /api/v1/onboarding/complete` - Complete onboarding
+- `GET /api/v1/demo/positions` - List demo positions
+- `POST /api/v1/demo/positions` - Create demo position
+- `PUT /api/v1/demo/positions/:id` - Update demo position
+- `DELETE /api/v1/demo/positions/:id` - Close demo position
+- `GET /api/v1/demo/balance` - Get demo balance
+- `PUT /api/v1/demo/balance` - Update demo balance
+- `POST /api/v1/demo/reset` - Reset demo portfolio
+
+**Database Migrations:**
+
+- `20260117_010_workspaces.sql`: Workspaces, members, invites tables
+- `20260117_011_workspace_allocations.sql`: Wallet allocations with tiers
+- `20260117_012_automation.sql`: Auto-rotation history, bans, automation columns
+- `20260117_013_demo_trading.sql`: Demo positions and balances
+- `20260118_014_allocation_enhancements.sql`: Pin, probation, grace period columns
+
+**Files Created:**
+
+- `crates/api-server/src/auto_optimizer.rs`
+- `crates/api-server/src/handlers/workspaces.rs`
+- `crates/api-server/src/handlers/admin_workspaces.rs`
+- `crates/api-server/src/handlers/invites.rs`
+- `crates/api-server/src/handlers/allocations.rs`
+- `crates/api-server/src/handlers/auto_rotation.rs`
+- `crates/api-server/src/handlers/onboarding.rs`
+- `crates/api-server/src/handlers/demo.rs`
+- `dashboard/app/trading/page.tsx`
+- `dashboard/components/trading/AutomationPanel.tsx`
+- `dashboard/components/trading/WalletCard.tsx`
+- `dashboard/components/trading/PortfolioSummary.tsx`
+- `dashboard/components/trading/ManualPositions.tsx`
+- `dashboard/stores/roster-store.ts`
+
+**Files Modified:**
+
+- `crates/api-server/src/routes.rs` - Added new route groups
+- `crates/api-server/src/handlers/mod.rs` - Export new handlers
+- `crates/api-server/src/state.rs` - Added AutoOptimizer to state
+- `crates/api-server/src/main.rs` - Initialize automation service
+- `dashboard/lib/api.ts` - Added workspace, roster, demo API methods
+- `dashboard/types/api.ts` - Added new type definitions
+- `dashboard/stores/mode-store.ts` - Demo/Live mode state
+- `dashboard/components/layout/Sidebar.tsx` - Updated navigation
+
 ## 2026-01-16: Phase 12 - Rate Limiting & Audit Logging
 
 **Admin Rate Limiting:**
