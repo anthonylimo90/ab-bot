@@ -4,12 +4,11 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard,
-  Star,
-  Eye,
   Search,
-  PieChart,
   TrendingUp,
   Settings,
+  LineChart,
+  Star,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -35,18 +34,11 @@ const navSections: NavSection[] = [
     ],
   },
   {
-    title: 'Copy Trading',
+    title: 'Trading',
     items: [
       { href: '/discover', label: 'Discover', icon: Search },
-      { href: '/bench', label: 'Watching', icon: Eye, badge: 'watching' },
-      { href: '/roster', label: 'Active', icon: Star, badge: 'active' },
-    ],
-  },
-  {
-    title: 'Portfolio',
-    items: [
-      { href: '/portfolio', label: 'Positions', icon: PieChart },
-      { href: '/backtest', label: 'Backtest', icon: TrendingUp },
+      { href: '/trading', label: 'Trading', icon: TrendingUp, badge: 'active' },
+      { href: '/backtest', label: 'Backtest', icon: LineChart },
     ],
   },
   {
