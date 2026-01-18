@@ -1,17 +1,38 @@
 # AB-Bot
 
-A high-performance Polymarket trading platform built in Rust, featuring arbitrage detection, bot scanning, copy trading, and risk management.
+A high-performance Polymarket trading platform built in Rust, featuring automated wallet selection, copy trading, arbitrage detection, and risk management.
 
 ## Features
 
-- **Arbitrage Monitor** - Real-time detection of mispriced prediction markets
-- **Bot Scanner** - Identify automated trading wallets through behavioral analysis
+### Core Trading
 - **Copy Trading** - Mirror successful wallets with configurable allocation strategies
+- **Arbitrage Monitor** - Real-time detection of mispriced prediction markets
 - **Risk Management** - Advanced stop-loss strategies and circuit breakers
-- **Backtesting** - Historical simulation framework with realistic execution models
 - **Live Wallet Integration** - EIP-712 signing for real order execution on Polymarket
+- **Demo Mode** - Paper trading with simulated capital ($10,000 default)
+
+### Automated Wallet Management
+- **Auto-Select** - Automatically fills Active roster with best-performing wallets
+- **Auto-Drop** - Demotes wallets that fail performance thresholds
+- **Auto-Swap** - Replaces underperformers with better candidates from the pool
+- **Confidence-Weighted Allocation** - Higher allocation to wallets with higher prediction confidence
+- **Probation System** - New wallets start at 50% allocation for 7 days
+- **Pin/Ban Support** - User overrides for automation behavior
+
+### Wallet Discovery & Analysis
+- **Bot Scanner** - Identify automated trading wallets through behavioral analysis
 - **Wallet Discovery** - Find and track top-performing wallets with success predictions
+- **Success Metrics** - ROI, Sharpe ratio, win rate, drawdown tracking
 - **Demo P&L Simulator** - See potential returns from copy trading strategies
+
+### Multi-Tenant Workspaces
+- **Workspaces** - Isolated trading environments with separate budgets and rosters
+- **Role-Based Access** - Owner, Manager, Trader, Viewer roles
+- **Email Invites** - Invite team members to collaborate
+- **Setup Wizard** - Guided onboarding for new workspaces
+
+### Platform
+- **Backtesting** - Historical simulation framework with realistic execution models
 - **REST/WebSocket API** - Full-featured API with OpenAPI documentation
 - **Dashboard** - Next.js frontend with Demo and Live trading modes
 
@@ -88,6 +109,9 @@ JWT_SECRET=your-secret-key-here
 POLYMARKET_API_URL=https://clob.polymarket.com
 POLYGON_RPC_URL=https://polygon-rpc.com
 
+# Email (Resend)
+RESEND_API_KEY=re_...
+
 # Live Trading (optional)
 WALLET_PRIVATE_KEY=0x...  # 64-char hex private key for order signing
 LIVE_TRADING=true         # Enable live order execution
@@ -100,11 +124,115 @@ LIVE_TRADING=true         # Enable live order execution
 WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
 ```
 
+## Automation System
+
+The platform includes a fully automated wallet selection system that runs hands-off from day one.
+
+### How It Works
+
+1. **Auto-Select (Promotion)**
+   - System automatically fills empty Active slots (max 5) with best candidates
+   - Candidates ranked by composite score: ROI (30%) + Sharpe (25%) + Win Rate (25%) + Consistency (20%)
+   - New wallets start in 7-day probation with 50% of target allocation
+
+2. **Auto-Drop (Demotion)**
+   - Wallets demoted to Bench when they fail thresholds
+   - **Immediate triggers**: 5+ consecutive losses, drawdown > 30%, circuit breaker trip
+   - **Grace period triggers**: ROI < 0% for 48h, Sharpe < 0.5 for 24h, no trades in 14 days
+
+3. **Confidence-Weighted Allocation**
+   - Uses ensemble of 4 rule-based models (Statistical, Momentum, Risk-Adjusted, Behavioral)
+   - Higher confidence = higher allocation (range: 10% to 35% per wallet)
+   - Market regime adjustments (Bull/Bear, Calm/Volatile)
+
+4. **User Overrides**
+   - **Pin wallet**: Prevents auto-demotion (max 3 pins)
+   - **Ban wallet**: Prevents auto-promotion
+   - **Manual drop**: Instant, respected immediately
+
+### Thresholds
+
+**Promotion Criteria (must meet ALL):**
+| Metric | Minimum |
+|--------|---------|
+| ROI 30d | ≥ 5% |
+| Sharpe Ratio | ≥ 1.0 |
+| Win Rate | ≥ 50% |
+| Trade Count | ≥ 10 |
+| Max Drawdown | ≤ 20% |
+
+**Demotion Triggers:**
+| Condition | Action |
+|-----------|--------|
+| 5+ consecutive losses | Immediate demote |
+| Drawdown > 30% | Immediate demote |
+| ROI < 0% for 48h | Demote after grace period |
+| Sharpe < 0.5 for 24h | Demote after grace period |
+| No activity 14 days | Demote |
+
 ## API Endpoints
 
 ### Health & Status
 - `GET /health` - Health check
 - `GET /ready` - Readiness check
+
+### Authentication
+- `POST /api/v1/auth/register` - Register new user
+- `POST /api/v1/auth/login` - Login
+- `POST /api/v1/auth/refresh` - Refresh token
+- `GET /api/v1/auth/me` - Get current user
+- `POST /api/v1/auth/forgot-password` - Request password reset
+- `POST /api/v1/auth/reset-password` - Reset password
+
+### Workspaces
+- `GET /api/v1/workspaces` - List user's workspaces
+- `GET /api/v1/workspaces/current` - Get current workspace
+- `GET /api/v1/workspaces/:id` - Get workspace details
+- `PUT /api/v1/workspaces/:id` - Update workspace settings
+- `POST /api/v1/workspaces/switch/:id` - Switch to workspace
+- `GET /api/v1/workspaces/:id/members` - List workspace members
+- `GET /api/v1/workspaces/:id/optimizer-status` - Get automation status
+
+### Invites
+- `GET /api/v1/invites` - List pending invites
+- `POST /api/v1/invites` - Create invite
+- `DELETE /api/v1/invites/:id` - Revoke invite
+- `GET /api/v1/invites/:token/info` - Get invite info (public)
+- `POST /api/v1/invites/:token/accept` - Accept invite
+
+### Allocations (Roster)
+- `GET /api/v1/allocations` - List wallet allocations
+- `POST /api/v1/allocations` - Add wallet to roster
+- `PUT /api/v1/allocations/:address` - Update allocation
+- `DELETE /api/v1/allocations/:address` - Remove from roster
+- `POST /api/v1/allocations/:address/promote` - Promote to Active
+- `POST /api/v1/allocations/:address/demote` - Demote to Bench
+- `PUT /api/v1/allocations/:address/pin` - Pin wallet
+- `DELETE /api/v1/allocations/:address/pin` - Unpin wallet
+- `POST /api/v1/allocations/bans` - Ban wallet
+- `DELETE /api/v1/allocations/bans/:address` - Unban wallet
+- `GET /api/v1/allocations/bans` - List banned wallets
+
+### Auto-Rotation
+- `GET /api/v1/auto-rotation/history` - Get rotation history
+- `POST /api/v1/auto-rotation/history/:id/acknowledge` - Acknowledge entry
+- `POST /api/v1/auto-rotation/trigger` - Trigger optimization manually
+
+### Onboarding
+- `GET /api/v1/onboarding/status` - Get onboarding status
+- `POST /api/v1/onboarding/mode` - Set workspace mode
+- `POST /api/v1/onboarding/budget` - Set budget
+- `POST /api/v1/onboarding/auto-setup` - Run auto-setup
+- `POST /api/v1/onboarding/complete` - Complete onboarding
+
+### Demo Positions
+- `GET /api/v1/demo/positions` - List demo positions
+- `POST /api/v1/demo/positions` - Create demo position
+- `PUT /api/v1/demo/positions/:id` - Update demo position
+- `DELETE /api/v1/demo/positions/:id` - Close demo position
+- `GET /api/v1/demo/balance` - Get demo balance
+- `PUT /api/v1/demo/balance` - Update demo balance
+- `POST /api/v1/demo/reset` - Reset demo portfolio
 
 ### Markets
 - `GET /api/v1/markets` - List markets
@@ -119,20 +247,21 @@ WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
 ### Wallets
 - `GET /api/v1/wallets` - List tracked wallets
 - `POST /api/v1/wallets` - Add wallet to track
+- `GET /api/v1/wallets/:address` - Get wallet details
 - `GET /api/v1/wallets/:address/metrics` - Get wallet metrics
 
 ### Trading
 - `POST /api/v1/orders` - Place order
 - `POST /api/v1/orders/:id/cancel` - Cancel order
 
-### Backtesting
-- `POST /api/v1/backtest` - Run backtest
-- `GET /api/v1/backtest/results` - List backtest results
-
 ### Discovery
 - `GET /api/v1/discover/trades` - Live trades from monitored wallets
 - `GET /api/v1/discover/wallets` - Top-performing wallets leaderboard
 - `GET /api/v1/discover/simulate` - Demo P&L simulation
+
+### Backtesting
+- `POST /api/v1/backtest` - Run backtest
+- `GET /api/v1/backtest/results` - List backtest results
 
 ### WebSocket Streams
 - `WS /ws/orderbook` - Live orderbook updates
@@ -141,6 +270,37 @@ WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
 - `WS /ws/all` - All streams combined
 
 API documentation available at `/swagger-ui` when running.
+
+## Dashboard Features
+
+### Pages
+
+- **Dashboard** - Portfolio overview and metrics
+- **Trading** - Unified copy trading and portfolio management
+  - Active tab: Active roster wallets with positions
+  - Bench tab: Bench wallets ready for promotion
+  - Positions tab: Manual position management
+  - History tab: Closed positions
+  - Automation tab: Auto-optimizer controls and history
+- **Discover** - Find top-performing wallets
+- **Backtest** - Historical simulations
+- **Settings** - Configuration and user management
+
+### Demo Mode
+- Paper trading with simulated capital ($10,000 default)
+- Full backtesting capabilities
+- No wallet connection required
+
+### Live Mode
+- Real trading connected to Polymarket
+- Actual order execution
+- Real P&L tracking
+
+### Automation Panel
+- ON/OFF toggles for auto-select and auto-demote
+- Adjustable thresholds (ROI, Sharpe, Win Rate, Trades, Drawdown)
+- Live rotation history with reasons
+- Manual trigger button for immediate optimization
 
 ## Development
 
@@ -160,7 +320,7 @@ cargo run -p bot-scanner
 
 # Format and lint
 cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ### Database Migrations
@@ -203,26 +363,6 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for complete step-by-step instructions.
 - `Dockerfile.*` - Service-specific container builds
 - `.dockerignore` - Build context optimization
 
-## Dashboard Features
-
-### Demo Mode
-- Paper trading with simulated capital ($10,000 default)
-- Full backtesting capabilities
-- No wallet connection required
-
-### Live Mode
-- Real trading connected to Polymarket
-- Actual order execution
-- Real P&L tracking
-
-### Pages
-- **Dashboard** - Portfolio overview and metrics
-- **Portfolio** - Position management
-- **Discover** - Find top-performing wallets
-- **Allocate** - Strategy allocation wizard
-- **Backtest** - Historical simulations
-- **Settings** - Configuration
-
 ## Tech Stack
 
 ### Backend
@@ -252,4 +392,4 @@ MIT
 4. Push to branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-See [CLAUDE.md](CLAUDE.md) for detailed development guidelines and changelog.
+See [CLAUDE.md](CLAUDE.md) for detailed development guidelines.
