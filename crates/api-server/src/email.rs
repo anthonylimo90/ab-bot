@@ -1,22 +1,22 @@
-//! Email client for sending password reset and notification emails.
+//! Email client using Resend HTTP API.
+//!
+//! Uses Resend's HTTP API instead of SMTP for reliable email delivery
+//! in cloud environments where SMTP ports may be blocked.
 
-use lettre::{
-    message::{header::ContentType, Mailbox},
-    transport::smtp::authentication::Credentials,
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+
+const RESEND_API_URL: &str = "https://api.resend.com/emails";
 
 /// Email client errors.
 #[derive(Debug, Error)]
 pub enum EmailError {
-    #[error("SMTP connection failed: {0}")]
-    SmtpConnection(String),
-    #[error("Failed to build email: {0}")]
-    BuildEmail(String),
+    #[error("HTTP request failed: {0}")]
+    HttpError(String),
     #[error("Failed to send email: {0}")]
-    SendEmail(String),
+    SendError(String),
     #[error("Email client not configured")]
     NotConfigured,
 }
@@ -24,14 +24,8 @@ pub enum EmailError {
 /// Email client configuration.
 #[derive(Debug, Clone)]
 pub struct EmailConfig {
-    /// SMTP host.
-    pub smtp_host: String,
-    /// SMTP port.
-    pub smtp_port: u16,
-    /// SMTP username.
-    pub smtp_username: String,
-    /// SMTP password.
-    pub smtp_password: String,
+    /// Resend API key.
+    pub api_key: String,
     /// From email address.
     pub from_email: String,
     /// From display name.
@@ -43,24 +37,18 @@ pub struct EmailConfig {
 impl EmailConfig {
     /// Create configuration from environment variables.
     pub fn from_env() -> Option<Self> {
-        let smtp_host = std::env::var("SMTP_HOST").ok()?;
-        let smtp_port = std::env::var("SMTP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(587);
-        let smtp_username = std::env::var("SMTP_USERNAME").ok()?;
-        let smtp_password = std::env::var("SMTP_PASSWORD").ok()?;
-        let from_email = std::env::var("SMTP_FROM").ok()?;
-        let from_name =
-            std::env::var("SMTP_FROM_NAME").unwrap_or_else(|_| "Polymarket Scanner".to_string());
+        let api_key = std::env::var("RESEND_API_KEY").ok()?;
+        let from_email = std::env::var("RESEND_FROM")
+            .or_else(|_| std::env::var("SMTP_FROM"))
+            .ok()?;
+        let from_name = std::env::var("RESEND_FROM_NAME")
+            .or_else(|_| std::env::var("SMTP_FROM_NAME"))
+            .unwrap_or_else(|_| "Polymarket Scanner".to_string());
         let app_url =
             std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3002".to_string());
 
         Some(Self {
-            smtp_host,
-            smtp_port,
-            smtp_username,
-            smtp_password,
+            api_key,
             from_email,
             from_name,
             app_url,
@@ -68,44 +56,97 @@ impl EmailConfig {
     }
 }
 
-/// Email client for sending transactional emails.
+/// Resend API request body.
+#[derive(Debug, Serialize)]
+struct ResendEmailRequest {
+    from: String,
+    to: Vec<String>,
+    subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+}
+
+/// Resend API response.
+#[derive(Debug, Deserialize)]
+struct ResendEmailResponse {
+    id: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Email client for sending transactional emails via Resend.
 #[derive(Clone)]
 pub struct EmailClient {
-    mailer: Arc<AsyncSmtpTransport<Tokio1Executor>>,
-    from_mailbox: Mailbox,
+    client: Arc<Client>,
+    api_key: String,
+    from: String,
     app_url: String,
 }
 
 impl EmailClient {
     /// Create a new email client with the given configuration.
     pub fn new(config: EmailConfig) -> Result<Self, EmailError> {
-        let creds = Credentials::new(config.smtp_username, config.smtp_password);
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| EmailError::HttpError(e.to_string()))?;
 
-        let mailer = AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)
-            .map_err(|e| EmailError::SmtpConnection(e.to_string()))?
-            .port(config.smtp_port)
-            .credentials(creds)
-            .timeout(Some(std::time::Duration::from_secs(10)))
-            .build();
-
-        let from_mailbox = format!("{} <{}>", config.from_name, config.from_email)
-            .parse()
-            .map_err(|e: lettre::address::AddressError| EmailError::BuildEmail(e.to_string()))?;
+        let from = format!("{} <{}>", config.from_name, config.from_email);
 
         Ok(Self {
-            mailer: Arc::new(mailer),
-            from_mailbox,
+            client: Arc::new(client),
+            api_key: config.api_key,
+            from,
             app_url: config.app_url,
         })
+    }
+
+    /// Send an email via Resend API.
+    async fn send_email(
+        &self,
+        to: &str,
+        subject: &str,
+        html: Option<String>,
+        text: Option<String>,
+    ) -> Result<(), EmailError> {
+        let request = ResendEmailRequest {
+            from: self.from.clone(),
+            to: vec![to.to_string()],
+            subject: subject.to_string(),
+            html,
+            text,
+        };
+
+        let response = self
+            .client
+            .post(RESEND_API_URL)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| EmailError::HttpError(e.to_string()))?;
+
+        let status = response.status();
+        let body: ResendEmailResponse = response
+            .json()
+            .await
+            .unwrap_or(ResendEmailResponse { id: None, message: None });
+
+        if status.is_success() {
+            tracing::debug!(email_id = ?body.id, "Email sent successfully via Resend");
+            Ok(())
+        } else {
+            let error_msg = body.message.unwrap_or_else(|| format!("HTTP {}", status));
+            Err(EmailError::SendError(error_msg))
+        }
     }
 
     /// Send a password reset email with the given token.
     pub async fn send_password_reset(&self, to_email: &str, token: &str) -> Result<(), EmailError> {
         let reset_url = format!("{}/reset-password?token={}", self.app_url, token);
-
-        let to_mailbox: Mailbox = to_email
-            .parse()
-            .map_err(|e: lettre::address::AddressError| EmailError::BuildEmail(e.to_string()))?;
 
         let html_body = format!(
             r#"<!DOCTYPE html>
@@ -172,31 +213,13 @@ This link will expire in 1 hour.
 If you didn't request this password reset, you can safely ignore this email."#
         );
 
-        let email = Message::builder()
-            .from(self.from_mailbox.clone())
-            .to(to_mailbox)
-            .subject("Reset Your Password - Polymarket Scanner")
-            .multipart(
-                lettre::message::MultiPart::alternative()
-                    .singlepart(
-                        lettre::message::SinglePart::builder()
-                            .header(ContentType::TEXT_PLAIN)
-                            .body(text_body),
-                    )
-                    .singlepart(
-                        lettre::message::SinglePart::builder()
-                            .header(ContentType::TEXT_HTML)
-                            .body(html_body),
-                    ),
-            )
-            .map_err(|e| EmailError::BuildEmail(e.to_string()))?;
-
-        self.mailer
-            .send(email)
-            .await
-            .map_err(|e| EmailError::SendEmail(e.to_string()))?;
-
-        Ok(())
+        self.send_email(
+            to_email,
+            "Reset Your Password - Polymarket Scanner",
+            Some(html_body),
+            Some(text_body),
+        )
+        .await
     }
 
     /// Send a simple text email.
@@ -206,24 +229,8 @@ If you didn't request this password reset, you can safely ignore this email."#
         subject: &str,
         body: &str,
     ) -> Result<(), EmailError> {
-        let to_mailbox: Mailbox = to_email
-            .parse()
-            .map_err(|e: lettre::address::AddressError| EmailError::BuildEmail(e.to_string()))?;
-
-        let email = Message::builder()
-            .from(self.from_mailbox.clone())
-            .to(to_mailbox)
-            .subject(subject)
-            .header(ContentType::TEXT_PLAIN)
-            .body(body.to_string())
-            .map_err(|e| EmailError::BuildEmail(e.to_string()))?;
-
-        self.mailer
-            .send(email)
+        self.send_email(to_email, subject, None, Some(body.to_string()))
             .await
-            .map_err(|e| EmailError::SendEmail(e.to_string()))?;
-
-        Ok(())
     }
 }
 
