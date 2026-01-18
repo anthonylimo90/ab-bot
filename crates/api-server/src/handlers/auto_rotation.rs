@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use auth::{AuditAction, Claims};
 
+use crate::auto_optimizer::AutoOptimizer;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -296,10 +297,11 @@ pub async fn acknowledge_entry(
     post,
     path = "/api/v1/auto-rotation/trigger",
     responses(
-        (status = 202, description = "Optimization triggered"),
+        (status = 200, description = "Optimization completed successfully"),
         (status = 400, description = "Auto-optimization not enabled"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not allowed to trigger optimization"),
+        (status = 500, description = "Optimization failed"),
     ),
     security(("bearer_auth" = [])),
     tag = "auto_rotation"
@@ -343,14 +345,26 @@ pub async fn trigger_optimization(
         ));
     }
 
-    // For now, just log the trigger. The actual optimization would be handled
-    // by the auto_optimizer background service.
-    // In a full implementation, this would send a message to a background queue.
+    tracing::info!(
+        workspace_id = %workspace_id,
+        triggered_by = %user_id,
+        "Manual optimization triggered"
+    );
 
-    // Audit log
+    // Run the optimization synchronously
+    let optimizer = AutoOptimizer::new(state.pool.clone());
+    optimizer
+        .optimize_workspace_by_id(workspace_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(workspace_id = %workspace_id, error = %e, "Optimization failed");
+            ApiError::Internal(format!("Optimization failed: {}", e))
+        })?;
+
+    // Audit log after successful optimization
     state.audit_logger.log_user_action(
         &claims.sub,
-        AuditAction::Custom("optimization_triggered".to_string()),
+        AuditAction::Custom("optimization_completed".to_string()),
         &workspace_id.to_string(),
         serde_json::json!({
             "triggered_by": &claims.sub,
@@ -361,9 +375,9 @@ pub async fn trigger_optimization(
     tracing::info!(
         workspace_id = %workspace_id,
         triggered_by = %user_id,
-        "Manual optimization triggered"
+        "Manual optimization completed"
     );
 
-    // Return 202 Accepted to indicate the optimization has been queued
-    Ok(StatusCode::ACCEPTED)
+    // Return 200 OK to indicate optimization completed successfully
+    Ok(StatusCode::OK)
 }
