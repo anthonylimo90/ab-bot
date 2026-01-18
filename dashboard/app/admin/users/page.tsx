@@ -14,13 +14,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import { Badge } from '@/components/ui/badge';
 import { useAuthStore } from '@/stores/auth-store';
 import api from '@/lib/api';
@@ -31,9 +24,7 @@ import {
   Pencil,
   Trash2,
   RefreshCw,
-  Shield,
   ShieldAlert,
-  Eye,
 } from 'lucide-react';
 
 export default function AdminUsersPage() {
@@ -47,7 +38,6 @@ export default function AdminUsersPage() {
     email: '',
     password: '',
     name: '',
-    role: 'Viewer' as UserRole,
   });
 
   const { data: users, isLoading, error, refetch } = useQuery({
@@ -61,7 +51,7 @@ export default function AdminUsersPage() {
         email: formData.email,
         password: formData.password,
         name: formData.name || undefined,
-        role: formData.role,
+        role: 'PlatformAdmin',
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'users'] });
@@ -74,7 +64,6 @@ export default function AdminUsersPage() {
     mutationFn: () =>
       api.updateUser(selectedUser!.id, {
         name: formData.name || undefined,
-        role: formData.role,
         password: formData.password || undefined,
       }),
     onSuccess: () => {
@@ -99,7 +88,6 @@ export default function AdminUsersPage() {
       email: '',
       password: '',
       name: '',
-      role: 'Viewer',
     });
   };
 
@@ -109,7 +97,6 @@ export default function AdminUsersPage() {
       email: user.email,
       password: '',
       name: user.name || '',
-      role: user.role,
     });
     setEditDialogOpen(true);
   };
@@ -120,25 +107,17 @@ export default function AdminUsersPage() {
   };
 
   const getRoleIcon = (role: UserRole) => {
-    switch (role) {
-      case 'PlatformAdmin':
-        return <ShieldAlert className="h-4 w-4 text-red-500" />;
-      case 'Trader':
-        return <Shield className="h-4 w-4 text-blue-500" />;
-      default:
-        return <Eye className="h-4 w-4 text-gray-500" />;
+    if (role === 'PlatformAdmin') {
+      return <ShieldAlert className="h-4 w-4 text-red-500" />;
     }
+    return <Users className="h-4 w-4 text-gray-500" />;
   };
 
   const getRoleBadgeVariant = (role: UserRole): 'default' | 'destructive' | 'secondary' => {
-    switch (role) {
-      case 'PlatformAdmin':
-        return 'destructive';
-      case 'Trader':
-        return 'default';
-      default:
-        return 'secondary';
+    if (role === 'PlatformAdmin') {
+      return 'destructive';
     }
+    return 'secondary';
   };
 
   return (
@@ -157,13 +136,13 @@ export default function AdminUsersPage() {
           </Button>
           <Button onClick={() => setCreateDialogOpen(true)}>
             <Plus className="mr-2 h-4 w-4" />
-            Add User
+            Add Admin
           </Button>
         </div>
       </div>
 
       {/* Stats */}
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">Total Users</CardTitle>
@@ -175,34 +154,12 @@ export default function AdminUsersPage() {
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Admins</CardTitle>
+            <CardTitle className="text-sm font-medium">Platform Admins</CardTitle>
             <ShieldAlert className="h-4 w-4 text-red-500" />
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
               {users?.filter((u) => u.role === 'PlatformAdmin').length ?? 0}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Traders</CardTitle>
-            <Shield className="h-4 w-4 text-blue-500" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {users?.filter((u) => u.role === 'Trader').length ?? 0}
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Viewers</CardTitle>
-            <Eye className="h-4 w-4 text-gray-500" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {users?.filter((u) => u.role === 'Viewer').length ?? 0}
             </div>
           </CardContent>
         </Card>
@@ -287,13 +244,13 @@ export default function AdminUsersPage() {
         </CardContent>
       </Card>
 
-      {/* Create User Dialog */}
+      {/* Create Platform Admin Dialog */}
       <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Create New User</DialogTitle>
+            <DialogTitle>Create Platform Admin</DialogTitle>
             <DialogDescription>
-              Add a new user to the platform
+              Add a new platform administrator
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -302,7 +259,7 @@ export default function AdminUsersPage() {
               <Input
                 id="create-email"
                 type="email"
-                placeholder="user@example.com"
+                placeholder="admin@example.com"
                 value={formData.email}
                 onChange={(e) => setFormData({ ...formData, email: e.target.value })}
               />
@@ -326,22 +283,6 @@ export default function AdminUsersPage() {
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               />
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="create-role">Role</Label>
-              <Select
-                value={formData.role}
-                onValueChange={(value) => setFormData({ ...formData, role: value as UserRole })}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select role" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Viewer">Viewer (read-only)</SelectItem>
-                  <SelectItem value="Trader">Trader (can execute trades)</SelectItem>
-                  <SelectItem value="PlatformAdmin">Platform Admin (full access)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateDialogOpen(false)}>
@@ -351,7 +292,7 @@ export default function AdminUsersPage() {
               onClick={() => createMutation.mutate()}
               disabled={createMutation.isPending || !formData.email || !formData.password}
             >
-              {createMutation.isPending ? 'Creating...' : 'Create User'}
+              {createMutation.isPending ? 'Creating...' : 'Create Admin'}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -363,7 +304,7 @@ export default function AdminUsersPage() {
           <DialogHeader>
             <DialogTitle>Edit User</DialogTitle>
             <DialogDescription>
-              Update user {selectedUser?.email}
+              Update name or password for {selectedUser?.email}. Role changes are managed at the workspace level.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
@@ -375,22 +316,6 @@ export default function AdminUsersPage() {
                 value={formData.name}
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
               />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="edit-role">Role</Label>
-              <Select
-                value={formData.role}
-                onValueChange={(value) => setFormData({ ...formData, role: value as UserRole })}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select role" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="Viewer">Viewer (read-only)</SelectItem>
-                  <SelectItem value="Trader">Trader (can execute trades)</SelectItem>
-                  <SelectItem value="PlatformAdmin">Platform Admin (full access)</SelectItem>
-                </SelectContent>
-              </Select>
             </div>
             <div className="space-y-2">
               <Label htmlFor="edit-password">New Password (leave blank to keep current)</Label>
