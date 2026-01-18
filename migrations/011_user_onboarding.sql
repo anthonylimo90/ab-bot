@@ -39,8 +39,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     CONSTRAINT valid_setup_mode CHECK (setup_mode IN ('manual', 'automatic'))
 );
 
-CREATE INDEX idx_workspaces_created_by ON workspaces(created_by);
-CREATE INDEX idx_workspaces_name ON workspaces(name);
+CREATE INDEX IF NOT EXISTS idx_workspaces_created_by ON workspaces(created_by);
+CREATE INDEX IF NOT EXISTS idx_workspaces_name ON workspaces(name);
 
 -- ===================
 -- Workspace Members Table
@@ -60,8 +60,8 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     CONSTRAINT valid_workspace_role CHECK (role IN ('owner', 'admin', 'member', 'viewer'))
 );
 
-CREATE INDEX idx_workspace_members_user ON workspace_members(user_id);
-CREATE INDEX idx_workspace_members_workspace ON workspace_members(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_members_workspace ON workspace_members(workspace_id);
 
 -- ===================
 -- User Settings Table
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_user_settings_workspace ON user_settings(default_workspace_id);
+CREATE INDEX IF NOT EXISTS idx_user_settings_workspace ON user_settings(default_workspace_id);
 
 -- ===================
 -- Workspace Wallet Allocations Table
@@ -127,9 +127,9 @@ CREATE TABLE IF NOT EXISTS workspace_wallet_allocations (
     CONSTRAINT valid_copy_behavior CHECK (copy_behavior IN ('copy_all', 'events_only', 'arb_threshold'))
 );
 
-CREATE INDEX idx_workspace_allocations_workspace ON workspace_wallet_allocations(workspace_id);
-CREATE INDEX idx_workspace_allocations_tier ON workspace_wallet_allocations(tier);
-CREATE INDEX idx_workspace_allocations_wallet ON workspace_wallet_allocations(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_workspace_allocations_workspace ON workspace_wallet_allocations(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_allocations_tier ON workspace_wallet_allocations(tier);
+CREATE INDEX IF NOT EXISTS idx_workspace_allocations_wallet ON workspace_wallet_allocations(wallet_address);
 
 -- ===================
 -- Workspace Invites Table
@@ -159,10 +159,10 @@ CREATE TABLE IF NOT EXISTS workspace_invites (
     CONSTRAINT valid_invite_role CHECK (role IN ('admin', 'member', 'viewer'))
 );
 
-CREATE INDEX idx_workspace_invites_workspace ON workspace_invites(workspace_id);
-CREATE INDEX idx_workspace_invites_email ON workspace_invites(email);
-CREATE INDEX idx_workspace_invites_token ON workspace_invites(token_hash);
-CREATE INDEX idx_workspace_invites_expires ON workspace_invites(expires_at);
+CREATE INDEX IF NOT EXISTS idx_workspace_invites_workspace ON workspace_invites(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_invites_email ON workspace_invites(email);
+CREATE INDEX IF NOT EXISTS idx_workspace_invites_token ON workspace_invites(token_hash);
+CREATE INDEX IF NOT EXISTS idx_workspace_invites_expires ON workspace_invites(expires_at);
 
 -- ===================
 -- Auto Rotation History Table
@@ -198,24 +198,27 @@ CREATE TABLE IF NOT EXISTS auto_rotation_history (
     CONSTRAINT valid_action CHECK (action IN ('promote', 'demote', 'replace', 'add', 'remove'))
 );
 
-CREATE INDEX idx_rotation_history_workspace ON auto_rotation_history(workspace_id);
-CREATE INDEX idx_rotation_history_created ON auto_rotation_history(created_at DESC);
-CREATE INDEX idx_rotation_history_acknowledged ON auto_rotation_history(acknowledged) WHERE NOT acknowledged;
+CREATE INDEX IF NOT EXISTS idx_rotation_history_workspace ON auto_rotation_history(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_rotation_history_created ON auto_rotation_history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rotation_history_acknowledged ON auto_rotation_history(acknowledged) WHERE NOT acknowledged;
 
 -- ===================
 -- Update Triggers
 -- ===================
 
+DROP TRIGGER IF EXISTS update_workspaces_updated_at ON workspaces;
 CREATE TRIGGER update_workspaces_updated_at
     BEFORE UPDATE ON workspaces
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_user_settings_updated_at ON user_settings;
 CREATE TRIGGER update_user_settings_updated_at
     BEFORE UPDATE ON user_settings
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_workspace_allocations_updated_at ON workspace_wallet_allocations;
 CREATE TRIGGER update_workspace_allocations_updated_at
     BEFORE UPDATE ON workspace_wallet_allocations
     FOR EACH ROW
@@ -246,6 +249,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS enforce_active_wallet_limit ON workspace_wallet_allocations;
 CREATE TRIGGER enforce_active_wallet_limit
     BEFORE INSERT OR UPDATE ON workspace_wallet_allocations
     FOR EACH ROW

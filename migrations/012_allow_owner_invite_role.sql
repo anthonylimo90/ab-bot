@@ -2,7 +2,7 @@
 -- where the owner doesn't have an account yet
 
 ALTER TABLE workspace_invites
-DROP CONSTRAINT valid_invite_role;
+DROP CONSTRAINT IF EXISTS valid_invite_role;
 
 ALTER TABLE workspace_invites
 ADD CONSTRAINT valid_invite_role CHECK (role IN ('owner', 'admin', 'member', 'viewer'));

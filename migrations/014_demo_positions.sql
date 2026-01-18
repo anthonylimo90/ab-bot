@@ -1,7 +1,7 @@
 -- Demo positions table for workspace-scoped demo trading
 -- These positions are visible to all workspace members
 
-CREATE TABLE demo_positions (
+CREATE TABLE IF NOT EXISTS demo_positions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     created_by UUID NOT NULL REFERENCES users(id),
@@ -22,16 +22,16 @@ CREATE TABLE demo_positions (
 );
 
 -- Index for fetching positions by workspace
-CREATE INDEX idx_demo_positions_workspace ON demo_positions(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_demo_positions_workspace ON demo_positions(workspace_id);
 
 -- Index for fetching open positions by workspace (common query)
-CREATE INDEX idx_demo_positions_open ON demo_positions(workspace_id) WHERE closed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_demo_positions_open ON demo_positions(workspace_id) WHERE closed_at IS NULL;
 
 -- Index for fetching closed positions by workspace
-CREATE INDEX idx_demo_positions_closed ON demo_positions(workspace_id) WHERE closed_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_demo_positions_closed ON demo_positions(workspace_id) WHERE closed_at IS NOT NULL;
 
 -- Demo balance table for workspace-scoped demo balances
-CREATE TABLE demo_balances (
+CREATE TABLE IF NOT EXISTS demo_balances (
     workspace_id UUID PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
     balance NUMERIC(20, 8) NOT NULL DEFAULT 10000,
     initial_balance NUMERIC(20, 8) NOT NULL DEFAULT 10000,
