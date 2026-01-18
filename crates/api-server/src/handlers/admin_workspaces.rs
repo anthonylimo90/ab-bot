@@ -277,7 +277,7 @@ pub async fn create_workspace(
     .await?;
 
     // If owner exists, add them directly; otherwise create an invite
-    let invite_token = if let Some((owner_id,)) = owner {
+    if let Some((owner_id,)) = owner {
         // Add owner as workspace member
         sqlx::query(
             r#"
@@ -307,9 +307,18 @@ pub async fn create_workspace(
         .execute(&mut *tx)
         .await?;
 
-        None
+        // Commit transaction - owner exists and is added
+        tx.commit().await?;
     } else {
-        // Owner doesn't exist - create an invite with owner role
+        // Owner doesn't exist - we must be able to send them an invite
+        // Check if email is configured first
+        let email_client = state.email_client.as_ref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "Cannot invite non-existent user: email is not configured. Please use an existing user's email.".into()
+            )
+        })?;
+
+        // Create invite record
         let token = generate_invite_token();
         let token_hash = hash_token(&token);
         let expires_at = Utc::now() + Duration::days(7);
@@ -331,41 +340,37 @@ pub async fn create_workspace(
         .execute(&mut *tx)
         .await?;
 
-        Some(token)
-    };
+        // Try to send the invite email BEFORE committing
+        let invite_link = format!(
+            "{}/invite/{}",
+            std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "http://localhost:3002".to_string()),
+            token
+        );
 
-    tx.commit().await?;
+        let subject = format!("You've been invited to own {} on AB-Bot", req.name);
+        let body = format!(
+            "You've been invited to be the owner of the workspace '{}'.\n\n\
+            Click the link below to accept and create your account:\n{}\n\n\
+            This invite expires in 7 days.",
+            req.name, invite_link
+        );
 
-    // Send invite email if owner doesn't exist
-    if let Some(ref token) = invite_token {
-        if let Some(email_client) = &state.email_client {
-            let invite_link = format!(
-                "{}/invite/{}",
-                std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "http://localhost:3002".to_string()),
-                token
-            );
+        // Send email - if it fails, rollback the transaction
+        email_client
+            .send_simple(&req.owner_email, &subject, &body)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, email = %req.owner_email, "Failed to send workspace owner invite email");
+                ApiError::Internal(format!(
+                    "Failed to send invite email to '{}'. Please try again or use an existing user's email.",
+                    req.owner_email
+                ))
+            })?;
 
-            let subject = format!("You've been invited to own {} on AB-Bot", req.name);
-            let body = format!(
-                "You've been invited to be the owner of the workspace '{}'.\n\n\
-                Click the link below to accept and create your account:\n{}\n\n\
-                This invite expires in 7 days.",
-                req.name, invite_link
-            );
+        // Email sent successfully - now commit the transaction
+        tx.commit().await?;
 
-            if let Err(e) = email_client.send_simple(&req.owner_email, &subject, &body).await {
-                tracing::error!(error = %e, "Failed to send workspace owner invite email");
-            } else {
-                tracing::info!(email = %req.owner_email, workspace = %req.name, "Workspace owner invite email sent");
-            }
-        } else {
-            tracing::info!(
-                token = %token,
-                email = %req.owner_email,
-                workspace = %req.name,
-                "Workspace created with owner invite (email not configured)"
-            );
-        }
+        tracing::info!(email = %req.owner_email, workspace = %req.name, "Workspace owner invite email sent");
     }
 
     // Audit log
@@ -377,7 +382,7 @@ pub async fn create_workspace(
     .details(serde_json::json!({
         "name": &req.name,
         "owner_email": &req.owner_email,
-        "owner_invited": invite_token.is_some(),
+        "owner_invited": owner.is_none(),
         "created_by_admin": &claims.sub
     }))
     .build();
