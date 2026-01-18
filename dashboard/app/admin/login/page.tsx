@@ -34,7 +34,7 @@ export default function AdminLoginPage() {
       const response = await api.login(data.email, data.password);
 
       // Verify user is an admin
-      if (response.user.role !== 'Admin') {
+      if (response.user.role !== 'PlatformAdmin') {
         addToast({
           type: 'error',
           title: 'Access Denied',

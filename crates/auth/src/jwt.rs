@@ -6,28 +6,29 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// User roles for authorization.
+/// Platform-level user roles for authorization.
+/// Note: This is distinct from WorkspaceRole which controls per-workspace access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
 pub enum UserRole {
     /// Read-only access to dashboards and data.
     #[default]
     Viewer,
     /// Can execute trades and manage positions.
     Trader,
-    /// Full access including configuration.
-    Admin,
+    /// Platform administrator - manages workspaces and users platform-wide.
+    /// Cannot access trading dashboard (uses separate admin portal).
+    PlatformAdmin,
 }
 
 impl UserRole {
     /// Check if this role can execute trades.
     pub fn can_trade(&self) -> bool {
-        matches!(self, UserRole::Trader | UserRole::Admin)
+        matches!(self, UserRole::Trader | UserRole::PlatformAdmin)
     }
 
     /// Check if this role can modify configuration.
     pub fn can_configure(&self) -> bool {
-        matches!(self, UserRole::Admin)
+        matches!(self, UserRole::PlatformAdmin)
     }
 
     /// Check if this role can view data.
@@ -180,7 +181,7 @@ impl JwtAuth {
         let has_permission = match required_role {
             UserRole::Viewer => true, // All roles have viewer permissions
             UserRole::Trader => claims.role.can_trade(),
-            UserRole::Admin => claims.role.can_configure(),
+            UserRole::PlatformAdmin => claims.role.can_configure(),
         };
 
         Ok(has_permission)
@@ -213,9 +214,9 @@ mod tests {
 
     #[test]
     fn test_role_permissions() {
-        assert!(UserRole::Admin.can_trade());
-        assert!(UserRole::Admin.can_configure());
-        assert!(UserRole::Admin.can_view());
+        assert!(UserRole::PlatformAdmin.can_trade());
+        assert!(UserRole::PlatformAdmin.can_configure());
+        assert!(UserRole::PlatformAdmin.can_view());
 
         assert!(UserRole::Trader.can_trade());
         assert!(!UserRole::Trader.can_configure());
@@ -230,7 +231,7 @@ mod tests {
     fn test_check_permission() {
         let auth = create_test_auth();
 
-        let admin_token = auth.create_token("admin", UserRole::Admin).unwrap();
+        let admin_token = auth.create_token("admin", UserRole::PlatformAdmin).unwrap();
         let trader_token = auth.create_token("trader", UserRole::Trader).unwrap();
         let viewer_token = auth.create_token("viewer", UserRole::Viewer).unwrap();
 
@@ -242,7 +243,7 @@ mod tests {
             .check_permission(&admin_token, UserRole::Trader)
             .unwrap());
         assert!(auth
-            .check_permission(&admin_token, UserRole::Admin)
+            .check_permission(&admin_token, UserRole::PlatformAdmin)
             .unwrap());
 
         // Trader can trade and view
@@ -253,7 +254,7 @@ mod tests {
             .check_permission(&trader_token, UserRole::Trader)
             .unwrap());
         assert!(!auth
-            .check_permission(&trader_token, UserRole::Admin)
+            .check_permission(&trader_token, UserRole::PlatformAdmin)
             .unwrap());
 
         // Viewer can only view
@@ -264,7 +265,7 @@ mod tests {
             .check_permission(&viewer_token, UserRole::Trader)
             .unwrap());
         assert!(!auth
-            .check_permission(&viewer_token, UserRole::Admin)
+            .check_permission(&viewer_token, UserRole::PlatformAdmin)
             .unwrap());
     }
 

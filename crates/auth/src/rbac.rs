@@ -295,9 +295,9 @@ impl DefaultRoles {
         role
     }
 
-    /// Create the Admin role.
-    pub fn admin() -> Role {
-        let mut role = Role::new("admin", "Full access including configuration").as_system_role();
+    /// Create the Platform Admin role.
+    pub fn platform_admin() -> Role {
+        let mut role = Role::new("platform_admin", "Platform administrator - manages workspaces and users").as_system_role();
 
         role.inherit_from("trader");
 
@@ -348,7 +348,7 @@ impl DefaultRoles {
         vec![
             Self::viewer(),
             Self::trader(),
-            Self::admin(),
+            Self::platform_admin(),
             Self::copy_trader(),
             Self::risk_manager(),
         ]
@@ -561,8 +561,8 @@ mod tests {
         let trader = DefaultRoles::trader();
         assert!(trader.inherits.contains(&"viewer".to_string()));
 
-        let admin = DefaultRoles::admin();
-        assert!(admin.permissions.iter().any(|p| p.action == Action::All));
+        let platform_admin = DefaultRoles::platform_admin();
+        assert!(platform_admin.permissions.iter().any(|p| p.action == Action::All));
     }
 
     #[tokio::test]
@@ -608,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn test_role_inheritance() {
         let manager = RbacManager::new();
-        manager.assign_role("admin_user", "admin").await.unwrap();
+        manager.assign_role("admin_user", "platform_admin").await.unwrap();
 
         // Admin should have viewer and trader permissions through inheritance
         assert!(

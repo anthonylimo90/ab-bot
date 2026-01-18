@@ -121,7 +121,7 @@ export default function AdminUsersPage() {
 
   const getRoleIcon = (role: UserRole) => {
     switch (role) {
-      case 'Admin':
+      case 'PlatformAdmin':
         return <ShieldAlert className="h-4 w-4 text-red-500" />;
       case 'Trader':
         return <Shield className="h-4 w-4 text-blue-500" />;
@@ -132,7 +132,7 @@ export default function AdminUsersPage() {
 
   const getRoleBadgeVariant = (role: UserRole): 'default' | 'destructive' | 'secondary' => {
     switch (role) {
-      case 'Admin':
+      case 'PlatformAdmin':
         return 'destructive';
       case 'Trader':
         return 'default';
@@ -180,7 +180,7 @@ export default function AdminUsersPage() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {users?.filter((u) => u.role === 'Admin').length ?? 0}
+              {users?.filter((u) => u.role === 'PlatformAdmin').length ?? 0}
             </div>
           </CardContent>
         </Card>
@@ -338,7 +338,7 @@ export default function AdminUsersPage() {
                 <SelectContent>
                   <SelectItem value="Viewer">Viewer (read-only)</SelectItem>
                   <SelectItem value="Trader">Trader (can execute trades)</SelectItem>
-                  <SelectItem value="Admin">Admin (full access)</SelectItem>
+                  <SelectItem value="PlatformAdmin">Platform Admin (full access)</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -388,7 +388,7 @@ export default function AdminUsersPage() {
                 <SelectContent>
                   <SelectItem value="Viewer">Viewer (read-only)</SelectItem>
                   <SelectItem value="Trader">Trader (can execute trades)</SelectItem>
-                  <SelectItem value="Admin">Admin (full access)</SelectItem>
+                  <SelectItem value="PlatformAdmin">Platform Admin (full access)</SelectItem>
                 </SelectContent>
               </Select>
             </div>

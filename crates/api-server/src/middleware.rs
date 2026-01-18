@@ -62,7 +62,7 @@ pub async fn require_auth(
     let rbac_role = match claims.role {
         UserRole::Viewer => "viewer",
         UserRole::Trader => "trader",
-        UserRole::Admin => "admin",
+        UserRole::PlatformAdmin => "platform_admin",
     };
 
     // Assign the role to the user in RBAC (idempotent operation)

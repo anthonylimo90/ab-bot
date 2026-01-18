@@ -64,7 +64,7 @@ export const useAuthStore = create<AuthStore>()(
 
       isPlatformAdmin: () => {
         const { user } = get();
-        return user?.role === 'Admin';
+        return user?.role === 'PlatformAdmin';
       },
     }),
     {

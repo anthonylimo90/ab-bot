@@ -27,7 +27,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
   const isAdminRoute = pathname.startsWith(ADMIN_ROUTE_PREFIX);
   const isAdminLoginRoute = pathname === '/admin/login';
   const isUserLoginRoute = pathname === '/login';
-  const isPlatformAdmin = user?.role === 'Admin';
+  const isPlatformAdmin = user?.role === 'PlatformAdmin';
 
   // Track client-side mount
   useEffect(() => {

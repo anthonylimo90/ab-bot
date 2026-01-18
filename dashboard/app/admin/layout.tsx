@@ -19,7 +19,7 @@ export default function AdminLayout({ children }: AdminLayoutProps) {
 
   // Redirect non-admin users (must be called before any early returns to satisfy React hooks rules)
   useEffect(() => {
-    if (!isAdminLoginRoute && !isLoading && isAuthenticated && user?.role !== 'Admin') {
+    if (!isAdminLoginRoute && !isLoading && isAuthenticated && user?.role !== 'PlatformAdmin') {
       router.push('/');
     }
   }, [isAdminLoginRoute, isLoading, isAuthenticated, user, router]);
@@ -42,7 +42,7 @@ export default function AdminLayout({ children }: AdminLayoutProps) {
   }
 
   // Don't render for non-admin users
-  if (!isAuthenticated || user?.role !== 'Admin') {
+  if (!isAuthenticated || user?.role !== 'PlatformAdmin') {
     return null;
   }
 

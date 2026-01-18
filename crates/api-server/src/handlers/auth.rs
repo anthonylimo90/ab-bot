@@ -115,7 +115,7 @@ impl UserRow {
         match self.role {
             0 => "Viewer".to_string(),
             1 => "Trader".to_string(),
-            2 => "Admin".to_string(),
+            2 => "PlatformAdmin".to_string(),
             _ => "Viewer".to_string(),
         }
     }
@@ -124,7 +124,7 @@ impl UserRow {
         match self.role {
             0 => UserRole::Viewer,
             1 => UserRole::Trader,
-            2 => UserRole::Admin,
+            2 => UserRole::PlatformAdmin,
             _ => UserRole::Viewer,
         }
     }

@@ -530,8 +530,8 @@ async fn test_default_roles() {
 
     let rbac = RbacManager::new();
 
-    // Assign built-in admin role
-    rbac.assign_role("admin_user", "admin").await.unwrap();
+    // Assign built-in platform_admin role
+    rbac.assign_role("admin_user", "platform_admin").await.unwrap();
 
     // Admin should have all permissions
     assert!(

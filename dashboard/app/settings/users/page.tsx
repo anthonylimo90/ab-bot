@@ -58,7 +58,7 @@ export default function UsersPage() {
 
   // Check if current user is admin
   useEffect(() => {
-    if (currentUser && currentUser.role !== 'Admin') {
+    if (currentUser && currentUser.role !== 'PlatformAdmin') {
       toast.error('Access Denied', 'Only administrators can access user management');
       router.push('/settings');
     }
@@ -66,7 +66,7 @@ export default function UsersPage() {
 
   // Load users
   useEffect(() => {
-    if (currentUser?.role === 'Admin') {
+    if (currentUser?.role === 'PlatformAdmin') {
       loadUsers();
     }
   }, [currentUser]);
@@ -179,7 +179,7 @@ export default function UsersPage() {
 
   const getRoleIcon = (role: UserRole) => {
     switch (role) {
-      case 'Admin':
+      case 'PlatformAdmin':
         return <ShieldAlert className="h-4 w-4 text-red-500" />;
       case 'Trader':
         return <Shield className="h-4 w-4 text-blue-500" />;
@@ -190,7 +190,7 @@ export default function UsersPage() {
 
   const getRoleBadgeClass = (role: UserRole) => {
     switch (role) {
-      case 'Admin':
+      case 'PlatformAdmin':
         return 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200';
       case 'Trader':
         return 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200';
@@ -200,7 +200,7 @@ export default function UsersPage() {
   };
 
   // Don't render if not admin
-  if (currentUser?.role !== 'Admin') {
+  if (currentUser?.role !== 'PlatformAdmin') {
     return null;
   }
 
@@ -354,7 +354,7 @@ export default function UsersPage() {
                 <SelectContent>
                   <SelectItem value="Viewer">Viewer (read-only)</SelectItem>
                   <SelectItem value="Trader">Trader (can execute trades)</SelectItem>
-                  <SelectItem value="Admin">Admin (full access)</SelectItem>
+                  <SelectItem value="PlatformAdmin">Platform Admin (full access)</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -408,7 +408,7 @@ export default function UsersPage() {
                 <SelectContent>
                   <SelectItem value="Viewer">Viewer (read-only)</SelectItem>
                   <SelectItem value="Trader">Trader (can execute trades)</SelectItem>
-                  <SelectItem value="Admin">Admin (full access)</SelectItem>
+                  <SelectItem value="PlatformAdmin">Platform Admin (full access)</SelectItem>
                 </SelectContent>
               </Select>
             </div>

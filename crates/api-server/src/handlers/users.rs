@@ -87,7 +87,7 @@ impl UserRow {
         match self.role {
             0 => "Viewer".to_string(),
             1 => "Trader".to_string(),
-            2 => "Admin".to_string(),
+            2 => "PlatformAdmin".to_string(),
             _ => "Viewer".to_string(),
         }
     }
@@ -97,9 +97,9 @@ fn parse_role(role: &str) -> Result<i16, ApiError> {
     match role.to_lowercase().as_str() {
         "viewer" => Ok(0),
         "trader" => Ok(1),
-        "admin" => Ok(2),
+        "platformadmin" => Ok(2),
         _ => Err(ApiError::BadRequest(format!(
-            "Invalid role '{}'. Must be 'Viewer', 'Trader', or 'Admin'",
+            "Invalid role '{}'. Must be 'Viewer', 'Trader', or 'PlatformAdmin'",
             role
         ))),
     }

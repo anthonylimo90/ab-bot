@@ -36,7 +36,7 @@ export default function LoginPage() {
       const response = await api.login(data.email, data.password);
 
       // Block admin users from using regular login
-      if (response.user.role === 'Admin') {
+      if (response.user.role === 'PlatformAdmin') {
         addToast({
           type: 'error',
           title: 'Access Denied',

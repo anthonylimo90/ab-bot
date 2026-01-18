@@ -1,5 +1,6 @@
 // Auth types
-export type UserRole = 'Viewer' | 'Trader' | 'Admin';
+// Platform-level roles (distinct from WorkspaceRole which controls per-workspace access)
+export type UserRole = 'Viewer' | 'Trader' | 'PlatformAdmin';
 
 export interface User {
   id: string;
