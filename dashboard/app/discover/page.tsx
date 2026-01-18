@@ -40,15 +40,15 @@ function toDisplayWallet(w: DiscoveredWallet, rank: number): DisplayWallet {
   return {
     address: w.address,
     rank,
-    roi30d: w.roi_30d,
-    roi7d: w.roi_7d,
-    roi90d: w.roi_90d,
-    sharpe: w.sharpe_ratio,
-    trades: w.total_trades,
-    winRate: w.win_rate,
-    maxDrawdown: w.max_drawdown,
+    roi30d: Number(w.roi_30d) || 0,
+    roi7d: Number(w.roi_7d) || 0,
+    roi90d: Number(w.roi_90d) || 0,
+    sharpe: Number(w.sharpe_ratio) || 0,
+    trades: Number(w.total_trades) || 0,
+    winRate: Number(w.win_rate) || 0,
+    maxDrawdown: Number(w.max_drawdown) || 0,
     prediction: w.prediction,
-    confidence: w.confidence,
+    confidence: Number(w.confidence) || 0,
     tracked: w.is_tracked,
   };
 }

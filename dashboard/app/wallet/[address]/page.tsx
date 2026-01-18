@@ -437,7 +437,7 @@ export default function WalletDetailPage() {
                           {trade.direction}
                         </span>
                       </td>
-                      <td className="p-4 text-right tabular-nums">${trade.price.toFixed(2)}</td>
+                      <td className="p-4 text-right tabular-nums">${Number(trade.price).toFixed(2)}</td>
                       <td className="p-4 text-right tabular-nums">{formatCurrency(trade.value)}</td>
                       <td className="p-4 text-right text-muted-foreground text-sm">
                         {new Date(trade.timestamp).toLocaleTimeString()}
