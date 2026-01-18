@@ -25,9 +25,9 @@ CREATE TABLE IF NOT EXISTS workspace_wallet_bans (
     UNIQUE(workspace_id, wallet_address)
 );
 
-CREATE INDEX idx_wallet_bans_workspace ON workspace_wallet_bans(workspace_id);
-CREATE INDEX idx_wallet_bans_wallet ON workspace_wallet_bans(wallet_address);
-CREATE INDEX idx_wallet_bans_expires ON workspace_wallet_bans(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_wallet_bans_workspace ON workspace_wallet_bans(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_bans_wallet ON workspace_wallet_bans(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_wallet_bans_expires ON workspace_wallet_bans(expires_at) WHERE expires_at IS NOT NULL;
 
 -- ===================
 -- Extend Workspace Wallet Allocations
@@ -185,6 +185,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS enforce_pinned_wallet_limit ON workspace_wallet_allocations;
 CREATE TRIGGER enforce_pinned_wallet_limit
     BEFORE INSERT OR UPDATE ON workspace_wallet_allocations
     FOR EACH ROW
