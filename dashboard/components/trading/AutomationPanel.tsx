@@ -238,7 +238,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
 
             <div className="pt-4 border-t border-border/50">
               <div className="text-xs text-muted-foreground mb-2">Thresholds</div>
-              <div className="grid grid-cols-2 gap-3 text-sm">
+              <div className="space-y-2 text-sm">
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Probation Period</span>
                   <span>{settings.probation_days} days</span>
@@ -247,10 +247,10 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                   <span className="text-muted-foreground">Max Pins</span>
                   <span>{settings.max_pinned_wallets}</span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex justify-between items-center">
                   <span className="text-muted-foreground">Strategy</span>
-                  <Badge variant="outline" className="text-xs">
-                    {settings.allocation_strategy.replace('_', ' ')}
+                  <Badge variant="outline" className="text-xs capitalize">
+                    {settings.allocation_strategy.replace(/_/g, ' ')}
                   </Badge>
                 </div>
               </div>
