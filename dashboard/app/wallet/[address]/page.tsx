@@ -21,11 +21,12 @@ import {
   CheckCircle,
   ChevronUp,
   ChevronDown,
-  Settings,
   Zap,
   Activity,
   AlertCircle,
 } from 'lucide-react';
+import { WalletAllocationSection } from '@/components/trading/WalletAllocationSection';
+import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import type { TradingStyle, DecisionBrief, TradeClassification } from '@/types/api';
 
 const tradingStyleLabels: Record<TradingStyle, string> = {
@@ -51,6 +52,7 @@ export default function WalletDetailPage() {
   const address = params.address as string;
   const toast = useToastStore();
   const { activeWallets, benchWallets, promoteToActive, demoteToBench, isRosterFull } = useRosterStore();
+  const { balance, positions } = useDemoPortfolioStore();
 
   // Fetch wallet data from API
   const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(address);
@@ -109,6 +111,13 @@ export default function WalletDetailPage() {
   }, [storedWallet, apiWallet, walletMetrics, address]);
 
   const decisionBrief = storedWallet?.decisionBrief as DecisionBrief | undefined;
+
+  // Calculate positions value for this wallet
+  const walletPositionsValue = useMemo(() => {
+    return positions
+      .filter((p) => p.walletAddress?.toLowerCase() === address?.toLowerCase())
+      .reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+  }, [positions, address]);
 
   const isActive = activeWallets.some((w) => w.address.toLowerCase() === address?.toLowerCase());
   const isBench = benchWallets.some((w) => w.address.toLowerCase() === address?.toLowerCase());
@@ -184,9 +193,6 @@ export default function WalletDetailPage() {
               Promote
             </Button>
           )}
-          <Button variant="outline" size="icon">
-            <Settings className="h-4 w-4" />
-          </Button>
         </div>
       </div>
 
@@ -270,6 +276,16 @@ export default function WalletDetailPage() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Allocation Section - Only show for active wallets */}
+      {isActive && (
+        <WalletAllocationSection
+          walletAddress={address}
+          totalBalance={balance}
+          positionsValue={walletPositionsValue}
+          isDemo={true}
+        />
+      )}
 
       {/* Decision Brief - Only show if data is available */}
       {decisionBrief && (

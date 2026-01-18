@@ -15,11 +15,33 @@ export default function BacktestPage() {
   const { activeWallets, benchWallets } = useRosterStore();
   const { results, history, isRunning, error, runBacktest, loadHistory, loadResult } = useBacktest();
 
+  // Date helpers
+  const formatDate = (date: Date) => date.toISOString().split('T')[0];
+  const today = useMemo(() => new Date(), []);
+  const getDateDaysAgo = (days: number) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - days);
+    return date;
+  };
+
   // Form state
   const [capital, setCapital] = useState(1000);
-  const [startDate, setStartDate] = useState('2024-01-01');
-  const [endDate, setEndDate] = useState('2024-12-31');
+  const [startDate, setStartDate] = useState(() => formatDate(getDateDaysAgo(30)));
+  const [endDate, setEndDate] = useState(() => formatDate(today));
   const [slippage, setSlippage] = useState(0.1);
+
+  // Date presets
+  const datePresets = useMemo(() => [
+    { label: '7D', days: 7 },
+    { label: '30D', days: 30 },
+    { label: '90D', days: 90 },
+    { label: 'YTD', days: Math.ceil((today.getTime() - new Date(today.getFullYear(), 0, 1).getTime()) / (1000 * 60 * 60 * 24)) },
+  ], [today]);
+
+  const applyDatePreset = (days: number) => {
+    setStartDate(formatDate(getDateDaysAgo(days)));
+    setEndDate(formatDate(today));
+  };
   const [fees, setFees] = useState(0.1);
   const [selectedWallets, setSelectedWallets] = useState<string[]>([]);
 
@@ -112,7 +134,22 @@ export default function BacktestPage() {
               </div>
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">Period</label>
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Period</label>
+                <div className="flex gap-1">
+                  {datePresets.map((preset) => (
+                    <Button
+                      key={preset.label}
+                      variant="ghost"
+                      size="sm"
+                      className="h-6 px-2 text-xs"
+                      onClick={() => applyDatePreset(preset.days)}
+                    >
+                      {preset.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
               <div className="flex gap-2">
                 <input
                   type="date"

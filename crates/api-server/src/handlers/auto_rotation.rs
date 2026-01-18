@@ -1,7 +1,6 @@
 //! Auto-rotation history handlers.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -292,12 +291,30 @@ pub async fn acknowledge_entry(
     }))
 }
 
+/// Optimization result response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OptimizationResultResponse {
+    pub candidates_found: i32,
+    pub wallets_promoted: i32,
+    pub thresholds: OptimizationThresholds,
+    pub message: String,
+}
+
+/// Thresholds used for optimization.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OptimizationThresholds {
+    pub min_roi_30d: Option<f64>,
+    pub min_sharpe: Option<f64>,
+    pub min_win_rate: Option<f64>,
+    pub min_trades_30d: Option<i32>,
+}
+
 /// Manually trigger auto-optimization (owner/admin only).
 #[utoipa::path(
     post,
     path = "/api/v1/auto-rotation/trigger",
     responses(
-        (status = 200, description = "Optimization completed successfully"),
+        (status = 200, description = "Optimization completed successfully", body = OptimizationResultResponse),
         (status = 400, description = "Auto-optimization not enabled"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not allowed to trigger optimization"),
@@ -309,7 +326,7 @@ pub async fn acknowledge_entry(
 pub async fn trigger_optimization(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Json<OptimizationResultResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
 
@@ -328,15 +345,33 @@ pub async fn trigger_optimization(
         ));
     }
 
-    // Check if auto-optimization is enabled (either old or new automation flags)
-    let settings: Option<(bool, bool, bool)> =
-        sqlx::query_as("SELECT auto_optimize_enabled, auto_select_enabled, auto_demote_enabled FROM workspaces WHERE id = $1")
-            .bind(workspace_id)
-            .fetch_optional(&state.pool)
-            .await?;
+    // Check if auto-optimization is enabled and get thresholds
+    let settings: Option<(
+        bool,
+        bool,
+        bool,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+        Option<rust_decimal::Decimal>,
+        Option<i32>,
+    )> = sqlx::query_as(
+        r#"SELECT auto_optimize_enabled, auto_select_enabled, auto_demote_enabled,
+                      min_roi_30d, min_sharpe, min_win_rate, min_trades_30d
+               FROM workspaces WHERE id = $1"#,
+    )
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await?;
 
-    let (auto_optimize_enabled, auto_select_enabled, auto_demote_enabled) =
-        settings.ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
+    let (
+        auto_optimize_enabled,
+        auto_select_enabled,
+        auto_demote_enabled,
+        min_roi,
+        min_sharpe,
+        min_win_rate,
+        min_trades,
+    ) = settings.ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
 
     // Allow trigger if either old auto_optimize or new auto_select/demote is enabled
     if !auto_optimize_enabled && !auto_select_enabled && !auto_demote_enabled {
@@ -344,6 +379,14 @@ pub async fn trigger_optimization(
             "Auto-optimization is not enabled for this workspace. Enable auto-select or auto-demote in settings.".into(),
         ));
     }
+
+    // Get active wallet count before optimization
+    let before_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM workspace_wallet_allocations WHERE workspace_id = $1 AND tier = 'active'"
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
 
     tracing::info!(
         workspace_id = %workspace_id,
@@ -361,6 +404,32 @@ pub async fn trigger_optimization(
             ApiError::Internal(format!("Optimization failed: {}", e))
         })?;
 
+    // Get active wallet count after optimization
+    let after_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM workspace_wallet_allocations WHERE workspace_id = $1 AND tier = 'active'"
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // Get count of candidates that meet thresholds
+    let candidates_count: (i64,) = sqlx::query_as(
+        r#"SELECT COUNT(*) FROM wallet_success_metrics
+           WHERE COALESCE(roi_30d, 0) >= COALESCE($1, 5.0)
+             AND COALESCE(sharpe_30d, 0) >= COALESCE($2, 1.0)
+             AND COALESCE(win_rate_30d, 0) >= COALESCE($3, 50.0)
+             AND COALESCE(trades_30d, 0) >= COALESCE($4, 10)"#,
+    )
+    .bind(min_roi)
+    .bind(min_sharpe)
+    .bind(min_win_rate)
+    .bind(min_trades)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let wallets_promoted = (after_count.0 - before_count.0).max(0) as i32;
+    let candidates_found = candidates_count.0 as i32;
+
     // Audit log after successful optimization
     state.audit_logger.log_user_action(
         &claims.sub,
@@ -368,16 +437,37 @@ pub async fn trigger_optimization(
         &workspace_id.to_string(),
         serde_json::json!({
             "triggered_by": &claims.sub,
-            "manual": true
+            "manual": true,
+            "candidates_found": candidates_found,
+            "wallets_promoted": wallets_promoted
         }),
     );
 
     tracing::info!(
         workspace_id = %workspace_id,
         triggered_by = %user_id,
+        candidates_found = candidates_found,
+        wallets_promoted = wallets_promoted,
         "Manual optimization completed"
     );
 
-    // Return 200 OK to indicate optimization completed successfully
-    Ok(StatusCode::OK)
+    let message = if wallets_promoted > 0 {
+        format!("{} wallet(s) promoted to active roster", wallets_promoted)
+    } else if candidates_found == 0 {
+        "No wallets meet current thresholds".to_string()
+    } else {
+        "Roster is full - no changes made".to_string()
+    };
+
+    Ok(Json(OptimizationResultResponse {
+        candidates_found,
+        wallets_promoted,
+        thresholds: OptimizationThresholds {
+            min_roi_30d: min_roi.map(|d| d.to_string().parse().unwrap_or(5.0)),
+            min_sharpe: min_sharpe.map(|d| d.to_string().parse().unwrap_or(1.0)),
+            min_win_rate: min_win_rate.map(|d| d.to_string().parse().unwrap_or(50.0)),
+            min_trades_30d: min_trades,
+        },
+        message,
+    }))
 }

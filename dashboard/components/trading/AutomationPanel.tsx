@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useToastStore } from '@/stores/toast-store';
+import { useNotificationStore } from '@/stores/notification-store';
 import type { RotationHistoryEntry, WalletBan } from '@/types/api';
 import { formatDistanceToNow } from 'date-fns';
 
@@ -104,10 +105,35 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   const handleTriggerOptimization = async () => {
     setIsLoading(true);
     try {
-      await api.triggerOptimization();
-      addToast({ type: 'success', title: 'Optimization triggered successfully' });
+      const result = await api.triggerOptimization();
+
+      // Always refresh history to show the run
       loadHistory();
       onRefresh?.();
+
+      // Check the result and show appropriate notification
+      if (result.candidates_found === 0) {
+        // No wallets met thresholds - show warning banner
+        useNotificationStore.getState().noWalletsFound(
+          result.thresholds,
+          () => {
+            // Navigate to settings tab
+            const tabsTrigger = document.querySelector('[data-state="inactive"][value="settings"]') as HTMLElement;
+            if (tabsTrigger) tabsTrigger.click();
+          }
+        );
+        addToast({ type: 'info', title: 'Optimization complete', description: 'No wallets met the current thresholds' });
+      } else if (result.wallets_promoted > 0) {
+        // Wallets were promoted
+        useNotificationStore.getState().optimizationSuccess(result.wallets_promoted);
+        addToast({ type: 'success', title: `${result.wallets_promoted} wallet(s) promoted` });
+      } else if (result.candidates_found === -1) {
+        // Legacy response (no body) - just show success
+        addToast({ type: 'success', title: 'Optimization triggered successfully' });
+      } else {
+        // Candidates found but none promoted (roster might be full)
+        addToast({ type: 'info', title: 'Optimization complete', description: 'Roster is already full' });
+      }
     } catch (error) {
       addToast({ type: 'error', title: 'Failed to trigger optimization' });
     } finally {

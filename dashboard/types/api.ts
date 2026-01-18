@@ -736,6 +736,18 @@ export interface OptimizerStatus {
   portfolio_metrics: OptimizerPortfolioMetrics;
 }
 
+export interface OptimizationResult {
+  candidates_found: number;
+  wallets_promoted: number;
+  thresholds: {
+    min_roi_30d?: number;
+    min_sharpe?: number;
+    min_win_rate?: number;
+    min_trades_30d?: number;
+  };
+  message?: string;
+}
+
 // Demo position types
 export interface DemoPosition {
   id: string;

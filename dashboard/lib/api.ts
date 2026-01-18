@@ -42,6 +42,7 @@ import type {
   SetupMode,
   WorkspaceRole,
   OptimizerStatus,
+  OptimizationResult,
   DemoPosition,
   CreateDemoPositionRequest,
   UpdateDemoPositionRequest,
@@ -630,10 +631,35 @@ class ApiClient {
     });
   }
 
-  async triggerOptimization(): Promise<void> {
-    return this.request<void>('/api/v1/auto-rotation/trigger', {
+  async triggerOptimization(): Promise<OptimizationResult> {
+    // The endpoint may return 200 OK with body or 202 Accepted without body
+    const response = await fetch(`${this.baseUrl}/api/v1/auto-rotation/trigger`, {
       method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(this.token ? { 'Authorization': `Bearer ${this.token}` } : {}),
+      },
     });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        code: 'UNKNOWN_ERROR',
+        message: `HTTP ${response.status}`,
+      }));
+      throw new Error(error.message || `HTTP ${response.status}`);
+    }
+
+    // Handle both 200 with body and 202/204 without body
+    if (response.status === 204 || response.status === 202) {
+      return { candidates_found: -1, wallets_promoted: 0, thresholds: {} };
+    }
+
+    try {
+      return await response.json();
+    } catch {
+      // If JSON parsing fails, return a default result
+      return { candidates_found: -1, wallets_promoted: 0, thresholds: {} };
+    }
   }
 
   // Onboarding

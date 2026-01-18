@@ -28,26 +28,7 @@ export const PortfolioSummary = memo(function PortfolioSummary({
   const pnlPercent = totalValue > 0 ? (totalPnl / (totalValue - totalPnl)) * 100 : 0;
 
   return (
-    <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
-      {/* Total Value */}
-      <Card>
-        <CardContent className="p-4">
-          <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-full bg-primary/10 flex items-center justify-center">
-              <PieChart className="h-5 w-5 text-primary" />
-            </div>
-            <div>
-              <p className="text-sm text-muted-foreground">
-                {isDemo ? 'Demo Value' : 'Total Value'}
-              </p>
-              <p className="text-2xl font-bold tabular-nums">
-                {formatCurrency(totalValue)}
-              </p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
+    <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-5">
       {/* Unrealized P&L */}
       <Card>
         <CardContent className="p-4">
