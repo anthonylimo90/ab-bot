@@ -646,6 +646,16 @@ export interface AcceptInviteRequest {
   name?: string;
 }
 
+export interface AcceptInviteResponse {
+  workspace_id: string;
+  workspace_name: string;
+  role: string;
+  is_new_user: boolean;
+  // Only present for new users
+  token?: string;
+  user?: User;
+}
+
 export interface AddAllocationRequest {
   allocation_pct?: number;
   max_position_size?: number;

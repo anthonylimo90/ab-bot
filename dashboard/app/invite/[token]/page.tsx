@@ -9,6 +9,7 @@ import { Label } from '@/components/ui/label';
 import { Building2, CheckCircle, XCircle, Loader2 } from 'lucide-react';
 import api from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import type { InviteInfo } from '@/types/api';
 
 export default function InviteAcceptPage() {
@@ -16,6 +17,7 @@ export default function InviteAcceptPage() {
   const router = useRouter();
   const token = params.token as string;
   const { isAuthenticated, user, setAuth } = useAuthStore();
+  const { switchWorkspace, fetchWorkspaces } = useWorkspaceStore();
 
   const [inviteInfo, setInviteInfo] = useState<InviteInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -54,9 +56,13 @@ export default function InviteAcceptPage() {
       });
 
       // If new user, set auth
-      if (response.token) {
+      if (response.token && response.user) {
         setAuth(response.token, response.user);
       }
+
+      // Switch to the new workspace and refresh workspaces list
+      await switchWorkspace(response.workspace_id);
+      await fetchWorkspaces();
 
       setAccepted(true);
     } catch (err) {

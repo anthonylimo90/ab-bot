@@ -33,6 +33,7 @@ import type {
   CreateInviteRequest,
   InviteInfo,
   AcceptInviteRequest,
+  AcceptInviteResponse,
   AddAllocationRequest,
   UpdateAllocationRequest,
   SetBudgetRequest,
@@ -523,8 +524,8 @@ class ApiClient {
     return this.request<InviteInfo>(`/api/v1/invites/${token}`);
   }
 
-  async acceptInvite(token: string, params?: AcceptInviteRequest): Promise<AuthResponse> {
-    return this.request<AuthResponse>(`/api/v1/invites/${token}/accept`, {
+  async acceptInvite(token: string, params?: AcceptInviteRequest): Promise<AcceptInviteResponse> {
+    return this.request<AcceptInviteResponse>(`/api/v1/invites/${token}/accept`, {
       method: 'POST',
       body: JSON.stringify(params || {}),
     });

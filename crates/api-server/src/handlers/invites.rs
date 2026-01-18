@@ -635,13 +635,13 @@ pub async fn accept_invite(
         .execute(&mut *tx)
         .await?;
 
-    // Set as default workspace if first workspace
+    // Set as default workspace (always switch to invited workspace)
     sqlx::query(
         r#"
         INSERT INTO user_settings (user_id, default_workspace_id, created_at, updated_at)
         VALUES ($1, $2, $3, $3)
         ON CONFLICT (user_id) DO UPDATE SET
-            default_workspace_id = COALESCE(user_settings.default_workspace_id, $2),
+            default_workspace_id = $2,
             updated_at = $3
         "#,
     )
