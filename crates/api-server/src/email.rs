@@ -130,10 +130,10 @@ impl EmailClient {
             .map_err(|e| EmailError::HttpError(e.to_string()))?;
 
         let status = response.status();
-        let body: ResendEmailResponse = response
-            .json()
-            .await
-            .unwrap_or(ResendEmailResponse { id: None, message: None });
+        let body: ResendEmailResponse = response.json().await.unwrap_or(ResendEmailResponse {
+            id: None,
+            message: None,
+        });
 
         if status.is_success() {
             tracing::debug!(email_id = ?body.id, "Email sent successfully via Resend");

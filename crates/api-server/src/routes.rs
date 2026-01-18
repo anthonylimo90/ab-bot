@@ -84,6 +84,7 @@ use crate::websocket;
         workspaces::list_members,
         workspaces::update_member_role,
         workspaces::remove_member,
+        workspaces::get_optimizer_status,
         // Invites
         invites::list_invites,
         invites::create_invite,
@@ -171,6 +172,9 @@ use crate::websocket;
             workspaces::UpdateWorkspaceRequest,
             workspaces::WorkspaceMemberResponse,
             workspaces::UpdateMemberRoleRequest,
+            workspaces::OptimizerStatusResponse,
+            workspaces::OptimizerCriteria,
+            workspaces::PortfolioMetrics,
             // Invites
             invites::InviteResponse,
             invites::CreateInviteRequest,
@@ -333,6 +337,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/members",
             get(workspaces::list_members),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/optimizer-status",
+            get(workspaces::get_optimizer_status),
         )
         .route(
             "/api/v1/workspaces/:workspace_id/invites",

@@ -182,6 +182,17 @@ impl AutoOptimizer {
             self.add_to_active(workspace.id, &candidate.address).await?;
         }
 
+        // Update last_optimization_at timestamp
+        sqlx::query("UPDATE workspaces SET last_optimization_at = NOW() WHERE id = $1")
+            .bind(workspace.id)
+            .execute(&self.pool)
+            .await?;
+
+        tracing::info!(
+            workspace_id = %workspace.id,
+            "Updated last_optimization_at timestamp"
+        );
+
         Ok(())
     }
 

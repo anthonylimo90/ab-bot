@@ -77,4 +77,25 @@ export const queryKeys = {
     results: () => [...queryKeys.backtest.all, 'results'] as const,
     detail: (id: string) => [...queryKeys.backtest.all, 'detail', id] as const,
   },
+
+  // Optimizer
+  optimizer: {
+    all: ['optimizer'] as const,
+    status: (workspaceId: string) =>
+      [...queryKeys.optimizer.all, 'status', workspaceId] as const,
+  },
+
+  // Allocations
+  allocations: {
+    all: ['allocations'] as const,
+    active: () => [...queryKeys.allocations.all, 'active'] as const,
+    bench: () => [...queryKeys.allocations.all, 'bench'] as const,
+  },
+
+  // Rotation history
+  rotationHistory: {
+    all: ['rotation-history'] as const,
+    list: (params?: { unacknowledgedOnly?: boolean }) =>
+      [...queryKeys.rotationHistory.all, 'list', params] as const,
+  },
 } as const;

@@ -49,6 +49,37 @@ pub struct WorkspaceResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Optimizer status response for automatic workspaces.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OptimizerStatusResponse {
+    pub enabled: bool,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub interval_hours: i32,
+    pub criteria: OptimizerCriteria,
+    pub active_wallet_count: i32,
+    pub bench_wallet_count: i32,
+    pub portfolio_metrics: PortfolioMetrics,
+}
+
+/// Optimizer selection criteria.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OptimizerCriteria {
+    pub min_roi_30d: Option<Decimal>,
+    pub min_sharpe: Option<Decimal>,
+    pub min_win_rate: Option<Decimal>,
+    pub min_trades_30d: Option<i32>,
+}
+
+/// Aggregated portfolio metrics from active wallets.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PortfolioMetrics {
+    pub total_roi_30d: Decimal,
+    pub avg_sharpe: Decimal,
+    pub avg_win_rate: Decimal,
+    pub total_value: Decimal,
+}
+
 /// Update workspace request (owner only).
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateWorkspaceRequest {
@@ -746,4 +777,136 @@ pub async fn remove_member(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Database row for optimizer status.
+#[derive(Debug, sqlx::FromRow)]
+struct OptimizerSettingsRow {
+    auto_optimize_enabled: bool,
+    optimization_interval_hours: i32,
+    last_optimization_at: Option<DateTime<Utc>>,
+    min_roi_30d: Option<Decimal>,
+    min_sharpe: Option<Decimal>,
+    min_win_rate: Option<Decimal>,
+    min_trades_30d: Option<i32>,
+    total_budget: Decimal,
+}
+
+/// Database row for wallet counts.
+#[derive(Debug, sqlx::FromRow)]
+struct WalletCountsRow {
+    active_count: i64,
+    bench_count: i64,
+}
+
+/// Database row for portfolio metrics.
+#[derive(Debug, sqlx::FromRow)]
+struct PortfolioMetricsRow {
+    avg_roi: Decimal,
+    avg_sharpe: Decimal,
+    avg_win_rate: Decimal,
+}
+
+/// Get optimizer status for a workspace.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/optimizer-status",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    responses(
+        (status = 200, description = "Optimizer status", body = OptimizerStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member of this workspace"),
+        (status = 404, description = "Workspace not found"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn get_optimizer_status(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+) -> ApiResult<Json<OptimizerStatusResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    // Verify membership
+    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
+    if role.is_none() {
+        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    }
+
+    // Get workspace optimizer settings
+    let settings: OptimizerSettingsRow = sqlx::query_as(
+        r#"
+        SELECT
+            auto_optimize_enabled,
+            optimization_interval_hours,
+            last_optimization_at,
+            min_roi_30d, min_sharpe, min_win_rate, min_trades_30d,
+            total_budget
+        FROM workspaces WHERE id = $1
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::NotFound("Workspace not found".into()))?;
+
+    // Get wallet counts by tier
+    let counts: WalletCountsRow = sqlx::query_as(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE tier = 'active') as active_count,
+            COUNT(*) FILTER (WHERE tier = 'bench') as bench_count
+        FROM workspace_wallet_allocations WHERE workspace_id = $1
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // Get aggregated portfolio metrics from active wallets
+    let metrics: PortfolioMetricsRow = sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE(AVG(backtest_roi), 0) as avg_roi,
+            COALESCE(AVG(backtest_sharpe), 0) as avg_sharpe,
+            COALESCE(AVG(backtest_win_rate), 0) as avg_win_rate
+        FROM workspace_wallet_allocations
+        WHERE workspace_id = $1 AND tier = 'active'
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // Calculate next run time
+    let next_run_at = settings.last_optimization_at.map(|last_run| {
+        last_run + chrono::Duration::hours(settings.optimization_interval_hours as i64)
+    });
+
+    Ok(Json(OptimizerStatusResponse {
+        enabled: settings.auto_optimize_enabled,
+        last_run_at: settings.last_optimization_at,
+        next_run_at,
+        interval_hours: settings.optimization_interval_hours,
+        criteria: OptimizerCriteria {
+            min_roi_30d: settings.min_roi_30d,
+            min_sharpe: settings.min_sharpe,
+            min_win_rate: settings.min_win_rate,
+            min_trades_30d: settings.min_trades_30d,
+        },
+        active_wallet_count: counts.active_count as i32,
+        bench_wallet_count: counts.bench_count as i32,
+        portfolio_metrics: PortfolioMetrics {
+            total_roi_30d: metrics.avg_roi,
+            avg_sharpe: metrics.avg_sharpe,
+            avg_win_rate: metrics.avg_win_rate,
+            total_value: settings.total_budget,
+        },
+    }))
 }

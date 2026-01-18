@@ -37,3 +37,14 @@ export {
   type RecommendationReason,
   type Urgency,
 } from './useRecommendationsQuery';
+
+// Optimizer queries
+export {
+  useOptimizerStatusQuery,
+  useRotationHistoryQuery,
+  useActiveAllocationsQuery,
+  useBenchAllocationsQuery,
+  useTriggerOptimizationMutation,
+  useAcknowledgeRotationMutation,
+  useUnacknowledgedRotationCount,
+} from './useOptimizerQuery';

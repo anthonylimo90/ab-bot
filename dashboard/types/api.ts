@@ -509,6 +509,7 @@ export interface Workspace {
   min_win_rate?: number;
   min_trades_30d?: number;
   trading_wallet_address?: string;
+  my_role: WorkspaceRole;
   created_by?: string;
   created_at: string;
   updated_at: string;
@@ -668,4 +669,30 @@ export interface AutoSetupConfig {
   min_sharpe?: number;
   min_win_rate?: number;
   min_trades_30d?: number;
+}
+
+// Optimizer Status types
+export interface OptimizerCriteria {
+  min_roi_30d: number | null;
+  min_sharpe: number | null;
+  min_win_rate: number | null;
+  min_trades_30d: number | null;
+}
+
+export interface OptimizerPortfolioMetrics {
+  total_roi_30d: number;
+  avg_sharpe: number;
+  avg_win_rate: number;
+  total_value: number;
+}
+
+export interface OptimizerStatus {
+  enabled: boolean;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  interval_hours: number;
+  criteria: OptimizerCriteria;
+  active_wallet_count: number;
+  bench_wallet_count: number;
+  portfolio_metrics: OptimizerPortfolioMetrics;
 }

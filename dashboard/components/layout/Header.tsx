@@ -8,6 +8,7 @@ import { ModeToggle } from './ModeToggle';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 
 const mobileNavItems = [
   { href: '/', label: 'Dashboard' },
@@ -23,6 +24,7 @@ export function Header() {
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
+  const { currentWorkspace } = useWorkspaceStore();
 
   // Close menu when clicking outside
   useEffect(() => {
@@ -111,7 +113,7 @@ export function Header() {
                   <p className="text-sm font-medium">{user?.name || 'User'}</p>
                   <p className="text-xs text-muted-foreground">{user?.email}</p>
                   <p className="text-xs text-muted-foreground capitalize mt-1">
-                    Role: {user?.role}
+                    Role: {currentWorkspace?.my_role || user?.role}
                   </p>
                 </div>
                 <Link

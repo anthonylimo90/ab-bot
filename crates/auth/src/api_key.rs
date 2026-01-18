@@ -327,7 +327,8 @@ mod tests {
 
         auth.create_key("user1", "Key 1", UserRole::Viewer).await;
         auth.create_key("user1", "Key 2", UserRole::Trader).await;
-        auth.create_key("user2", "Key 3", UserRole::PlatformAdmin).await;
+        auth.create_key("user2", "Key 3", UserRole::PlatformAdmin)
+            .await;
 
         let user1_keys = auth.get_user_keys("user1").await;
         assert_eq!(user1_keys.len(), 2);

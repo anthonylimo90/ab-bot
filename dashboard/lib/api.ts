@@ -39,6 +39,7 @@ import type {
   AutoSetupConfig,
   SetupMode,
   WorkspaceRole,
+  OptimizerStatus,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -494,6 +495,10 @@ class ApiClient {
     return this.request<void>(`/api/v1/workspaces/${workspaceId}/members/${memberId}`, {
       method: 'DELETE',
     });
+  }
+
+  async getOptimizerStatus(workspaceId: string): Promise<OptimizerStatus> {
+    return this.request<OptimizerStatus>(`/api/v1/workspaces/${workspaceId}/optimizer-status`);
   }
 
   // Workspace Invites
