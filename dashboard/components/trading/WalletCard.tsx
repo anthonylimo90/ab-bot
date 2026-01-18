@@ -22,7 +22,15 @@ import {
   TrendingDown,
   X,
   Trash2,
+  Pin,
+  PinOff,
+  Clock,
+  Zap,
+  AlertTriangle,
 } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { differenceInDays, formatDistanceToNow } from 'date-fns';
 import { useRosterStore, type RosterWallet } from '@/stores/roster-store';
 import type { DemoPosition } from '@/stores/demo-portfolio-store';
 import type { CopyBehavior } from '@/types/api';
@@ -46,9 +54,13 @@ interface WalletCardProps {
   onPromote?: (address: string) => void;
   onRemove?: (address: string) => void;
   onClosePosition?: (id: string) => void;
+  onPin?: (address: string) => void;
+  onUnpin?: (address: string) => void;
   isActive?: boolean;
   isRosterFull?: boolean;
   isLoading?: boolean;
+  pinsRemaining?: number;
+  maxPins?: number;
 }
 
 export const WalletCard = memo(function WalletCard({
@@ -58,9 +70,13 @@ export const WalletCard = memo(function WalletCard({
   onPromote,
   onRemove,
   onClosePosition,
+  onPin,
+  onUnpin,
   isActive = false,
   isRosterFull = false,
   isLoading = false,
+  pinsRemaining = 3,
+  maxPins = 3,
 }: WalletCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -68,6 +84,13 @@ export const WalletCard = memo(function WalletCard({
 
   const totalPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
   const hasPositions = positions.length > 0;
+
+  // Automation computed values
+  const isInProbation = wallet.probationUntil && new Date(wallet.probationUntil) > new Date();
+  const probationDaysRemaining = wallet.probationUntil
+    ? Math.max(0, differenceInDays(new Date(wallet.probationUntil), new Date()))
+    : 0;
+  const hasConsecutiveLosses = (wallet.consecutiveLosses || 0) >= 3;
 
   const copyBehaviorLabels: Record<string, string> = {
     copy_all: 'All Trades',
@@ -101,9 +124,57 @@ export const WalletCard = memo(function WalletCard({
               {wallet.label?.charAt(0) || wallet.address.charAt(2).toUpperCase()}
             </div>
             <div>
-              <p className="font-medium">
-                {wallet.label || shortenAddress(wallet.address)}
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="font-medium">
+                  {wallet.label || shortenAddress(wallet.address)}
+                </p>
+                {/* Pinned indicator */}
+                {wallet.pinned && (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <Pin className="h-3.5 w-3.5 text-purple-500 fill-purple-500" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Pinned - protected from auto-demotion</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+                {/* Probation badge */}
+                {isActive && isInProbation && (
+                  <Badge variant="outline" className="text-xs bg-blue-500/10 text-blue-500 border-blue-500/20">
+                    <Clock className="h-3 w-3 mr-1" />
+                    {probationDaysRemaining}d left
+                  </Badge>
+                )}
+                {/* Auto-selected indicator */}
+                {wallet.isAutoSelected && !isInProbation && (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <Zap className="h-3.5 w-3.5 text-yellow-500" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Auto-selected by automation</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+                {/* Consecutive losses warning */}
+                {hasConsecutiveLosses && (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <AlertTriangle className="h-3.5 w-3.5 text-orange-500" />
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>{wallet.consecutiveLosses} consecutive losses</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+              </div>
               <p className="text-xs text-muted-foreground font-mono">
                 {shortenAddress(wallet.address)}
               </p>
@@ -131,7 +202,7 @@ export const WalletCard = memo(function WalletCard({
 
       <CardContent className="space-y-4">
         {/* Metrics Row */}
-        <div className="grid grid-cols-4 gap-4 text-sm">
+        <div className="grid grid-cols-5 gap-3 text-sm">
           <div>
             <p className="text-xs text-muted-foreground">ROI (30d)</p>
             <p
@@ -151,6 +222,15 @@ export const WalletCard = memo(function WalletCard({
           <div>
             <p className="text-xs text-muted-foreground">Win Rate</p>
             <p className="font-medium">{Number(wallet.winRate).toFixed(1)}%</p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground">Confidence</p>
+            <p className={cn(
+              'font-medium',
+              wallet.confidence >= 80 ? 'text-profit' : wallet.confidence >= 60 ? 'text-yellow-500' : 'text-muted-foreground'
+            )}>
+              {Number(wallet.confidence).toFixed(0)}%
+            </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">
@@ -249,15 +329,62 @@ export const WalletCard = memo(function WalletCard({
               </Button>
             </Link>
             {isActive ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onDemote?.(wallet.address)}
-                disabled={isLoading}
-              >
-                <ChevronDown className="mr-1 h-4 w-4" />
-                Demote
-              </Button>
+              <>
+                {/* Pin/Unpin button */}
+                {wallet.pinned ? (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => onUnpin?.(wallet.address)}
+                          disabled={isLoading}
+                          className="text-purple-500 hover:text-purple-600"
+                        >
+                          <PinOff className="mr-1 h-4 w-4" />
+                          Unpin
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Remove protection from auto-demotion</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                ) : (
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => onPin?.(wallet.address)}
+                          disabled={isLoading || pinsRemaining <= 0}
+                        >
+                          <Pin className="mr-1 h-4 w-4" />
+                          Pin
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        {pinsRemaining > 0 ? (
+                          <p>Pin to protect from auto-demotion ({pinsRemaining} of {maxPins} remaining)</p>
+                        ) : (
+                          <p>No pins remaining (max {maxPins})</p>
+                        )}
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onDemote?.(wallet.address)}
+                  disabled={isLoading}
+                >
+                  <ChevronDown className="mr-1 h-4 w-4" />
+                  Demote
+                </Button>
+              </>
             ) : (
               <>
                 <Button

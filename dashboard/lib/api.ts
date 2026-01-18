@@ -26,6 +26,7 @@ import type {
   WorkspaceMember,
   WorkspaceInvite,
   WorkspaceAllocation,
+  WalletBan,
   RotationHistoryEntry,
   OnboardingStatus,
   CreateWorkspaceRequest,
@@ -569,6 +570,41 @@ class ApiClient {
   async demoteAllocation(address: string): Promise<WorkspaceAllocation> {
     return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}/demote`, {
       method: 'POST',
+    });
+  }
+
+  // Pin/Unpin Wallet (prevents auto-demotion)
+  async pinAllocation(address: string): Promise<{ success: boolean; pinned: boolean; message: string }> {
+    return this.request<{ success: boolean; pinned: boolean; message: string }>(`/api/v1/allocations/${address}/pin`, {
+      method: 'PUT',
+    });
+  }
+
+  async unpinAllocation(address: string): Promise<{ success: boolean; pinned: boolean; message: string }> {
+    return this.request<{ success: boolean; pinned: boolean; message: string }>(`/api/v1/allocations/${address}/pin`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Wallet Bans (prevents auto-promotion)
+  async listBans(): Promise<{ bans: WalletBan[] }> {
+    return this.request<{ bans: WalletBan[] }>('/api/v1/allocations/bans');
+  }
+
+  async banWallet(params: {
+    wallet_address: string;
+    reason?: string;
+    expires_at?: string;
+  }): Promise<WalletBan> {
+    return this.request<WalletBan>('/api/v1/allocations/bans', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async unbanWallet(address: string): Promise<void> {
+    return this.request<void>(`/api/v1/allocations/bans/${address}`, {
+      method: 'DELETE',
     });
   }
 

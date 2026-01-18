@@ -115,10 +115,11 @@ pub struct ApiServer {
 impl ApiServer {
     /// Create a new API server.
     pub async fn new(config: ServerConfig, pool: PgPool) -> anyhow::Result<Self> {
-        // Create broadcast channels for WebSocket
+        // Create broadcast channels for WebSocket and automation
         let (orderbook_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (position_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
+        let (automation_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
         // Create app state
         let state = Arc::new(AppState::new(
@@ -127,6 +128,7 @@ impl ApiServer {
             orderbook_tx,
             position_tx,
             signal_tx,
+            automation_tx,
         ));
 
         // Build router
@@ -193,7 +195,7 @@ impl ApiServer {
 
         // Spawn auto-optimizer background service
         let optimizer = Arc::new(AutoOptimizer::new(self.state.pool.clone()));
-        tokio::spawn(optimizer.start());
+        tokio::spawn(optimizer.start(None));
 
         let addr = self.config.socket_addr();
         info!(address = %addr, "Starting API server");

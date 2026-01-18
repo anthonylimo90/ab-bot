@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { ToastProvider } from '@/components/shared/ToastProvider';
+import { AlertBannerProvider } from '@/components/shared/AlertBannerProvider';
 import { QueryProvider } from '@/providers/QueryProvider';
 import { WorkspaceProvider } from '@/providers/WorkspaceProvider';
 import { AuthGuard } from '@/components/auth/AuthGuard';
@@ -31,6 +32,7 @@ export default function RootLayout({
               </WorkspaceProvider>
             </AuthGuard>
             <ToastProvider />
+            <AlertBannerProvider />
           </TooltipProvider>
         </QueryProvider>
       </body>

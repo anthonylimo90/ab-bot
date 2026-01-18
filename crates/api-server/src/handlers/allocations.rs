@@ -894,3 +894,455 @@ pub async fn demote_allocation(
         wallet_success_score: allocation.wallet_success_score,
     }))
 }
+
+/// Pin response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PinResponse {
+    pub success: bool,
+    pub pinned: bool,
+    pub message: String,
+}
+
+/// Ban wallet request.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BanWalletRequest {
+    pub wallet_address: String,
+    pub reason: Option<String>,
+    /// Optional expiration (ISO 8601 format)
+    pub expires_at: Option<String>,
+}
+
+/// Ban response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BanResponse {
+    pub id: String,
+    pub wallet_address: String,
+    pub reason: Option<String>,
+    pub banned_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// List of bans response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BanListResponse {
+    pub bans: Vec<BanResponse>,
+}
+
+/// Pin a wallet to prevent auto-demotion.
+#[utoipa::path(
+    put,
+    path = "/api/v1/allocations/{address}/pin",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Wallet pinned", body = PinResponse),
+        (status = 400, description = "Invalid request or max pins reached"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not allowed to modify roster"),
+        (status = 404, description = "Wallet not in roster"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "allocations"
+)]
+pub async fn pin_allocation(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(address): Path<String>,
+) -> ApiResult<Json<PinResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+
+    let workspace_id = get_current_workspace(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No workspace set".into()))?;
+
+    // Check role
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only owner or admin can pin wallets".into(),
+        ));
+    }
+
+    // Check if wallet is active
+    let existing: Option<(String, bool)> = sqlx::query_as(
+        "SELECT tier, COALESCE(pinned, false) FROM workspace_wallet_allocations WHERE workspace_id = $1 AND wallet_address = $2",
+    )
+    .bind(workspace_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (tier, already_pinned) =
+        existing.ok_or_else(|| ApiError::NotFound("Wallet not in roster".into()))?;
+
+    if tier != "active" {
+        return Err(ApiError::BadRequest(
+            "Only active wallets can be pinned".into(),
+        ));
+    }
+
+    if already_pinned {
+        return Ok(Json(PinResponse {
+            success: true,
+            pinned: true,
+            message: "Wallet is already pinned".to_string(),
+        }));
+    }
+
+    // Check max pinned limit
+    let (max_pins,): (i32,) =
+        sqlx::query_as("SELECT COALESCE(max_pinned_wallets, 3) FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .fetch_one(&state.pool)
+            .await?;
+
+    let (current_pins,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM workspace_wallet_allocations WHERE workspace_id = $1 AND COALESCE(pinned, false) = true",
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if current_pins >= max_pins as i64 {
+        return Err(ApiError::BadRequest(format!(
+            "Maximum {} pinned wallets reached. Unpin one first.",
+            max_pins
+        )));
+    }
+
+    // Pin the wallet
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE workspace_wallet_allocations
+        SET pinned = true, pinned_at = $1, pinned_by = $2, updated_at = $1
+        WHERE workspace_id = $3 AND wallet_address = $4
+        "#,
+    )
+    .bind(now)
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(&address)
+    .execute(&state.pool)
+    .await?;
+
+    // Audit log
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("roster_wallet_pinned".to_string()),
+        &address,
+        serde_json::json!({
+            "workspace_id": workspace_id.to_string()
+        }),
+    );
+
+    Ok(Json(PinResponse {
+        success: true,
+        pinned: true,
+        message: "Wallet pinned successfully".to_string(),
+    }))
+}
+
+/// Unpin a wallet to allow auto-demotion.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/allocations/{address}/pin",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Wallet unpinned", body = PinResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not allowed to modify roster"),
+        (status = 404, description = "Wallet not in roster"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "allocations"
+)]
+pub async fn unpin_allocation(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(address): Path<String>,
+) -> ApiResult<Json<PinResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+
+    let workspace_id = get_current_workspace(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No workspace set".into()))?;
+
+    // Check role
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only owner or admin can unpin wallets".into(),
+        ));
+    }
+
+    // Unpin the wallet
+    let now = Utc::now();
+    let result = sqlx::query(
+        r#"
+        UPDATE workspace_wallet_allocations
+        SET pinned = false, pinned_at = NULL, pinned_by = NULL, updated_at = $1
+        WHERE workspace_id = $2 AND wallet_address = $3
+        "#,
+    )
+    .bind(now)
+    .bind(workspace_id)
+    .bind(&address)
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Wallet not in roster".into()));
+    }
+
+    // Audit log
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("roster_wallet_unpinned".to_string()),
+        &address,
+        serde_json::json!({
+            "workspace_id": workspace_id.to_string()
+        }),
+    );
+
+    Ok(Json(PinResponse {
+        success: true,
+        pinned: false,
+        message: "Wallet unpinned successfully".to_string(),
+    }))
+}
+
+/// Ban a wallet from auto-promotion.
+#[utoipa::path(
+    post,
+    path = "/api/v1/allocations/bans",
+    request_body = BanWalletRequest,
+    responses(
+        (status = 201, description = "Wallet banned", body = BanResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not allowed to ban wallets"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "allocations"
+)]
+pub async fn ban_wallet(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<BanWalletRequest>,
+) -> ApiResult<(StatusCode, Json<BanResponse>)> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+
+    let workspace_id = get_current_workspace(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No workspace set".into()))?;
+
+    // Check role
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only owner or admin can ban wallets".into(),
+        ));
+    }
+
+    // Parse optional expiration
+    let expires_at = req
+        .expires_at
+        .as_ref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| ApiError::BadRequest("Invalid expires_at format".into()))
+        })
+        .transpose()?;
+
+    let ban_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO workspace_wallet_bans
+        (id, workspace_id, wallet_address, reason, banned_by, banned_at, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (workspace_id, wallet_address) DO UPDATE SET
+            reason = EXCLUDED.reason,
+            banned_by = EXCLUDED.banned_by,
+            banned_at = EXCLUDED.banned_at,
+            expires_at = EXCLUDED.expires_at
+        "#,
+    )
+    .bind(ban_id)
+    .bind(workspace_id)
+    .bind(&req.wallet_address)
+    .bind(&req.reason)
+    .bind(user_id)
+    .bind(now)
+    .bind(expires_at)
+    .execute(&state.pool)
+    .await?;
+
+    // Audit log
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("roster_wallet_banned".to_string()),
+        &req.wallet_address,
+        serde_json::json!({
+            "workspace_id": workspace_id.to_string(),
+            "reason": &req.reason
+        }),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(BanResponse {
+            id: ban_id.to_string(),
+            wallet_address: req.wallet_address,
+            reason: req.reason,
+            banned_at: now,
+            expires_at,
+        }),
+    ))
+}
+
+/// Unban a wallet to allow auto-promotion.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/allocations/bans/{address}",
+    params(
+        ("address" = String, Path, description = "Wallet address to unban")
+    ),
+    responses(
+        (status = 204, description = "Wallet unbanned"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not allowed to unban wallets"),
+        (status = 404, description = "Wallet not banned"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "allocations"
+)]
+pub async fn unban_wallet(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(address): Path<String>,
+) -> ApiResult<StatusCode> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+
+    let workspace_id = get_current_workspace(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No workspace set".into()))?;
+
+    // Check role
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only owner or admin can unban wallets".into(),
+        ));
+    }
+
+    let result = sqlx::query(
+        "DELETE FROM workspace_wallet_bans WHERE workspace_id = $1 AND wallet_address = $2",
+    )
+    .bind(workspace_id)
+    .bind(&address)
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Wallet not banned".into()));
+    }
+
+    // Audit log
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("roster_wallet_unbanned".to_string()),
+        &address,
+        serde_json::json!({
+            "workspace_id": workspace_id.to_string()
+        }),
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List banned wallets.
+#[utoipa::path(
+    get,
+    path = "/api/v1/allocations/bans",
+    responses(
+        (status = 200, description = "List of banned wallets", body = BanListResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "No workspace set"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "allocations"
+)]
+pub async fn list_bans(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult<Json<BanListResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+
+    let workspace_id = get_current_workspace(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No workspace set".into()))?;
+
+    // Verify membership
+    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
+    if role.is_none() {
+        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    }
+
+    let bans: Vec<(
+        Uuid,
+        String,
+        Option<String>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT id, wallet_address, reason, banned_at, expires_at
+        FROM workspace_wallet_bans
+        WHERE workspace_id = $1
+          AND (expires_at IS NULL OR expires_at > NOW())
+        ORDER BY banned_at DESC
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let bans = bans
+        .into_iter()
+        .map(
+            |(id, wallet_address, reason, banned_at, expires_at)| BanResponse {
+                id: id.to_string(),
+                wallet_address,
+                reason,
+                banned_at,
+                expires_at,
+            },
+        )
+        .collect();
+
+    Ok(Json(BanListResponse { bans }))
+}

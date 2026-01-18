@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
-import { PortfolioSummary, WalletCard, ManualPositions } from '@/components/trading';
+import { PortfolioSummary, WalletCard, ManualPositions, AutomationPanel } from '@/components/trading';
 import { useRosterStore, RosterWallet } from '@/stores/roster-store';
 import { useDemoPortfolioStore, DemoPosition } from '@/stores/demo-portfolio-store';
 import { useModeStore } from '@/stores/mode-store';
@@ -23,7 +23,9 @@ import {
   RefreshCw,
   TestTube2,
   History,
+  Bot,
 } from 'lucide-react';
+import { api } from '@/lib/api';
 
 // Position format expected by WalletCard
 interface WalletPosition {
@@ -154,6 +156,32 @@ export default function TradingPage() {
     }
   };
 
+  // Pin/Unpin handlers
+  const handlePin = async (address: string) => {
+    try {
+      await api.pinAllocation(address);
+      toast.success('Wallet Pinned', `${shortenAddress(address)} is protected from auto-demotion`);
+      fetchAll();
+    } catch (error) {
+      toast.error('Pin Failed', 'Could not pin wallet');
+    }
+  };
+
+  const handleUnpin = async (address: string) => {
+    try {
+      await api.unpinAllocation(address);
+      toast.info('Wallet Unpinned', `${shortenAddress(address)} can now be auto-demoted`);
+      fetchAll();
+    } catch (error) {
+      toast.error('Unpin Failed', 'Could not unpin wallet');
+    }
+  };
+
+  // Count pinned wallets
+  const pinnedCount = activeWallets.filter((w) => w.pinned).length;
+  const maxPins = 3;
+  const pinsRemaining = maxPins - pinnedCount;
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -217,6 +245,10 @@ export default function TradingPage() {
             <History className="h-4 w-4" />
             Closed ({closedCount})
           </TabsTrigger>
+          <TabsTrigger value="automation" className="flex items-center gap-2">
+            <Bot className="h-4 w-4" />
+            Automation
+          </TabsTrigger>
         </TabsList>
 
         {/* Active Tab */}
@@ -269,8 +301,12 @@ export default function TradingPage() {
                   positions={positionsByWallet[wallet.address] || []}
                   onDemote={handleDemote}
                   onClosePosition={handleClosePosition}
+                  onPin={handlePin}
+                  onUnpin={handleUnpin}
                   isActive={true}
                   isRosterFull={isRosterFull()}
+                  pinsRemaining={pinsRemaining}
+                  maxPins={maxPins}
                 />
               ))}
 
@@ -448,6 +484,14 @@ export default function TradingPage() {
               </CardContent>
             </Card>
           )}
+        </TabsContent>
+
+        {/* Automation Tab */}
+        <TabsContent value="automation" className="space-y-4">
+          <AutomationPanel
+            workspaceId="default"
+            onRefresh={() => fetchAll()}
+          />
         </TabsContent>
       </Tabs>
     </div>

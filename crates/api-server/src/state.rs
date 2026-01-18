@@ -13,6 +13,7 @@ use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
 
+use crate::auto_optimizer::AutomationEvent;
 use crate::email::{EmailClient, EmailConfig};
 use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 
@@ -45,6 +46,8 @@ pub struct AppState {
     pub position_tx: broadcast::Sender<PositionUpdate>,
     /// Broadcast channel for trading signals.
     pub signal_tx: broadcast::Sender<SignalUpdate>,
+    /// Broadcast channel for automation events (circuit breaker trips, etc.).
+    pub automation_tx: broadcast::Sender<AutomationEvent>,
 }
 
 impl AppState {
@@ -55,6 +58,7 @@ impl AppState {
         orderbook_tx: broadcast::Sender<OrderbookUpdate>,
         position_tx: broadcast::Sender<PositionUpdate>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        automation_tx: broadcast::Sender<AutomationEvent>,
     ) -> Self {
         // Create JWT auth handler
         let jwt_config = JwtConfig {
@@ -136,6 +140,7 @@ impl AppState {
             orderbook_tx,
             position_tx,
             signal_tx,
+            automation_tx,
         }
     }
 
@@ -176,6 +181,19 @@ impl AppState {
         update: SignalUpdate,
     ) -> Result<usize, broadcast::error::SendError<SignalUpdate>> {
         self.signal_tx.send(update)
+    }
+
+    /// Subscribe to automation events.
+    pub fn subscribe_automation(&self) -> broadcast::Receiver<AutomationEvent> {
+        self.automation_tx.subscribe()
+    }
+
+    /// Publish an automation event.
+    pub fn publish_automation(
+        &self,
+        event: AutomationEvent,
+    ) -> Result<usize, broadcast::error::SendError<AutomationEvent>> {
+        self.automation_tx.send(event)
     }
 }
 

@@ -566,6 +566,33 @@ export interface WorkspaceAllocation {
   added_by?: string;
   added_at: string;
   updated_at: string;
+  // Pin status (prevents auto-demotion)
+  pinned?: boolean;
+  pinned_at?: string;
+  pinned_by?: string;
+  // Probation status (new wallets)
+  probation_until?: string;
+  probation_allocation_pct?: number;
+  // Loss tracking
+  consecutive_losses?: number;
+  last_loss_at?: string;
+  // Confidence score
+  confidence_score?: number;
+  // Grace period
+  grace_period_started_at?: string;
+  grace_period_reason?: string;
+  // Wallet metadata
+  wallet_label?: string;
+  wallet_success_score?: number;
+}
+
+// Wallet ban (prevents auto-promotion)
+export interface WalletBan {
+  id: string;
+  wallet_address: string;
+  reason?: string;
+  banned_at: string;
+  expires_at?: string;
 }
 
 export interface RotationHistoryEntry {

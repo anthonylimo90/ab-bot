@@ -18,6 +18,12 @@ export interface RosterWallet {
   // Status
   addedAt: string;
   lastActivity?: string;
+  // Automation fields
+  pinned?: boolean;
+  pinnedAt?: string;
+  probationUntil?: string;
+  isAutoSelected?: boolean;
+  consecutiveLosses?: number;
 }
 
 interface RosterState {

@@ -98,6 +98,11 @@ use crate::websocket;
         allocations::remove_allocation,
         allocations::promote_allocation,
         allocations::demote_allocation,
+        allocations::pin_allocation,
+        allocations::unpin_allocation,
+        allocations::ban_wallet,
+        allocations::unban_wallet,
+        allocations::list_bans,
         // Auto-rotation
         auto_rotation::list_rotation_history,
         auto_rotation::acknowledge_entry,
@@ -193,6 +198,10 @@ use crate::websocket;
             allocations::AllocationResponse,
             allocations::AddAllocationRequest,
             allocations::UpdateAllocationRequest,
+            allocations::PinResponse,
+            allocations::BanWalletRequest,
+            allocations::BanResponse,
+            allocations::BanListResponse,
             // Auto-rotation
             auto_rotation::RotationHistoryResponse,
             // Onboarding
@@ -453,6 +462,22 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/allocations/:address/demote",
             post(allocations::demote_allocation),
+        )
+        // Pin/unpin wallet (prevents auto-demotion)
+        .route(
+            "/api/v1/allocations/:address/pin",
+            put(allocations::pin_allocation),
+        )
+        .route(
+            "/api/v1/allocations/:address/pin",
+            delete(allocations::unpin_allocation),
+        )
+        // Wallet bans (prevents auto-promotion)
+        .route("/api/v1/allocations/bans", post(allocations::ban_wallet))
+        .route("/api/v1/allocations/bans", get(allocations::list_bans))
+        .route(
+            "/api/v1/allocations/bans/:address",
+            delete(allocations::unban_wallet),
         )
         // Auto-rotation operations
         .route(
