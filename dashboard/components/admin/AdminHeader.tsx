@@ -4,7 +4,6 @@ import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { LogOut, ChevronDown, ShieldAlert } from 'lucide-react';
-import { ModeToggle } from '@/components/layout/ModeToggle';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth-store';
@@ -51,10 +50,8 @@ export function AdminHeader() {
           </Link>
         </div>
 
-        {/* Mode Toggle & Actions */}
+        {/* Actions */}
         <div className="flex items-center gap-2">
-          <ModeToggle />
-
           {/* User Menu */}
           <div className="relative" ref={menuRef}>
             <Button
