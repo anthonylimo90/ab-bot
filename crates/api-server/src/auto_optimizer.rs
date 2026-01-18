@@ -499,7 +499,15 @@ impl AutoOptimizer {
         let active_count = current.iter().filter(|a| a.tier == "active").count();
         let empty_slots = 5_usize.saturating_sub(active_count);
 
+        info!(
+            workspace_id = %workspace.id,
+            active_count = active_count,
+            empty_slots = empty_slots,
+            "Checking for empty slots to fill"
+        );
+
         if empty_slots == 0 {
+            info!(workspace_id = %workspace.id, "No empty slots - roster is full");
             return Ok(());
         }
 
@@ -514,6 +522,11 @@ impl AutoOptimizer {
 
         // Get candidate wallets
         let candidates = self.get_candidate_wallets(workspace).await?;
+        info!(
+            workspace_id = %workspace.id,
+            candidate_count = candidates.len(),
+            "Found candidate wallets meeting criteria"
+        );
 
         // Filter out banned and already-in-roster wallets
         let available_candidates: Vec<_> = candidates
@@ -524,13 +537,35 @@ impl AutoOptimizer {
             })
             .collect();
 
+        info!(
+            workspace_id = %workspace.id,
+            available_count = available_candidates.len(),
+            banned_count = banned.len(),
+            roster_count = current.len(),
+            "Filtered available candidates"
+        );
+
         // Rank candidates by composite score
         let ranked = self.rank_candidates(&available_candidates).await?;
 
         // Add top candidates to fill empty slots
         let probation_days = workspace.probation_days.unwrap_or(7);
 
+        if ranked.is_empty() {
+            warn!(
+                workspace_id = %workspace.id,
+                "No candidates available to fill empty slots"
+            );
+        }
+
         for candidate in ranked.iter().take(empty_slots) {
+            info!(
+                workspace_id = %workspace.id,
+                wallet = %candidate.address,
+                score = candidate.total_score,
+                confidence = candidate.confidence,
+                "Adding wallet to active with probation"
+            );
             self.add_to_active_with_probation(workspace.id, &candidate.address, probation_days)
                 .await?;
         }
@@ -882,6 +917,16 @@ impl AutoOptimizer {
         let max_drawdown = workspace
             .max_drawdown_pct
             .unwrap_or(Decimal::new(DEFAULT_MAX_DRAWDOWN as i64, 0));
+
+        debug!(
+            workspace_id = %workspace.id,
+            min_roi = %min_roi,
+            min_sharpe = %min_sharpe,
+            min_win_rate = %min_win_rate,
+            min_trades = min_trades,
+            max_drawdown = %max_drawdown,
+            "Querying candidate wallets with thresholds"
+        );
 
         let candidates: Vec<WalletCandidate> = sqlx::query_as(
             r#"

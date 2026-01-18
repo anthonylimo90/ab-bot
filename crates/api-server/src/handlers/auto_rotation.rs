@@ -333,8 +333,8 @@ pub async fn trigger_optimization(
             .fetch_optional(&state.pool)
             .await?;
 
-    let (auto_optimize_enabled, auto_select_enabled, auto_demote_enabled) = settings
-        .ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
+    let (auto_optimize_enabled, auto_select_enabled, auto_demote_enabled) =
+        settings.ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
 
     // Allow trigger if either old auto_optimize or new auto_select/demote is enabled
     if !auto_optimize_enabled && !auto_select_enabled && !auto_demote_enabled {
