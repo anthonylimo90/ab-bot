@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Building2, Users, ArrowLeft } from 'lucide-react';
+import { Building2, Users } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const navItems = [
@@ -16,17 +16,6 @@ export function AdminSidebar() {
   return (
     <aside className="fixed left-0 top-16 z-30 hidden h-[calc(100vh-4rem)] w-64 border-r bg-background md:block">
       <div className="flex flex-col h-full">
-        {/* Back to Dashboard */}
-        <div className="p-4 border-b">
-          <Link
-            href="/"
-            className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to Dashboard
-          </Link>
-        </div>
-
         {/* Admin Portal Header */}
         <div className="p-4 border-b">
           <h2 className="text-lg font-semibold">Admin Portal</h2>

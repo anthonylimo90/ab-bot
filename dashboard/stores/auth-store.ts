@@ -14,6 +14,7 @@ interface AuthStore {
   logout: () => void;
   checkAuth: () => Promise<void>;
   setHasHydrated: (state: boolean) => void;
+  isPlatformAdmin: () => boolean;
 }
 
 export const useAuthStore = create<AuthStore>()(
@@ -59,6 +60,11 @@ export const useAuthStore = create<AuthStore>()(
           api.clearToken();
           set({ token: null, user: null, isAuthenticated: false, isLoading: false });
         }
+      },
+
+      isPlatformAdmin: () => {
+        const { user } = get();
+        return user?.role === 'Admin';
       },
     }),
     {

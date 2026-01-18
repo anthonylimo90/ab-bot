@@ -1,10 +1,10 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
-import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
+import { ShieldAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -14,10 +14,8 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useToastStore } from '@/stores/toast-store';
 import api from '@/lib/api';
 
-export default function LoginPage() {
+export default function AdminLoginPage() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const redirectTo = searchParams.get('redirect') || '/';
   const [isLoading, setIsLoading] = useState(false);
   const setAuth = useAuthStore((state) => state.setAuth);
   const addToast = useToastStore((state) => state.addToast);
@@ -35,14 +33,14 @@ export default function LoginPage() {
     try {
       const response = await api.login(data.email, data.password);
 
-      // Block admin users from using regular login
-      if (response.user.role === 'Admin') {
+      // Verify user is an admin
+      if (response.user.role !== 'Admin') {
         addToast({
           type: 'error',
           title: 'Access Denied',
-          description: 'Platform administrators must use the Admin Portal login.',
+          description: 'This login is for platform administrators only.',
         });
-        router.push('/admin/login');
+        setIsLoading(false);
         return;
       }
 
@@ -52,7 +50,7 @@ export default function LoginPage() {
         title: 'Welcome back!',
         description: `Signed in as ${response.user.email}`,
       });
-      router.push(redirectTo);
+      router.push('/admin/workspaces');
     } catch (error) {
       addToast({
         type: 'error',
@@ -67,9 +65,12 @@ export default function LoginPage() {
   return (
     <Card className="w-full max-w-md mx-4">
       <CardHeader className="space-y-1">
-        <CardTitle className="text-2xl font-bold text-center">Sign in</CardTitle>
+        <div className="flex items-center justify-center gap-2 mb-2">
+          <ShieldAlert className="h-8 w-8 text-red-500" />
+        </div>
+        <CardTitle className="text-2xl font-bold text-center">Admin Portal</CardTitle>
         <CardDescription className="text-center">
-          Enter your email and password to access your account
+          Sign in with your administrator credentials
         </CardDescription>
       </CardHeader>
       <form onSubmit={handleSubmit(onSubmit)}>
@@ -79,7 +80,7 @@ export default function LoginPage() {
             <Input
               id="email"
               type="email"
-              placeholder="you@example.com"
+              placeholder="admin@example.com"
               autoComplete="email"
               error={!!errors.email}
               {...register('email')}
@@ -89,15 +90,7 @@ export default function LoginPage() {
             )}
           </div>
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label htmlFor="password">Password</Label>
-              <Link
-                href="/forgot-password"
-                className="text-sm text-muted-foreground hover:text-primary"
-              >
-                Forgot password?
-              </Link>
-            </div>
+            <Label htmlFor="password">Password</Label>
             <Input
               id="password"
               type="password"
@@ -113,10 +106,13 @@ export default function LoginPage() {
         </CardContent>
         <CardFooter className="flex flex-col space-y-4">
           <Button type="submit" className="w-full" disabled={isLoading}>
-            {isLoading ? 'Signing in...' : 'Sign in'}
+            {isLoading ? 'Signing in...' : 'Sign in to Admin Portal'}
           </Button>
           <p className="text-sm text-muted-foreground text-center">
-            Contact an administrator for account access.
+            Platform administrators only. Workspace users should use the{' '}
+            <a href="/login" className="text-primary hover:underline">
+              regular login
+            </a>.
           </p>
         </CardFooter>
       </form>
