@@ -326,20 +326,20 @@ pub async fn trigger_optimization(
         ));
     }
 
-    // Check if auto-optimization is enabled
-    let settings: Option<(bool,)> =
-        sqlx::query_as("SELECT auto_optimize_enabled FROM workspaces WHERE id = $1")
+    // Check if auto-optimization is enabled (either old or new automation flags)
+    let settings: Option<(bool, bool, bool)> =
+        sqlx::query_as("SELECT auto_optimize_enabled, auto_select_enabled, auto_demote_enabled FROM workspaces WHERE id = $1")
             .bind(workspace_id)
             .fetch_optional(&state.pool)
             .await?;
 
-    let auto_optimize_enabled = settings
-        .ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?
-        .0;
+    let (auto_optimize_enabled, auto_select_enabled, auto_demote_enabled) = settings
+        .ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
 
-    if !auto_optimize_enabled {
+    // Allow trigger if either old auto_optimize or new auto_select/demote is enabled
+    if !auto_optimize_enabled && !auto_select_enabled && !auto_demote_enabled {
         return Err(ApiError::BadRequest(
-            "Auto-optimization is not enabled for this workspace".into(),
+            "Auto-optimization is not enabled for this workspace. Enable auto-select or auto-demote in settings.".into(),
         ));
     }
 
