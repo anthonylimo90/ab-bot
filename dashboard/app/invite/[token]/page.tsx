@@ -146,7 +146,8 @@ export default function InviteAcceptPage() {
             </div>
           )}
 
-          {isAuthenticated ? (
+          {isAuthenticated && user?.email === inviteInfo?.email ? (
+            // Logged in user matches invite email - can accept directly
             <>
               <p className="text-sm text-center text-muted-foreground">
                 You&apos;re signed in as <span className="font-medium">{user?.email}</span>
@@ -161,6 +162,59 @@ export default function InviteAcceptPage() {
                   'Accept Invite'
                 )}
               </Button>
+            </>
+          ) : isAuthenticated && user?.email !== inviteInfo?.email ? (
+            // Logged in as different user - show warning
+            <>
+              <div className="rounded-md bg-yellow-500/10 border border-yellow-500/20 p-3 text-sm text-yellow-700 dark:text-yellow-400">
+                <p className="font-medium">Email mismatch</p>
+                <p className="mt-1">
+                  This invite is for <span className="font-medium">{inviteInfo?.email}</span>,
+                  but you&apos;re signed in as <span className="font-medium">{user?.email}</span>.
+                </p>
+              </div>
+              <p className="text-sm text-center text-muted-foreground mt-2">
+                Sign out and create an account with the invited email, or use the form below.
+              </p>
+
+              <div className="space-y-4 mt-4">
+                <div className="grid gap-2">
+                  <Label htmlFor="name">Name (optional)</Label>
+                  <Input
+                    id="name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="Your name"
+                  />
+                </div>
+
+                <div className="grid gap-2">
+                  <Label htmlFor="password">Password for new account</Label>
+                  <Input
+                    id="password"
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="Min. 8 characters"
+                    required
+                  />
+                </div>
+
+                <Button
+                  className="w-full"
+                  onClick={handleAccept}
+                  disabled={isAccepting || !password}
+                >
+                  {isAccepting ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Creating Account...
+                    </>
+                  ) : (
+                    `Create Account for ${inviteInfo?.email}`
+                  )}
+                </Button>
+              </div>
             </>
           ) : (
             <>

@@ -631,8 +631,10 @@ export interface CreateInviteRequest {
 export interface InviteInfo {
   workspace_name: string;
   inviter_email: string;
+  email: string;
   role: WorkspaceRole;
   expires_at: string;
+  user_exists: boolean;
 }
 
 export interface AcceptInviteRequest {
