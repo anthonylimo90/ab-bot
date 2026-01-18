@@ -94,20 +94,20 @@ function RosterCard({ wallet }: { wallet: RosterWallet }) {
           <div>
             <p className="text-xs text-muted-foreground">ROI (30d)</p>
             <p className={`font-medium ${wallet.roi30d >= 0 ? 'text-profit' : 'text-loss'}`}>
-              {wallet.roi30d >= 0 ? '+' : ''}{wallet.roi30d}%
+              {wallet.roi30d >= 0 ? '+' : ''}{Number(wallet.roi30d).toFixed(1)}%
             </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Sharpe</p>
-            <p className="font-medium">{wallet.sharpe}</p>
+            <p className="font-medium">{Number(wallet.sharpe).toFixed(2)}</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Win Rate</p>
-            <p className="font-medium">{wallet.winRate}%</p>
+            <p className="font-medium">{Number(wallet.winRate).toFixed(1)}%</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Max DD</p>
-            <p className="font-medium text-loss">{wallet.maxDrawdown}%</p>
+            <p className="font-medium text-loss">{Number(wallet.maxDrawdown).toFixed(1)}%</p>
           </div>
         </div>
 

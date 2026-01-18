@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -25,13 +26,20 @@ import {
   AlertTriangle,
   Users,
   ChevronRight,
+  UserPlus,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import { InviteMemberDialog } from '@/components/workspace/InviteMemberDialog';
+import { MemberList } from '@/components/workspace/MemberList';
+import api from '@/lib/api';
 import Link from 'next/link';
 
 export default function SettingsPage() {
   const toast = useToastStore();
+  const queryClient = useQueryClient();
   const { user } = useAuthStore();
+  const { currentWorkspace } = useWorkspaceStore();
   const {
     risk,
     notifications,
@@ -45,7 +53,38 @@ export default function SettingsPage() {
   } = useSettingsStore();
 
   const [connectWalletOpen, setConnectWalletOpen] = useState(false);
+  const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+
+  // Fetch workspace members
+  const { data: members = [], isLoading: membersLoading } = useQuery({
+    queryKey: ['workspace', currentWorkspace?.id, 'members'],
+    queryFn: () => api.listWorkspaceMembers(currentWorkspace!.id),
+    enabled: !!currentWorkspace?.id,
+  });
+
+  // Fetch pending invites
+  const { data: invites = [], isLoading: invitesLoading } = useQuery({
+    queryKey: ['workspace', currentWorkspace?.id, 'invites'],
+    queryFn: () => api.listWorkspaceInvites(currentWorkspace!.id),
+    enabled: !!currentWorkspace?.id,
+  });
+
+  // Get current user's role in workspace
+  const currentUserRole = currentWorkspace?.my_role;
+  const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
+
+  // Revoke invite mutation
+  const revokeInviteMutation = useMutation({
+    mutationFn: (inviteId: string) => api.revokeInvite(currentWorkspace!.id, inviteId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workspace', currentWorkspace?.id, 'invites'] });
+      toast.success('Invite revoked', 'The invitation has been cancelled');
+    },
+    onError: (err: Error) => {
+      toast.error('Failed to revoke invite', err.message);
+    },
+  });
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -138,6 +177,73 @@ export default function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Team Management */}
+      {currentWorkspace && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <div>
+                <CardTitle className="flex items-center gap-2">
+                  <Users className="h-5 w-5" />
+                  Team
+                </CardTitle>
+                <CardDescription>
+                  Manage workspace members and invitations
+                </CardDescription>
+              </div>
+              {canInvite && (
+                <Button onClick={() => setInviteDialogOpen(true)}>
+                  <UserPlus className="mr-2 h-4 w-4" />
+                  Invite Member
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            {/* Members List */}
+            <div>
+              <h3 className="text-sm font-medium mb-3">Members ({members.length})</h3>
+              {membersLoading ? (
+                <div className="text-center py-4 text-muted-foreground">Loading...</div>
+              ) : (
+                <MemberList
+                  workspaceId={currentWorkspace.id}
+                  members={members}
+                  currentUserRole={currentUserRole}
+                />
+              )}
+            </div>
+
+            {/* Pending Invites (only show if canInvite and has pending) */}
+            {canInvite && invites.filter(i => !i.accepted_at).length > 0 && (
+              <div>
+                <h3 className="text-sm font-medium mb-3">Pending Invitations</h3>
+                <div className="space-y-2">
+                  {invites.filter(i => !i.accepted_at).map(invite => (
+                    <div key={invite.id} className="flex items-center justify-between p-3 rounded-lg border">
+                      <div>
+                        <p className="font-medium">{invite.email}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {invite.role} · Expires {new Date(invite.expires_at).toLocaleDateString()}
+                        </p>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => revokeInviteMutation.mutate(invite.id)}
+                        disabled={revokeInviteMutation.isPending}
+                      >
+                        {revokeInviteMutation.isPending ? 'Revoking...' : 'Revoke'}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* User Management (Platform Admin Only) */}
       {user?.role === 'PlatformAdmin' && (
@@ -400,6 +506,15 @@ export default function SettingsPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Invite Member Dialog */}
+      {currentWorkspace && (
+        <InviteMemberDialog
+          workspaceId={currentWorkspace.id}
+          open={inviteDialogOpen}
+          onOpenChange={setInviteDialogOpen}
+        />
+      )}
     </div>
   );
 }
