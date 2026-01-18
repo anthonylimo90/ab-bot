@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Progress } from '@/components/ui/progress';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -17,17 +18,20 @@ import {
   BarChart3,
   Target,
   Activity,
+  CheckCircle,
 } from 'lucide-react';
+import { useToastStore } from '@/stores/toast-store';
 import api from '@/lib/api';
 import type { AutoSetupConfig, WorkspaceAllocation } from '@/types/api';
 
 interface AutoSetupStepProps {
-  onComplete: () => void;
+  onComplete: (walletCount: number) => void;
   onBack: () => void;
 }
 
 export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
   const queryClient = useQueryClient();
+  const toast = useToastStore();
   const [config, setConfig] = useState<AutoSetupConfig>({
     min_roi_30d: 0.05, // 5%
     min_sharpe: 1.0,
@@ -36,6 +40,7 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
   });
   const [hasRun, setHasRun] = useState(false);
   const [selectedWallets, setSelectedWallets] = useState<string[]>([]);
+  const [analysisProgress, setAnalysisProgress] = useState(0);
 
   // Fetch current allocations
   const { data: allocations } = useQuery({
@@ -44,11 +49,29 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
   });
 
   const autoSetupMutation = useMutation({
-    mutationFn: () => api.runAutoSetup(config),
+    mutationFn: async () => {
+      // Simulate progress updates for better UX
+      setAnalysisProgress(10);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      setAnalysisProgress(30);
+      const result = await api.runAutoSetup(config);
+      setAnalysisProgress(70);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      setAnalysisProgress(100);
+      return result;
+    },
     onSuccess: (data) => {
       setSelectedWallets(data.selected_wallets);
       setHasRun(true);
       queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      toast.success(
+        'Portfolio optimized',
+        `${data.selected_wallets.length} wallets selected for your portfolio`
+      );
+    },
+    onError: (error: Error) => {
+      setAnalysisProgress(0);
+      toast.error('Optimization failed', error.message);
     },
   });
 
@@ -61,13 +84,78 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Automatic Setup</h2>
+        <h2 className="text-2xl font-bold">Guided Portfolio Setup</h2>
         <p className="text-muted-foreground">
-          Configure criteria and let the system select the best wallets
+          Configure criteria and let the system select the best wallets for you
         </p>
       </div>
 
-      {!hasRun ? (
+      {autoSetupMutation.isPending ? (
+        /* Progress Indicator During Analysis */
+        <Card>
+          <CardContent className="py-8">
+            <div className="space-y-6 text-center">
+              <div className="flex justify-center">
+                <div className="relative">
+                  <Wand2 className="h-12 w-12 text-primary animate-pulse" />
+                </div>
+              </div>
+              <div>
+                <h3 className="text-lg font-medium mb-2">Analyzing Wallets...</h3>
+                <Progress value={analysisProgress} className="h-2 max-w-xs mx-auto" />
+              </div>
+              <ul className="text-sm space-y-2 text-left max-w-xs mx-auto">
+                <li className="flex items-center gap-2">
+                  {analysisProgress >= 10 ? (
+                    <CheckCircle className="h-4 w-4 text-green-500" />
+                  ) : (
+                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                  )}
+                  <span className={analysisProgress >= 10 ? '' : 'text-muted-foreground'}>
+                    Fetching wallet candidates
+                  </span>
+                </li>
+                <li className="flex items-center gap-2">
+                  {analysisProgress >= 30 ? (
+                    <CheckCircle className="h-4 w-4 text-green-500" />
+                  ) : analysisProgress >= 10 ? (
+                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                  ) : (
+                    <div className="h-4 w-4 rounded-full border-2 border-muted-foreground" />
+                  )}
+                  <span className={analysisProgress >= 30 ? '' : 'text-muted-foreground'}>
+                    Analyzing 30-day performance
+                  </span>
+                </li>
+                <li className="flex items-center gap-2">
+                  {analysisProgress >= 70 ? (
+                    <CheckCircle className="h-4 w-4 text-green-500" />
+                  ) : analysisProgress >= 30 ? (
+                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                  ) : (
+                    <div className="h-4 w-4 rounded-full border-2 border-muted-foreground" />
+                  )}
+                  <span className={analysisProgress >= 70 ? '' : 'text-muted-foreground'}>
+                    Running backtests
+                  </span>
+                </li>
+                <li className="flex items-center gap-2">
+                  {analysisProgress >= 100 ? (
+                    <CheckCircle className="h-4 w-4 text-green-500" />
+                  ) : analysisProgress >= 70 ? (
+                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                  ) : (
+                    <div className="h-4 w-4 rounded-full border-2 border-muted-foreground" />
+                  )}
+                  <span className={analysisProgress >= 100 ? '' : 'text-muted-foreground'}>
+                    Selecting optimal portfolio
+                  </span>
+                </li>
+              </ul>
+            </div>
+          </CardContent>
+        </Card>
+      ) : !hasRun ? (
         <>
           {/* Criteria Configuration */}
           <Card>
@@ -155,26 +243,16 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
           </Card>
 
           {/* Run Auto-Setup */}
-          <div className="text-center">
+          <div className="text-center space-y-3">
             <Button
               size="lg"
               onClick={() => autoSetupMutation.mutate()}
-              disabled={autoSetupMutation.isPending}
             >
-              {autoSetupMutation.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                  Analyzing Wallets...
-                </>
-              ) : (
-                <>
-                  <Wand2 className="mr-2 h-5 w-5" />
-                  Run Auto-Setup
-                </>
-              )}
+              <Wand2 className="mr-2 h-5 w-5" />
+              Optimize My Portfolio
             </Button>
-            <p className="text-sm text-muted-foreground mt-2">
-              This will analyze top wallets and select the best 5
+            <p className="text-sm text-muted-foreground">
+              The system will analyze top wallets and select the best performers
             </p>
           </div>
         </>
@@ -188,7 +266,7 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
                 Auto-Setup Complete
               </CardTitle>
               <CardDescription>
-                {selectedWallets.length} wallets selected for your Active 5
+                {selectedWallets.length} wallets selected for your Active portfolio
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -223,13 +301,16 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
 
       {/* Navigation */}
       <div className="flex justify-between pt-4">
-        <Button variant="outline" onClick={onBack}>
+        <Button variant="outline" onClick={onBack} disabled={autoSetupMutation.isPending}>
           <ArrowLeft className="mr-2 h-4 w-4" />
           Back
         </Button>
-        <Button onClick={onComplete} disabled={!hasRun}>
+        <Button
+          onClick={() => onComplete(activeAllocations.length)}
+          disabled={!hasRun || autoSetupMutation.isPending}
+        >
           <Check className="mr-2 h-4 w-4" />
-          Complete Setup
+          Complete Setup ({activeAllocations.length} wallet{activeAllocations.length !== 1 ? 's' : ''})
         </Button>
       </div>
     </div>

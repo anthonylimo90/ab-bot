@@ -3,6 +3,7 @@ import { Inter } from 'next/font/google';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { ToastProvider } from '@/components/shared/ToastProvider';
 import { QueryProvider } from '@/providers/QueryProvider';
+import { WorkspaceProvider } from '@/providers/WorkspaceProvider';
 import { AuthGuard } from '@/components/auth/AuthGuard';
 import { AppShell } from '@/components/layout/AppShell';
 import './globals.css';
@@ -25,7 +26,9 @@ export default function RootLayout({
         <QueryProvider>
           <TooltipProvider>
             <AuthGuard>
-              <AppShell>{children}</AppShell>
+              <WorkspaceProvider>
+                <AppShell>{children}</AppShell>
+              </WorkspaceProvider>
             </AuthGuard>
             <ToastProvider />
           </TooltipProvider>

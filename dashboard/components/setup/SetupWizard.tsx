@@ -6,10 +6,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
-import { CheckCircle, ArrowRight, ArrowLeft, Wand2, Settings2 } from 'lucide-react';
+import { CheckCircle, ArrowRight, ArrowLeft, Wand2, Settings2, Target, Clock, Eye, Wallet, TrendingUp, BarChart3 } from 'lucide-react';
 import { BudgetStep } from './BudgetStep';
 import { WalletSelectionStep } from './WalletSelectionStep';
 import { AutoSetupStep } from './AutoSetupStep';
+import { useToastStore } from '@/stores/toast-store';
 import api from '@/lib/api';
 import type { SetupMode, OnboardingStatus } from '@/types/api';
 
@@ -22,15 +23,21 @@ interface SetupWizardProps {
 export function SetupWizard({ initialStatus }: SetupWizardProps) {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const toast = useToastStore();
   const [step, setStep] = useState<WizardStep>('mode');
   const [mode, setMode] = useState<SetupMode>(initialStatus.setup_mode);
   const [budget, setBudget] = useState(initialStatus.total_budget);
   const [reservedPct, setReservedPct] = useState(20);
+  const [activeWalletCount, setActiveWalletCount] = useState(0);
 
   const setModeMutation = useMutation({
     mutationFn: (newMode: SetupMode) => api.setOnboardingMode(newMode),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['onboarding', 'status'] });
+      toast.success('Mode selected', `${mode === 'automatic' ? 'Guided' : 'Custom'} mode enabled`);
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to set mode', error.message);
     },
   });
 
@@ -38,6 +45,10 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
     mutationFn: () => api.setOnboardingBudget({ total_budget: budget, reserved_cash_pct: reservedPct }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['onboarding', 'status'] });
+      toast.success('Budget configured', 'Your trading budget has been set');
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to set budget', error.message);
     },
   });
 
@@ -45,7 +56,11 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
     mutationFn: () => api.completeOnboarding(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['onboarding', 'status'] });
+      toast.success('Setup complete', 'Welcome to AB-Bot!');
       router.push('/');
+    },
+    onError: (error: Error) => {
+      toast.error('Failed to complete setup', error.message);
     },
   });
 
@@ -68,11 +83,13 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
     }
   };
 
-  const handleWalletsComplete = () => {
+  const handleWalletsComplete = (walletCount: number) => {
+    setActiveWalletCount(walletCount);
     setStep('complete');
   };
 
-  const handleAutoComplete = () => {
+  const handleAutoComplete = (walletCount: number) => {
+    setActiveWalletCount(walletCount);
     setStep('complete');
   };
 
@@ -104,51 +121,79 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
         return (
           <div className="space-y-6">
             <div className="text-center space-y-2">
-              <h2 className="text-2xl font-bold">Choose Your Setup Mode</h2>
+              <h2 className="text-2xl font-bold">How do you want to manage your portfolio?</h2>
               <p className="text-muted-foreground">
-                How would you like to configure your wallet roster?
+                Choose the management style that fits your trading approach
               </p>
             </div>
 
             <div className="grid gap-4 md:grid-cols-2">
               <Card
-                className="cursor-pointer transition-all hover:border-primary"
-                onClick={() => handleModeSelect('manual')}
+                className={`cursor-pointer transition-all hover:border-primary hover:shadow-md ${setModeMutation.isPending ? 'opacity-50 pointer-events-none' : ''}`}
+                onClick={() => handleModeSelect('automatic')}
               >
                 <CardHeader>
-                  <Settings2 className="h-10 w-10 text-primary mb-2" />
-                  <CardTitle>Manual Setup</CardTitle>
+                  <div className="flex items-center justify-between">
+                    <Target className="h-10 w-10 text-primary" />
+                    <span className="text-xs bg-primary/10 text-primary px-2 py-1 rounded-full font-medium">
+                      Recommended
+                    </span>
+                  </div>
+                  <CardTitle className="mt-2">Guided</CardTitle>
                   <CardDescription>
-                    Browse discovered wallets, select your favorites, and configure allocations
-                    yourself.
+                    Best for most users. System analyzes wallets and optimizes your portfolio.
                   </CardDescription>
                 </CardHeader>
-                <CardContent>
-                  <ul className="text-sm text-muted-foreground space-y-1">
-                    <li>- Full control over wallet selection</li>
-                    <li>- Custom allocation percentages</li>
-                    <li>- Manual bench management</li>
+                <CardContent className="space-y-3">
+                  <ul className="text-sm space-y-2">
+                    <li className="flex items-center gap-2">
+                      <BarChart3 className="h-4 w-4 text-muted-foreground" />
+                      System analyzes wallet performance
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <TrendingUp className="h-4 w-4 text-muted-foreground" />
+                      Optimizes selection automatically
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <Clock className="h-4 w-4 text-muted-foreground" />
+                      Auto-rebalances weekly
+                    </li>
                   </ul>
+                  <p className="text-xs text-muted-foreground pt-2 border-t">
+                    Quick setup - get started in minutes
+                  </p>
                 </CardContent>
               </Card>
 
               <Card
-                className="cursor-pointer transition-all hover:border-primary"
-                onClick={() => handleModeSelect('automatic')}
+                className={`cursor-pointer transition-all hover:border-primary hover:shadow-md ${setModeMutation.isPending ? 'opacity-50 pointer-events-none' : ''}`}
+                onClick={() => handleModeSelect('manual')}
               >
                 <CardHeader>
-                  <Wand2 className="h-10 w-10 text-primary mb-2" />
-                  <CardTitle>Automatic Setup</CardTitle>
+                  <Settings2 className="h-10 w-10 text-muted-foreground" />
+                  <CardTitle className="mt-2">Custom</CardTitle>
                   <CardDescription>
-                    Let the system analyze and select the best performing wallets using backtesting.
+                    For experienced traders. Full control over wallet selection and allocations.
                   </CardDescription>
                 </CardHeader>
-                <CardContent>
-                  <ul className="text-sm text-muted-foreground space-y-1">
-                    <li>- AI-powered wallet selection</li>
-                    <li>- Optimal allocation calculation</li>
-                    <li>- Continuous auto-optimization</li>
+                <CardContent className="space-y-3">
+                  <ul className="text-sm space-y-2">
+                    <li className="flex items-center gap-2">
+                      <Eye className="h-4 w-4 text-muted-foreground" />
+                      Browse all available wallets
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <Wallet className="h-4 w-4 text-muted-foreground" />
+                      Choose your own portfolio
+                    </li>
+                    <li className="flex items-center gap-2">
+                      <Settings2 className="h-4 w-4 text-muted-foreground" />
+                      Full manual control
+                    </li>
                   </ul>
+                  <p className="text-xs text-muted-foreground pt-2 border-t">
+                    More setup time - fully customizable
+                  </p>
                 </CardContent>
               </Card>
             </div>
@@ -185,19 +230,95 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
         );
 
       case 'complete':
+        const tradingCapital = budget * ((100 - reservedPct) / 100);
+        const reservedAmount = budget * (reservedPct / 100);
+        const perWalletAmount = activeWalletCount > 0 ? tradingCapital / activeWalletCount : 0;
+
         return (
-          <div className="text-center space-y-6">
-            <CheckCircle className="h-16 w-16 text-green-500 mx-auto" />
-            <div className="space-y-2">
-              <h2 className="text-2xl font-bold">Setup Complete!</h2>
-              <p className="text-muted-foreground">
-                Your workspace is configured and ready to use.
-              </p>
+          <div className="space-y-6">
+            <div className="text-center space-y-4">
+              <div className="flex h-16 w-16 items-center justify-center rounded-full bg-green-100 mx-auto">
+                <CheckCircle className="h-10 w-10 text-green-600" />
+              </div>
+              <div className="space-y-2">
+                <h2 className="text-2xl font-bold">You&apos;re Ready to Trade!</h2>
+                <p className="text-muted-foreground">
+                  Your portfolio has been configured and monitoring has started.
+                </p>
+              </div>
             </div>
-            <Button size="lg" onClick={handleFinish} disabled={completeMutation.isPending}>
-              {completeMutation.isPending ? 'Finishing...' : 'Go to Dashboard'}
-              <ArrowRight className="ml-2 h-4 w-4" />
-            </Button>
+
+            {/* Portfolio Summary */}
+            <div className="rounded-lg border bg-muted/30 p-4 space-y-4">
+              <h3 className="font-medium text-sm text-muted-foreground">Your Portfolio Summary</h3>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <p className="text-sm text-muted-foreground">Total Budget</p>
+                  <p className="text-lg font-semibold">${budget.toLocaleString()}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Trading Capital</p>
+                  <p className="text-lg font-semibold text-green-600">${tradingCapital.toLocaleString()}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Reserved Cash</p>
+                  <p className="text-lg font-semibold">${reservedAmount.toLocaleString()}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Active Wallets</p>
+                  <p className="text-lg font-semibold">{activeWalletCount} wallet{activeWalletCount !== 1 ? 's' : ''}</p>
+                </div>
+              </div>
+              {activeWalletCount > 0 && (
+                <div className="pt-2 border-t">
+                  <p className="text-sm text-muted-foreground">
+                    ~${perWalletAmount.toLocaleString(undefined, { maximumFractionDigits: 0 })} allocated per wallet
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* What Happens Next */}
+            <div className="rounded-lg border p-4 space-y-3">
+              <h3 className="font-medium">What happens next?</h3>
+              <ul className="space-y-3">
+                <li className="flex items-start gap-3">
+                  <div className="flex h-6 w-6 items-center justify-center rounded-full bg-green-100 text-green-600 text-xs font-medium shrink-0">
+                    1
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium">Monitoring has started</p>
+                    <p className="text-xs text-muted-foreground">We&apos;re watching your selected wallets for trades</p>
+                  </div>
+                </li>
+                <li className="flex items-start gap-3">
+                  <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-muted-foreground text-xs font-medium shrink-0">
+                    2
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium">Trades will be copied</p>
+                    <p className="text-xs text-muted-foreground">When monitored wallets trade, we&apos;ll mirror their positions</p>
+                  </div>
+                </li>
+                <li className="flex items-start gap-3">
+                  <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-muted-foreground text-xs font-medium shrink-0">
+                    3
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium">Track your performance</p>
+                    <p className="text-xs text-muted-foreground">Check the dashboard daily to monitor your positions</p>
+                  </div>
+                </li>
+              </ul>
+            </div>
+
+            {/* Actions */}
+            <div className="flex flex-col sm:flex-row gap-3 pt-2">
+              <Button size="lg" className="flex-1" onClick={handleFinish} disabled={completeMutation.isPending}>
+                {completeMutation.isPending ? 'Finishing...' : 'Go to Dashboard'}
+                <ArrowRight className="ml-2 h-4 w-4" />
+              </Button>
+            </div>
           </div>
         );
     }

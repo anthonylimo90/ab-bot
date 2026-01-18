@@ -186,7 +186,7 @@ export default function RosterPage() {
         <div>
           <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
             <Users className="h-8 w-8" />
-            Active 5
+            Active
           </h1>
           <p className="text-muted-foreground">
             Your top-tier wallets being actively copied

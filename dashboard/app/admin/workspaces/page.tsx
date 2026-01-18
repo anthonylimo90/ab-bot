@@ -51,7 +51,7 @@ export default function AdminWorkspacesPage() {
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Manual Mode</CardTitle>
+            <CardTitle className="text-sm font-medium">Custom Mode</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
@@ -61,7 +61,7 @@ export default function AdminWorkspacesPage() {
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Automatic Mode</CardTitle>
+            <CardTitle className="text-sm font-medium">Guided Mode</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">

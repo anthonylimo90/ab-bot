@@ -1,8 +1,7 @@
 'use client';
 
 import { useWorkspaceStore } from '@/stores/workspace-store';
-import { ManualDashboard } from '@/components/manual/ManualDashboard';
-import { AutomaticDashboard } from '@/components/automatic/AutomaticDashboard';
+import { DashboardHome } from '@/components/dashboard/DashboardHome';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Card, CardContent } from '@/components/ui/card';
 
@@ -19,17 +18,9 @@ export default function DashboardPage() {
     return <DashboardSkeleton />;
   }
 
-  // No workspace selected - show manual dashboard as default
-  if (!currentWorkspace) {
-    return <ManualDashboard />;
-  }
-
-  // Route based on setup_mode
-  if (currentWorkspace.setup_mode === 'automatic') {
-    return <AutomaticDashboard />;
-  }
-
-  return <ManualDashboard />;
+  // The WorkspaceGate in AppShell handles the no-workspace case
+  // Just render the unified dashboard
+  return <DashboardHome />;
 }
 
 function DashboardSkeleton() {

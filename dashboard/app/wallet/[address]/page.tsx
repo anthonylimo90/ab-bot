@@ -168,7 +168,7 @@ export default function WalletDetailPage() {
       return;
     }
     promoteToActive(address);
-    toast.success('Promoted!', `${shortenAddress(address)} added to Active 5`);
+    toast.success('Promoted!', `${shortenAddress(address)} added to Active`);
   };
 
   const handleDemote = () => {
@@ -199,11 +199,11 @@ export default function WalletDetailPage() {
         <div className="flex items-center gap-2">
           {isActive ? (
             <span className="px-3 py-1 rounded-full bg-primary text-primary-foreground text-sm font-medium">
-              Active 5
+              Active
             </span>
           ) : isBench ? (
             <span className="px-3 py-1 rounded-full bg-muted text-muted-foreground text-sm font-medium">
-              Bench
+              Watching
             </span>
           ) : (
             <span className="px-3 py-1 rounded-full bg-muted text-muted-foreground text-sm font-medium">

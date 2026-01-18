@@ -200,7 +200,7 @@ export function CopyWalletModal({
                           : 'border-border hover:border-muted-foreground'
                       } ${!canAddToActive ? 'opacity-50 cursor-not-allowed' : ''}`}
                     >
-                      <div className="font-medium">Active 5</div>
+                      <div className="font-medium">Active</div>
                       <div className="text-xs text-muted-foreground">
                         {canAddToActive
                           ? `${slotsRemaining} slot${slotsRemaining !== 1 ? 's' : ''} available`
@@ -216,7 +216,7 @@ export function CopyWalletModal({
                           : 'border-border hover:border-muted-foreground'
                       }`}
                     >
-                      <div className="font-medium">Bench</div>
+                      <div className="font-medium">Watching</div>
                       <div className="text-xs text-muted-foreground">
                         Monitor & evaluate
                       </div>
@@ -227,7 +227,7 @@ export function CopyWalletModal({
               {!canAddToActive && tier === 'bench' && (
                 <p className="text-xs text-muted-foreground flex items-center gap-1">
                   <AlertTriangle className="h-3 w-3" />
-                  Active roster is full. Demote a wallet first to add to Active 5.
+                  Active roster is full. Demote a wallet first to add to Active.
                 </p>
               )}
             </div>
@@ -360,7 +360,7 @@ export function CopyWalletModal({
               Cancel
             </Button>
             <Button type="submit">
-              {tier === 'active' ? 'Add to Active 5' : 'Add to Bench'}
+              {tier === 'active' ? 'Add to Active' : 'Add to Watching'}
             </Button>
           </DialogFooter>
         </form>

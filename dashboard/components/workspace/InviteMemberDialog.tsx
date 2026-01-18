@@ -116,7 +116,7 @@ export function InviteMemberDialog({
                     <div className="flex flex-col">
                       <span>Admin</span>
                       <span className="text-xs text-muted-foreground">
-                        Can modify roster and manage members
+                        Can modify wallets and manage members
                       </span>
                     </div>
                   </SelectItem>

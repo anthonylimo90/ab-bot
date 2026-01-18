@@ -145,7 +145,7 @@ export default function BenchPage() {
 
   const handlePromote = async (address: string) => {
     if (isRosterFull()) {
-      toast.error('Roster Full', 'Demote a wallet from Active 5 first');
+      toast.error('Roster Full', 'Demote a wallet from Active first');
       return;
     }
 
@@ -153,7 +153,7 @@ export default function BenchPage() {
     await new Promise((r) => setTimeout(r, 500));
 
     promoteToActive(address);
-    toast.success('Promoted!', `${shortenAddress(address)} added to Active 5`);
+    toast.success('Promoted!', `${shortenAddress(address)} added to Active`);
     setLoadingStates((prev) => ({ ...prev, [address]: false }));
   };
 
@@ -202,7 +202,7 @@ export default function BenchPage() {
       addToBench(rosterWallet);
     }
 
-    const tierLabel = settings.tier === 'active' ? 'Active 5' : 'Bench';
+    const tierLabel = settings.tier === 'active' ? 'Active' : 'Watching';
     toast.success(`Added to ${tierLabel}`, `${shortenAddress(settings.address)} is now ${settings.tier === 'active' ? 'being copied' : 'being monitored'}`);
     setCopyModalOpen(false);
     setSelectedWallet(null);
@@ -215,10 +215,10 @@ export default function BenchPage() {
         <div>
           <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
             <UserCheck className="h-8 w-8" />
-            Bench
+            Watching
           </h1>
           <p className="text-muted-foreground">
-            Monitor and evaluate wallets before adding to your Active 5
+            Monitor and evaluate wallets before adding to your Active portfolio
           </p>
         </div>
       </div>

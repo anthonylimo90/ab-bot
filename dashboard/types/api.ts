@@ -510,6 +510,7 @@ export interface Workspace {
   min_trades_30d?: number;
   trading_wallet_address?: string;
   my_role: WorkspaceRole;
+  onboarding_completed?: boolean;
   created_by?: string;
   created_at: string;
   updated_at: string;
@@ -522,6 +523,7 @@ export interface WorkspaceListItem {
   setup_mode: SetupMode;
   owner_email?: string;
   member_count: number;
+  my_role?: WorkspaceRole;
   created_at: string;
 }
 

@@ -234,7 +234,7 @@ export default function DiscoverPage() {
     max_position_size: number;
     tier: 'active' | 'bench';
   }) => {
-    const tierLabel = settings.tier === 'active' ? 'Active 5' : 'Bench';
+    const tierLabel = settings.tier === 'active' ? 'Active' : 'Watching';
     toast.success(
       `Wallet added to ${tierLabel}`,
       `${shortenAddress(settings.address)} is now being ${settings.tier === 'active' ? 'copied' : 'monitored'}`
