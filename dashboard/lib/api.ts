@@ -41,6 +41,10 @@ import type {
   SetupMode,
   WorkspaceRole,
   OptimizerStatus,
+  DemoPosition,
+  CreateDemoPositionRequest,
+  UpdateDemoPositionRequest,
+  DemoBalance,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -625,6 +629,53 @@ class ApiClient {
   async completeOnboarding(): Promise<OnboardingStatus> {
     return this.request<OnboardingStatus>('/api/v1/onboarding/complete', {
       method: 'PUT',
+    });
+  }
+
+  // Demo Positions
+  async listDemoPositions(params?: {
+    status?: 'open' | 'closed' | 'all';
+  }): Promise<DemoPosition[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.status) searchParams.set('status', params.status);
+    const query = searchParams.toString();
+    return this.request<DemoPosition[]>(`/api/v1/demo/positions${query ? `?${query}` : ''}`);
+  }
+
+  async createDemoPosition(params: CreateDemoPositionRequest): Promise<DemoPosition> {
+    return this.request<DemoPosition>('/api/v1/demo/positions', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async updateDemoPosition(positionId: string, params: UpdateDemoPositionRequest): Promise<DemoPosition> {
+    return this.request<DemoPosition>(`/api/v1/demo/positions/${positionId}`, {
+      method: 'PUT',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async deleteDemoPosition(positionId: string): Promise<void> {
+    return this.request<void>(`/api/v1/demo/positions/${positionId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getDemoBalance(): Promise<DemoBalance> {
+    return this.request<DemoBalance>('/api/v1/demo/balance');
+  }
+
+  async updateDemoBalance(balance: number): Promise<DemoBalance> {
+    return this.request<DemoBalance>('/api/v1/demo/balance', {
+      method: 'PUT',
+      body: JSON.stringify({ balance }),
+    });
+  }
+
+  async resetDemoPortfolio(): Promise<DemoBalance> {
+    return this.request<DemoBalance>('/api/v1/demo/reset', {
+      method: 'POST',
     });
   }
 }

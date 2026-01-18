@@ -11,7 +11,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health, invites,
+    admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health, invites,
     markets, onboarding, positions, recommendations, trading, users, vault, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
@@ -108,6 +108,14 @@ use crate::websocket;
         onboarding::set_budget,
         onboarding::auto_setup,
         onboarding::complete_onboarding,
+        // Demo positions
+        demo::list_demo_positions,
+        demo::create_demo_position,
+        demo::update_demo_position,
+        demo::delete_demo_position,
+        demo::get_demo_balance,
+        demo::update_demo_balance,
+        demo::reset_demo_portfolio,
     ),
     components(
         schemas(
@@ -194,6 +202,12 @@ use crate::websocket;
             onboarding::AutoSetupRequest,
             onboarding::AutoSetupResponse,
             onboarding::AutoSelectedWallet,
+            // Demo
+            demo::DemoPositionResponse,
+            demo::CreateDemoPositionRequest,
+            demo::UpdateDemoPositionRequest,
+            demo::DemoBalanceResponse,
+            demo::UpdateDemoBalanceRequest,
         )
     ),
     tags(
@@ -214,6 +228,7 @@ use crate::websocket;
         (name = "allocations", description = "Wallet roster allocations"),
         (name = "auto_rotation", description = "Auto-rotation history and optimization"),
         (name = "onboarding", description = "Setup wizard and onboarding"),
+        (name = "demo", description = "Demo trading positions and balance"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -355,6 +370,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Onboarding status (read for all)
         .route("/api/v1/onboarding/status", get(onboarding::get_status))
+        // Demo positions (read for all workspace members)
+        .route("/api/v1/demo/positions", get(demo::list_demo_positions))
+        .route("/api/v1/demo/balance", get(demo::get_demo_balance))
         // Apply auth middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -456,6 +474,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/onboarding/complete",
             put(onboarding::complete_onboarding),
         )
+        // Demo positions (write requires trader role)
+        .route("/api/v1/demo/positions", post(demo::create_demo_position))
+        .route(
+            "/api/v1/demo/positions/:position_id",
+            put(demo::update_demo_position),
+        )
+        .route(
+            "/api/v1/demo/positions/:position_id",
+            delete(demo::delete_demo_position),
+        )
+        .route("/api/v1/demo/balance", put(demo::update_demo_balance))
+        .route("/api/v1/demo/reset", post(demo::reset_demo_portfolio))
         // Apply trader check first, then auth
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

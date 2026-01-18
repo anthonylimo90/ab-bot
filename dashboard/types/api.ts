@@ -708,3 +708,50 @@ export interface OptimizerStatus {
   bench_wallet_count: number;
   portfolio_metrics: OptimizerPortfolioMetrics;
 }
+
+// Demo position types
+export interface DemoPosition {
+  id: string;
+  workspace_id: string;
+  created_by: string;
+  wallet_address: string;
+  wallet_label?: string;
+  market_id: string;
+  market_question?: string;
+  outcome: 'yes' | 'no';
+  quantity: number;
+  entry_price: number;
+  current_price?: number;
+  opened_at: string;
+  closed_at?: string;
+  exit_price?: number;
+  realized_pnl?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateDemoPositionRequest {
+  wallet_address: string;
+  wallet_label?: string;
+  market_id: string;
+  market_question?: string;
+  outcome: 'yes' | 'no';
+  quantity: number;
+  entry_price: number;
+  current_price?: number;
+  opened_at: string;
+}
+
+export interface UpdateDemoPositionRequest {
+  current_price?: number;
+  closed_at?: string;
+  exit_price?: number;
+  realized_pnl?: number;
+}
+
+export interface DemoBalance {
+  workspace_id: string;
+  balance: number;
+  initial_balance: number;
+  updated_at: string;
+}

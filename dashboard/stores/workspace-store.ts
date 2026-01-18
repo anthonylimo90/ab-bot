@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { Workspace, WorkspaceListItem } from '@/types/api';
 import api from '@/lib/api';
+import { useDemoPortfolioStore } from './demo-portfolio-store';
 
 interface WorkspaceStore {
   workspaces: WorkspaceListItem[];
@@ -49,6 +50,11 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
         try {
           const workspace = await api.getCurrentWorkspace();
           set({ currentWorkspace: workspace, isLoading: false });
+
+          // Sync demo positions for current workspace
+          const demoStore = useDemoPortfolioStore.getState();
+          demoStore.setWorkspaceId(workspace.id);
+          demoStore.fetchAll();
         } catch (err) {
           // If 404, user has no workspace set
           if (err instanceof Error && err.message.includes('No workspace set')) {
@@ -69,6 +75,11 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
           // Fetch the new current workspace details
           const workspace = await api.getWorkspace(workspaceId);
           set({ currentWorkspace: workspace, isLoading: false });
+
+          // Sync demo positions for new workspace
+          const demoStore = useDemoPortfolioStore.getState();
+          demoStore.setWorkspaceId(workspaceId);
+          demoStore.fetchAll();
         } catch (err) {
           set({
             error: err instanceof Error ? err.message : 'Failed to switch workspace',
