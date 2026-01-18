@@ -117,8 +117,8 @@ class ApiClient {
       throw new Error(error.message || `HTTP ${response.status}`);
     }
 
-    // Handle 204 No Content
-    if (response.status === 204) {
+    // Handle 204 No Content and 202 Accepted (no body)
+    if (response.status === 204 || response.status === 202) {
       return undefined as T;
     }
 
