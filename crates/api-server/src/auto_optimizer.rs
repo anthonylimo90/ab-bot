@@ -885,14 +885,14 @@ impl AutoOptimizer {
 
         let candidates: Vec<WalletCandidate> = sqlx::query_as(
             r#"
-            SELECT address, roi_30d, sharpe_30d, win_rate_30d, trade_count_30d,
+            SELECT address, roi_30d, sharpe_30d, win_rate_30d, trades_30d AS trade_count_30d,
                    max_drawdown_30d, last_trade_at
             FROM wallet_success_metrics
             WHERE enabled = true
               AND COALESCE(roi_30d, 0) >= $1
               AND COALESCE(sharpe_30d, 0) >= $2
               AND COALESCE(win_rate_30d, 0) >= $3
-              AND COALESCE(trade_count_30d, 0) >= $4
+              AND COALESCE(trades_30d, 0) >= $4
               AND COALESCE(max_drawdown_30d, 100) <= $5
             ORDER BY COALESCE(roi_30d, 0) DESC
             LIMIT 50
