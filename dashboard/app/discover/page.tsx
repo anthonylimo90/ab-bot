@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import { Skeleton } from '@/components/ui/skeleton';
 import {
   Select,
   SelectContent,
@@ -11,106 +12,46 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { EquityCurve } from '@/components/charts/EquityCurve';
 import { CopyWalletModal } from '@/components/modals/CopyWalletModal';
+import { useDiscoverWalletsQuery } from '@/hooks/queries/useDiscoverQuery';
 import { useToastStore } from '@/stores/toast-store';
-import { formatCurrency, shortenAddress } from '@/lib/utils';
-import { Star, Plus, Check, Loader2 } from 'lucide-react';
-import type { CopyBehavior } from '@/types/api';
+import { useRosterStore, createRosterWallet } from '@/stores/roster-store';
+import { shortenAddress } from '@/lib/utils';
+import { Star, Plus, Check, Loader2, Search } from 'lucide-react';
+import type { CopyBehavior, DiscoveredWallet, PredictionCategory } from '@/types/api';
 
-// Generate mock equity curve data
-function generateEquityCurve(days: number, roi: number) {
-  const data: { time: string; value: number }[] = [];
-  let value = 100;
-  const dailyReturn = Math.pow(1 + roi / 100, 1 / days) - 1;
-  const now = new Date();
-
-  for (let i = days; i >= 0; i--) {
-    const date = new Date(now);
-    date.setDate(date.getDate() - i);
-    const randomFactor = 1 + (Math.random() - 0.5) * 0.04;
-    value = value * (1 + dailyReturn) * randomFactor;
-    data.push({
-      time: date.toISOString().split('T')[0],
-      value: Math.round(value * 100) / 100,
-    });
-  }
-  return data;
+// Transform API wallet to component format
+interface DisplayWallet {
+  address: string;
+  rank: number;
+  roi30d: number;
+  roi7d: number;
+  roi90d: number;
+  sharpe: number;
+  trades: number;
+  winRate: number;
+  maxDrawdown: number;
+  prediction: PredictionCategory;
+  confidence: number;
+  tracked: boolean;
 }
 
-// Mock data - extended with more properties
-const initialMockWallets = [
-  {
-    address: '0x1234567890abcdef1234567890abcdef12345678',
-    rank: 1,
-    roi30d: 47.3,
-    roi7d: 12.1,
-    roi90d: 89.2,
-    sharpe: 2.4,
-    trades: 156,
-    winRate: 71,
-    maxDrawdown: -8.2,
-    prediction: 'HIGH_POTENTIAL' as const,
-    confidence: 85,
-    tracked: false,
-  },
-  {
-    address: '0xabcdef1234567890abcdef1234567890abcdef12',
-    rank: 2,
-    roi30d: 38.1,
-    roi7d: 8.4,
-    roi90d: 72.5,
-    sharpe: 1.9,
-    trades: 89,
-    winRate: 68,
-    maxDrawdown: -12.1,
-    prediction: 'MODERATE' as const,
-    confidence: 72,
-    tracked: true,
-  },
-  {
-    address: '0x5678901234abcdef5678901234abcdef56789012',
-    rank: 3,
-    roi30d: 29.4,
-    roi7d: 5.2,
-    roi90d: 54.8,
-    sharpe: 1.5,
-    trades: 234,
-    winRate: 64,
-    maxDrawdown: -15.3,
-    prediction: 'MODERATE' as const,
-    confidence: 65,
-    tracked: false,
-  },
-  {
-    address: '0x9876543210fedcba9876543210fedcba98765432',
-    rank: 4,
-    roi30d: 22.8,
-    roi7d: 3.1,
-    roi90d: 41.2,
-    sharpe: 1.3,
-    trades: 78,
-    winRate: 61,
-    maxDrawdown: -18.5,
-    prediction: 'LOW_POTENTIAL' as const,
-    confidence: 52,
-    tracked: false,
-  },
-  {
-    address: '0xfedcba9876543210fedcba9876543210fedcba98',
-    rank: 5,
-    roi30d: 18.5,
-    roi7d: 2.8,
-    roi90d: 35.1,
-    sharpe: 1.1,
-    trades: 45,
-    winRate: 53,
-    maxDrawdown: -22.1,
-    prediction: 'LOW_POTENTIAL' as const,
-    confidence: 45,
-    tracked: false,
-  },
-];
+function toDisplayWallet(w: DiscoveredWallet, rank: number): DisplayWallet {
+  return {
+    address: w.address,
+    rank,
+    roi30d: w.roi_30d,
+    roi7d: w.roi_7d,
+    roi90d: w.roi_90d,
+    sharpe: w.sharpe_ratio,
+    trades: w.total_trades,
+    winRate: w.win_rate,
+    maxDrawdown: w.max_drawdown,
+    prediction: w.prediction,
+    confidence: w.confidence,
+    tracked: w.is_tracked,
+  };
+}
 
 const predictionColors = {
   HIGH_POTENTIAL: 'text-profit bg-profit/10',
@@ -131,6 +72,7 @@ type TimePeriod = '7d' | '30d' | '90d';
 
 export default function DiscoverPage() {
   const toast = useToastStore();
+  const { activeWallets, benchWallets, addToBench, addToActive } = useRosterStore();
 
   // Filter state
   const [sortBy, setSortBy] = useState<SortField>('roi');
@@ -145,40 +87,42 @@ export default function DiscoverPage() {
   // Track button loading states
   const [trackingLoading, setTrackingLoading] = useState<Record<string, boolean>>({});
 
-  // Wallet tracking state (simulated - would come from store in real app)
-  const [wallets, setWallets] = useState(initialMockWallets);
-
   // Copy modal state
   const [copyModalOpen, setCopyModalOpen] = useState(false);
-  const [selectedWallet, setSelectedWallet] = useState<typeof wallets[0] | null>(null);
-  const [rosterCount] = useState(2);
+  const [selectedWallet, setSelectedWallet] = useState<DisplayWallet | null>(null);
 
-  // Generate equity curves (memoized)
-  const walletEquityCurves = useMemo(() => {
-    return wallets.reduce((acc, wallet) => {
-      const roi = timePeriod === '7d' ? wallet.roi7d : timePeriod === '90d' ? wallet.roi90d : wallet.roi30d;
-      const days = timePeriod === '7d' ? 7 : timePeriod === '90d' ? 90 : 30;
-      acc[wallet.address] = generateEquityCurve(days, roi);
-      return acc;
-    }, {} as Record<string, { time: string; value: number }[]>);
-  }, [wallets, timePeriod]);
+  // Roster count from store
+  const rosterCount = activeWallets.length;
 
-  // Filter and sort wallets
+  // Fetch wallets from API
+  const { data: apiWallets, isLoading, error, refetch } = useDiscoverWalletsQuery({
+    sortBy: sortBy,
+    period: timePeriod,
+    minTrades: minTrades === '0' ? undefined : parseInt(minTrades),
+    minWinRate: minWinRate ? 55 : undefined,
+    limit: 50,
+  });
+
+  // Check if wallet is tracked in roster store
+  const isWalletTracked = (address: string): boolean => {
+    const lowerAddress = address.toLowerCase();
+    return (
+      activeWallets.some(w => w.address.toLowerCase() === lowerAddress) ||
+      benchWallets.some(w => w.address.toLowerCase() === lowerAddress)
+    );
+  };
+
+  // Transform and filter wallets
   const filteredWallets = useMemo(() => {
-    let result = [...wallets];
+    if (!apiWallets) return [];
 
-    // Apply min trades filter
-    const minTradesNum = parseInt(minTrades);
-    if (!isNaN(minTradesNum)) {
-      result = result.filter(w => w.trades >= minTradesNum);
-    }
+    // Transform API wallets to display format
+    let result = apiWallets.map((w, i) => ({
+      ...toDisplayWallet(w, i + 1),
+      tracked: isWalletTracked(w.address),
+    }));
 
-    // Apply min win rate filter
-    if (minWinRate) {
-      result = result.filter(w => w.winRate >= 55);
-    }
-
-    // Sort
+    // Sort (API already returns sorted, but we can re-sort client-side if needed)
     result.sort((a, b) => {
       switch (sortBy) {
         case 'roi':
@@ -198,31 +142,42 @@ export default function DiscoverPage() {
 
     // Re-rank after filtering
     return result.map((w, i) => ({ ...w, rank: i + 1 }));
-  }, [wallets, sortBy, timePeriod, minTrades, minWinRate]);
+  }, [apiWallets, sortBy, timePeriod, activeWallets, benchWallets]);
 
   const handleTrack = async (address: string) => {
     setTrackingLoading(prev => ({ ...prev, [address]: true }));
 
-    // Simulate API call
-    await new Promise(resolve => setTimeout(resolve, 800));
+    const wallet = filteredWallets.find(w => w.address === address);
+    if (!wallet) {
+      setTrackingLoading(prev => ({ ...prev, [address]: false }));
+      return;
+    }
 
-    setWallets(prev => prev.map(w =>
-      w.address === address ? { ...w, tracked: !w.tracked } : w
-    ));
+    const isTracked = isWalletTracked(address);
 
-    const wallet = wallets.find(w => w.address === address);
-    const wasTracked = wallet?.tracked;
-
-    if (wasTracked) {
+    if (isTracked) {
+      // Remove from bench (tracked wallets are on bench by default from discovery)
+      const { removeFromBench } = useRosterStore.getState();
+      removeFromBench(address);
       toast.info('Removed from Bench', `${shortenAddress(address)} is no longer being monitored`);
     } else {
+      // Add to bench
+      const rosterWallet = createRosterWallet(address, {
+        roi30d: wallet.roi30d,
+        sharpe: wallet.sharpe,
+        winRate: wallet.winRate,
+        trades: wallet.trades,
+        maxDrawdown: wallet.maxDrawdown,
+        confidence: wallet.confidence,
+      });
+      addToBench(rosterWallet);
       toast.success('Added to Bench', `${shortenAddress(address)} is now being monitored`);
     }
 
     setTrackingLoading(prev => ({ ...prev, [address]: false }));
   };
 
-  const handleCopyClick = (wallet: typeof wallets[0]) => {
+  const handleCopyClick = (wallet: DisplayWallet) => {
     setSelectedWallet(wallet);
     setCopyModalOpen(true);
   };
@@ -234,22 +189,44 @@ export default function DiscoverPage() {
     max_position_size: number;
     tier: 'active' | 'bench';
   }) => {
+    const wallet = filteredWallets.find(w => w.address === settings.address);
+    if (!wallet) return;
+
+    const rosterWallet = createRosterWallet(
+      settings.address,
+      {
+        roi30d: wallet.roi30d,
+        sharpe: wallet.sharpe,
+        winRate: wallet.winRate,
+        trades: wallet.trades,
+        maxDrawdown: wallet.maxDrawdown,
+        confidence: wallet.confidence,
+      },
+      settings.tier,
+      {
+        allocation_pct: settings.allocation_pct,
+        copy_behavior: settings.copy_behavior,
+        max_position_size: settings.max_position_size,
+      }
+    );
+
+    if (settings.tier === 'active') {
+      addToActive(rosterWallet);
+    } else {
+      addToBench(rosterWallet);
+    }
+
     const tierLabel = settings.tier === 'active' ? 'Active' : 'Watching';
     toast.success(
       `Wallet added to ${tierLabel}`,
       `${shortenAddress(settings.address)} is now being ${settings.tier === 'active' ? 'copied' : 'monitored'}`
     );
 
-    // Mark as tracked
-    setWallets(prev => prev.map(w =>
-      w.address === settings.address ? { ...w, tracked: true } : w
-    ));
-
     setCopyModalOpen(false);
     setSelectedWallet(null);
   };
 
-  const getROI = (wallet: typeof wallets[0]) => {
+  const getROI = (wallet: DisplayWallet) => {
     return timePeriod === '7d' ? wallet.roi7d : timePeriod === '90d' ? wallet.roi90d : wallet.roi30d;
   };
 
@@ -364,116 +341,155 @@ export default function DiscoverPage() {
             <h2 className="text-xl font-semibold">Top Performers</h2>
           </div>
           <span className="text-sm text-muted-foreground">
-            {filteredWallets.length} wallets
+            {isLoading ? 'Loading...' : `${filteredWallets.length} wallets`}
           </span>
         </div>
 
         <div className="grid gap-4">
-          {filteredWallets.map((wallet) => {
+          {/* Loading State */}
+          {isLoading && (
+            <>
+              {[1, 2, 3].map((i) => (
+                <Card key={i}>
+                  <CardContent className="p-6">
+                    <div className="flex flex-col lg:flex-row lg:items-center gap-6">
+                      <div className="flex items-center gap-4">
+                        <Skeleton className="h-10 w-10 rounded-full" />
+                        <div className="space-y-2">
+                          <Skeleton className="h-4 w-32" />
+                          <Skeleton className="h-3 w-24" />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-5 gap-4 flex-1">
+                        {[1, 2, 3, 4, 5].map((j) => (
+                          <div key={j} className="space-y-2">
+                            <Skeleton className="h-3 w-12" />
+                            <Skeleton className="h-4 w-16" />
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex gap-2">
+                        <Skeleton className="h-8 w-24" />
+                        <Skeleton className="h-8 w-16" />
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </>
+          )}
+
+          {/* Error State */}
+          {error && !isLoading && (
+            <Card>
+              <CardContent className="p-12 text-center">
+                <p className="text-destructive mb-4">
+                  Failed to load wallets. Please try again.
+                </p>
+                <Button variant="outline" onClick={() => refetch()}>
+                  Retry
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Wallet List */}
+          {!isLoading && !error && filteredWallets.map((wallet) => {
             const roi = getROI(wallet);
             const hypotheticalReturn = whatIfAmount * (roi / 100);
             const hypotheticalTotal = whatIfAmount + hypotheticalReturn;
-            const equityCurve = walletEquityCurves[wallet.address];
-            const isLoading = trackingLoading[wallet.address];
+            const isTrackLoading = trackingLoading[wallet.address];
 
             return (
               <Card key={wallet.address} className="hover:border-primary transition-colors">
                 <CardContent className="p-6">
-                  <div className="flex flex-col gap-6">
-                    {/* Header Row */}
-                    <div className="flex flex-col lg:flex-row lg:items-center gap-6">
-                      {/* Rank & Address */}
-                      <div className="flex items-center gap-4">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-primary-foreground font-bold">
-                          #{wallet.rank}
-                        </div>
-                        <div>
-                          <p className="font-medium font-mono">
-                            {shortenAddress(wallet.address)}
-                          </p>
-                          <span
-                            className={`text-xs px-2 py-0.5 rounded-full ${
-                              predictionColors[wallet.prediction]
-                            }`}
-                          >
-                            {predictionLabels[wallet.prediction]} ({wallet.confidence}%)
-                          </span>
-                        </div>
+                  <div className="flex flex-col lg:flex-row lg:items-center gap-6">
+                    {/* Rank & Address */}
+                    <div className="flex items-center gap-4">
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-primary-foreground font-bold">
+                        #{wallet.rank}
                       </div>
-
-                      {/* Metrics */}
-                      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 flex-1">
-                        <div>
-                          <p className="text-xs text-muted-foreground">ROI ({timePeriod})</p>
-                          <p className={`font-medium ${roi >= 0 ? 'text-profit' : 'text-loss'}`}>
-                            {roi >= 0 ? '+' : ''}{roi}%
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-muted-foreground">Sharpe</p>
-                          <p className="font-medium">{wallet.sharpe}</p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-muted-foreground">Trades</p>
-                          <p className="font-medium">{wallet.trades}</p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-muted-foreground">Win Rate</p>
-                          <p className="font-medium">{wallet.winRate}%</p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-muted-foreground">Max DD</p>
-                          <p className="font-medium text-loss">
-                            {wallet.maxDrawdown}%
-                          </p>
-                        </div>
-                      </div>
-
-                      {/* What-If & Actions */}
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-                        <div className="text-sm">
-                          <p className="text-muted-foreground">
-                            If invested ${whatIfAmount}:
-                          </p>
-                          <p className={`font-medium text-lg ${hypotheticalReturn >= 0 ? 'text-profit' : 'text-loss'}`}>
-                            ${hypotheticalTotal.toFixed(2)}
-                          </p>
-                        </div>
-                        <div className="flex gap-2">
-                          <Button
-                            variant={wallet.tracked ? 'outline' : 'secondary'}
-                            size="sm"
-                            onClick={() => handleTrack(wallet.address)}
-                            disabled={isLoading}
-                          >
-                            {isLoading ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : wallet.tracked ? (
-                              <>
-                                <Check className="mr-1 h-4 w-4" />
-                                Tracking
-                              </>
-                            ) : (
-                              <>
-                                <Plus className="mr-1 h-4 w-4" />
-                                Track
-                              </>
-                            )}
-                          </Button>
-                          <Button
-                            variant="default"
-                            size="sm"
-                            onClick={() => handleCopyClick(wallet)}
-                          >
-                            Copy
-                          </Button>
-                        </div>
+                      <div>
+                        <p className="font-medium font-mono">
+                          {shortenAddress(wallet.address)}
+                        </p>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded-full ${
+                            predictionColors[wallet.prediction]
+                          }`}
+                        >
+                          {predictionLabels[wallet.prediction]} ({wallet.confidence}%)
+                        </span>
                       </div>
                     </div>
 
-                    {/* Equity Curve */}
-                    <div className="border rounded-lg p-2 bg-muted/20">
-                      <EquityCurve data={equityCurve} height={80} />
+                    {/* Metrics */}
+                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 flex-1">
+                      <div>
+                        <p className="text-xs text-muted-foreground">ROI ({timePeriod})</p>
+                        <p className={`font-medium ${roi >= 0 ? 'text-profit' : 'text-loss'}`}>
+                          {roi >= 0 ? '+' : ''}{roi.toFixed(1)}%
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Sharpe</p>
+                        <p className="font-medium">{wallet.sharpe.toFixed(2)}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Trades</p>
+                        <p className="font-medium">{wallet.trades}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Win Rate</p>
+                        <p className="font-medium">{wallet.winRate.toFixed(1)}%</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-muted-foreground">Max DD</p>
+                        <p className="font-medium text-loss">
+                          {wallet.maxDrawdown.toFixed(1)}%
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* What-If & Actions */}
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                      <div className="text-sm">
+                        <p className="text-muted-foreground">
+                          If invested ${whatIfAmount}:
+                        </p>
+                        <p className={`font-medium text-lg ${hypotheticalReturn >= 0 ? 'text-profit' : 'text-loss'}`}>
+                          ${hypotheticalTotal.toFixed(2)}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          variant={wallet.tracked ? 'outline' : 'secondary'}
+                          size="sm"
+                          onClick={() => handleTrack(wallet.address)}
+                          disabled={isTrackLoading}
+                        >
+                          {isTrackLoading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : wallet.tracked ? (
+                            <>
+                              <Check className="mr-1 h-4 w-4" />
+                              Tracking
+                            </>
+                          ) : (
+                            <>
+                              <Plus className="mr-1 h-4 w-4" />
+                              Track
+                            </>
+                          )}
+                        </Button>
+                        <Button
+                          variant="default"
+                          size="sm"
+                          onClick={() => handleCopyClick(wallet)}
+                        >
+                          Copy
+                        </Button>
+                      </div>
                     </div>
                   </div>
                 </CardContent>
@@ -481,9 +497,12 @@ export default function DiscoverPage() {
             );
           })}
 
-          {filteredWallets.length === 0 && (
+          {/* Empty State */}
+          {!isLoading && !error && filteredWallets.length === 0 && (
             <Card>
               <CardContent className="p-12 text-center">
+                <Search className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                <h3 className="text-lg font-medium mb-2">No wallets found</h3>
                 <p className="text-muted-foreground">
                   No wallets match your filters. Try adjusting the criteria.
                 </p>

@@ -4,6 +4,14 @@ import { useState, memo } from 'react';
 import Link from 'next/link';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Slider } from '@/components/ui/slider';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { shortenAddress, formatCurrency, cn } from '@/lib/utils';
 import {
   ChevronDown,
@@ -15,8 +23,9 @@ import {
   X,
   Trash2,
 } from 'lucide-react';
-import type { RosterWallet } from '@/stores/roster-store';
+import { useRosterStore, type RosterWallet } from '@/stores/roster-store';
 import type { DemoPosition } from '@/stores/demo-portfolio-store';
+import type { CopyBehavior } from '@/types/api';
 
 interface Position {
   id: string;
@@ -54,6 +63,8 @@ export const WalletCard = memo(function WalletCard({
   isLoading = false,
 }: WalletCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const { updateCopySettings } = useRosterStore();
 
   const totalPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
   const hasPositions = positions.length > 0;
@@ -62,6 +73,18 @@ export const WalletCard = memo(function WalletCard({
     copy_all: 'All Trades',
     events_only: 'Events Only',
     arb_threshold: 'Arb Threshold',
+  };
+
+  const handleAllocationChange = (value: number[]) => {
+    updateCopySettings(wallet.address, { allocation_pct: value[0] });
+  };
+
+  const handleBehaviorChange = (value: CopyBehavior) => {
+    updateCopySettings(wallet.address, { copy_behavior: value });
+  };
+
+  const handleMaxPositionChange = (value: number[]) => {
+    updateCopySettings(wallet.address, { max_position_size: value[0] });
   };
 
   return (
@@ -92,9 +115,16 @@ export const WalletCard = memo(function WalletCard({
                 {copyBehaviorLabels[wallet.copySettings.copy_behavior] || 'All Trades'}
               </span>
             )}
-            <Button variant="ghost" size="icon" className="h-8 w-8">
-              <Settings className="h-4 w-4" />
-            </Button>
+            {isActive && (
+              <Button
+                variant={showSettings ? 'secondary' : 'ghost'}
+                size="icon"
+                className="h-8 w-8"
+                onClick={() => setShowSettings(!showSettings)}
+              >
+                <Settings className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         </div>
       </CardHeader>
@@ -141,6 +171,69 @@ export const WalletCard = memo(function WalletCard({
               <div
                 className="bg-primary h-2 rounded-full transition-all"
                 style={{ width: `${wallet.copySettings.allocation_pct}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Settings Panel (Active wallets only) */}
+        {isActive && showSettings && wallet.copySettings && (
+          <div className="p-4 bg-muted/30 rounded-lg space-y-4 border">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+              Copy Settings
+            </p>
+
+            {/* Allocation Slider */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Allocation</label>
+                <span className="text-sm tabular-nums">
+                  {wallet.copySettings.allocation_pct}%
+                </span>
+              </div>
+              <Slider
+                value={[wallet.copySettings.allocation_pct]}
+                onValueChange={handleAllocationChange}
+                min={0}
+                max={100}
+                step={5}
+                className="w-full"
+              />
+            </div>
+
+            {/* Copy Behavior */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Copy Behavior</label>
+              <Select
+                value={wallet.copySettings.copy_behavior}
+                onValueChange={(v) => handleBehaviorChange(v as CopyBehavior)}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select behavior" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="copy_all">All Trades</SelectItem>
+                  <SelectItem value="events_only">Events Only</SelectItem>
+                  <SelectItem value="arb_threshold">Arb Threshold</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Max Position Size */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-sm font-medium">Max Position Size</label>
+                <span className="text-sm tabular-nums">
+                  ${wallet.copySettings.max_position_size}
+                </span>
+              </div>
+              <Slider
+                value={[wallet.copySettings.max_position_size]}
+                onValueChange={handleMaxPositionChange}
+                min={10}
+                max={500}
+                step={10}
+                className="w-full"
               />
             </div>
           </div>

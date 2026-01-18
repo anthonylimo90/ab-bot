@@ -1,82 +1,70 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
+import { Skeleton } from '@/components/ui/skeleton';
 import { MetricCard } from '@/components/shared/MetricCard';
 import { BacktestChart } from '@/components/charts/BacktestChart';
-import { formatCurrency } from '@/lib/utils';
-import { Play, ChevronDown, Loader2 } from 'lucide-react';
-
-// Generate mock backtest equity curve
-function generateBacktestData(
-  startDate: string,
-  endDate: string,
-  capital: number,
-  returnPercent: number
-) {
-  const data: { time: string; value: number }[] = [];
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-  const days = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-  const dailyReturn = Math.pow(1 + returnPercent / 100, 1 / days) - 1;
-
-  let value = capital;
-  for (let i = 0; i <= days; i++) {
-    const date = new Date(start);
-    date.setDate(date.getDate() + i);
-
-    // Add volatility
-    const randomFactor = 1 + (Math.random() - 0.5) * 0.03;
-    value = value * (1 + dailyReturn) * randomFactor;
-
-    // Simulate a drawdown period
-    if (i > days * 0.3 && i < days * 0.4) {
-      value = value * 0.995;
-    }
-
-    data.push({
-      time: date.toISOString().split('T')[0],
-      value: Math.round(value * 100) / 100,
-    });
-  }
-  return data;
-}
-
-// Mock results
-const mockResults = {
-  totalReturn: 342,
-  totalReturnPercent: 34.2,
-  sharpe: 1.85,
-  maxDrawdown: -12.3,
-  winRate: 67,
-  totalTrades: 89,
-};
+import { useBacktest } from '@/hooks/useBacktest';
+import { useRosterStore } from '@/stores/roster-store';
+import { formatCurrency, shortenAddress } from '@/lib/utils';
+import { Play, ChevronDown, Loader2, AlertCircle, History } from 'lucide-react';
 
 export default function BacktestPage() {
-  const [isRunning, setIsRunning] = useState(false);
-  const [hasResults, setHasResults] = useState(false);
+  const { activeWallets, benchWallets } = useRosterStore();
+  const { results, history, isRunning, error, runBacktest, loadHistory, loadResult } = useBacktest();
+
+  // Form state
   const [capital, setCapital] = useState(1000);
   const [startDate, setStartDate] = useState('2024-01-01');
   const [endDate, setEndDate] = useState('2024-12-31');
   const [slippage, setSlippage] = useState(0.1);
   const [fees, setFees] = useState(0.1);
+  const [selectedWallets, setSelectedWallets] = useState<string[]>([]);
 
-  // Generate backtest data when results are available
-  const backtestData = useMemo(() => {
-    if (!hasResults) return [];
-    return generateBacktestData(startDate, endDate, capital, mockResults.totalReturnPercent);
-  }, [hasResults, startDate, endDate, capital]);
+  // Load history on mount
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
 
-  const runBacktest = () => {
-    setIsRunning(true);
-    setHasResults(false);
-    // Simulate backtest
-    setTimeout(() => {
-      setIsRunning(false);
-      setHasResults(true);
-    }, 2000);
+  // All tracked wallets
+  const allWallets = useMemo(() => {
+    return [...activeWallets, ...benchWallets];
+  }, [activeWallets, benchWallets]);
+
+  // Handle backtest run
+  const handleRunBacktest = async () => {
+    await runBacktest({
+      strategy: {
+        type: 'CopyTrading',
+        wallets: selectedWallets.length > 0 ? selectedWallets : allWallets.map(w => w.address),
+      },
+      start_date: startDate,
+      end_date: endDate,
+      initial_capital: capital,
+      slippage_pct: slippage,
+      fee_pct: fees,
+    });
   };
+
+  // Toggle wallet selection
+  const toggleWallet = (address: string) => {
+    setSelectedWallets(prev =>
+      prev.includes(address)
+        ? prev.filter(a => a !== address)
+        : [...prev, address]
+    );
+  };
+
+  // Generate equity curve from results
+  const backtestData = useMemo(() => {
+    if (!results?.equity_curve) return [];
+    return results.equity_curve.map(point => ({
+      time: point.timestamp,
+      value: point.value,
+    }));
+  }, [results]);
 
   return (
     <div className="space-y-6">
@@ -88,7 +76,7 @@ export default function BacktestPage() {
             Test strategies against historical data
           </p>
         </div>
-        <Button onClick={runBacktest} disabled={isRunning}>
+        <Button onClick={handleRunBacktest} disabled={isRunning}>
           {isRunning ? (
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           ) : (
@@ -176,37 +164,72 @@ export default function BacktestPage() {
 
           <div className="mt-4 space-y-2">
             <label className="text-sm font-medium">Wallets to Copy</label>
-            <Button variant="outline" className="w-full justify-between">
-              Select wallets... <ChevronDown className="h-4 w-4" />
-            </Button>
+            {allWallets.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {allWallets.map((wallet) => (
+                  <Button
+                    key={wallet.address}
+                    variant={selectedWallets.includes(wallet.address) ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => toggleWallet(wallet.address)}
+                  >
+                    {wallet.label || shortenAddress(wallet.address)}
+                  </Button>
+                ))}
+                {selectedWallets.length === 0 && (
+                  <p className="text-sm text-muted-foreground ml-2">
+                    No wallets selected - will use all tracked wallets
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No wallets being tracked. Add wallets from the Trading page first.
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
 
+      {/* Error State */}
+      {error && (
+        <Card className="border-destructive">
+          <CardContent className="p-6">
+            <div className="flex items-center gap-4">
+              <AlertCircle className="h-8 w-8 text-destructive" />
+              <div>
+                <h3 className="font-medium">Backtest Failed</h3>
+                <p className="text-sm text-muted-foreground">{error}</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Results */}
-      {hasResults && (
+      {results && results.status === 'completed' && (
         <>
           <div className="grid gap-4 md:grid-cols-4">
             <MetricCard
               title="Total Return"
-              value={`+${mockResults.totalReturnPercent}%`}
-              changeLabel={formatCurrency(mockResults.totalReturn)}
-              trend="up"
+              value={`${results.total_return_pct >= 0 ? '+' : ''}${results.total_return_pct.toFixed(1)}%`}
+              changeLabel={formatCurrency(results.total_return)}
+              trend={results.total_return_pct >= 0 ? 'up' : 'down'}
             />
             <MetricCard
               title="Sharpe Ratio"
-              value={mockResults.sharpe.toFixed(2)}
+              value={results.sharpe_ratio.toFixed(2)}
               trend="neutral"
             />
             <MetricCard
               title="Max Drawdown"
-              value={`${mockResults.maxDrawdown}%`}
+              value={`${results.max_drawdown_pct.toFixed(1)}%`}
               trend="down"
             />
             <MetricCard
               title="Win Rate"
-              value={`${mockResults.winRate}%`}
-              changeLabel={`${mockResults.totalTrades} trades`}
+              value={`${results.win_rate.toFixed(0)}%`}
+              changeLabel={`${results.total_trades} trades`}
               trend="neutral"
             />
           </div>
@@ -224,41 +247,37 @@ export default function BacktestPage() {
             </CardContent>
           </Card>
 
-          {/* Monthly Returns */}
+          {/* Additional Stats */}
           <Card>
             <CardHeader>
-              <CardTitle>Monthly Returns</CardTitle>
+              <CardTitle>Performance Breakdown</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="grid grid-cols-6 md:grid-cols-12 gap-2">
-                {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].map(
-                  (month, i) => {
-                    const returnVal = (Math.random() - 0.3) * 15;
-                    return (
-                      <div
-                        key={month}
-                        className="text-center p-2 rounded bg-muted/50"
-                      >
-                        <div className="text-xs text-muted-foreground">{month}</div>
-                        <div
-                          className={`text-sm font-medium tabular-nums ${
-                            returnVal >= 0 ? 'text-profit' : 'text-loss'
-                          }`}
-                        >
-                          {returnVal >= 0 ? '+' : ''}
-                          {returnVal.toFixed(1)}%
-                        </div>
-                      </div>
-                    );
-                  }
-                )}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                  <p className="text-sm text-muted-foreground">Final Value</p>
+                  <p className="font-medium">{formatCurrency(results.final_value)}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Total Fees</p>
+                  <p className="font-medium text-loss">{formatCurrency(results.total_fees)}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Profit Factor</p>
+                  <p className="font-medium">{results.profit_factor.toFixed(2)}</p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Sortino Ratio</p>
+                  <p className="font-medium">{results.sortino_ratio.toFixed(2)}</p>
+                </div>
               </div>
             </CardContent>
           </Card>
         </>
       )}
 
-      {!hasResults && !isRunning && (
+      {/* No Results Yet */}
+      {!results && !isRunning && !error && (
         <Card>
           <CardContent className="py-20">
             <p className="text-center text-muted-foreground">
@@ -269,6 +288,7 @@ export default function BacktestPage() {
         </Card>
       )}
 
+      {/* Running State */}
       {isRunning && (
         <Card>
           <CardContent className="py-20">
@@ -278,6 +298,47 @@ export default function BacktestPage() {
               <p className="text-xs text-muted-foreground">
                 Simulating {Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / (1000 * 60 * 60 * 24))} days of trading
               </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* History */}
+      {history.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <History className="h-5 w-5" />
+              Backtest History
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {history.slice(0, 5).map((result) => (
+                <div
+                  key={result.id}
+                  className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 cursor-pointer transition-colors"
+                  onClick={() => loadResult(result.id)}
+                >
+                  <div>
+                    <p className="font-medium text-sm">
+                      {result.strategy.type}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {new Date(result.created_at).toLocaleDateString()} |
+                      {result.start_date} to {result.end_date}
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <p className={`font-medium ${result.total_return_pct >= 0 ? 'text-profit' : 'text-loss'}`}>
+                      {result.total_return_pct >= 0 ? '+' : ''}{result.total_return_pct.toFixed(1)}%
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {result.total_trades} trades
+                    </p>
+                  </div>
+                </div>
+              ))}
             </div>
           </CardContent>
         </Card>

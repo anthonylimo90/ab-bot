@@ -1,14 +1,15 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useMemo } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { EquityCurve } from '@/components/charts/EquityCurve';
+import { Skeleton } from '@/components/ui/skeleton';
 import { useRosterStore } from '@/stores/roster-store';
 import { useToastStore } from '@/stores/toast-store';
+import { useWalletQuery, useWalletMetricsQuery } from '@/hooks/queries/useWalletsQuery';
+import { useLiveTradesQuery } from '@/hooks/queries/useDiscoverQuery';
 import { shortenAddress, formatCurrency } from '@/lib/utils';
 import {
   ArrowLeft,
@@ -16,113 +17,16 @@ import {
   TrendingUp,
   TrendingDown,
   Shield,
-  Clock,
   Target,
-  AlertTriangle,
   CheckCircle,
-  XCircle,
-  Users,
   ChevronUp,
   ChevronDown,
   Settings,
   Zap,
   Activity,
+  AlertCircle,
 } from 'lucide-react';
 import type { TradingStyle, DecisionBrief, TradeClassification } from '@/types/api';
-
-// Generate mock equity curve data
-function generateEquityCurve(days: number, roi: number) {
-  const data: { time: string; value: number }[] = [];
-  let value = 100;
-  const dailyReturn = Math.pow(1 + roi / 100, 1 / days) - 1;
-  const now = new Date();
-
-  for (let i = days; i >= 0; i--) {
-    const date = new Date(now);
-    date.setDate(date.getDate() - i);
-    const randomFactor = 1 + (Math.random() - 0.5) * 0.04;
-    value = value * (1 + dailyReturn) * randomFactor;
-    data.push({
-      time: date.toISOString().split('T')[0],
-      value: Math.round(value * 100) / 100,
-    });
-  }
-  return data;
-}
-
-// Mock wallet data
-const mockWalletData = {
-  address: '0x1234567890abcdef1234567890abcdef12345678',
-  label: 'Alpha Trader',
-  tier: 'active' as const,
-  roi30d: 47.3,
-  roi7d: 12.1,
-  roi90d: 89.2,
-  sharpe: 2.4,
-  winRate: 71,
-  trades: 156,
-  maxDrawdown: -8.2,
-  confidence: 85,
-  avgTradeSize: 125,
-  avgHoldTime: '4.2 hours',
-  profitFactor: 2.1,
-};
-
-const mockDecisionBrief: DecisionBrief = {
-  trading_style: 'event_trader',
-  slippage_tolerance: 'moderate',
-  preferred_categories: ['Politics', 'Sports', 'Crypto'],
-  typical_hold_time: '4-8 hours',
-  event_trade_ratio: 0.75,
-  arb_trade_ratio: 0.25,
-  fitness_score: 85,
-  fitness_reasons: [
-    'Strong event trading performance with 71% win rate',
-    'Moderate slippage tolerance suitable for copy trading',
-    'Consistent strategy over 150+ trades',
-    'Drawdown within acceptable range (-8.2%)',
-  ],
-};
-
-// Mock trades
-const mockTrades = [
-  {
-    id: '1',
-    market: 'Will ETH reach $5000 by March?',
-    outcome: 'yes' as const,
-    classification: 'event' as TradeClassification,
-    entryPrice: 0.42,
-    exitPrice: 0.68,
-    quantity: 150,
-    pnl: 39.0,
-    holdTime: '6.2 hours',
-    date: '2026-01-09T14:30:00Z',
-  },
-  {
-    id: '2',
-    market: 'Trump wins 2028 nomination?',
-    outcome: 'yes' as const,
-    classification: 'event' as TradeClassification,
-    entryPrice: 0.65,
-    exitPrice: 0.72,
-    quantity: 200,
-    pnl: 14.0,
-    holdTime: '2.1 hours',
-    date: '2026-01-09T10:15:00Z',
-  },
-  {
-    id: '3',
-    market: 'BTC > $100k by Feb?',
-    outcome: 'no' as const,
-    classification: 'arbitrage' as TradeClassification,
-    entryPrice: 0.35,
-    exitPrice: 0.38,
-    quantity: 500,
-    pnl: 15.0,
-    holdTime: '3 min',
-    date: '2026-01-08T22:45:00Z',
-  },
-];
 
 const tradingStyleLabels: Record<TradingStyle, string> = {
   event_trader: 'Event Trader',
@@ -148,19 +52,68 @@ export default function WalletDetailPage() {
   const toast = useToastStore();
   const { activeWallets, benchWallets, promoteToActive, demoteToBench, isRosterFull } = useRosterStore();
 
-  // Find wallet in store or use mock
-  const storedWallet = [...activeWallets, ...benchWallets].find(
-    (w) => w.address.toLowerCase() === address?.toLowerCase()
-  );
+  // Fetch wallet data from API
+  const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(address);
+  const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(address);
+  const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery({ wallet: address, limit: 10 });
 
-  const wallet = storedWallet || { ...mockWalletData, address: address || mockWalletData.address };
-  const decisionBrief = (storedWallet?.decisionBrief as DecisionBrief) || mockDecisionBrief;
+  // Find wallet in local roster store
+  const storedWallet = useMemo(() => {
+    return [...activeWallets, ...benchWallets].find(
+      (w) => w.address.toLowerCase() === address?.toLowerCase()
+    );
+  }, [activeWallets, benchWallets, address]);
+
+  // Merge API data with stored wallet data
+  const wallet = useMemo(() => {
+    if (storedWallet) return storedWallet;
+    if (apiWallet) {
+      return {
+        address: apiWallet.address,
+        label: apiWallet.label,
+        tier: apiWallet.copy_enabled ? 'active' as const : 'bench' as const,
+        roi30d: walletMetrics?.roi ?? 0,
+        roi7d: 0, // Not available in WalletMetrics
+        roi90d: 0, // Not available in WalletMetrics
+        sharpe: walletMetrics?.sharpe_ratio ?? 0,
+        winRate: apiWallet?.win_rate ?? 0,
+        trades: apiWallet?.total_trades ?? 0,
+        maxDrawdown: walletMetrics?.max_drawdown ?? 0,
+        confidence: 0,
+        copySettings: {
+          copy_behavior: 'events_only' as const,
+          allocation_pct: apiWallet.allocation_pct ?? 0,
+          max_position_size: apiWallet.max_position_size ?? 100,
+        },
+        addedAt: apiWallet.added_at ?? new Date().toISOString(),
+      };
+    }
+    // Return minimal wallet for display while loading
+    return {
+      address: address,
+      label: undefined,
+      tier: 'bench' as const,
+      roi30d: 0,
+      sharpe: 0,
+      winRate: 0,
+      trades: 0,
+      maxDrawdown: 0,
+      confidence: 0,
+      copySettings: {
+        copy_behavior: 'events_only' as const,
+        allocation_pct: 0,
+        max_position_size: 100,
+      },
+      addedAt: new Date().toISOString(),
+    };
+  }, [storedWallet, apiWallet, walletMetrics, address]);
+
+  const decisionBrief = storedWallet?.decisionBrief as DecisionBrief | undefined;
 
   const isActive = activeWallets.some((w) => w.address.toLowerCase() === address?.toLowerCase());
   const isBench = benchWallets.some((w) => w.address.toLowerCase() === address?.toLowerCase());
   const isTracked = isActive || isBench;
-
-  const equityCurve = useMemo(() => generateEquityCurve(30, wallet.roi30d), [wallet.roi30d]);
+  const isLoading = isLoadingWallet || isLoadingMetrics;
 
   const handlePromote = () => {
     if (isRosterFull()) {
@@ -180,7 +133,7 @@ export default function WalletDetailPage() {
     <div className="space-y-6">
       {/* Breadcrumb & Header */}
       <div className="flex items-center gap-4">
-        <Link href={isActive ? '/roster' : '/bench'}>
+        <Link href="/trading">
           <Button variant="ghost" size="icon">
             <ArrowLeft className="h-5 w-5" />
           </Button>
@@ -189,10 +142,19 @@ export default function WalletDetailPage() {
           <div className="flex items-center gap-3">
             <Wallet className="h-8 w-8" />
             <div>
-              <h1 className="text-3xl font-bold tracking-tight">
-                {wallet.label || shortenAddress(address)}
-              </h1>
-              <p className="text-muted-foreground font-mono">{shortenAddress(address)}</p>
+              {isLoading ? (
+                <>
+                  <Skeleton className="h-8 w-48 mb-2" />
+                  <Skeleton className="h-4 w-32" />
+                </>
+              ) : (
+                <>
+                  <h1 className="text-3xl font-bold tracking-tight">
+                    {wallet.label || shortenAddress(address)}
+                  </h1>
+                  <p className="text-muted-foreground font-mono">{shortenAddress(address)}</p>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -236,7 +198,13 @@ export default function WalletDetailPage() {
               <TrendingUp className="h-5 w-5 text-profit" />
               <div>
                 <p className="text-xs text-muted-foreground">ROI (30d)</p>
-                <p className="text-xl font-bold text-profit">+{wallet.roi30d}%</p>
+                {isLoading ? (
+                  <Skeleton className="h-6 w-16" />
+                ) : (
+                  <p className={`text-xl font-bold ${Number(wallet.roi30d) >= 0 ? 'text-profit' : 'text-loss'}`}>
+                    {Number(wallet.roi30d) >= 0 ? '+' : ''}{Number(wallet.roi30d).toFixed(1)}%
+                  </p>
+                )}
               </div>
             </div>
           </CardContent>
@@ -247,7 +215,11 @@ export default function WalletDetailPage() {
               <Target className="h-5 w-5 text-primary" />
               <div>
                 <p className="text-xs text-muted-foreground">Win Rate</p>
-                <p className="text-xl font-bold">{wallet.winRate}%</p>
+                {isLoading ? (
+                  <Skeleton className="h-6 w-16" />
+                ) : (
+                  <p className="text-xl font-bold">{Number(wallet.winRate).toFixed(1)}%</p>
+                )}
               </div>
             </div>
           </CardContent>
@@ -258,7 +230,11 @@ export default function WalletDetailPage() {
               <Activity className="h-5 w-5 text-blue-500" />
               <div>
                 <p className="text-xs text-muted-foreground">Sharpe</p>
-                <p className="text-xl font-bold">{wallet.sharpe}</p>
+                {isLoading ? (
+                  <Skeleton className="h-6 w-12" />
+                ) : (
+                  <p className="text-xl font-bold">{Number(wallet.sharpe).toFixed(2)}</p>
+                )}
               </div>
             </div>
           </CardContent>
@@ -269,7 +245,11 @@ export default function WalletDetailPage() {
               <TrendingDown className="h-5 w-5 text-loss" />
               <div>
                 <p className="text-xs text-muted-foreground">Max Drawdown</p>
-                <p className="text-xl font-bold text-loss">{wallet.maxDrawdown}%</p>
+                {isLoading ? (
+                  <Skeleton className="h-6 w-16" />
+                ) : (
+                  <p className="text-xl font-bold text-loss">{Number(wallet.maxDrawdown).toFixed(1)}%</p>
+                )}
               </div>
             </div>
           </CardContent>
@@ -280,122 +260,131 @@ export default function WalletDetailPage() {
               <Zap className="h-5 w-5 text-yellow-500" />
               <div>
                 <p className="text-xs text-muted-foreground">Trades</p>
-                <p className="text-xl font-bold">{wallet.trades}</p>
+                {isLoading ? (
+                  <Skeleton className="h-6 w-12" />
+                ) : (
+                  <p className="text-xl font-bold">{wallet.trades}</p>
+                )}
               </div>
             </div>
           </CardContent>
         </Card>
       </div>
 
-      {/* Equity Curve */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Performance</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <EquityCurve data={equityCurve} height={200} />
-        </CardContent>
-      </Card>
-
-      {/* Decision Brief */}
-      <Card className="border-primary/50">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Decision Brief
-          </CardTitle>
-          <CardDescription>
-            Strategy profile and fitness assessment for copy trading
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          {/* Trading Style */}
-          <div className="grid md:grid-cols-2 gap-6">
-            <div className="space-y-4">
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Trading Style</p>
-                <p className="text-lg font-semibold">
-                  {tradingStyleLabels[decisionBrief.trading_style]}
-                </p>
-                <p className="text-sm text-muted-foreground">
-                  {tradingStyleDescriptions[decisionBrief.trading_style]}
-                </p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
+      {/* Decision Brief - Only show if data is available */}
+      {decisionBrief && (
+        <Card className="border-primary/50">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Shield className="h-5 w-5" />
+              Decision Brief
+            </CardTitle>
+            <CardDescription>
+              Strategy profile and fitness assessment for copy trading
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            {/* Trading Style */}
+            <div className="grid md:grid-cols-2 gap-6">
+              <div className="space-y-4">
                 <div>
-                  <p className="text-sm text-muted-foreground mb-1">Event Trades</p>
+                  <p className="text-sm text-muted-foreground mb-1">Trading Style</p>
                   <p className="text-lg font-semibold">
-                    {Math.round(decisionBrief.event_trade_ratio * 100)}%
+                    {tradingStyleLabels[decisionBrief.trading_style]}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {tradingStyleDescriptions[decisionBrief.trading_style]}
                   </p>
                 </div>
-                <div>
-                  <p className="text-sm text-muted-foreground mb-1">Arb Trades</p>
-                  <p className="text-lg font-semibold">
-                    {Math.round(decisionBrief.arb_trade_ratio * 100)}%
-                  </p>
-                </div>
-              </div>
 
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Slippage Tolerance</p>
-                <p className={`text-lg font-semibold capitalize ${slippageColors[decisionBrief.slippage_tolerance]}`}>
-                  {decisionBrief.slippage_tolerance}
-                </p>
-              </div>
-
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Typical Hold Time</p>
-                <p className="text-lg font-semibold">{decisionBrief.typical_hold_time}</p>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Preferred Categories</p>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {decisionBrief.preferred_categories.map((cat) => (
-                    <span
-                      key={cat}
-                      className="px-3 py-1 rounded-full bg-primary/10 text-primary text-sm"
-                    >
-                      {cat}
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-              <div>
-                <p className="text-sm text-muted-foreground mb-2">Fitness Score</p>
-                <div className="flex items-center gap-3">
-                  <div className="flex-1 h-3 bg-muted rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-profit rounded-full transition-all"
-                      style={{ width: `${decisionBrief.fitness_score}%` }}
-                    />
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <p className="text-sm text-muted-foreground mb-1">Event Trades</p>
+                    <p className="text-lg font-semibold">
+                      {Math.round(decisionBrief.event_trade_ratio * 100)}%
+                    </p>
                   </div>
-                  <span className="text-lg font-bold">{decisionBrief.fitness_score}/100</span>
+                  <div>
+                    <p className="text-sm text-muted-foreground mb-1">Arb Trades</p>
+                    <p className="text-lg font-semibold">
+                      {Math.round(decisionBrief.arb_trade_ratio * 100)}%
+                    </p>
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-sm text-muted-foreground mb-1">Slippage Tolerance</p>
+                  <p className={`text-lg font-semibold capitalize ${slippageColors[decisionBrief.slippage_tolerance]}`}>
+                    {decisionBrief.slippage_tolerance}
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-sm text-muted-foreground mb-1">Typical Hold Time</p>
+                  <p className="text-lg font-semibold">{decisionBrief.typical_hold_time}</p>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <p className="text-sm text-muted-foreground mb-1">Preferred Categories</p>
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {decisionBrief.preferred_categories.map((cat) => (
+                      <span
+                        key={cat}
+                        className="px-3 py-1 rounded-full bg-primary/10 text-primary text-sm"
+                      >
+                        {cat}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <p className="text-sm text-muted-foreground mb-2">Fitness Score</p>
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 h-3 bg-muted rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-profit rounded-full transition-all"
+                        style={{ width: `${decisionBrief.fitness_score}%` }}
+                      />
+                    </div>
+                    <span className="text-lg font-bold">{decisionBrief.fitness_score}/100</span>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
 
-          {/* Fitness Reasons */}
-          <div>
-            <p className="text-sm text-muted-foreground mb-3 font-medium uppercase">
-              Assessment
+            {/* Fitness Reasons */}
+            <div>
+              <p className="text-sm text-muted-foreground mb-3 font-medium uppercase">
+                Assessment
+              </p>
+              <ul className="space-y-2">
+                {decisionBrief.fitness_reasons.map((reason, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm">
+                    <CheckCircle className="h-4 w-4 text-profit mt-0.5 shrink-0" />
+                    {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* No Decision Brief Placeholder */}
+      {!decisionBrief && !isLoading && (
+        <Card className="border-muted">
+          <CardContent className="p-8 text-center">
+            <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+            <h3 className="text-lg font-medium mb-2">No Decision Brief Available</h3>
+            <p className="text-muted-foreground">
+              Strategy profile data is not yet available for this wallet.
             </p>
-            <ul className="space-y-2">
-              {decisionBrief.fitness_reasons.map((reason, i) => (
-                <li key={i} className="flex items-start gap-2 text-sm">
-                  <CheckCircle className="h-4 w-4 text-profit mt-0.5 shrink-0" />
-                  {reason}
-                </li>
-              ))}
-            </ul>
-          </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Trade History */}
       <Card>
@@ -403,67 +392,68 @@ export default function WalletDetailPage() {
           <CardTitle>Recent Trades</CardTitle>
         </CardHeader>
         <CardContent>
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="border-b bg-muted/50">
-                <tr>
-                  <th className="text-left p-4 font-medium">Market</th>
-                  <th className="text-left p-4 font-medium">Type</th>
-                  <th className="text-left p-4 font-medium">Side</th>
-                  <th className="text-right p-4 font-medium">Entry</th>
-                  <th className="text-right p-4 font-medium">Exit</th>
-                  <th className="text-right p-4 font-medium">P&L</th>
-                  <th className="text-right p-4 font-medium">Hold Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {mockTrades.map((trade) => (
-                  <tr key={trade.id} className="border-b hover:bg-muted/30">
-                    <td className="p-4">
-                      <p className="font-medium text-sm">{trade.market}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {new Date(trade.date).toLocaleDateString()}
-                      </p>
-                    </td>
-                    <td className="p-4">
-                      <span
-                        className={`px-2 py-1 rounded text-xs font-medium ${
-                          trade.classification === 'event'
-                            ? 'bg-blue-500/10 text-blue-500'
-                            : 'bg-purple-500/10 text-purple-500'
-                        }`}
-                      >
-                        {trade.classification === 'event' ? 'Event' : 'Arb'}
-                      </span>
-                    </td>
-                    <td className="p-4">
-                      <span
-                        className={`px-2 py-1 rounded text-xs font-medium uppercase ${
-                          trade.outcome === 'yes'
-                            ? 'bg-profit/10 text-profit'
-                            : 'bg-loss/10 text-loss'
-                        }`}
-                      >
-                        {trade.outcome}
-                      </span>
-                    </td>
-                    <td className="p-4 text-right tabular-nums">${trade.entryPrice.toFixed(2)}</td>
-                    <td className="p-4 text-right tabular-nums">${trade.exitPrice.toFixed(2)}</td>
-                    <td className="p-4 text-right">
-                      <span
-                        className={`tabular-nums font-medium ${
-                          trade.pnl >= 0 ? 'text-profit' : 'text-loss'
-                        }`}
-                      >
-                        {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
-                      </span>
-                    </td>
-                    <td className="p-4 text-right text-muted-foreground">{trade.holdTime}</td>
+          {isLoadingTrades ? (
+            <div className="space-y-4">
+              {[1, 2, 3].map((i) => (
+                <div key={i} className="flex items-center gap-4 p-4 border-b">
+                  <div className="flex-1 space-y-2">
+                    <Skeleton className="h-4 w-48" />
+                    <Skeleton className="h-3 w-24" />
+                  </div>
+                  <Skeleton className="h-6 w-16" />
+                  <Skeleton className="h-6 w-16" />
+                </div>
+              ))}
+            </div>
+          ) : recentTrades && recentTrades.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="border-b bg-muted/50">
+                  <tr>
+                    <th className="text-left p-4 font-medium">Market</th>
+                    <th className="text-left p-4 font-medium">Side</th>
+                    <th className="text-right p-4 font-medium">Price</th>
+                    <th className="text-right p-4 font-medium">Value</th>
+                    <th className="text-right p-4 font-medium">Time</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {recentTrades.map((trade) => (
+                    <tr key={trade.tx_hash} className="border-b hover:bg-muted/30">
+                      <td className="p-4">
+                        <p className="font-medium text-sm">{trade.market_question || trade.market_id}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {new Date(trade.timestamp).toLocaleDateString()}
+                        </p>
+                      </td>
+                      <td className="p-4">
+                        <span
+                          className={`px-2 py-1 rounded text-xs font-medium uppercase ${
+                            trade.direction === 'buy'
+                              ? 'bg-profit/10 text-profit'
+                              : 'bg-loss/10 text-loss'
+                          }`}
+                        >
+                          {trade.direction}
+                        </span>
+                      </td>
+                      <td className="p-4 text-right tabular-nums">${trade.price.toFixed(2)}</td>
+                      <td className="p-4 text-right tabular-nums">{formatCurrency(trade.value)}</td>
+                      <td className="p-4 text-right text-muted-foreground text-sm">
+                        {new Date(trade.timestamp).toLocaleTimeString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="py-12 text-center">
+              <p className="text-muted-foreground">
+                No recent trades found for this wallet.
+              </p>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>
