@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { Settings, User, LogOut, ChevronDown } from 'lucide-react';
+import { Settings, User, LogOut, ChevronDown, ShieldAlert } from 'lucide-react';
 import { ModeToggle } from './ModeToggle';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -114,6 +114,16 @@ export function Header() {
                     Role: {user?.role}
                   </p>
                 </div>
+                {user?.role === 'Admin' && (
+                  <Link
+                    href="/admin"
+                    className="flex items-center gap-2 px-3 py-2 text-sm rounded-sm hover:bg-accent cursor-pointer"
+                    onClick={() => setIsUserMenuOpen(false)}
+                  >
+                    <ShieldAlert className="h-4 w-4 text-red-500" />
+                    Admin Portal
+                  </Link>
+                )}
                 <Link
                   href="/settings"
                   className="flex items-center gap-2 px-3 py-2 text-sm rounded-sm hover:bg-accent cursor-pointer"

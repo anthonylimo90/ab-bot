@@ -6,6 +6,7 @@ import { useAuthStore } from '@/stores/auth-store';
 
 // Routes that don't require authentication
 const PUBLIC_ROUTES = ['/login', '/forgot-password', '/reset-password'];
+const PUBLIC_ROUTE_PREFIXES = ['/invite/'];
 
 interface AuthGuardProps {
   children: React.ReactNode;
@@ -18,7 +19,8 @@ export function AuthGuard({ children }: AuthGuardProps) {
   const [hasChecked, setHasChecked] = useState(false);
   const [mounted, setMounted] = useState(false);
 
-  const isPublicRoute = PUBLIC_ROUTES.includes(pathname);
+  const isPublicRoute = PUBLIC_ROUTES.includes(pathname) ||
+    PUBLIC_ROUTE_PREFIXES.some(prefix => pathname.startsWith(prefix));
 
   // Track client-side mount
   useEffect(() => {

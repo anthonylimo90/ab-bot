@@ -198,6 +198,33 @@ If you didn't request this password reset, you can safely ignore this email."#
 
         Ok(())
     }
+
+    /// Send a simple text email.
+    pub async fn send_simple(
+        &self,
+        to_email: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<(), EmailError> {
+        let to_mailbox: Mailbox = to_email
+            .parse()
+            .map_err(|e: lettre::address::AddressError| EmailError::BuildEmail(e.to_string()))?;
+
+        let email = Message::builder()
+            .from(self.from_mailbox.clone())
+            .to(to_mailbox)
+            .subject(subject)
+            .header(ContentType::TEXT_PLAIN)
+            .body(body.to_string())
+            .map_err(|e| EmailError::BuildEmail(e.to_string()))?;
+
+        self.mailer
+            .send(email)
+            .await
+            .map_err(|e| EmailError::SendEmail(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

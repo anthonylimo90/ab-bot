@@ -1,8 +1,38 @@
 //! API Server binary entrypoint.
 
 use api_server::{ApiServer, ServerConfig};
+use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+mod seed;
+
+/// Polymarket Trading API Server
+#[derive(Parser)]
+#[command(name = "api-server")]
+#[command(about = "REST and WebSocket API for the Polymarket trading platform")]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the API server (default)
+    Serve,
+
+    /// Seed the initial platform admin user
+    SeedAdmin {
+        /// Admin email address
+        #[arg(long)]
+        email: String,
+
+        /// Admin password (min 8 characters)
+        #[arg(long)]
+        password: String,
+    },
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -20,6 +50,41 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let cli = Cli::parse();
+
+    // Get database URL (required for all commands)
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+
+    // Create database connection pool
+    let pool = PgPoolOptions::new()
+        .max_connections(20)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect(&database_url)
+        .await?;
+
+    // Run migrations
+    let skip_migrations = std::env::var("SKIP_MIGRATIONS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    if !skip_migrations {
+        tracing::info!("Running database migrations...");
+        sqlx::migrate!("../../migrations").run(&pool).await?;
+    }
+
+    match cli.command {
+        Some(Commands::SeedAdmin { email, password }) => {
+            seed::seed_admin(&pool, &email, &password).await?;
+        }
+        Some(Commands::Serve) | None => {
+            run_server(pool).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_server(pool: sqlx::PgPool) -> anyhow::Result<()> {
     tracing::info!("API Server starting up...");
 
     // Validate JWT_SECRET for security
@@ -38,29 +103,16 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("JWT secret validation passed");
 
-    // Get database URL
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    tracing::info!("Connecting to database...");
-
-    // Create database connection pool
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&database_url)
-        .await?;
-
     tracing::info!("Database connection established");
 
-    // Run migrations (can be disabled via SKIP_MIGRATIONS=true for manual migration management)
-    let skip_migrations = std::env::var("SKIP_MIGRATIONS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    if !skip_migrations {
-        tracing::info!("Running database migrations...");
-        sqlx::migrate!("../../migrations").run(&pool).await?;
-    } else {
-        tracing::info!("Skipping migrations (SKIP_MIGRATIONS=true)");
+    // Try to seed admin from environment (for first-time setup via Docker)
+    if let Err(e) = seed::seed_admin_from_env(&pool).await {
+        // Only log as debug if admin already exists, error for other issues
+        if e.to_string().contains("already exists") {
+            tracing::debug!("Admin user already exists, skipping seed");
+        } else {
+            tracing::warn!("Failed to seed admin from env: {}", e);
+        }
     }
 
     // Create server config from environment

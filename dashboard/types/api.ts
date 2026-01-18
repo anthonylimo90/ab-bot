@@ -489,3 +489,180 @@ export interface DemoPnlSimulation {
   equity_curve: { date: string; value: number }[];
   wallets: WalletSimulation[];
 }
+
+// Workspace types
+export type SetupMode = 'manual' | 'automatic';
+export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
+
+export interface Workspace {
+  id: string;
+  name: string;
+  description?: string;
+  setup_mode: SetupMode;
+  total_budget: number;
+  reserved_cash_pct: number;
+  auto_optimize_enabled: boolean;
+  optimization_interval_hours: number;
+  min_roi_30d?: number;
+  min_sharpe?: number;
+  min_win_rate?: number;
+  min_trades_30d?: number;
+  trading_wallet_address?: string;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceListItem {
+  id: string;
+  name: string;
+  description?: string;
+  setup_mode: SetupMode;
+  owner_email?: string;
+  member_count: number;
+  created_at: string;
+}
+
+export interface WorkspaceMember {
+  workspace_id: string;
+  user_id: string;
+  role: WorkspaceRole;
+  joined_at: string;
+  email?: string;
+  name?: string;
+}
+
+export interface WorkspaceInvite {
+  id: string;
+  workspace_id: string;
+  email: string;
+  role: WorkspaceRole;
+  invited_by: string;
+  expires_at: string;
+  accepted_at?: string;
+  created_at: string;
+  workspace_name?: string;
+  inviter_email?: string;
+}
+
+export interface WorkspaceAllocation {
+  id: string;
+  workspace_id: string;
+  wallet_address: string;
+  allocation_pct: number;
+  max_position_size?: number;
+  tier: 'active' | 'bench';
+  auto_assigned: boolean;
+  auto_assigned_reason?: string;
+  backtest_roi?: number;
+  backtest_sharpe?: number;
+  backtest_win_rate?: number;
+  copy_behavior: CopyBehavior;
+  arb_threshold_pct?: number;
+  added_by?: string;
+  added_at: string;
+  updated_at: string;
+}
+
+export interface RotationHistoryEntry {
+  id: string;
+  action: string;
+  wallet_in?: string;
+  wallet_out?: string;
+  reason: string;
+  evidence: Record<string, unknown>;
+  triggered_by?: string;
+  is_automatic: boolean;
+  notification_sent: boolean;
+  acknowledged: boolean;
+  acknowledged_at?: string;
+  acknowledged_by?: string;
+  created_at: string;
+}
+
+export interface OnboardingStatus {
+  workspace_id?: string;
+  workspace_name?: string;
+  setup_mode: SetupMode;
+  onboarding_completed: boolean;
+  onboarding_step: number;
+  total_budget: number;
+  active_count: number;
+  bench_count: number;
+}
+
+export interface UserSettings {
+  user_id: string;
+  onboarding_completed: boolean;
+  onboarding_step: number;
+  default_workspace_id?: string;
+  preferences: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateWorkspaceRequest {
+  name: string;
+  description?: string;
+  owner_email: string;
+  setup_mode?: SetupMode;
+}
+
+export interface UpdateWorkspaceRequest {
+  name?: string;
+  description?: string;
+  setup_mode?: SetupMode;
+  total_budget?: number;
+  reserved_cash_pct?: number;
+  auto_optimize_enabled?: boolean;
+  optimization_interval_hours?: number;
+  min_roi_30d?: number;
+  min_sharpe?: number;
+  min_win_rate?: number;
+  min_trades_30d?: number;
+}
+
+export interface CreateInviteRequest {
+  email: string;
+  role: WorkspaceRole;
+}
+
+export interface InviteInfo {
+  workspace_name: string;
+  inviter_email: string;
+  role: WorkspaceRole;
+  expires_at: string;
+}
+
+export interface AcceptInviteRequest {
+  email?: string;
+  password?: string;
+  name?: string;
+}
+
+export interface AddAllocationRequest {
+  allocation_pct?: number;
+  max_position_size?: number;
+  tier?: 'active' | 'bench';
+  copy_behavior?: CopyBehavior;
+  arb_threshold_pct?: number;
+}
+
+export interface UpdateAllocationRequest {
+  allocation_pct?: number;
+  max_position_size?: number;
+  copy_behavior?: CopyBehavior;
+  arb_threshold_pct?: number;
+}
+
+export interface SetBudgetRequest {
+  total_budget: number;
+  reserved_cash_pct?: number;
+}
+
+export interface AutoSetupConfig {
+  min_roi_30d?: number;
+  min_sharpe?: number;
+  min_win_rate?: number;
+  min_trades_30d?: number;
+}

@@ -71,5 +71,8 @@ redis.workspace = true
 utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "6", features = ["axum"] }
 
+# CLI
+clap.workspace = true
+
 [dev-dependencies]
 tokio-test.workspace = true

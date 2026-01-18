@@ -6,6 +6,7 @@ import { Sidebar } from './Sidebar';
 
 // Routes that should not show the app shell (header/sidebar)
 const AUTH_ROUTES = ['/login', '/signup', '/forgot-password', '/reset-password'];
+const MINIMAL_LAYOUT_PREFIXES = ['/invite/'];
 
 interface AppShellProps {
   children: React.ReactNode;
@@ -14,9 +15,10 @@ interface AppShellProps {
 export function AppShell({ children }: AppShellProps) {
   const pathname = usePathname();
   const isAuthRoute = AUTH_ROUTES.includes(pathname);
+  const isMinimalLayoutRoute = MINIMAL_LAYOUT_PREFIXES.some(prefix => pathname.startsWith(prefix));
 
-  // Auth routes get a minimal layout
-  if (isAuthRoute) {
+  // Auth routes and minimal layout routes get no app shell
+  if (isAuthRoute || isMinimalLayoutRoute) {
     return <>{children}</>;
   }
 

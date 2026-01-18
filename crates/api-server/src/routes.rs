@@ -11,8 +11,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    auth, backtest, discover, health, markets, positions, recommendations, trading, users, vault,
-    wallets,
+    admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health, invites,
+    markets, onboarding, positions, recommendations, trading, users, vault, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -69,6 +69,44 @@ use crate::websocket;
         users::get_user,
         users::update_user,
         users::delete_user,
+        // Admin workspaces
+        admin_workspaces::list_workspaces,
+        admin_workspaces::create_workspace,
+        admin_workspaces::get_workspace,
+        admin_workspaces::update_workspace,
+        admin_workspaces::delete_workspace,
+        // User workspaces
+        workspaces::list_workspaces,
+        workspaces::get_current_workspace,
+        workspaces::get_workspace,
+        workspaces::update_workspace,
+        workspaces::switch_workspace,
+        workspaces::list_members,
+        workspaces::update_member_role,
+        workspaces::remove_member,
+        // Invites
+        invites::list_invites,
+        invites::create_invite,
+        invites::revoke_invite,
+        invites::get_invite_info,
+        invites::accept_invite,
+        // Allocations
+        allocations::list_allocations,
+        allocations::add_allocation,
+        allocations::update_allocation,
+        allocations::remove_allocation,
+        allocations::promote_allocation,
+        allocations::demote_allocation,
+        // Auto-rotation
+        auto_rotation::list_rotation_history,
+        auto_rotation::acknowledge_entry,
+        auto_rotation::trigger_optimization,
+        // Onboarding
+        onboarding::get_status,
+        onboarding::set_mode,
+        onboarding::set_budget,
+        onboarding::auto_setup,
+        onboarding::complete_onboarding,
     ),
     components(
         schemas(
@@ -122,6 +160,36 @@ use crate::websocket;
             users::UserListItem,
             users::CreateUserRequest,
             users::UpdateUserRequest,
+            // Admin workspaces
+            admin_workspaces::AdminWorkspaceListItem,
+            admin_workspaces::CreateWorkspaceRequest,
+            admin_workspaces::UpdateWorkspaceRequest,
+            admin_workspaces::WorkspaceDetailResponse,
+            // User workspaces
+            workspaces::WorkspaceListItem,
+            workspaces::WorkspaceResponse,
+            workspaces::UpdateWorkspaceRequest,
+            workspaces::WorkspaceMemberResponse,
+            workspaces::UpdateMemberRoleRequest,
+            // Invites
+            invites::InviteResponse,
+            invites::CreateInviteRequest,
+            invites::AcceptInviteRequest,
+            invites::AcceptInviteResponse,
+            invites::InviteInfoResponse,
+            // Allocations
+            allocations::AllocationResponse,
+            allocations::AddAllocationRequest,
+            allocations::UpdateAllocationRequest,
+            // Auto-rotation
+            auto_rotation::RotationHistoryResponse,
+            // Onboarding
+            onboarding::OnboardingStatusResponse,
+            onboarding::SetModeRequest,
+            onboarding::SetBudgetRequest,
+            onboarding::AutoSetupRequest,
+            onboarding::AutoSetupResponse,
+            onboarding::AutoSelectedWallet,
         )
     ),
     tags(
@@ -136,6 +204,12 @@ use crate::websocket;
         (name = "vault", description = "Secure wallet key management"),
         (name = "recommendations", description = "AI-powered rotation recommendations"),
         (name = "users", description = "User management (admin only)"),
+        (name = "admin_workspaces", description = "Workspace management (platform admin only)"),
+        (name = "workspaces", description = "User workspace operations"),
+        (name = "invites", description = "Workspace invite management"),
+        (name = "allocations", description = "Wallet roster allocations"),
+        (name = "auto_rotation", description = "Auto-rotation history and optimization"),
+        (name = "onboarding", description = "Setup wizard and onboarding"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -195,6 +269,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/recommendations/:id/accept",
             post(recommendations::accept_recommendation),
         )
+        // Invite info and acceptance (public - token validates access)
+        .route("/api/v1/invites/:token", get(invites::get_invite_info))
+        .route(
+            "/api/v1/invites/:token/accept",
+            post(invites::accept_invite),
+        )
         // WebSocket endpoints (auth handled via query param or message)
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))
@@ -240,6 +320,33 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/backtest/results/:result_id",
             get(backtest::get_backtest_result),
         )
+        // Workspace endpoints (read-only for all members)
+        .route("/api/v1/workspaces", get(workspaces::list_workspaces))
+        .route(
+            "/api/v1/workspaces/current",
+            get(workspaces::get_current_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id",
+            get(workspaces::get_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/members",
+            get(workspaces::list_members),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites",
+            get(invites::list_invites),
+        )
+        // Allocations (read-only for all members)
+        .route("/api/v1/allocations", get(allocations::list_allocations))
+        // Auto-rotation history (read-only for all members)
+        .route(
+            "/api/v1/auto-rotation/history",
+            get(auto_rotation::list_rotation_history),
+        )
+        // Onboarding status (read for all)
+        .route("/api/v1/onboarding/status", get(onboarding::get_status))
         // Apply auth middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -275,6 +382,72 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/vault/wallets/:address/primary",
             put(vault::set_primary_wallet),
         )
+        // Workspace operations (owner/admin can modify)
+        .route(
+            "/api/v1/workspaces/:workspace_id",
+            put(workspaces::update_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/switch",
+            post(workspaces::switch_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/members/:member_id",
+            put(workspaces::update_member_role),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/members/:member_id",
+            delete(workspaces::remove_member),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites",
+            post(invites::create_invite),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites/:invite_id",
+            delete(invites::revoke_invite),
+        )
+        // Allocation management (owner/admin can modify)
+        .route(
+            "/api/v1/allocations/:address",
+            post(allocations::add_allocation),
+        )
+        .route(
+            "/api/v1/allocations/:address",
+            put(allocations::update_allocation),
+        )
+        .route(
+            "/api/v1/allocations/:address",
+            delete(allocations::remove_allocation),
+        )
+        .route(
+            "/api/v1/allocations/:address/promote",
+            post(allocations::promote_allocation),
+        )
+        .route(
+            "/api/v1/allocations/:address/demote",
+            post(allocations::demote_allocation),
+        )
+        // Auto-rotation operations
+        .route(
+            "/api/v1/auto-rotation/:entry_id/acknowledge",
+            put(auto_rotation::acknowledge_entry),
+        )
+        .route(
+            "/api/v1/auto-rotation/trigger",
+            post(auto_rotation::trigger_optimization),
+        )
+        // Onboarding operations
+        .route("/api/v1/onboarding/mode", put(onboarding::set_mode))
+        .route("/api/v1/onboarding/budget", put(onboarding::set_budget))
+        .route(
+            "/api/v1/onboarding/auto-setup",
+            post(onboarding::auto_setup),
+        )
+        .route(
+            "/api/v1/onboarding/complete",
+            put(onboarding::complete_onboarding),
+        )
         // Apply trader check first, then auth
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -293,6 +466,27 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/users/:user_id", get(users::get_user))
         .route("/api/v1/users/:user_id", patch(users::update_user))
         .route("/api/v1/users/:user_id", delete(users::delete_user))
+        // Admin workspace management
+        .route(
+            "/api/v1/admin/workspaces",
+            get(admin_workspaces::list_workspaces),
+        )
+        .route(
+            "/api/v1/admin/workspaces",
+            post(admin_workspaces::create_workspace),
+        )
+        .route(
+            "/api/v1/admin/workspaces/:workspace_id",
+            get(admin_workspaces::get_workspace),
+        )
+        .route(
+            "/api/v1/admin/workspaces/:workspace_id",
+            put(admin_workspaces::update_workspace),
+        )
+        .route(
+            "/api/v1/admin/workspaces/:workspace_id",
+            delete(admin_workspaces::delete_workspace),
+        )
         // Apply rate limiting first (outermost layer runs last)
         .layer(GovernorLayer {
             config: Arc::new(admin_rate_limit_config),
@@ -322,13 +516,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::broadcast;
-
-    fn create_test_state() -> Arc<AppState> {
-        // Create a mock pool - this would need a real database for integration tests
-        // For now, we'll just verify the router compiles
-        todo!("Need database for tests")
-    }
 
     #[test]
     fn test_openapi_spec() {
@@ -337,5 +524,7 @@ mod tests {
         assert!(json.contains("Polymarket Trading API"));
         assert!(json.contains("health"));
         assert!(json.contains("markets"));
+        assert!(json.contains("workspaces"));
+        assert!(json.contains("allocations"));
     }
 }

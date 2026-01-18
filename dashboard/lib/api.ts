@@ -21,6 +21,24 @@ import type {
   UserListItem,
   CreateUserRequest,
   UpdateUserRequest,
+  WorkspaceListItem,
+  Workspace,
+  WorkspaceMember,
+  WorkspaceInvite,
+  WorkspaceAllocation,
+  RotationHistoryEntry,
+  OnboardingStatus,
+  CreateWorkspaceRequest,
+  UpdateWorkspaceRequest,
+  CreateInviteRequest,
+  InviteInfo,
+  AcceptInviteRequest,
+  AddAllocationRequest,
+  UpdateAllocationRequest,
+  SetBudgetRequest,
+  AutoSetupConfig,
+  SetupMode,
+  WorkspaceRole,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -403,6 +421,204 @@ class ApiClient {
   async deleteUser(userId: string): Promise<void> {
     return this.request<void>(`/api/v1/users/${userId}`, {
       method: 'DELETE',
+    });
+  }
+
+  // Admin Workspace Management (Platform Admin only)
+  async adminListWorkspaces(): Promise<WorkspaceListItem[]> {
+    return this.request<WorkspaceListItem[]>('/api/v1/admin/workspaces');
+  }
+
+  async adminCreateWorkspace(params: CreateWorkspaceRequest): Promise<Workspace> {
+    return this.request<Workspace>('/api/v1/admin/workspaces', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async adminGetWorkspace(workspaceId: string): Promise<Workspace> {
+    return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`);
+  }
+
+  async adminUpdateWorkspace(workspaceId: string, params: UpdateWorkspaceRequest): Promise<Workspace> {
+    return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`, {
+      method: 'PUT',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async adminDeleteWorkspace(workspaceId: string): Promise<void> {
+    return this.request<void>(`/api/v1/admin/workspaces/${workspaceId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // User Workspaces
+  async listWorkspaces(): Promise<WorkspaceListItem[]> {
+    return this.request<WorkspaceListItem[]>('/api/v1/workspaces');
+  }
+
+  async getCurrentWorkspace(): Promise<Workspace> {
+    return this.request<Workspace>('/api/v1/workspaces/current');
+  }
+
+  async getWorkspace(workspaceId: string): Promise<Workspace> {
+    return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`);
+  }
+
+  async updateWorkspace(workspaceId: string, params: UpdateWorkspaceRequest): Promise<Workspace> {
+    return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`, {
+      method: 'PUT',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async switchWorkspace(workspaceId: string): Promise<void> {
+    return this.request<void>(`/api/v1/workspaces/${workspaceId}/switch`, {
+      method: 'POST',
+    });
+  }
+
+  async listWorkspaceMembers(workspaceId: string): Promise<WorkspaceMember[]> {
+    return this.request<WorkspaceMember[]>(`/api/v1/workspaces/${workspaceId}/members`);
+  }
+
+  async updateMemberRole(workspaceId: string, memberId: string, role: WorkspaceRole): Promise<WorkspaceMember> {
+    return this.request<WorkspaceMember>(`/api/v1/workspaces/${workspaceId}/members/${memberId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ role }),
+    });
+  }
+
+  async removeMember(workspaceId: string, memberId: string): Promise<void> {
+    return this.request<void>(`/api/v1/workspaces/${workspaceId}/members/${memberId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Workspace Invites
+  async listWorkspaceInvites(workspaceId: string): Promise<WorkspaceInvite[]> {
+    return this.request<WorkspaceInvite[]>(`/api/v1/workspaces/${workspaceId}/invites`);
+  }
+
+  async createInvite(workspaceId: string, params: CreateInviteRequest): Promise<WorkspaceInvite> {
+    return this.request<WorkspaceInvite>(`/api/v1/workspaces/${workspaceId}/invites`, {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async revokeInvite(workspaceId: string, inviteId: string): Promise<void> {
+    return this.request<void>(`/api/v1/workspaces/${workspaceId}/invites/${inviteId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getInviteInfo(token: string): Promise<InviteInfo> {
+    return this.request<InviteInfo>(`/api/v1/invites/${token}`);
+  }
+
+  async acceptInvite(token: string, params?: AcceptInviteRequest): Promise<AuthResponse> {
+    return this.request<AuthResponse>(`/api/v1/invites/${token}/accept`, {
+      method: 'POST',
+      body: JSON.stringify(params || {}),
+    });
+  }
+
+  // Workspace Allocations
+  async listAllocations(): Promise<WorkspaceAllocation[]> {
+    return this.request<WorkspaceAllocation[]>('/api/v1/allocations');
+  }
+
+  async addAllocation(address: string, params?: AddAllocationRequest): Promise<WorkspaceAllocation> {
+    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}`, {
+      method: 'POST',
+      body: JSON.stringify(params || {}),
+    });
+  }
+
+  async updateAllocation(address: string, params: UpdateAllocationRequest): Promise<WorkspaceAllocation> {
+    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}`, {
+      method: 'PUT',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async removeAllocation(address: string): Promise<void> {
+    return this.request<void>(`/api/v1/allocations/${address}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async promoteAllocation(address: string): Promise<WorkspaceAllocation> {
+    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}/promote`, {
+      method: 'POST',
+    });
+  }
+
+  async demoteAllocation(address: string): Promise<WorkspaceAllocation> {
+    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}/demote`, {
+      method: 'POST',
+    });
+  }
+
+  // Auto-Rotation
+  async listRotationHistory(params?: {
+    limit?: number;
+    offset?: number;
+    unacknowledged_only?: boolean;
+  }): Promise<RotationHistoryEntry[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.unacknowledged_only !== undefined) {
+      searchParams.set('unacknowledged_only', String(params.unacknowledged_only));
+    }
+    const query = searchParams.toString();
+    return this.request<RotationHistoryEntry[]>(`/api/v1/auto-rotation/history${query ? `?${query}` : ''}`);
+  }
+
+  async acknowledgeRotation(entryId: string): Promise<RotationHistoryEntry> {
+    return this.request<RotationHistoryEntry>(`/api/v1/auto-rotation/${entryId}/acknowledge`, {
+      method: 'PUT',
+    });
+  }
+
+  async triggerOptimization(): Promise<void> {
+    return this.request<void>('/api/v1/auto-rotation/trigger', {
+      method: 'POST',
+    });
+  }
+
+  // Onboarding
+  async getOnboardingStatus(): Promise<OnboardingStatus> {
+    return this.request<OnboardingStatus>('/api/v1/onboarding/status');
+  }
+
+  async setOnboardingMode(mode: SetupMode): Promise<OnboardingStatus> {
+    return this.request<OnboardingStatus>('/api/v1/onboarding/mode', {
+      method: 'PUT',
+      body: JSON.stringify({ mode }),
+    });
+  }
+
+  async setOnboardingBudget(params: SetBudgetRequest): Promise<OnboardingStatus> {
+    return this.request<OnboardingStatus>('/api/v1/onboarding/budget', {
+      method: 'PUT',
+      body: JSON.stringify(params),
+    });
+  }
+
+  async runAutoSetup(config?: AutoSetupConfig): Promise<{ selected_wallets: string[]; message: string }> {
+    return this.request<{ selected_wallets: string[]; message: string }>('/api/v1/onboarding/auto-setup', {
+      method: 'POST',
+      body: JSON.stringify(config || {}),
+    });
+  }
+
+  async completeOnboarding(): Promise<OnboardingStatus> {
+    return this.request<OnboardingStatus>('/api/v1/onboarding/complete', {
+      method: 'PUT',
     });
   }
 }

@@ -19,6 +19,7 @@
 //! server.run().await?;
 //! ```
 
+pub mod auto_optimizer;
 pub mod copy_trading;
 pub mod email;
 pub mod error;
@@ -29,6 +30,7 @@ pub mod routes;
 pub mod state;
 pub mod websocket;
 
+pub use auto_optimizer::AutoOptimizer;
 pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use error::ApiError;
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
@@ -188,6 +190,10 @@ impl ApiServer {
             self.state.signal_tx.clone(),
             self.state.orderbook_tx.clone(),
         );
+
+        // Spawn auto-optimizer background service
+        let optimizer = Arc::new(AutoOptimizer::new(self.state.pool.clone()));
+        tokio::spawn(optimizer.start());
 
         let addr = self.config.socket_addr();
         info!(address = %addr, "Starting API server");
