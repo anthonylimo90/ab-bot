@@ -16,7 +16,7 @@ use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use auth::{AuditAction, AuditEvent, Claims};
+use auth::{AuditAction, AuditEvent, Claims, UserRole};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -55,6 +55,22 @@ pub struct AcceptInviteRequest {
     pub name: Option<String>,
 }
 
+/// User info returned for newly created users accepting an invite.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InviteUserInfo {
+    /// User ID.
+    pub id: String,
+    /// Email address.
+    pub email: String,
+    /// Display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// User role.
+    pub role: String,
+    /// Account creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Accept invite response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AcceptInviteResponse {
@@ -62,6 +78,12 @@ pub struct AcceptInviteResponse {
     pub workspace_name: String,
     pub role: String,
     pub is_new_user: bool,
+    /// JWT token for auto-login (only for new users).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// User info for auto-login (only for new users).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<InviteUserInfo>,
 }
 
 /// Public invite info (for invite acceptance page).
@@ -528,28 +550,33 @@ pub async fn accept_invite(
         role: String,
     }
 
+    // Start transaction early to prevent race conditions
+    let mut tx = state.pool.begin().await?;
+    let now = Utc::now();
+
+    // Fetch and lock invite inside transaction to prevent concurrent acceptance
     let invite: Option<InviteRow> = sqlx::query_as(
         r#"
         SELECT wi.id, wi.workspace_id, w.name as workspace_name, wi.email, wi.role
         FROM workspace_invites wi
         INNER JOIN workspaces w ON wi.workspace_id = w.id
         WHERE wi.token_hash = $1 AND wi.accepted_at IS NULL AND wi.expires_at > NOW()
+        FOR UPDATE OF wi
         "#,
     )
     .bind(&token_hash)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let invite = invite.ok_or_else(|| ApiError::NotFound("Invite not found or expired".into()))?;
 
-    // Check if user exists
-    let existing_user: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
-        .bind(&invite.email)
-        .fetch_optional(&state.pool)
-        .await?;
+    // Check if user exists (inside transaction to prevent race condition)
+    let existing_user: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE email = $1 FOR UPDATE")
+            .bind(&invite.email)
+            .fetch_optional(&mut *tx)
+            .await?;
 
-    let mut tx = state.pool.begin().await?;
-    let now = Utc::now();
     let is_new_user;
     let user_id;
 
@@ -576,6 +603,7 @@ pub async fn accept_invite(
         // New user - must provide password
         let password = req
             .password
+            .as_ref()
             .ok_or_else(|| ApiError::BadRequest("Password is required for new account".into()))?;
 
         if password.len() < 8 {
@@ -594,7 +622,7 @@ pub async fn accept_invite(
 
         // Create user
         user_id = Uuid::new_v4();
-        let role: i16 = 1; // Trader by default
+        let db_role: i16 = 1; // Trader by default
 
         sqlx::query(
             r#"
@@ -605,11 +633,22 @@ pub async fn accept_invite(
         .bind(user_id)
         .bind(&invite.email)
         .bind(&password_hash)
-        .bind(role)
+        .bind(db_role)
         .bind(&req.name)
         .bind(now)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|e| {
+            // Handle constraint violation (race condition where user was created concurrently)
+            if let sqlx::Error::Database(ref db_err) = e {
+                if db_err.constraint() == Some("users_email_key") {
+                    return ApiError::Conflict(
+                        "An account with this email already exists".into(),
+                    );
+                }
+            }
+            ApiError::Database(e)
+        })?;
 
         is_new_user = true;
     }
@@ -653,6 +692,26 @@ pub async fn accept_invite(
 
     tx.commit().await?;
 
+    // Generate token and user info for new users (for auto-login)
+    let (token, user_info) = if is_new_user {
+        let jwt_token = state
+            .jwt_auth
+            .create_token(&user_id.to_string(), UserRole::Trader)
+            .map_err(|e| ApiError::Internal(format!("Token generation failed: {}", e)))?;
+
+        let info = InviteUserInfo {
+            id: user_id.to_string(),
+            email: invite.email.clone(),
+            name: req.name.clone(),
+            role: "Trader".to_string(),
+            created_at: now,
+        };
+
+        (Some(jwt_token), Some(info))
+    } else {
+        (None, None)
+    };
+
     // Audit log
     let event = AuditEvent::builder(
         AuditAction::Custom("workspace_invite_accepted".to_string()),
@@ -672,5 +731,7 @@ pub async fn accept_invite(
         workspace_name: invite.workspace_name,
         role: invite.role,
         is_new_user,
+        token,
+        user: user_info,
     }))
 }
