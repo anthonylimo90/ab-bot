@@ -44,6 +44,8 @@ pub struct Claims {
     pub sub: String,
     /// User's email.
     pub email: Option<String>,
+    /// User's wallet address (if authenticated via wallet).
+    pub wallet_address: Option<String>,
     /// User's role.
     pub role: UserRole,
     /// Issued at timestamp.
@@ -61,6 +63,7 @@ impl Claims {
         Self {
             sub: user_id.into(),
             email: None,
+            wallet_address: None,
             role,
             iat: now.timestamp(),
             exp: (now + Duration::hours(expiry_hours)).timestamp(),
@@ -71,6 +74,12 @@ impl Claims {
     /// Add email to claims.
     pub fn with_email(mut self, email: impl Into<String>) -> Self {
         self.email = Some(email.into());
+        self
+    }
+
+    /// Add wallet address to claims.
+    pub fn with_wallet_address(mut self, address: impl Into<String>) -> Self {
+        self.wallet_address = Some(address.into());
         self
     }
 

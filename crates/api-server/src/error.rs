@@ -53,6 +53,9 @@ pub enum ApiError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Gone: {0}")]
+    Gone(String),
+
     #[error("Validation error: {0}")]
     Validation(String),
 
@@ -84,6 +87,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
+            ApiError::Gone(_) => StatusCode::GONE,
             ApiError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -102,6 +106,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => "UNAUTHORIZED",
             ApiError::Forbidden(_) => "FORBIDDEN",
             ApiError::Conflict(_) => "CONFLICT",
+            ApiError::Gone(_) => "GONE",
             ApiError::Validation(_) => "VALIDATION_ERROR",
             ApiError::RateLimited => "RATE_LIMITED",
             ApiError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",

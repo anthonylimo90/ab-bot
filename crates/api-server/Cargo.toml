@@ -54,6 +54,10 @@ reqwest = { workspace = true }
 # Hashing (for password reset tokens)
 sha2 = "0.10"
 
+# SIWE (Sign-In With Ethereum)
+siwe = "0.6"
+time = "0.3"
+
 # Error handling
 thiserror.workspace = true
 anyhow.workspace = true

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -27,6 +27,8 @@ import {
   Users,
   ChevronRight,
   UserPlus,
+  Link as LinkIcon,
+  ExternalLink,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -55,6 +57,8 @@ export default function SettingsPage() {
   const [connectWalletOpen, setConnectWalletOpen] = useState(false);
   const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [walletConnectProjectId, setWalletConnectProjectId] = useState('');
+  const [isSavingWalletConnect, setIsSavingWalletConnect] = useState(false);
 
   // Fetch workspace members
   const { data: members = [], isLoading: membersLoading } = useQuery({
@@ -73,6 +77,14 @@ export default function SettingsPage() {
   // Get current user's role in workspace
   const currentUserRole = currentWorkspace?.my_role;
   const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
+  const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
+
+  // Initialize walletConnectProjectId from workspace
+  useEffect(() => {
+    if (currentWorkspace?.walletconnect_project_id) {
+      setWalletConnectProjectId(currentWorkspace.walletconnect_project_id);
+    }
+  }, [currentWorkspace?.walletconnect_project_id]);
 
   // Revoke invite mutation
   const revokeInviteMutation = useMutation({
@@ -85,6 +97,24 @@ export default function SettingsPage() {
       toast.error('Failed to revoke invite', err.message);
     },
   });
+
+  // Save WalletConnect project ID
+  const handleSaveWalletConnect = async () => {
+    if (!currentWorkspace) return;
+    setIsSavingWalletConnect(true);
+    try {
+      await api.updateWorkspace(currentWorkspace.id, {
+        walletconnect_project_id: walletConnectProjectId || undefined,
+      });
+      toast.success('WalletConnect settings saved', 'Your wallet connection is now configured');
+      // Refresh workspace to get updated config
+      queryClient.invalidateQueries({ queryKey: ['workspace'] });
+    } catch (err) {
+      toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setIsSavingWalletConnect(false);
+    }
+  };
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -177,6 +207,77 @@ export default function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* WalletConnect Settings (Owner/Admin only) */}
+      {currentWorkspace && canConfigureWalletConnect && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <LinkIcon className="h-5 w-5" />
+              Wallet Connection
+            </CardTitle>
+            <CardDescription>
+              Configure WalletConnect for MetaMask and other wallet connections
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="walletconnect-project-id">
+                WalletConnect Project ID
+              </label>
+              <div className="flex gap-2">
+                <input
+                  id="walletconnect-project-id"
+                  type="text"
+                  value={walletConnectProjectId}
+                  onChange={(e) => setWalletConnectProjectId(e.target.value)}
+                  placeholder="Enter your WalletConnect project ID"
+                  className="flex-1 rounded border bg-background px-3 py-2 text-sm"
+                />
+                <Button
+                  onClick={handleSaveWalletConnect}
+                  disabled={isSavingWalletConnect || walletConnectProjectId === (currentWorkspace.walletconnect_project_id || '')}
+                >
+                  {isSavingWalletConnect ? (
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Save className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Get your project ID from{' '}
+                <a
+                  href="https://cloud.walletconnect.com"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary hover:underline inline-flex items-center gap-1"
+                >
+                  WalletConnect Cloud
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+              </p>
+            </div>
+
+            {!walletConnectProjectId && !currentWorkspace.walletconnect_project_id && (
+              <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-3">
+                <p className="text-sm text-yellow-500">
+                  Wallet connection requires a WalletConnect project ID. Create a free account at WalletConnect Cloud to get started.
+                </p>
+              </div>
+            )}
+
+            {(walletConnectProjectId || currentWorkspace.walletconnect_project_id) && (
+              <div className="rounded-lg border border-green-500/20 bg-green-500/10 p-3">
+                <p className="text-sm text-green-500 flex items-center gap-2">
+                  <Check className="h-4 w-4" />
+                  Wallet connection is configured. Users can connect their MetaMask wallets.
+                </p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Team Management */}
       {currentWorkspace && (

@@ -216,6 +216,9 @@ pub struct Workspace {
     // Trading wallet
     pub trading_wallet_address: Option<String>,
 
+    // WalletConnect configuration
+    pub walletconnect_project_id: Option<String>,
+
     // Audit
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,

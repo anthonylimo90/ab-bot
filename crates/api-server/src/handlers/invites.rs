@@ -642,9 +642,7 @@ pub async fn accept_invite(
             // Handle constraint violation (race condition where user was created concurrently)
             if let sqlx::Error::Database(ref db_err) = e {
                 if db_err.constraint() == Some("users_email_key") {
-                    return ApiError::Conflict(
-                        "An account with this email already exists".into(),
-                    );
+                    return ApiError::Conflict("An account with this email already exists".into());
                 }
             }
             ApiError::Database(e)

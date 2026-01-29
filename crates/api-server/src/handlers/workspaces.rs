@@ -44,6 +44,7 @@ pub struct WorkspaceResponse {
     pub min_win_rate: Option<Decimal>,
     pub min_trades_30d: Option<i32>,
     pub trading_wallet_address: Option<String>,
+    pub walletconnect_project_id: Option<String>,
     pub my_role: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -94,6 +95,7 @@ pub struct UpdateWorkspaceRequest {
     pub min_sharpe: Option<Decimal>,
     pub min_win_rate: Option<Decimal>,
     pub min_trades_30d: Option<i32>,
+    pub walletconnect_project_id: Option<String>,
 }
 
 /// Workspace member response.
@@ -140,6 +142,7 @@ struct WorkspaceDetailRow {
     min_win_rate: Option<Decimal>,
     min_trades_30d: Option<i32>,
     trading_wallet_address: Option<String>,
+    walletconnect_project_id: Option<String>,
     role: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -281,7 +284,7 @@ pub async fn get_workspace(
             w.id, w.name, w.description, w.setup_mode, w.total_budget, w.reserved_cash_pct,
             w.auto_optimize_enabled, w.optimization_interval_hours,
             w.min_roi_30d, w.min_sharpe, w.min_win_rate, w.min_trades_30d,
-            w.trading_wallet_address, wm.role, w.created_at, w.updated_at
+            w.trading_wallet_address, w.walletconnect_project_id, wm.role, w.created_at, w.updated_at
         FROM workspaces w
         INNER JOIN workspace_members wm ON w.id = wm.workspace_id
         WHERE w.id = $1 AND wm.user_id = $2
@@ -310,6 +313,7 @@ pub async fn get_workspace(
         min_win_rate: workspace.min_win_rate,
         min_trades_30d: workspace.min_trades_30d,
         trading_wallet_address: workspace.trading_wallet_address,
+        walletconnect_project_id: workspace.walletconnect_project_id,
         my_role: workspace.role,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
@@ -381,6 +385,7 @@ pub async fn update_workspace(
     add_param!(min_sharpe, "min_sharpe");
     add_param!(min_win_rate, "min_win_rate");
     add_param!(min_trades_30d, "min_trades_30d");
+    add_param!(walletconnect_project_id, "walletconnect_project_id");
 
     let query = format!(
         "UPDATE workspaces SET {} WHERE id = $1",
@@ -421,6 +426,9 @@ pub async fn update_workspace(
     }
     if let Some(min_trades_30d) = req.min_trades_30d {
         q = q.bind(min_trades_30d);
+    }
+    if let Some(ref walletconnect_project_id) = req.walletconnect_project_id {
+        q = q.bind(walletconnect_project_id);
     }
 
     q.execute(&state.pool).await?;

@@ -15,6 +15,7 @@ import type {
   DiscoveredWallet,
   DemoPnlSimulation,
   User,
+  WalletUser,
   AuthResponse,
   ConnectedWallet,
   StoreWalletRequest,
@@ -169,6 +170,54 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ token, password }),
     });
+  }
+
+  // Wallet Authentication (SIWE)
+  async walletChallenge(address: string): Promise<{
+    message: string;
+    nonce: string;
+    expires_at: string;
+  }> {
+    return this.request<{ message: string; nonce: string; expires_at: string }>(
+      '/api/v1/auth/wallet/challenge',
+      {
+        method: 'POST',
+        body: JSON.stringify({ address }),
+      }
+    );
+  }
+
+  async walletVerify(
+    message: string,
+    signature: string
+  ): Promise<{
+    token: string;
+    user: WalletUser;
+    is_new_user: boolean;
+  }> {
+    const response = await this.request<{
+      token: string;
+      user: WalletUser;
+      is_new_user: boolean;
+    }>('/api/v1/auth/wallet/verify', {
+      method: 'POST',
+      body: JSON.stringify({ message, signature }),
+    });
+    this.setToken(response.token);
+    return response;
+  }
+
+  async walletLink(
+    message: string,
+    signature: string
+  ): Promise<{ message: string; wallet_address: string }> {
+    return this.request<{ message: string; wallet_address: string }>(
+      '/api/v1/auth/wallet/link',
+      {
+        method: 'POST',
+        body: JSON.stringify({ message, signature }),
+      }
+    );
   }
 
   // Markets

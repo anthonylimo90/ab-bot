@@ -12,7 +12,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health, invites,
-    markets, onboarding, positions, recommendations, trading, users, vault, wallets, workspaces,
+    markets, onboarding, order_signing, positions, recommendations, trading, users, vault,
+    wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -35,6 +36,10 @@ use crate::websocket;
         auth::get_current_user,
         auth::forgot_password,
         auth::reset_password,
+        // Wallet auth
+        wallet_auth::challenge,
+        wallet_auth::verify,
+        wallet_auth::link_wallet,
         markets::list_markets,
         markets::get_market,
         markets::get_market_orderbook,
@@ -121,6 +126,9 @@ use crate::websocket;
         demo::get_demo_balance,
         demo::update_demo_balance,
         demo::reset_demo_portfolio,
+        // Order signing (MetaMask)
+        order_signing::prepare_order,
+        order_signing::submit_order,
     ),
     components(
         schemas(
@@ -133,6 +141,14 @@ use crate::websocket;
             auth::ForgotPasswordResponse,
             auth::ResetPasswordRequest,
             auth::ResetPasswordResponse,
+            // Wallet auth schemas
+            wallet_auth::ChallengeRequest,
+            wallet_auth::ChallengeResponse,
+            wallet_auth::VerifyRequest,
+            wallet_auth::VerifyResponse,
+            wallet_auth::WalletUserInfo,
+            wallet_auth::LinkWalletRequest,
+            wallet_auth::LinkWalletResponse,
             crate::websocket::OrderbookUpdate,
             crate::websocket::PositionUpdate,
             crate::websocket::SignalUpdate,
@@ -217,6 +233,17 @@ use crate::websocket;
             demo::UpdateDemoPositionRequest,
             demo::DemoBalanceResponse,
             demo::UpdateDemoBalanceRequest,
+            // Order signing
+            order_signing::PrepareOrderRequest,
+            order_signing::PrepareOrderResponse,
+            order_signing::SubmitOrderRequest,
+            order_signing::SubmitOrderResponse,
+            order_signing::Eip712TypedData,
+            order_signing::Eip712Domain,
+            order_signing::Eip712Order,
+            order_signing::Eip712Types,
+            order_signing::TypeDefinition,
+            order_signing::OrderSummary,
         )
     ),
     tags(
@@ -238,6 +265,7 @@ use crate::websocket;
         (name = "auto_rotation", description = "Auto-rotation history and optimization"),
         (name = "onboarding", description = "Setup wizard and onboarding"),
         (name = "demo", description = "Demo trading positions and balance"),
+        (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -269,6 +297,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/forgot-password", post(auth::forgot_password))
         .route("/api/v1/auth/reset-password", post(auth::reset_password))
+        // Wallet auth (SIWE)
+        .route(
+            "/api/v1/auth/wallet/challenge",
+            post(wallet_auth::challenge),
+        )
+        .route("/api/v1/auth/wallet/verify", post(wallet_auth::verify))
         .layer(GovernorLayer {
             config: Arc::new(auth_rate_limit_config),
         });
@@ -314,6 +348,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Auth endpoints (protected)
         .route("/api/v1/auth/refresh", post(auth::refresh_token))
         .route("/api/v1/auth/me", get(auth::get_current_user))
+        // Wallet linking (requires auth)
+        .route("/api/v1/auth/wallet/link", post(wallet_auth::link_wallet))
         // Market endpoints (read-only)
         .route("/api/v1/markets", get(markets::list_markets))
         .route("/api/v1/markets/:market_id", get(markets::get_market))
@@ -396,6 +432,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/orders/:order_id/cancel",
             post(trading::cancel_order),
         )
+        // Wallet-based order signing (MetaMask)
+        .route("/api/v1/orders/prepare", post(order_signing::prepare_order))
+        .route("/api/v1/orders/submit", post(order_signing::submit_order))
         // Position operations
         .route(
             "/api/v1/positions/:position_id/close",

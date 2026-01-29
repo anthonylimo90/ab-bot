@@ -12,6 +12,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { loginSchema, type LoginFormData } from '@/lib/validations';
 import { useAuthStore } from '@/stores/auth-store';
 import { useToastStore } from '@/stores/toast-store';
+import { WalletLoginButton } from '@/components/wallet';
 import api from '@/lib/api';
 
 export default function LoginPage() {
@@ -115,6 +116,23 @@ export default function LoginPage() {
           <Button type="submit" className="w-full" disabled={isLoading}>
             {isLoading ? 'Signing in...' : 'Sign in'}
           </Button>
+
+          <div className="relative w-full">
+            <div className="absolute inset-0 flex items-center">
+              <span className="w-full border-t" />
+            </div>
+            <div className="relative flex justify-center text-xs uppercase">
+              <span className="bg-card px-2 text-muted-foreground">
+                Or continue with
+              </span>
+            </div>
+          </div>
+
+          <WalletLoginButton
+            className="w-full"
+            onSuccess={() => router.push(redirectTo)}
+          />
+
           <p className="text-sm text-muted-foreground text-center">
             Contact an administrator for account access.
           </p>

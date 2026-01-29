@@ -4,9 +4,19 @@ export type UserRole = 'Viewer' | 'Trader' | 'PlatformAdmin';
 
 export interface User {
   id: string;
-  email: string;
+  email?: string;
   name?: string;
+  wallet_address?: string;
   role: UserRole;
+  created_at: string;
+}
+
+export interface WalletUser {
+  id: string;
+  wallet_address: string;
+  email?: string;
+  name?: string;
+  role: string;
   created_at: string;
 }
 
@@ -509,6 +519,7 @@ export interface Workspace {
   min_win_rate?: number;
   min_trades_30d?: number;
   trading_wallet_address?: string;
+  walletconnect_project_id?: string;
   my_role: WorkspaceRole;
   onboarding_completed?: boolean;
   created_by?: string;
@@ -651,6 +662,7 @@ export interface UpdateWorkspaceRequest {
   min_sharpe?: number;
   min_win_rate?: number;
   min_trades_30d?: number;
+  walletconnect_project_id?: string;
 }
 
 export interface CreateInviteRequest {
@@ -793,4 +805,75 @@ export interface DemoBalance {
   balance: number;
   initial_balance: number;
   updated_at: string;
+}
+
+// Order Signing Types (for MetaMask trade signing)
+export interface Eip712Domain {
+  name: string;
+  version: string;
+  chainId: number;
+  verifyingContract: string;
+}
+
+export interface Eip712Order {
+  salt: string;
+  maker: string;
+  signer: string;
+  taker: string;
+  tokenId: string;
+  makerAmount: string;
+  takerAmount: string;
+  expiration: string;
+  nonce: string;
+  feeRateBps: string;
+  side: number;
+  signatureType: number;
+}
+
+export interface Eip712TypedData {
+  types: {
+    EIP712Domain: Array<{ name: string; type: string }>;
+    Order: Array<{ name: string; type: string }>;
+  };
+  primaryType: string;
+  domain: Eip712Domain;
+  message: Eip712Order;
+}
+
+export interface OrderSummary {
+  side: string;
+  outcome: string;
+  price: string;
+  size: string;
+  total_cost: string;
+  potential_payout: string;
+}
+
+export interface PrepareOrderRequest {
+  token_id: string;
+  side: 'BUY' | 'SELL';
+  price: number;
+  size: number;
+  maker_address: string;
+  neg_risk?: boolean;
+  expires_in_secs?: number;
+}
+
+export interface PrepareOrderResponse {
+  pending_order_id: string;
+  typed_data: Eip712TypedData;
+  expires_at: string;
+  summary: OrderSummary;
+}
+
+export interface SubmitOrderRequest {
+  pending_order_id: string;
+  signature: string;
+}
+
+export interface SubmitOrderResponse {
+  success: boolean;
+  order_id?: string;
+  message: string;
+  tx_hash?: string;
 }
