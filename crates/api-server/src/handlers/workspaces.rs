@@ -360,6 +360,15 @@ pub async fn update_workspace(
         ));
     }
 
+    // Validate WalletConnect project ID format if provided
+    if let Some(ref project_id) = req.walletconnect_project_id {
+        if !project_id.is_empty() && !is_valid_walletconnect_project_id(project_id) {
+            return Err(ApiError::BadRequest(
+                "Invalid WalletConnect project ID format. Expected 32-character alphanumeric string.".into(),
+            ));
+        }
+    }
+
     // Build dynamic update
     let now = Utc::now();
     let mut set_parts = vec!["updated_at = $2".to_string()];
@@ -917,4 +926,11 @@ pub async fn get_optimizer_status(
             total_value: settings.total_budget,
         },
     }))
+}
+
+/// Validate WalletConnect project ID format.
+/// Expected: 32-character alphanumeric string (hex).
+fn is_valid_walletconnect_project_id(project_id: &str) -> bool {
+    // WalletConnect project IDs are typically 32 character hex strings
+    project_id.len() == 32 && project_id.chars().all(|c| c.is_ascii_hexdigit())
 }

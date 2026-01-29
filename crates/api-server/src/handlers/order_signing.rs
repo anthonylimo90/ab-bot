@@ -4,6 +4,8 @@
 //! that users can sign with their wallet, and then submitting
 //! the signed orders to the Polymarket CLOB.
 
+use alloy_primitives::{keccak256, Address, B256};
+use alloy_sol_types::SolValue;
 use axum::extract::State;
 use axum::Extension;
 use axum::Json;
@@ -16,7 +18,7 @@ use uuid::Uuid;
 
 use auth::Claims;
 use polymarket_core::signing::{
-    CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS, POLYGON_CHAIN_ID,
+    SignedOrder, CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS, POLYGON_CHAIN_ID,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -504,6 +506,31 @@ pub async fn submit_order(
         ));
     }
 
+    // Verify signature matches the maker address
+    let recovered_address =
+        verify_order_signature(&pending_order, &req.signature).map_err(|e| {
+            tracing::warn!(
+                maker = %pending_order.maker_address,
+                error = %e,
+                "Signature verification failed"
+            );
+            ApiError::BadRequest(format!("Signature verification failed: {}", e))
+        })?;
+
+    // Ensure recovered address matches maker
+    let maker_addr = pending_order.maker_address.to_lowercase();
+    let recovered_addr = format!("{:?}", recovered_address).to_lowercase();
+    if maker_addr != recovered_addr {
+        tracing::warn!(
+            maker = %maker_addr,
+            recovered = %recovered_addr,
+            "Signature signer mismatch"
+        );
+        return Err(ApiError::BadRequest(
+            "Signature does not match maker address".into(),
+        ));
+    }
+
     // Build the signed order for CLOB submission
     let side_str = if pending_order.side == 0 {
         "BUY"
@@ -511,52 +538,263 @@ pub async fn submit_order(
         "SELL"
     };
 
-    let signed_order = serde_json::json!({
-        "salt": pending_order.salt,
-        "maker": pending_order.maker_address,
-        "signer": pending_order.maker_address,
-        "taker": "0x0000000000000000000000000000000000000000",
-        "tokenId": pending_order.token_id,
-        "makerAmount": pending_order.maker_amount,
-        "takerAmount": pending_order.taker_amount,
-        "expiration": pending_order.expiration.to_string(),
-        "nonce": pending_order.nonce,
-        "feeRateBps": pending_order.fee_rate_bps.to_string(),
-        "side": side_str,
-        "signatureType": pending_order.signature_type,
-        "signature": req.signature
-    });
+    let signed_order = SignedOrder {
+        salt: pending_order.salt.clone(),
+        maker: pending_order.maker_address.clone(),
+        signer: pending_order.maker_address.clone(),
+        taker: "0x0000000000000000000000000000000000000000".to_string(),
+        token_id: pending_order.token_id.clone(),
+        maker_amount: pending_order.maker_amount.clone(),
+        taker_amount: pending_order.taker_amount.clone(),
+        expiration: pending_order.expiration.to_string(),
+        nonce: pending_order.nonce.clone(),
+        fee_rate_bps: pending_order.fee_rate_bps.to_string(),
+        side: side_str.to_string(),
+        signature_type: pending_order.signature_type as u8,
+        signature: req.signature.clone(),
+    };
 
-    // TODO: Submit to actual Polymarket CLOB API
-    // For now, we simulate a successful submission
-    //
-    // In production, this would:
-    // 1. Call the Polymarket CLOB API with the signed order
-    // 2. Handle the response (success/failure)
-    // 3. Store the order in our database for tracking
+    // Submit to Polymarket CLOB API
+    let clob_result = submit_to_clob(&state, &signed_order, pending_order.neg_risk).await;
 
-    // Delete pending order after submission
+    // Delete pending order after submission attempt
     sqlx::query("DELETE FROM pending_wallet_orders WHERE id = $1")
         .bind(pending_order_id)
         .execute(&state.pool)
         .await?;
 
-    // Generate a mock order ID for now
-    let order_id = Uuid::new_v4().to_string();
+    match clob_result {
+        Ok(response) => {
+            tracing::info!(
+                user_id = %user_id,
+                pending_order_id = %pending_order_id,
+                order_id = %response.order_id,
+                maker = %pending_order.maker_address,
+                token_id = %pending_order.token_id,
+                side = %side_str,
+                "Order submitted to CLOB successfully"
+            );
 
-    tracing::info!(
-        user_id = %user_id,
-        pending_order_id = %pending_order_id,
-        maker = %pending_order.maker_address,
-        token_id = %pending_order.token_id,
-        side = %side_str,
-        "Signed order submitted"
+            Ok(Json(SubmitOrderResponse {
+                success: true,
+                order_id: Some(response.order_id),
+                message: "Order submitted successfully".to_string(),
+                tx_hash: response.tx_hash,
+            }))
+        }
+        Err(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                pending_order_id = %pending_order_id,
+                maker = %pending_order.maker_address,
+                error = %e,
+                "Failed to submit order to CLOB"
+            );
+
+            // Return error but don't expose internal details
+            Err(ApiError::Internal(format!(
+                "Order submission failed: {}",
+                e
+            )))
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Response from CLOB submission.
+struct ClobSubmitResponse {
+    order_id: String,
+    tx_hash: Option<String>,
+}
+
+/// Verify the EIP-712 signature and recover the signer address.
+fn verify_order_signature(
+    pending_order: &PendingOrderRow,
+    signature: &str,
+) -> Result<Address, String> {
+    use alloy_primitives::U256;
+
+    // Parse signature bytes
+    let sig_bytes = hex::decode(signature.trim_start_matches("0x"))
+        .map_err(|e| format!("Invalid signature hex: {}", e))?;
+
+    if sig_bytes.len() != 65 {
+        return Err("Signature must be 65 bytes".to_string());
+    }
+
+    // Extract r, s, v from signature
+    let mut r = [0u8; 32];
+    let mut s = [0u8; 32];
+    r.copy_from_slice(&sig_bytes[0..32]);
+    s.copy_from_slice(&sig_bytes[32..64]);
+    let v = sig_bytes[64];
+
+    // Build the EIP-712 struct hash
+    let order_type_hash = keccak256(
+        b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
     );
 
-    Ok(Json(SubmitOrderResponse {
-        success: true,
-        order_id: Some(order_id),
-        message: "Order submitted successfully".to_string(),
-        tx_hash: None, // Would be populated from CLOB response
-    }))
+    // Parse order fields
+    let salt = U256::from_str_radix(&pending_order.salt, 10)
+        .map_err(|e| format!("Invalid salt: {}", e))?;
+    let maker: Address = pending_order
+        .maker_address
+        .parse()
+        .map_err(|e| format!("Invalid maker address: {}", e))?;
+    let signer = maker;
+    let taker = Address::ZERO;
+    let token_id = U256::from_str_radix(&pending_order.token_id, 10)
+        .map_err(|e| format!("Invalid token_id: {}", e))?;
+    let maker_amount = U256::from_str_radix(&pending_order.maker_amount, 10)
+        .map_err(|e| format!("Invalid maker_amount: {}", e))?;
+    let taker_amount = U256::from_str_radix(&pending_order.taker_amount, 10)
+        .map_err(|e| format!("Invalid taker_amount: {}", e))?;
+    let expiration = U256::from(pending_order.expiration as u64);
+    let nonce = U256::from_str_radix(&pending_order.nonce, 10).unwrap_or(U256::ZERO);
+    let fee_rate_bps = U256::from(pending_order.fee_rate_bps as u64);
+    let side = U256::from(pending_order.side as u64);
+    let signature_type = U256::from(pending_order.signature_type as u64);
+
+    // Encode struct hash
+    let struct_encoded = (
+        order_type_hash,
+        salt,
+        maker,
+        signer,
+        taker,
+        token_id,
+        maker_amount,
+        taker_amount,
+        expiration,
+        nonce,
+        fee_rate_bps,
+        side,
+        signature_type,
+    )
+        .abi_encode_packed();
+
+    let struct_hash = keccak256(&struct_encoded);
+
+    // Build domain separator
+    let domain_type_hash = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak256(b"Polymarket CTF Exchange");
+    let version_hash = keccak256(b"1");
+    let chain_id = U256::from(POLYGON_CHAIN_ID);
+    let verifying_contract: Address = if pending_order.neg_risk {
+        NEG_RISK_CTF_EXCHANGE_ADDRESS.parse().unwrap()
+    } else {
+        CTF_EXCHANGE_ADDRESS.parse().unwrap()
+    };
+
+    let domain_encoded = (
+        domain_type_hash,
+        name_hash,
+        version_hash,
+        chain_id,
+        verifying_contract,
+    )
+        .abi_encode_packed();
+
+    let domain_separator = keccak256(&domain_encoded);
+
+    // Build EIP-712 hash: keccak256("\x19\x01" ++ domainSeparator ++ structHash)
+    let prefix = [0x19u8, 0x01u8];
+    let typed_data = (prefix, domain_separator, struct_hash).abi_encode_packed();
+    let digest = keccak256(&typed_data);
+
+    // Recover the signer address using secp256k1
+    recover_address(&digest, &r, &s, v)
+}
+
+/// Recover address from signature using secp256k1.
+fn recover_address(digest: &B256, r: &[u8; 32], s: &[u8; 32], v: u8) -> Result<Address, String> {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+
+    // Normalize v value (handle both legacy 27/28 and EIP-155 formats)
+    let recovery_id_val = match v {
+        0 | 27 => 0,
+        1 | 28 => 1,
+        _ => return Err(format!("Invalid recovery id: {}", v)),
+    };
+
+    let recovery_id =
+        RecoveryId::try_from(recovery_id_val).map_err(|e| format!("Invalid recovery id: {}", e))?;
+
+    // Create signature from r and s
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes[..32].copy_from_slice(r);
+    sig_bytes[32..].copy_from_slice(s);
+
+    let signature =
+        Signature::from_slice(&sig_bytes).map_err(|e| format!("Invalid signature: {}", e))?;
+
+    // Recover the verifying key
+    let verifying_key =
+        VerifyingKey::recover_from_prehash(digest.as_slice(), &signature, recovery_id)
+            .map_err(|e| format!("Failed to recover key: {}", e))?;
+
+    // Convert to address (keccak256 of public key, take last 20 bytes)
+    let public_key_bytes = verifying_key.to_encoded_point(false);
+    let public_key_hash = keccak256(&public_key_bytes.as_bytes()[1..]); // Skip the 0x04 prefix
+    let address_bytes: [u8; 20] = public_key_hash[12..32].try_into().unwrap();
+
+    Ok(Address::from(address_bytes))
+}
+
+/// Submit signed order to Polymarket CLOB API.
+async fn submit_to_clob(
+    state: &Arc<AppState>,
+    signed_order: &SignedOrder,
+    _neg_risk: bool,
+) -> Result<ClobSubmitResponse, String> {
+    // Build request body
+    let request_body = serde_json::json!({
+        "order": signed_order,
+        "orderType": "GTC"
+    });
+
+    // Submit to CLOB
+    let url = format!(
+        "{}/order",
+        polymarket_core::api::ClobClient::DEFAULT_BASE_URL
+    );
+
+    let response = state
+        .clob_client
+        .http_client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("CLOB API error {}: {}", status, body));
+    }
+
+    #[derive(Deserialize)]
+    struct ClobResponse {
+        #[serde(rename = "orderID")]
+        order_id: String,
+        #[serde(rename = "transactionHash")]
+        transaction_hash: Option<String>,
+    }
+
+    let clob_response: ClobResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse CLOB response: {}", e))?;
+
+    Ok(ClobSubmitResponse {
+        order_id: clob_response.order_id,
+        tx_hash: clob_response.transaction_hash,
+    })
 }

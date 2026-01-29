@@ -58,6 +58,11 @@ sha2 = "0.10"
 siwe = "0.6"
 time = "0.3"
 
+# Crypto (for signature verification)
+k256 = { version = "0.13", features = ["ecdsa"] }
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+
 # Error handling
 thiserror.workspace = true
 anyhow.workspace = true

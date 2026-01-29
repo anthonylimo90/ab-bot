@@ -21,7 +21,8 @@ use tracing::{debug, info, warn};
 pub struct ClobClient {
     base_url: String,
     ws_url: String,
-    http_client: reqwest::Client,
+    /// HTTP client for API requests.
+    pub http_client: reqwest::Client,
 }
 
 impl ClobClient {
