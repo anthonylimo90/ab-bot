@@ -46,20 +46,20 @@ impl Default for AdvancedStopConfig {
     fn default() -> Self {
         Self {
             break_even_enabled: true,
-            break_even_trigger_pct: Decimal::new(5, 2), // 5% profit
-            break_even_buffer_pct: Decimal::new(1, 3),  // 0.1% buffer
+            break_even_trigger_pct: Decimal::new(8, 2), // 8% profit — let profits run longer
+            break_even_buffer_pct: Decimal::new(5, 3),  // 0.5% buffer — avoid false triggers
 
             step_trailing_enabled: false,
             step_size: Decimal::new(5, 2),       // $0.05 steps
             step_offset_pct: Decimal::new(3, 2), // 3% offset
 
             volatility_adjusted: true,
-            atr_multiplier: Decimal::new(2, 0), // 2x ATR
+            atr_multiplier: Decimal::new(25, 1), // 2.5x ATR — wider for prediction markets
             atr_period: 14,
 
             time_decay_enabled: true,
-            time_decay_start_hours: 24,
-            time_decay_final_multiplier: Decimal::new(5, 1), // 0.5x (tighter)
+            time_decay_start_hours: 12, // Start tightening sooner
+            time_decay_final_multiplier: Decimal::new(65, 2), // 0.65x — less aggressive
         }
     }
 }

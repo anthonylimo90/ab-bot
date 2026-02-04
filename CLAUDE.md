@@ -61,6 +61,10 @@ REDIS_URL=                 # Redis connection
 JWT_SECRET=                # Min 32 chars, required
 WALLET_PRIVATE_KEY=        # For live trading (optional)
 LIVE_TRADING=true          # Enable live orders (optional)
+CB_MAX_DAILY_LOSS=2500     # Circuit breaker daily loss limit (optional)
+CB_MAX_DRAWDOWN_PCT=0.20   # Circuit breaker max drawdown (optional)
+CB_MAX_CONSECUTIVE_LOSSES=8 # Circuit breaker consecutive losses (optional)
+CB_COOLDOWN_MINUTES=30     # Circuit breaker cooldown minutes (optional)
 ```
 
 ## SQLx Offline Mode

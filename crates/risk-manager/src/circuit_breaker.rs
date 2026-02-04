@@ -56,15 +56,15 @@ pub struct CircuitBreakerConfig {
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            max_daily_loss: Decimal::new(1000, 0), // $1000 daily loss limit
-            max_drawdown_pct: Decimal::new(10, 2), // 10% max drawdown
-            max_consecutive_losses: 5,             // 5 consecutive losses
-            cooldown_minutes: 60,                  // 1 hour cooldown
+            max_daily_loss: Decimal::new(2500, 0), // $2500 daily loss limit
+            max_drawdown_pct: Decimal::new(20, 2), // 20% max drawdown
+            max_consecutive_losses: 8,             // 8 consecutive losses
+            cooldown_minutes: 30,                  // 30 min cooldown
             enabled: true,
-            gradual_recovery_enabled: false, // Off by default for backward compatibility
-            recovery_stages: 4,              // 25%, 50%, 75%, 100%
-            recovery_stage_minutes: 15,      // 15 minutes per stage
-            require_profit_to_advance: true, // Need a win to advance
+            gradual_recovery_enabled: true, // Use recovery system instead of hard lockout
+            recovery_stages: 3,             // 33%, 66%, 100%
+            recovery_stage_minutes: 10,     // 10 minutes per stage
+            require_profit_to_advance: false, // Time-based is sufficient for learning
         }
     }
 }

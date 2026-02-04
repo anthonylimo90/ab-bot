@@ -192,11 +192,12 @@ impl DemotionTrigger {
         )
     }
 
-    /// Get the grace period in hours for non-immediate triggers
+    /// Get the grace period in hours for non-immediate triggers.
+    /// Returns defaults; use AutoOptimizerConfig for configurable values.
     pub fn grace_period_hours(&self) -> Option<i64> {
         match self {
-            DemotionTrigger::NegativeRoi => Some(48),
-            DemotionTrigger::LowSharpe => Some(24),
+            DemotionTrigger::NegativeRoi => Some(72),
+            DemotionTrigger::LowSharpe => Some(48),
             DemotionTrigger::Inactivity => None, // No grace period, but not immediate
             _ => None,
         }
@@ -245,19 +246,46 @@ pub const DEFAULT_MIN_WIN_RATE: f64 = 50.0;
 pub const DEFAULT_MIN_TRADES: i32 = 10;
 pub const DEFAULT_MAX_DRAWDOWN: f64 = 20.0;
 
-/// Default demotion thresholds
-pub const DEMOTION_MAX_CONSECUTIVE_LOSSES: i32 = 5;
-pub const DEMOTION_MAX_DRAWDOWN_PCT: f64 = 30.0;
-pub const DEMOTION_GRACE_ROI_THRESHOLD: f64 = 0.0;
-pub const DEMOTION_GRACE_SHARPE_THRESHOLD: f64 = 0.5;
+/// Configuration for auto-optimizer demotion thresholds and allocation limits.
+#[derive(Debug, Clone)]
+pub struct AutoOptimizerConfig {
+    /// Max consecutive losses before immediate demotion.
+    pub demotion_max_consecutive_losses: i32,
+    /// Max drawdown percentage before immediate demotion.
+    pub demotion_max_drawdown_pct: f64,
+    /// ROI threshold below which grace period starts.
+    pub demotion_grace_roi_threshold: f64,
+    /// Sharpe threshold below which grace period starts.
+    pub demotion_grace_sharpe_threshold: f64,
+    /// Grace period hours for negative ROI trigger.
+    pub grace_period_negative_roi_hours: i64,
+    /// Grace period hours for low Sharpe trigger.
+    pub grace_period_low_sharpe_hours: i64,
+    /// Minimum allocation percentage per wallet.
+    pub min_allocation_pct: f64,
+    /// Maximum allocation percentage per wallet.
+    pub max_allocation_pct: f64,
+}
 
-/// Allocation limits
-pub const MIN_ALLOCATION_PCT: f64 = 10.0;
-pub const MAX_ALLOCATION_PCT: f64 = 35.0;
+impl Default for AutoOptimizerConfig {
+    fn default() -> Self {
+        Self {
+            demotion_max_consecutive_losses: 8,
+            demotion_max_drawdown_pct: 40.0,
+            demotion_grace_roi_threshold: -5.0,
+            demotion_grace_sharpe_threshold: 0.3,
+            grace_period_negative_roi_hours: 72,
+            grace_period_low_sharpe_hours: 48,
+            min_allocation_pct: 5.0,
+            max_allocation_pct: 50.0,
+        }
+    }
+}
 
 /// Auto-optimizer service with event-driven automation.
 pub struct AutoOptimizer {
     pool: PgPool,
+    config: AutoOptimizerConfig,
     event_sender: Option<mpsc::Sender<AutomationEvent>>,
 }
 
@@ -268,10 +296,20 @@ impl Default for AutoOptimizer {
 }
 
 impl AutoOptimizer {
-    /// Create a new auto-optimizer.
+    /// Create a new auto-optimizer with default config.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            config: AutoOptimizerConfig::default(),
+            event_sender: None,
+        }
+    }
+
+    /// Create a new auto-optimizer with custom config.
+    pub fn new_with_config(pool: PgPool, config: AutoOptimizerConfig) -> Self {
+        Self {
+            pool,
+            config,
             event_sender: None,
         }
     }
@@ -282,6 +320,7 @@ impl AutoOptimizer {
         (
             Self {
                 pool,
+                config: AutoOptimizerConfig::default(),
                 event_sender: Some(tx),
             },
             rx,
@@ -579,8 +618,9 @@ impl AutoOptimizer {
         allocation: &CurrentAllocation,
         workspace: &WorkspaceOptimizationSettings,
     ) -> anyhow::Result<Option<DemotionTrigger>> {
-        // Immediate trigger: 5+ consecutive losses
-        if allocation.consecutive_losses.unwrap_or(0) >= DEMOTION_MAX_CONSECUTIVE_LOSSES {
+        // Immediate trigger: consecutive losses
+        if allocation.consecutive_losses.unwrap_or(0) >= self.config.demotion_max_consecutive_losses
+        {
             return Ok(Some(DemotionTrigger::ConsecutiveLosses));
         }
 
@@ -590,9 +630,9 @@ impl AutoOptimizer {
             .map(|d| {
                 d.to_string()
                     .parse::<f64>()
-                    .unwrap_or(DEMOTION_MAX_DRAWDOWN_PCT)
+                    .unwrap_or(self.config.demotion_max_drawdown_pct)
             })
-            .unwrap_or(DEMOTION_MAX_DRAWDOWN_PCT);
+            .unwrap_or(self.config.demotion_max_drawdown_pct);
 
         if let Some(roi) = allocation.backtest_roi {
             let roi_f64: f64 = roi.to_string().parse().unwrap_or(0.0);
@@ -602,18 +642,18 @@ impl AutoOptimizer {
             }
         }
 
-        // Grace period trigger: ROI < 0%
+        // Grace period trigger: ROI below threshold
         if let Some(roi) = allocation.backtest_roi {
             let roi_f64: f64 = roi.to_string().parse().unwrap_or(0.0);
-            if roi_f64 < DEMOTION_GRACE_ROI_THRESHOLD {
+            if roi_f64 < self.config.demotion_grace_roi_threshold {
                 return Ok(Some(DemotionTrigger::NegativeRoi));
             }
         }
 
-        // Grace period trigger: Sharpe < 0.5
+        // Grace period trigger: Sharpe below threshold
         if let Some(sharpe) = allocation.backtest_sharpe {
             let sharpe_f64: f64 = sharpe.to_string().parse().unwrap_or(0.0);
-            if sharpe_f64 < DEMOTION_GRACE_SHARPE_THRESHOLD {
+            if sharpe_f64 < self.config.demotion_grace_sharpe_threshold {
                 return Ok(Some(DemotionTrigger::LowSharpe));
             }
         }
@@ -675,8 +715,8 @@ impl AutoOptimizer {
         // Find wallets with expired grace periods
         let now = Utc::now();
 
-        // ROI grace period: 48 hours
-        let roi_expiry = now - Duration::hours(48);
+        // ROI grace period
+        let roi_expiry = now - Duration::hours(self.config.grace_period_negative_roi_hours);
 
         let expired_roi: Vec<(Uuid, String)> = sqlx::query_as(
             r#"
@@ -703,8 +743,8 @@ impl AutoOptimizer {
             .await?;
         }
 
-        // Sharpe grace period: 24 hours
-        let sharpe_expiry = now - Duration::hours(24);
+        // Sharpe grace period
+        let sharpe_expiry = now - Duration::hours(self.config.grace_period_low_sharpe_hours);
 
         let expired_sharpe: Vec<(Uuid, String)> = sqlx::query_as(
             r#"
@@ -1176,7 +1216,9 @@ impl AutoOptimizer {
             .map(|(id, v)| {
                 let pct = (v / total) * 100.0;
                 // Apply min/max caps
-                let capped = pct.max(MIN_ALLOCATION_PCT).min(MAX_ALLOCATION_PCT);
+                let capped = pct
+                    .max(self.config.min_allocation_pct)
+                    .min(self.config.max_allocation_pct);
                 (id, capped)
             })
             .collect();
@@ -1218,7 +1260,9 @@ impl AutoOptimizer {
                     .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0).max(0.0))
                     .unwrap_or(0.0);
                 let pct = (roi / total_roi) * 100.0;
-                let capped = pct.max(MIN_ALLOCATION_PCT).min(MAX_ALLOCATION_PCT);
+                let capped = pct
+                    .max(self.config.min_allocation_pct)
+                    .min(self.config.max_allocation_pct);
                 (a.id, capped)
             })
             .collect()
@@ -1605,7 +1649,9 @@ impl AutoOptimizer {
                 }
 
                 // Check consecutive losses threshold
-                if alloc.consecutive_losses.unwrap_or(0) >= DEMOTION_MAX_CONSECUTIVE_LOSSES {
+                if alloc.consecutive_losses.unwrap_or(0)
+                    >= self.config.demotion_max_consecutive_losses
+                {
                     self.demote_wallet(
                         workspace_id,
                         wallet_address,

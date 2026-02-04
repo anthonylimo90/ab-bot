@@ -109,7 +109,27 @@ impl AppState {
         let order_executor = Arc::new(OrderExecutor::new(clob_client.clone(), executor_config));
 
         // Create circuit breaker for risk management
-        let circuit_breaker_config = CircuitBreakerConfig::default();
+        let mut circuit_breaker_config = CircuitBreakerConfig::default();
+        if let Ok(v) = std::env::var("CB_MAX_DAILY_LOSS") {
+            if let Ok(d) = v.parse::<rust_decimal::Decimal>() {
+                circuit_breaker_config.max_daily_loss = d;
+            }
+        }
+        if let Ok(v) = std::env::var("CB_MAX_DRAWDOWN_PCT") {
+            if let Ok(d) = v.parse::<rust_decimal::Decimal>() {
+                circuit_breaker_config.max_drawdown_pct = d;
+            }
+        }
+        if let Ok(v) = std::env::var("CB_MAX_CONSECUTIVE_LOSSES") {
+            if let Ok(n) = v.parse::<u32>() {
+                circuit_breaker_config.max_consecutive_losses = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CB_COOLDOWN_MINUTES") {
+            if let Ok(n) = v.parse::<i64>() {
+                circuit_breaker_config.cooldown_minutes = n;
+            }
+        }
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
 
         // Create email client if configured
