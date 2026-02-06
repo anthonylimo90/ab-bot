@@ -313,8 +313,11 @@ impl CopyTrader {
                 }
             }
             AllocationStrategy::RiskAdjusted => {
-                // For now, same as configured weight
                 // TODO: Implement Sharpe-ratio based weighting
+                tracing::warn!(
+                    wallet = %wallet.address,
+                    "RiskAdjusted allocation not yet implemented, falling back to ConfiguredWeight"
+                );
                 self.total_capital * wallet.allocation_pct / Decimal::new(100, 0)
             }
         }

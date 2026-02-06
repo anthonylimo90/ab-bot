@@ -49,7 +49,10 @@ impl ArbMonitor {
             signal_publisher,
             order_books: HashMap::new(),
             market_outcomes: HashMap::new(),
-            min_profit_threshold: Decimal::new(1, 3), // 0.001 = 0.1% minimum profit
+            min_profit_threshold: std::env::var("ARB_MIN_PROFIT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| Decimal::new(1, 3)), // default 0.001 = 0.1%
         })
     }
 

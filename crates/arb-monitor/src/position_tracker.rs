@@ -26,7 +26,10 @@ impl PositionTracker {
         Self {
             repo: PositionRepository::new(pool),
             active_positions: HashMap::new(),
-            exit_threshold: Decimal::new(5, 3), // 0.005 = 0.5% minimum exit profit
+            exit_threshold: std::env::var("ARB_EXIT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| Decimal::new(5, 3)), // default 0.005 = 0.5%
         }
     }
 

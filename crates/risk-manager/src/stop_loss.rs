@@ -571,11 +571,17 @@ impl StopLossManager {
             }
         }
 
-        // Persist trailing stop peak updates to database
+        // Persist trailing stop peak updates to database (batched — only rules with new peaks)
         if let Some(repo) = &self.repo {
-            for rule in rules_to_update {
-                if let Err(e) = repo.update(&rule).await {
-                    error!(rule_id = %rule.id, error = %e, "Failed to persist trailing stop peak update");
+            if !rules_to_update.is_empty() {
+                debug!(
+                    count = rules_to_update.len(),
+                    "Persisting trailing stop peak updates"
+                );
+                for rule in rules_to_update {
+                    if let Err(e) = repo.update(&rule).await {
+                        error!(rule_id = %rule.id, error = %e, "Failed to persist trailing stop peak update");
+                    }
                 }
             }
         }
