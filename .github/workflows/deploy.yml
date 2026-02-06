@@ -5,7 +5,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch:
 
 jobs:
@@ -29,6 +29,7 @@ jobs:
           echo "Commit: ${{ github.sha }}"
           echo "Branch: ${{ github.ref_name }}"
           echo "Author: ${{ github.actor }}"
+          echo "Environment: ${{ github.ref_name == 'main' && 'production' || 'develop' }}"
           echo ""
           echo "Railway will automatically deploy:"
           echo "  - api-server"
