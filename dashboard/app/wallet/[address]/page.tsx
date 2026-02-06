@@ -15,7 +15,7 @@ import {
   usePromoteAllocationMutation,
 } from '@/hooks/queries/useAllocationsQuery';
 import { useWorkspaceStore } from '@/stores/workspace-store';
-import { shortenAddress, formatCurrency } from '@/lib/utils';
+import { shortenAddress, formatCurrency, ratioOrPercentToPercent } from '@/lib/utils';
 import {
   ArrowLeft,
   Wallet,
@@ -83,11 +83,11 @@ export default function WalletDetailPage() {
         address: storedWallet.wallet_address,
         label: storedWallet.wallet_label,
         tier: storedWallet.tier,
-        roi30d: (storedWallet.backtest_roi ?? 0) * 100,
+        roi30d: ratioOrPercentToPercent(storedWallet.backtest_roi),
         roi7d: 0,
         roi90d: 0,
         sharpe: storedWallet.backtest_sharpe ?? 0,
-        winRate: (storedWallet.backtest_win_rate ?? 0) * 100,
+        winRate: ratioOrPercentToPercent(storedWallet.backtest_win_rate),
         trades: 0,
         maxDrawdown: 0,
         confidence: storedWallet.confidence_score ?? 0,
@@ -104,13 +104,13 @@ export default function WalletDetailPage() {
         address: apiWallet.address,
         label: apiWallet.label,
         tier: apiWallet.copy_enabled ? 'active' as const : 'bench' as const,
-        roi30d: walletMetrics?.roi ?? 0,
+        roi30d: ratioOrPercentToPercent(walletMetrics?.roi),
         roi7d: 0, // Not available in WalletMetrics
         roi90d: 0, // Not available in WalletMetrics
         sharpe: walletMetrics?.sharpe_ratio ?? 0,
-        winRate: apiWallet?.win_rate ?? 0,
+        winRate: ratioOrPercentToPercent(apiWallet?.win_rate),
         trades: apiWallet?.total_trades ?? 0,
-        maxDrawdown: walletMetrics?.max_drawdown ?? 0,
+        maxDrawdown: ratioOrPercentToPercent(walletMetrics?.max_drawdown),
         confidence: 0,
         copySettings: {
           copy_behavior: 'events_only' as const,

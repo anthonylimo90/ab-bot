@@ -33,30 +33,6 @@ export function useRotationHistoryQuery(params?: {
   });
 }
 
-export function useActiveAllocationsQuery(workspaceId: string | undefined) {
-  return useQuery({
-    queryKey: workspaceId ? queryKeys.allocations.active(workspaceId) : ['allocations', 'active', 'disabled'],
-    queryFn: async () => {
-      const allocations = await api.listAllocations();
-      return allocations.filter((a) => a.tier === 'active');
-    },
-    enabled: Boolean(workspaceId),
-    staleTime: 60000,
-  });
-}
-
-export function useBenchAllocationsQuery(workspaceId: string | undefined) {
-  return useQuery({
-    queryKey: workspaceId ? queryKeys.allocations.bench(workspaceId) : ['allocations', 'bench', 'disabled'],
-    queryFn: async () => {
-      const allocations = await api.listAllocations();
-      return allocations.filter((a) => a.tier === 'bench');
-    },
-    enabled: Boolean(workspaceId),
-    staleTime: 60000,
-  });
-}
-
 export function useTriggerOptimizationMutation() {
   const queryClient = useQueryClient();
   return useMutation({

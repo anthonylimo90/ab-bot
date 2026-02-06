@@ -20,7 +20,7 @@ import {
   usePinAllocationMutation,
   useUnpinAllocationMutation,
 } from '@/hooks/queries/useAllocationsQuery';
-import { shortenAddress, formatCurrency, cn } from '@/lib/utils';
+import { shortenAddress, formatCurrency, cn, ratioOrPercentToPercent } from '@/lib/utils';
 import {
   TrendingUp,
   TrendingDown,
@@ -100,9 +100,9 @@ function toTradingWallet(allocation: WorkspaceAllocation): TradingWallet {
       max_position_size: allocation.max_position_size ?? 100,
       arb_threshold_pct: allocation.arb_threshold_pct,
     },
-    roi30d: (allocation.backtest_roi ?? 0) * 100,
+    roi30d: ratioOrPercentToPercent(allocation.backtest_roi),
     sharpe: allocation.backtest_sharpe ?? 0,
-    winRate: (allocation.backtest_win_rate ?? 0) * 100,
+    winRate: ratioOrPercentToPercent(allocation.backtest_win_rate),
     trades: 0,
     maxDrawdown: 0,
     confidence: allocation.confidence_score ?? 0,

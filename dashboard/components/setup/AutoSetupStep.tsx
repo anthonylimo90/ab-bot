@@ -7,7 +7,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Progress } from '@/components/ui/progress';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import {
   ArrowLeft,
@@ -23,7 +22,8 @@ import {
 import { useToastStore } from '@/stores/toast-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import api from '@/lib/api';
-import type { AutoSetupConfig, WorkspaceAllocation } from '@/types/api';
+import { ratioOrPercentToPercent } from '@/lib/utils';
+import type { AutoSelectedWallet, AutoSetupConfig } from '@/types/api';
 
 interface AutoSetupStepProps {
   onComplete: (walletCount: number) => void;
@@ -41,7 +41,7 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
     min_trades_30d: 10,
   });
   const [hasRun, setHasRun] = useState(false);
-  const [selectedWallets, setSelectedWallets] = useState<string[]>([]);
+  const [selectedWallets, setSelectedWallets] = useState<AutoSelectedWallet[]>([]);
   const [analysisProgress, setAnalysisProgress] = useState(0);
 
   // Fetch current allocations
@@ -287,10 +287,10 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
                     </div>
                     <div className="flex items-center gap-4 text-sm text-muted-foreground">
                       {allocation.backtest_roi && (
-                        <span>ROI: {(allocation.backtest_roi * 100).toFixed(1)}%</span>
+                        <span>ROI: {ratioOrPercentToPercent(allocation.backtest_roi).toFixed(1)}%</span>
                       )}
                       {allocation.backtest_win_rate && (
-                        <span>Win: {(allocation.backtest_win_rate * 100).toFixed(1)}%</span>
+                        <span>Win: {ratioOrPercentToPercent(allocation.backtest_win_rate).toFixed(1)}%</span>
                       )}
                       <Badge>{allocation.allocation_pct}%</Badge>
                     </div>

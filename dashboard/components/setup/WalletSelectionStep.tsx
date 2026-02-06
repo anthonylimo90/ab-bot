@@ -21,7 +21,8 @@ import {
 import { useToastStore } from '@/stores/toast-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import api from '@/lib/api';
-import type { DiscoveredWallet, WorkspaceAllocation } from '@/types/api';
+import { ratioOrPercentToPercent } from '@/lib/utils';
+import type { DiscoveredWallet } from '@/types/api';
 
 interface WalletSelectionStepProps {
   onComplete: (walletCount: number) => void;
@@ -104,7 +105,7 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
   };
 
   const formatPercent = (value: number) => {
-    return `${(value * 100).toFixed(1)}%`;
+    return `${ratioOrPercentToPercent(value).toFixed(1)}%`;
   };
 
   const formatAddress = (address: string) => {

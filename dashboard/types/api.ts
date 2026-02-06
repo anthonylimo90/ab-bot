@@ -728,6 +728,21 @@ export interface AutoSetupConfig {
   min_trades_30d?: number;
 }
 
+export interface AutoSelectedWallet {
+  address: string;
+  allocation_pct: number;
+  roi_30d?: number;
+  sharpe_ratio?: number;
+  win_rate?: number;
+  reason: string;
+}
+
+export interface AutoSetupResponse {
+  success: boolean;
+  message: string;
+  selected_wallets: AutoSelectedWallet[];
+}
+
 // Optimizer Status types
 export interface OptimizerCriteria {
   min_roi_30d: number | null;
