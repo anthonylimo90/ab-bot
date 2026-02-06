@@ -66,11 +66,11 @@ repository = "https://github.com/anthonylimo/ab-bot"
 tokio = { version = "1.35", features = ["full"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 futures-util = "0.3"
 
 # HTTP client
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", features = ["json", "rustls-tls"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -102,7 +102,7 @@ tokio-test = "0.4"
 mockall = "0.12"
 
 # Concurrent data structures
-dashmap = "5.5"
+dashmap = "6.1"
 
 # Encoding
 hex = "0.4"
