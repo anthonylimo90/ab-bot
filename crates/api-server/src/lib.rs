@@ -41,6 +41,7 @@ pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
 use axum::Router;
 use sqlx::PgPool;
@@ -169,6 +170,7 @@ impl ApiServer {
                         },
                     ),
             )
+            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
             .layer(if config.cors_permissive {
                 CorsLayer::permissive()
             } else {

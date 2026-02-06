@@ -390,6 +390,31 @@ pub async fn refresh_token(
     Ok(Json(response))
 }
 
+/// Logout and revoke the current JWT token.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/logout",
+    responses(
+        (status = 200, description = "Successfully logged out"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "auth"
+)]
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Revoke the current token so it can't be reused
+    state.jwt_auth.revoke_token(&claims.jti, claims.exp);
+
+    tracing::info!(user_id = %claims.sub, "User logged out, token revoked");
+
+    Ok(Json(serde_json::json!({ "status": "logged_out" })))
+}
+
 /// Get the current authenticated user's information.
 #[utoipa::path(
     get,

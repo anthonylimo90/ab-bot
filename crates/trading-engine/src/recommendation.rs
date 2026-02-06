@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -227,6 +229,8 @@ pub struct RecommendationEngine {
     min_arb_profit: Decimal,
     min_wallet_score: f64,
     max_recommendations: usize,
+    /// Cache of recently generated recommendations, keyed by ID.
+    cache: Arc<RwLock<HashMap<Uuid, Recommendation>>>,
 }
 
 impl RecommendationEngine {
@@ -237,6 +241,7 @@ impl RecommendationEngine {
             min_arb_profit: Decimal::new(2, 2), // 2% minimum
             min_wallet_score: 0.65,
             max_recommendations: 10,
+            cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -283,6 +288,14 @@ impl RecommendationEngine {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         recommendations.truncate(self.max_recommendations);
+
+        // Cache all generated recommendations for lookup by ID
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+            for rec in &recommendations {
+                cache.insert(rec.id, rec.clone());
+            }
+        }
 
         info!(
             user_id = %profile.user_id,
@@ -714,10 +727,13 @@ impl RecommendationEngine {
         Ok(recommendations)
     }
 
-    /// Get recommendation by ID.
-    pub fn get_recommendation(&self, _id: Uuid) -> Option<Recommendation> {
-        // Would typically fetch from cache or database
-        None
+    /// Get recommendation by ID from the cache.
+    pub fn get_recommendation(&self, id: Uuid) -> Option<Recommendation> {
+        self.cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&id).cloned())
+            .filter(|rec| rec.is_valid())
     }
 
     /// Dismiss a recommendation.

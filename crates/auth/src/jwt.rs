@@ -4,6 +4,8 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::RwLock;
 use uuid::Uuid;
 
 /// Platform-level user roles for authorization.
@@ -129,6 +131,9 @@ pub struct JwtAuth {
     decoding_key: DecodingKey,
     config: JwtConfig,
     validation: Validation,
+    /// Blacklisted token JTIs mapped to their expiry timestamps.
+    /// Entries are automatically pruned during revocation checks.
+    blacklist: RwLock<HashMap<String, i64>>,
 }
 
 impl JwtAuth {
@@ -150,6 +155,7 @@ impl JwtAuth {
             decoding_key,
             config,
             validation,
+            blacklist: RwLock::new(HashMap::new()),
         }
     }
 
@@ -169,7 +175,44 @@ impl JwtAuth {
     /// Validate and decode a token.
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
         let token_data = decode::<Claims>(token, &self.decoding_key, &self.validation)?;
-        Ok(token_data.claims)
+        let claims = token_data.claims;
+
+        // Check if the token has been revoked
+        if self.is_revoked(&claims.jti) {
+            return Err(anyhow::anyhow!("Token has been revoked"));
+        }
+
+        Ok(claims)
+    }
+
+    /// Revoke a token by its JTI (e.g. on logout).
+    /// The revocation is tracked until the token's natural expiry.
+    pub fn revoke_token(&self, jti: &str, exp: i64) {
+        if let Ok(mut blacklist) = self.blacklist.write() {
+            blacklist.insert(jti.to_string(), exp);
+        }
+    }
+
+    /// Check if a JTI has been revoked. Also prunes expired entries.
+    fn is_revoked(&self, jti: &str) -> bool {
+        let now = Utc::now().timestamp();
+
+        // Try read lock first for the common (non-revoked) path
+        if let Ok(blacklist) = self.blacklist.read() {
+            match blacklist.get(jti) {
+                Some(&exp) if exp > now => return true,
+                None => return false,
+                _ => {} // expired entry, fall through to prune
+            }
+        }
+
+        // Prune expired entries while we have the write lock
+        if let Ok(mut blacklist) = self.blacklist.write() {
+            blacklist.retain(|_, exp| *exp > now);
+            return blacklist.contains_key(jti);
+        }
+
+        false
     }
 
     /// Refresh a token (create new token with extended expiry).
@@ -284,6 +327,22 @@ mod tests {
 
         let result = auth.validate_token("invalid-token");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_revoke_token() {
+        let auth = create_test_auth();
+
+        let token = auth.create_token("user123", UserRole::Trader).unwrap();
+        let claims = auth.validate_token(&token).unwrap();
+
+        // Revoke the token
+        auth.revoke_token(&claims.jti, claims.exp);
+
+        // Token should now be rejected
+        let result = auth.validate_token(&token);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("revoked"));
     }
 
     #[test]
