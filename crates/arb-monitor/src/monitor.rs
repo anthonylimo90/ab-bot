@@ -92,8 +92,13 @@ impl ArbMonitor {
         info!("Subscribed to order book updates, monitoring for arbitrage...");
 
         // Process updates
+        let mut health_tick = 0u64;
         while let Some(update) = updates.recv().await {
             self.process_update(update).await?;
+            health_tick += 1;
+            if health_tick % 100 == 0 {
+                crate::touch_health_file();
+            }
         }
 
         Ok(())

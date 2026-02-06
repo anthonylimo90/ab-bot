@@ -368,7 +368,7 @@ impl WsMessage {
 // ============================================================================
 
 /// API credentials for authenticated CLOB requests.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiCredentials {
     /// API key (derived from wallet).
     pub api_key: String,
@@ -376,6 +376,16 @@ pub struct ApiCredentials {
     pub api_secret: String,
     /// Passphrase for additional security.
     pub api_passphrase: String,
+}
+
+impl std::fmt::Debug for ApiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiCredentials")
+            .field("api_key", &"[REDACTED]")
+            .field("api_secret", &"[REDACTED]")
+            .field("api_passphrase", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ApiCredentials {

@@ -11,6 +11,12 @@ use polymarket_core::config::Config;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+const HEALTH_FILE: &str = "/tmp/healthy";
+
+fn touch_health_file() {
+    let _ = std::fs::write(HEALTH_FILE, format!("{}", chrono::Utc::now().timestamp()));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -23,6 +29,7 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Starting Arbitrage Monitor");
+    touch_health_file();
 
     // Load configuration
     let config = Config::from_env()?;

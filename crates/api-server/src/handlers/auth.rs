@@ -152,8 +152,15 @@ pub async fn register(
         ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
     })?;
 
-    // Validate email format
-    if !req.email.contains('@') || req.email.len() < 5 {
+    // Validate email format: local@domain with domain containing a dot
+    let email_parts: Vec<&str> = req.email.splitn(2, '@').collect();
+    if email_parts.len() != 2
+        || email_parts[0].is_empty()
+        || email_parts[1].len() < 3
+        || !email_parts[1].contains('.')
+        || email_parts[1].starts_with('.')
+        || email_parts[1].ends_with('.')
+    {
         return Err(ApiError::BadRequest("Invalid email address".into()));
     }
 
@@ -463,8 +470,15 @@ pub async fn forgot_password(
         ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
     })?;
 
-    // Validate email format
-    if !req.email.contains('@') || req.email.len() < 5 {
+    // Validate email format: local@domain with domain containing a dot
+    let email_parts: Vec<&str> = req.email.splitn(2, '@').collect();
+    if email_parts.len() != 2
+        || email_parts[0].is_empty()
+        || email_parts[1].len() < 3
+        || !email_parts[1].contains('.')
+        || email_parts[1].starts_with('.')
+        || email_parts[1].ends_with('.')
+    {
         return Err(ApiError::BadRequest("Invalid email address".into()));
     }
 

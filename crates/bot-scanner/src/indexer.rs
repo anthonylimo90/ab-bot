@@ -65,6 +65,7 @@ impl TradeIndexer {
                 error!("Error polling blocks: {}", e);
             }
 
+            crate::touch_health_file();
             tokio::time::sleep(self.poll_interval).await;
         }
     }
