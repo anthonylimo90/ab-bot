@@ -1,7 +1,7 @@
 # ==============================================================================
 # Stage 1: Builder - Build application
 # ==============================================================================
-FROM rust:1.85-bookworm AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
@@ -14,9 +14,6 @@ RUN apt-get update && apt-get install -y \
 
 # Copy source code
 COPY . .
-
-# Pin home crate to version compatible with Rust 1.85
-RUN cargo update home --precise 0.5.9
 
 # Enable sqlx offline mode (uses pre-generated .sqlx cache)
 ENV SQLX_OFFLINE=true
