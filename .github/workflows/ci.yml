@@ -184,11 +184,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build API Server image
+      - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          target: api-server
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
