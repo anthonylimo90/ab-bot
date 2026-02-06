@@ -298,6 +298,8 @@ export interface AllocationConfig {
 // Activity types
 export type ActivityType =
   | 'TRADE_COPIED'
+  | 'TRADE_COPY_SKIPPED'
+  | 'TRADE_COPY_FAILED'
   | 'POSITION_OPENED'
   | 'POSITION_CLOSED'
   | 'STOP_LOSS_TRIGGERED'

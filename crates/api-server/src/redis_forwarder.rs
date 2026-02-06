@@ -77,6 +77,7 @@ pub struct RedisForwarder {
     config: RedisForwarderConfig,
     signal_tx: broadcast::Sender<SignalUpdate>,
     orderbook_tx: broadcast::Sender<OrderbookUpdate>,
+    arb_entry_tx: broadcast::Sender<ArbOpportunity>,
 }
 
 impl RedisForwarder {
@@ -85,11 +86,13 @@ impl RedisForwarder {
         config: RedisForwarderConfig,
         signal_tx: broadcast::Sender<SignalUpdate>,
         orderbook_tx: broadcast::Sender<OrderbookUpdate>,
+        arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     ) -> Self {
         Self {
             config,
             signal_tx,
             orderbook_tx,
+            arb_entry_tx,
         }
     }
 
@@ -189,6 +192,9 @@ impl RedisForwarder {
 
     async fn handle_arb_entry(&self, payload: &str) -> anyhow::Result<()> {
         let arb: ArbOpportunity = serde_json::from_str(payload)?;
+
+        // Forward to arb auto-executor before WebSocket processing
+        let _ = self.arb_entry_tx.send(arb.clone());
 
         // Clone values needed for logging before moving
         let market_id_log = arb.market_id.clone();
@@ -387,8 +393,9 @@ pub fn spawn_redis_forwarder(
     config: RedisForwarderConfig,
     signal_tx: broadcast::Sender<SignalUpdate>,
     orderbook_tx: broadcast::Sender<OrderbookUpdate>,
+    arb_entry_tx: broadcast::Sender<ArbOpportunity>,
 ) {
-    let forwarder = RedisForwarder::new(config, signal_tx, orderbook_tx);
+    let forwarder = RedisForwarder::new(config, signal_tx, orderbook_tx, arb_entry_tx);
 
     tokio::spawn(async move {
         if let Err(e) = forwarder.run().await {

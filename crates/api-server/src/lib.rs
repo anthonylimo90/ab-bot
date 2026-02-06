@@ -19,10 +19,12 @@
 //! server.run().await?;
 //! ```
 
+pub mod arb_executor;
 pub mod auto_optimizer;
 pub mod copy_trading;
 pub mod email;
 pub mod error;
+pub mod exit_handler;
 pub mod handlers;
 pub mod middleware;
 pub mod redis_forwarder;
@@ -30,9 +32,11 @@ pub mod routes;
 pub mod state;
 pub mod websocket;
 
+pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
 pub use auto_optimizer::AutoOptimizer;
 pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use error::ApiError;
+pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
@@ -40,9 +44,10 @@ pub use state::AppState;
 use axum::http::Request;
 use axum::Router;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{info, Level};
@@ -120,6 +125,7 @@ impl ApiServer {
         let (position_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (automation_tx, _) = broadcast::channel(config.ws_channel_capacity);
+        let (arb_entry_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
         // Create app state
         let state = Arc::new(AppState::new(
@@ -129,6 +135,7 @@ impl ApiServer {
             position_tx,
             signal_tx,
             automation_tx,
+            arb_entry_tx,
         ));
 
         // Build router
@@ -191,7 +198,40 @@ impl ApiServer {
             redis_config,
             self.state.signal_tx.clone(),
             self.state.orderbook_tx.clone(),
+            self.state.arb_entry_tx.clone(),
         );
+
+        // Shared dedup set for arb executor + exit handler
+        let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
+
+        // Spawn arb auto-executor if enabled
+        let arb_config = ArbExecutorConfig::from_env();
+        if arb_config.enabled {
+            spawn_arb_auto_executor(
+                arb_config,
+                self.state.subscribe_arb_entry(),
+                self.state.signal_tx.clone(),
+                self.state.order_executor.clone(),
+                self.state.circuit_breaker.clone(),
+                self.state.clob_client.clone(),
+                self.state.pool.clone(),
+                arb_dedup.clone(),
+            );
+        }
+
+        // Spawn exit handler if enabled
+        let exit_config = ExitHandlerConfig::from_env();
+        if exit_config.enabled {
+            spawn_exit_handler(
+                exit_config,
+                self.state.order_executor.clone(),
+                self.state.circuit_breaker.clone(),
+                self.state.clob_client.clone(),
+                self.state.signal_tx.clone(),
+                self.state.pool.clone(),
+                arb_dedup.clone(),
+            );
+        }
 
         // Spawn auto-optimizer background service
         let optimizer = Arc::new(AutoOptimizer::new(self.state.pool.clone()));

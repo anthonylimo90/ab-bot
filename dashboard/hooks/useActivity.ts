@@ -22,8 +22,19 @@ function signalToActivity(signal: SignalUpdate): Activity {
       message = `Arbitrage opportunity on ${signal.market_id}`;
       break;
     case 'CopyTrade':
-      type = 'TRADE_COPIED';
-      message = `Copy trade signal: ${signal.action} on ${signal.market_id}`;
+      if (signal.action === 'skipped') {
+        type = 'TRADE_COPY_SKIPPED';
+        message = `Skipped: ${signal.metadata?.reason || 'Unknown reason'}`;
+      } else if (signal.action === 'failed') {
+        type = 'TRADE_COPY_FAILED';
+        message = `Failed: ${signal.metadata?.error || 'Unknown error'}`;
+      } else if (signal.action === 'copied') {
+        type = 'TRADE_COPIED';
+        message = `Copied trade on ${signal.market_id}`;
+      } else {
+        type = 'TRADE_COPIED';
+        message = `Copy trade signal: ${signal.action} on ${signal.market_id}`;
+      }
       break;
     case 'StopLoss':
       type = 'STOP_LOSS_TRIGGERED';

@@ -194,6 +194,66 @@ impl PositionRepository {
         Ok(rows.iter().map(Self::row_to_position).collect())
     }
 
+    /// Get positions in ExitReady state (for ExitOnCorrection exits).
+    pub async fn get_exit_ready(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated
+            FROM positions
+            WHERE state = 2
+            ORDER BY last_updated ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
+    /// Get HoldToResolution positions that are Open or ExitReady.
+    pub async fn get_hold_to_resolution(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated
+            FROM positions
+            WHERE exit_strategy = 0 AND state IN (1, 2)
+            ORDER BY entry_timestamp ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
+    /// Get ExitFailed positions eligible for retry (retry_count < 3).
+    pub async fn get_failed_exits(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated
+            FROM positions
+            WHERE state = 6 AND retry_count < 3
+            ORDER BY last_updated ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
     /// Get position statistics.
     pub async fn get_stats(&self) -> Result<PositionStats> {
         let row = sqlx::query(

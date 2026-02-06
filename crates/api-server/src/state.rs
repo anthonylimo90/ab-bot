@@ -9,6 +9,7 @@ use auth::key_vault::KeyVault;
 use auth::rbac::RbacManager;
 use auth::{AuditLogger, AuditStorage, PostgresAuditStorage};
 use polymarket_core::api::ClobClient;
+use polymarket_core::types::ArbOpportunity;
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
@@ -48,6 +49,8 @@ pub struct AppState {
     pub signal_tx: broadcast::Sender<SignalUpdate>,
     /// Broadcast channel for automation events (circuit breaker trips, etc.).
     pub automation_tx: broadcast::Sender<AutomationEvent>,
+    /// Broadcast channel for arb entry signals (feeds ArbAutoExecutor).
+    pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
 }
 
 impl AppState {
@@ -59,6 +62,7 @@ impl AppState {
         position_tx: broadcast::Sender<PositionUpdate>,
         signal_tx: broadcast::Sender<SignalUpdate>,
         automation_tx: broadcast::Sender<AutomationEvent>,
+        arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     ) -> Self {
         // Create JWT auth handler
         let jwt_config = JwtConfig {
@@ -161,6 +165,7 @@ impl AppState {
             position_tx,
             signal_tx,
             automation_tx,
+            arb_entry_tx,
         }
     }
 
@@ -214,6 +219,19 @@ impl AppState {
         event: AutomationEvent,
     ) -> Result<usize, broadcast::error::SendError<AutomationEvent>> {
         self.automation_tx.send(event)
+    }
+
+    /// Subscribe to arb entry signals.
+    pub fn subscribe_arb_entry(&self) -> broadcast::Receiver<ArbOpportunity> {
+        self.arb_entry_tx.subscribe()
+    }
+
+    /// Publish an arb entry signal.
+    pub fn publish_arb_entry(
+        &self,
+        arb: ArbOpportunity,
+    ) -> Result<usize, broadcast::error::SendError<ArbOpportunity>> {
+        self.arb_entry_tx.send(arb)
     }
 }
 

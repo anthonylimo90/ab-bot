@@ -19,6 +19,7 @@ import {
   TrendingDown,
   Zap,
   AlertCircle,
+  XCircle,
   Search,
   PieChart,
   TrendingUp,
@@ -33,6 +34,8 @@ type Period = '1D' | '7D' | '30D' | 'ALL';
 
 const activityIcons: Record<string, React.ReactNode> = {
   TRADE_COPIED: <Copy className="h-4 w-4 text-blue-500" />,
+  TRADE_COPY_SKIPPED: <AlertCircle className="h-4 w-4 text-yellow-500" />,
+  TRADE_COPY_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
   STOP_LOSS_TRIGGERED: <TrendingDown className="h-4 w-4 text-loss" />,
   RECOMMENDATION_NEW: <Activity className="h-4 w-4 text-purple-500" />,
   ARBITRAGE_DETECTED: <Zap className="h-4 w-4 text-yellow-500" />,

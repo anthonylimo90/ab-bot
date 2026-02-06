@@ -110,6 +110,45 @@ impl CopyTradingMonitor {
         Ok(())
     }
 
+    /// Publish a skip signal for trades that aren't copied.
+    fn publish_skip_signal(&self, trade: &WalletTrade, skip_type: &str, reason: &str) {
+        let signal = SignalUpdate {
+            signal_id: uuid::Uuid::new_v4(),
+            signal_type: SignalType::CopyTrade,
+            market_id: trade.market_id.clone(),
+            outcome_id: trade.token_id.clone(),
+            action: "skipped".to_string(),
+            confidence: 0.0,
+            timestamp: Utc::now(),
+            metadata: serde_json::json!({
+                "wallet_address": trade.wallet_address,
+                "skip_type": skip_type,
+                "reason": reason,
+                "value": trade.value.to_string(),
+            }),
+        };
+        let _ = self.signal_tx.send(signal);
+    }
+
+    /// Publish a failure signal for trades that errored during copy.
+    fn publish_failure_signal(&self, trade: &WalletTrade, error: &str) {
+        let signal = SignalUpdate {
+            signal_id: uuid::Uuid::new_v4(),
+            signal_type: SignalType::CopyTrade,
+            market_id: trade.market_id.clone(),
+            outcome_id: trade.token_id.clone(),
+            action: "failed".to_string(),
+            confidence: 0.0,
+            timestamp: Utc::now(),
+            metadata: serde_json::json!({
+                "wallet_address": trade.wallet_address,
+                "error": error,
+                "value": trade.value.to_string(),
+            }),
+        };
+        let _ = self.signal_tx.send(signal);
+    }
+
     async fn process_trade(&self, trade: WalletTrade) -> anyhow::Result<()> {
         // Check minimum trade value
         if trade.value < self.config.min_trade_value {
@@ -118,6 +157,14 @@ impl CopyTradingMonitor {
                 value = %trade.value,
                 min = %self.config.min_trade_value,
                 "Trade below minimum value, skipping"
+            );
+            self.publish_skip_signal(
+                &trade,
+                "below_minimum",
+                &format!(
+                    "Trade value ${} below minimum ${}",
+                    trade.value, self.config.min_trade_value
+                ),
             );
             return Ok(());
         }
@@ -131,6 +178,14 @@ impl CopyTradingMonitor {
                 latency = latency,
                 max = self.config.max_latency_secs,
                 "Trade too old, skipping"
+            );
+            self.publish_skip_signal(
+                &trade,
+                "too_stale",
+                &format!(
+                    "Trade is {}s old (max {}s)",
+                    latency, self.config.max_latency_secs
+                ),
             );
             return Ok(());
         }
@@ -206,10 +261,22 @@ impl CopyTradingMonitor {
                 let _ = self.signal_tx.send(success_signal);
             }
             Ok(None) => {
+                let reason = if !copy_trader.is_active() {
+                    "Copy trading is paused"
+                } else if copy_trader
+                    .get_tracked_wallet(&trade.wallet_address)
+                    .is_none()
+                {
+                    "Wallet not tracked"
+                } else {
+                    "Wallet disabled or trade filtered"
+                };
                 debug!(
                     wallet = %trade.wallet_address,
-                    "Trade not copied (wallet disabled or not tracked)"
+                    reason = reason,
+                    "Trade not copied"
                 );
+                self.publish_skip_signal(&trade, "not_copied", reason);
             }
             Err(e) => {
                 error!(
@@ -217,6 +284,7 @@ impl CopyTradingMonitor {
                     error = %e,
                     "Failed to copy trade"
                 );
+                self.publish_failure_signal(&trade, &e.to_string());
             }
         }
 
