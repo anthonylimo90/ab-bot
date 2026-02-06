@@ -147,7 +147,10 @@ impl PositionTracker {
             let potential_profit = exit_value - entry_cost - fees;
 
             if potential_profit >= self.exit_threshold * position.quantity {
-                position.mark_exit_ready();
+                if let Err(e) = position.mark_exit_ready() {
+                    warn!("Cannot mark position {} exit ready: {}", position.id, e);
+                    continue;
+                }
                 self.repo.update(position).await?;
                 exit_ready.push(position.id);
 
@@ -165,7 +168,10 @@ impl PositionTracker {
     pub async fn mark_position_open(&mut self, position_id: Uuid) -> Result<()> {
         for positions in self.active_positions.values_mut() {
             if let Some(pos) = positions.iter_mut().find(|p| p.id == position_id) {
-                pos.mark_open();
+                if let Err(e) = pos.mark_open() {
+                    warn!("Cannot mark position {} open: {}", position_id, e);
+                    return Ok(());
+                }
                 self.repo.update(pos).await?;
                 info!("Position {} marked as OPEN", position_id);
                 return Ok(());

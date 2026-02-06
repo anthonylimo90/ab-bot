@@ -156,18 +156,45 @@ impl Position {
     }
 
     /// Mark position as open (both sides purchased).
-    pub fn mark_open(&mut self) {
+    /// Only valid from Pending state.
+    pub fn mark_open(&mut self) -> std::result::Result<(), String> {
+        if self.state != PositionState::Pending {
+            return Err(format!(
+                "Cannot transition to Open from {:?} (expected Pending)",
+                self.state
+            ));
+        }
         self.state = PositionState::Open;
+        self.last_updated = Utc::now();
+        Ok(())
     }
 
     /// Mark position as ready to exit.
-    pub fn mark_exit_ready(&mut self) {
+    /// Only valid from Open state.
+    pub fn mark_exit_ready(&mut self) -> std::result::Result<(), String> {
+        if self.state != PositionState::Open {
+            return Err(format!(
+                "Cannot transition to ExitReady from {:?} (expected Open)",
+                self.state
+            ));
+        }
         self.state = PositionState::ExitReady;
+        self.last_updated = Utc::now();
+        Ok(())
     }
 
     /// Mark position as closing.
-    pub fn mark_closing(&mut self) {
+    /// Only valid from ExitReady state.
+    pub fn mark_closing(&mut self) -> std::result::Result<(), String> {
+        if self.state != PositionState::ExitReady {
+            return Err(format!(
+                "Cannot transition to Closing from {:?} (expected ExitReady)",
+                self.state
+            ));
+        }
         self.state = PositionState::Closing;
+        self.last_updated = Utc::now();
+        Ok(())
     }
 
     /// Close the position via market exit.
@@ -403,7 +430,7 @@ mod tests {
         assert_eq!(pos.entry_cost(), Decimal::new(94, 0));
         assert_eq!(pos.state, PositionState::Pending);
 
-        pos.mark_open();
+        pos.mark_open().unwrap();
         assert_eq!(pos.state, PositionState::Open);
 
         // Update P&L with current prices
@@ -415,7 +442,7 @@ mod tests {
         // Unrealized P&L: 100 - 94 - 4 = 2
         assert_eq!(pos.unrealized_pnl, Decimal::new(2, 0));
 
-        pos.mark_exit_ready();
+        pos.mark_exit_ready().unwrap();
         assert_eq!(pos.state, PositionState::ExitReady);
 
         pos.close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee);
@@ -434,7 +461,7 @@ mod tests {
             ExitStrategy::HoldToResolution,
         );
 
-        pos.mark_open();
+        pos.mark_open().unwrap();
         let fee = Decimal::new(2, 2); // 0.02
 
         // For hold strategy, unrealized P&L is based on guaranteed $1 return
@@ -481,8 +508,8 @@ mod tests {
             ExitStrategy::ExitOnCorrection,
         );
 
-        pos.mark_open();
-        pos.mark_exit_ready();
+        pos.mark_open().unwrap();
+        pos.mark_exit_ready().unwrap();
 
         // First exit attempt fails
         pos.mark_exit_failed(FailureReason::OrderTimeout { elapsed_ms: 5000 });
@@ -522,7 +549,7 @@ mod tests {
             ExitStrategy::ExitOnCorrection,
         );
 
-        pos.mark_open();
+        pos.mark_open().unwrap();
         let fee = Decimal::new(2, 2);
         pos.update_pnl(Decimal::new(50, 2), Decimal::new(50, 2), fee);
 
@@ -538,6 +565,28 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_state_transitions() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+
+        // Cannot go directly to ExitReady from Pending
+        assert!(pos.mark_exit_ready().is_err());
+        // Cannot go directly to Closing from Pending
+        assert!(pos.mark_closing().is_err());
+
+        pos.mark_open().unwrap();
+        // Cannot mark_open again
+        assert!(pos.mark_open().is_err());
+        // Cannot go to Closing from Open (must go through ExitReady)
+        assert!(pos.mark_closing().is_err());
+    }
+
+    #[test]
     fn test_status_messages() {
         let mut pos = Position::new(
             "market123".to_string(),
@@ -549,7 +598,7 @@ mod tests {
 
         assert!(pos.status_message().contains("Awaiting"));
 
-        pos.mark_open();
+        pos.mark_open().unwrap();
         assert!(pos.status_message().contains("Open"));
 
         pos.mark_exit_failed(FailureReason::OrderTimeout { elapsed_ms: 5000 });
