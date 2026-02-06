@@ -3,7 +3,7 @@
 use axum::extract::State;
 use axum::Extension;
 use axum::Json;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -68,6 +68,15 @@ pub struct AutoSelectedWallet {
     pub sharpe_ratio: Option<Decimal>,
     pub win_rate: Option<Decimal>,
     pub reason: String,
+}
+
+fn normalize_ratio_threshold(value: Decimal, fallback: f64) -> f64 {
+    let parsed = value.to_string().parse::<f64>().unwrap_or(fallback);
+    if parsed.abs() > 1.0 {
+        parsed / 100.0
+    } else {
+        parsed
+    }
 }
 
 /// Get user's current workspace ID.
@@ -447,6 +456,8 @@ pub async fn auto_setup(
     let min_sharpe = req.min_sharpe.unwrap_or(Decimal::ONE);
     let min_win_rate = req.min_win_rate.unwrap_or(Decimal::new(50, 0));
     let min_trades = req.min_trades_30d.unwrap_or(10);
+    let min_roi_norm = normalize_ratio_threshold(min_roi, 0.05);
+    let min_win_rate_norm = normalize_ratio_threshold(min_win_rate, 0.50);
 
     // Query top wallets from wallet_success_metrics
     #[derive(sqlx::FromRow)]
@@ -460,26 +471,45 @@ pub async fn auto_setup(
 
     let candidates: Vec<WalletCandidate> = sqlx::query_as(
         r#"
+        WITH candidate_metrics AS (
+            SELECT
+                COALESCE(wsm.address, wf.address) as address,
+                CASE
+                    WHEN ABS(COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)) > 1
+                        THEN COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0) / 100
+                    ELSE COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)
+                END as roi,
+                COALESCE(wsm.sharpe_30d, 0) as sharpe_ratio,
+                CASE
+                    WHEN ABS(COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)) > 1
+                        THEN COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0) / 100
+                    ELSE COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)
+                END as win_rate,
+                COALESCE(wsm.trades_30d, wf.total_trades::bigint, 0) as total_trades
+            FROM wallet_success_metrics wsm
+            FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
+            WHERE COALESCE(wsm.address, wf.address) IS NOT NULL
+        )
         SELECT
-            wallet_address as address,
+            address,
             roi,
             sharpe_ratio,
             win_rate,
             total_trades
-        FROM wallet_success_metrics
+        FROM candidate_metrics
         WHERE
-            roi >= $1
-            AND sharpe_ratio >= $2
-            AND win_rate >= $3
+            roi >= $1::numeric
+            AND sharpe_ratio >= $2::numeric
+            AND win_rate >= $3::numeric
             AND total_trades >= $4
         ORDER BY
-            (COALESCE(roi, 0) * 0.4 + COALESCE(sharpe_ratio, 0) * 0.3 + COALESCE(win_rate, 0) / 100 * 0.3) DESC
+            (COALESCE(roi, 0) * 0.4 + COALESCE(sharpe_ratio, 0) * 0.3 + COALESCE(win_rate, 0) * 0.3) DESC
         LIMIT 5
         "#,
     )
-    .bind(min_roi)
+    .bind(min_roi_norm)
     .bind(min_sharpe)
-    .bind(min_win_rate)
+    .bind(min_win_rate_norm)
     .bind(min_trades as i64)
     .fetch_all(&state.pool)
     .await?;
@@ -522,9 +552,9 @@ pub async fn auto_setup(
         .bind(allocation_per_wallet)
         .bind(format!(
             "Auto-selected: ROI {:.2}%, Sharpe {:.2}, WinRate {:.1}%",
-            candidate.roi.unwrap_or_default(),
+            candidate.roi.unwrap_or_default() * Decimal::new(100, 0),
             candidate.sharpe_ratio.unwrap_or_default(),
-            candidate.win_rate.unwrap_or_default()
+            candidate.win_rate.unwrap_or_default() * Decimal::new(100, 0)
         ))
         .bind(candidate.roi)
         .bind(candidate.sharpe_ratio)
@@ -536,9 +566,9 @@ pub async fn auto_setup(
         selected_wallets.push(AutoSelectedWallet {
             address: candidate.address.clone(),
             allocation_pct: allocation_per_wallet,
-            roi_30d: candidate.roi,
+            roi_30d: candidate.roi.map(|v| v * Decimal::new(100, 0)),
             sharpe_ratio: candidate.sharpe_ratio,
-            win_rate: candidate.win_rate,
+            win_rate: candidate.win_rate.map(|v| v * Decimal::new(100, 0)),
             reason: format!("Top performer with {} trades", candidate.total_trades),
         });
     }

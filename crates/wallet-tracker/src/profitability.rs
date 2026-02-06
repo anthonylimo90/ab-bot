@@ -306,18 +306,40 @@ impl ProfitabilityAnalyzer {
 
     /// Store metrics in the database.
     pub async fn store_metrics(&self, metrics: &WalletMetrics) -> Result<()> {
+        let total_trades = i32::try_from(metrics.total_trades).unwrap_or(i32::MAX);
+        let winning_trades = i32::try_from(metrics.winning_trades).unwrap_or(i32::MAX);
+        let losing_trades = i32::try_from(metrics.losing_trades).unwrap_or(i32::MAX);
+
         sqlx::query(
             r#"
             INSERT INTO wallet_success_metrics (
-                address, roi_30d, roi_90d, sharpe_30d, max_drawdown_30d,
-                consistency_score, predicted_success_prob, last_computed
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                address, wallet_address, roi_30d, roi_90d, roi_all_time, annualized_return,
+                sharpe_30d, max_drawdown_30d, consistency_score,
+                win_rate_30d, trades_30d, winning_trades_30d, losing_trades_30d,
+                predicted_success_prob, last_computed, calculated_at, roi
+            ) VALUES (
+                $1, $1, $2, $2, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12, $12, $2
+            )
             ON CONFLICT (address) DO UPDATE SET
+                wallet_address = EXCLUDED.wallet_address,
                 roi_30d = EXCLUDED.roi_30d,
+                roi_90d = EXCLUDED.roi_90d,
+                roi_all_time = EXCLUDED.roi_all_time,
+                annualized_return = EXCLUDED.annualized_return,
                 sharpe_30d = EXCLUDED.sharpe_30d,
                 max_drawdown_30d = EXCLUDED.max_drawdown_30d,
                 consistency_score = EXCLUDED.consistency_score,
-                last_computed = EXCLUDED.last_computed
+                win_rate_30d = EXCLUDED.win_rate_30d,
+                trades_30d = EXCLUDED.trades_30d,
+                winning_trades_30d = EXCLUDED.winning_trades_30d,
+                losing_trades_30d = EXCLUDED.losing_trades_30d,
+                predicted_success_prob = EXCLUDED.predicted_success_prob,
+                last_computed = EXCLUDED.last_computed,
+                calculated_at = EXCLUDED.calculated_at,
+                roi = EXCLUDED.roi
             "#,
         )
         .bind(&metrics.address)
@@ -326,6 +348,10 @@ impl ProfitabilityAnalyzer {
         .bind(metrics.sharpe_ratio)
         .bind(metrics.max_drawdown)
         .bind(metrics.consistency_score)
+        .bind(metrics.win_rate)
+        .bind(total_trades)
+        .bind(winning_trades)
+        .bind(losing_trades)
         .bind(metrics.composite_score() / 100.0)
         .bind(&metrics.computed_at)
         .execute(&self.pool)
@@ -342,14 +368,16 @@ impl ProfitabilityAnalyzer {
         let query = if let Some(cutoff_date) = cutoff {
             sqlx::query(
                 r#"
-                SELECT market_id, side, average_price as entry_price, filled_quantity as quantity,
-                       fees_paid as fees, executed_at as timestamp
-                FROM execution_reports
-                WHERE LOWER(market_id) IN (
-                    SELECT DISTINCT LOWER(market_id) FROM positions WHERE source_wallet = $1
-                )
-                AND executed_at >= $2
-                ORDER BY executed_at
+                SELECT source_market_id AS market_id,
+                       source_direction AS side,
+                       source_price AS entry_price,
+                       source_quantity AS quantity,
+                       pnl,
+                       source_timestamp AS timestamp
+                FROM copy_trade_history
+                WHERE LOWER(source_wallet) = LOWER($1)
+                  AND source_timestamp >= $2
+                ORDER BY source_timestamp
                 "#,
             )
             .bind(address)
@@ -359,13 +387,15 @@ impl ProfitabilityAnalyzer {
         } else {
             sqlx::query(
                 r#"
-                SELECT market_id, side, average_price as entry_price, filled_quantity as quantity,
-                       fees_paid as fees, executed_at as timestamp
-                FROM execution_reports
-                WHERE LOWER(market_id) IN (
-                    SELECT DISTINCT LOWER(market_id) FROM positions WHERE source_wallet = $1
-                )
-                ORDER BY executed_at
+                SELECT source_market_id AS market_id,
+                       source_direction AS side,
+                       source_price AS entry_price,
+                       source_quantity AS quantity,
+                       pnl,
+                       source_timestamp AS timestamp
+                FROM copy_trade_history
+                WHERE LOWER(source_wallet) = LOWER($1)
+                ORDER BY source_timestamp
                 "#,
             )
             .bind(address)
@@ -377,19 +407,31 @@ impl ProfitabilityAnalyzer {
             .iter()
             .map(|row| {
                 use sqlx::Row;
+                let side_raw: i16 = row.get("side");
+                let side = if side_raw == 0 {
+                    TradeSide::Buy
+                } else {
+                    TradeSide::Sell
+                };
+                let entry_price: Decimal = row.get("entry_price");
+                let quantity: Decimal = row.get("quantity");
+                let recorded_pnl: Option<Decimal> = row.try_get("pnl").unwrap_or(None);
+
+                // Some rows may not have realized PnL yet; fall back to signed cashflow.
+                let signed_cashflow = match side {
+                    TradeSide::Buy => -(quantity * entry_price),
+                    TradeSide::Sell => quantity * entry_price,
+                };
+
                 TradeRecord {
                     timestamp: row.get("timestamp"),
                     market_id: row.get("market_id"),
-                    side: if row.get::<i16, _>("side") == 0 {
-                        TradeSide::Buy
-                    } else {
-                        TradeSide::Sell
-                    },
-                    entry_price: row.get("entry_price"),
+                    side,
+                    entry_price,
                     exit_price: None,
-                    quantity: row.get("quantity"),
-                    pnl: None, // Calculated separately
-                    fees: row.get("fees"),
+                    quantity,
+                    pnl: recorded_pnl.or(Some(signed_cashflow)),
+                    fees: Decimal::ZERO,
                 }
             })
             .collect();

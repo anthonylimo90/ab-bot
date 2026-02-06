@@ -4,6 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -56,6 +57,17 @@ struct RotationHistoryRow {
     acknowledged_at: Option<DateTime<Utc>>,
     acknowledged_by: Option<Uuid>,
     created_at: DateTime<Utc>,
+}
+
+fn normalize_ratio_opt(value: Option<Decimal>, fallback: f64) -> f64 {
+    let parsed = value
+        .and_then(|d| d.to_string().parse::<f64>().ok())
+        .unwrap_or(fallback);
+    if parsed.abs() > 1.0 {
+        parsed / 100.0
+    } else {
+        parsed
+    }
 }
 
 /// Get user's current workspace ID.
@@ -372,6 +384,8 @@ pub async fn trigger_optimization(
         min_win_rate,
         min_trades,
     ) = settings.ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
+    let min_roi_norm = normalize_ratio_opt(min_roi, 0.05);
+    let min_win_rate_norm = normalize_ratio_opt(min_win_rate, 0.50);
 
     // Allow trigger if either old auto_optimize or new auto_select/demote is enabled
     if !auto_optimize_enabled && !auto_select_enabled && !auto_demote_enabled {
@@ -414,15 +428,36 @@ pub async fn trigger_optimization(
 
     // Get count of candidates that meet thresholds
     let candidates_count: (i64,) = sqlx::query_as(
-        r#"SELECT COUNT(*) FROM wallet_success_metrics
-           WHERE COALESCE(roi_30d, 0) >= COALESCE($1, 5.0)
-             AND COALESCE(sharpe_30d, 0) >= COALESCE($2, 1.0)
-             AND COALESCE(win_rate_30d, 0) >= COALESCE($3, 50.0)
-             AND COALESCE(trades_30d, 0) >= COALESCE($4, 10)"#,
+        r#"
+        WITH candidate_metrics AS (
+            SELECT
+                COALESCE(wsm.address, wf.address) AS address,
+                CASE
+                    WHEN ABS(COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)) > 1
+                        THEN COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0) / 100
+                    ELSE COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)
+                END AS roi_30d,
+                COALESCE(wsm.sharpe_30d, 0) AS sharpe_30d,
+                CASE
+                    WHEN ABS(COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)) > 1
+                        THEN COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0) / 100
+                    ELSE COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)
+                END AS win_rate_30d,
+                COALESCE(wsm.trades_30d, wf.total_trades::integer, 0) AS trades_30d
+            FROM wallet_success_metrics wsm
+            FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
+            WHERE COALESCE(wsm.address, wf.address) IS NOT NULL
+        )
+        SELECT COUNT(*) FROM candidate_metrics
+        WHERE roi_30d >= $1::numeric
+          AND sharpe_30d >= $2::numeric
+          AND win_rate_30d >= $3::numeric
+          AND trades_30d >= $4
+        "#,
     )
-    .bind(min_roi)
+    .bind(min_roi_norm)
     .bind(min_sharpe)
-    .bind(min_win_rate)
+    .bind(min_win_rate_norm)
     .bind(min_trades)
     .fetch_one(&state.pool)
     .await?;
@@ -463,9 +498,9 @@ pub async fn trigger_optimization(
         candidates_found,
         wallets_promoted,
         thresholds: OptimizationThresholds {
-            min_roi_30d: min_roi.map(|d| d.to_string().parse().unwrap_or(5.0)),
+            min_roi_30d: Some(min_roi_norm * 100.0),
             min_sharpe: min_sharpe.map(|d| d.to_string().parse().unwrap_or(1.0)),
-            min_win_rate: min_win_rate.map(|d| d.to_string().parse().unwrap_or(50.0)),
+            min_win_rate: Some(min_win_rate_norm * 100.0),
             min_trades_30d: min_trades,
         },
         message,
