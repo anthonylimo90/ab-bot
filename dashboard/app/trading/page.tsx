@@ -548,7 +548,7 @@ export default function TradingPage() {
         {/* Automation Tab */}
         <TabsContent value="automation" className="space-y-4">
           <AutomationPanel
-            workspaceId={currentWorkspace?.id || 'default'}
+            workspaceId={currentWorkspace?.id ?? ''}
             onRefresh={() => fetchAll()}
           />
         </TabsContent>
