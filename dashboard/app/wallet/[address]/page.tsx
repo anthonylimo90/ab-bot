@@ -6,10 +6,15 @@ import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { useRosterStore } from '@/stores/roster-store';
 import { useToastStore } from '@/stores/toast-store';
 import { useWalletQuery, useWalletMetricsQuery } from '@/hooks/queries/useWalletsQuery';
 import { useLiveTradesQuery } from '@/hooks/queries/useDiscoverQuery';
+import {
+  useAllocationsQuery,
+  useDemoteAllocationMutation,
+  usePromoteAllocationMutation,
+} from '@/hooks/queries/useAllocationsQuery';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import { shortenAddress, formatCurrency } from '@/lib/utils';
 import {
   ArrowLeft,
@@ -51,24 +56,49 @@ export default function WalletDetailPage() {
   const params = useParams();
   const address = params.address as string;
   const toast = useToastStore();
-  const { activeWallets, benchWallets, promoteToActive, demoteToBench, isRosterFull } = useRosterStore();
+  const { currentWorkspace } = useWorkspaceStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id);
+  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id);
   const { balance, positions } = useDemoPortfolioStore();
 
   // Fetch wallet data from API
   const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(address);
   const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(address);
-  const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery({ wallet: address, limit: 10 });
+  const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery({
+    wallet: address,
+    limit: 10,
+    workspaceId: currentWorkspace?.id,
+  });
 
-  // Find wallet in local roster store
+  // Find wallet in workspace allocations
   const storedWallet = useMemo(() => {
-    return [...activeWallets, ...benchWallets].find(
-      (w) => w.address.toLowerCase() === address?.toLowerCase()
-    );
-  }, [activeWallets, benchWallets, address]);
+    return allocations.find((w) => w.wallet_address.toLowerCase() === address?.toLowerCase());
+  }, [allocations, address]);
 
   // Merge API data with stored wallet data
   const wallet = useMemo(() => {
-    if (storedWallet) return storedWallet;
+    if (storedWallet) {
+      return {
+        address: storedWallet.wallet_address,
+        label: storedWallet.wallet_label,
+        tier: storedWallet.tier,
+        roi30d: (storedWallet.backtest_roi ?? 0) * 100,
+        roi7d: 0,
+        roi90d: 0,
+        sharpe: storedWallet.backtest_sharpe ?? 0,
+        winRate: (storedWallet.backtest_win_rate ?? 0) * 100,
+        trades: 0,
+        maxDrawdown: 0,
+        confidence: storedWallet.confidence_score ?? 0,
+        copySettings: {
+          copy_behavior: storedWallet.copy_behavior,
+          allocation_pct: storedWallet.allocation_pct,
+          max_position_size: storedWallet.max_position_size ?? 100,
+        },
+        addedAt: storedWallet.added_at,
+      };
+    }
     if (apiWallet) {
       return {
         address: apiWallet.address,
@@ -110,7 +140,7 @@ export default function WalletDetailPage() {
     };
   }, [storedWallet, apiWallet, walletMetrics, address]);
 
-  const decisionBrief = storedWallet?.decisionBrief as DecisionBrief | undefined;
+  const decisionBrief = undefined as DecisionBrief | undefined;
 
   // Calculate positions value for this wallet
   const walletPositionsValue = useMemo(() => {
@@ -119,23 +149,27 @@ export default function WalletDetailPage() {
       .reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
   }, [positions, address]);
 
-  const isActive = activeWallets.some((w) => w.address.toLowerCase() === address?.toLowerCase());
-  const isBench = benchWallets.some((w) => w.address.toLowerCase() === address?.toLowerCase());
-  const isTracked = isActive || isBench;
+  const isActive = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'active');
+  const isBench = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'bench');
   const isLoading = isLoadingWallet || isLoadingMetrics;
+  const isRosterFull = () => allocations.filter((a) => a.tier === 'active').length >= 5;
 
   const handlePromote = () => {
     if (isRosterFull()) {
       toast.error('Roster Full', 'Demote a wallet first to make room');
       return;
     }
-    promoteToActive(address);
-    toast.success('Promoted!', `${shortenAddress(address)} added to Active`);
+    promoteMutation.mutate(address, {
+      onSuccess: () => toast.success('Promoted!', `${shortenAddress(address)} added to Active`),
+      onError: () => toast.error('Promotion Failed', 'Could not promote wallet'),
+    });
   };
 
   const handleDemote = () => {
-    demoteToBench(address);
-    toast.info('Demoted', `${shortenAddress(address)} moved to Bench`);
+    demoteMutation.mutate(address, {
+      onSuccess: () => toast.info('Demoted', `${shortenAddress(address)} moved to Bench`),
+      onError: () => toast.error('Demotion Failed', 'Could not demote wallet'),
+    });
   };
 
   return (

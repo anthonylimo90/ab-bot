@@ -55,12 +55,27 @@ export const queryKeys = {
   // Discovery
   discover: {
     all: ['discover'] as const,
-    wallets: (filters?: {
-      minRoi?: number;
-      minWinRate?: number;
-      minTrades?: number;
-    }) => [...queryKeys.discover.all, 'wallets', filters] as const,
-    leaderboard: () => [...queryKeys.discover.all, 'leaderboard'] as const,
+    byWorkspace: (workspaceId: string) =>
+      [...queryKeys.discover.all, 'workspace', workspaceId] as const,
+    wallets: (filters?: unknown, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+      'wallets',
+      filters,
+    ] as const,
+    leaderboard: (workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+      'leaderboard',
+    ] as const,
+    trades: (params?: { wallet?: string; limit?: number; minValue?: number }, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+      'trades',
+      params,
+    ] as const,
+    simulate: (params?: { amount?: number; period?: string; wallets?: string[] }, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+      'simulate',
+      params,
+    ] as const,
   },
 
   // Portfolio
@@ -88,14 +103,22 @@ export const queryKeys = {
   // Allocations
   allocations: {
     all: ['allocations'] as const,
-    active: () => [...queryKeys.allocations.all, 'active'] as const,
-    bench: () => [...queryKeys.allocations.all, 'bench'] as const,
+    byWorkspace: (workspaceId: string) =>
+      [...queryKeys.allocations.all, 'workspace', workspaceId] as const,
+    list: (workspaceId: string) =>
+      [...queryKeys.allocations.byWorkspace(workspaceId), 'list'] as const,
+    active: (workspaceId: string) =>
+      [...queryKeys.allocations.byWorkspace(workspaceId), 'active'] as const,
+    bench: (workspaceId: string) =>
+      [...queryKeys.allocations.byWorkspace(workspaceId), 'bench'] as const,
   },
 
   // Rotation history
   rotationHistory: {
     all: ['rotation-history'] as const,
-    list: (params?: { unacknowledgedOnly?: boolean }) =>
-      [...queryKeys.rotationHistory.all, 'list', params] as const,
+    byWorkspace: (workspaceId: string) =>
+      [...queryKeys.rotationHistory.all, 'workspace', workspaceId] as const,
+    list: (workspaceId: string, params?: { unacknowledgedOnly?: boolean }) =>
+      [...queryKeys.rotationHistory.byWorkspace(workspaceId), 'list', params] as const,
   },
 } as const;

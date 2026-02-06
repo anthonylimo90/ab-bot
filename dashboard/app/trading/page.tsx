@@ -8,10 +8,18 @@ import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
 import { PortfolioSummary, WalletCard, ManualPositions, AutomationPanel } from '@/components/trading';
-import { useRosterStore, RosterWallet } from '@/stores/roster-store';
 import { useDemoPortfolioStore, DemoPosition } from '@/stores/demo-portfolio-store';
 import { useModeStore } from '@/stores/mode-store';
 import { useToastStore } from '@/stores/toast-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import {
+  useAllocationsQuery,
+  usePromoteAllocationMutation,
+  useDemoteAllocationMutation,
+  useRemoveAllocationMutation,
+  usePinAllocationMutation,
+  useUnpinAllocationMutation,
+} from '@/hooks/queries/useAllocationsQuery';
 import { shortenAddress, formatCurrency, cn } from '@/lib/utils';
 import {
   TrendingUp,
@@ -25,7 +33,7 @@ import {
   History,
   Bot,
 } from 'lucide-react';
-import { api } from '@/lib/api';
+import type { WorkspaceAllocation } from '@/types/api';
 
 // Position format expected by WalletCard
 interface WalletPosition {
@@ -38,6 +46,30 @@ interface WalletPosition {
   currentPrice: number;
   pnl: number;
   pnlPercent: number;
+}
+
+interface TradingWallet {
+  address: string;
+  label?: string;
+  tier: 'active' | 'bench';
+  copySettings: {
+    copy_behavior: 'copy_all' | 'events_only' | 'arb_threshold';
+    allocation_pct: number;
+    max_position_size: number;
+    arb_threshold_pct?: number;
+  };
+  roi30d: number;
+  sharpe: number;
+  winRate: number;
+  trades: number;
+  maxDrawdown: number;
+  confidence: number;
+  addedAt: string;
+  pinned?: boolean;
+  pinnedAt?: string;
+  probationUntil?: string;
+  isAutoSelected?: boolean;
+  consecutiveLosses?: number;
 }
 
 // Convert demo position to wallet position format
@@ -57,25 +89,52 @@ function toWalletPosition(p: DemoPosition): WalletPosition {
   };
 }
 
+function toTradingWallet(allocation: WorkspaceAllocation): TradingWallet {
+  return {
+    address: allocation.wallet_address,
+    label: allocation.wallet_label,
+    tier: allocation.tier,
+    copySettings: {
+      copy_behavior: allocation.copy_behavior,
+      allocation_pct: allocation.allocation_pct,
+      max_position_size: allocation.max_position_size ?? 100,
+      arb_threshold_pct: allocation.arb_threshold_pct,
+    },
+    roi30d: (allocation.backtest_roi ?? 0) * 100,
+    sharpe: allocation.backtest_sharpe ?? 0,
+    winRate: (allocation.backtest_win_rate ?? 0) * 100,
+    trades: 0,
+    maxDrawdown: 0,
+    confidence: allocation.confidence_score ?? 0,
+    addedAt: allocation.added_at,
+    pinned: allocation.pinned,
+    pinnedAt: allocation.pinned_at,
+    probationUntil: allocation.probation_until,
+    isAutoSelected: allocation.auto_assigned,
+    consecutiveLosses: allocation.consecutive_losses,
+  };
+}
+
 export default function TradingPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const toast = useToastStore();
+  const { currentWorkspace } = useWorkspaceStore();
   const { mode } = useModeStore();
   const isDemo = mode === 'demo';
 
   // Get tab from URL, default to 'active'
   const currentTab = searchParams.get('tab') || 'active';
 
-  // Roster store
-  const {
-    activeWallets,
-    benchWallets,
-    promoteToActive,
-    demoteToBench,
-    removeFromBench,
-    isRosterFull,
-  } = useRosterStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id);
+  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id);
+  const removeMutation = useRemoveAllocationMutation(currentWorkspace?.id);
+  const pinMutation = usePinAllocationMutation(currentWorkspace?.id);
+  const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id);
+  const activeWallets = allocations.filter((a) => a.tier === 'active').map(toTradingWallet);
+  const benchWallets = allocations.filter((a) => a.tier === 'bench').map(toTradingWallet);
+  const isRosterFull = () => activeWallets.length >= 5;
 
   // Demo portfolio store
   const {
@@ -134,18 +193,24 @@ export default function TradingPage() {
       toast.error('Roster Full', 'Demote a wallet from Active first');
       return;
     }
-    promoteToActive(address);
-    toast.success('Promoted!', `${shortenAddress(address)} is now active`);
+    promoteMutation.mutate(address, {
+      onSuccess: () => toast.success('Promoted!', `${shortenAddress(address)} is now active`),
+      onError: () => toast.error('Promotion Failed', 'Could not promote wallet'),
+    });
   };
 
   const handleDemote = (address: string) => {
-    demoteToBench(address);
-    toast.info('Demoted', `${shortenAddress(address)} moved to Watching`);
+    demoteMutation.mutate(address, {
+      onSuccess: () => toast.info('Demoted', `${shortenAddress(address)} moved to Watching`),
+      onError: () => toast.error('Demotion Failed', 'Could not demote wallet'),
+    });
   };
 
   const handleRemove = (address: string) => {
-    removeFromBench(address);
-    toast.info('Removed', `${shortenAddress(address)} removed from Watching`);
+    removeMutation.mutate(address, {
+      onSuccess: () => toast.info('Removed', `${shortenAddress(address)} removed from Watching`),
+      onError: () => toast.error('Remove Failed', 'Could not remove wallet'),
+    });
   };
 
   const handleClosePosition = (id: string) => {
@@ -157,24 +222,18 @@ export default function TradingPage() {
   };
 
   // Pin/Unpin handlers
-  const handlePin = async (address: string) => {
-    try {
-      await api.pinAllocation(address);
-      toast.success('Wallet Pinned', `${shortenAddress(address)} is protected from auto-demotion`);
-      fetchAll();
-    } catch (error) {
-      toast.error('Pin Failed', 'Could not pin wallet');
-    }
+  const handlePin = (address: string) => {
+    pinMutation.mutate(address, {
+      onSuccess: () => toast.success('Wallet Pinned', `${shortenAddress(address)} is protected from auto-demotion`),
+      onError: () => toast.error('Pin Failed', 'Could not pin wallet'),
+    });
   };
 
-  const handleUnpin = async (address: string) => {
-    try {
-      await api.unpinAllocation(address);
-      toast.info('Wallet Unpinned', `${shortenAddress(address)} can now be auto-demoted`);
-      fetchAll();
-    } catch (error) {
-      toast.error('Unpin Failed', 'Could not unpin wallet');
-    }
+  const handleUnpin = (address: string) => {
+    unpinMutation.mutate(address, {
+      onSuccess: () => toast.info('Wallet Unpinned', `${shortenAddress(address)} can now be auto-demoted`),
+      onError: () => toast.error('Unpin Failed', 'Could not unpin wallet'),
+    });
   };
 
   // Count pinned wallets
@@ -489,7 +548,7 @@ export default function TradingPage() {
         {/* Automation Tab */}
         <TabsContent value="automation" className="space-y-4">
           <AutomationPanel
-            workspaceId="default"
+            workspaceId={currentWorkspace?.id || 'default'}
             onRefresh={() => fetchAll()}
           />
         </TabsContent>

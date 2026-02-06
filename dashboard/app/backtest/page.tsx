@@ -7,12 +7,14 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { MetricCard } from '@/components/shared/MetricCard';
 import { BacktestChart } from '@/components/charts/BacktestChart';
 import { useBacktest } from '@/hooks/useBacktest';
-import { useRosterStore } from '@/stores/roster-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
 import { formatCurrency, shortenAddress } from '@/lib/utils';
 import { Play, ChevronDown, Loader2, AlertCircle, History } from 'lucide-react';
 
 export default function BacktestPage() {
-  const { activeWallets, benchWallets } = useRosterStore();
+  const { currentWorkspace } = useWorkspaceStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
   const { results, history, isRunning, error, runBacktest, loadHistory, loadResult } = useBacktest();
 
   // Date helpers
@@ -52,8 +54,11 @@ export default function BacktestPage() {
 
   // All tracked wallets
   const allWallets = useMemo(() => {
-    return [...activeWallets, ...benchWallets];
-  }, [activeWallets, benchWallets]);
+    return allocations.map((allocation) => ({
+      address: allocation.wallet_address,
+      label: allocation.wallet_label,
+    }));
+  }, [allocations]);
 
   // Handle backtest run
   const handleRunBacktest = async () => {

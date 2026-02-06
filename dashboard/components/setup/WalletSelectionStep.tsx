@@ -19,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import { useToastStore } from '@/stores/toast-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import api from '@/lib/api';
 import type { DiscoveredWallet, WorkspaceAllocation } from '@/types/api';
 
@@ -30,23 +31,26 @@ interface WalletSelectionStepProps {
 export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepProps) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const { currentWorkspace } = useWorkspaceStore();
 
   // Fetch discovered wallets
   const { data: discoveredWallets, isLoading: isLoadingWallets } = useQuery({
-    queryKey: ['discover', 'wallets'],
+    queryKey: ['discover', 'wallets', currentWorkspace?.id],
     queryFn: () => api.discoverWallets({ sort_by: 'roi', period: '30d', limit: 50 }),
+    enabled: !!currentWorkspace?.id,
   });
 
   // Fetch current allocations
   const { data: allocations, isLoading: isLoadingAllocations } = useQuery({
-    queryKey: ['allocations'],
+    queryKey: ['allocations', 'workspace', currentWorkspace?.id],
     queryFn: () => api.listAllocations(),
+    enabled: !!currentWorkspace?.id,
   });
 
   const addMutation = useMutation({
     mutationFn: (address: string) => api.addAllocation(address, { tier: 'bench' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: ['allocations', 'workspace', currentWorkspace?.id] });
       toast.success('Wallet added', 'Added to watching list');
     },
     onError: (error: Error) => {
@@ -57,7 +61,7 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
   const promoteMutation = useMutation({
     mutationFn: (address: string) => api.promoteAllocation(address),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: ['allocations', 'workspace', currentWorkspace?.id] });
       toast.success('Wallet promoted', 'Now copying trades from this wallet');
     },
     onError: (error: Error) => {
@@ -68,7 +72,7 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
   const demoteMutation = useMutation({
     mutationFn: (address: string) => api.demoteAllocation(address),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: ['allocations', 'workspace', currentWorkspace?.id] });
       toast.success('Wallet demoted', 'Moved back to watching list');
     },
     onError: (error: Error) => {
@@ -79,7 +83,7 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
   const removeMutation = useMutation({
     mutationFn: (address: string) => api.removeAllocation(address),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: ['allocations', 'workspace', currentWorkspace?.id] });
       toast.success('Wallet removed', 'Removed from your list');
     },
     onError: (error: Error) => {

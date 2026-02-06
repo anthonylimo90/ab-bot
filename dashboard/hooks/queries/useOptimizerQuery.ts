@@ -15,38 +15,44 @@ export function useOptimizerStatusQuery(workspaceId: string | undefined) {
 }
 
 export function useRotationHistoryQuery(params?: {
+  workspaceId?: string;
   limit?: number;
   unacknowledgedOnly?: boolean;
 }) {
   return useQuery({
-    queryKey: queryKeys.rotationHistory.list({ unacknowledgedOnly: params?.unacknowledgedOnly }),
+    queryKey: params?.workspaceId
+      ? queryKeys.rotationHistory.list(params.workspaceId, { unacknowledgedOnly: params?.unacknowledgedOnly })
+      : ['rotation-history', 'disabled'],
     queryFn: () =>
       api.listRotationHistory({
         limit: params?.limit,
         unacknowledged_only: params?.unacknowledgedOnly,
       }),
+    enabled: Boolean(params?.workspaceId),
     refetchInterval: 30000, // Refresh every 30 seconds
   });
 }
 
-export function useActiveAllocationsQuery() {
+export function useActiveAllocationsQuery(workspaceId: string | undefined) {
   return useQuery({
-    queryKey: queryKeys.allocations.active(),
+    queryKey: workspaceId ? queryKeys.allocations.active(workspaceId) : ['allocations', 'active', 'disabled'],
     queryFn: async () => {
       const allocations = await api.listAllocations();
       return allocations.filter((a) => a.tier === 'active');
     },
+    enabled: Boolean(workspaceId),
     staleTime: 60000,
   });
 }
 
-export function useBenchAllocationsQuery() {
+export function useBenchAllocationsQuery(workspaceId: string | undefined) {
   return useQuery({
-    queryKey: queryKeys.allocations.bench(),
+    queryKey: workspaceId ? queryKeys.allocations.bench(workspaceId) : ['allocations', 'bench', 'disabled'],
     queryFn: async () => {
       const allocations = await api.listAllocations();
       return allocations.filter((a) => a.tier === 'bench');
     },
+    enabled: Boolean(workspaceId),
     staleTime: 60000,
   });
 }
@@ -74,7 +80,7 @@ export function useAcknowledgeRotationMutation() {
 }
 
 // Hook to get unacknowledged rotation count
-export function useUnacknowledgedRotationCount() {
-  const { data: history } = useRotationHistoryQuery({ unacknowledgedOnly: true });
+export function useUnacknowledgedRotationCount(workspaceId: string | undefined) {
+  const { data: history } = useRotationHistoryQuery({ unacknowledgedOnly: true, workspaceId });
   return history?.length ?? 0;
 }

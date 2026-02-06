@@ -21,6 +21,7 @@ import {
   CheckCircle,
 } from 'lucide-react';
 import { useToastStore } from '@/stores/toast-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import api from '@/lib/api';
 import type { AutoSetupConfig, WorkspaceAllocation } from '@/types/api';
 
@@ -32,6 +33,7 @@ interface AutoSetupStepProps {
 export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const { currentWorkspace } = useWorkspaceStore();
   const [config, setConfig] = useState<AutoSetupConfig>({
     min_roi_30d: 0.05, // 5%
     min_sharpe: 1.0,
@@ -44,8 +46,9 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
 
   // Fetch current allocations
   const { data: allocations } = useQuery({
-    queryKey: ['allocations'],
+    queryKey: ['allocations', 'workspace', currentWorkspace?.id],
     queryFn: () => api.listAllocations(),
+    enabled: !!currentWorkspace?.id,
   });
 
   const autoSetupMutation = useMutation({
@@ -63,7 +66,7 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
     onSuccess: (data) => {
       setSelectedWallets(data.selected_wallets);
       setHasRun(true);
-      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: ['allocations', 'workspace', currentWorkspace?.id] });
       toast.success(
         'Portfolio optimized',
         `${data.selected_wallets.length} wallets selected for your portfolio`

@@ -1,6 +1,7 @@
 'use client';
 
 import { useRouter } from 'next/navigation';
+import { useQueryClient } from '@tanstack/react-query';
 import { Building2, LogOut, Check, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -15,6 +16,7 @@ interface WorkspaceGateProps {
 
 export function WorkspaceGate({ children }: WorkspaceGateProps) {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const { logout } = useAuthStore();
   const {
     workspaces,
@@ -32,6 +34,7 @@ export function WorkspaceGate({ children }: WorkspaceGateProps) {
   const handleSelectWorkspace = async (workspaceId: string) => {
     try {
       await switchWorkspace(workspaceId);
+      queryClient.invalidateQueries();
       router.refresh();
     } catch {
       // Error handled in store
