@@ -1544,7 +1544,7 @@ impl AutoOptimizer {
             return active.iter().map(|a| (a.id, pct)).collect();
         }
 
-        active
+        let capped: Vec<(Uuid, f64)> = active
             .iter()
             .map(|a| {
                 let roi = a
@@ -1552,11 +1552,22 @@ impl AutoOptimizer {
                     .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0).max(0.0))
                     .unwrap_or(0.0);
                 let pct = (roi / total_roi) * 100.0;
-                let capped = pct
+                let bounded = pct
                     .max(self.config.min_allocation_pct)
                     .min(self.config.max_allocation_pct);
-                (a.id, capped)
+                (a.id, bounded)
             })
+            .collect();
+
+        let total_capped: f64 = capped.iter().map(|(_, v)| v).sum();
+        if total_capped <= 0.0 {
+            let pct = 100.0 / active.len() as f64;
+            return active.iter().map(|a| (a.id, pct)).collect();
+        }
+
+        capped
+            .into_iter()
+            .map(|(id, v)| (id, (v / total_capped) * 100.0))
             .collect()
     }
 
