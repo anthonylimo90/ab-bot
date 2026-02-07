@@ -316,7 +316,10 @@ impl AppState {
         let key_hex = format!("0x{}", hex::encode(key_bytes));
         let wallet = TradingWallet::from_private_key(&key_hex)
             .context("Failed to parse private key from vault payload")?;
-        self.order_executor.reload_wallet(wallet).await
+        self.order_executor
+            .reload_wallet(wallet)
+            .await
+            .with_context(|| format!("Failed to activate trading wallet {}", address))
     }
 }
 

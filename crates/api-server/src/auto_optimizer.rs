@@ -87,6 +87,106 @@ mod tests {
                 > AutoOptimizer::exploration_score(&conservative)
         );
     }
+
+    #[test]
+    fn normalize_ratio_edge_cases() {
+        // Zero stays zero
+        assert_eq!(AutoOptimizer::normalize_ratio(0.0), 0.0);
+        // 100.0 => 1.0 (percentage to ratio)
+        assert!((AutoOptimizer::normalize_ratio(100.0) - 1.0).abs() < f64::EPSILON);
+        // 1000.0 => 10.0 (still divides by 100)
+        assert!((AutoOptimizer::normalize_ratio(1000.0) - 10.0).abs() < f64::EPSILON);
+        // Negative percentage
+        assert!((AutoOptimizer::normalize_ratio(-50.0) - (-0.5)).abs() < f64::EPSILON);
+        // Values <= 1.0 stay as-is
+        assert!((AutoOptimizer::normalize_ratio(0.99) - 0.99).abs() < f64::EPSILON);
+        assert!((AutoOptimizer::normalize_ratio(-0.5) - (-0.5)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn relax_thresholds_multiple_rounds() {
+        let base = CandidateThresholds {
+            min_roi: 0.05,
+            min_sharpe: 1.0,
+            min_win_rate: 0.55,
+            min_trades: 12,
+            max_drawdown: 0.20,
+        };
+
+        // Round 0 (default/catch-all)
+        let r0 = AutoOptimizer::relax_thresholds(&base, 0);
+        assert!(r0.min_roi < base.min_roi, "Round 0 should relax ROI");
+        assert!(
+            r0.max_drawdown > base.max_drawdown,
+            "Round 0 should relax drawdown"
+        );
+
+        // Round 1
+        let r1 = AutoOptimizer::relax_thresholds(&base, 1);
+        assert!((r1.min_roi - 0.03).abs() < f64::EPSILON);
+        assert!((r1.min_sharpe - 0.85).abs() < f64::EPSILON);
+        assert_eq!(r1.min_trades, 6);
+
+        // Round 5 (falls into catch-all _ branch)
+        let r5 = AutoOptimizer::relax_thresholds(&base, 5);
+        assert!(
+            r5.min_roi <= r1.min_roi,
+            "Higher rounds should be more relaxed than round 1"
+        );
+        assert!(r5.max_drawdown >= r1.max_drawdown);
+        assert_eq!(r5.min_trades, 1);
+    }
+
+    #[test]
+    fn exploration_score_equal_total_score_tie_break() {
+        // Two wallets with equal total_score but different confidence
+        let high_conf = WalletCompositeScore {
+            address: "0xa".to_string(),
+            total_score: 70.0,
+            roi_score: 70.0,
+            sharpe_score: 70.0,
+            win_rate_score: 70.0,
+            consistency_score: 70.0,
+            confidence: 0.9,
+        };
+        let low_conf = WalletCompositeScore {
+            confidence: 0.3,
+            ..high_conf.clone()
+        };
+
+        // Lower confidence should get a higher exploration score
+        // because of the (1.0 - confidence) * 10.0 bonus
+        assert!(
+            AutoOptimizer::exploration_score(&low_conf)
+                > AutoOptimizer::exploration_score(&high_conf),
+            "Lower confidence should win exploration tie-break"
+        );
+    }
+
+    #[test]
+    fn allocation_strategy_round_trip() {
+        use std::str::FromStr;
+
+        let strategies = vec![
+            (AllocationStrategy::Equal, "equal"),
+            (
+                AllocationStrategy::ConfidenceWeighted,
+                "confidence_weighted",
+            ),
+            (AllocationStrategy::Performance, "performance"),
+        ];
+
+        for (strategy, expected_str) in strategies {
+            let display = strategy.to_string();
+            assert_eq!(display, expected_str);
+
+            let parsed = AllocationStrategy::from_str(&display).unwrap();
+            assert_eq!(parsed, strategy);
+        }
+
+        // Invalid string should error
+        assert!(AllocationStrategy::from_str("invalid").is_err());
+    }
 }
 
 impl std::fmt::Display for AllocationStrategy {

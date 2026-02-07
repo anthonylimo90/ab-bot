@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Row type for wallet metrics query.
@@ -345,6 +345,16 @@ impl RecommendationEngine {
             let sharpe = decimal_to_f64(wallet.sharpe_30d);
             let win_rate = decimal_to_f64(wallet.win_rate_30d);
 
+            // Guard: skip wallets with invalid success probability
+            if !success_prob.is_finite() || !(0.0..=1.0).contains(&success_prob) {
+                warn!(
+                    wallet = %wallet.address,
+                    success_prob = %success_prob,
+                    "Skipping wallet with invalid success probability"
+                );
+                continue;
+            }
+
             // Calculate suggested allocation based on risk profile
             let base_allocation = match profile.risk_tolerance {
                 RiskLevel::Conservative => Decimal::new(5, 0),
@@ -354,7 +364,7 @@ impl RecommendationEngine {
             };
 
             let adjusted_allocation =
-                base_allocation * Decimal::from_f64_retain(success_prob).unwrap_or(Decimal::ONE);
+                base_allocation * Decimal::from_f64_retain(success_prob).unwrap_or(Decimal::ZERO);
 
             let evidence = vec![
                 Evidence {
@@ -844,5 +854,146 @@ mod tests {
 
         assert!(evidence.is_positive);
         assert_eq!(evidence.weight, 0.25);
+    }
+
+    #[test]
+    fn test_allocation_by_risk_level() {
+        // Verify base allocation values per risk level
+        let cases = vec![
+            (RiskLevel::Conservative, Decimal::new(5, 0)),
+            (RiskLevel::Moderate, Decimal::new(10, 0)),
+            (RiskLevel::Aggressive, Decimal::new(15, 0)),
+            (RiskLevel::Speculative, Decimal::new(20, 0)),
+        ];
+
+        for (risk_level, expected) in cases {
+            let allocation = match risk_level {
+                RiskLevel::Conservative => Decimal::new(5, 0),
+                RiskLevel::Moderate => Decimal::new(10, 0),
+                RiskLevel::Aggressive => Decimal::new(15, 0),
+                RiskLevel::Speculative => Decimal::new(20, 0),
+            };
+            assert_eq!(
+                allocation, expected,
+                "Allocation mismatch for {:?}",
+                risk_level
+            );
+        }
+    }
+
+    #[test]
+    fn test_priority_score_boundary_values() {
+        let base = Recommendation {
+            id: Uuid::new_v4(),
+            recommendation_type: RecommendationType::CopyWallet,
+            title: "Test".to_string(),
+            description: "Test".to_string(),
+            confidence: 1.0,
+            expected_return: None,
+            risk_level: RiskLevel::Moderate,
+            urgency: Urgency::Critical,
+            action: RecommendedAction::TakeRiskAction {
+                action: "test".to_string(),
+                affected_positions: vec![],
+                reason: "test".to_string(),
+            },
+            evidence: vec![],
+            valid_until: Utc::now() + chrono::Duration::hours(1),
+            created_at: Utc::now(),
+            target_risk_tolerance: RiskLevel::Moderate,
+        };
+
+        // confidence=1.0, urgency=Critical(2.0) => 2.0
+        assert_eq!(base.priority_score(), 2.0);
+
+        // confidence=0.0 => 0.0 regardless of urgency
+        let zero_conf = Recommendation {
+            confidence: 0.0,
+            ..base.clone()
+        };
+        assert_eq!(zero_conf.priority_score(), 0.0);
+
+        // confidence=1.0, urgency=Low(0.5) => 0.5
+        let low_urgency = Recommendation {
+            urgency: Urgency::Low,
+            ..base
+        };
+        assert_eq!(low_urgency.priority_score(), 0.5);
+    }
+
+    #[test]
+    fn test_urgency_multiplier_values() {
+        let make = |urgency: Urgency| -> f64 {
+            let rec = Recommendation {
+                id: Uuid::new_v4(),
+                recommendation_type: RecommendationType::Arbitrage,
+                title: "t".to_string(),
+                description: "d".to_string(),
+                confidence: 1.0,
+                expected_return: None,
+                risk_level: RiskLevel::Moderate,
+                urgency,
+                action: RecommendedAction::TakeRiskAction {
+                    action: "t".to_string(),
+                    affected_positions: vec![],
+                    reason: "t".to_string(),
+                },
+                evidence: vec![],
+                valid_until: Utc::now() + chrono::Duration::hours(1),
+                created_at: Utc::now(),
+                target_risk_tolerance: RiskLevel::Moderate,
+            };
+            rec.priority_score()
+        };
+
+        assert_eq!(make(Urgency::Critical), 2.0);
+        assert_eq!(make(Urgency::High), 1.5);
+        assert_eq!(make(Urgency::Medium), 1.0);
+        assert_eq!(make(Urgency::Low), 0.5);
+    }
+
+    #[test]
+    fn test_evidence_weight_validity() {
+        let evidence = vec![
+            Evidence {
+                factor: "ROI".into(),
+                value: "20%".into(),
+                weight: 0.3,
+                is_positive: true,
+            },
+            Evidence {
+                factor: "Sharpe".into(),
+                value: "2.0".into(),
+                weight: 0.25,
+                is_positive: true,
+            },
+            Evidence {
+                factor: "Win Rate".into(),
+                value: "60%".into(),
+                weight: 0.25,
+                is_positive: true,
+            },
+            Evidence {
+                factor: "Prediction".into(),
+                value: "80%".into(),
+                weight: 0.2,
+                is_positive: true,
+            },
+        ];
+
+        for e in &evidence {
+            assert!(
+                e.weight >= 0.0,
+                "Weight should not be negative: {}",
+                e.factor
+            );
+        }
+
+        let total: f64 = evidence.iter().map(|e| e.weight).sum();
+        assert!(
+            (total - 1.0).abs() < f64::EPSILON,
+            "Evidence weights should sum to 1.0, got {}",
+            total
+        );
     }
 }

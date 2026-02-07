@@ -393,6 +393,22 @@ pub async fn set_primary_wallet(
         None => return Err(ApiError::NotFound("Wallet not connected".into())),
     };
 
+    // When live, verify the vault key exists before committing the DB change
+    if state.order_executor.is_live() {
+        let key_exists = state
+            .key_vault
+            .get_wallet_key(&wallet.address)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to check vault key: {}", e)))?
+            .is_some();
+
+        if !key_exists {
+            return Err(ApiError::BadRequest(
+                "Cannot set as primary: wallet key not found in vault".into(),
+            ));
+        }
+    }
+
     // Unset all other wallets as primary
     sqlx::query(
         "UPDATE user_wallets SET is_primary = false, updated_at = NOW() WHERE user_id = $1",

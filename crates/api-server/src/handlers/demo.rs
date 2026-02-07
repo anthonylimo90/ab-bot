@@ -583,15 +583,48 @@ pub async fn delete_demo_position(
         return Err(ApiError::Forbidden("Not a member of this workspace".into()));
     }
 
+    let mut tx = state.pool.begin().await?;
+
+    // Fetch the position (lock row) to check if it's open and get cost info
+    let position: Option<(Decimal, Decimal, Option<DateTime<Utc>>)> = sqlx::query_as(
+        r#"
+        SELECT quantity, entry_price, closed_at
+        FROM demo_positions
+        WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(position_uuid)
+    .bind(workspace_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (quantity, entry_price, closed_at) =
+        position.ok_or_else(|| ApiError::NotFound("Position not found".into()))?;
+
+    // If the position is still open, refund the entry cost to the demo balance
+    if closed_at.is_none() {
+        let refund = quantity * entry_price;
+        sqlx::query(
+            "UPDATE demo_balances SET balance = balance + $2, updated_at = NOW() WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .bind(refund)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     let result = sqlx::query("DELETE FROM demo_positions WHERE id = $1 AND workspace_id = $2")
         .bind(position_uuid)
         .bind(workspace_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Position not found".into()));
     }
+
+    tx.commit().await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -820,5 +853,101 @@ mod tests {
         assert!(json.contains("test-id"));
         assert!(json.contains("0x123"));
         assert!(!json.contains("closed_at")); // skipped when None
+    }
+
+    #[test]
+    fn test_demo_balance_response_serialization() {
+        let now = Utc::now();
+        let response = DemoBalanceResponse {
+            workspace_id: "ws-123".to_string(),
+            balance: Decimal::new(9500, 0),
+            initial_balance: Decimal::new(10000, 0),
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["workspace_id"], "ws-123");
+        assert_eq!(parsed["balance"], "9500");
+        assert_eq!(parsed["initial_balance"], "10000");
+        assert!(parsed["updated_at"].is_string());
+    }
+
+    #[test]
+    fn test_create_demo_position_request_deserialization() {
+        // Valid request
+        let json = r#"{
+            "wallet_address": "0xabc",
+            "market_id": "market-1",
+            "outcome": "yes",
+            "quantity": "10",
+            "entry_price": "0.50",
+            "opened_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let req: CreateDemoPositionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.wallet_address, "0xabc");
+        assert_eq!(req.quantity, Decimal::new(10, 0));
+        assert_eq!(req.entry_price, Decimal::new(50, 2));
+        assert!(req.wallet_label.is_none());
+        assert!(req.market_question.is_none());
+        assert!(req.current_price.is_none());
+
+        // Invalid outcome value (validated at handler level, not deserialization)
+        let json_bad = r#"{
+            "wallet_address": "0xabc",
+            "market_id": "market-1",
+            "outcome": "maybe",
+            "quantity": "10",
+            "entry_price": "0.50",
+            "opened_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let bad_req: CreateDemoPositionRequest = serde_json::from_str(json_bad).unwrap();
+        assert_eq!(bad_req.outcome, "maybe"); // Deserializes fine, handler rejects
+    }
+
+    #[test]
+    fn test_demo_position_closed_fields_serialized() {
+        let now = Utc::now();
+        let response = DemoPositionResponse {
+            id: "pos-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            created_by: "user-1".to_string(),
+            wallet_address: "0x123".to_string(),
+            wallet_label: None,
+            market_id: "market-1".to_string(),
+            market_question: None,
+            outcome: "yes".to_string(),
+            quantity: Decimal::new(50, 0),
+            entry_price: Decimal::new(40, 2),
+            current_price: Some(Decimal::new(60, 2)),
+            opened_at: now - chrono::Duration::days(1),
+            closed_at: Some(now),
+            exit_price: Some(Decimal::new(60, 2)),
+            realized_pnl: Some(Decimal::new(10, 0)),
+            created_at: now - chrono::Duration::days(1),
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        // Closed fields should all be present
+        assert!(json.contains("closed_at"), "closed_at should be serialized");
+        assert!(
+            json.contains("exit_price"),
+            "exit_price should be serialized"
+        );
+        assert!(
+            json.contains("realized_pnl"),
+            "realized_pnl should be serialized"
+        );
+        // Optional None fields should be absent
+        assert!(
+            !json.contains("wallet_label"),
+            "wallet_label should be skipped when None"
+        );
+        assert!(
+            !json.contains("market_question"),
+            "market_question should be skipped when None"
+        );
     }
 }

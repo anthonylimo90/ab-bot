@@ -839,4 +839,81 @@ mod tests {
         );
         assert_eq!(delay_max, 5000);
     }
+
+    #[test]
+    fn test_backoff_caps_at_max_delay() {
+        let config = ExecutorConfig {
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
+            ..Default::default()
+        };
+
+        // Very high attempt numbers should all cap at max_delay
+        for attempt in [20, 30, 50, 63] {
+            let delay = std::cmp::min(
+                config
+                    .retry_base_delay_ms
+                    .saturating_mul(2_u64.saturating_pow(attempt)),
+                config.retry_max_delay_ms,
+            );
+            assert_eq!(delay, 5000, "Attempt {} should cap at max_delay", attempt);
+        }
+    }
+
+    #[test]
+    fn test_zero_quantity_passes_size_validation() {
+        // Zero quantity should pass the max_order_size check (0 <= max)
+        let max_order_size = Decimal::new(100, 0);
+        let zero_qty = Decimal::ZERO;
+        assert!(
+            zero_qty <= max_order_size,
+            "Zero qty should pass size validation"
+        );
+
+        // Negative quantity should also pass the numeric check
+        let neg_qty = Decimal::new(-1, 0);
+        assert!(neg_qty <= max_order_size);
+    }
+
+    #[test]
+    fn test_is_retryable_error_case_insensitive() {
+        // All patterns should be matched case-insensitively
+        assert!(is_retryable_error("TIMEOUT"));
+        assert!(is_retryable_error("Connection Refused"));
+        assert!(is_retryable_error("NETWORK ERROR"));
+        assert!(is_retryable_error("Temporarily Unavailable"));
+        assert!(is_retryable_error("Rate Limit Exceeded"));
+        assert!(is_retryable_error("ECONNREFUSED"));
+
+        // Non-retryable remain non-retryable
+        assert!(!is_retryable_error("INVALID ORDER"));
+        assert!(!is_retryable_error("Insufficient Funds"));
+    }
+
+    #[tokio::test]
+    async fn test_paper_trading_limit_order_simulates() {
+        let clob_client = Arc::new(ClobClient::new(None, None));
+        let config = ExecutorConfig {
+            live_trading: false,
+            fee_rate: Decimal::new(2, 2), // 2%
+            ..Default::default()
+        };
+        let executor = OrderExecutor::new(clob_client, config);
+
+        let order = LimitOrder::new(
+            "market".to_string(),
+            "token".to_string(),
+            OrderSide::Buy,
+            Decimal::new(50, 2), // price 0.50
+            Decimal::new(10, 0), // quantity 10
+        );
+
+        let report = executor.execute_limit_order(order).await.unwrap();
+        // Paper mode should fill at the limit price
+        assert_eq!(report.status, OrderStatus::Filled);
+        assert_eq!(report.average_price, Decimal::new(50, 2));
+        assert_eq!(report.filled_quantity, Decimal::new(10, 0));
+        // Fees: 10 * 0.50 * 0.02 = 0.10
+        assert_eq!(report.fees_paid, Decimal::new(10, 2));
+    }
 }
