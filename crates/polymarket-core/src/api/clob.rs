@@ -132,6 +132,39 @@ impl ClobClient {
         Ok(book.into())
     }
 
+    /// Fetch recent trades from the CLOB API.
+    ///
+    /// This is a public endpoint (no auth needed) that returns recent trades
+    /// with maker/taker addresses — the primary source for wallet discovery.
+    pub async fn get_recent_trades(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Vec<ClobTrade>> {
+        let mut url = format!("{}/trades?limit={}", self.base_url, limit);
+        if let Some(c) = cursor {
+            url.push_str(&format!("&next_cursor={}", c));
+        }
+
+        let response = self.get_with_retry(&url).await?;
+        let text = response.text().await?;
+
+        // The CLOB API may return trades as a top-level array or wrapped in { data: [...] }
+        if let Ok(trades) = serde_json::from_str::<Vec<ClobTrade>>(&text) {
+            return Ok(trades);
+        }
+
+        if let Ok(wrapper) = serde_json::from_str::<TradesResponse>(&text) {
+            if let Some(trades) = wrapper.data {
+                return Ok(trades);
+            }
+        }
+
+        // If neither format works, return empty rather than failing
+        warn!("Could not parse CLOB trades response, returning empty");
+        Ok(Vec::new())
+    }
+
     /// Subscribe to real-time order book updates via WebSocket.
     /// Returns a channel receiver that yields order book updates.
     pub async fn subscribe_orderbook(
@@ -202,6 +235,51 @@ impl ClobClient {
 
         Ok(())
     }
+}
+
+/// A trade from the CLOB API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClobTrade {
+    /// Unique trade ID.
+    pub id: String,
+    /// Taker order ID.
+    #[serde(default)]
+    pub taker_order_id: String,
+    /// Market condition ID.
+    #[serde(default)]
+    pub market: String,
+    /// Asset/token ID.
+    pub asset_id: String,
+    /// Trade side (BUY/SELL).
+    pub side: String,
+    /// Trade size.
+    pub size: String,
+    /// Trade price.
+    pub price: String,
+    /// Maker address.
+    pub maker_address: String,
+    /// Trader address (taker).
+    #[serde(default)]
+    pub trader_address: Option<String>,
+    /// Timestamp string.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// Status of the trade.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Match time (Unix timestamp).
+    #[serde(default)]
+    pub match_time: Option<String>,
+}
+
+/// Response wrapper for paginated trades.
+#[derive(Debug, Deserialize)]
+struct TradesResponse {
+    #[serde(default)]
+    data: Option<Vec<ClobTrade>>,
+    /// Some endpoints return trades at top level.
+    #[serde(flatten)]
+    _extra: serde_json::Value,
 }
 
 /// Order book update from WebSocket.

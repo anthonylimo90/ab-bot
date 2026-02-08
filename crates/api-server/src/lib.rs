@@ -30,6 +30,7 @@ pub mod middleware;
 pub mod redis_forwarder;
 pub mod routes;
 pub mod state;
+pub mod wallet_harvester;
 pub mod websocket;
 
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
@@ -40,6 +41,7 @@ pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
+pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
@@ -245,6 +247,15 @@ impl ApiServer {
         // Spawn auto-optimizer background service
         let optimizer = Arc::new(AutoOptimizer::new(self.state.pool.clone()));
         tokio::spawn(optimizer.start(None));
+
+        // Spawn wallet harvester (discovers wallets from CLOB trades)
+        let harvester_config = WalletHarvesterConfig::from_env();
+        spawn_wallet_harvester(
+            harvester_config,
+            self.state.clob_client.clone(),
+            self.state.pool.clone(),
+            build_polygon_client(),
+        );
 
         // Spawn copy trading monitor + wallet trade monitor if enabled
         let copy_config = CopyTradingConfig::from_env();

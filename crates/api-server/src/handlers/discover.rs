@@ -12,6 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::error::ApiResult;
 use crate::state::AppState;
+use wallet_tracker::discovery::DiscoveryCriteria;
 
 /// A live trade from a wallet.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -199,10 +200,83 @@ fn default_amount() -> Decimal {
     )
 )]
 pub async fn get_live_trades(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<LiveTradesQuery>,
 ) -> ApiResult<Json<Vec<LiveTrade>>> {
-    // Generate realistic mock trades for demo
+    // Try fetching real trades from CLOB API
+    match state
+        .clob_client
+        .get_recent_trades(query.limit as u32, None)
+        .await
+    {
+        Ok(clob_trades) if !clob_trades.is_empty() => {
+            let min_val = query.min_value.unwrap_or(Decimal::ZERO);
+            let trades: Vec<LiveTrade> = clob_trades
+                .into_iter()
+                .filter_map(|ct| {
+                    let price = ct.price.parse::<Decimal>().ok()?;
+                    let quantity = ct.size.parse::<Decimal>().ok()?;
+                    let value = price * quantity;
+
+                    if value < min_val {
+                        return None;
+                    }
+
+                    // Filter by wallet if requested
+                    if let Some(ref wallet_filter) = query.wallet {
+                        let maker_match =
+                            ct.maker_address.to_lowercase() == wallet_filter.to_lowercase();
+                        let taker_match = ct
+                            .trader_address
+                            .as_ref()
+                            .map(|t| t.to_lowercase() == wallet_filter.to_lowercase())
+                            .unwrap_or(false);
+                        if !maker_match && !taker_match {
+                            return None;
+                        }
+                    }
+
+                    let timestamp = ct
+                        .created_at
+                        .as_deref()
+                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                        .or_else(|| {
+                            ct.match_time
+                                .as_deref()
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .and_then(|ts| DateTime::from_timestamp(ts, 0))
+                        })
+                        .unwrap_or_else(Utc::now);
+
+                    Some(LiveTrade {
+                        wallet_address: ct.maker_address.clone(),
+                        wallet_label: None,
+                        tx_hash: ct.id.clone(),
+                        timestamp,
+                        market_id: ct.market.clone(),
+                        market_question: None,
+                        outcome: ct.asset_id.clone(),
+                        direction: ct.side.to_lowercase(),
+                        price,
+                        quantity,
+                        value,
+                    })
+                })
+                .collect();
+
+            if !trades.is_empty() {
+                return Ok(Json(trades));
+            }
+        }
+        Ok(_) => {
+            tracing::debug!("CLOB returned no trades, falling back to mock data");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "CLOB trade fetch failed, falling back to mock data");
+        }
+    }
+
+    // Fallback: generate realistic mock trades for demo
     let trades = generate_mock_trades(query.limit as usize, query.min_value);
     Ok(Json(trades))
 }
@@ -219,10 +293,63 @@ pub async fn get_live_trades(
     )
 )]
 pub async fn discover_wallets(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<DiscoverWalletsQuery>,
 ) -> ApiResult<Json<Vec<DiscoveredWallet>>> {
-    // Generate mock discovered wallets for demo
+    // Try real wallet discovery from DB first
+    if let Some(ref discovery) = state.wallet_discovery {
+        let time_window = match query.period.as_str() {
+            "7d" => 7,
+            "90d" => 90,
+            _ => 30,
+        };
+
+        let criteria = DiscoveryCriteria::new()
+            .min_trades(query.min_trades.unwrap_or(10) as u64)
+            .min_win_rate(
+                query
+                    .min_win_rate
+                    .map(|w| w.try_into().unwrap_or(0.55))
+                    .unwrap_or(0.55),
+            )
+            .time_window(time_window)
+            .limit(query.limit as usize);
+
+        match discovery.discover_profitable_wallets(&criteria).await {
+            Ok(discovered) if !discovered.is_empty() => {
+                let mut wallets: Vec<DiscoveredWallet> = Vec::with_capacity(discovered.len());
+                for (i, dw) in discovered.iter().enumerate() {
+                    let is_tracked = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
+                    )
+                    .bind(&dw.address.to_lowercase())
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap_or(false);
+
+                    wallets.push(map_to_api_wallet(dw, (i + 1) as i32, is_tracked));
+                }
+
+                // Sort by requested field
+                sort_wallets(&mut wallets, &query.sort_by, &query.period);
+
+                // Re-rank after sorting
+                for (i, wallet) in wallets.iter_mut().enumerate() {
+                    wallet.rank = (i + 1) as i32;
+                }
+
+                return Ok(Json(wallets));
+            }
+            Ok(_) => {
+                tracing::debug!("WalletDiscovery returned empty, falling back to mock data");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "WalletDiscovery query failed, falling back to mock data");
+            }
+        }
+    }
+
+    // Fallback: generate mock discovered wallets for demo
     let mut wallets = generate_mock_wallets(query.limit as usize);
 
     // Apply filters
@@ -233,9 +360,60 @@ pub async fn discover_wallets(
         wallets.retain(|w| w.win_rate >= min_win_rate);
     }
 
-    // Sort by requested field
+    sort_wallets(&mut wallets, &query.sort_by, &query.period);
+
+    // Re-rank after sorting
+    for (i, wallet) in wallets.iter_mut().enumerate() {
+        wallet.rank = (i + 1) as i32;
+    }
+
+    Ok(Json(wallets))
+}
+
+/// Map a `wallet_tracker::DiscoveredWallet` to the API `DiscoveredWallet`.
+fn map_to_api_wallet(
+    dw: &wallet_tracker::discovery::DiscoveredWallet,
+    rank: i32,
+    is_tracked: bool,
+) -> DiscoveredWallet {
+    let roi_30d = Decimal::from_f64_retain(dw.roi * 100.0).unwrap_or_default();
+    let roi_7d = roi_30d * Decimal::new(30, 2); // ~30% of monthly
+    let roi_90d = roi_30d * Decimal::new(250, 2); // ~2.5x monthly
+    let win_rate = Decimal::from_f64_retain(dw.win_rate * 100.0).unwrap_or_default();
+
+    let (prediction, confidence) = if dw.total_trades >= 50 && dw.win_rate > 0.65 {
+        (PredictionCategory::HighPotential, 80)
+    } else if dw.total_trades >= 20 && dw.win_rate > 0.55 {
+        (PredictionCategory::Moderate, 60)
+    } else if dw.total_trades >= 10 {
+        (PredictionCategory::LowPotential, 40)
+    } else {
+        (PredictionCategory::InsufficientData, 20)
+    };
+
+    let trades_per_day = dw.trades_per_day();
+
+    DiscoveredWallet {
+        address: dw.address.clone(),
+        rank,
+        roi_7d,
+        roi_30d,
+        roi_90d,
+        sharpe_ratio: Decimal::from_f64_retain(dw.win_rate * 2.0).unwrap_or_default(),
+        total_trades: dw.total_trades as i64,
+        win_rate,
+        max_drawdown: Decimal::new(-10, 0), // estimated
+        prediction,
+        confidence,
+        is_tracked,
+        trades_24h: (trades_per_day.min(50.0)) as i64,
+        total_pnl: dw.total_pnl,
+    }
+}
+
+fn sort_wallets(wallets: &mut [DiscoveredWallet], sort_by: &str, period: &str) {
     use std::cmp::Ordering;
-    match query.sort_by.as_str() {
+    match sort_by {
         "sharpe" => wallets.sort_by(|a, b| {
             b.sharpe_ratio
                 .partial_cmp(&a.sharpe_ratio)
@@ -249,7 +427,7 @@ pub async fn discover_wallets(
         "trades" => wallets.sort_by(|a, b| b.total_trades.cmp(&a.total_trades)),
         _ => {
             // Default: roi
-            match query.period.as_str() {
+            match period {
                 "7d" => wallets
                     .sort_by(|a, b| b.roi_7d.partial_cmp(&a.roi_7d).unwrap_or(Ordering::Equal)),
                 "90d" => wallets
@@ -259,13 +437,6 @@ pub async fn discover_wallets(
             }
         }
     }
-
-    // Re-rank after sorting
-    for (i, wallet) in wallets.iter_mut().enumerate() {
-        wallet.rank = (i + 1) as i32;
-    }
-
-    Ok(Json(wallets))
 }
 
 /// Run a demo P&L simulation.
