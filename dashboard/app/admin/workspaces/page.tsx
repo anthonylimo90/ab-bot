@@ -15,6 +15,8 @@ export default function AdminWorkspacesPage() {
   const { data: workspaces, isLoading, error, refetch } = useQuery({
     queryKey: ['admin', 'workspaces'],
     queryFn: () => api.adminListWorkspaces(),
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 5000),
   });
 
   return (
@@ -87,6 +89,9 @@ export default function AdminWorkspacesPage() {
           ) : error ? (
             <div className="text-center py-12">
               <p className="text-destructive">Failed to load workspaces</p>
+              <p className="text-sm text-muted-foreground mt-1">
+                {error instanceof Error ? error.message : 'An unexpected error occurred'}
+              </p>
               <Button variant="outline" className="mt-4" onClick={() => refetch()}>
                 Try Again
               </Button>

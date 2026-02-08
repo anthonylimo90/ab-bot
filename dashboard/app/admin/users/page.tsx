@@ -43,6 +43,8 @@ export default function AdminUsersPage() {
   const { data: users, isLoading, error, refetch } = useQuery({
     queryKey: ['admin', 'users'],
     queryFn: () => api.listUsers(),
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 5000),
   });
 
   const createMutation = useMutation({
@@ -181,6 +183,9 @@ export default function AdminUsersPage() {
           ) : error ? (
             <div className="text-center py-12">
               <p className="text-destructive">Failed to load users</p>
+              <p className="text-sm text-muted-foreground mt-1">
+                {error instanceof Error ? error.message : 'An unexpected error occurred'}
+              </p>
               <Button variant="outline" className="mt-4" onClick={() => refetch()}>
                 Try Again
               </Button>

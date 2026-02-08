@@ -113,6 +113,9 @@ class ApiClient {
     });
 
     if (!response.ok) {
+      if (response.status === 429) {
+        throw new Error('Too many requests. Please wait a moment and try again.');
+      }
       const error: ApiError = await response.json().catch(() => ({
         code: 'UNKNOWN_ERROR',
         message: `HTTP ${response.status}`,
