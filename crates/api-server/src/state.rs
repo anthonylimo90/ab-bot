@@ -9,11 +9,12 @@ use auth::jwt::{JwtAuth, JwtConfig};
 use auth::key_vault::KeyVault;
 use auth::rbac::RbacManager;
 use auth::{AuditLogger, AuditStorage, PostgresAuditStorage, TradingWallet};
-use polymarket_core::api::ClobClient;
+use polymarket_core::api::{ClobClient, PolygonClient};
 use polymarket_core::types::ArbOpportunity;
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
+use wallet_tracker::discovery::WalletDiscovery;
 
 use crate::auto_optimizer::AutomationEvent;
 use crate::email::{EmailClient, EmailConfig};
@@ -72,6 +73,8 @@ pub struct AppState {
     pub automation_tx: broadcast::Sender<AutomationEvent>,
     /// Broadcast channel for arb entry signals (feeds ArbAutoExecutor).
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
+    /// Wallet discovery service for querying profitable wallets from DB.
+    pub wallet_discovery: Option<Arc<WalletDiscovery>>,
 }
 
 impl AppState {
@@ -207,6 +210,10 @@ impl AppState {
         }
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
 
+        // Create wallet discovery service if Polygon RPC is available
+        let wallet_discovery = build_polygon_client_for_discovery()
+            .map(|pc| Arc::new(WalletDiscovery::new(pc, pool.clone())));
+
         // Create email client if configured
         let email_client = EmailConfig::from_env().and_then(|config| {
             match EmailClient::new(config) {
@@ -237,6 +244,7 @@ impl AppState {
             signal_tx,
             automation_tx,
             arb_entry_tx,
+            wallet_discovery,
         })
     }
 
@@ -329,4 +337,14 @@ impl AppState {
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
     }
+}
+
+fn build_polygon_client_for_discovery() -> Option<PolygonClient> {
+    if let Ok(rpc_url) = std::env::var("POLYGON_RPC_URL") {
+        return Some(PolygonClient::new(rpc_url));
+    }
+    if let Ok(alchemy_api_key) = std::env::var("ALCHEMY_API_KEY") {
+        return Some(PolygonClient::with_alchemy(&alchemy_api_key));
+    }
+    None
 }

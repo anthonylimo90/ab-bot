@@ -3,5 +3,5 @@
 pub mod clob;
 pub mod polygon;
 
-pub use clob::ClobClient;
+pub use clob::{ClobClient, ClobTrade};
 pub use polygon::PolygonClient;
