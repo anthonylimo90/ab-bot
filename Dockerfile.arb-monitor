@@ -37,12 +37,14 @@ RUN mkdir -p src && echo "" > src/lib.rs \
     && mkdir -p crates/wallet-tracker/src && echo "" > crates/wallet-tracker/src/lib.rs
 
 # Build dependencies only (this layer is cached unless Cargo.toml/Cargo.lock change)
-RUN cargo update home --precise 0.5.9
 RUN cargo build --release --workspace 2>/dev/null || true
 
 # --- Phase 2: Build real source ---
 # Copy actual source code
 COPY . .
+
+# Pin home crate version after copying source (before final build)
+RUN cargo update home --precise 0.5.9
 
 # Touch source files to ensure cargo rebuilds workspace crates
 RUN touch src/lib.rs \
