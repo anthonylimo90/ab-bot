@@ -283,11 +283,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .finish()
         .expect("Failed to create auth rate limiter config");
 
-    // Rate limiter for admin endpoints: 10 requests per 60 seconds per IP
+    // Rate limiter for admin endpoints: 30 requests per 60 seconds per IP
     // Uses SmartIpKeyExtractor to handle X-Forwarded-For from Railway's proxy
+    // Higher burst to accommodate cascading refetches after bulk deletions
     let admin_rate_limit_config = GovernorConfigBuilder::default()
         .per_second(60)
-        .burst_size(10)
+        .burst_size(30)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .expect("Failed to create admin rate limiter config");
