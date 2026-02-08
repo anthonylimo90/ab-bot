@@ -25,8 +25,8 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const [step, setStep] = useState<WizardStep>('mode');
-  const [mode, setMode] = useState<SetupMode>(initialStatus.setup_mode);
-  const [budget, setBudget] = useState(initialStatus.total_budget);
+  const [mode, setMode] = useState<SetupMode>(initialStatus.setup_mode || 'automatic');
+  const [budget, setBudget] = useState<number>(initialStatus.total_budget || 10000);
   const [reservedPct, setReservedPct] = useState(20);
   const [activeWalletCount, setActiveWalletCount] = useState(0);
 

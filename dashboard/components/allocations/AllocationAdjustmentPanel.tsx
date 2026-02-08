@@ -67,8 +67,8 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
       });
     },
     onSuccess: (data) => {
-      setPreviews(data.data.previews);
-      toast.success('Preview generated', `${data.data.wallet_count} wallets analyzed`);
+      setPreviews(data.previews);
+      toast.success('Preview generated', `${data.wallet_count} wallets analyzed`);
     },
     onError: (error: Error) => {
       toast.error('Preview failed', error.message);
@@ -86,7 +86,7 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
       queryClient.invalidateQueries({ queryKey: ['allocations'] });
       queryClient.invalidateQueries({ queryKey: ['wallets'] });
       setPreviews([]);
-      toast.success('Allocations updated', `${data.data.wallet_count} wallets recalculated`);
+      toast.success('Allocations updated', `${data.wallet_count} wallets recalculated`);
     },
     onError: (error: Error) => {
       toast.error('Apply failed', error.message);
