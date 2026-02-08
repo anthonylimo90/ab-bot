@@ -1,8 +1,8 @@
 //! Risk-based allocation recalculation API handlers.
 
 use crate::error::ApiError;
-use crate::middleware::Claims;
 use crate::state::AppState;
+use auth::Claims;
 use axum::{extract::State, Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
