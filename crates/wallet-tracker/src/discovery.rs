@@ -31,11 +31,11 @@ impl Default for DiscoveryCriteria {
     fn default() -> Self {
         Self {
             min_trades: 10,
-            min_win_rate: 0.55,
-            min_volume: Decimal::new(1000, 0),
+            min_win_rate: 0.52, // Lowered from 0.55 to include more wallets
+            min_volume: Decimal::new(500, 0), // Lowered from 1000 to include smaller traders
             time_window_days: 30,
-            exclude_bots: true,
-            min_roi: Some(0.05), // 5% minimum ROI
+            exclude_bots: false, // Changed from true - include profitable bots
+            min_roi: Some(0.02), // Lowered from 0.05 (2% minimum ROI)
             limit: 100,
         }
     }
@@ -523,8 +523,14 @@ impl WalletDiscovery {
             return false;
         }
 
-        if criteria.exclude_bots && wallet.is_bot {
-            return false;
+        // Only filter out very high confidence bots (score > 70)
+        // Include profitable bots with lower scores
+        if criteria.exclude_bots {
+            if let Some(bot_score) = wallet.bot_score {
+                if bot_score > 70 {
+                    return false;
+                }
+            }
         }
 
         if let Some(min_roi) = criteria.min_roi {
