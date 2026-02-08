@@ -44,6 +44,8 @@ pub struct AllocationResponse {
 /// Add wallet to roster request.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AddAllocationRequest {
+    /// Ignored — address comes from the URL path parameter.
+    #[serde(default)]
     pub wallet_address: String,
     #[serde(default = "default_allocation")]
     pub allocation_pct: Decimal,

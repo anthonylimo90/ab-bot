@@ -7,8 +7,9 @@ A high-performance Polymarket trading platform built in Rust, featuring automate
 ### Core Trading
 - **Copy Trading** - Mirror successful wallets with configurable allocation strategies
 - **Arbitrage Monitor** - Real-time detection of mispriced prediction markets
-- **Risk Management** - Advanced stop-loss strategies and circuit breakers
+- **Risk Management** - Advanced stop-loss strategies, circuit breakers, and adaptive risk appetite (Conservative/Balanced/Aggressive presets)
 - **Live Wallet Integration** - EIP-712 signing for real order execution on Polymarket
+- **MetaMask / WalletConnect** - Connect browser wallets for authentication and trade signing
 - **Demo Mode** - Paper trading with simulated capital ($10,000 default)
 
 ### Automated Wallet Management
@@ -20,10 +21,17 @@ A high-performance Polymarket trading platform built in Rust, featuring automate
 - **Pin/Ban Support** - User overrides for automation behavior
 
 ### Wallet Discovery & Analysis
+- **CLOB Trade Harvester** - Background service that discovers wallets from live Polymarket trades, aggregates per-wallet statistics, and accumulates data across cycles
 - **Bot Scanner** - Identify automated trading wallets through behavioral analysis
-- **Wallet Discovery** - Find and track top-performing wallets with success predictions
+- **Wallet Discovery** - Find and track top-performing wallets with success predictions (works without Polygon RPC using CLOB data)
 - **Success Metrics** - ROI, Sharpe ratio, win rate, drawdown tracking
 - **Demo P&L Simulator** - See potential returns from copy trading strategies
+
+### Wallet & Key Management
+- **Self-Serve Wallet UI** - Connect and manage multiple wallets from the Settings page
+- **Encrypted Key Vault** - Secure private key storage with AES encryption
+- **Hot Wallet Reload** - Swap the active trading wallet without restarting the server
+- **Primary Wallet Selection** - Designate which vault wallet is used for live trading
 
 ### Multi-Tenant Workspaces
 - **Workspaces** - Isolated trading environments with separate budgets and rosters
@@ -115,6 +123,18 @@ RESEND_API_KEY=re_...
 # Live Trading (optional)
 WALLET_PRIVATE_KEY=0x...  # 64-char hex private key for order signing
 LIVE_TRADING=true         # Enable live order execution
+
+# Wallet Harvester (optional)
+HARVESTER_ENABLED=true            # Enable background wallet discovery
+HARVESTER_INTERVAL_SECS=300       # Harvest cycle interval (default: 5 min)
+HARVESTER_TRADES_PER_FETCH=200    # CLOB trades per cycle
+HARVESTER_MAX_NEW_PER_CYCLE=20    # Max wallets to store per cycle
+
+# Circuit Breaker (optional)
+CB_MAX_DAILY_LOSS=2500
+CB_MAX_DRAWDOWN_PCT=0.20
+CB_MAX_CONSECUTIVE_LOSSES=8
+CB_COOLDOWN_MINUTES=30
 ```
 
 ### Testing Wallet Connection
@@ -255,9 +275,20 @@ The platform includes a fully automated wallet selection system that runs hands-
 - `POST /api/v1/orders/:id/cancel` - Cancel order
 
 ### Discovery
-- `GET /api/v1/discover/trades` - Live trades from monitored wallets
-- `GET /api/v1/discover/wallets` - Top-performing wallets leaderboard
+- `GET /api/v1/discover/trades` - Live trades from CLOB API
+- `GET /api/v1/discover/wallets` - Top-performing wallets leaderboard (real data from harvester)
 - `GET /api/v1/discover/simulate` - Demo P&L simulation
+
+### Vault & Wallet Management
+- `POST /api/v1/vault/wallets` - Store wallet with encrypted private key
+- `GET /api/v1/vault/wallets` - List connected wallets
+- `GET /api/v1/vault/wallets/:id` - Get wallet details
+- `DELETE /api/v1/vault/wallets/:id` - Remove wallet from vault
+- `POST /api/v1/vault/wallets/:id/primary` - Set as primary trading wallet
+- `POST /api/v1/wallet-auth/challenge` - Request wallet auth challenge
+- `POST /api/v1/wallet-auth/verify` - Verify wallet signature
+- `POST /api/v1/wallet-auth/link` - Link wallet to account
+- `POST /api/v1/order-signing/prepare` - Prepare order for client-side signing
 
 ### Backtesting
 - `POST /api/v1/backtest` - Run backtest
@@ -284,7 +315,7 @@ API documentation available at `/swagger-ui` when running.
   - Automation tab: Auto-optimizer controls and history
 - **Discover** - Find top-performing wallets
 - **Backtest** - Historical simulations
-- **Settings** - Configuration and user management
+- **Settings** - Configuration, wallet management, and WalletConnect setup
 
 ### Demo Mode
 - Paper trading with simulated capital ($10,000 default)
@@ -298,7 +329,9 @@ API documentation available at `/swagger-ui` when running.
 
 ### Automation Panel
 - ON/OFF toggles for auto-select and auto-demote
+- Risk appetite presets: Conservative, Balanced, Aggressive
 - Adjustable thresholds (ROI, Sharpe, Win Rate, Trades, Drawdown)
+- Allocation strategies: Equal, Confidence-Weighted, Performance-Weighted
 - Live rotation history with reasons
 - Manual trigger button for immediate optimization
 

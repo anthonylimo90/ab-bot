@@ -9,12 +9,56 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . .
-
-RUN cargo update home --precise 0.5.9
-
 ENV SQLX_OFFLINE=true
 
+# --- Phase 1: Cache dependency compilation ---
+# Copy only manifests and lock file
+COPY Cargo.toml Cargo.lock ./
+COPY crates/api-server/Cargo.toml crates/api-server/Cargo.toml
+COPY crates/arb-monitor/Cargo.toml crates/arb-monitor/Cargo.toml
+COPY crates/auth/Cargo.toml crates/auth/Cargo.toml
+COPY crates/backtester/Cargo.toml crates/backtester/Cargo.toml
+COPY crates/bot-scanner/Cargo.toml crates/bot-scanner/Cargo.toml
+COPY crates/polymarket-core/Cargo.toml crates/polymarket-core/Cargo.toml
+COPY crates/risk-manager/Cargo.toml crates/risk-manager/Cargo.toml
+COPY crates/trading-engine/Cargo.toml crates/trading-engine/Cargo.toml
+COPY crates/wallet-tracker/Cargo.toml crates/wallet-tracker/Cargo.toml
+
+# Create dummy source files so cargo can resolve the workspace
+RUN mkdir -p src && echo "" > src/lib.rs \
+    && mkdir -p crates/api-server/src && echo "fn main() {}" > crates/api-server/src/main.rs && echo "" > crates/api-server/src/lib.rs \
+    && mkdir -p crates/arb-monitor/src && echo "fn main() {}" > crates/arb-monitor/src/main.rs \
+    && mkdir -p crates/auth/src && echo "" > crates/auth/src/lib.rs \
+    && mkdir -p crates/backtester/src && echo "" > crates/backtester/src/lib.rs \
+    && mkdir -p crates/bot-scanner/src && echo "fn main() {}" > crates/bot-scanner/src/main.rs \
+    && mkdir -p crates/polymarket-core/src && echo "" > crates/polymarket-core/src/lib.rs \
+    && mkdir -p crates/risk-manager/src && echo "" > crates/risk-manager/src/lib.rs \
+    && mkdir -p crates/trading-engine/src && echo "" > crates/trading-engine/src/lib.rs \
+    && mkdir -p crates/wallet-tracker/src && echo "" > crates/wallet-tracker/src/lib.rs
+
+# Build dependencies only (this layer is cached unless Cargo.toml/Cargo.lock change)
+RUN cargo build --release --workspace 2>/dev/null || true
+
+# --- Phase 2: Build real source ---
+# Copy actual source code
+COPY . .
+
+# Pin home crate version after copying source (before final build)
+RUN cargo update home --precise 0.5.9
+
+# Touch source files to ensure cargo rebuilds workspace crates
+RUN touch src/lib.rs \
+    && touch crates/api-server/src/main.rs crates/api-server/src/lib.rs \
+    && touch crates/arb-monitor/src/main.rs \
+    && touch crates/auth/src/lib.rs \
+    && touch crates/backtester/src/lib.rs \
+    && touch crates/bot-scanner/src/main.rs \
+    && touch crates/polymarket-core/src/lib.rs \
+    && touch crates/risk-manager/src/lib.rs \
+    && touch crates/trading-engine/src/lib.rs \
+    && touch crates/wallet-tracker/src/lib.rs
+
+# Build arb-monitor in release mode (only workspace crates recompile)
 RUN cargo build --release -p arb-monitor
 
 # Runtime

@@ -13,10 +13,48 @@ env:
 
 jobs:
   # ==========================================================================
+  # Path Filtering
+  # ==========================================================================
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/**'
+              - 'src/**'
+              - '.sqlx/**'
+              - 'migrations/**'
+              - '.github/workflows/ci.yml'
+            dashboard:
+              - 'dashboard/**'
+              - '.github/workflows/ci.yml'
+            docker:
+              - 'Dockerfile'
+              - 'Dockerfile.*'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
+
+  # ==========================================================================
   # Rust Backend
   # ==========================================================================
   rust-format:
     name: Rust Format
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +69,8 @@ jobs:
 
   rust-clippy:
     name: Rust Clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,22 +80,17 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-clippy-
+          shared-key: "rust-ci"
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   rust-test:
     name: Rust Tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,60 +98,34 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
+          shared-key: "rust-ci"
 
       - name: Run tests
         run: cargo test --all --verbose
 
   rust-audit:
     name: Security Audit
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-
-      - name: Run security audit
-        run: cargo audit
-
-  rust-build:
-    name: Rust Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: rustsec/audit-check@v2.0.0
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
-
-      - name: Build release
-        run: cargo build --release --all
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ==========================================================================
   # Dashboard (Next.js)
   # ==========================================================================
-  dashboard-lint:
-    name: Dashboard Lint
+  dashboard-check:
+    name: Dashboard Lint & TypeCheck
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -137,30 +146,13 @@ jobs:
       - name: Run ESLint
         run: npm run lint
 
-  dashboard-typecheck:
-    name: Dashboard TypeCheck
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: dashboard
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: dashboard/package-lock.json
-
-      - name: Install dependencies
-        run: npm ci
-
       - name: Type check
         run: npx tsc --noEmit
 
   dashboard-build:
     name: Dashboard Build
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -189,6 +181,8 @@ jobs:
   # ==========================================================================
   docker-build:
     name: Docker Build
+    needs: changes
+    if: needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -210,12 +204,12 @@ jobs:
   ci-success:
     name: CI Success
     needs:
+      - changes
       - rust-format
       - rust-clippy
       - rust-test
-      - rust-build
-      - dashboard-lint
-      - dashboard-typecheck
+      - rust-audit
+      - dashboard-check
       - dashboard-build
       - docker-build
     runs-on: ubuntu-latest
@@ -223,15 +217,19 @@ jobs:
     steps:
       - name: Check all jobs passed
         run: |
-          if [[ "${{ needs.rust-format.result }}" != "success" ]] || \
-             [[ "${{ needs.rust-clippy.result }}" != "success" ]] || \
-             [[ "${{ needs.rust-test.result }}" != "success" ]] || \
-             [[ "${{ needs.rust-build.result }}" != "success" ]] || \
-             [[ "${{ needs.dashboard-lint.result }}" != "success" ]] || \
-             [[ "${{ needs.dashboard-typecheck.result }}" != "success" ]] || \
-             [[ "${{ needs.dashboard-build.result }}" != "success" ]] || \
-             [[ "${{ needs.docker-build.result }}" != "success" ]]; then
-            echo "One or more jobs failed"
-            exit 1
-          fi
+          results=(
+            "${{ needs.rust-format.result }}"
+            "${{ needs.rust-clippy.result }}"
+            "${{ needs.rust-test.result }}"
+            "${{ needs.rust-audit.result }}"
+            "${{ needs.dashboard-check.result }}"
+            "${{ needs.dashboard-build.result }}"
+            "${{ needs.docker-build.result }}"
+          )
+          for result in "${results[@]}"; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "One or more jobs failed (got: $result)"
+              exit 1
+            fi
+          done
           echo "All CI checks passed!"
