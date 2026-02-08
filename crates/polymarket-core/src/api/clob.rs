@@ -12,6 +12,7 @@ use hmac::{Hmac, Mac};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::time::Duration as StdDuration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -39,6 +40,59 @@ impl ClobClient {
         }
     }
 
+    /// Maximum retry attempts for API calls.
+    const MAX_RETRIES: u32 = 3;
+
+    /// Execute an HTTP GET with retry and exponential backoff.
+    async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response> {
+        let mut last_error = None;
+
+        for attempt in 0..Self::MAX_RETRIES {
+            match self.http_client.get(url).send().await {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) if response.status().is_server_error() => {
+                    let status = response.status();
+                    warn!(
+                        attempt = attempt + 1,
+                        status = %status,
+                        url = url,
+                        "Retryable API error, backing off"
+                    );
+                    last_error = Some(Error::Api {
+                        message: format!("Server error: {}", status),
+                        status: Some(status.as_u16()),
+                    });
+                }
+                Ok(response) => {
+                    // Client error (4xx) — don't retry
+                    return Err(Error::Api {
+                        message: format!("API error: {}", response.status()),
+                        status: Some(response.status().as_u16()),
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        url = url,
+                        "HTTP request failed, backing off"
+                    );
+                    last_error = Some(Error::Http(e));
+                }
+            }
+
+            if attempt + 1 < Self::MAX_RETRIES {
+                let backoff = StdDuration::from_millis(500 * 2u64.pow(attempt));
+                tokio::time::sleep(backoff).await;
+            }
+        }
+
+        Err(last_error.unwrap_or(Error::Api {
+            message: "Max retries exceeded".to_string(),
+            status: None,
+        }))
+    }
+
     /// Fetch list of active markets.
     pub async fn get_markets(&self) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
@@ -50,14 +104,7 @@ impl ClobClient {
                 None => format!("{}/markets", self.base_url),
             };
 
-            let response = self.http_client.get(&url).send().await?;
-
-            if !response.status().is_success() {
-                return Err(Error::Api {
-                    message: format!("Failed to fetch markets: {}", response.status()),
-                    status: Some(response.status().as_u16()),
-                });
-            }
+            let response = self.get_with_retry(&url).await?;
 
             let page: MarketsResponse = response.json().await?;
             all_markets.extend(page.data.into_iter().map(Into::into));
@@ -79,14 +126,7 @@ impl ClobClient {
     /// Fetch order book for a specific token.
     pub async fn get_order_book(&self, token_id: &str) -> Result<OrderBook> {
         let url = format!("{}/book?token_id={}", self.base_url, token_id);
-        let response = self.http_client.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(Error::Api {
-                message: format!("Failed to fetch order book: {}", response.status()),
-                status: Some(response.status().as_u16()),
-            });
-        }
+        let response = self.get_with_retry(&url).await?;
 
         let book: ClobOrderBook = response.json().await?;
         Ok(book.into())
@@ -328,7 +368,7 @@ impl WsMessage {
 // ============================================================================
 
 /// API credentials for authenticated CLOB requests.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiCredentials {
     /// API key (derived from wallet).
     pub api_key: String,
@@ -336,6 +376,16 @@ pub struct ApiCredentials {
     pub api_secret: String,
     /// Passphrase for additional security.
     pub api_passphrase: String,
+}
+
+impl std::fmt::Debug for ApiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiCredentials")
+            .field("api_key", &"[REDACTED]")
+            .field("api_secret", &"[REDACTED]")
+            .field("api_passphrase", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ApiCredentials {

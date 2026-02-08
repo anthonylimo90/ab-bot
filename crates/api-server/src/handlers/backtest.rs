@@ -393,8 +393,8 @@ async fn run_backtest_task(
     // Configure simulator
     let simulator_config = SimulatorConfig {
         initial_capital,
-        trading_fee_pct: fee_pct,
         slippage_model: backtester_slippage,
+        fee_model: backtester::simulator::FeeModel::Fixed(fee_pct),
         ..Default::default()
     };
 

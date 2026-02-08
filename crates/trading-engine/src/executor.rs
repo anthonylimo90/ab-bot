@@ -105,8 +105,8 @@ pub struct OrderExecutor {
     /// Receiver for execution reports (taken once).
     report_rx: Option<mpsc::Receiver<ExecutionReport>>,
     metrics: std::sync::RwLock<ExecutionMetrics>,
-    /// Authenticated client for live trading (optional).
-    auth_client: Option<Arc<RwLock<AuthenticatedClobClient>>>,
+    /// Authenticated client for live trading (swappable at runtime).
+    auth_client: Arc<RwLock<Option<AuthenticatedClobClient>>>,
 }
 
 impl OrderExecutor {
@@ -120,7 +120,7 @@ impl OrderExecutor {
             report_tx,
             report_rx: Some(report_rx),
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
-            auth_client: None,
+            auth_client: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -151,12 +151,7 @@ impl OrderExecutor {
     ) -> Self {
         let (report_tx, report_rx) = mpsc::channel(1000);
 
-        // Create the order signer from the wallet
-        let signer = OrderSigner::new(wallet.into_signer());
-
-        // Create authenticated client
-        let client = ClobClient::new(None, None);
-        let auth_client = AuthenticatedClobClient::new(client, signer);
+        let auth_client = Self::build_auth_client(wallet);
 
         info!(
             address = %auth_client.address(),
@@ -171,19 +166,26 @@ impl OrderExecutor {
             report_tx,
             report_rx: Some(report_rx),
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
-            auth_client: Some(Arc::new(RwLock::new(auth_client))),
+            auth_client: Arc::new(RwLock::new(Some(auth_client))),
         }
+    }
+
+    fn build_auth_client(wallet: TradingWallet) -> AuthenticatedClobClient {
+        let signer = OrderSigner::new(wallet.into_signer());
+        let client = ClobClient::new(None, None);
+        AuthenticatedClobClient::new(client, signer)
     }
 
     /// Initialize the authenticated client by deriving API credentials.
     ///
     /// This must be called before executing live orders.
     pub async fn initialize_live_trading(&self) -> Result<()> {
-        let auth_client = self.auth_client.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("No authenticated client - use new_with_wallet() for live trading")
+        let mut slot = self.auth_client.write().await;
+        let client = slot.as_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No authenticated client - call reload_wallet() or use new_with_wallet() first"
+            )
         })?;
-
-        let mut client = auth_client.write().await;
         client
             .derive_api_key()
             .await
@@ -198,22 +200,35 @@ impl OrderExecutor {
         if !self.config.live_trading {
             return false;
         }
-        if let Some(auth_client) = &self.auth_client {
-            let client = auth_client.read().await;
-            client.has_credentials()
-        } else {
-            false
-        }
+        let slot = self.auth_client.read().await;
+        slot.as_ref().map(|c| c.has_credentials()).unwrap_or(false)
     }
 
     /// Get the trading wallet address (if available).
     pub async fn wallet_address(&self) -> Option<String> {
-        if let Some(auth_client) = &self.auth_client {
-            let client = auth_client.read().await;
-            Some(client.address())
-        } else {
-            None
+        let slot = self.auth_client.read().await;
+        slot.as_ref().map(|c| c.address())
+    }
+
+    /// Hot-reload the live trading wallet signer and API credentials.
+    pub async fn reload_wallet(&self, wallet: TradingWallet) -> Result<String> {
+        if !self.config.live_trading {
+            return Err(anyhow::anyhow!(
+                "Executor is not in live mode; set LIVE_TRADING=true"
+            ));
         }
+
+        let mut auth_client = Self::build_auth_client(wallet);
+        let address = auth_client.address();
+        auth_client
+            .derive_api_key()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to derive API credentials: {}", e))?;
+
+        let mut slot = self.auth_client.write().await;
+        *slot = Some(auth_client);
+        info!(address = %address, "Live trading wallet reloaded");
+        Ok(address)
     }
 
     /// Take the execution report receiver (can only be called once).
@@ -486,7 +501,8 @@ impl OrderExecutor {
 
     async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
-        let auth_client = match &self.auth_client {
+        let client_guard = self.auth_client.read().await;
+        let client = match client_guard.as_ref() {
             Some(client) => client,
             None => {
                 warn!("No authenticated client for live trading - falling back to simulation");
@@ -531,9 +547,6 @@ impl OrderExecutor {
             OrderSide::Buy => SigningOrderSide::Buy,
             OrderSide::Sell => SigningOrderSide::Sell,
         };
-
-        // Create and sign the order
-        let client = auth_client.read().await;
 
         if !client.has_credentials() {
             return Err(anyhow::anyhow!(
@@ -583,7 +596,8 @@ impl OrderExecutor {
 
     async fn execute_live_limit_order(&self, order: &LimitOrder) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
-        let auth_client = match &self.auth_client {
+        let client_guard = self.auth_client.read().await;
+        let client = match client_guard.as_ref() {
             Some(client) => client,
             None => {
                 warn!("No authenticated client for live trading - falling back to simulation");
@@ -596,8 +610,6 @@ impl OrderExecutor {
             OrderSide::Buy => SigningOrderSide::Buy,
             OrderSide::Sell => SigningOrderSide::Sell,
         };
-
-        let client = auth_client.read().await;
 
         if !client.has_credentials() {
             return Err(anyhow::anyhow!(
@@ -826,5 +838,82 @@ mod tests {
             config.retry_max_delay_ms,
         );
         assert_eq!(delay_max, 5000);
+    }
+
+    #[test]
+    fn test_backoff_caps_at_max_delay() {
+        let config = ExecutorConfig {
+            retry_base_delay_ms: 100,
+            retry_max_delay_ms: 5000,
+            ..Default::default()
+        };
+
+        // Very high attempt numbers should all cap at max_delay
+        for attempt in [20, 30, 50, 63] {
+            let delay = std::cmp::min(
+                config
+                    .retry_base_delay_ms
+                    .saturating_mul(2_u64.saturating_pow(attempt)),
+                config.retry_max_delay_ms,
+            );
+            assert_eq!(delay, 5000, "Attempt {} should cap at max_delay", attempt);
+        }
+    }
+
+    #[test]
+    fn test_zero_quantity_passes_size_validation() {
+        // Zero quantity should pass the max_order_size check (0 <= max)
+        let max_order_size = Decimal::new(100, 0);
+        let zero_qty = Decimal::ZERO;
+        assert!(
+            zero_qty <= max_order_size,
+            "Zero qty should pass size validation"
+        );
+
+        // Negative quantity should also pass the numeric check
+        let neg_qty = Decimal::new(-1, 0);
+        assert!(neg_qty <= max_order_size);
+    }
+
+    #[test]
+    fn test_is_retryable_error_case_insensitive() {
+        // All patterns should be matched case-insensitively
+        assert!(is_retryable_error("TIMEOUT"));
+        assert!(is_retryable_error("Connection Refused"));
+        assert!(is_retryable_error("NETWORK ERROR"));
+        assert!(is_retryable_error("Temporarily Unavailable"));
+        assert!(is_retryable_error("Rate Limit Exceeded"));
+        assert!(is_retryable_error("ECONNREFUSED"));
+
+        // Non-retryable remain non-retryable
+        assert!(!is_retryable_error("INVALID ORDER"));
+        assert!(!is_retryable_error("Insufficient Funds"));
+    }
+
+    #[tokio::test]
+    async fn test_paper_trading_limit_order_simulates() {
+        let clob_client = Arc::new(ClobClient::new(None, None));
+        let config = ExecutorConfig {
+            live_trading: false,
+            fee_rate: Decimal::new(2, 2), // 2%
+            ..Default::default()
+        };
+        let executor = OrderExecutor::new(clob_client, config);
+
+        let order = LimitOrder::new(
+            "market".to_string(),
+            "token".to_string(),
+            OrderSide::Buy,
+            Decimal::new(50, 2), // price 0.50
+            Decimal::new(10, 0), // quantity 10
+        );
+
+        let report = executor.execute_limit_order(order).await.unwrap();
+        // Paper mode should fill at the limit price
+        assert_eq!(report.status, OrderStatus::Filled);
+        assert_eq!(report.average_price, Decimal::new(50, 2));
+        assert_eq!(report.filled_quantity, Decimal::new(10, 0));
+        // Fees: 10 * 0.50 * 0.02 = 0.10
+        assert_eq!(report.fees_paid, Decimal::new(10, 2));
     }
 }

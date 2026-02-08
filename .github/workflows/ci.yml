@@ -77,6 +77,18 @@ jobs:
       - name: Run tests
         run: cargo test --all --verbose
 
+  rust-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run security audit
+        run: cargo audit
+
   rust-build:
     name: Rust Build
     runs-on: ubuntu-latest

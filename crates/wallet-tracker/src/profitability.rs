@@ -306,18 +306,40 @@ impl ProfitabilityAnalyzer {
 
     /// Store metrics in the database.
     pub async fn store_metrics(&self, metrics: &WalletMetrics) -> Result<()> {
+        let total_trades = i32::try_from(metrics.total_trades).unwrap_or(i32::MAX);
+        let winning_trades = i32::try_from(metrics.winning_trades).unwrap_or(i32::MAX);
+        let losing_trades = i32::try_from(metrics.losing_trades).unwrap_or(i32::MAX);
+
         sqlx::query(
             r#"
             INSERT INTO wallet_success_metrics (
-                address, roi_30d, roi_90d, sharpe_30d, max_drawdown_30d,
-                consistency_score, predicted_success_prob, last_computed
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                address, wallet_address, roi_30d, roi_90d, roi_all_time, annualized_return,
+                sharpe_30d, max_drawdown_30d, consistency_score,
+                win_rate_30d, trades_30d, winning_trades_30d, losing_trades_30d,
+                predicted_success_prob, last_computed, calculated_at, roi
+            ) VALUES (
+                $1, $1, $2, $2, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12, $12, $2
+            )
             ON CONFLICT (address) DO UPDATE SET
+                wallet_address = EXCLUDED.wallet_address,
                 roi_30d = EXCLUDED.roi_30d,
+                roi_90d = EXCLUDED.roi_90d,
+                roi_all_time = EXCLUDED.roi_all_time,
+                annualized_return = EXCLUDED.annualized_return,
                 sharpe_30d = EXCLUDED.sharpe_30d,
                 max_drawdown_30d = EXCLUDED.max_drawdown_30d,
                 consistency_score = EXCLUDED.consistency_score,
-                last_computed = EXCLUDED.last_computed
+                win_rate_30d = EXCLUDED.win_rate_30d,
+                trades_30d = EXCLUDED.trades_30d,
+                winning_trades_30d = EXCLUDED.winning_trades_30d,
+                losing_trades_30d = EXCLUDED.losing_trades_30d,
+                predicted_success_prob = EXCLUDED.predicted_success_prob,
+                last_computed = EXCLUDED.last_computed,
+                calculated_at = EXCLUDED.calculated_at,
+                roi = EXCLUDED.roi
             "#,
         )
         .bind(&metrics.address)
@@ -326,6 +348,10 @@ impl ProfitabilityAnalyzer {
         .bind(metrics.sharpe_ratio)
         .bind(metrics.max_drawdown)
         .bind(metrics.consistency_score)
+        .bind(metrics.win_rate)
+        .bind(total_trades)
+        .bind(winning_trades)
+        .bind(losing_trades)
         .bind(metrics.composite_score() / 100.0)
         .bind(&metrics.computed_at)
         .execute(&self.pool)
@@ -342,14 +368,16 @@ impl ProfitabilityAnalyzer {
         let query = if let Some(cutoff_date) = cutoff {
             sqlx::query(
                 r#"
-                SELECT market_id, side, average_price as entry_price, filled_quantity as quantity,
-                       fees_paid as fees, executed_at as timestamp
-                FROM execution_reports
-                WHERE LOWER(market_id) IN (
-                    SELECT DISTINCT LOWER(market_id) FROM positions WHERE source_wallet = $1
-                )
-                AND executed_at >= $2
-                ORDER BY executed_at
+                SELECT source_market_id AS market_id,
+                       source_direction AS side,
+                       source_price AS entry_price,
+                       source_quantity AS quantity,
+                       pnl,
+                       source_timestamp AS timestamp
+                FROM copy_trade_history
+                WHERE LOWER(source_wallet) = LOWER($1)
+                  AND source_timestamp >= $2
+                ORDER BY source_timestamp
                 "#,
             )
             .bind(address)
@@ -359,13 +387,15 @@ impl ProfitabilityAnalyzer {
         } else {
             sqlx::query(
                 r#"
-                SELECT market_id, side, average_price as entry_price, filled_quantity as quantity,
-                       fees_paid as fees, executed_at as timestamp
-                FROM execution_reports
-                WHERE LOWER(market_id) IN (
-                    SELECT DISTINCT LOWER(market_id) FROM positions WHERE source_wallet = $1
-                )
-                ORDER BY executed_at
+                SELECT source_market_id AS market_id,
+                       source_direction AS side,
+                       source_price AS entry_price,
+                       source_quantity AS quantity,
+                       pnl,
+                       source_timestamp AS timestamp
+                FROM copy_trade_history
+                WHERE LOWER(source_wallet) = LOWER($1)
+                ORDER BY source_timestamp
                 "#,
             )
             .bind(address)
@@ -377,19 +407,31 @@ impl ProfitabilityAnalyzer {
             .iter()
             .map(|row| {
                 use sqlx::Row;
+                let side_raw: i16 = row.get("side");
+                let side = if side_raw == 0 {
+                    TradeSide::Buy
+                } else {
+                    TradeSide::Sell
+                };
+                let entry_price: Decimal = row.get("entry_price");
+                let quantity: Decimal = row.get("quantity");
+                let recorded_pnl: Option<Decimal> = row.try_get("pnl").unwrap_or(None);
+
+                // Some rows may not have realized PnL yet; fall back to signed cashflow.
+                let signed_cashflow = match side {
+                    TradeSide::Buy => -(quantity * entry_price),
+                    TradeSide::Sell => quantity * entry_price,
+                };
+
                 TradeRecord {
                     timestamp: row.get("timestamp"),
                     market_id: row.get("market_id"),
-                    side: if row.get::<i16, _>("side") == 0 {
-                        TradeSide::Buy
-                    } else {
-                        TradeSide::Sell
-                    },
-                    entry_price: row.get("entry_price"),
+                    side,
+                    entry_price,
                     exit_price: None,
-                    quantity: row.get("quantity"),
-                    pnl: None, // Calculated separately
-                    fees: row.get("fees"),
+                    quantity,
+                    pnl: recorded_pnl.or(Some(signed_cashflow)),
+                    fees: Decimal::ZERO,
                 }
             })
             .collect();
@@ -639,6 +681,30 @@ impl ProfitabilityAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    /// Create a test analyzer with a lazy (never-connected) pool.
+    /// The pool is never actually queried in these pure-calc unit tests.
+    fn test_analyzer() -> ProfitabilityAnalyzer {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://fake:fake@localhost/fake")
+            .expect("lazy pool");
+        ProfitabilityAnalyzer::new(pool)
+    }
+
+    fn make_trade(pnl: f64, day_offset: i64) -> TradeRecord {
+        TradeRecord {
+            timestamp: Utc::now() - Duration::days(day_offset),
+            market_id: "market-1".to_string(),
+            side: TradeSide::Buy,
+            entry_price: Decimal::new(50, 2),
+            exit_price: Some(Decimal::new(60, 2)),
+            quantity: Decimal::new(100, 0),
+            pnl: Some(Decimal::from_f64_retain(pnl).unwrap_or(Decimal::ZERO)),
+            fees: Decimal::ZERO,
+        }
+    }
 
     #[test]
     fn test_time_period_to_days() {
@@ -723,5 +789,319 @@ mod tests {
 
         metrics.sharpe_ratio = 0.5;
         assert!(!metrics.is_risk_adjusted_profitable());
+    }
+
+    #[tokio::test]
+    async fn test_sharpe_ratio_basic() {
+        let analyzer = test_analyzer();
+        // Create returns with known mean and std dev
+        let returns = vec![
+            DailyReturn {
+                date: Utc::now() - Duration::days(5),
+                return_pct: 0.02,
+                cumulative_value: 1.02,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(4),
+                return_pct: -0.01,
+                cumulative_value: 1.01,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(3),
+                return_pct: 0.03,
+                cumulative_value: 1.04,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(2),
+                return_pct: 0.01,
+                cumulative_value: 1.05,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(1),
+                return_pct: 0.015,
+                cumulative_value: 1.065,
+            },
+        ];
+
+        let sharpe = analyzer.calculate_sharpe_ratio(&returns);
+        // Positive returns should produce a positive Sharpe ratio
+        assert!(
+            sharpe > 0.0,
+            "Sharpe should be positive for net-positive returns, got {}",
+            sharpe
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sharpe_ratio_zero_volatility() {
+        let analyzer = test_analyzer();
+        // All same returns => zero standard deviation => Sharpe = 0
+        let returns = vec![
+            DailyReturn {
+                date: Utc::now() - Duration::days(3),
+                return_pct: 0.01,
+                cumulative_value: 1.01,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(2),
+                return_pct: 0.01,
+                cumulative_value: 1.02,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(1),
+                return_pct: 0.01,
+                cumulative_value: 1.03,
+            },
+        ];
+
+        let sharpe = analyzer.calculate_sharpe_ratio(&returns);
+        assert_eq!(sharpe, 0.0, "Sharpe should be 0 for zero volatility");
+    }
+
+    #[tokio::test]
+    async fn test_sharpe_ratio_insufficient_data() {
+        let analyzer = test_analyzer();
+        // Less than 2 returns => 0.0
+        let returns = vec![DailyReturn {
+            date: Utc::now(),
+            return_pct: 0.05,
+            cumulative_value: 1.05,
+        }];
+
+        assert_eq!(analyzer.calculate_sharpe_ratio(&returns), 0.0);
+        assert_eq!(analyzer.calculate_sharpe_ratio(&[]), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_sortino_ratio_no_downside() {
+        let analyzer = test_analyzer();
+        // Only positive returns => no downside deviation => infinity
+        let returns = vec![
+            DailyReturn {
+                date: Utc::now() - Duration::days(3),
+                return_pct: 0.02,
+                cumulative_value: 1.02,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(2),
+                return_pct: 0.03,
+                cumulative_value: 1.05,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(1),
+                return_pct: 0.01,
+                cumulative_value: 1.06,
+            },
+        ];
+
+        let sortino = analyzer.calculate_sortino_ratio(&returns);
+        assert!(
+            sortino.is_infinite() && sortino > 0.0,
+            "Sortino should be +infinity with no downside"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_drawdown_monotonic_up() {
+        let analyzer = test_analyzer();
+        // Always rising => drawdown should be 0
+        let returns = vec![
+            DailyReturn {
+                date: Utc::now() - Duration::days(3),
+                return_pct: 0.01,
+                cumulative_value: 1.01,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(2),
+                return_pct: 0.02,
+                cumulative_value: 1.03,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(1),
+                return_pct: 0.01,
+                cumulative_value: 1.04,
+            },
+        ];
+
+        let (max_dd, _dd_duration) = analyzer.calculate_max_drawdown(&returns);
+        assert_eq!(
+            max_dd, 0.0,
+            "No drawdown for monotonically increasing values"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_drawdown_known_case() {
+        let analyzer = test_analyzer();
+        // Peak at 1.10, trough at 0.88 => drawdown = (1.10 - 0.88) / 1.10 = 0.2
+        let returns = vec![
+            DailyReturn {
+                date: Utc::now() - Duration::days(4),
+                return_pct: 0.10,
+                cumulative_value: 1.10,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(3),
+                return_pct: -0.10,
+                cumulative_value: 1.00,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(2),
+                return_pct: -0.12,
+                cumulative_value: 0.88,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(1),
+                return_pct: 0.25,
+                cumulative_value: 1.13,
+            },
+        ];
+
+        let (max_dd, _dd_duration) = analyzer.calculate_max_drawdown(&returns);
+        assert!(
+            (max_dd - 0.2).abs() < 0.001,
+            "Expected ~20% drawdown, got {}",
+            max_dd
+        );
+    }
+
+    #[tokio::test]
+    async fn test_volatility_constant_returns() {
+        let analyzer = test_analyzer();
+        // Constant returns => zero std dev => zero volatility
+        let returns = vec![
+            DailyReturn {
+                date: Utc::now() - Duration::days(3),
+                return_pct: 0.01,
+                cumulative_value: 1.01,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(2),
+                return_pct: 0.01,
+                cumulative_value: 1.02,
+            },
+            DailyReturn {
+                date: Utc::now() - Duration::days(1),
+                return_pct: 0.01,
+                cumulative_value: 1.03,
+            },
+        ];
+
+        let vol = analyzer.calculate_volatility(&returns);
+        assert_eq!(vol, 0.0, "Zero volatility for constant returns");
+    }
+
+    #[tokio::test]
+    async fn test_calculate_streaks() {
+        let analyzer = test_analyzer();
+
+        // Win, Win, Loss, Win, Loss, Loss, Loss
+        let trades = vec![
+            make_trade(10.0, 7),
+            make_trade(5.0, 6),
+            make_trade(-3.0, 5),
+            make_trade(8.0, 4),
+            make_trade(-2.0, 3),
+            make_trade(-4.0, 2),
+            make_trade(-1.0, 1),
+        ];
+
+        let (win_streak, lose_streak, current) = analyzer.calculate_streaks(&trades);
+        assert_eq!(win_streak, 2, "Max winning streak should be 2");
+        assert_eq!(lose_streak, 3, "Max losing streak should be 3");
+        assert_eq!(current, -3, "Current streak should be -3 (3 losses)");
+    }
+
+    #[tokio::test]
+    async fn test_estimate_initial_capital() {
+        let analyzer = test_analyzer();
+
+        let trades = vec![
+            TradeRecord {
+                timestamp: Utc::now() - Duration::days(3),
+                market_id: "m1".to_string(),
+                side: TradeSide::Buy,
+                entry_price: Decimal::new(50, 2), // 0.50
+                quantity: Decimal::new(200, 0),   // 200
+                exit_price: None,
+                pnl: Some(Decimal::new(10, 0)),
+                fees: Decimal::ZERO,
+            },
+            TradeRecord {
+                timestamp: Utc::now() - Duration::days(2),
+                market_id: "m2".to_string(),
+                side: TradeSide::Buy,
+                entry_price: Decimal::new(80, 2), // 0.80
+                quantity: Decimal::new(500, 0),   // 500
+                exit_price: None,
+                pnl: Some(Decimal::new(20, 0)),
+                fees: Decimal::ZERO,
+            },
+        ];
+
+        let capital = analyzer.estimate_initial_capital(&trades);
+        // max(200*0.50, 500*0.80) = max(100, 400) = 400
+        assert_eq!(capital, Decimal::new(400, 0));
+    }
+
+    #[tokio::test]
+    async fn test_consistency_score_few_trades() {
+        let analyzer = test_analyzer();
+
+        // Less than 5 PnLs => 0.0
+        let pnls = vec![1.0, 2.0, -1.0];
+        assert_eq!(analyzer.calculate_consistency_score(&pnls), 0.0);
+    }
+
+    #[test]
+    fn test_composite_score_edge_cases() {
+        // All zeros
+        let metrics = WalletMetrics {
+            address: "0x0".to_string(),
+            period: TimePeriod::Month,
+            total_return: Decimal::ZERO,
+            roi_percentage: 0.0,
+            annualized_return: 0.0,
+            sharpe_ratio: 0.0,
+            sortino_ratio: 0.0,
+            max_drawdown: 0.0,
+            max_drawdown_duration_days: 0,
+            volatility: 0.0,
+            downside_deviation: 0.0,
+            total_trades: 0,
+            winning_trades: 0,
+            losing_trades: 0,
+            win_rate: 0.0,
+            avg_win: Decimal::ZERO,
+            avg_loss: Decimal::ZERO,
+            profit_factor: 0.0,
+            expectancy: Decimal::ZERO,
+            avg_position_size: Decimal::ZERO,
+            max_position_size: Decimal::ZERO,
+            avg_holding_period_hours: 0.0,
+            consistency_score: 0.0,
+            winning_streak: 0,
+            losing_streak: 0,
+            current_streak: 0,
+            computed_at: Utc::now(),
+        };
+        assert_eq!(metrics.composite_score(), 0.0);
+
+        // All maxed out
+        let maxed = WalletMetrics {
+            roi_percentage: 10.0,   // 10 * 100 = 1000, capped at 30
+            sharpe_ratio: 5.0,      // 5 * 10 = 50, capped at 25
+            win_rate: 1.0,          // 1.0 * 25 = 25, capped at 25
+            consistency_score: 1.0, // 1.0 * 20 = 20, capped at 20
+            ..metrics.clone()
+        };
+        assert_eq!(maxed.composite_score(), 100.0);
+
+        // Negative ROI should be clamped at 0
+        let negative = WalletMetrics {
+            roi_percentage: -0.50,
+            ..metrics
+        };
+        assert_eq!(negative.composite_score(), 0.0);
     }
 }

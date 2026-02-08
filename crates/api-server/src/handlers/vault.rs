@@ -7,6 +7,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::{info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -154,6 +155,16 @@ pub async fn store_wallet(
     .bind(now)
     .execute(&state.pool)
     .await?;
+
+    // Seamless live mode: first/primary connected wallet becomes active trading wallet immediately.
+    if is_primary && state.order_executor.is_live() {
+        match state.activate_trading_wallet(&address).await {
+            Ok(loaded) => info!(wallet = %loaded, "Activated primary wallet for live trading"),
+            Err(e) => {
+                warn!(wallet = %address, error = %e, "Failed to activate primary wallet for live trading")
+            }
+        }
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -315,6 +326,23 @@ pub async fn remove_wallet(
         .bind(user_id)
         .execute(&state.pool)
         .await?;
+
+        if state.order_executor.is_live() {
+            let next_primary: Option<(String,)> = sqlx::query_as(
+                "SELECT address FROM user_wallets WHERE user_id = $1 AND is_primary = true LIMIT 1",
+            )
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
+
+            if let Some((next_address,)) = next_primary {
+                if let Err(e) = state.activate_trading_wallet(&next_address).await {
+                    warn!(wallet = %next_address, error = %e, "Failed to activate fallback primary wallet");
+                }
+            } else {
+                warn!("No fallback primary wallet available after removal");
+            }
+        }
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -365,6 +393,22 @@ pub async fn set_primary_wallet(
         None => return Err(ApiError::NotFound("Wallet not connected".into())),
     };
 
+    // When live, verify the vault key exists before committing the DB change
+    if state.order_executor.is_live() {
+        let key_exists = state
+            .key_vault
+            .get_wallet_key(&wallet.address)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to check vault key: {}", e)))?
+            .is_some();
+
+        if !key_exists {
+            return Err(ApiError::BadRequest(
+                "Cannot set as primary: wallet key not found in vault".into(),
+            ));
+        }
+    }
+
     // Unset all other wallets as primary
     sqlx::query(
         "UPDATE user_wallets SET is_primary = false, updated_at = NOW() WHERE user_id = $1",
@@ -378,6 +422,13 @@ pub async fn set_primary_wallet(
         .bind(wallet.id)
         .execute(&state.pool)
         .await?;
+
+    if state.order_executor.is_live() {
+        state
+            .activate_trading_wallet(&wallet.address)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to activate primary wallet: {}", e)))?;
+    }
 
     Ok(Json(WalletInfo {
         id: wallet.id.to_string(),

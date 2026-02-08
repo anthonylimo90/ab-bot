@@ -220,7 +220,9 @@ impl ExitHandler {
         let market_id = position.market_id.clone();
 
         // Mark Closing
-        position.mark_closing();
+        if let Err(e) = position.mark_closing() {
+            anyhow::bail!("Cannot mark position closing: {}", e);
+        }
         let _ = self.position_repo.update(position).await;
 
         // Resolve token IDs

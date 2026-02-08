@@ -379,7 +379,9 @@ impl ArbAutoExecutor {
         }
 
         // 12. Both filled → mark position OPEN
-        position.mark_open();
+        if let Err(e) = position.mark_open() {
+            error!(error = %e, "Failed to transition position to OPEN");
+        }
         if let Err(e) = self.position_repo.update(&position).await {
             error!(error = %e, "Failed to update position to OPEN");
         }

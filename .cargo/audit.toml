@@ -1,0 +1,16 @@
+# Ignored advisories for cargo audit
+#
+# These should be revisited when upgrading sqlx from 0.7 to 0.8+
+
+[advisories]
+ignore = [
+    # rsa 0.9.10 - Marvin Attack timing sidechannel (CVSS 5.9 medium)
+    # No fixed version available. Pulled in via sqlx-mysql which is unused
+    # (this project only uses PostgreSQL).
+    "RUSTSEC-2023-0071",
+
+    # sqlx 0.7.4 - Binary Protocol Misinterpretation from truncating casts
+    # Fix requires upgrade to sqlx >=0.8.1 (breaking major version change).
+    # Tracked for upgrade separately.
+    "RUSTSEC-2024-0363",
+]

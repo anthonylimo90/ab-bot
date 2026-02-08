@@ -147,9 +147,6 @@ export const useDemoPortfolioStore = create<DemoPortfolioStore>()((set, get) => 
   addPosition: async (position) => {
     set({ isLoading: true, error: null });
     try {
-      const cost = position.quantity * position.entryPrice;
-      const currentBalance = get().balance;
-
       // Create position via API
       const created = await api.createDemoPosition({
         wallet_address: position.walletAddress,
@@ -163,13 +160,12 @@ export const useDemoPortfolioStore = create<DemoPortfolioStore>()((set, get) => 
         opened_at: position.openedAt,
       });
 
-      // Update balance via API
-      const newBalance = currentBalance - cost;
-      await api.updateDemoBalance(newBalance);
+      const latestBalance = await api.getDemoBalance();
 
       set((state) => ({
         positions: [...state.positions, apiToLocal(created)],
-        balance: newBalance,
+        balance: latestBalance.balance,
+        initialBalance: latestBalance.initial_balance,
         isLoading: false,
       }));
     } catch (err) {
@@ -189,9 +185,8 @@ export const useDemoPortfolioStore = create<DemoPortfolioStore>()((set, get) => 
 
     set({ isLoading: true, error: null });
     try {
-      const exitValue = position.quantity * exitPrice;
       const entryValue = position.quantity * position.entryPrice;
-      const realizedPnl = exitValue - entryValue;
+      const realizedPnl = position.quantity * exitPrice - entryValue;
       const closedAt = new Date().toISOString();
 
       // Update position via API
@@ -202,16 +197,15 @@ export const useDemoPortfolioStore = create<DemoPortfolioStore>()((set, get) => 
         current_price: exitPrice,
       });
 
-      // Update balance via API
-      const newBalance = state.balance + exitValue;
-      await api.updateDemoBalance(newBalance);
+      const latestBalance = await api.getDemoBalance();
 
       const closedPosition = apiToLocal(updated);
 
       set((s) => ({
         positions: s.positions.filter((p) => p.id !== id),
         closedPositions: [...s.closedPositions, closedPosition],
-        balance: newBalance,
+        balance: latestBalance.balance,
+        initialBalance: latestBalance.initial_balance,
         isLoading: false,
       }));
     } catch (err) {

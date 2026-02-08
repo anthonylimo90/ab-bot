@@ -16,8 +16,6 @@ use crate::strategy::{Position, Signal, SignalType, Strategy, StrategyContext};
 pub struct SimulatorConfig {
     /// Initial portfolio value.
     pub initial_capital: Decimal,
-    /// Trading fee percentage (e.g., 0.02 for 2%). Deprecated: use fee_model instead.
-    pub trading_fee_pct: Decimal,
     /// Slippage model to use.
     pub slippage_model: SlippageModel,
     /// Fee model to use for trading costs.
@@ -42,9 +40,8 @@ impl Default for SimulatorConfig {
     fn default() -> Self {
         Self {
             initial_capital: Decimal::new(10000, 0),
-            trading_fee_pct: Decimal::new(2, 2), // 2% (deprecated)
             slippage_model: SlippageModel::Fixed(Decimal::new(1, 3)), // 0.1%
-            fee_model: FeeModel::Fixed(Decimal::new(2, 2)), // 2%
+            fee_model: FeeModel::Fixed(Decimal::new(2, 2)),           // 2%
             partial_fill_model: PartialFillModel::FullFill,
             allow_margin: false,
             max_leverage: Decimal::ONE,
@@ -1296,7 +1293,7 @@ mod tests {
     fn test_simulator_config_default() {
         let config = SimulatorConfig::default();
         assert_eq!(config.initial_capital, Decimal::new(10000, 0));
-        assert_eq!(config.trading_fee_pct, Decimal::new(2, 2));
+        assert!(matches!(config.fee_model, FeeModel::Fixed(f) if f == Decimal::new(2, 2)));
     }
 
     #[test]

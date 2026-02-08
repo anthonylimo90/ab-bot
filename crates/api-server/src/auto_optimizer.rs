@@ -12,6 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration as TokioDuration};
@@ -29,6 +30,163 @@ pub enum AllocationStrategy {
     ConfidenceWeighted,
     /// Weighted by recent performance
     Performance,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_percent_and_ratio_inputs() {
+        assert!((AutoOptimizer::normalize_ratio(50.0) - 0.5).abs() < f64::EPSILON);
+        assert!((AutoOptimizer::normalize_ratio(5.0) - 0.05).abs() < f64::EPSILON);
+        assert!((AutoOptimizer::normalize_ratio(0.5) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn relax_thresholds_expands_candidate_window() {
+        let base = CandidateThresholds {
+            min_roi: 0.05,
+            min_sharpe: 1.0,
+            min_win_rate: 0.55,
+            min_trades: 12,
+            max_drawdown: 0.20,
+        };
+
+        let relaxed = AutoOptimizer::relax_thresholds(&base, 2);
+        assert!(relaxed.min_roi <= base.min_roi);
+        assert!(relaxed.min_sharpe <= base.min_sharpe);
+        assert!(relaxed.min_win_rate <= base.min_win_rate);
+        assert!(relaxed.min_trades <= base.min_trades);
+        assert!(relaxed.max_drawdown >= base.max_drawdown);
+    }
+
+    #[test]
+    fn exploration_score_prefers_upside_with_lower_confidence() {
+        let conservative = WalletCompositeScore {
+            address: "0x1".to_string(),
+            total_score: 75.0,
+            roi_score: 60.0,
+            sharpe_score: 70.0,
+            win_rate_score: 65.0,
+            consistency_score: 80.0,
+            confidence: 0.9,
+        };
+        let exploratory = WalletCompositeScore {
+            address: "0x2".to_string(),
+            total_score: 74.0,
+            roi_score: 82.0,
+            sharpe_score: 65.0,
+            win_rate_score: 62.0,
+            consistency_score: 70.0,
+            confidence: 0.35,
+        };
+
+        assert!(
+            AutoOptimizer::exploration_score(&exploratory)
+                > AutoOptimizer::exploration_score(&conservative)
+        );
+    }
+
+    #[test]
+    fn normalize_ratio_edge_cases() {
+        // Zero stays zero
+        assert_eq!(AutoOptimizer::normalize_ratio(0.0), 0.0);
+        // 100.0 => 1.0 (percentage to ratio)
+        assert!((AutoOptimizer::normalize_ratio(100.0) - 1.0).abs() < f64::EPSILON);
+        // 1000.0 => 10.0 (still divides by 100)
+        assert!((AutoOptimizer::normalize_ratio(1000.0) - 10.0).abs() < f64::EPSILON);
+        // Negative percentage
+        assert!((AutoOptimizer::normalize_ratio(-50.0) - (-0.5)).abs() < f64::EPSILON);
+        // Values <= 1.0 stay as-is
+        assert!((AutoOptimizer::normalize_ratio(0.99) - 0.99).abs() < f64::EPSILON);
+        assert!((AutoOptimizer::normalize_ratio(-0.5) - (-0.5)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn relax_thresholds_multiple_rounds() {
+        let base = CandidateThresholds {
+            min_roi: 0.05,
+            min_sharpe: 1.0,
+            min_win_rate: 0.55,
+            min_trades: 12,
+            max_drawdown: 0.20,
+        };
+
+        // Round 0 (default/catch-all)
+        let r0 = AutoOptimizer::relax_thresholds(&base, 0);
+        assert!(r0.min_roi < base.min_roi, "Round 0 should relax ROI");
+        assert!(
+            r0.max_drawdown > base.max_drawdown,
+            "Round 0 should relax drawdown"
+        );
+
+        // Round 1
+        let r1 = AutoOptimizer::relax_thresholds(&base, 1);
+        assert!((r1.min_roi - 0.03).abs() < f64::EPSILON);
+        assert!((r1.min_sharpe - 0.85).abs() < f64::EPSILON);
+        assert_eq!(r1.min_trades, 6);
+
+        // Round 5 (falls into catch-all _ branch)
+        let r5 = AutoOptimizer::relax_thresholds(&base, 5);
+        assert!(
+            r5.min_roi <= r1.min_roi,
+            "Higher rounds should be more relaxed than round 1"
+        );
+        assert!(r5.max_drawdown >= r1.max_drawdown);
+        assert_eq!(r5.min_trades, 1);
+    }
+
+    #[test]
+    fn exploration_score_equal_total_score_tie_break() {
+        // Two wallets with equal total_score but different confidence
+        let high_conf = WalletCompositeScore {
+            address: "0xa".to_string(),
+            total_score: 70.0,
+            roi_score: 70.0,
+            sharpe_score: 70.0,
+            win_rate_score: 70.0,
+            consistency_score: 70.0,
+            confidence: 0.9,
+        };
+        let low_conf = WalletCompositeScore {
+            confidence: 0.3,
+            ..high_conf.clone()
+        };
+
+        // Lower confidence should get a higher exploration score
+        // because of the (1.0 - confidence) * 10.0 bonus
+        assert!(
+            AutoOptimizer::exploration_score(&low_conf)
+                > AutoOptimizer::exploration_score(&high_conf),
+            "Lower confidence should win exploration tie-break"
+        );
+    }
+
+    #[test]
+    fn allocation_strategy_round_trip() {
+        use std::str::FromStr;
+
+        let strategies = vec![
+            (AllocationStrategy::Equal, "equal"),
+            (
+                AllocationStrategy::ConfidenceWeighted,
+                "confidence_weighted",
+            ),
+            (AllocationStrategy::Performance, "performance"),
+        ];
+
+        for (strategy, expected_str) in strategies {
+            let display = strategy.to_string();
+            assert_eq!(display, expected_str);
+
+            let parsed = AllocationStrategy::from_str(&display).unwrap();
+            assert_eq!(parsed, strategy);
+        }
+
+        // Invalid string should error
+        assert!(AllocationStrategy::from_str("invalid").is_err());
+    }
 }
 
 impl std::fmt::Display for AllocationStrategy {
@@ -115,6 +273,23 @@ pub struct WalletCandidate {
     pub trade_count_30d: Option<i32>,
     pub max_drawdown_30d: Option<Decimal>,
     pub last_trade_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct CandidateThresholds {
+    min_roi: f64,
+    min_sharpe: f64,
+    min_win_rate: f64,
+    min_trades: i32,
+    max_drawdown: f64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct WalletMetricSnapshot {
+    roi_30d: Option<Decimal>,
+    sharpe_30d: Option<Decimal>,
+    win_rate_30d: Option<Decimal>,
+    confidence_score: Option<Decimal>,
 }
 
 /// Current allocation in a workspace (extended).
@@ -240,11 +415,11 @@ pub struct RotationRecord {
 }
 
 /// Default thresholds for promotion criteria
-pub const DEFAULT_MIN_ROI_30D: f64 = 5.0;
+pub const DEFAULT_MIN_ROI_30D: f64 = 0.05;
 pub const DEFAULT_MIN_SHARPE: f64 = 1.0;
-pub const DEFAULT_MIN_WIN_RATE: f64 = 50.0;
+pub const DEFAULT_MIN_WIN_RATE: f64 = 0.50;
 pub const DEFAULT_MIN_TRADES: i32 = 10;
-pub const DEFAULT_MAX_DRAWDOWN: f64 = 20.0;
+pub const DEFAULT_MAX_DRAWDOWN: f64 = 0.20;
 
 /// Configuration for auto-optimizer demotion thresholds and allocation limits.
 #[derive(Debug, Clone)]
@@ -265,19 +440,31 @@ pub struct AutoOptimizerConfig {
     pub min_allocation_pct: f64,
     /// Maximum allocation percentage per wallet.
     pub max_allocation_pct: f64,
+    /// Whether to progressively relax thresholds when candidate pool is thin.
+    pub auto_relax_thresholds: bool,
+    /// Number of relaxation rounds to apply.
+    pub max_relaxation_rounds: usize,
+    /// Number of slots reserved for high-upside exploration candidates.
+    pub exploration_slots: usize,
+    /// Minimum confidence required for exploration picks.
+    pub min_exploration_confidence: f64,
 }
 
 impl Default for AutoOptimizerConfig {
     fn default() -> Self {
         Self {
             demotion_max_consecutive_losses: 8,
-            demotion_max_drawdown_pct: 40.0,
-            demotion_grace_roi_threshold: -5.0,
+            demotion_max_drawdown_pct: 0.40,
+            demotion_grace_roi_threshold: -0.05,
             demotion_grace_sharpe_threshold: 0.3,
             grace_period_negative_roi_hours: 72,
             grace_period_low_sharpe_hours: 48,
             min_allocation_pct: 5.0,
             max_allocation_pct: 50.0,
+            auto_relax_thresholds: true,
+            max_relaxation_rounds: 3,
+            exploration_slots: 1,
+            min_exploration_confidence: 0.15,
         }
     }
 }
@@ -559,12 +746,15 @@ impl AutoOptimizer {
         let current_addresses: Vec<&str> =
             current.iter().map(|a| a.wallet_address.as_str()).collect();
 
-        // Get candidate wallets
-        let candidates = self.get_candidate_wallets(workspace).await?;
+        // Get candidate wallets with adaptive relaxation when needed.
+        let candidate_target = empty_slots + self.config.exploration_slots + 2;
+        let candidates = self
+            .get_candidate_wallets(workspace, candidate_target)
+            .await?;
         info!(
             workspace_id = %workspace.id,
             candidate_count = candidates.len(),
-            "Found candidate wallets meeting criteria"
+            "Found candidate wallets for slot filling"
         );
 
         // Filter out banned and already-in-roster wallets
@@ -587,7 +777,8 @@ impl AutoOptimizer {
         // Rank candidates by composite score
         let ranked = self.rank_candidates(&available_candidates).await?;
 
-        // Add top candidates to fill empty slots
+        // Add top candidates to fill empty slots. Reserve a small number of slots
+        // for exploration picks when appetite is higher.
         let probation_days = workspace.probation_days.unwrap_or(7);
 
         if ranked.is_empty() {
@@ -597,7 +788,37 @@ impl AutoOptimizer {
             );
         }
 
-        for candidate in ranked.iter().take(empty_slots) {
+        let exploration_slots = self
+            .config
+            .exploration_slots
+            .min(empty_slots.saturating_sub(1));
+        let core_slots = empty_slots.saturating_sub(exploration_slots);
+
+        let mut selected: Vec<&WalletCompositeScore> = ranked.iter().take(core_slots).collect();
+
+        if exploration_slots > 0 {
+            let mut exploration_pool: Vec<&WalletCompositeScore> = ranked
+                .iter()
+                .skip(core_slots)
+                .filter(|candidate| candidate.confidence >= self.config.min_exploration_confidence)
+                .collect();
+
+            exploration_pool.sort_by(|a, b| {
+                let score_a = Self::exploration_score(a);
+                let score_b = Self::exploration_score(b);
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            selected.extend(exploration_pool.into_iter().take(exploration_slots));
+        }
+
+        if selected.is_empty() {
+            return Ok(());
+        }
+
+        for candidate in selected.into_iter().take(empty_slots) {
             info!(
                 workspace_id = %workspace.id,
                 wallet = %candidate.address,
@@ -633,9 +854,10 @@ impl AutoOptimizer {
                     .unwrap_or(self.config.demotion_max_drawdown_pct)
             })
             .unwrap_or(self.config.demotion_max_drawdown_pct);
+        let max_dd = Self::normalize_ratio(max_dd);
 
         if let Some(roi) = allocation.backtest_roi {
-            let roi_f64: f64 = roi.to_string().parse().unwrap_or(0.0);
+            let roi_f64 = Self::normalize_ratio(roi.to_string().parse().unwrap_or(0.0));
             // Check drawdown (simplified - would need actual drawdown tracking)
             if roi_f64 < -max_dd {
                 return Ok(Some(DemotionTrigger::MaxDrawdown));
@@ -644,8 +866,9 @@ impl AutoOptimizer {
 
         // Grace period trigger: ROI below threshold
         if let Some(roi) = allocation.backtest_roi {
-            let roi_f64: f64 = roi.to_string().parse().unwrap_or(0.0);
-            if roi_f64 < self.config.demotion_grace_roi_threshold {
+            let roi_f64 = Self::normalize_ratio(roi.to_string().parse().unwrap_or(0.0));
+            let roi_threshold = Self::normalize_ratio(self.config.demotion_grace_roi_threshold);
+            if roi_f64 < roi_threshold {
                 return Ok(Some(DemotionTrigger::NegativeRoi));
             }
         }
@@ -943,50 +1166,174 @@ impl AutoOptimizer {
     async fn get_candidate_wallets(
         &self,
         workspace: &WorkspaceOptimizationSettings,
+        target_count: usize,
     ) -> anyhow::Result<Vec<WalletCandidate>> {
-        let min_roi = workspace
-            .min_roi_30d
-            .unwrap_or(Decimal::new(DEFAULT_MIN_ROI_30D as i64 * 100, 2));
-        let min_sharpe = workspace
-            .min_sharpe
-            .unwrap_or(Decimal::new(DEFAULT_MIN_SHARPE as i64 * 100, 2));
-        let min_win_rate = workspace
-            .min_win_rate
-            .unwrap_or(Decimal::new(DEFAULT_MIN_WIN_RATE as i64, 0));
-        let min_trades = workspace.min_trades_30d.unwrap_or(DEFAULT_MIN_TRADES);
-        let max_drawdown = workspace
-            .max_drawdown_pct
-            .unwrap_or(Decimal::new(DEFAULT_MAX_DRAWDOWN as i64, 0));
+        let base_thresholds = self.base_candidate_thresholds(workspace);
+        let mut merged: HashMap<String, WalletCandidate> = HashMap::new();
+
+        let strict = self.query_candidate_wallets(&base_thresholds, 50).await?;
+        let strict_count = strict.len();
+        for candidate in strict {
+            merged.insert(candidate.address.clone(), candidate);
+        }
+
+        if self.config.auto_relax_thresholds && merged.len() < target_count {
+            for round in 1..=self.config.max_relaxation_rounds {
+                let relaxed = Self::relax_thresholds(&base_thresholds, round);
+                let relaxed_candidates = self.query_candidate_wallets(&relaxed, 100).await?;
+                for candidate in relaxed_candidates {
+                    merged.entry(candidate.address.clone()).or_insert(candidate);
+                }
+
+                if merged.len() >= target_count {
+                    break;
+                }
+            }
+        }
+
+        let mut candidates: Vec<WalletCandidate> = merged.into_values().collect();
+        candidates.sort_by(|a, b| {
+            let a_roi = a
+                .roi_30d
+                .as_ref()
+                .and_then(|d| d.to_string().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let b_roi = b
+                .roi_30d
+                .as_ref()
+                .and_then(|d| d.to_string().parse::<f64>().ok())
+                .unwrap_or(0.0);
+            b_roi
+                .partial_cmp(&a_roi)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         debug!(
             workspace_id = %workspace.id,
-            min_roi = %min_roi,
-            min_sharpe = %min_sharpe,
-            min_win_rate = %min_win_rate,
-            min_trades = min_trades,
-            max_drawdown = %max_drawdown,
-            "Querying candidate wallets with thresholds"
+            strict_count = strict_count,
+            total_count = candidates.len(),
+            min_roi = base_thresholds.min_roi,
+            min_sharpe = base_thresholds.min_sharpe,
+            min_win_rate = base_thresholds.min_win_rate,
+            min_trades = base_thresholds.min_trades,
+            max_drawdown = base_thresholds.max_drawdown,
+            "Candidate query complete"
         );
 
+        Ok(candidates)
+    }
+
+    fn base_candidate_thresholds(
+        &self,
+        workspace: &WorkspaceOptimizationSettings,
+    ) -> CandidateThresholds {
+        let min_roi = workspace
+            .min_roi_30d
+            .map(|d| d.to_string().parse::<f64>().unwrap_or(DEFAULT_MIN_ROI_30D))
+            .map(Self::normalize_ratio)
+            .unwrap_or(DEFAULT_MIN_ROI_30D);
+        let min_sharpe = workspace
+            .min_sharpe
+            .map(|d| d.to_string().parse::<f64>().unwrap_or(DEFAULT_MIN_SHARPE))
+            .unwrap_or(DEFAULT_MIN_SHARPE);
+        let min_win_rate = workspace
+            .min_win_rate
+            .map(|d| d.to_string().parse::<f64>().unwrap_or(DEFAULT_MIN_WIN_RATE))
+            .map(Self::normalize_ratio)
+            .unwrap_or(DEFAULT_MIN_WIN_RATE);
+        let min_trades = workspace.min_trades_30d.unwrap_or(DEFAULT_MIN_TRADES);
+        let max_drawdown = workspace
+            .max_drawdown_pct
+            .map(|d| d.to_string().parse::<f64>().unwrap_or(DEFAULT_MAX_DRAWDOWN))
+            .map(Self::normalize_ratio)
+            .unwrap_or(DEFAULT_MAX_DRAWDOWN);
+
+        CandidateThresholds {
+            min_roi,
+            min_sharpe,
+            min_win_rate,
+            min_trades,
+            max_drawdown,
+        }
+    }
+
+    fn relax_thresholds(base: &CandidateThresholds, round: usize) -> CandidateThresholds {
+        match round {
+            1 => CandidateThresholds {
+                min_roi: (base.min_roi - 0.02).max(-0.10),
+                min_sharpe: (base.min_sharpe - 0.15).max(0.0),
+                min_win_rate: (base.min_win_rate - 0.05).max(0.45),
+                min_trades: (base.min_trades / 2).max(5),
+                max_drawdown: (base.max_drawdown + 0.10).min(0.60),
+            },
+            2 => CandidateThresholds {
+                min_roi: (base.min_roi - 0.05).max(-0.15),
+                min_sharpe: (base.min_sharpe - 0.30).max(0.0),
+                min_win_rate: (base.min_win_rate - 0.10).max(0.42),
+                min_trades: (base.min_trades / 3).max(3),
+                max_drawdown: (base.max_drawdown + 0.20).min(0.70),
+            },
+            _ => CandidateThresholds {
+                min_roi: (base.min_roi - 0.10).max(-0.25),
+                min_sharpe: (base.min_sharpe - 0.50).max(0.0),
+                min_win_rate: (base.min_win_rate - 0.15).max(0.40),
+                min_trades: 1,
+                max_drawdown: (base.max_drawdown + 0.30).min(0.80),
+            },
+        }
+    }
+
+    async fn query_candidate_wallets(
+        &self,
+        thresholds: &CandidateThresholds,
+        limit: i64,
+    ) -> anyhow::Result<Vec<WalletCandidate>> {
         let candidates: Vec<WalletCandidate> = sqlx::query_as(
             r#"
-            SELECT address, roi_30d, sharpe_30d, win_rate_30d, trades_30d AS trade_count_30d,
-                   max_drawdown_30d, last_computed AS last_trade_at
-            FROM wallet_success_metrics
-            WHERE COALESCE(roi_30d, 0) >= $1
-              AND COALESCE(sharpe_30d, 0) >= $2
-              AND COALESCE(win_rate_30d, 0) >= $3
-              AND COALESCE(trades_30d, 0) >= $4
-              AND COALESCE(max_drawdown_30d, 100) <= $5
-            ORDER BY COALESCE(roi_30d, 0) DESC
-            LIMIT 50
+            WITH candidate_metrics AS (
+                SELECT
+                    COALESCE(wsm.address, wf.address) AS address,
+                    CASE
+                        WHEN ABS(COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)) > 1
+                            THEN COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0) / 100
+                        ELSE COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)
+                    END AS roi_30d,
+                    COALESCE(wsm.sharpe_30d, 0) AS sharpe_30d,
+                    CASE
+                        WHEN ABS(COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)) > 1
+                            THEN COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0) / 100
+                        ELSE COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)
+                    END AS win_rate_30d,
+                    COALESCE(wsm.trades_30d, wf.total_trades::integer, 0) AS trade_count_30d,
+                    CASE
+                        WHEN ABS(COALESCE(wsm.max_drawdown_30d, 0.2)) > 1
+                            THEN COALESCE(wsm.max_drawdown_30d, 0.2) / 100
+                        ELSE COALESCE(wsm.max_drawdown_30d, 0.2)
+                    END AS max_drawdown_30d,
+                    COALESCE(wsm.last_computed, wf.last_trade, NOW()) AS last_trade_at
+                FROM wallet_success_metrics wsm
+                FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
+                WHERE COALESCE(wsm.address, wf.address) IS NOT NULL
+            )
+            SELECT
+                address, roi_30d, sharpe_30d, win_rate_30d,
+                trade_count_30d, max_drawdown_30d, last_trade_at
+            FROM candidate_metrics
+            WHERE roi_30d >= $1::numeric
+              AND sharpe_30d >= $2::numeric
+              AND win_rate_30d >= $3::numeric
+              AND trade_count_30d >= $4
+              AND max_drawdown_30d <= $5::numeric
+            ORDER BY roi_30d DESC
+            LIMIT $6
             "#,
         )
-        .bind(min_roi)
-        .bind(min_sharpe)
-        .bind(min_win_rate)
-        .bind(min_trades)
-        .bind(max_drawdown)
+        .bind(thresholds.min_roi)
+        .bind(thresholds.min_sharpe)
+        .bind(thresholds.min_win_rate)
+        .bind(thresholds.min_trades)
+        .bind(thresholds.max_drawdown)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1004,6 +1351,7 @@ impl AutoOptimizer {
             let roi = candidate
                 .roi_30d
                 .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
+                .map(Self::normalize_ratio)
                 .unwrap_or(0.0);
             let sharpe = candidate
                 .sharpe_30d
@@ -1012,21 +1360,23 @@ impl AutoOptimizer {
             let win_rate = candidate
                 .win_rate_30d
                 .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
+                .map(Self::normalize_ratio)
                 .unwrap_or(0.0);
             let trade_count = candidate.trade_count_30d.unwrap_or(0) as f64;
 
             // Normalize scores (0-100 scale)
-            let roi_score = (roi / 20.0).min(1.0).max(0.0) * 100.0; // 20% = max score
+            let roi_score = (roi / 0.20).min(1.0).max(0.0) * 100.0; // 20% monthly = max score
             let sharpe_score = (sharpe / 3.0).min(1.0).max(0.0) * 100.0; // 3.0 = max score
-            let win_rate_score = win_rate; // Already 0-100
+            let win_rate_score = (win_rate * 100.0).min(100.0).max(0.0);
 
             // Consistency score based on trade count and drawdown
             let drawdown = candidate
                 .max_drawdown_30d
                 .map(|d| d.to_string().parse::<f64>().unwrap_or(20.0))
-                .unwrap_or(20.0);
+                .map(Self::normalize_ratio)
+                .unwrap_or(DEFAULT_MAX_DRAWDOWN);
             let trade_consistency = (trade_count / 50.0).min(1.0) * 50.0;
-            let drawdown_score = (1.0 - drawdown / 30.0).max(0.0) * 50.0;
+            let drawdown_score = (1.0 - drawdown / 0.30).max(0.0) * 50.0;
             let consistency_score = trade_consistency + drawdown_score;
 
             // Weighted composite score
@@ -1082,14 +1432,30 @@ impl AutoOptimizer {
             confidence += 0.1;
         }
 
-        if win_rate > 60.0 {
+        if win_rate > 0.60 {
             confidence += 0.2;
-        } else if win_rate > 50.0 {
+        } else if win_rate > 0.50 {
             confidence += 0.1;
         }
 
         // Cap at 1.0
         confidence.min(1.0)
+    }
+
+    fn normalize_ratio(value: f64) -> f64 {
+        if value.abs() > 1.0 {
+            value / 100.0
+        } else {
+            value
+        }
+    }
+
+    fn exploration_score(candidate: &WalletCompositeScore) -> f64 {
+        candidate.roi_score * 0.45
+            + candidate.sharpe_score * 0.20
+            + candidate.win_rate_score * 0.15
+            + candidate.consistency_score * 0.10
+            + ((1.0 - candidate.confidence).max(0.0) * 10.0)
     }
 
     /// Check if allocation meets promotion criteria.
@@ -1101,6 +1467,7 @@ impl AutoOptimizer {
         let min_roi = workspace
             .min_roi_30d
             .map(|d| d.to_string().parse::<f64>().unwrap_or(DEFAULT_MIN_ROI_30D))
+            .map(Self::normalize_ratio)
             .unwrap_or(DEFAULT_MIN_ROI_30D);
         let min_sharpe = workspace
             .min_sharpe
@@ -1109,22 +1476,47 @@ impl AutoOptimizer {
         let min_win_rate = workspace
             .min_win_rate
             .map(|d| d.to_string().parse::<f64>().unwrap_or(DEFAULT_MIN_WIN_RATE))
+            .map(Self::normalize_ratio)
             .unwrap_or(DEFAULT_MIN_WIN_RATE);
 
         let roi = allocation
             .backtest_roi
-            .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
-            .unwrap_or(0.0);
+            .map(|d| Self::normalize_ratio(d.to_string().parse::<f64>().unwrap_or(0.0)));
         let sharpe = allocation
             .backtest_sharpe
-            .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
-            .unwrap_or(0.0);
+            .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0));
         let win_rate = allocation
             .backtest_win_rate
-            .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
-            .unwrap_or(0.0);
+            .map(|d| Self::normalize_ratio(d.to_string().parse::<f64>().unwrap_or(0.0)));
 
-        roi >= min_roi && sharpe >= min_sharpe && win_rate >= min_win_rate
+        // If no metrics are available yet, do not fail probation purely on missing data.
+        if roi.is_none() && sharpe.is_none() && win_rate.is_none() {
+            return true;
+        }
+
+        let mut checks = 0;
+        let mut passed = 0;
+
+        if let Some(roi) = roi {
+            checks += 1;
+            if roi >= min_roi {
+                passed += 1;
+            }
+        }
+        if let Some(sharpe) = sharpe {
+            checks += 1;
+            if sharpe >= min_sharpe {
+                passed += 1;
+            }
+        }
+        if let Some(win_rate) = win_rate {
+            checks += 1;
+            if win_rate >= min_win_rate {
+                passed += 1;
+            }
+        }
+
+        checks == passed
     }
 
     /// Recalculate allocations based on strategy.
@@ -1252,7 +1644,7 @@ impl AutoOptimizer {
             return active.iter().map(|a| (a.id, pct)).collect();
         }
 
-        active
+        let capped: Vec<(Uuid, f64)> = active
             .iter()
             .map(|a| {
                 let roi = a
@@ -1260,11 +1652,22 @@ impl AutoOptimizer {
                     .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0).max(0.0))
                     .unwrap_or(0.0);
                 let pct = (roi / total_roi) * 100.0;
-                let capped = pct
+                let bounded = pct
                     .max(self.config.min_allocation_pct)
                     .min(self.config.max_allocation_pct);
-                (a.id, capped)
+                (a.id, bounded)
             })
+            .collect();
+
+        let total_capped: f64 = capped.iter().map(|(_, v)| v).sum();
+        if total_capped <= 0.0 {
+            let pct = 100.0 / active.len() as f64;
+            return active.iter().map(|a| (a.id, pct)).collect();
+        }
+
+        capped
+            .into_iter()
+            .map(|(id, v)| (id, (v / total_capped) * 100.0))
             .collect()
     }
 
@@ -1438,6 +1841,42 @@ impl AutoOptimizer {
         self.optimize_workspace(&workspace).await
     }
 
+    async fn get_wallet_metric_snapshot(
+        &self,
+        address: &str,
+    ) -> anyhow::Result<Option<WalletMetricSnapshot>> {
+        let snapshot: Option<WalletMetricSnapshot> = sqlx::query_as(
+            r#"
+            SELECT
+                CASE
+                    WHEN ABS(COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)) > 1
+                        THEN COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0) / 100
+                    ELSE COALESCE(wsm.roi_30d, ((COALESCE(wf.win_rate, 0.5) - 0.5) * 2)::numeric, 0)
+                END AS roi_30d,
+                COALESCE(wsm.sharpe_30d, 0) AS sharpe_30d,
+                CASE
+                    WHEN ABS(COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)) > 1
+                        THEN COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0) / 100
+                    ELSE COALESCE(wsm.win_rate_30d, wf.win_rate::numeric, 0)
+                END AS win_rate_30d,
+                CASE
+                    WHEN ABS(COALESCE(wsm.predicted_success_prob, 0.5)) > 1
+                        THEN COALESCE(wsm.predicted_success_prob, 0.5) / 100
+                    ELSE COALESCE(wsm.predicted_success_prob, 0.5)
+                END AS confidence_score
+            FROM wallet_success_metrics wsm
+            FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
+            WHERE LOWER(COALESCE(wsm.address, wf.address)) = LOWER($1)
+            LIMIT 1
+            "#,
+        )
+        .bind(address)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(snapshot)
+    }
+
     /// Add wallet to active roster with probation period.
     async fn add_to_active_with_probation(
         &self,
@@ -1447,6 +1886,19 @@ impl AutoOptimizer {
     ) -> anyhow::Result<()> {
         let now = Utc::now();
         let probation_until = now + Duration::days(probation_days as i64);
+        let snapshot = self.get_wallet_metric_snapshot(address).await?;
+
+        let backtest_roi = snapshot.as_ref().and_then(|s| s.roi_30d.as_ref().cloned());
+        let backtest_sharpe = snapshot
+            .as_ref()
+            .and_then(|s| s.sharpe_30d.as_ref().cloned());
+        let backtest_win_rate = snapshot
+            .as_ref()
+            .and_then(|s| s.win_rate_30d.as_ref().cloned());
+        let confidence = snapshot
+            .as_ref()
+            .and_then(|s| s.confidence_score.as_ref().cloned())
+            .unwrap_or(Decimal::new(5, 1)); // 0.5 default
 
         // Check if already in roster
         let existing: Option<(Uuid,)> = sqlx::query_as(
@@ -1464,11 +1916,17 @@ impl AutoOptimizer {
                 UPDATE workspace_wallet_allocations
                 SET tier = 'active', allocation_pct = 20,
                     probation_until = $1, probation_allocation_pct = 50,
-                    updated_at = $2
-                WHERE id = $3
+                    backtest_roi = $2, backtest_sharpe = $3, backtest_win_rate = $4,
+                    confidence_score = $5,
+                    updated_at = $6
+                WHERE id = $7
                 "#,
             )
             .bind(probation_until)
+            .bind(backtest_roi)
+            .bind(backtest_sharpe)
+            .bind(backtest_win_rate)
+            .bind(confidence)
             .bind(now)
             .bind(id)
             .execute(&self.pool)
@@ -1479,14 +1937,21 @@ impl AutoOptimizer {
                 r#"
                 INSERT INTO workspace_wallet_allocations
                 (id, workspace_id, wallet_address, allocation_pct, tier, auto_assigned, auto_assigned_reason,
-                 probation_until, probation_allocation_pct, added_at, updated_at)
-                VALUES ($1, $2, $3, 20, 'active', true, 'Auto-selected with probation', $4, 50, $5, $5)
+                 probation_until, probation_allocation_pct,
+                 backtest_roi, backtest_sharpe, backtest_win_rate, confidence_score,
+                 added_at, updated_at)
+                VALUES ($1, $2, $3, 20, 'active', true, 'Auto-selected with probation',
+                        $4, 50, $5, $6, $7, $8, $9, $9)
                 "#,
             )
             .bind(Uuid::new_v4())
             .bind(workspace_id)
             .bind(address)
             .bind(probation_until)
+            .bind(backtest_roi)
+            .bind(backtest_sharpe)
+            .bind(backtest_win_rate)
+            .bind(confidence)
             .bind(now)
             .execute(&self.pool)
             .await?;
@@ -2090,7 +2555,10 @@ impl AutoOptimizer {
             let current_addresses: Vec<&str> =
                 current.iter().map(|a| a.wallet_address.as_str()).collect();
 
-            let candidates = self.get_candidate_wallets(&workspace).await?;
+            let candidate_target = empty_slots + self.config.exploration_slots + 2;
+            let candidates = self
+                .get_candidate_wallets(&workspace, candidate_target)
+                .await?;
             let available: Vec<_> = candidates
                 .iter()
                 .filter(|c| {

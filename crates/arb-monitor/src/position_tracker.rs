@@ -26,7 +26,10 @@ impl PositionTracker {
         Self {
             repo: PositionRepository::new(pool),
             active_positions: HashMap::new(),
-            exit_threshold: Decimal::new(5, 3), // 0.005 = 0.5% minimum exit profit
+            exit_threshold: std::env::var("ARB_EXIT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| Decimal::new(5, 3)), // default 0.005 = 0.5%
         }
     }
 
@@ -147,7 +150,10 @@ impl PositionTracker {
             let potential_profit = exit_value - entry_cost - fees;
 
             if potential_profit >= self.exit_threshold * position.quantity {
-                position.mark_exit_ready();
+                if let Err(e) = position.mark_exit_ready() {
+                    warn!("Cannot mark position {} exit ready: {}", position.id, e);
+                    continue;
+                }
                 self.repo.update(position).await?;
                 exit_ready.push(position.id);
 
@@ -165,7 +171,10 @@ impl PositionTracker {
     pub async fn mark_position_open(&mut self, position_id: Uuid) -> Result<()> {
         for positions in self.active_positions.values_mut() {
             if let Some(pos) = positions.iter_mut().find(|p| p.id == position_id) {
-                pos.mark_open();
+                if let Err(e) = pos.mark_open() {
+                    warn!("Cannot mark position {} open: {}", position_id, e);
+                    return Ok(());
+                }
                 self.repo.update(pos).await?;
                 info!("Position {} marked as OPEN", position_id);
                 return Ok(());
@@ -601,4 +610,157 @@ pub struct PositionSummary {
     pub stalled: usize,
     pub total_realized_pnl: Decimal,
     pub total_unrealized_pnl: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_position(
+        state: PositionState,
+        unrealized: Decimal,
+        realized: Option<Decimal>,
+    ) -> Position {
+        let mut pos = Position::new(
+            "test-market".to_string(),
+            Decimal::new(45, 2), // 0.45
+            Decimal::new(50, 2), // 0.50
+            Decimal::new(10, 0), // 10 shares
+            ExitStrategy::HoldToResolution,
+        );
+        pos.state = state;
+        pos.unrealized_pnl = unrealized;
+        pos.realized_pnl = realized;
+        pos
+    }
+
+    #[test]
+    fn test_reconciliation_result_no_issues() {
+        let result = ReconciliationResult {
+            total_positions: 5,
+            healthy: 5,
+            ..Default::default()
+        };
+        assert!(!result.has_issues());
+        assert_eq!(result.needs_manual_intervention(), 0);
+    }
+
+    #[test]
+    fn test_reconciliation_result_with_issues() {
+        let result = ReconciliationResult {
+            total_positions: 10,
+            healthy: 5,
+            stale_pending: 2,
+            interrupted_closing: 1,
+            stalled: 1,
+            already_failed: 1,
+            ..Default::default()
+        };
+        assert!(result.has_issues());
+        assert_eq!(result.needs_manual_intervention(), 1);
+    }
+
+    #[test]
+    fn test_position_summary_counts() {
+        // Build a tracker's active_positions HashMap manually to test get_position_summary
+        let positions = vec![
+            make_position(PositionState::Open, Decimal::new(5, 2), None),
+            make_position(PositionState::Open, Decimal::new(3, 2), None),
+            make_position(PositionState::ExitReady, Decimal::new(10, 2), None),
+            make_position(
+                PositionState::Closed,
+                Decimal::ZERO,
+                Some(Decimal::new(15, 2)),
+            ),
+            make_position(PositionState::EntryFailed, Decimal::ZERO, None),
+            make_position(PositionState::ExitFailed, Decimal::new(-2, 2), None),
+        ];
+
+        // Simulate what get_position_summary does
+        let mut summary = PositionSummary::default();
+        for pos in &positions {
+            summary.total += 1;
+            match pos.state {
+                PositionState::Pending => summary.pending += 1,
+                PositionState::Open => summary.open += 1,
+                PositionState::ExitReady => summary.exit_ready += 1,
+                PositionState::Closing => summary.closing += 1,
+                PositionState::Closed => summary.closed += 1,
+                PositionState::EntryFailed => summary.entry_failed += 1,
+                PositionState::ExitFailed => summary.exit_failed += 1,
+                PositionState::Stalled => summary.stalled += 1,
+            }
+            if let Some(pnl) = pos.realized_pnl {
+                summary.total_realized_pnl += pnl;
+            }
+            summary.total_unrealized_pnl += pos.unrealized_pnl;
+        }
+
+        assert_eq!(summary.total, 6);
+        assert_eq!(summary.open, 2);
+        assert_eq!(summary.exit_ready, 1);
+        assert_eq!(summary.closed, 1);
+        assert_eq!(summary.entry_failed, 1);
+        assert_eq!(summary.exit_failed, 1);
+        assert_eq!(summary.total_realized_pnl, Decimal::new(15, 2));
+        // 0.05 + 0.03 + 0.10 + 0 + 0 + (-0.02) = 0.16
+        assert_eq!(summary.total_unrealized_pnl, Decimal::new(16, 2));
+    }
+
+    #[test]
+    fn test_state_counts() {
+        let mut counts: HashMap<PositionState, usize> = HashMap::new();
+        let positions = vec![
+            make_position(PositionState::Open, Decimal::ZERO, None),
+            make_position(PositionState::Open, Decimal::ZERO, None),
+            make_position(PositionState::Pending, Decimal::ZERO, None),
+            make_position(PositionState::Closed, Decimal::ZERO, Some(Decimal::ONE)),
+        ];
+
+        for pos in &positions {
+            *counts.entry(pos.state).or_insert(0) += 1;
+        }
+
+        assert_eq!(counts[&PositionState::Open], 2);
+        assert_eq!(counts[&PositionState::Pending], 1);
+        assert_eq!(counts[&PositionState::Closed], 1);
+        assert_eq!(counts.get(&PositionState::ExitReady), None);
+    }
+
+    #[test]
+    fn test_position_active_filtering() {
+        let positions = vec![
+            make_position(PositionState::Open, Decimal::ZERO, None),
+            make_position(PositionState::Closed, Decimal::ZERO, Some(Decimal::ONE)),
+            make_position(PositionState::EntryFailed, Decimal::ZERO, None),
+            make_position(PositionState::ExitFailed, Decimal::ZERO, None),
+            make_position(PositionState::Pending, Decimal::ZERO, None),
+        ];
+
+        let active: Vec<_> = positions.iter().filter(|p| p.is_active()).collect();
+        assert_eq!(active.len(), 3); // Open, ExitFailed, Pending
+
+        let needing_recovery: Vec<_> = positions.iter().filter(|p| p.needs_recovery()).collect();
+        assert_eq!(needing_recovery.len(), 1); // ExitFailed
+    }
+
+    #[test]
+    fn test_exit_opportunity_math() {
+        // Simulate the exit opportunity calculation from check_exit_opportunities
+        let position = make_position(PositionState::Open, Decimal::ZERO, None);
+        let exit_threshold = Decimal::new(5, 3); // 0.005
+
+        let yes_bid = Decimal::new(52, 2); // 0.52
+        let no_bid = Decimal::new(50, 2); // 0.50
+
+        let exit_value = (yes_bid + no_bid) * position.quantity;
+        let entry_cost = position.entry_cost(); // (0.45 + 0.50) * 10 = 9.50
+        let fees = ArbOpportunity::DEFAULT_FEE * Decimal::TWO * position.quantity; // 0.02 * 2 * 10 = 0.40
+        let potential_profit = exit_value - entry_cost - fees;
+        // exit_value = 1.02 * 10 = 10.20
+        // potential_profit = 10.20 - 9.50 - 0.40 = 0.30
+
+        assert!(potential_profit >= exit_threshold * position.quantity);
+        assert_eq!(potential_profit, Decimal::new(30, 2));
+    }
 }

@@ -12,7 +12,8 @@ import {
 import { formatCurrency, cn } from '@/lib/utils';
 import { Settings, Info } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { useRosterStore } from '@/stores/roster-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useActiveAllocationsQuery, useUpdateAllocationMutation } from '@/hooks/queries/useAllocationsQuery';
 import type { CopyBehavior } from '@/types/api';
 
 interface WalletAllocationSectionProps {
@@ -34,11 +35,13 @@ export function WalletAllocationSection({
   positionsValue,
   isDemo = false,
 }: WalletAllocationSectionProps) {
-  const { activeWallets, benchWallets, updateCopySettings } = useRosterStore();
+  const { currentWorkspace } = useWorkspaceStore();
+  const { data: activeWallets = [] } = useActiveAllocationsQuery(currentWorkspace?.id);
+  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id);
 
   // Find wallet in roster
-  const wallet = [...activeWallets, ...benchWallets].find(
-    (w) => w.address.toLowerCase() === walletAddress.toLowerCase()
+  const wallet = activeWallets.find(
+    (w) => w.wallet_address.toLowerCase() === walletAddress.toLowerCase()
   );
 
   // Not in roster - don't show allocation section
@@ -46,27 +49,31 @@ export function WalletAllocationSection({
     return null;
   }
 
-  const copySettings = wallet.copySettings;
-  if (!copySettings) {
-    return null;
-  }
-
   // Calculate allocation values
-  const allocationPct = copySettings.allocation_pct;
+  const allocationPct = wallet.allocation_pct;
   const maxAllocation = (allocationPct / 100) * totalBalance;
   const inUse = positionsValue;
   const available = Math.max(0, maxAllocation - inUse);
 
   const handleAllocationChange = (value: number[]) => {
-    updateCopySettings(walletAddress, { allocation_pct: value[0] });
+    updateAllocationMutation.mutate({
+      address: walletAddress,
+      params: { allocation_pct: value[0] },
+    });
   };
 
   const handleBehaviorChange = (value: CopyBehavior) => {
-    updateCopySettings(walletAddress, { copy_behavior: value });
+    updateAllocationMutation.mutate({
+      address: walletAddress,
+      params: { copy_behavior: value },
+    });
   };
 
   const handleMaxPositionChange = (value: number[]) => {
-    updateCopySettings(walletAddress, { max_position_size: value[0] });
+    updateAllocationMutation.mutate({
+      address: walletAddress,
+      params: { max_position_size: value[0] },
+    });
   };
 
   return (
@@ -191,11 +198,11 @@ export function WalletAllocationSection({
                 </TooltipProvider>
               </div>
               <span className="text-sm font-medium tabular-nums">
-                ${copySettings.max_position_size}
+                ${wallet.max_position_size ?? 100}
               </span>
             </div>
             <Slider
-              value={[copySettings.max_position_size]}
+              value={[wallet.max_position_size ?? 100]}
               onValueChange={handleMaxPositionChange}
               min={10}
               max={500}
@@ -223,7 +230,7 @@ export function WalletAllocationSection({
             </TooltipProvider>
           </div>
           <Select
-            value={copySettings.copy_behavior}
+            value={wallet.copy_behavior}
             onValueChange={(v) => handleBehaviorChange(v as CopyBehavior)}
           >
             <SelectTrigger className="w-full">
@@ -236,7 +243,7 @@ export function WalletAllocationSection({
             </SelectContent>
           </Select>
           <p className="text-xs text-muted-foreground">
-            {copyBehaviorDescriptions[copySettings.copy_behavior]}
+            {copyBehaviorDescriptions[wallet.copy_behavior]}
           </p>
         </div>
       </CardContent>

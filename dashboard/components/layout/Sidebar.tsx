@@ -12,7 +12,8 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useRosterStore } from '@/stores/roster-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
 
 interface NavItem {
   href: string;
@@ -51,7 +52,10 @@ const navSections: NavSection[] = [
 
 export function Sidebar() {
   const pathname = usePathname();
-  const { activeWallets, benchWallets } = useRosterStore();
+  const { currentWorkspace } = useWorkspaceStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const activeWallets = allocations.filter((a) => a.tier === 'active');
+  const benchWallets = allocations.filter((a) => a.tier === 'bench');
 
   const getBadgeCount = (badgeType?: 'active' | 'watching') => {
     if (badgeType === 'active') return activeWallets.length;

@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -345,6 +345,10 @@ pub async fn place_order(
 }
 
 /// Store a conditional order (stop-loss/take-profit) without immediate execution.
+///
+/// WARNING: These orders are stored in the database but automatic trigger monitoring
+/// is not yet implemented. They will not execute automatically when the stop price
+/// is reached. Use the risk-manager crate's stop-loss rules for monitored stops.
 async fn store_conditional_order(
     state: &Arc<AppState>,
     request: &PlaceOrderRequest,
@@ -377,11 +381,11 @@ async fn store_conditional_order(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    info!(
+    warn!(
         order_id = %order_id,
         order_type = ?request.order_type,
         stop_price = ?request.stop_price,
-        "Conditional order stored"
+        "Conditional order stored — automatic trigger monitoring not yet implemented"
     );
 
     Ok(Json(OrderResponse {

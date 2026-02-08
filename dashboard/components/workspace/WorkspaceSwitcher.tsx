@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { useQueryClient } from '@tanstack/react-query';
 import { Check, ChevronsUpDown, Building2, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
@@ -17,6 +18,7 @@ import { cn } from '@/lib/utils';
 
 export function WorkspaceSwitcher() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const {
     workspaces,
@@ -40,6 +42,7 @@ export function WorkspaceSwitcher() {
     }
     try {
       await switchWorkspace(workspaceId);
+      queryClient.invalidateQueries();
       setOpen(false);
       router.refresh();
     } catch {

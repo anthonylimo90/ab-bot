@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -14,11 +14,19 @@ import {
 } from '@/components/ui/select';
 import { CopyWalletModal } from '@/components/modals/CopyWalletModal';
 import { useDiscoverWalletsQuery } from '@/hooks/queries/useDiscoverQuery';
+import {
+  useAddAllocationMutation,
+  useAllocationsQuery,
+  useDemoteAllocationMutation,
+  usePromoteAllocationMutation,
+  useRemoveAllocationMutation,
+  useUpdateAllocationMutation,
+} from '@/hooks/queries/useAllocationsQuery';
 import { useToastStore } from '@/stores/toast-store';
-import { useRosterStore, createRosterWallet } from '@/stores/roster-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import { shortenAddress } from '@/lib/utils';
 import { Star, Plus, Check, Loader2, Search } from 'lucide-react';
-import type { CopyBehavior, DiscoveredWallet, PredictionCategory } from '@/types/api';
+import type { CopyBehavior, DiscoveredWallet, PredictionCategory, WorkspaceAllocation } from '@/types/api';
 
 // Transform API wallet to component format
 interface DisplayWallet {
@@ -72,7 +80,13 @@ type TimePeriod = '7d' | '30d' | '90d';
 
 export default function DiscoverPage() {
   const toast = useToastStore();
-  const { activeWallets, benchWallets, addToBench, addToActive } = useRosterStore();
+  const { currentWorkspace } = useWorkspaceStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const addAllocationMutation = useAddAllocationMutation(currentWorkspace?.id);
+  const removeAllocationMutation = useRemoveAllocationMutation(currentWorkspace?.id);
+  const promoteAllocationMutation = usePromoteAllocationMutation(currentWorkspace?.id);
+  const demoteAllocationMutation = useDemoteAllocationMutation(currentWorkspace?.id);
+  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id);
 
   // Filter state
   const [sortBy, setSortBy] = useState<SortField>('roi');
@@ -91,8 +105,8 @@ export default function DiscoverPage() {
   const [copyModalOpen, setCopyModalOpen] = useState(false);
   const [selectedWallet, setSelectedWallet] = useState<DisplayWallet | null>(null);
 
-  // Roster count from store
-  const rosterCount = activeWallets.length;
+  // Active allocation count
+  const rosterCount = allocations.filter((a) => a.tier === 'active').length;
 
   // Fetch wallets from API
   const { data: apiWallets, isLoading, error, refetch } = useDiscoverWalletsQuery({
@@ -101,16 +115,17 @@ export default function DiscoverPage() {
     minTrades: minTrades === '0' ? undefined : parseInt(minTrades),
     minWinRate: minWinRate ? 55 : undefined,
     limit: 50,
+    workspaceId: currentWorkspace?.id,
   });
 
-  // Check if wallet is tracked in roster store
+  // Check if wallet is tracked in workspace allocations
   const isWalletTracked = (address: string): boolean => {
     const lowerAddress = address.toLowerCase();
-    return (
-      activeWallets.some(w => w.address.toLowerCase() === lowerAddress) ||
-      benchWallets.some(w => w.address.toLowerCase() === lowerAddress)
-    );
+    return allocations.some((a) => a.wallet_address.toLowerCase() === lowerAddress);
   };
+
+  const getAllocation = (address: string): WorkspaceAllocation | undefined =>
+    allocations.find((a) => a.wallet_address.toLowerCase() === address.toLowerCase());
 
   // Transform and filter wallets
   const filteredWallets = useMemo(() => {
@@ -119,7 +134,7 @@ export default function DiscoverPage() {
     // Transform API wallets to display format
     let result = apiWallets.map((w, i) => ({
       ...toDisplayWallet(w, i + 1),
-      tracked: isWalletTracked(w.address),
+      tracked: allocations.some((a) => a.wallet_address.toLowerCase() === w.address.toLowerCase()),
     }));
 
     // Sort (API already returns sorted, but we can re-sort client-side if needed)
@@ -140,41 +155,33 @@ export default function DiscoverPage() {
       }
     });
 
-    // Re-rank after filtering
+    if (hideBots) {
+      // Lightweight heuristic until API exposes bot classification.
+      result = result.filter((wallet) => !(wallet.trades > 1000 && wallet.roi30d < 2));
+    }
+
+    // Re-rank after filtering/sorting
     return result.map((w, i) => ({ ...w, rank: i + 1 }));
-  }, [apiWallets, sortBy, timePeriod, activeWallets, benchWallets]);
+  }, [apiWallets, sortBy, timePeriod, allocations, hideBots]);
 
   const handleTrack = async (address: string) => {
     setTrackingLoading(prev => ({ ...prev, [address]: true }));
 
-    const wallet = filteredWallets.find(w => w.address === address);
-    if (!wallet) {
-      setTrackingLoading(prev => ({ ...prev, [address]: false }));
-      return;
-    }
-
     const isTracked = isWalletTracked(address);
 
-    if (isTracked) {
-      // Remove from bench (tracked wallets are on bench by default from discovery)
-      const { removeFromBench } = useRosterStore.getState();
-      removeFromBench(address);
-      toast.info('Removed from Bench', `${shortenAddress(address)} is no longer being monitored`);
-    } else {
-      // Add to bench
-      const rosterWallet = createRosterWallet(address, {
-        roi30d: wallet.roi30d,
-        sharpe: wallet.sharpe,
-        winRate: wallet.winRate,
-        trades: wallet.trades,
-        maxDrawdown: wallet.maxDrawdown,
-        confidence: wallet.confidence,
-      });
-      addToBench(rosterWallet);
-      toast.success('Added to Bench', `${shortenAddress(address)} is now being monitored`);
+    try {
+      if (isTracked) {
+        await removeAllocationMutation.mutateAsync(address);
+        toast.info('Removed from Tracking', `${shortenAddress(address)} is no longer being monitored`);
+      } else {
+        await addAllocationMutation.mutateAsync({ address, params: { tier: 'bench' } });
+        toast.success('Added to Watching', `${shortenAddress(address)} is now being monitored`);
+      }
+    } catch {
+      toast.error('Update Failed', 'Could not update wallet tracking');
+    } finally {
+      setTrackingLoading(prev => ({ ...prev, [address]: false }));
     }
-
-    setTrackingLoading(prev => ({ ...prev, [address]: false }));
   };
 
   const handleCopyClick = (wallet: DisplayWallet) => {
@@ -182,48 +189,52 @@ export default function DiscoverPage() {
     setCopyModalOpen(true);
   };
 
-  const handleCopyConfirm = (settings: {
+  const handleCopyConfirm = async (settings: {
     address: string;
     allocation_pct: number;
     copy_behavior: CopyBehavior;
     max_position_size: number;
     tier: 'active' | 'bench';
   }) => {
-    const wallet = filteredWallets.find(w => w.address === settings.address);
-    if (!wallet) return;
-
-    const rosterWallet = createRosterWallet(
-      settings.address,
-      {
-        roi30d: wallet.roi30d,
-        sharpe: wallet.sharpe,
-        winRate: wallet.winRate,
-        trades: wallet.trades,
-        maxDrawdown: wallet.maxDrawdown,
-        confidence: wallet.confidence,
-      },
-      settings.tier,
-      {
-        allocation_pct: settings.allocation_pct,
-        copy_behavior: settings.copy_behavior,
-        max_position_size: settings.max_position_size,
+    try {
+      const existing = getAllocation(settings.address);
+      if (!existing) {
+        await addAllocationMutation.mutateAsync({
+          address: settings.address,
+          params: {
+            tier: settings.tier,
+            allocation_pct: settings.allocation_pct,
+            copy_behavior: settings.copy_behavior,
+            max_position_size: settings.max_position_size,
+          },
+        });
+      } else {
+        await updateAllocationMutation.mutateAsync({
+          address: settings.address,
+          params: {
+            allocation_pct: settings.allocation_pct,
+            copy_behavior: settings.copy_behavior,
+            max_position_size: settings.max_position_size,
+          },
+        });
+        if (settings.tier === 'active' && existing.tier !== 'active') {
+          await promoteAllocationMutation.mutateAsync(settings.address);
+        }
+        if (settings.tier === 'bench' && existing.tier !== 'bench') {
+          await demoteAllocationMutation.mutateAsync(settings.address);
+        }
       }
-    );
 
-    if (settings.tier === 'active') {
-      addToActive(rosterWallet);
-    } else {
-      addToBench(rosterWallet);
+      const tierLabel = settings.tier === 'active' ? 'Active' : 'Watching';
+      toast.success(
+        `Wallet added to ${tierLabel}`,
+        `${shortenAddress(settings.address)} is now being ${settings.tier === 'active' ? 'copied' : 'monitored'}`
+      );
+      setCopyModalOpen(false);
+      setSelectedWallet(null);
+    } catch {
+      toast.error('Copy Setup Failed', 'Could not save wallet copy settings');
     }
-
-    const tierLabel = settings.tier === 'active' ? 'Active' : 'Watching';
-    toast.success(
-      `Wallet added to ${tierLabel}`,
-      `${shortenAddress(settings.address)} is now being ${settings.tier === 'active' ? 'copied' : 'monitored'}`
-    );
-
-    setCopyModalOpen(false);
-    setSelectedWallet(null);
   };
 
   const getROI = (wallet: DisplayWallet) => {

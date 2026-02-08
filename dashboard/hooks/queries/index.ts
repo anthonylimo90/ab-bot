@@ -42,9 +42,21 @@ export {
 export {
   useOptimizerStatusQuery,
   useRotationHistoryQuery,
-  useActiveAllocationsQuery,
-  useBenchAllocationsQuery,
   useTriggerOptimizationMutation,
   useAcknowledgeRotationMutation,
   useUnacknowledgedRotationCount,
 } from './useOptimizerQuery';
+
+// Allocation queries
+export {
+  useAllocationsQuery,
+  useActiveAllocationsQuery,
+  useBenchAllocationsQuery,
+  useAddAllocationMutation,
+  useUpdateAllocationMutation,
+  usePromoteAllocationMutation,
+  useDemoteAllocationMutation,
+  useRemoveAllocationMutation,
+  usePinAllocationMutation,
+  useUnpinAllocationMutation,
+} from './useAllocationsQuery';

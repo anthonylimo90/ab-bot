@@ -5,14 +5,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
 import { useSettingsStore, Theme } from '@/stores/settings-store';
 import { useToastStore } from '@/stores/toast-store';
 import {
@@ -29,11 +21,15 @@ import {
   UserPlus,
   Link as LinkIcon,
   ExternalLink,
+  Star,
+  Trash2,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { InviteMemberDialog } from '@/components/workspace/InviteMemberDialog';
 import { MemberList } from '@/components/workspace/MemberList';
+import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
+import { useWalletStore } from '@/stores/wallet-store';
 import api from '@/lib/api';
 import Link from 'next/link';
 
@@ -59,6 +55,14 @@ export default function SettingsPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [walletConnectProjectId, setWalletConnectProjectId] = useState('');
   const [isSavingWalletConnect, setIsSavingWalletConnect] = useState(false);
+  const {
+    connectedWallets,
+    primaryWallet,
+    isLoading: walletLoading,
+    fetchWallets,
+    setPrimary,
+    disconnectWallet,
+  } = useWalletStore();
 
   // Fetch workspace members
   const { data: members = [], isLoading: membersLoading } = useQuery({
@@ -85,6 +89,12 @@ export default function SettingsPage() {
       setWalletConnectProjectId(currentWorkspace.walletconnect_project_id);
     }
   }, [currentWorkspace?.walletconnect_project_id]);
+
+  useEffect(() => {
+    fetchWallets().catch(() => {
+      // Wallet card will show empty/fallback state if loading fails.
+    });
+  }, [fetchWallets]);
 
   // Revoke invite mutation
   const revokeInviteMutation = useMutation({
@@ -135,6 +145,32 @@ export default function SettingsPage() {
     { value: 'dark', label: 'Dark' },
     { value: 'system', label: 'System' },
   ];
+
+  const handleMakePrimary = async (address: string) => {
+    try {
+      await setPrimary(address);
+      toast.success('Primary wallet updated', 'This wallet is now active for live trading');
+    } catch (err) {
+      toast.error(
+        'Failed to set primary wallet',
+        err instanceof Error ? err.message : 'Unknown error'
+      );
+    }
+  };
+
+  const handleDisconnectWallet = async (address: string) => {
+    try {
+      await disconnectWallet(address);
+      toast.success('Wallet disconnected', 'Wallet removed from vault');
+    } catch (err) {
+      toast.error(
+        'Failed to disconnect wallet',
+        err instanceof Error ? err.message : 'Unknown error'
+      );
+    }
+  };
+
+  const shortAddress = (address: string) => `${address.slice(0, 6)}...${address.slice(-4)}`;
 
   return (
     <div className="max-w-3xl mx-auto space-y-6">
@@ -197,13 +233,69 @@ export default function SettingsPage() {
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="rounded-lg border p-4">
-            <p className="font-medium mb-2">Connected Wallet</p>
-            <p className="text-sm text-muted-foreground mb-4">
-              No wallet connected
-            </p>
-            <Button onClick={() => setConnectWalletOpen(true)}>
-              Connect Wallet
-            </Button>
+            <div className="flex items-center justify-between gap-2 mb-4">
+              <div>
+                <p className="font-medium">Connected Wallets</p>
+                <p className="text-sm text-muted-foreground">
+                  Primary wallet is used automatically for live trading
+                </p>
+              </div>
+              <Button onClick={() => setConnectWalletOpen(true)}>Connect Wallet</Button>
+            </div>
+
+            {walletLoading && connectedWallets.length === 0 ? (
+              <p className="text-sm text-muted-foreground">Loading wallets...</p>
+            ) : connectedWallets.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                No wallets connected yet. Connect one to enable live trading.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {connectedWallets.map((wallet) => {
+                  const isPrimary = wallet.address === primaryWallet;
+                  return (
+                    <div
+                      key={wallet.id}
+                      className="flex items-center justify-between gap-3 rounded-md border p-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-medium truncate">
+                          {wallet.label || shortAddress(wallet.address)}
+                        </p>
+                        <p className="text-xs text-muted-foreground font-mono truncate">
+                          {wallet.address}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {isPrimary ? (
+                          <span className="inline-flex items-center gap-1 rounded-full border border-green-500/30 bg-green-500/10 px-2 py-1 text-xs text-green-600">
+                            <Star className="h-3 w-3" />
+                            Active
+                          </span>
+                        ) : (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleMakePrimary(wallet.address)}
+                            disabled={walletLoading}
+                          >
+                            Set Active
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleDisconnectWallet(wallet.address)}
+                          disabled={walletLoading}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -577,36 +669,7 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Connect Wallet Modal */}
-      <Dialog open={connectWalletOpen} onOpenChange={setConnectWalletOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Connect Wallet</DialogTitle>
-            <DialogDescription>
-              Connect your wallet to enable live trading
-            </DialogDescription>
-          </DialogHeader>
-          <div className="py-6 space-y-4">
-            <p className="text-sm text-muted-foreground text-center">
-              Wallet connection is not yet implemented. This feature will allow
-              you to connect your Polygon wallet for live trading.
-            </p>
-            <div className="flex flex-col gap-2">
-              <Button variant="outline" disabled className="w-full">
-                MetaMask (Coming Soon)
-              </Button>
-              <Button variant="outline" disabled className="w-full">
-                WalletConnect (Coming Soon)
-              </Button>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConnectWalletOpen(false)}>
-              Close
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConnectWalletModal open={connectWalletOpen} onOpenChange={setConnectWalletOpen} />
 
       {/* Invite Member Dialog */}
       {currentWorkspace && (

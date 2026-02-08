@@ -41,8 +41,11 @@ pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
 use axum::Router;
+use polymarket_core::api::PolygonClient;
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -51,6 +54,8 @@ use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{info, Level};
+use trading_engine::copy_trader::{CopyTrader, TrackedWallet};
+use wallet_tracker::trade_monitor::{MonitorConfig, TradeMonitor};
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -128,15 +133,18 @@ impl ApiServer {
         let (arb_entry_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
         // Create app state
-        let state = Arc::new(AppState::new(
-            pool,
-            config.jwt_secret.clone(),
-            orderbook_tx,
-            position_tx,
-            signal_tx,
-            automation_tx,
-            arb_entry_tx,
-        ));
+        let state = Arc::new(
+            AppState::new(
+                pool,
+                config.jwt_secret.clone(),
+                orderbook_tx,
+                position_tx,
+                signal_tx,
+                automation_tx,
+                arb_entry_tx,
+            )
+            .await?,
+        );
 
         // Build router
         let router = create_router(state.clone());
@@ -169,6 +177,7 @@ impl ApiServer {
                         },
                     ),
             )
+            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
             .layer(if config.cors_permissive {
                 CorsLayer::permissive()
             } else {
@@ -237,6 +246,71 @@ impl ApiServer {
         let optimizer = Arc::new(AutoOptimizer::new(self.state.pool.clone()));
         tokio::spawn(optimizer.start(None));
 
+        // Spawn copy trading monitor + wallet trade monitor if enabled
+        let copy_config = CopyTradingConfig::from_env();
+        if copy_config.enabled {
+            #[derive(sqlx::FromRow)]
+            struct TrackedWalletRow {
+                address: String,
+                label: Option<String>,
+                allocation_pct: Decimal,
+                copy_delay_ms: i32,
+                max_position_size: Option<Decimal>,
+            }
+
+            let tracked_wallets: Vec<TrackedWalletRow> = sqlx::query_as(
+                r#"
+                SELECT address, label, allocation_pct, copy_delay_ms, max_position_size
+                FROM tracked_wallets
+                WHERE copy_enabled = TRUE
+                ORDER BY success_score DESC NULLS LAST, added_at ASC
+                "#,
+            )
+            .fetch_all(&self.state.pool)
+            .await?;
+
+            if tracked_wallets.is_empty() {
+                tracing::warn!(
+                    "Copy trading is enabled but no tracked wallets have copy_enabled=true"
+                );
+            } else if let Some(polygon_client) = build_polygon_client() {
+                let trade_monitor =
+                    Arc::new(TradeMonitor::new(polygon_client, MonitorConfig::default()));
+                let total_capital = std::env::var("COPY_TOTAL_CAPITAL")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(Decimal::new(10000, 0));
+                let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital);
+
+                for row in tracked_wallets {
+                    trade_monitor.add_wallet(&row.address).await;
+
+                    let mut wallet = TrackedWallet::new(row.address.clone(), row.allocation_pct)
+                        .with_delay(row.copy_delay_ms.max(0) as u64);
+                    if let Some(label) = row.label {
+                        wallet = wallet.with_alias(label);
+                    }
+                    if let Some(max_size) = row.max_position_size {
+                        wallet = wallet.with_max_size(max_size);
+                    }
+                    copy_trader.add_tracked_wallet(wallet);
+                }
+
+                trade_monitor.start().await?;
+                spawn_copy_trading_monitor(
+                    copy_config,
+                    trade_monitor,
+                    Arc::new(RwLock::new(copy_trader)),
+                    self.state.signal_tx.clone(),
+                );
+                tracing::info!("Copy trading monitor stack initialized");
+            } else {
+                tracing::warn!(
+                    "Copy trading is enabled but POLYGON_RPC_URL / ALCHEMY_API_KEY is not set; wallet trade monitoring is disabled"
+                );
+            }
+        }
+
         let addr = self.config.socket_addr();
         info!(address = %addr, "Starting API server");
 
@@ -250,4 +324,14 @@ impl ApiServer {
     pub fn router(&self) -> Router {
         self.router.clone()
     }
+}
+
+fn build_polygon_client() -> Option<Arc<PolygonClient>> {
+    if let Ok(rpc_url) = std::env::var("POLYGON_RPC_URL") {
+        return Some(Arc::new(PolygonClient::new(rpc_url)));
+    }
+    if let Ok(alchemy_api_key) = std::env::var("ALCHEMY_API_KEY") {
+        return Some(Arc::new(PolygonClient::with_alchemy(&alchemy_api_key)));
+    }
+    None
 }

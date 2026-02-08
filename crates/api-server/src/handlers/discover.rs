@@ -234,16 +234,28 @@ pub async fn discover_wallets(
     }
 
     // Sort by requested field
+    use std::cmp::Ordering;
     match query.sort_by.as_str() {
-        "sharpe" => wallets.sort_by(|a, b| b.sharpe_ratio.partial_cmp(&a.sharpe_ratio).unwrap()),
-        "winRate" => wallets.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap()),
+        "sharpe" => wallets.sort_by(|a, b| {
+            b.sharpe_ratio
+                .partial_cmp(&a.sharpe_ratio)
+                .unwrap_or(Ordering::Equal)
+        }),
+        "winRate" => wallets.sort_by(|a, b| {
+            b.win_rate
+                .partial_cmp(&a.win_rate)
+                .unwrap_or(Ordering::Equal)
+        }),
         "trades" => wallets.sort_by(|a, b| b.total_trades.cmp(&a.total_trades)),
         _ => {
             // Default: roi
             match query.period.as_str() {
-                "7d" => wallets.sort_by(|a, b| b.roi_7d.partial_cmp(&a.roi_7d).unwrap()),
-                "90d" => wallets.sort_by(|a, b| b.roi_90d.partial_cmp(&a.roi_90d).unwrap()),
-                _ => wallets.sort_by(|a, b| b.roi_30d.partial_cmp(&a.roi_30d).unwrap()),
+                "7d" => wallets
+                    .sort_by(|a, b| b.roi_7d.partial_cmp(&a.roi_7d).unwrap_or(Ordering::Equal)),
+                "90d" => wallets
+                    .sort_by(|a, b| b.roi_90d.partial_cmp(&a.roi_90d).unwrap_or(Ordering::Equal)),
+                _ => wallets
+                    .sort_by(|a, b| b.roi_30d.partial_cmp(&a.roi_30d).unwrap_or(Ordering::Equal)),
             }
         }
     }
@@ -416,8 +428,8 @@ fn generate_simulation(amount: Decimal, period: &str, _wallets: Option<&str>) ->
 
         let random_factor = 1.0 + (rng.gen::<f64>() - 0.5) * volatility * 2.0;
         value = value
-            * Decimal::from_f64_retain(1.0 + daily_return).unwrap()
-            * Decimal::from_f64_retain(random_factor).unwrap();
+            * Decimal::from_f64_retain(1.0 + daily_return).unwrap_or(Decimal::ONE)
+            * Decimal::from_f64_retain(random_factor).unwrap_or(Decimal::ONE);
 
         equity_curve.push(EquityPoint {
             date,

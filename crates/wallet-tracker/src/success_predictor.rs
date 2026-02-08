@@ -226,17 +226,31 @@ impl SuccessPredictor {
         sqlx::query(
             r#"
             UPDATE wallet_success_metrics
-            SET predicted_success_prob = $1, last_computed = $2
-            WHERE address = $3
+            SET predicted_success_prob = $1,
+                prediction_confidence = $2,
+                prediction_category = $3,
+                last_computed = $4
+            WHERE address = $5
             "#,
         )
         .bind(prediction.success_probability)
+        .bind(prediction.confidence)
+        .bind(Self::category_to_db(prediction.category))
         .bind(&prediction.predicted_at)
         .bind(&prediction.address)
         .execute(&self.pool)
         .await?;
 
         Ok(())
+    }
+
+    fn category_to_db(category: PredictionCategory) -> i16 {
+        match category {
+            PredictionCategory::HighPotential => 0,
+            PredictionCategory::Moderate => 1,
+            PredictionCategory::LowPotential => 2,
+            PredictionCategory::Uncertain => 3,
+        }
     }
 
     // Private prediction methods

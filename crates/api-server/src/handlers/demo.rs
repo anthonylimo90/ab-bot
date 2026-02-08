@@ -310,10 +310,58 @@ pub async fn create_demo_position(
     if !["yes", "no"].contains(&outcome.as_str()) {
         return Err(ApiError::BadRequest("Outcome must be 'yes' or 'no'".into()));
     }
+    if req.quantity <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "Quantity must be greater than 0".into(),
+        ));
+    }
+    if req.entry_price <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "Entry price must be greater than 0".into(),
+        ));
+    }
 
     let position_id = Uuid::new_v4();
     let now = Utc::now();
     let current_price = req.current_price.unwrap_or(req.entry_price);
+    let position_cost = req.quantity * req.entry_price;
+
+    let mut tx = state.pool.begin().await?;
+
+    // Ensure balance row exists, then lock it for atomic debit.
+    sqlx::query(
+        r#"
+        INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at)
+        VALUES ($1, 10000, 10000, $2)
+        ON CONFLICT (workspace_id) DO NOTHING
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+
+    let (current_balance,): (Decimal,) =
+        sqlx::query_as("SELECT balance FROM demo_balances WHERE workspace_id = $1 FOR UPDATE")
+            .bind(workspace_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    if current_balance < position_cost {
+        return Err(ApiError::BadRequest(format!(
+            "Insufficient demo balance: required {}, available {}",
+            position_cost, current_balance
+        )));
+    }
+
+    sqlx::query(
+        "UPDATE demo_balances SET balance = balance - $2, updated_at = $3 WHERE workspace_id = $1",
+    )
+    .bind(workspace_id)
+    .bind(position_cost)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
 
     let row: DemoPositionRow = sqlx::query_as(
         r#"
@@ -341,8 +389,10 @@ pub async fn create_demo_position(
     .bind(current_price)
     .bind(req.opened_at)
     .bind(now)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(row.into())))
 }
@@ -385,45 +435,115 @@ pub async fn update_demo_position(
         return Err(ApiError::Forbidden("Not a member of this workspace".into()));
     }
 
-    // Verify position belongs to workspace
-    let exists: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM demo_positions WHERE id = $1 AND workspace_id = $2")
-            .bind(position_uuid)
-            .bind(workspace_id)
-            .fetch_optional(&state.pool)
-            .await?;
-
-    if exists.is_none() {
-        return Err(ApiError::NotFound("Position not found".into()));
-    }
-
     let now = Utc::now();
+    let mut tx = state.pool.begin().await?;
 
-    // Build dynamic update query
-    let row: DemoPositionRow = sqlx::query_as(
+    // Lock position row for atomic close + balance credit semantics.
+    let position: Option<(Decimal, Decimal, Option<DateTime<Utc>>)> = sqlx::query_as(
         r#"
-        UPDATE demo_positions
-        SET current_price = COALESCE($1, current_price),
-            closed_at = COALESCE($2, closed_at),
-            exit_price = COALESCE($3, exit_price),
-            realized_pnl = COALESCE($4, realized_pnl),
-            updated_at = $5
-        WHERE id = $6 AND workspace_id = $7
-        RETURNING id, workspace_id, created_by, wallet_address, wallet_label,
-                  market_id, market_question, outcome, quantity, entry_price,
-                  current_price, opened_at, closed_at, exit_price, realized_pnl,
-                  created_at, updated_at
+        SELECT quantity, entry_price, closed_at
+        FROM demo_positions
+        WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE
         "#,
     )
-    .bind(req.current_price)
-    .bind(req.closed_at)
-    .bind(req.exit_price)
-    .bind(req.realized_pnl)
-    .bind(now)
     .bind(position_uuid)
     .bind(workspace_id)
-    .fetch_one(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
+
+    let (quantity, entry_price, existing_closed_at) =
+        position.ok_or_else(|| ApiError::NotFound("Position not found".into()))?;
+
+    let is_close_request =
+        req.closed_at.is_some() || req.exit_price.is_some() || req.realized_pnl.is_some();
+
+    let row: DemoPositionRow = if is_close_request {
+        if existing_closed_at.is_some() {
+            return Err(ApiError::BadRequest("Position is already closed".into()));
+        }
+
+        let exit_price = req.exit_price.or(req.current_price).ok_or_else(|| {
+            ApiError::BadRequest("Exit price is required when closing a position".into())
+        })?;
+        if exit_price <= Decimal::ZERO {
+            return Err(ApiError::BadRequest(
+                "Exit price must be greater than 0".into(),
+            ));
+        }
+        let closed_at = req.closed_at.unwrap_or(now);
+        let realized_pnl = req
+            .realized_pnl
+            .unwrap_or((exit_price - entry_price) * quantity);
+        let exit_value = quantity * exit_price;
+
+        sqlx::query(
+            r#"
+            INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at)
+            VALUES ($1, 10000, 10000, $2)
+            ON CONFLICT (workspace_id) DO NOTHING
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "UPDATE demo_balances SET balance = balance + $2, updated_at = $3 WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .bind(exit_value)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query_as(
+            r#"
+            UPDATE demo_positions
+            SET current_price = COALESCE($1, current_price),
+                closed_at = $2,
+                exit_price = $3,
+                realized_pnl = $4,
+                updated_at = $5
+            WHERE id = $6 AND workspace_id = $7
+            RETURNING id, workspace_id, created_by, wallet_address, wallet_label,
+                      market_id, market_question, outcome, quantity, entry_price,
+                      current_price, opened_at, closed_at, exit_price, realized_pnl,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(Some(req.current_price.unwrap_or(exit_price)))
+        .bind(Some(closed_at))
+        .bind(Some(exit_price))
+        .bind(Some(realized_pnl))
+        .bind(now)
+        .bind(position_uuid)
+        .bind(workspace_id)
+        .fetch_one(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as(
+            r#"
+            UPDATE demo_positions
+            SET current_price = COALESCE($1, current_price),
+                updated_at = $2
+            WHERE id = $3 AND workspace_id = $4
+            RETURNING id, workspace_id, created_by, wallet_address, wallet_label,
+                      market_id, market_question, outcome, quantity, entry_price,
+                      current_price, opened_at, closed_at, exit_price, realized_pnl,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(req.current_price)
+        .bind(now)
+        .bind(position_uuid)
+        .bind(workspace_id)
+        .fetch_one(&mut *tx)
+        .await?
+    };
+
+    tx.commit().await?;
 
     Ok(Json(row.into()))
 }
@@ -463,15 +583,48 @@ pub async fn delete_demo_position(
         return Err(ApiError::Forbidden("Not a member of this workspace".into()));
     }
 
+    let mut tx = state.pool.begin().await?;
+
+    // Fetch the position (lock row) to check if it's open and get cost info
+    let position: Option<(Decimal, Decimal, Option<DateTime<Utc>>)> = sqlx::query_as(
+        r#"
+        SELECT quantity, entry_price, closed_at
+        FROM demo_positions
+        WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(position_uuid)
+    .bind(workspace_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (quantity, entry_price, closed_at) =
+        position.ok_or_else(|| ApiError::NotFound("Position not found".into()))?;
+
+    // If the position is still open, refund the entry cost to the demo balance
+    if closed_at.is_none() {
+        let refund = quantity * entry_price;
+        sqlx::query(
+            "UPDATE demo_balances SET balance = balance + $2, updated_at = NOW() WHERE workspace_id = $1",
+        )
+        .bind(workspace_id)
+        .bind(refund)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     let result = sqlx::query("DELETE FROM demo_positions WHERE id = $1 AND workspace_id = $2")
         .bind(position_uuid)
         .bind(workspace_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound("Position not found".into()));
     }
+
+    tx.commit().await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -574,6 +727,12 @@ pub async fn update_demo_balance(
         return Err(ApiError::Forbidden("Not a member of this workspace".into()));
     }
 
+    if req.balance < Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "Demo balance cannot be negative".into(),
+        ));
+    }
+
     let now = Utc::now();
 
     // Upsert balance
@@ -630,11 +789,12 @@ pub async fn reset_demo_portfolio(
 
     let now = Utc::now();
     let default_balance = Decimal::new(10000, 0);
+    let mut tx = state.pool.begin().await?;
 
     // Delete all positions
     sqlx::query("DELETE FROM demo_positions WHERE workspace_id = $1")
         .bind(workspace_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
     // Reset balance
@@ -650,8 +810,10 @@ pub async fn reset_demo_portfolio(
     .bind(workspace_id)
     .bind(default_balance)
     .bind(now)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(Json(DemoBalanceResponse {
         workspace_id: row.workspace_id.to_string(),
@@ -691,5 +853,101 @@ mod tests {
         assert!(json.contains("test-id"));
         assert!(json.contains("0x123"));
         assert!(!json.contains("closed_at")); // skipped when None
+    }
+
+    #[test]
+    fn test_demo_balance_response_serialization() {
+        let now = Utc::now();
+        let response = DemoBalanceResponse {
+            workspace_id: "ws-123".to_string(),
+            balance: Decimal::new(9500, 0),
+            initial_balance: Decimal::new(10000, 0),
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["workspace_id"], "ws-123");
+        assert_eq!(parsed["balance"], "9500");
+        assert_eq!(parsed["initial_balance"], "10000");
+        assert!(parsed["updated_at"].is_string());
+    }
+
+    #[test]
+    fn test_create_demo_position_request_deserialization() {
+        // Valid request
+        let json = r#"{
+            "wallet_address": "0xabc",
+            "market_id": "market-1",
+            "outcome": "yes",
+            "quantity": "10",
+            "entry_price": "0.50",
+            "opened_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let req: CreateDemoPositionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.wallet_address, "0xabc");
+        assert_eq!(req.quantity, Decimal::new(10, 0));
+        assert_eq!(req.entry_price, Decimal::new(50, 2));
+        assert!(req.wallet_label.is_none());
+        assert!(req.market_question.is_none());
+        assert!(req.current_price.is_none());
+
+        // Invalid outcome value (validated at handler level, not deserialization)
+        let json_bad = r#"{
+            "wallet_address": "0xabc",
+            "market_id": "market-1",
+            "outcome": "maybe",
+            "quantity": "10",
+            "entry_price": "0.50",
+            "opened_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let bad_req: CreateDemoPositionRequest = serde_json::from_str(json_bad).unwrap();
+        assert_eq!(bad_req.outcome, "maybe"); // Deserializes fine, handler rejects
+    }
+
+    #[test]
+    fn test_demo_position_closed_fields_serialized() {
+        let now = Utc::now();
+        let response = DemoPositionResponse {
+            id: "pos-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            created_by: "user-1".to_string(),
+            wallet_address: "0x123".to_string(),
+            wallet_label: None,
+            market_id: "market-1".to_string(),
+            market_question: None,
+            outcome: "yes".to_string(),
+            quantity: Decimal::new(50, 0),
+            entry_price: Decimal::new(40, 2),
+            current_price: Some(Decimal::new(60, 2)),
+            opened_at: now - chrono::Duration::days(1),
+            closed_at: Some(now),
+            exit_price: Some(Decimal::new(60, 2)),
+            realized_pnl: Some(Decimal::new(10, 0)),
+            created_at: now - chrono::Duration::days(1),
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        // Closed fields should all be present
+        assert!(json.contains("closed_at"), "closed_at should be serialized");
+        assert!(
+            json.contains("exit_price"),
+            "exit_price should be serialized"
+        );
+        assert!(
+            json.contains("realized_pnl"),
+            "realized_pnl should be serialized"
+        );
+        // Optional None fields should be absent
+        assert!(
+            !json.contains("wallet_label"),
+            "wallet_label should be skipped when None"
+        );
+        assert!(
+            !json.contains("market_question"),
+            "market_question should be skipped when None"
+        );
     }
 }

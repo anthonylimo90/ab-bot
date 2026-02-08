@@ -49,7 +49,10 @@ impl ArbMonitor {
             signal_publisher,
             order_books: HashMap::new(),
             market_outcomes: HashMap::new(),
-            min_profit_threshold: Decimal::new(1, 3), // 0.001 = 0.1% minimum profit
+            min_profit_threshold: std::env::var("ARB_MIN_PROFIT_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| Decimal::new(1, 3)), // default 0.001 = 0.1%
         })
     }
 
@@ -92,8 +95,13 @@ impl ArbMonitor {
         info!("Subscribed to order book updates, monitoring for arbitrage...");
 
         // Process updates
+        let mut health_tick = 0u64;
         while let Some(update) = updates.recv().await {
             self.process_update(update).await?;
+            health_tick += 1;
+            if health_tick % 100 == 0 {
+                crate::touch_health_file();
+            }
         }
 
         Ok(())

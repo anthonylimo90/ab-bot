@@ -36,6 +36,22 @@ export function formatPercent(
   return value < 0 ? `-${formatted}` : formatted;
 }
 
+// Normalizes values that may be stored as either ratio (0.55) or percent (55).
+export function ratioOrPercentToPercent(value: number | null | undefined): number {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.abs(value) <= 1 ? value * 100 : value;
+}
+
+// Normalizes values that may be stored as either percent (55) or ratio (0.55).
+export function ratioOrPercentToRatio(value: number | null | undefined): number {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return 0;
+  }
+  return Math.abs(value) > 1 ? value / 100 : value;
+}
+
 export function formatNumber(value: number, decimals: number = 2): string {
   return new Intl.NumberFormat('en-US', {
     minimumFractionDigits: decimals,

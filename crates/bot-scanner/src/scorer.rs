@@ -137,4 +137,64 @@ mod tests {
         assert!(report.contains("Very Consistent (Bot-like)"));
         assert!(report.contains("Bot Speed"));
     }
+
+    #[test]
+    fn test_generate_report_human_wallet() {
+        let features = WalletFeatures {
+            address: "0x456".to_string(),
+            total_trades: 5,
+            interval_cv: Some(0.8),
+            win_rate: Some(0.50),
+            avg_latency_ms: Some(15000.0),
+            markets_traded: 3,
+            has_opposing_positions: false,
+            opposing_position_count: 0,
+            hourly_distribution: {
+                let mut h = [0u64; 24];
+                h[9] = 2;
+                h[14] = 3;
+                h
+            },
+            activity_spread: 2.0 / 24.0,
+            total_volume: Decimal::new(500, 2),
+            ..Default::default()
+        };
+
+        let score = BotScore::new("0x456".to_string(), &features);
+        let report = generate_report(&features, &score);
+
+        assert!(report.contains("Likely Human"));
+        assert!(report.contains("Slow (Human-like)"));
+    }
+
+    #[test]
+    fn test_rank_wallets() {
+        let w1 = WalletFeatures {
+            address: "0xlow".to_string(),
+            total_trades: 5,
+            ..Default::default()
+        };
+        let s1 = BotScore::new("0xlow".to_string(), &w1);
+
+        let w2 = WalletFeatures {
+            address: "0xhigh".to_string(),
+            total_trades: 200,
+            interval_cv: Some(0.02),
+            win_rate: Some(0.99),
+            avg_latency_ms: Some(50.0),
+            activity_spread: 1.0,
+            has_opposing_positions: true,
+            opposing_position_count: 20,
+            hourly_distribution: [1; 24],
+            ..Default::default()
+        };
+        let s2 = BotScore::new("0xhigh".to_string(), &w2);
+
+        let wallets = vec![(w1, s1), (w2, s2)];
+        let ranked = rank_wallets(&wallets);
+
+        assert_eq!(ranked.len(), 2);
+        // Higher bot score should be first
+        assert!(ranked[0].1.total_score >= ranked[1].1.total_score);
+    }
 }

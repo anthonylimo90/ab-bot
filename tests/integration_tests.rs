@@ -123,15 +123,15 @@ fn test_position_state_transitions() {
     assert_eq!(position.state, PositionState::Pending);
 
     // Transition to Open
-    position.mark_open();
+    position.mark_open().unwrap();
     assert_eq!(position.state, PositionState::Open);
 
     // Transition to ExitReady
-    position.mark_exit_ready();
+    position.mark_exit_ready().unwrap();
     assert_eq!(position.state, PositionState::ExitReady);
 
     // Transition to Closing
-    position.mark_closing();
+    position.mark_closing().unwrap();
     assert_eq!(position.state, PositionState::Closing);
 }
 
@@ -162,8 +162,8 @@ fn test_position_failure_states() {
         ExitStrategy::ExitOnCorrection,
     );
 
-    position2.mark_open();
-    position2.mark_exit_ready();
+    position2.mark_open().unwrap();
+    position2.mark_exit_ready().unwrap();
 
     // Mark exit failed
     position2.mark_exit_failed(FailureReason::ConnectivityError {

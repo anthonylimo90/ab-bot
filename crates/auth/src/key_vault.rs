@@ -188,13 +188,19 @@ impl KeyVault {
             KeyVaultProvider::Memory => {
                 debug!("Storing key in memory");
             }
-            KeyVaultProvider::AwsSecretsManager { region: _ } => {
-                // TODO: Implement AWS Secrets Manager storage
-                warn!("AWS Secrets Manager not yet implemented, using memory");
+            KeyVaultProvider::AwsSecretsManager { region } => {
+                return Err(anyhow!(
+                    "AWS Secrets Manager storage not yet implemented (region: {}). \
+                     Use 'file' or 'memory' provider instead.",
+                    region
+                ));
             }
-            KeyVaultProvider::HashicorpVault { address: _ } => {
-                // TODO: Implement HashiCorp Vault storage
-                warn!("HashiCorp Vault not yet implemented, using memory");
+            KeyVaultProvider::HashicorpVault { address } => {
+                return Err(anyhow!(
+                    "HashiCorp Vault storage not yet implemented (address: {}). \
+                     Use 'file' or 'memory' provider instead.",
+                    address
+                ));
             }
         }
 
@@ -225,13 +231,19 @@ impl KeyVault {
                 self.load_from_file(path, &address_lower).await?
             }
             KeyVaultProvider::Memory => None,
-            KeyVaultProvider::AwsSecretsManager { region: _ } => {
-                // TODO: Implement AWS Secrets Manager retrieval
-                None
+            KeyVaultProvider::AwsSecretsManager { region } => {
+                return Err(anyhow!(
+                    "AWS Secrets Manager retrieval not yet implemented (region: {}). \
+                     Use 'file' or 'memory' provider instead.",
+                    region
+                ));
             }
-            KeyVaultProvider::HashicorpVault { address: _ } => {
-                // TODO: Implement HashiCorp Vault retrieval
-                None
+            KeyVaultProvider::HashicorpVault { address } => {
+                return Err(anyhow!(
+                    "HashiCorp Vault retrieval not yet implemented (address: {}). \
+                     Use 'file' or 'memory' provider instead.",
+                    address
+                ));
             }
         };
 

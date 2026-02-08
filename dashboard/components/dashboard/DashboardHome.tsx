@@ -4,8 +4,8 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { usePortfolioStats } from '@/hooks/usePortfolioStats';
 import { useActivity } from '@/hooks/useActivity';
-import { useRosterStore } from '@/stores/roster-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
 import { MetricCard } from '@/components/shared/MetricCard';
 import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
 import { LiveIndicator } from '@/components/shared/LiveIndicator';
@@ -53,7 +53,8 @@ const activityIcons: Record<string, React.ReactNode> = {
 export function DashboardHome() {
   const [selectedPeriod, setSelectedPeriod] = useState<Period>('30D');
   const { currentWorkspace } = useWorkspaceStore();
-  const { activeWallets } = useRosterStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const activeWallets = allocations.filter((a) => a.tier === 'active');
   const { stats, status: portfolioStatus } = usePortfolioStats(selectedPeriod);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 

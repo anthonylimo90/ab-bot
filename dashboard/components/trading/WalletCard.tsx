@@ -22,8 +22,7 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { differenceInDays } from 'date-fns';
-import { useRosterStore, type RosterWallet } from '@/stores/roster-store';
-import type { DemoPosition } from '@/stores/demo-portfolio-store';
+import type { CopySettings } from '@/types/api';
 
 interface Position {
   id: string;
@@ -38,7 +37,21 @@ interface Position {
 }
 
 interface WalletCardProps {
-  wallet: RosterWallet;
+  wallet: {
+    address: string;
+    label?: string;
+    copySettings: CopySettings;
+    roi30d: number;
+    sharpe: number;
+    winRate: number;
+    trades: number;
+    maxDrawdown: number;
+    confidence: number;
+    pinned?: boolean;
+    probationUntil?: string;
+    isAutoSelected?: boolean;
+    consecutiveLosses?: number;
+  };
   positions: Position[];
   onDemote?: (address: string) => void;
   onPromote?: (address: string) => void;

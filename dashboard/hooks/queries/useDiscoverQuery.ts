@@ -11,11 +11,12 @@ interface DiscoverFilters {
   minTrades?: number;
   minWinRate?: number;
   limit?: number;
+  workspaceId?: string;
 }
 
 export function useDiscoverWalletsQuery(filters?: DiscoverFilters) {
   return useQuery({
-    queryKey: queryKeys.discover.wallets(filters),
+    queryKey: queryKeys.discover.wallets(filters, filters?.workspaceId),
     queryFn: () =>
       api.discoverWallets({
         sort_by: filters?.sortBy,
@@ -32,9 +33,13 @@ export function useLiveTradesQuery(params?: {
   wallet?: string;
   limit?: number;
   minValue?: number;
+  workspaceId?: string;
 }) {
   return useQuery({
-    queryKey: ['discover', 'trades', params],
+    queryKey: queryKeys.discover.trades(
+      { wallet: params?.wallet, limit: params?.limit, minValue: params?.minValue },
+      params?.workspaceId
+    ),
     queryFn: () =>
       api.getLiveTrades({
         wallet: params?.wallet,
@@ -50,9 +55,13 @@ export function useDemoPnlSimulationQuery(params?: {
   amount?: number;
   period?: '7d' | '30d' | '90d';
   wallets?: string[];
+  workspaceId?: string;
 }) {
   return useQuery({
-    queryKey: ['discover', 'simulate', params],
+    queryKey: queryKeys.discover.simulate(
+      { amount: params?.amount, period: params?.period, wallets: params?.wallets },
+      params?.workspaceId
+    ),
     queryFn: () =>
       api.simulateDemoPnl({
         amount: params?.amount,
@@ -63,11 +72,12 @@ export function useDemoPnlSimulationQuery(params?: {
   });
 }
 
-export function useLeaderboardQuery() {
+export function useLeaderboardQuery(workspaceId?: string) {
   return useDiscoverWalletsQuery({
     sortBy: 'roi',
     period: '30d',
     minTrades: 10,
     limit: 10,
+    ...(workspaceId ? { workspaceId } : {}),
   });
 }

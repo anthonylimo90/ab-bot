@@ -686,9 +686,13 @@ fn verify_order_signature(
     let version_hash = keccak256(b"1");
     let chain_id = U256::from(POLYGON_CHAIN_ID);
     let verifying_contract: Address = if pending_order.neg_risk {
-        NEG_RISK_CTF_EXCHANGE_ADDRESS.parse().unwrap()
+        NEG_RISK_CTF_EXCHANGE_ADDRESS
+            .parse()
+            .map_err(|e| format!("Invalid neg-risk exchange address: {}", e))?
     } else {
-        CTF_EXCHANGE_ADDRESS.parse().unwrap()
+        CTF_EXCHANGE_ADDRESS
+            .parse()
+            .map_err(|e| format!("Invalid exchange address: {}", e))?
     };
 
     let domain_encoded = (
@@ -741,7 +745,9 @@ fn recover_address(digest: &B256, r: &[u8; 32], s: &[u8; 32], v: u8) -> Result<A
     // Convert to address (keccak256 of public key, take last 20 bytes)
     let public_key_bytes = verifying_key.to_encoded_point(false);
     let public_key_hash = keccak256(&public_key_bytes.as_bytes()[1..]); // Skip the 0x04 prefix
-    let address_bytes: [u8; 20] = public_key_hash[12..32].try_into().unwrap();
+    let address_bytes: [u8; 20] = public_key_hash[12..32]
+        .try_into()
+        .map_err(|_| "Failed to extract address bytes from public key hash".to_string())?;
 
     Ok(Address::from(address_bytes))
 }

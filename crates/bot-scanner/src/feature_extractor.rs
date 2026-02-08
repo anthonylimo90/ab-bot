@@ -166,6 +166,13 @@ mod tests {
     }
 
     #[test]
+    fn test_coefficient_of_variation_edge_cases() {
+        assert_eq!(coefficient_of_variation(&[]), 1.0);
+        assert_eq!(coefficient_of_variation(&[0.0, 0.0, 0.0]), 1.0);
+        assert!(coefficient_of_variation(&[5.0]).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_activity_spread() {
         // Active all hours
         let all_hours = [1u64; 24];
@@ -177,5 +184,47 @@ mod tests {
             half_hours[i] = 5;
         }
         assert_eq!(calculate_activity_spread(&half_hours), 0.5);
+    }
+
+    #[test]
+    fn test_activity_spread_edge_cases() {
+        let empty = [0u64; 24];
+        assert_eq!(calculate_activity_spread(&empty), 0.0);
+
+        let mut one_hour = [0u64; 24];
+        one_hour[12] = 100;
+        let spread = calculate_activity_spread(&one_hour);
+        assert!((spread - 1.0 / 24.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_extract_features_empty_transfers() {
+        let features = extract_features("0xabc", &[]).unwrap();
+        assert_eq!(features.address, "0xabc");
+        assert_eq!(features.total_trades, 0);
+        assert!(!features.has_opposing_positions);
+    }
+
+    #[test]
+    fn test_detect_opposing_positions_empty() {
+        assert_eq!(detect_opposing_positions(&[]), 0);
+    }
+
+    #[test]
+    fn test_calculate_intervals() {
+        let ts1 = "2025-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let ts2 = "2025-01-01T00:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let ts3 = "2025-01-01T00:00:30Z".parse::<DateTime<Utc>>().unwrap();
+
+        let intervals = calculate_intervals(&[ts1, ts2, ts3]);
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0], 10.0);
+        assert_eq!(intervals[1], 20.0);
+    }
+
+    #[test]
+    fn test_calculate_intervals_single() {
+        let ts1 = "2025-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert!(calculate_intervals(&[ts1]).is_empty());
     }
 }

@@ -40,6 +40,7 @@ import type {
   UpdateAllocationRequest,
   SetBudgetRequest,
   AutoSetupConfig,
+  AutoSetupResponse,
   SetupMode,
   WorkspaceRole,
   OptimizerStatus,
@@ -730,8 +731,8 @@ class ApiClient {
     });
   }
 
-  async runAutoSetup(config?: AutoSetupConfig): Promise<{ selected_wallets: string[]; message: string }> {
-    return this.request<{ selected_wallets: string[]; message: string }>('/api/v1/onboarding/auto-setup', {
+  async runAutoSetup(config?: AutoSetupConfig): Promise<AutoSetupResponse> {
+    return this.request<AutoSetupResponse>('/api/v1/onboarding/auto-setup', {
       method: 'POST',
       body: JSON.stringify(config || {}),
     });

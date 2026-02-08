@@ -7,7 +7,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Progress } from '@/components/ui/progress';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import {
   ArrowLeft,
@@ -21,8 +20,10 @@ import {
   CheckCircle,
 } from 'lucide-react';
 import { useToastStore } from '@/stores/toast-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import api from '@/lib/api';
-import type { AutoSetupConfig, WorkspaceAllocation } from '@/types/api';
+import { ratioOrPercentToPercent } from '@/lib/utils';
+import type { AutoSelectedWallet, AutoSetupConfig } from '@/types/api';
 
 interface AutoSetupStepProps {
   onComplete: (walletCount: number) => void;
@@ -32,6 +33,7 @@ interface AutoSetupStepProps {
 export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const { currentWorkspace } = useWorkspaceStore();
   const [config, setConfig] = useState<AutoSetupConfig>({
     min_roi_30d: 0.05, // 5%
     min_sharpe: 1.0,
@@ -39,13 +41,14 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
     min_trades_30d: 10,
   });
   const [hasRun, setHasRun] = useState(false);
-  const [selectedWallets, setSelectedWallets] = useState<string[]>([]);
+  const [selectedWallets, setSelectedWallets] = useState<AutoSelectedWallet[]>([]);
   const [analysisProgress, setAnalysisProgress] = useState(0);
 
   // Fetch current allocations
   const { data: allocations } = useQuery({
-    queryKey: ['allocations'],
+    queryKey: ['allocations', 'workspace', currentWorkspace?.id],
     queryFn: () => api.listAllocations(),
+    enabled: !!currentWorkspace?.id,
   });
 
   const autoSetupMutation = useMutation({
@@ -63,7 +66,7 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
     onSuccess: (data) => {
       setSelectedWallets(data.selected_wallets);
       setHasRun(true);
-      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: ['allocations', 'workspace', currentWorkspace?.id] });
       toast.success(
         'Portfolio optimized',
         `${data.selected_wallets.length} wallets selected for your portfolio`
@@ -284,10 +287,10 @@ export function AutoSetupStep({ onComplete, onBack }: AutoSetupStepProps) {
                     </div>
                     <div className="flex items-center gap-4 text-sm text-muted-foreground">
                       {allocation.backtest_roi && (
-                        <span>ROI: {(allocation.backtest_roi * 100).toFixed(1)}%</span>
+                        <span>ROI: {ratioOrPercentToPercent(allocation.backtest_roi).toFixed(1)}%</span>
                       )}
                       {allocation.backtest_win_rate && (
-                        <span>Win: {(allocation.backtest_win_rate * 100).toFixed(1)}%</span>
+                        <span>Win: {ratioOrPercentToPercent(allocation.backtest_win_rate).toFixed(1)}%</span>
                       )}
                       <Badge>{allocation.allocation_pct}%</Badge>
                     </div>
