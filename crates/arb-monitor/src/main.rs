@@ -23,8 +23,9 @@ async fn main() -> Result<()> {
     // Filter out noisy crates to avoid hitting Railway's 500 logs/sec limit
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "arb_monitor=info,polymarket_core=warn,tungstenite=warn,hyper=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "arb_monitor=info,polymarket_core=warn,tungstenite=warn,hyper=warn".into()
+            }),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
