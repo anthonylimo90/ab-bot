@@ -20,17 +20,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-bench-
-            ${{ runner.os }}-cargo-
+          shared-key: "rust-bench"
 
       - name: Run latency benchmarks
         run: cargo bench --bench latency -- --noplot
@@ -57,16 +49,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-bench"
+
+      - name: Cache critcmp binary
+        id: critcmp-cache
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          path: ~/.cargo/bin/critcmp
+          key: ${{ runner.os }}-critcmp-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install critcmp
+        if: steps.critcmp-cache.outputs.cache-hit != 'true'
         run: cargo install critcmp
 
       - name: Checkout base branch
@@ -102,14 +97,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: "rust-bench"
 
       - name: Run latency benchmarks with regression check
         run: |
