@@ -296,78 +296,63 @@ pub async fn discover_wallets(
     State(state): State<Arc<AppState>>,
     Query(query): Query<DiscoverWalletsQuery>,
 ) -> ApiResult<Json<Vec<DiscoveredWallet>>> {
-    // Try real wallet discovery from DB first
-    if let Some(ref discovery) = state.wallet_discovery {
-        let time_window = match query.period.as_str() {
-            "7d" => 7,
-            "90d" => 90,
-            _ => 30,
-        };
+    let time_window = match query.period.as_str() {
+        "7d" => 7,
+        "90d" => 90,
+        _ => 30,
+    };
 
-        let criteria = DiscoveryCriteria::new()
-            .min_trades(query.min_trades.unwrap_or(10) as u64)
-            .min_win_rate(
-                query
-                    .min_win_rate
-                    .map(|w| w.try_into().unwrap_or(0.55))
-                    .unwrap_or(0.55),
-            )
-            .time_window(time_window)
-            .limit(query.limit as usize);
+    let criteria = DiscoveryCriteria::new()
+        .min_trades(query.min_trades.unwrap_or(1) as u64)
+        .min_win_rate(
+            query
+                .min_win_rate
+                .map(|w| w.try_into().unwrap_or(0.0))
+                .unwrap_or(0.0),
+        )
+        .min_volume(Decimal::ZERO)
+        .no_min_roi()
+        .time_window(time_window)
+        .limit(query.limit as usize);
 
-        match discovery.discover_profitable_wallets(&criteria).await {
-            Ok(discovered) if !discovered.is_empty() => {
-                let mut wallets: Vec<DiscoveredWallet> = Vec::with_capacity(discovered.len());
-                for (i, dw) in discovered.iter().enumerate() {
-                    let is_tracked = sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
-                    )
-                    .bind(&dw.address.to_lowercase())
-                    .fetch_one(&state.pool)
-                    .await
-                    .unwrap_or(false);
+    match state
+        .wallet_discovery
+        .discover_profitable_wallets(&criteria)
+        .await
+    {
+        Ok(discovered) if !discovered.is_empty() => {
+            let mut wallets: Vec<DiscoveredWallet> = Vec::with_capacity(discovered.len());
+            for (i, dw) in discovered.iter().enumerate() {
+                let is_tracked = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
+                )
+                .bind(&dw.address.to_lowercase())
+                .fetch_one(&state.pool)
+                .await
+                .unwrap_or(false);
 
-                    wallets.push(map_to_api_wallet(dw, (i + 1) as i32, is_tracked));
-                }
-
-                // Sort by requested field
-                sort_wallets(&mut wallets, &query.sort_by, &query.period);
-
-                // Re-rank after sorting
-                for (i, wallet) in wallets.iter_mut().enumerate() {
-                    wallet.rank = (i + 1) as i32;
-                }
-
-                return Ok(Json(wallets));
+                wallets.push(map_to_api_wallet(dw, (i + 1) as i32, is_tracked));
             }
-            Ok(_) => {
-                tracing::debug!("WalletDiscovery returned empty, falling back to mock data");
+
+            // Sort by requested field
+            sort_wallets(&mut wallets, &query.sort_by, &query.period);
+
+            // Re-rank after sorting
+            for (i, wallet) in wallets.iter_mut().enumerate() {
+                wallet.rank = (i + 1) as i32;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "WalletDiscovery query failed, falling back to mock data");
-            }
+
+            Ok(Json(wallets))
+        }
+        Ok(_) => {
+            tracing::debug!("WalletDiscovery returned empty, falling back to mock data");
+            Ok(Json(generate_mock_wallets(query.limit as usize)))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "WalletDiscovery query failed, falling back to mock data");
+            Ok(Json(generate_mock_wallets(query.limit as usize)))
         }
     }
-
-    // Fallback: generate mock discovered wallets for demo
-    let mut wallets = generate_mock_wallets(query.limit as usize);
-
-    // Apply filters
-    if let Some(min_trades) = query.min_trades {
-        wallets.retain(|w| w.total_trades >= min_trades);
-    }
-    if let Some(min_win_rate) = query.min_win_rate {
-        wallets.retain(|w| w.win_rate >= min_win_rate);
-    }
-
-    sort_wallets(&mut wallets, &query.sort_by, &query.period);
-
-    // Re-rank after sorting
-    for (i, wallet) in wallets.iter_mut().enumerate() {
-        wallet.rank = (i + 1) as i32;
-    }
-
-    Ok(Json(wallets))
 }
 
 /// Map a `wallet_tracker::DiscoveredWallet` to the API `DiscoveredWallet`.

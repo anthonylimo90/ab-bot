@@ -254,7 +254,6 @@ impl ApiServer {
             harvester_config,
             self.state.clob_client.clone(),
             self.state.pool.clone(),
-            build_polygon_client(),
         );
 
         // Spawn copy trading monitor + wallet trade monitor if enabled

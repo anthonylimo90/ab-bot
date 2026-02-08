@@ -66,6 +66,42 @@ impl WalletRepository {
         Ok(())
     }
 
+    /// Accumulate wallet features from CLOB trade data.
+    ///
+    /// Unlike `upsert_features` which replaces all fields, this method
+    /// *adds* the incoming trade count and volume to existing values and
+    /// widens the first_trade / last_trade window.
+    pub async fn accumulate_features(
+        &self,
+        address: &str,
+        trade_count: i64,
+        total_volume: rust_decimal::Decimal,
+        first_trade: chrono::DateTime<chrono::Utc>,
+        last_trade: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO wallet_features (address, total_trades, total_volume, first_trade, last_trade)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (address) DO UPDATE SET
+                total_trades = wallet_features.total_trades + EXCLUDED.total_trades,
+                total_volume = wallet_features.total_volume + EXCLUDED.total_volume,
+                first_trade = LEAST(wallet_features.first_trade, EXCLUDED.first_trade),
+                last_trade = GREATEST(wallet_features.last_trade, EXCLUDED.last_trade),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(address)
+        .bind(trade_count)
+        .bind(total_volume)
+        .bind(first_trade)
+        .bind(last_trade)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Insert a bot score.
     pub async fn insert_score(&self, score: &BotScore) -> Result<()> {
         let signals_json = serde_json::to_value(&score.signals)?;

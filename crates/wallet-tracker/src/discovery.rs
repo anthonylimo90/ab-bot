@@ -76,6 +76,11 @@ impl DiscoveryCriteria {
         self
     }
 
+    pub fn no_min_roi(mut self) -> Self {
+        self.min_roi = None;
+        self
+    }
+
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
         self
@@ -124,17 +129,28 @@ impl DiscoveredWallet {
 
 /// Wallet discovery service.
 pub struct WalletDiscovery {
-    polygon_client: PolygonClient,
+    polygon_client: Option<PolygonClient>,
     pool: PgPool,
     /// Cache of recently discovered wallets.
     cache: dashmap::DashMap<String, DiscoveredWallet>,
 }
 
 impl WalletDiscovery {
-    /// Create a new wallet discovery service.
+    /// Create a new wallet discovery service with a Polygon client.
     pub fn new(polygon_client: PolygonClient, pool: PgPool) -> Self {
         Self {
-            polygon_client,
+            polygon_client: Some(polygon_client),
+            pool,
+            cache: dashmap::DashMap::new(),
+        }
+    }
+
+    /// Create a wallet discovery service backed only by the database.
+    ///
+    /// Discovery queries work without Polygon; only `refresh_wallet()` requires it.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self {
+            polygon_client: None,
             pool,
             cache: dashmap::DashMap::new(),
         }
@@ -248,12 +264,17 @@ impl WalletDiscovery {
     }
 
     /// Refresh wallet data from on-chain.
+    ///
+    /// Requires a Polygon client; returns an error if constructed via `from_pool()`.
     pub async fn refresh_wallet(&self, address: &str) -> Result<Option<DiscoveredWallet>> {
+        let polygon_client = self.polygon_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Polygon client not configured — cannot refresh on-chain data")
+        })?;
+
         let address_lower = address.to_lowercase();
 
         // Fetch fresh data from Polygon
-        let transfers = self
-            .polygon_client
+        let transfers = polygon_client
             .get_asset_transfers(&address_lower, None, None)
             .await?;
 
