@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
 import { PortfolioSummary, WalletCard, ManualPositions, AutomationPanel } from '@/components/trading';
+import { AllocationAdjustmentPanel } from '@/components/allocations/AllocationAdjustmentPanel';
 import { useDemoPortfolioStore, DemoPosition } from '@/stores/demo-portfolio-store';
 import { useModeStore } from '@/stores/mode-store';
 import { useToastStore } from '@/stores/toast-store';
@@ -402,6 +403,11 @@ export default function TradingPage() {
               onClosePosition={handleClosePosition}
             />
           )}
+
+          {/* Risk-Based Allocation Adjustment */}
+          {activeWallets.length > 0 && (
+            <AllocationAdjustmentPanel tier="active" className="mt-6" />
+          )}
         </TabsContent>
 
         {/* Watching Tab */}
@@ -436,6 +442,11 @@ export default function TradingPage() {
                 />
               ))}
             </div>
+          )}
+
+          {/* Risk-Based Allocation Adjustment */}
+          {benchWallets.length > 0 && (
+            <AllocationAdjustmentPanel tier="bench" className="mt-6" />
           )}
         </TabsContent>
 

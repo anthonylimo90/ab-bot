@@ -631,12 +631,12 @@ export interface RotationHistoryEntry {
 export interface OnboardingStatus {
   workspace_id?: string;
   workspace_name?: string;
-  setup_mode: SetupMode;
+  setup_mode?: SetupMode;
   onboarding_completed: boolean;
   onboarding_step: number;
-  total_budget: number;
-  active_count: number;
-  bench_count: number;
+  total_budget?: number;
+  active_wallet_count: number;
+  bench_wallet_count: number;
 }
 
 export interface UserSettings {

@@ -32,9 +32,9 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
 
   const setModeMutation = useMutation({
     mutationFn: (newMode: SetupMode) => api.setOnboardingMode(newMode),
-    onSuccess: () => {
+    onSuccess: (_data, selectedMode) => {
       queryClient.invalidateQueries({ queryKey: ['onboarding', 'status'] });
-      toast.success('Mode selected', `${mode === 'automatic' ? 'Guided' : 'Custom'} mode enabled`);
+      toast.success('Mode selected', `${selectedMode === 'automatic' ? 'Guided' : 'Custom'} mode enabled`);
     },
     onError: (error: Error) => {
       toast.error('Failed to set mode', error.message);
