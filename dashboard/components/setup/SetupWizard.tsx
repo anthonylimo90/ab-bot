@@ -25,16 +25,16 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const [step, setStep] = useState<WizardStep>('mode');
-  const [mode, setMode] = useState<SetupMode>(initialStatus.setup_mode);
-  const [budget, setBudget] = useState(initialStatus.total_budget);
+  const [mode, setMode] = useState<SetupMode>(initialStatus.setup_mode || 'automatic');
+  const [budget, setBudget] = useState<number>(initialStatus.total_budget || 10000);
   const [reservedPct, setReservedPct] = useState(20);
   const [activeWalletCount, setActiveWalletCount] = useState(0);
 
   const setModeMutation = useMutation({
     mutationFn: (newMode: SetupMode) => api.setOnboardingMode(newMode),
-    onSuccess: () => {
+    onSuccess: (_data, selectedMode) => {
       queryClient.invalidateQueries({ queryKey: ['onboarding', 'status'] });
-      toast.success('Mode selected', `${mode === 'automatic' ? 'Guided' : 'Custom'} mode enabled`);
+      toast.success('Mode selected', `${selectedMode === 'automatic' ? 'Guided' : 'Custom'} mode enabled`);
     },
     onError: (error: Error) => {
       toast.error('Failed to set mode', error.message);

@@ -26,6 +26,7 @@ pub mod email;
 pub mod error;
 pub mod exit_handler;
 pub mod handlers;
+pub mod metrics_calculator;
 pub mod middleware;
 pub mod redis_forwarder;
 pub mod routes;
@@ -38,6 +39,7 @@ pub use auto_optimizer::AutoOptimizer;
 pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
+pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use state::AppState;
@@ -255,6 +257,21 @@ impl ApiServer {
             self.state.clob_client.clone(),
             self.state.pool.clone(),
         );
+
+        // Spawn metrics calculator (populates wallet_success_metrics)
+        let metrics_config = MetricsCalculatorConfig::from_env();
+        if metrics_config.enabled {
+            let calculator = Arc::new(MetricsCalculator::new(
+                self.state.pool.clone(),
+                metrics_config.clone(),
+            ));
+            tokio::spawn(calculator.run());
+            info!(
+                interval_secs = metrics_config.interval_secs,
+                batch_size = metrics_config.batch_size,
+                "Metrics calculator background job spawned"
+            );
+        }
 
         // Spawn copy trading monitor + wallet trade monitor if enabled
         let copy_config = CopyTradingConfig::from_env();

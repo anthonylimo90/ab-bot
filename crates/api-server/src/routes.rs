@@ -12,8 +12,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health, invites,
-    markets, onboarding, order_signing, positions, recommendations, trading, users, vault,
-    wallet_auth, wallets, workspaces,
+    markets, onboarding, order_signing, positions, recommendations, risk_allocations, trading,
+    users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -520,6 +520,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/allocations/bans/:address",
             delete(allocations::unban_wallet),
+        )
+        // Risk-based allocation recalculation
+        .route(
+            "/api/v1/allocations/risk/recalculate",
+            post(risk_allocations::recalculate_allocations),
         )
         // Auto-rotation operations
         .route(

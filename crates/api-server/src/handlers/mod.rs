@@ -14,6 +14,7 @@ pub mod onboarding;
 pub mod order_signing;
 pub mod positions;
 pub mod recommendations;
+pub mod risk_allocations;
 pub mod trading;
 pub mod users;
 pub mod vault;
