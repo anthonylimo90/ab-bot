@@ -76,10 +76,11 @@ impl Default for RiskScorerConfig {
 pub struct RiskScorer {
     pool: PgPool,
     config: RiskScorerConfig,
+    workspace_id: String,
 }
 
 /// Row structure for fetching wallet metrics from database.
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 struct WalletMetricsRow {
     address: String,
     roi_30d: Decimal,
@@ -92,31 +93,44 @@ struct WalletMetricsRow {
 }
 
 impl RiskScorer {
-    /// Create a new risk scorer.
-    pub fn new(pool: PgPool) -> Self {
+    /// Create a new risk scorer for a specific workspace.
+    pub fn new(pool: PgPool, workspace_id: String) -> Self {
         Self {
             pool,
             config: RiskScorerConfig::default(),
+            workspace_id,
         }
     }
 
-    /// Create with custom configuration.
-    pub fn with_config(pool: PgPool, config: RiskScorerConfig) -> Self {
-        Self { pool, config }
+    /// Create with custom configuration for a specific workspace.
+    pub fn with_config(pool: PgPool, workspace_id: String, config: RiskScorerConfig) -> Self {
+        Self {
+            pool,
+            config,
+            workspace_id,
+        }
     }
 
     /// Calculate risk scores for all wallets with metrics.
     pub async fn calculate_scores(&self) -> Result<Vec<WalletRiskScore>> {
-        let metrics = self.fetch_wallet_metrics().await?;
+        let metrics = self.fetch_wallet_metrics(None).await?;
 
         if metrics.is_empty() {
             warn!("No wallet metrics found for risk scoring");
             return Ok(vec![]);
         }
 
+        let scores = self.calculate_risk_scores(&metrics);
+        debug!(count = scores.len(), "Calculated risk scores for wallets");
+
+        Ok(scores)
+    }
+
+    /// Calculate risk scores from wallet metrics.
+    fn calculate_risk_scores(&self, metrics: &[WalletMetricsRow]) -> Vec<WalletRiskScore> {
         let mut scores: Vec<WalletRiskScore> = metrics
-            .into_iter()
-            .map(|m| self.calculate_wallet_score(m))
+            .iter()
+            .map(|m| self.calculate_wallet_score(m.clone()))
             .collect();
 
         // Sort by composite score descending
@@ -126,9 +140,7 @@ impl RiskScorer {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        debug!(count = scores.len(), "Calculated risk scores for wallets");
-
-        Ok(scores)
+        scores
     }
 
     /// Calculate recommended allocations for a portfolio tier.
@@ -136,8 +148,9 @@ impl RiskScorer {
         // Get current allocations
         let current_allocations = self.fetch_current_allocations(tier).await?;
 
-        // Calculate risk scores
-        let mut scores = self.calculate_scores().await?;
+        // Calculate risk scores for wallets in this tier
+        let metrics = self.fetch_wallet_metrics(Some(tier)).await?;
+        let mut scores = self.calculate_risk_scores(&metrics);
 
         // Merge current allocations
         for score in &mut scores {
@@ -152,6 +165,7 @@ impl RiskScorer {
             return Ok(scores);
         }
 
+        // Calculate initial allocations with volatility scaling
         for score in &mut scores {
             // Base allocation from score proportion
             let base_allocation = (score.composite_score / total_score) * 100.0;
@@ -163,21 +177,57 @@ impl RiskScorer {
                 1.0
             };
 
-            let scaled_allocation = base_allocation * volatility_factor;
-
-            // Clamp to min/max bounds
-            score.recommended_allocation_pct = scaled_allocation
-                .max(self.config.min_allocation_pct)
-                .min(self.config.max_allocation_pct);
+            score.recommended_allocation_pct = base_allocation * volatility_factor;
         }
 
-        // Normalize to sum to 100%
-        let total_allocation: f64 = scores.iter().map(|s| s.recommended_allocation_pct).sum();
+        // Iterative "clamp and redistribute" to satisfy all constraints
+        const MAX_ITERATIONS: usize = 10;
+        for _ in 0..MAX_ITERATIONS {
+            // Normalize to 100%
+            let total: f64 = scores.iter().map(|s| s.recommended_allocation_pct).sum();
+            if total > 0.0 {
+                for score in &mut scores {
+                    score.recommended_allocation_pct =
+                        (score.recommended_allocation_pct / total) * 100.0;
+                }
+            }
 
-        if total_allocation > 0.0 {
+            // Clamp to bounds and track excess/deficit
+            let mut excess_deficit = 0.0;
+            let mut clamped_count = 0;
+
             for score in &mut scores {
-                score.recommended_allocation_pct =
-                    (score.recommended_allocation_pct / total_allocation) * 100.0;
+                let original = score.recommended_allocation_pct;
+                if original < self.config.min_allocation_pct {
+                    score.recommended_allocation_pct = self.config.min_allocation_pct;
+                    excess_deficit += self.config.min_allocation_pct - original;
+                    clamped_count += 1;
+                } else if original > self.config.max_allocation_pct {
+                    score.recommended_allocation_pct = self.config.max_allocation_pct;
+                    excess_deficit += self.config.max_allocation_pct - original;
+                    clamped_count += 1;
+                }
+            }
+
+            // If no clamping occurred, we're done
+            if clamped_count == 0 {
+                break;
+            }
+
+            // Redistribute excess/deficit among unclamped wallets
+            let unclamped_count = scores.len() - clamped_count;
+            if unclamped_count > 0 {
+                for score in &mut scores {
+                    let is_at_min =
+                        (score.recommended_allocation_pct - self.config.min_allocation_pct).abs()
+                            < 0.01;
+                    let is_at_max =
+                        (score.recommended_allocation_pct - self.config.max_allocation_pct).abs()
+                            < 0.01;
+                    if !is_at_min && !is_at_max {
+                        score.recommended_allocation_pct -= excess_deficit / unclamped_count as f64;
+                    }
+                }
             }
         }
 
@@ -207,11 +257,13 @@ impl RiskScorer {
                 UPDATE workspace_wallet_allocations
                 SET allocation_pct = $1,
                     updated_at = NOW()
-                WHERE tier = $2
-                  AND LOWER(wallet_address) = LOWER($3)
+                WHERE workspace_id = $2
+                  AND tier = $3
+                  AND LOWER(wallet_address) = LOWER($4)
                 "#,
             )
             .bind(decimal_pct)
+            .bind(&self.workspace_id)
             .bind(tier)
             .bind(&allocation.address)
             .execute(&mut *tx)
@@ -233,27 +285,58 @@ impl RiskScorer {
 
     // Private methods
 
-    async fn fetch_wallet_metrics(&self) -> Result<Vec<WalletMetricsRow>> {
-        let rows = sqlx::query_as::<_, WalletMetricsRow>(
-            r#"
-            SELECT
-                address,
-                roi_30d,
-                sharpe_30d,
-                sortino_30d,
-                max_drawdown_30d,
-                volatility_30d,
-                consistency_score,
-                win_rate_30d
-            FROM wallet_success_metrics
-            WHERE last_computed >= NOW() - INTERVAL '48 hours'
-              AND roi_30d > 0
-              AND sortino_30d IS NOT NULL
-            ORDER BY roi_30d DESC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+    async fn fetch_wallet_metrics(&self, tier: Option<&str>) -> Result<Vec<WalletMetricsRow>> {
+        let rows = if let Some(t) = tier {
+            // Filter by tier when specified
+            sqlx::query_as::<_, WalletMetricsRow>(
+                r#"
+                SELECT DISTINCT
+                    wsm.address,
+                    wsm.roi_30d,
+                    wsm.sharpe_30d,
+                    wsm.sortino_30d,
+                    wsm.max_drawdown_30d,
+                    wsm.volatility_30d,
+                    wsm.consistency_score,
+                    wsm.win_rate_30d
+                FROM wallet_success_metrics wsm
+                INNER JOIN workspace_wallet_allocations wwa
+                    ON LOWER(wsm.address) = LOWER(wwa.wallet_address)
+                WHERE wsm.last_computed >= NOW() - INTERVAL '48 hours'
+                  AND wsm.roi_30d > 0
+                  AND wsm.sortino_30d IS NOT NULL
+                  AND wwa.workspace_id = $1
+                  AND wwa.tier = $2
+                ORDER BY wsm.roi_30d DESC
+                "#,
+            )
+            .bind(&self.workspace_id)
+            .bind(t)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            // Fetch all wallets (for calculate_scores public API)
+            sqlx::query_as::<_, WalletMetricsRow>(
+                r#"
+                SELECT
+                    address,
+                    roi_30d,
+                    sharpe_30d,
+                    sortino_30d,
+                    max_drawdown_30d,
+                    volatility_30d,
+                    consistency_score,
+                    win_rate_30d
+                FROM wallet_success_metrics
+                WHERE last_computed >= NOW() - INTERVAL '48 hours'
+                  AND roi_30d > 0
+                  AND sortino_30d IS NOT NULL
+                ORDER BY roi_30d DESC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         Ok(rows)
     }
@@ -266,9 +349,11 @@ impl RiskScorer {
             r#"
             SELECT LOWER(wallet_address) as address, allocation_pct
             FROM workspace_wallet_allocations
-            WHERE tier = $1
+            WHERE workspace_id = $1
+              AND tier = $2
             "#,
         )
+        .bind(&self.workspace_id)
         .bind(tier)
         .fetch_all(&self.pool)
         .await?;
