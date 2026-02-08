@@ -314,14 +314,14 @@ impl ProfitabilityAnalyzer {
             r#"
             INSERT INTO wallet_success_metrics (
                 address, wallet_address, roi_30d, roi_90d, roi_all_time, annualized_return,
-                sharpe_30d, max_drawdown_30d, consistency_score,
+                sharpe_30d, sortino_30d, max_drawdown_30d, volatility_30d, consistency_score,
                 win_rate_30d, trades_30d, winning_trades_30d, losing_trades_30d,
                 predicted_success_prob, last_computed, calculated_at, roi
             ) VALUES (
                 $1, $1, $2, $2, $2, $3,
-                $4, $5, $6,
-                $7, $8, $9, $10,
-                $11, $12, $12, $2
+                $4, $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                $13, $14, $14, $2
             )
             ON CONFLICT (address) DO UPDATE SET
                 wallet_address = EXCLUDED.wallet_address,
@@ -330,7 +330,9 @@ impl ProfitabilityAnalyzer {
                 roi_all_time = EXCLUDED.roi_all_time,
                 annualized_return = EXCLUDED.annualized_return,
                 sharpe_30d = EXCLUDED.sharpe_30d,
+                sortino_30d = EXCLUDED.sortino_30d,
                 max_drawdown_30d = EXCLUDED.max_drawdown_30d,
+                volatility_30d = EXCLUDED.volatility_30d,
                 consistency_score = EXCLUDED.consistency_score,
                 win_rate_30d = EXCLUDED.win_rate_30d,
                 trades_30d = EXCLUDED.trades_30d,
@@ -346,7 +348,9 @@ impl ProfitabilityAnalyzer {
         .bind(metrics.roi_percentage)
         .bind(metrics.annualized_return)
         .bind(metrics.sharpe_ratio)
+        .bind(metrics.sortino_ratio)
         .bind(metrics.max_drawdown)
+        .bind(metrics.volatility)
         .bind(metrics.consistency_score)
         .bind(metrics.win_rate)
         .bind(total_trades)

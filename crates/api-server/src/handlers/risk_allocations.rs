@@ -1,11 +1,13 @@
 //! Risk-based allocation recalculation API handlers.
 
 use crate::error::ApiError;
+use crate::middleware::Claims;
 use crate::state::AppState;
-use axum::{extract::State, Json};
+use axum::{extract::State, Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
+use uuid::Uuid;
 use wallet_tracker::risk_scorer::{RiskScorer, WalletRiskScore};
 
 /// Request to recalculate risk-based allocations.
@@ -43,6 +45,7 @@ pub struct AllocationPreview {
 /// Recalculate risk-based allocations for a portfolio tier.
 pub async fn recalculate_allocations(
     State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
     Json(req): Json<RecalculateAllocationsRequest>,
 ) -> Result<Json<RecalculateAllocationsResponse>, ApiError> {
     info!(
@@ -51,6 +54,15 @@ pub async fn recalculate_allocations(
         "Recalculating risk-based allocations"
     );
 
+    // Extract user_id from claims
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    // Resolve user's workspace
+    let workspace_id = get_current_workspace(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("No workspace configured".into()))?;
+
     // Validate tier
     if !matches!(req.tier.as_str(), "active" | "bench" | "all") {
         return Err(ApiError::BadRequest(
@@ -58,7 +70,7 @@ pub async fn recalculate_allocations(
         ));
     }
 
-    let risk_scorer = RiskScorer::new(state.pool.clone());
+    let risk_scorer = RiskScorer::new(state.pool.clone(), workspace_id.to_string());
 
     let tiers = if req.tier == "all" {
         vec!["active".to_string(), "bench".to_string()]
@@ -102,7 +114,7 @@ pub async fn recalculate_allocations(
                 })?;
 
             // Log to audit trail
-            log_allocation_change(&state, &tier, &allocations).await?;
+            log_allocation_change(&state, workspace_id, &tier, &allocations).await?;
 
             info!(
                 tier = %tier,
@@ -140,6 +152,7 @@ fn allocation_to_preview(score: &WalletRiskScore) -> AllocationPreview {
 
 async fn log_allocation_change(
     state: &AppState,
+    workspace_id: Uuid,
     tier: &str,
     allocations: &[WalletRiskScore],
 ) -> Result<(), ApiError> {
@@ -156,16 +169,17 @@ async fn log_allocation_change(
                 created_at
             )
             VALUES (
-                (SELECT id FROM workspaces LIMIT 1),
-                'allocation_adjustment',
                 $1,
-                $2,
+                'allocation_adjustment',
                 $2,
                 $3,
+                $3,
+                $4,
                 NOW()
             )
             "#,
         )
+        .bind(workspace_id)
         .bind(&allocation.address)
         .bind(tier)
         .bind(format!(
@@ -181,6 +195,20 @@ async fn log_allocation_change(
     }
 
     Ok(())
+}
+
+/// Get user's current workspace ID.
+async fn get_current_workspace(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let settings: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT default_workspace_id FROM user_settings WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(settings.and_then(|(workspace_id,)| workspace_id))
 }
 
 #[cfg(test)]
