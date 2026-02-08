@@ -199,8 +199,9 @@ impl ClobClient {
                 "channel": "book"
             });
             write.send(Message::Text(subscribe_msg.to_string())).await?;
-            info!("Subscribed to market: {}", market_id);
+            debug!("Subscribed to market: {}", market_id);
         }
+        info!("Subscribed to {} markets", market_ids.len());
 
         // Process incoming messages
         while let Some(msg) = read.next().await {
