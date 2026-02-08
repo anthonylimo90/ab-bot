@@ -74,7 +74,7 @@ pub struct AppState {
     /// Broadcast channel for arb entry signals (feeds ArbAutoExecutor).
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     /// Wallet discovery service for querying profitable wallets from DB.
-    pub wallet_discovery: Option<Arc<WalletDiscovery>>,
+    pub wallet_discovery: Arc<WalletDiscovery>,
 }
 
 impl AppState {
@@ -210,9 +210,11 @@ impl AppState {
         }
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
 
-        // Create wallet discovery service if Polygon RPC is available
-        let wallet_discovery = build_polygon_client_for_discovery()
-            .map(|pc| Arc::new(WalletDiscovery::new(pc, pool.clone())));
+        // Create wallet discovery service (works without Polygon — DB queries only)
+        let wallet_discovery = match build_polygon_client_for_discovery() {
+            Some(pc) => Arc::new(WalletDiscovery::new(pc, pool.clone())),
+            None => Arc::new(WalletDiscovery::from_pool(pool.clone())),
+        };
 
         // Create email client if configured
         let email_client = EmailConfig::from_env().and_then(|config| {
