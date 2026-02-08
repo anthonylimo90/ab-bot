@@ -155,7 +155,7 @@ impl MetricsCalculator {
         // Priority 3: Active wallets (have traded recently)
         let rows = sqlx::query_scalar::<_, String>(
             r#"
-            SELECT DISTINCT wf.address
+            SELECT wf.address
             FROM wallet_features wf
             LEFT JOIN wallet_success_metrics wsm ON wsm.address = wf.address
             WHERE
