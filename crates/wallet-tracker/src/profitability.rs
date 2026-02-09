@@ -442,6 +442,7 @@ impl ProfitabilityAnalyzer {
             .collect();
 
         // If no copy trades found, fall back to wallet_trades (for discovery/evaluation)
+        // Using sqlx::query (not query!) to avoid offline mode requirement for wallet_trades
         if trades.is_empty() {
             let wallet_query = if let Some(cutoff_date) = cutoff {
                 sqlx::query(

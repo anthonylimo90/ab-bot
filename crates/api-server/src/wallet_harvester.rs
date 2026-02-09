@@ -194,7 +194,8 @@ async fn harvest_cycle(
         let timestamp = chrono::DateTime::from_timestamp(trade.timestamp, 0).unwrap_or(now);
 
         // Insert trade with ON CONFLICT DO NOTHING for deduplication
-        let result = sqlx::query!(
+        // Using sqlx::query (not query!) to avoid offline mode requirement
+        let result = sqlx::query(
             r#"
             INSERT INTO wallet_trades (
                 transaction_hash, wallet_address, asset_id, condition_id,
@@ -204,19 +205,19 @@ async fn harvest_cycle(
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (transaction_hash) DO NOTHING
             "#,
-            trade.transaction_hash,
-            wallet_addr,
-            trade.asset_id,
-            trade.condition_id,
-            trade.side,
-            price,
-            size,
-            value,
-            timestamp,
-            trade.title,
-            trade.slug,
-            trade.outcome,
         )
+        .bind(&trade.transaction_hash)
+        .bind(&wallet_addr)
+        .bind(&trade.asset_id)
+        .bind(&trade.condition_id)
+        .bind(&trade.side)
+        .bind(price)
+        .bind(size)
+        .bind(value)
+        .bind(timestamp)
+        .bind(&trade.title)
+        .bind(&trade.slug)
+        .bind(&trade.outcome)
         .execute(wallet_repo.pool())
         .await;
 
