@@ -526,6 +526,11 @@ export interface Workspace {
   min_trades_30d?: number;
   trading_wallet_address?: string;
   walletconnect_project_id?: string;
+  polygon_rpc_url?: string;
+  alchemy_api_key?: string;
+  arb_auto_execute: boolean;
+  copy_trading_enabled: boolean;
+  live_trading_enabled: boolean;
   my_role: WorkspaceRole;
   onboarding_completed?: boolean;
   created_by?: string;
@@ -669,6 +674,11 @@ export interface UpdateWorkspaceRequest {
   min_win_rate?: number;
   min_trades_30d?: number;
   walletconnect_project_id?: string;
+  polygon_rpc_url?: string;
+  alchemy_api_key?: string;
+  arb_auto_execute?: boolean;
+  copy_trading_enabled?: boolean;
+  live_trading_enabled?: boolean;
 }
 
 export interface CreateInviteRequest {
@@ -897,4 +907,18 @@ export interface SubmitOrderResponse {
   order_id?: string;
   message: string;
   tx_hash?: string;
+}
+
+// Service status types
+export interface ServiceStatusItem {
+  running: boolean;
+  reason?: string;
+}
+
+export interface ServiceStatus {
+  harvester: ServiceStatusItem;
+  metrics_calculator: ServiceStatusItem;
+  copy_trading: ServiceStatusItem;
+  arb_executor: ServiceStatusItem;
+  live_trading: ServiceStatusItem;
 }

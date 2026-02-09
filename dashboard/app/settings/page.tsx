@@ -23,6 +23,7 @@ import {
   ExternalLink,
   Star,
   Trash2,
+  Settings2,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -55,6 +56,12 @@ export default function SettingsPage() {
   const [isSaving, setIsSaving] = useState(false);
   const [walletConnectProjectId, setWalletConnectProjectId] = useState('');
   const [isSavingWalletConnect, setIsSavingWalletConnect] = useState(false);
+  const [isSavingTradingConfig, setIsSavingTradingConfig] = useState(false);
+  const [polygonRpcUrl, setPolygonRpcUrl] = useState('');
+  const [alchemyApiKey, setAlchemyApiKey] = useState('');
+  const [copyTradingEnabled, setCopyTradingEnabled] = useState(true);
+  const [arbAutoExecute, setArbAutoExecute] = useState(false);
+  const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
   const {
     connectedWallets,
     primaryWallet,
@@ -83,12 +90,31 @@ export default function SettingsPage() {
   const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
 
+  // Fetch service status
+  const { data: serviceStatus } = useQuery({
+    queryKey: ['workspace', currentWorkspace?.id, 'service-status'],
+    queryFn: () => api.getServiceStatus(currentWorkspace!.id),
+    enabled: !!currentWorkspace?.id && canConfigureWalletConnect,
+    refetchInterval: 30000, // refresh every 30s
+  });
+
   // Initialize walletConnectProjectId from workspace
   useEffect(() => {
     if (currentWorkspace?.walletconnect_project_id) {
       setWalletConnectProjectId(currentWorkspace.walletconnect_project_id);
     }
   }, [currentWorkspace?.walletconnect_project_id]);
+
+  // Initialize trading config from workspace
+  useEffect(() => {
+    if (currentWorkspace) {
+      setPolygonRpcUrl(currentWorkspace.polygon_rpc_url || '');
+      setAlchemyApiKey(''); // Never pre-fill masked key
+      setCopyTradingEnabled(currentWorkspace.copy_trading_enabled ?? true);
+      setArbAutoExecute(currentWorkspace.arb_auto_execute ?? false);
+      setLiveTradingEnabled(currentWorkspace.live_trading_enabled ?? false);
+    }
+  }, [currentWorkspace]);
 
   useEffect(() => {
     fetchWallets().catch(() => {
@@ -123,6 +149,30 @@ export default function SettingsPage() {
       toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsSavingWalletConnect(false);
+    }
+  };
+
+  // Save trading configuration
+  const handleSaveTradingConfig = async () => {
+    if (!currentWorkspace) return;
+    setIsSavingTradingConfig(true);
+    try {
+      const updates: Record<string, unknown> = {
+        copy_trading_enabled: copyTradingEnabled,
+        arb_auto_execute: arbAutoExecute,
+        live_trading_enabled: liveTradingEnabled,
+      };
+      if (polygonRpcUrl) updates.polygon_rpc_url = polygonRpcUrl;
+      if (alchemyApiKey) updates.alchemy_api_key = alchemyApiKey;
+      await api.updateWorkspace(currentWorkspace.id, updates);
+      toast.success('Trading config saved', 'Your trading configuration has been updated');
+      queryClient.invalidateQueries({ queryKey: ['workspace'] });
+      queryClient.invalidateQueries({ queryKey: ['workspace', currentWorkspace.id, 'service-status'] });
+      setAlchemyApiKey(''); // Clear after save
+    } catch (err) {
+      toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setIsSavingTradingConfig(false);
     }
   };
 
@@ -367,6 +417,148 @@ export default function SettingsPage() {
                 </p>
               </div>
             )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Trading Configuration (Owner/Admin only) */}
+      {currentWorkspace && canConfigureWalletConnect && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Settings2 className="h-5 w-5" />
+              Trading Configuration
+            </CardTitle>
+            <CardDescription>
+              Configure trading services and blockchain connectivity
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            {/* Service Status Indicators */}
+            {serviceStatus && (
+              <div className="rounded-lg border p-4 space-y-2">
+                <p className="text-sm font-medium mb-3">Service Status</p>
+                {Object.entries(serviceStatus).map(([key, status]) => (
+                  <div key={key} className="flex items-center justify-between text-sm">
+                    <span className="capitalize">{key.replace(/_/g, ' ')}</span>
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`inline-block h-2 w-2 rounded-full ${
+                          status.running ? 'bg-green-500' : 'bg-red-400'
+                        }`}
+                      />
+                      <span className={status.running ? 'text-green-600' : 'text-muted-foreground'}>
+                        {status.running ? 'Running' : status.reason || 'Stopped'}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Polygon RPC */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="polygon-rpc-url">
+                Polygon RPC URL
+              </label>
+              <input
+                id="polygon-rpc-url"
+                type="text"
+                value={polygonRpcUrl}
+                onChange={(e) => setPolygonRpcUrl(e.target.value)}
+                placeholder="https://polygon-mainnet.g.alchemy.com/v2/..."
+                className="w-full rounded border bg-background px-3 py-2 text-sm"
+              />
+              <p className="text-xs text-muted-foreground">
+                Required for copy trading and wallet monitoring
+              </p>
+            </div>
+
+            {/* Alchemy API Key */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium" htmlFor="alchemy-api-key">
+                Alchemy API Key
+              </label>
+              <input
+                id="alchemy-api-key"
+                type="password"
+                value={alchemyApiKey}
+                onChange={(e) => setAlchemyApiKey(e.target.value)}
+                placeholder={currentWorkspace.alchemy_api_key || 'Enter Alchemy API key'}
+                className="w-full rounded border bg-background px-3 py-2 text-sm"
+              />
+              <p className="text-xs text-muted-foreground">
+                Alternative to Polygon RPC URL. Leave empty to keep current key.
+              </p>
+            </div>
+
+            {/* Copy Trading Toggle */}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="font-medium">Copy Trading</p>
+                <p className="text-sm text-muted-foreground">
+                  Automatically replicate trades from tracked wallets
+                </p>
+              </div>
+              <Switch
+                checked={copyTradingEnabled}
+                onCheckedChange={setCopyTradingEnabled}
+              />
+            </div>
+
+            {/* Arb Auto-Execute Toggle */}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="font-medium">Arbitrage Auto-Execute</p>
+                <p className="text-sm text-muted-foreground">
+                  Automatically execute detected arbitrage opportunities
+                </p>
+              </div>
+              <Switch
+                checked={arbAutoExecute}
+                onCheckedChange={setArbAutoExecute}
+              />
+            </div>
+
+            {/* Live Trading Toggle */}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="font-medium">Live Trading</p>
+                <p className="text-sm text-muted-foreground">
+                  Execute real orders with connected wallet
+                </p>
+              </div>
+              <Switch
+                checked={liveTradingEnabled}
+                onCheckedChange={setLiveTradingEnabled}
+              />
+            </div>
+            {liveTradingEnabled && (
+              <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-3">
+                <p className="text-sm text-yellow-500 flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4" />
+                  Live trading uses real funds. Ensure a wallet is connected and funded.
+                </p>
+              </div>
+            )}
+
+            <Button
+              onClick={handleSaveTradingConfig}
+              disabled={isSavingTradingConfig}
+              className="w-full"
+            >
+              {isSavingTradingConfig ? (
+                <>
+                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Save className="mr-2 h-4 w-4" />
+                  Save Trading Configuration
+                </>
+              )}
+            </Button>
           </CardContent>
         </Card>
       )}

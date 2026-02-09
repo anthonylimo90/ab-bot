@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Configuration for the wallet harvester.
 #[derive(Debug, Clone)]
@@ -98,9 +98,30 @@ async fn harvester_loop(config: WalletHarvesterConfig, clob_client: Arc<ClobClie
     // Initial delay to let the server finish starting up
     tokio::time::sleep(Duration::from_secs(10)).await;
 
+    let mut first_cycle = true;
     loop {
-        if let Err(e) = harvest_cycle(&config, &clob_client, &wallet_repo).await {
-            warn!(error = %e, "Wallet harvest cycle failed");
+        match harvest_cycle(&config, &clob_client, &wallet_repo).await {
+            Ok(trade_count) => {
+                if first_cycle {
+                    if trade_count > 0 {
+                        info!(
+                            trades = trade_count,
+                            "Data API connectivity verified, fetched {} trades on first cycle",
+                            trade_count
+                        );
+                    } else {
+                        warn!("Data API returned 0 trades on first cycle — wallet discovery may be delayed");
+                    }
+                    first_cycle = false;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Wallet harvest cycle failed");
+                if first_cycle {
+                    warn!("First harvest cycle failed — Data API may be unreachable");
+                    first_cycle = false;
+                }
+            }
         }
 
         tokio::time::sleep(interval).await;
@@ -111,7 +132,7 @@ async fn harvest_cycle(
     config: &WalletHarvesterConfig,
     clob_client: &ClobClient,
     wallet_repo: &WalletRepository,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     // 1. Fetch recent trades from CLOB
     let trades = clob_client
         .get_recent_trades(config.trades_per_fetch, None)
@@ -119,8 +140,8 @@ async fn harvest_cycle(
         .map_err(|e| anyhow::anyhow!("CLOB trade fetch failed: {}", e))?;
 
     if trades.is_empty() {
-        debug!("No trades returned from CLOB API");
-        return Ok(());
+        info!("No trades returned from Data API this cycle");
+        return Ok(0);
     }
 
     let trade_count = trades.len();
@@ -175,7 +196,7 @@ async fn harvest_cycle(
         {
             Ok(()) => harvested += 1,
             Err(e) => {
-                debug!(address = %addr, error = %e, "Failed to accumulate wallet features");
+                warn!(address = %addr, error = %e, "Failed to accumulate wallet features");
             }
         }
     }
@@ -224,7 +245,7 @@ async fn harvest_cycle(
         match result {
             Ok(_) => trades_inserted += 1,
             Err(e) => {
-                debug!(tx_hash = %trade.transaction_hash, error = %e, "Failed to insert trade");
+                warn!(tx_hash = %trade.transaction_hash, error = %e, "Failed to insert trade");
             }
         }
     }
@@ -240,5 +261,5 @@ async fn harvest_cycle(
         trades_inserted
     );
 
-    Ok(())
+    Ok(trade_count)
 }

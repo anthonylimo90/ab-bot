@@ -158,11 +158,20 @@ impl ClobClient {
         match serde_json::from_str::<Vec<ClobTrade>>(&text) {
             Ok(trades) => Ok(trades),
             Err(e) => {
+                let preview = if text.len() > 500 {
+                    &text[..500]
+                } else {
+                    &text
+                };
                 warn!(
-                    "Could not parse Data API trades response: {} - returning empty",
-                    e
+                    error = %e,
+                    response_preview = %preview,
+                    "Could not parse Data API trades response"
                 );
-                Ok(Vec::new())
+                Err(Error::Api {
+                    message: format!("Data API response parse error: {}", e),
+                    status: None,
+                })
             }
         }
     }

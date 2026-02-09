@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { cn, formatCurrency, formatPercent } from '@/lib/utils';
@@ -24,7 +24,7 @@ export function DemoPnlCalculator({
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const runSimulation = async () => {
+  const runSimulation = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await api.simulateDemoPnl({ amount, period });
@@ -35,11 +35,11 @@ export function DemoPnlCalculator({
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [amount, period]);
 
   useEffect(() => {
     runSimulation();
-  }, [amount, period]);
+  }, [runSimulation]);
 
   const periods: { value: Period; label: string }[] = [
     { value: '7d', label: '7 Days' },

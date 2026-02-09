@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { cn, formatPercent, formatCurrency, shortenAddress } from '@/lib/utils';
@@ -25,7 +25,7 @@ export function WalletLeaderboard({
   const [sortBy, setSortBy] = useState<SortBy>('roi');
   const [period, setPeriod] = useState<Period>('30d');
 
-  const fetchWallets = async () => {
+  const fetchWallets = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await api.discoverWallets({ sort_by: sortBy, period, limit: 10 });
@@ -36,11 +36,11 @@ export function WalletLeaderboard({
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [sortBy, period]);
 
   useEffect(() => {
     fetchWallets();
-  }, [sortBy, period]);
+  }, [fetchWallets]);
 
   const sortOptions: { value: SortBy; label: string }[] = [
     { value: 'roi', label: 'ROI' },

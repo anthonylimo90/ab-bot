@@ -22,6 +22,7 @@
 pub mod arb_executor;
 pub mod auto_optimizer;
 pub mod copy_trading;
+pub mod crypto;
 pub mod email;
 pub mod error;
 pub mod exit_handler;

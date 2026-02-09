@@ -91,6 +91,7 @@ use crate::websocket;
         workspaces::update_member_role,
         workspaces::remove_member,
         workspaces::get_optimizer_status,
+        workspaces::get_service_status,
         // Invites
         invites::list_invites,
         invites::create_invite,
@@ -205,6 +206,8 @@ use crate::websocket;
             workspaces::OptimizerStatusResponse,
             workspaces::OptimizerCriteria,
             workspaces::PortfolioMetrics,
+            workspaces::ServiceStatusResponse,
+            workspaces::ServiceStatusItem,
             // Invites
             invites::InviteResponse,
             invites::CreateInviteRequest,
@@ -292,6 +295,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .key_extractor(SmartIpKeyExtractor)
         .finish()
         .expect("Failed to create admin rate limiter config");
+
+    // Rate limiter for workspace config updates: 10 requests per 60 seconds per IP
+    // Tighter limit for sensitive config changes (API keys, trading toggles)
+    let config_rate_limit_config = GovernorConfigBuilder::default()
+        .per_second(60)
+        .burst_size(10)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .expect("Failed to create config rate limiter config");
 
     // Auth routes with rate limiting (SmartIpKeyExtractor handles proxy IPs)
     let auth_routes = Router::new()
@@ -406,6 +418,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(workspaces::get_optimizer_status),
         )
         .route(
+            "/api/v1/workspaces/:workspace_id/service-status",
+            get(workspaces::get_service_status),
+        )
+        .route(
             "/api/v1/workspaces/:workspace_id/invites",
             get(invites::list_invites),
         )
@@ -460,10 +476,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             put(vault::set_primary_wallet),
         )
         // Workspace operations (owner/admin can modify)
-        .route(
-            "/api/v1/workspaces/:workspace_id",
-            put(workspaces::update_workspace),
-        )
+        // NOTE: PUT /workspaces/:id is in config_routes with stricter rate limiting
         .route(
             "/api/v1/workspaces/:workspace_id/switch",
             post(workspaces::switch_workspace),
@@ -611,11 +624,30 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             require_auth,
         ));
 
+    // Config routes - sensitive workspace config with tighter rate limiting (10 req/min)
+    let config_routes = Router::new()
+        .route(
+            "/api/v1/workspaces/:workspace_id",
+            put(workspaces::update_workspace),
+        )
+        .layer(GovernorLayer {
+            config: Arc::new(config_rate_limit_config),
+        })
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_trader,
+        ))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            require_auth,
+        ));
+
     Router::new()
         .merge(auth_routes)
         .merge(public_routes)
         .merge(protected_routes)
         .merge(trader_routes)
+        .merge(config_routes)
         .merge(admin_routes)
         // Swagger UI (public for development)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

@@ -49,6 +49,7 @@ import type {
   CreateDemoPositionRequest,
   UpdateDemoPositionRequest,
   DemoBalance,
+  ServiceStatus,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -559,6 +560,10 @@ class ApiClient {
 
   async getOptimizerStatus(workspaceId: string): Promise<OptimizerStatus> {
     return this.request<OptimizerStatus>(`/api/v1/workspaces/${workspaceId}/optimizer-status`);
+  }
+
+  async getServiceStatus(workspaceId: string): Promise<ServiceStatus> {
+    return this.request<ServiceStatus>(`/api/v1/workspaces/${workspaceId}/service-status`);
   }
 
   // Workspace Invites

@@ -7,12 +7,15 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::sync::Arc;
+use url::Url;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use auth::{AuditAction, Claims};
 
+use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -45,6 +48,12 @@ pub struct WorkspaceResponse {
     pub min_trades_30d: Option<i32>,
     pub trading_wallet_address: Option<String>,
     pub walletconnect_project_id: Option<String>,
+    pub polygon_rpc_url: Option<String>,
+    /// Masked alchemy API key (shows only last 4 chars).
+    pub alchemy_api_key: Option<String>,
+    pub arb_auto_execute: bool,
+    pub copy_trading_enabled: bool,
+    pub live_trading_enabled: bool,
     pub my_role: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -96,6 +105,11 @@ pub struct UpdateWorkspaceRequest {
     pub min_win_rate: Option<Decimal>,
     pub min_trades_30d: Option<i32>,
     pub walletconnect_project_id: Option<String>,
+    pub polygon_rpc_url: Option<String>,
+    pub alchemy_api_key: Option<String>,
+    pub arb_auto_execute: Option<bool>,
+    pub copy_trading_enabled: Option<bool>,
+    pub live_trading_enabled: Option<bool>,
 }
 
 /// Workspace member response.
@@ -143,6 +157,11 @@ struct WorkspaceDetailRow {
     min_trades_30d: Option<i32>,
     trading_wallet_address: Option<String>,
     walletconnect_project_id: Option<String>,
+    polygon_rpc_url: Option<String>,
+    alchemy_api_key: Option<String>,
+    arb_auto_execute: bool,
+    copy_trading_enabled: bool,
+    live_trading_enabled: bool,
     role: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -284,7 +303,12 @@ pub async fn get_workspace(
             w.id, w.name, w.description, w.setup_mode, w.total_budget, w.reserved_cash_pct,
             w.auto_optimize_enabled, w.optimization_interval_hours,
             w.min_roi_30d, w.min_sharpe, w.min_win_rate, w.min_trades_30d,
-            w.trading_wallet_address, w.walletconnect_project_id, wm.role, w.created_at, w.updated_at
+            w.trading_wallet_address, w.walletconnect_project_id,
+            w.polygon_rpc_url, w.alchemy_api_key,
+            COALESCE(w.arb_auto_execute, false) as arb_auto_execute,
+            COALESCE(w.copy_trading_enabled, true) as copy_trading_enabled,
+            COALESCE(w.live_trading_enabled, false) as live_trading_enabled,
+            wm.role, w.created_at, w.updated_at
         FROM workspaces w
         INNER JOIN workspace_members wm ON w.id = wm.workspace_id
         WHERE w.id = $1 AND wm.user_id = $2
@@ -298,6 +322,19 @@ pub async fn get_workspace(
     let workspace = workspace.ok_or_else(|| {
         ApiError::Forbidden("Not a member of this workspace or workspace not found".into())
     })?;
+
+    // Decrypt then mask: show only last 4 chars of alchemy key
+    let masked_alchemy_key = workspace.alchemy_api_key.as_ref().map(|stored| {
+        // Try to decrypt (encrypted values); fall back to treating as plaintext
+        // for backward compatibility with pre-encryption rows.
+        let plaintext =
+            crypto::decrypt_field(stored, &state.encryption_key).unwrap_or_else(|| stored.clone());
+        if plaintext.len() > 4 {
+            format!("••••••{}", &plaintext[plaintext.len() - 4..])
+        } else {
+            "••••••".to_string()
+        }
+    });
 
     Ok(Json(WorkspaceResponse {
         id: workspace.id.to_string(),
@@ -314,6 +351,11 @@ pub async fn get_workspace(
         min_trades_30d: workspace.min_trades_30d,
         trading_wallet_address: workspace.trading_wallet_address,
         walletconnect_project_id: workspace.walletconnect_project_id,
+        polygon_rpc_url: workspace.polygon_rpc_url,
+        alchemy_api_key: masked_alchemy_key,
+        arb_auto_execute: workspace.arb_auto_execute,
+        copy_trading_enabled: workspace.copy_trading_enabled,
+        live_trading_enabled: workspace.live_trading_enabled,
         my_role: workspace.role,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
@@ -369,13 +411,51 @@ pub async fn update_workspace(
         }
     }
 
+    // Validate Alchemy API key if provided
+    if let Some(ref key) = req.alchemy_api_key {
+        if key.is_empty() {
+            return Err(ApiError::BadRequest(
+                "Alchemy API key cannot be empty".into(),
+            ));
+        }
+    }
+
+    // Validate Polygon RPC URL format if provided (SSRF protection)
+    if let Some(ref url_str) = req.polygon_rpc_url {
+        if !url_str.is_empty() {
+            let parsed = Url::parse(url_str)
+                .map_err(|_| ApiError::BadRequest("Invalid Polygon RPC URL format".into()))?;
+
+            if parsed.scheme() != "https" {
+                return Err(ApiError::BadRequest(
+                    "Polygon RPC URL must use HTTPS".into(),
+                ));
+            }
+
+            // Block private/internal network addresses
+            if let Some(host) = parsed.host_str() {
+                if is_private_host(host) {
+                    return Err(ApiError::BadRequest(
+                        "Polygon RPC URL must not point to a private/internal address".into(),
+                    ));
+                }
+            } else {
+                return Err(ApiError::BadRequest(
+                    "Polygon RPC URL must include a valid host".into(),
+                ));
+            }
+        }
+    }
+
     // Build dynamic update
     let now = Utc::now();
     let mut set_parts = vec!["updated_at = $2".to_string()];
     let mut param_idx = 3;
 
+    // SAFETY: The $col arguments below MUST be hardcoded string literals (column names).
+    // Never pass user-controlled input as $col — that would be SQL injection.
     macro_rules! add_param {
-        ($field:ident, $col:expr) => {
+        ($field:ident, $col:literal) => {
             if req.$field.is_some() {
                 set_parts.push(format!("{} = ${}", $col, param_idx));
                 param_idx += 1;
@@ -395,6 +475,11 @@ pub async fn update_workspace(
     add_param!(min_win_rate, "min_win_rate");
     add_param!(min_trades_30d, "min_trades_30d");
     add_param!(walletconnect_project_id, "walletconnect_project_id");
+    add_param!(polygon_rpc_url, "polygon_rpc_url");
+    add_param!(alchemy_api_key, "alchemy_api_key");
+    add_param!(arb_auto_execute, "arb_auto_execute");
+    add_param!(copy_trading_enabled, "copy_trading_enabled");
+    add_param!(live_trading_enabled, "live_trading_enabled");
 
     let query = format!(
         "UPDATE workspaces SET {} WHERE id = $1",
@@ -438,6 +523,23 @@ pub async fn update_workspace(
     }
     if let Some(ref walletconnect_project_id) = req.walletconnect_project_id {
         q = q.bind(walletconnect_project_id);
+    }
+    if let Some(ref polygon_rpc_url) = req.polygon_rpc_url {
+        q = q.bind(polygon_rpc_url);
+    }
+    if let Some(ref alchemy_api_key) = req.alchemy_api_key {
+        let encrypted = crypto::encrypt_field(alchemy_api_key, &state.encryption_key)
+            .ok_or_else(|| ApiError::Internal("Failed to encrypt API key".into()))?;
+        q = q.bind(encrypted);
+    }
+    if let Some(arb_auto_execute) = req.arb_auto_execute {
+        q = q.bind(arb_auto_execute);
+    }
+    if let Some(copy_trading_enabled) = req.copy_trading_enabled {
+        q = q.bind(copy_trading_enabled);
+    }
+    if let Some(live_trading_enabled) = req.live_trading_enabled {
+        q = q.bind(live_trading_enabled);
     }
 
     q.execute(&state.pool).await?;
@@ -928,9 +1030,166 @@ pub async fn get_optimizer_status(
     }))
 }
 
+/// Service status for a single background service.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServiceStatusItem {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Aggregated service status response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServiceStatusResponse {
+    pub harvester: ServiceStatusItem,
+    pub metrics_calculator: ServiceStatusItem,
+    pub copy_trading: ServiceStatusItem,
+    pub arb_executor: ServiceStatusItem,
+    pub live_trading: ServiceStatusItem,
+}
+
+/// Get service status for a workspace.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/service-status",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    responses(
+        (status = 200, description = "Service status", body = ServiceStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member of this workspace"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn get_service_status(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+) -> ApiResult<Json<ServiceStatusResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    // Verify membership
+    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
+    if role.is_none() {
+        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    }
+
+    // Check harvester: enabled by env
+    let harvester_enabled = std::env::var("HARVESTER_ENABLED")
+        .map(|v| v != "false")
+        .unwrap_or(true);
+
+    // Check metrics calculator: enabled by env
+    let metrics_enabled = std::env::var("METRICS_CALCULATOR_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true);
+
+    // Check copy trading: needs POLYGON_RPC_URL or ALCHEMY_API_KEY
+    let has_polygon =
+        std::env::var("POLYGON_RPC_URL").is_ok() || std::env::var("ALCHEMY_API_KEY").is_ok();
+    let copy_trading_env = std::env::var("COPY_TRADING_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    // Check arb executor
+    let arb_enabled = std::env::var("ARB_AUTO_EXECUTE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    // Check live trading
+    let live_trading = std::env::var("LIVE_TRADING")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let has_wallet_key = std::env::var("WALLET_PRIVATE_KEY").is_ok();
+
+    Ok(Json(ServiceStatusResponse {
+        harvester: ServiceStatusItem {
+            running: harvester_enabled,
+            reason: if !harvester_enabled {
+                Some("HARVESTER_ENABLED is set to false".to_string())
+            } else {
+                None
+            },
+        },
+        metrics_calculator: ServiceStatusItem {
+            running: metrics_enabled,
+            reason: if !metrics_enabled {
+                Some("METRICS_CALCULATOR_ENABLED is disabled".to_string())
+            } else {
+                None
+            },
+        },
+        copy_trading: ServiceStatusItem {
+            running: copy_trading_env && has_polygon,
+            reason: if !copy_trading_env {
+                Some("COPY_TRADING_ENABLED is not set".to_string())
+            } else if !has_polygon {
+                Some("POLYGON_RPC_URL or ALCHEMY_API_KEY not configured".to_string())
+            } else {
+                None
+            },
+        },
+        arb_executor: ServiceStatusItem {
+            running: arb_enabled,
+            reason: if !arb_enabled {
+                Some("ARB_AUTO_EXECUTE is disabled".to_string())
+            } else {
+                None
+            },
+        },
+        live_trading: ServiceStatusItem {
+            running: live_trading && has_wallet_key,
+            reason: if !live_trading {
+                Some("LIVE_TRADING is not enabled".to_string())
+            } else if !has_wallet_key {
+                Some("No wallet key configured".to_string())
+            } else {
+                None
+            },
+        },
+    }))
+}
+
 /// Validate WalletConnect project ID format.
 /// Expected: 32-character alphanumeric string (hex).
 fn is_valid_walletconnect_project_id(project_id: &str) -> bool {
     // WalletConnect project IDs are typically 32 character hex strings
     project_id.len() == 32 && project_id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Check if a hostname resolves to a private/internal network address.
+/// Used to prevent SSRF attacks via user-supplied URLs.
+fn is_private_host(host: &str) -> bool {
+    // Check common private hostnames
+    let lower = host.to_lowercase();
+    if lower == "localhost"
+        || lower == "0.0.0.0"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return true;
+    }
+
+    // Check if the host is a private IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()          // 127.0.0.0/8
+                    || v4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                    || v4.is_link_local()  // 169.254.0.0/16
+                    || v4.is_unspecified() // 0.0.0.0
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()          // ::1
+                    || v6.is_unspecified() // ::
+            }
+        };
+    }
+
+    false
 }

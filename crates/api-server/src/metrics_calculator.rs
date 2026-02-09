@@ -90,7 +90,22 @@ impl MetricsCalculator {
             "Starting metrics calculator background job"
         );
 
+        // Wait for the harvester to populate wallet_features with initial data.
+        // The harvester has a 10s startup delay + ~5s per cycle, so 90s gives it
+        // several cycles to accumulate wallets before we try to compute metrics.
+        info!("Metrics calculator waiting 90s for harvester to populate initial data");
+        time::sleep(time::Duration::from_secs(90)).await;
+
+        // Run the first batch immediately after the initial delay
+        info!("Running initial metrics calculation batch");
+        if let Err(e) = self.calculate_batch().await {
+            error!(error = %e, "Failed to calculate initial metrics batch");
+        }
+
+        // Then resume the normal hourly interval
         let mut interval = time::interval(time::Duration::from_secs(self.config.interval_secs));
+        // Consume the first immediate tick so we don't double-run
+        interval.tick().await;
 
         loop {
             interval.tick().await;
@@ -162,7 +177,7 @@ impl MetricsCalculator {
                 -- Never calculated OR stale metrics
                 (wsm.last_computed IS NULL OR wsm.last_computed < $1)
                 -- Has enough trades to be meaningful
-                AND wf.total_trades >= 10
+                AND wf.total_trades >= 5
                 -- Active in the last 90 days
                 AND wf.last_trade >= NOW() - INTERVAL '90 days'
             ORDER BY

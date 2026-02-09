@@ -47,6 +47,8 @@ pub struct AppState {
     pub pool: PgPool,
     /// JWT secret for token validation.
     pub jwt_secret: String,
+    /// Encryption key for sensitive DB fields (alchemy keys, etc.).
+    pub encryption_key: String,
     /// JWT authentication handler.
     pub jwt_auth: Arc<JwtAuth>,
     /// RBAC manager for fine-grained permission checking.
@@ -88,6 +90,9 @@ impl AppState {
         automation_tx: broadcast::Sender<AutomationEvent>,
         arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     ) -> anyhow::Result<Self> {
+        // Resolve encryption key for sensitive DB fields
+        let encryption_key = std::env::var("ENCRYPTION_KEY").unwrap_or_else(|_| jwt_secret.clone());
+
         // Create JWT auth handler
         let jwt_config = JwtConfig {
             secret: jwt_secret.clone(),
@@ -233,6 +238,7 @@ impl AppState {
         Ok(Self {
             pool,
             jwt_secret,
+            encryption_key,
             jwt_auth,
             rbac,
             key_vault,
