@@ -316,7 +316,7 @@ impl WalletDiscovery {
             SELECT
                 wf.address,
                 wf.total_trades,
-                COALESCE(wf.win_rate, 0)::FLOAT8 as win_rate,
+                COALESCE(wsm.win_rate_30d, 0)::FLOAT8 as win_rate,
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
@@ -376,7 +376,7 @@ impl WalletDiscovery {
             SELECT
                 wf.address,
                 wf.total_trades,
-                COALESCE(wf.win_rate, 0)::FLOAT8 as win_rate,
+                COALESCE(wsm.win_rate_30d, 0)::FLOAT8 as win_rate,
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
