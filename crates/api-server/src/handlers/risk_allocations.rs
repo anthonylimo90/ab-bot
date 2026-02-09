@@ -70,7 +70,7 @@ pub async fn recalculate_allocations(
         ));
     }
 
-    let risk_scorer = RiskScorer::new(state.pool.clone(), workspace_id.to_string());
+    let risk_scorer = RiskScorer::new(state.pool.clone(), workspace_id);
 
     let tiers = if req.tier == "all" {
         vec!["active".to_string(), "bench".to_string()]

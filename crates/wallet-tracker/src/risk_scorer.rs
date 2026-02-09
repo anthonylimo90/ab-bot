@@ -9,6 +9,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 /// Wallet risk score and allocation recommendation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +77,7 @@ impl Default for RiskScorerConfig {
 pub struct RiskScorer {
     pool: PgPool,
     config: RiskScorerConfig,
-    workspace_id: String,
+    workspace_id: Uuid,
 }
 
 /// Row structure for fetching wallet metrics from database.
@@ -94,7 +95,7 @@ struct WalletMetricsRow {
 
 impl RiskScorer {
     /// Create a new risk scorer for a specific workspace.
-    pub fn new(pool: PgPool, workspace_id: String) -> Self {
+    pub fn new(pool: PgPool, workspace_id: Uuid) -> Self {
         Self {
             pool,
             config: RiskScorerConfig::default(),
@@ -103,7 +104,7 @@ impl RiskScorer {
     }
 
     /// Create with custom configuration for a specific workspace.
-    pub fn with_config(pool: PgPool, workspace_id: String, config: RiskScorerConfig) -> Self {
+    pub fn with_config(pool: PgPool, workspace_id: Uuid, config: RiskScorerConfig) -> Self {
         Self {
             pool,
             config,
