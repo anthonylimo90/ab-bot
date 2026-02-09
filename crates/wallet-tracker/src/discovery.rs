@@ -316,13 +316,13 @@ impl WalletDiscovery {
             SELECT
                 wf.address,
                 wf.total_trades,
-                COALESCE(wf.win_rate, 0) as win_rate,
+                COALESCE(wf.win_rate, 0)::FLOAT8 as win_rate,
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
                 COALESCE(bs.total_score, 0) as bot_score,
                 COALESCE(bs.classification, 0) as classification,
-                COALESCE(wsm.roi_30d, 0) as roi,
+                COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
                 COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl
             FROM wallet_features wf
             LEFT JOIN bot_scores bs ON bs.address = wf.address
@@ -376,13 +376,13 @@ impl WalletDiscovery {
             SELECT
                 wf.address,
                 wf.total_trades,
-                COALESCE(wf.win_rate, 0) as win_rate,
+                COALESCE(wf.win_rate, 0)::FLOAT8 as win_rate,
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
                 COALESCE(bs.total_score, 0) as bot_score,
                 COALESCE(bs.classification, 0) as classification,
-                COALESCE(wsm.roi_30d, 0) as roi,
+                COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
                 COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl
             FROM wallet_features wf
             LEFT JOIN bot_scores bs ON bs.address = wf.address
