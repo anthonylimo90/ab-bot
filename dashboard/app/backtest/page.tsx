@@ -8,13 +8,15 @@ import { MetricCard } from '@/components/shared/MetricCard';
 import { BacktestChart } from '@/components/charts/BacktestChart';
 import { useBacktest } from '@/hooks/useBacktest';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useModeStore } from '@/stores/mode-store';
 import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
 import { formatCurrency, shortenAddress } from '@/lib/utils';
 import { Play, ChevronDown, Loader2, AlertCircle, History } from 'lucide-react';
 
 export default function BacktestPage() {
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const { mode } = useModeStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
   const { results, history, isRunning, error, runBacktest, loadHistory, loadResult } = useBacktest();
 
   // Date helpers

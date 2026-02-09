@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useWebSocket, ConnectionStatus } from './useWebSocket';
 import { api } from '@/lib/api';
+import { useModeStore } from '@/stores/mode-store';
 import type { Position, PositionUpdate, WebSocketMessage } from '@/types/api';
 
 interface UsePositionsReturn {
@@ -18,12 +19,19 @@ interface UsePositionsReturn {
 }
 
 export function usePositions(): UsePositionsReturn {
+  const { mode } = useModeStore();
   const [positions, setPositions] = useState<Position[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   // Fetch positions from API
   const fetchPositions = useCallback(async () => {
+    // Only fetch in live mode
+    if (mode !== 'live') {
+      setIsLoading(false);
+      return;
+    }
+
     try {
       setIsLoading(true);
       setError(null);
@@ -35,7 +43,7 @@ export function usePositions(): UsePositionsReturn {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [mode]);
 
   // Handle WebSocket position updates
   const handleMessage = useCallback((message: WebSocketMessage) => {
@@ -75,11 +83,11 @@ export function usePositions(): UsePositionsReturn {
     });
   }, []);
 
-  // WebSocket connection for live updates
+  // WebSocket connection for live updates (only in live mode)
   const { status } = useWebSocket({
     channel: 'positions',
     onMessage: handleMessage,
-    enabled: true,
+    enabled: mode === 'live',
   });
 
   // Initial fetch

@@ -127,12 +127,12 @@ export default function TradingPage() {
   // Get tab from URL, default to 'active'
   const currentTab = searchParams.get('tab') || 'active';
 
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
-  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id);
-  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id);
-  const removeMutation = useRemoveAllocationMutation(currentWorkspace?.id);
-  const pinMutation = usePinAllocationMutation(currentWorkspace?.id);
-  const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id);
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
+  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id, mode);
+  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id, mode);
+  const removeMutation = useRemoveAllocationMutation(currentWorkspace?.id, mode);
+  const pinMutation = usePinAllocationMutation(currentWorkspace?.id, mode);
+  const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id, mode);
   const activeWallets = allocations.filter((a) => a.tier === 'active').map(toTradingWallet);
   const benchWallets = allocations.filter((a) => a.tier === 'bench').map(toTradingWallet);
   const isRosterFull = () => activeWallets.length >= 5;

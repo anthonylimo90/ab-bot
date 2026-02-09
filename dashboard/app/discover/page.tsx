@@ -24,6 +24,7 @@ import {
 } from '@/hooks/queries/useAllocationsQuery';
 import { useToastStore } from '@/stores/toast-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useModeStore } from '@/stores/mode-store';
 import { shortenAddress } from '@/lib/utils';
 import { Star, Plus, Check, Loader2, Search } from 'lucide-react';
 import type { CopyBehavior, DiscoveredWallet, PredictionCategory, WorkspaceAllocation } from '@/types/api';
@@ -81,12 +82,13 @@ type TimePeriod = '7d' | '30d' | '90d';
 export default function DiscoverPage() {
   const toast = useToastStore();
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
-  const addAllocationMutation = useAddAllocationMutation(currentWorkspace?.id);
-  const removeAllocationMutation = useRemoveAllocationMutation(currentWorkspace?.id);
-  const promoteAllocationMutation = usePromoteAllocationMutation(currentWorkspace?.id);
-  const demoteAllocationMutation = useDemoteAllocationMutation(currentWorkspace?.id);
-  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id);
+  const { mode } = useModeStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
+  const addAllocationMutation = useAddAllocationMutation(currentWorkspace?.id, mode);
+  const removeAllocationMutation = useRemoveAllocationMutation(currentWorkspace?.id, mode);
+  const promoteAllocationMutation = usePromoteAllocationMutation(currentWorkspace?.id, mode);
+  const demoteAllocationMutation = useDemoteAllocationMutation(currentWorkspace?.id, mode);
+  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id, mode);
 
   // Filter state
   const [sortBy, setSortBy] = useState<SortField>('roi');
@@ -109,7 +111,7 @@ export default function DiscoverPage() {
   const rosterCount = allocations.filter((a) => a.tier === 'active').length;
 
   // Fetch wallets from API
-  const { data: apiWallets, isLoading, error, refetch } = useDiscoverWalletsQuery({
+  const { data: apiWallets, isLoading, error, refetch } = useDiscoverWalletsQuery(mode, {
     sortBy: sortBy,
     period: timePeriod,
     minTrades: minTrades === '0' ? undefined : parseInt(minTrades),

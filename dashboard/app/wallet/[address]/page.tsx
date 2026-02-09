@@ -15,6 +15,7 @@ import {
   usePromoteAllocationMutation,
 } from '@/hooks/queries/useAllocationsQuery';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useModeStore } from '@/stores/mode-store';
 import { shortenAddress, formatCurrency, ratioOrPercentToPercent } from '@/lib/utils';
 import {
   ArrowLeft,
@@ -57,15 +58,16 @@ export default function WalletDetailPage() {
   const address = params.address as string;
   const toast = useToastStore();
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
-  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id);
-  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id);
+  const { mode } = useModeStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
+  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id, mode);
+  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id, mode);
   const { balance, positions } = useDemoPortfolioStore();
 
   // Fetch wallet data from API
-  const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(address);
-  const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(address);
-  const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery({
+  const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(mode, address);
+  const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(mode, address);
+  const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery(mode, {
     wallet: address,
     limit: 10,
     workspaceId: currentWorkspace?.id,
