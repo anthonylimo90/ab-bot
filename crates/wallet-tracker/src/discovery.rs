@@ -320,8 +320,8 @@ impl WalletDiscovery {
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
-                COALESCE(bs.total_score, 0) as bot_score,
-                COALESCE(bs.classification, 0) as classification,
+                COALESCE(bs.total_score, 0)::INT4 as bot_score,
+                COALESCE(bs.classification, 0)::INT2 as classification,
                 COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
                 COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl
             FROM wallet_features wf
@@ -380,8 +380,8 @@ impl WalletDiscovery {
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
-                COALESCE(bs.total_score, 0) as bot_score,
-                COALESCE(bs.classification, 0) as classification,
+                COALESCE(bs.total_score, 0)::INT4 as bot_score,
+                COALESCE(bs.classification, 0)::INT2 as classification,
                 COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
                 COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl
             FROM wallet_features wf
