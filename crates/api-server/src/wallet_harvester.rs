@@ -130,51 +130,33 @@ async fn harvest_cycle(
     let now = chrono::Utc::now();
 
     for trade in &trades {
-        let price: Decimal = trade.price.parse().unwrap_or(Decimal::ZERO);
-        let size: Decimal = trade.size.parse().unwrap_or(Decimal::ZERO);
+        // Data API returns f64 for price and size
+        let price = Decimal::from_f64_retain(trade.price).unwrap_or(Decimal::ZERO);
+        let size = Decimal::from_f64_retain(trade.size).unwrap_or(Decimal::ZERO);
         let volume = price * size;
 
-        let timestamp = trade
-            .created_at
-            .as_deref()
-            .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
-            .or_else(|| {
-                trade
-                    .match_time
-                    .as_deref()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-            })
-            .unwrap_or(now);
+        // Data API returns Unix timestamp as i64
+        let timestamp = chrono::DateTime::from_timestamp(trade.timestamp, 0).unwrap_or(now);
 
-        // Collect all addresses from this trade
-        let mut addrs = Vec::with_capacity(2);
-        let maker = trade.maker_address.to_lowercase();
-        if !maker.is_empty() && maker.starts_with("0x") {
-            addrs.push(maker);
-        }
-        if let Some(taker) = &trade.trader_address {
-            let taker = taker.to_lowercase();
-            if !taker.is_empty() && taker.starts_with("0x") {
-                addrs.push(taker);
-            }
+        // Data API returns wallet_address (proxyWallet)
+        let wallet_addr = trade.wallet_address.to_lowercase();
+        if wallet_addr.is_empty() || !wallet_addr.starts_with("0x") {
+            continue;
         }
 
-        for addr in addrs {
-            let entry = stats_map.entry(addr).or_insert(WalletTradeStats {
-                trade_count: 0,
-                total_volume: Decimal::ZERO,
-                first_seen: timestamp,
-                last_seen: timestamp,
-            });
-            entry.trade_count += 1;
-            entry.total_volume += volume;
-            if timestamp < entry.first_seen {
-                entry.first_seen = timestamp;
-            }
-            if timestamp > entry.last_seen {
-                entry.last_seen = timestamp;
-            }
+        let entry = stats_map.entry(wallet_addr).or_insert(WalletTradeStats {
+            trade_count: 0,
+            total_volume: Decimal::ZERO,
+            first_seen: timestamp,
+            last_seen: timestamp,
+        });
+        entry.trade_count += 1;
+        entry.total_volume += volume;
+        if timestamp < entry.first_seen {
+            entry.first_seen = timestamp;
+        }
+        if timestamp > entry.last_seen {
+            entry.last_seen = timestamp;
         }
     }
 
@@ -198,13 +180,63 @@ async fn harvest_cycle(
         }
     }
 
+    // 4. Store individual trades for profitability analysis
+    let mut trades_inserted = 0u32;
+    for trade in &trades {
+        let wallet_addr = trade.wallet_address.to_lowercase();
+        if wallet_addr.is_empty() || !wallet_addr.starts_with("0x") {
+            continue;
+        }
+
+        let price = Decimal::from_f64_retain(trade.price).unwrap_or(Decimal::ZERO);
+        let size = Decimal::from_f64_retain(trade.size).unwrap_or(Decimal::ZERO);
+        let value = price * size;
+        let timestamp = chrono::DateTime::from_timestamp(trade.timestamp, 0).unwrap_or(now);
+
+        // Insert trade with ON CONFLICT DO NOTHING for deduplication
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO wallet_trades (
+                transaction_hash, wallet_address, asset_id, condition_id,
+                side, price, quantity, value, timestamp,
+                title, slug, outcome
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (transaction_hash) DO NOTHING
+            "#,
+            trade.transaction_hash,
+            wallet_addr,
+            trade.asset_id,
+            trade.condition_id,
+            trade.side,
+            price,
+            size,
+            value,
+            timestamp,
+            trade.title,
+            trade.slug,
+            trade.outcome,
+        )
+        .execute(wallet_repo.pool())
+        .await;
+
+        match result {
+            Ok(_) => trades_inserted += 1,
+            Err(e) => {
+                debug!(tx_hash = %trade.transaction_hash, error = %e, "Failed to insert trade");
+            }
+        }
+    }
+
     info!(
         harvested = harvested,
         total_clob_trades = trade_count,
         unique_addresses = stats_map.len(),
-        "Harvested {} new wallets from {} CLOB trades",
+        trades_inserted = trades_inserted,
+        "Harvested {} new wallets from {} trades ({} trades stored)",
         harvested,
-        trade_count
+        trade_count,
+        trades_inserted
     );
 
     Ok(())

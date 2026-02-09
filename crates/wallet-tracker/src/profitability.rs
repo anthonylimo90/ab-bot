@@ -369,6 +369,7 @@ impl ProfitabilityAnalyzer {
     async fn fetch_trades(&self, address: &str, period: TimePeriod) -> Result<Vec<TradeRecord>> {
         let cutoff = period.to_days().map(|d| Utc::now() - Duration::days(d));
 
+        // Try copy_trade_history first (for actual copy trading performance)
         let query = if let Some(cutoff_date) = cutoff {
             sqlx::query(
                 r#"
@@ -407,7 +408,7 @@ impl ProfitabilityAnalyzer {
             .await?
         };
 
-        let trades: Vec<TradeRecord> = query
+        let mut trades: Vec<TradeRecord> = query
             .iter()
             .map(|row| {
                 use sqlx::Row;
@@ -439,6 +440,79 @@ impl ProfitabilityAnalyzer {
                 }
             })
             .collect();
+
+        // If no copy trades found, fall back to wallet_trades (for discovery/evaluation)
+        if trades.is_empty() {
+            let wallet_query = if let Some(cutoff_date) = cutoff {
+                sqlx::query(
+                    r#"
+                    SELECT asset_id,
+                           side,
+                           price,
+                           quantity,
+                           value,
+                           timestamp
+                    FROM wallet_trades
+                    WHERE LOWER(wallet_address) = LOWER($1)
+                      AND timestamp >= $2
+                    ORDER BY timestamp
+                    "#,
+                )
+                .bind(address)
+                .bind(cutoff_date)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query(
+                    r#"
+                    SELECT asset_id,
+                           side,
+                           price,
+                           quantity,
+                           value,
+                           timestamp
+                    FROM wallet_trades
+                    WHERE LOWER(wallet_address) = LOWER($1)
+                    ORDER BY timestamp
+                    "#,
+                )
+                .bind(address)
+                .fetch_all(&self.pool)
+                .await?
+            };
+
+            trades = wallet_query
+                .iter()
+                .map(|row| {
+                    use sqlx::Row;
+                    let side_str: String = row.get("side");
+                    let side = if side_str.to_uppercase() == "BUY" {
+                        TradeSide::Buy
+                    } else {
+                        TradeSide::Sell
+                    };
+                    let price: Decimal = row.get("price");
+                    let quantity: Decimal = row.get("quantity");
+
+                    // Use signed cashflow approach for PnL calculation
+                    let pnl = match side {
+                        TradeSide::Buy => -(quantity * price), // Spending money
+                        TradeSide::Sell => quantity * price,   // Receiving money
+                    };
+
+                    TradeRecord {
+                        timestamp: row.get("timestamp"),
+                        market_id: row.get("asset_id"),
+                        side,
+                        entry_price: price,
+                        exit_price: None,
+                        quantity,
+                        pnl: Some(pnl),
+                        fees: Decimal::ZERO,
+                    }
+                })
+                .collect();
+        }
 
         Ok(trades)
     }

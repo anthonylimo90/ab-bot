@@ -214,8 +214,9 @@ pub async fn get_live_trades(
             let trades: Vec<LiveTrade> = clob_trades
                 .into_iter()
                 .filter_map(|ct| {
-                    let price = ct.price.parse::<Decimal>().ok()?;
-                    let quantity = ct.size.parse::<Decimal>().ok()?;
+                    // Data API returns f64 for price and size
+                    let price = Decimal::from_f64_retain(ct.price)?;
+                    let quantity = Decimal::from_f64_retain(ct.size)?;
                     let value = price * quantity;
 
                     if value < min_val {
@@ -224,38 +225,28 @@ pub async fn get_live_trades(
 
                     // Filter by wallet if requested
                     if let Some(ref wallet_filter) = query.wallet {
-                        let maker_match =
-                            ct.maker_address.to_lowercase() == wallet_filter.to_lowercase();
-                        let taker_match = ct
-                            .trader_address
-                            .as_ref()
-                            .map(|t| t.to_lowercase() == wallet_filter.to_lowercase())
-                            .unwrap_or(false);
-                        if !maker_match && !taker_match {
+                        let wallet_match =
+                            ct.wallet_address.to_lowercase() == wallet_filter.to_lowercase();
+                        if !wallet_match {
                             return None;
                         }
                     }
 
-                    let timestamp = ct
-                        .created_at
-                        .as_deref()
-                        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                        .or_else(|| {
-                            ct.match_time
-                                .as_deref()
-                                .and_then(|s| s.parse::<i64>().ok())
-                                .and_then(|ts| DateTime::from_timestamp(ts, 0))
-                        })
-                        .unwrap_or_else(Utc::now);
+                    // Data API returns Unix timestamp as i64
+                    let timestamp =
+                        DateTime::from_timestamp(ct.timestamp, 0).unwrap_or_else(Utc::now);
 
                     Some(LiveTrade {
-                        wallet_address: ct.maker_address.clone(),
+                        wallet_address: ct.wallet_address.clone(),
                         wallet_label: None,
-                        tx_hash: ct.id.clone(),
+                        tx_hash: ct.transaction_hash.clone(),
                         timestamp,
-                        market_id: ct.market.clone(),
-                        market_question: None,
-                        outcome: ct.asset_id.clone(),
+                        market_id: ct
+                            .condition_id
+                            .clone()
+                            .unwrap_or_else(|| ct.asset_id.clone()),
+                        market_question: ct.title.clone(),
+                        outcome: ct.outcome.clone().unwrap_or_else(|| ct.asset_id.clone()),
                         direction: ct.side.to_lowercase(),
                         price,
                         quantity,
