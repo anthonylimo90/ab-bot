@@ -203,13 +203,13 @@ pub async fn get_live_trades(
     State(state): State<Arc<AppState>>,
     Query(query): Query<LiveTradesQuery>,
 ) -> ApiResult<Json<Vec<LiveTrade>>> {
-    // Try fetching real trades from CLOB API
+    // Fetch real trades from Data API
     match state
         .clob_client
         .get_recent_trades(query.limit as u32, None)
         .await
     {
-        Ok(clob_trades) if !clob_trades.is_empty() => {
+        Ok(clob_trades) => {
             let min_val = query.min_value.unwrap_or(Decimal::ZERO);
             let trades: Vec<LiveTrade> = clob_trades
                 .into_iter()
@@ -255,21 +255,16 @@ pub async fn get_live_trades(
                 })
                 .collect();
 
-            if !trades.is_empty() {
-                return Ok(Json(trades));
+            if trades.is_empty() {
+                tracing::warn!("Live trades endpoint returning empty — no trades matched filters");
             }
-        }
-        Ok(_) => {
-            tracing::debug!("CLOB returned no trades, falling back to mock data");
+            Ok(Json(trades))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "CLOB trade fetch failed, falling back to mock data");
+            tracing::warn!(error = %e, "Data API trade fetch failed, returning empty");
+            Ok(Json(Vec::new()))
         }
     }
-
-    // Fallback: generate realistic mock trades for demo
-    let trades = generate_mock_trades(query.limit as usize, query.min_value);
-    Ok(Json(trades))
 }
 
 /// Discover top-performing wallets.
@@ -336,12 +331,12 @@ pub async fn discover_wallets(
             Ok(Json(wallets))
         }
         Ok(_) => {
-            tracing::debug!("WalletDiscovery returned empty, falling back to mock data");
-            Ok(Json(generate_mock_wallets(query.limit as usize)))
+            tracing::warn!("Wallet discovery returned empty — metrics may not be computed yet");
+            Ok(Json(Vec::new()))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "WalletDiscovery query failed, falling back to mock data");
-            Ok(Json(generate_mock_wallets(query.limit as usize)))
+            tracing::warn!(error = %e, "Wallet discovery query failed, returning empty");
+            Ok(Json(Vec::new()))
         }
     }
 }
@@ -434,122 +429,6 @@ pub async fn simulate_demo_pnl(
     Ok(Json(simulation))
 }
 
-// Mock data generators
-
-fn generate_mock_trades(count: usize, min_value: Option<Decimal>) -> Vec<LiveTrade> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-
-    let wallets = [
-        (
-            "0x1234567890abcdef1234567890abcdef12345678",
-            Some("WhaleTrader"),
-        ),
-        (
-            "0xabcdef1234567890abcdef1234567890abcdef12",
-            Some("SharpBettor"),
-        ),
-        ("0x5678901234abcdef5678901234abcdef56789012", None),
-        (
-            "0x9876543210fedcba9876543210fedcba98765432",
-            Some("PoliticsGuru"),
-        ),
-        ("0xfedcba9876543210fedcba9876543210fedcba98", None),
-    ];
-
-    let markets = [
-        ("0xmarket1", "Will Trump win the 2024 election?"),
-        ("0xmarket2", "Will BTC reach $100k by end of year?"),
-        ("0xmarket3", "Will there be a Fed rate cut in Q1?"),
-        ("0xmarket4", "Will AI breakthrough happen in 2024?"),
-        ("0xmarket5", "Super Bowl winner: Chiefs vs 49ers"),
-    ];
-
-    let min_val = min_value.unwrap_or(Decimal::ZERO);
-    let now = Utc::now();
-
-    (0..count)
-        .filter_map(|i| {
-            let (wallet, label) = wallets[rng.gen_range(0..wallets.len())];
-            let (market_id, question) = markets[rng.gen_range(0..markets.len())];
-
-            let price = Decimal::new(rng.gen_range(15..85), 2);
-            let quantity = Decimal::new(rng.gen_range(50..2000), 0);
-            let value = price * quantity;
-
-            if value < min_val {
-                return None;
-            }
-
-            Some(LiveTrade {
-                wallet_address: wallet.to_string(),
-                wallet_label: label.map(String::from),
-                tx_hash: format!("0x{:064x}", rng.gen::<u64>()),
-                timestamp: now
-                    - chrono::Duration::seconds(rng.gen_range(0..3600) + (i as i64 * 60)),
-                market_id: market_id.to_string(),
-                market_question: Some(question.to_string()),
-                outcome: if rng.gen_bool(0.5) { "Yes" } else { "No" }.to_string(),
-                direction: if rng.gen_bool(0.6) { "buy" } else { "sell" }.to_string(),
-                price,
-                quantity,
-                value,
-            })
-        })
-        .collect()
-}
-
-fn generate_mock_wallets(count: usize) -> Vec<DiscoveredWallet> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-
-    (0..count)
-        .map(|i| {
-            let base_roi = 50.0 - (i as f64 * 3.0) + rng.gen_range(-5.0..5.0);
-            let roi_30d =
-                Decimal::from_f64_retain(base_roi.max(5.0)).unwrap_or(Decimal::new(20, 0));
-            let roi_7d = roi_30d * Decimal::new(30, 2); // ~30% of monthly
-            let roi_90d = roi_30d * Decimal::new(250, 2); // ~2.5x monthly
-
-            let win_rate = Decimal::new(rng.gen_range(52..78), 0);
-            let trades = rng.gen_range(30..300);
-
-            let prediction = match i {
-                0..=2 => PredictionCategory::HighPotential,
-                3..=7 => PredictionCategory::Moderate,
-                _ => PredictionCategory::LowPotential,
-            };
-
-            let confidence = match prediction {
-                PredictionCategory::HighPotential => rng.gen_range(75..95),
-                PredictionCategory::Moderate => rng.gen_range(55..75),
-                PredictionCategory::LowPotential => rng.gen_range(35..55),
-                PredictionCategory::InsufficientData => rng.gen_range(10..35),
-            };
-
-            DiscoveredWallet {
-                address: format!(
-                    "0x{:040x}",
-                    rng.gen::<u64>() as u128 * rng.gen::<u64>() as u128
-                ),
-                rank: (i + 1) as i32,
-                roi_7d,
-                roi_30d,
-                roi_90d,
-                sharpe_ratio: Decimal::new(rng.gen_range(100..280), 2),
-                total_trades: trades,
-                win_rate,
-                max_drawdown: Decimal::new(-rng.gen_range(5..25), 0),
-                prediction,
-                confidence,
-                is_tracked: i < 2, // First 2 are tracked for demo
-                trades_24h: rng.gen_range(0..15),
-                total_pnl: Decimal::new(rng.gen_range(500..50000), 2),
-            }
-        })
-        .collect()
-}
-
 fn generate_simulation(amount: Decimal, period: &str, _wallets: Option<&str>) -> DemoPnlSimulation {
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -624,29 +503,6 @@ fn generate_simulation(amount: Decimal, period: &str, _wallets: Option<&str>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_generate_mock_trades() {
-        let trades = generate_mock_trades(10, None);
-        assert_eq!(trades.len(), 10);
-
-        for trade in &trades {
-            assert!(trade.wallet_address.starts_with("0x"));
-            assert!(trade.price > Decimal::ZERO);
-            assert!(trade.quantity > Decimal::ZERO);
-        }
-    }
-
-    #[test]
-    fn test_generate_mock_wallets() {
-        let wallets = generate_mock_wallets(5);
-        assert_eq!(wallets.len(), 5);
-
-        for (i, wallet) in wallets.iter().enumerate() {
-            assert_eq!(wallet.rank, (i + 1) as i32);
-            assert!(wallet.address.starts_with("0x"));
-        }
-    }
 
     #[test]
     fn test_simulation_pnl() {
