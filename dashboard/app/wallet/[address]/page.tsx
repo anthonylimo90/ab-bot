@@ -83,18 +83,24 @@ export default function WalletDetailPage() {
   // Merge API data with stored wallet data
   const wallet = useMemo(() => {
     if (storedWallet) {
+      // Use backtest data if available, otherwise fall back to discovery data
+      const hasBacktest = storedWallet.backtest_roi != null && storedWallet.backtest_roi !== 0;
       return {
         address: storedWallet.wallet_address,
         label: storedWallet.wallet_label,
         tier: storedWallet.tier,
-        roi30d: ratioOrPercentToPercent(storedWallet.backtest_roi),
-        roi7d: 0,
-        roi90d: 0,
-        sharpe: storedWallet.backtest_sharpe ?? 0,
-        winRate: ratioOrPercentToPercent(storedWallet.backtest_win_rate),
-        trades: 0,
-        maxDrawdown: 0,
-        confidence: storedWallet.confidence_score ?? 0,
+        roi30d: hasBacktest
+          ? ratioOrPercentToPercent(storedWallet.backtest_roi)
+          : (discoveredWallet ? Number(discoveredWallet.roi_30d) : 0),
+        roi7d: discoveredWallet ? Number(discoveredWallet.roi_7d) : 0,
+        roi90d: discoveredWallet ? Number(discoveredWallet.roi_90d) : 0,
+        sharpe: storedWallet.backtest_sharpe ?? (discoveredWallet ? Number(discoveredWallet.sharpe_ratio) : 0),
+        winRate: hasBacktest
+          ? ratioOrPercentToPercent(storedWallet.backtest_win_rate)
+          : (discoveredWallet ? Number(discoveredWallet.win_rate) : 0),
+        trades: discoveredWallet?.total_trades ?? 0,
+        maxDrawdown: discoveredWallet ? Number(discoveredWallet.max_drawdown) : 0,
+        confidence: storedWallet.confidence_score ?? (discoveredWallet?.confidence ?? 0),
         copySettings: {
           copy_behavior: storedWallet.copy_behavior,
           allocation_pct: storedWallet.allocation_pct,
