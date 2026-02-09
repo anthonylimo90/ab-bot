@@ -13,6 +13,7 @@ import { formatCurrency, cn } from '@/lib/utils';
 import { Settings, Info } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useModeStore } from '@/stores/mode-store';
 import { useActiveAllocationsQuery, useUpdateAllocationMutation } from '@/hooks/queries/useAllocationsQuery';
 import type { CopyBehavior } from '@/types/api';
 
@@ -36,8 +37,9 @@ export function WalletAllocationSection({
   isDemo = false,
 }: WalletAllocationSectionProps) {
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: activeWallets = [] } = useActiveAllocationsQuery(currentWorkspace?.id);
-  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id);
+  const { mode } = useModeStore();
+  const { data: activeWallets = [] } = useActiveAllocationsQuery(currentWorkspace?.id, mode);
+  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id, mode);
 
   // Find wallet in roster
   const wallet = activeWallets.find(

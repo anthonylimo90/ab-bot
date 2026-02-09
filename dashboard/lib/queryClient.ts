@@ -1,4 +1,5 @@
 import { QueryClient } from '@tanstack/react-query';
+import type { TradingMode } from '@/stores/mode-store';
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -25,21 +26,21 @@ export const queryClient = new QueryClient({
 export const queryKeys = {
   // Positions
   positions: {
-    all: ['positions'] as const,
-    list: (filters?: { status?: string; market?: string }) =>
-      [...queryKeys.positions.all, 'list', filters] as const,
-    detail: (id: string) => [...queryKeys.positions.all, 'detail', id] as const,
+    all: (mode: TradingMode) => ['positions', mode] as const,
+    list: (mode: TradingMode, filters?: { status?: string; market?: string }) =>
+      [...queryKeys.positions.all(mode), 'list', filters] as const,
+    detail: (mode: TradingMode, id: string) => [...queryKeys.positions.all(mode), 'detail', id] as const,
   },
 
   // Wallets
   wallets: {
-    all: ['wallets'] as const,
-    roster: () => [...queryKeys.wallets.all, 'roster'] as const,
-    bench: () => [...queryKeys.wallets.all, 'bench'] as const,
-    detail: (address: string) =>
-      [...queryKeys.wallets.all, 'detail', address] as const,
-    metrics: (address: string) =>
-      [...queryKeys.wallets.all, 'metrics', address] as const,
+    all: (mode: TradingMode) => ['wallets', mode] as const,
+    roster: (mode: TradingMode) => [...queryKeys.wallets.all(mode), 'roster'] as const,
+    bench: (mode: TradingMode) => [...queryKeys.wallets.all(mode), 'bench'] as const,
+    detail: (mode: TradingMode, address: string) =>
+      [...queryKeys.wallets.all(mode), 'detail', address] as const,
+    metrics: (mode: TradingMode, address: string) =>
+      [...queryKeys.wallets.all(mode), 'metrics', address] as const,
   },
 
   // Markets
@@ -54,25 +55,25 @@ export const queryKeys = {
 
   // Discovery
   discover: {
-    all: ['discover'] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.discover.all, 'workspace', workspaceId] as const,
-    wallets: (filters?: unknown, workspaceId?: string) => [
-      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+    all: (mode: TradingMode) => ['discover', mode] as const,
+    byWorkspace: (mode: TradingMode, workspaceId: string) =>
+      [...queryKeys.discover.all(mode), 'workspace', workspaceId] as const,
+    wallets: (mode: TradingMode, filters?: unknown, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(mode, workspaceId) : queryKeys.discover.all(mode)),
       'wallets',
       filters,
     ] as const,
-    leaderboard: (workspaceId?: string) => [
-      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+    leaderboard: (mode: TradingMode, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(mode, workspaceId) : queryKeys.discover.all(mode)),
       'leaderboard',
     ] as const,
-    trades: (params?: { wallet?: string; limit?: number; minValue?: number }, workspaceId?: string) => [
-      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+    trades: (mode: TradingMode, params?: { wallet?: string; limit?: number; minValue?: number }, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(mode, workspaceId) : queryKeys.discover.all(mode)),
       'trades',
       params,
     ] as const,
-    simulate: (params?: { amount?: number; period?: string; wallets?: string[] }, workspaceId?: string) => [
-      ...(workspaceId ? queryKeys.discover.byWorkspace(workspaceId) : queryKeys.discover.all),
+    simulate: (mode: TradingMode, params?: { amount?: number; period?: string; wallets?: string[] }, workspaceId?: string) => [
+      ...(workspaceId ? queryKeys.discover.byWorkspace(mode, workspaceId) : queryKeys.discover.all(mode)),
       'simulate',
       params,
     ] as const,
@@ -80,10 +81,10 @@ export const queryKeys = {
 
   // Portfolio
   portfolio: {
-    all: ['portfolio'] as const,
-    stats: () => [...queryKeys.portfolio.all, 'stats'] as const,
-    history: (period: string) =>
-      [...queryKeys.portfolio.all, 'history', period] as const,
+    all: (mode: TradingMode) => ['portfolio', mode] as const,
+    stats: (mode: TradingMode) => [...queryKeys.portfolio.all(mode), 'stats'] as const,
+    history: (mode: TradingMode, period: string) =>
+      [...queryKeys.portfolio.all(mode), 'history', period] as const,
   },
 
   // Backtest
@@ -102,23 +103,23 @@ export const queryKeys = {
 
   // Allocations
   allocations: {
-    all: ['allocations'] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.allocations.all, 'workspace', workspaceId] as const,
-    list: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), 'list'] as const,
-    active: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), 'active'] as const,
-    bench: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), 'bench'] as const,
+    all: (mode: TradingMode) => ['allocations', mode] as const,
+    byWorkspace: (mode: TradingMode, workspaceId: string) =>
+      [...queryKeys.allocations.all(mode), 'workspace', workspaceId] as const,
+    list: (mode: TradingMode, workspaceId: string) =>
+      [...queryKeys.allocations.byWorkspace(mode, workspaceId), 'list'] as const,
+    active: (mode: TradingMode, workspaceId: string) =>
+      [...queryKeys.allocations.byWorkspace(mode, workspaceId), 'active'] as const,
+    bench: (mode: TradingMode, workspaceId: string) =>
+      [...queryKeys.allocations.byWorkspace(mode, workspaceId), 'bench'] as const,
   },
 
   // Rotation history
   rotationHistory: {
-    all: ['rotation-history'] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.rotationHistory.all, 'workspace', workspaceId] as const,
-    list: (workspaceId: string, params?: { unacknowledgedOnly?: boolean }) =>
-      [...queryKeys.rotationHistory.byWorkspace(workspaceId), 'list', params] as const,
+    all: (mode: TradingMode) => ['rotation-history', mode] as const,
+    byWorkspace: (mode: TradingMode, workspaceId: string) =>
+      [...queryKeys.rotationHistory.all(mode), 'workspace', workspaceId] as const,
+    list: (mode: TradingMode, workspaceId: string, params?: { unacknowledgedOnly?: boolean }) =>
+      [...queryKeys.rotationHistory.byWorkspace(mode, workspaceId), 'list', params] as const,
   },
 } as const;

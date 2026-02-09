@@ -39,6 +39,7 @@ interface DemoPortfolioStore {
   updatePrice: (id: string, price: number) => void;
   updatePrices: (updates: { marketId: string; outcome: 'yes' | 'no'; price: number }[]) => void;
   deletePosition: (id: string) => Promise<void>;
+  clearPositions: () => void;
 
   // Balance management
   updateBalance: (amount: number) => Promise<void>;
@@ -253,6 +254,13 @@ export const useDemoPortfolioStore = create<DemoPortfolioStore>()((set, get) => 
       });
       throw err;
     }
+  },
+
+  clearPositions: () => {
+    set({
+      positions: [],
+      closedPositions: [],
+    });
   },
 
   updateBalance: async (amount) => {

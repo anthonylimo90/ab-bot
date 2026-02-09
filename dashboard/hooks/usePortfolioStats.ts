@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useWebSocket, ConnectionStatus } from './useWebSocket';
 import { api } from '@/lib/api';
+import { useModeStore } from '@/stores/mode-store';
 import type { PortfolioStats, PortfolioHistory, WebSocketMessage, PositionUpdate } from '@/types/api';
 
 interface UsePortfolioStatsReturn {
@@ -31,6 +32,7 @@ const defaultStats: PortfolioStats = {
 };
 
 export function usePortfolioStats(period: '1D' | '7D' | '30D' | 'ALL' = '30D'): UsePortfolioStatsReturn {
+  const { mode } = useModeStore();
   const [stats, setStats] = useState<PortfolioStats>(defaultStats);
   const [history, setHistory] = useState<PortfolioHistory[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -38,6 +40,12 @@ export function usePortfolioStats(period: '1D' | '7D' | '30D' | 'ALL' = '30D'): 
 
   // Fetch stats from API
   const fetchStats = useCallback(async () => {
+    // Only fetch in live mode
+    if (mode !== 'live') {
+      setIsLoading(false);
+      return;
+    }
+
     try {
       setIsLoading(true);
       setError(null);
@@ -59,7 +67,7 @@ export function usePortfolioStats(period: '1D' | '7D' | '30D' | 'ALL' = '30D'): 
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [mode]);
 
   // Handle WebSocket position updates
   const handleMessage = useCallback((message: WebSocketMessage) => {
@@ -79,11 +87,11 @@ export function usePortfolioStats(period: '1D' | '7D' | '30D' | 'ALL' = '30D'): 
     }
   }, [fetchStats]);
 
-  // WebSocket connection for live updates
+  // WebSocket connection for live updates (only in live mode)
   const { status } = useWebSocket({
     channel: 'positions',
     onMessage: handleMessage,
-    enabled: true,
+    enabled: mode === 'live',
   });
 
   // Initial fetch

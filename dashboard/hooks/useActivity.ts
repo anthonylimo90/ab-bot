@@ -2,6 +2,7 @@
 
 import { useState, useCallback } from 'react';
 import { useWebSocket, ConnectionStatus } from './useWebSocket';
+import { useModeStore } from '@/stores/mode-store';
 import type { Activity, ActivityType, WebSocketMessage, SignalUpdate } from '@/types/api';
 
 interface UseActivityReturn {
@@ -97,6 +98,7 @@ function signalToActivity(signal: SignalUpdate): Activity {
 }
 
 export function useActivity(): UseActivityReturn {
+  const { mode } = useModeStore();
   const [activities, setActivities] = useState<Activity[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
 
@@ -109,11 +111,11 @@ export function useActivity(): UseActivityReturn {
     setUnreadCount((prev) => prev + 1);
   }, []);
 
-  // WebSocket connection for live signals
+  // WebSocket connection for live signals (only in live mode)
   const { status } = useWebSocket({
     channel: 'signals',
     onMessage: handleMessage,
-    enabled: true,
+    enabled: mode === 'live',
   });
 
   const markAsRead = useCallback(() => {

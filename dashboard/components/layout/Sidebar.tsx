@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useModeStore } from '@/stores/mode-store';
 import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
 
 interface NavItem {
@@ -53,7 +54,8 @@ const navSections: NavSection[] = [
 export function Sidebar() {
   const pathname = usePathname();
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const { mode } = useModeStore();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
   const activeWallets = allocations.filter((a) => a.tier === 'active');
   const benchWallets = allocations.filter((a) => a.tier === 'bench');
 
