@@ -24,6 +24,36 @@ struct WalletMetricsRow {
     tracked_id: Option<Uuid>,
 }
 
+/// Row type for arb_opportunities query.
+#[derive(Debug, FromRow)]
+struct ArbOpportunityRow {
+    market_id: String,
+    yes_ask: Decimal,
+    no_ask: Decimal,
+    net_profit: Decimal,
+    timestamp: DateTime<Utc>,
+}
+
+/// Row type for positions query.
+#[derive(Debug, FromRow)]
+struct PositionRow {
+    id: Uuid,
+    market_id: String,
+    unrealized_pnl: Decimal,
+    entry_timestamp: DateTime<Utc>,
+    quantity: Decimal,
+    yes_entry_price: Decimal,
+    no_entry_price: Decimal,
+    state: i32,
+}
+
+/// Row type for portfolio concentration query.
+#[derive(Debug, FromRow)]
+struct ConcentrationRow {
+    market_id: String,
+    total_value: Option<Decimal>,
+}
+
 /// Convert Decimal to f64.
 fn decimal_to_f64(d: Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
@@ -436,7 +466,7 @@ impl RecommendationEngine {
         let mut recommendations = Vec::new();
 
         // Find current arbitrage opportunities
-        let opportunities = sqlx::query!(
+        let opportunities = sqlx::query_as::<_, ArbOpportunityRow>(
             r#"
             SELECT market_id, yes_ask, no_ask, net_profit, timestamp
             FROM arb_opportunities
@@ -445,8 +475,8 @@ impl RecommendationEngine {
             ORDER BY net_profit DESC
             LIMIT 5
             "#,
-            self.min_arb_profit
         )
+        .bind(self.min_arb_profit)
         .fetch_all(&self.pool)
         .await?;
 
@@ -520,7 +550,7 @@ impl RecommendationEngine {
         let mut recommendations = Vec::new();
 
         // Find positions that may need attention
-        let positions = sqlx::query!(
+        let positions = sqlx::query_as::<_, PositionRow>(
             r#"
             SELECT id, market_id, unrealized_pnl, entry_timestamp, quantity,
                    yes_entry_price, no_entry_price, state
@@ -528,7 +558,7 @@ impl RecommendationEngine {
             WHERE state IN (1, 2)
             ORDER BY unrealized_pnl ASC
             LIMIT 10
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -636,14 +666,14 @@ impl RecommendationEngine {
         let mut recommendations = Vec::new();
 
         // Check portfolio concentration
-        let concentration = sqlx::query!(
+        let concentration = sqlx::query_as::<_, ConcentrationRow>(
             r#"
             SELECT market_id, SUM(quantity * (yes_entry_price + no_entry_price)) as total_value
             FROM positions
             WHERE state = 1
             GROUP BY market_id
             ORDER BY total_value DESC
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -691,13 +721,13 @@ impl RecommendationEngine {
         }
 
         // Check for positions without stop-loss
-        let unprotected = sqlx::query_scalar!(
+        let unprotected: Option<i64> = sqlx::query_scalar(
             r#"
             SELECT COUNT(*) as count
             FROM positions p
             LEFT JOIN stop_loss_rules sl ON sl.position_id = p.id AND sl.executed = false
             WHERE p.state = 1 AND sl.id IS NULL
-            "#
+            "#,
         )
         .fetch_one(&self.pool)
         .await?;
