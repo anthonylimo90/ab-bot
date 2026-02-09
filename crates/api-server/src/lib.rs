@@ -49,7 +49,6 @@ pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
 use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
 use axum::Router;
-use polymarket_core::api::PolygonClient;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -301,9 +300,11 @@ impl ApiServer {
                 tracing::warn!(
                     "Copy trading is enabled but no tracked wallets have copy_enabled=true"
                 );
-            } else if let Some(polygon_client) = build_polygon_client() {
-                let trade_monitor =
-                    Arc::new(TradeMonitor::new(polygon_client, MonitorConfig::default()));
+            } else {
+                let trade_monitor = Arc::new(TradeMonitor::new(
+                    self.state.clob_client.clone(),
+                    MonitorConfig::from_env(),
+                ));
                 let total_capital = std::env::var("COPY_TOTAL_CAPITAL")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -330,12 +331,9 @@ impl ApiServer {
                     trade_monitor,
                     Arc::new(RwLock::new(copy_trader)),
                     self.state.signal_tx.clone(),
+                    self.state.pool.clone(),
                 );
                 tracing::info!("Copy trading monitor stack initialized");
-            } else {
-                tracing::warn!(
-                    "Copy trading is enabled but POLYGON_RPC_URL / ALCHEMY_API_KEY is not set; wallet trade monitoring is disabled"
-                );
             }
         }
 
@@ -352,14 +350,4 @@ impl ApiServer {
     pub fn router(&self) -> Router {
         self.router.clone()
     }
-}
-
-fn build_polygon_client() -> Option<Arc<PolygonClient>> {
-    if let Ok(rpc_url) = std::env::var("POLYGON_RPC_URL") {
-        return Some(Arc::new(PolygonClient::new(rpc_url)));
-    }
-    if let Ok(alchemy_api_key) = std::env::var("ALCHEMY_API_KEY") {
-        return Some(Arc::new(PolygonClient::with_alchemy(&alchemy_api_key)));
-    }
-    None
 }

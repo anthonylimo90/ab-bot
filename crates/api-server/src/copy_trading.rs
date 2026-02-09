@@ -5,6 +5,7 @@
 
 use chrono::Utc;
 use rust_decimal::Decimal;
+use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
@@ -61,6 +62,7 @@ pub struct CopyTradingMonitor {
     trade_monitor: Arc<TradeMonitor>,
     copy_trader: Arc<RwLock<CopyTrader>>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    pool: PgPool,
 }
 
 impl CopyTradingMonitor {
@@ -70,12 +72,14 @@ impl CopyTradingMonitor {
         trade_monitor: Arc<TradeMonitor>,
         copy_trader: Arc<RwLock<CopyTrader>>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        pool: PgPool,
     ) -> Self {
         Self {
             config,
             trade_monitor,
             copy_trader,
             signal_tx,
+            pool,
         }
     }
 
@@ -242,6 +246,58 @@ impl CopyTradingMonitor {
                     "Successfully copied trade"
                 );
 
+                // Record in copy_trade_history
+                let allocation_pct = copy_trader
+                    .get_tracked_wallet(&trade.wallet_address)
+                    .map(|w| w.allocation_pct)
+                    .unwrap_or(Decimal::ZERO);
+                let slippage = if trade.price > Decimal::ZERO {
+                    report.average_price - trade.price
+                } else {
+                    Decimal::ZERO
+                };
+                let direction_i16: i16 = match trade.direction {
+                    TradeDirection::Buy => 0,
+                    TradeDirection::Sell => 1,
+                };
+
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO copy_trade_history (
+                        source_wallet, source_tx_hash,
+                        source_market_id, source_token_id, source_direction,
+                        source_price, source_quantity, source_timestamp,
+                        copy_order_id, copy_price, copy_quantity, copy_timestamp,
+                        allocation_pct, slippage,
+                        status
+                    ) VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8,
+                        $9, $10, $11, $12,
+                        $13, $14, $15
+                    )
+                    "#,
+                )
+                .bind(&trade.wallet_address)
+                .bind(&trade.tx_hash)
+                .bind(&trade.market_id)
+                .bind(&trade.token_id)
+                .bind(direction_i16)
+                .bind(trade.price)
+                .bind(trade.quantity)
+                .bind(trade.timestamp)
+                .bind(report.order_id)
+                .bind(report.average_price)
+                .bind(report.filled_quantity)
+                .bind(report.executed_at)
+                .bind(allocation_pct)
+                .bind(slippage)
+                .bind(1_i16) // status = 1 (executed)
+                .execute(&self.pool)
+                .await
+                {
+                    warn!(error = %e, "Failed to record copy trade history");
+                }
+
                 // Publish success signal
                 let success_signal = SignalUpdate {
                     signal_id: uuid::Uuid::new_v4(),
@@ -298,8 +354,9 @@ pub fn spawn_copy_trading_monitor(
     trade_monitor: Arc<TradeMonitor>,
     copy_trader: Arc<RwLock<CopyTrader>>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    pool: PgPool,
 ) {
-    let monitor = CopyTradingMonitor::new(config, trade_monitor, copy_trader, signal_tx);
+    let monitor = CopyTradingMonitor::new(config, trade_monitor, copy_trader, signal_tx, pool);
 
     tokio::spawn(async move {
         if let Err(e) = monitor.run().await {

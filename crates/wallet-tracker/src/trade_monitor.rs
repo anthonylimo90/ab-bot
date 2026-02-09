@@ -1,9 +1,13 @@
 //! Real-time trade monitoring for tracked wallets.
+//!
+//! Uses the Polymarket Data API (via `ClobClient`) to detect trades
+//! from monitored wallets in near-real-time.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use polymarket_core::api::PolygonClient;
+use polymarket_core::api::{ClobClient, ClobTrade};
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -19,8 +23,6 @@ pub struct WalletTrade {
     pub wallet_address: String,
     /// Transaction hash.
     pub tx_hash: String,
-    /// Block number.
-    pub block_number: u64,
     /// Timestamp of the trade.
     pub timestamp: DateTime<Utc>,
     /// Market/asset identifier.
@@ -75,9 +77,30 @@ pub struct MonitorConfig {
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
-            poll_interval_secs: 10,
-            min_trade_value: Decimal::new(100, 0),
-            max_trade_age_secs: 300, // 5 minutes
+            poll_interval_secs: 15,
+            min_trade_value: Decimal::new(10, 0),
+            max_trade_age_secs: 120,
+            max_history_size: 10000,
+        }
+    }
+}
+
+impl MonitorConfig {
+    /// Create config from environment variables.
+    pub fn from_env() -> Self {
+        Self {
+            poll_interval_secs: std::env::var("TRADE_MONITOR_POLL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15),
+            min_trade_value: std::env::var("TRADE_MONITOR_MIN_VALUE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(10, 0)),
+            max_trade_age_secs: std::env::var("TRADE_MONITOR_MAX_AGE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120),
             max_history_size: 10000,
         }
     }
@@ -85,14 +108,14 @@ impl Default for MonitorConfig {
 
 /// Real-time trade monitor for tracked wallets.
 pub struct TradeMonitor {
-    polygon_client: Arc<PolygonClient>,
+    clob_client: Arc<ClobClient>,
     config: MonitorConfig,
-    /// Wallets being monitored.
+    /// Wallets being monitored (lowercased).
     monitored_wallets: Arc<RwLock<HashSet<String>>>,
     /// Recent trades by wallet.
     recent_trades: DashMap<String, Vec<WalletTrade>>,
-    /// Last processed block per wallet.
-    last_block: DashMap<String, u64>,
+    /// Transaction hashes already seen (dedup).
+    seen_tx_hashes: Arc<RwLock<HashSet<String>>>,
     /// Channel for new trade notifications.
     trade_tx: broadcast::Sender<WalletTrade>,
     /// Whether monitoring is active.
@@ -101,14 +124,14 @@ pub struct TradeMonitor {
 
 impl TradeMonitor {
     /// Create a new trade monitor.
-    pub fn new(polygon_client: Arc<PolygonClient>, config: MonitorConfig) -> Self {
+    pub fn new(clob_client: Arc<ClobClient>, config: MonitorConfig) -> Self {
         let (trade_tx, _) = broadcast::channel(1000);
         Self {
-            polygon_client,
+            clob_client,
             config,
             monitored_wallets: Arc::new(RwLock::new(HashSet::new())),
             recent_trades: DashMap::new(),
-            last_block: DashMap::new(),
+            seen_tx_hashes: Arc::new(RwLock::new(HashSet::new())),
             trade_tx,
             active: Arc::new(RwLock::new(false)),
         }
@@ -135,7 +158,6 @@ impl TradeMonitor {
         let removed = wallets.remove(&address_lower);
         if removed {
             self.recent_trades.remove(&address_lower);
-            self.last_block.remove(&address_lower);
             info!(address = %address_lower, "Stopped monitoring wallet");
         }
         removed
@@ -207,32 +229,18 @@ impl TradeMonitor {
 
     /// Manually poll for new trades (useful for testing).
     pub async fn poll_once(&self) -> Result<Vec<WalletTrade>> {
-        let wallets = self.monitored_wallets.read().await.clone();
-        let mut all_new_trades = Vec::new();
-
-        for address in wallets {
-            match self.poll_wallet(&address).await {
-                Ok(trades) => {
-                    all_new_trades.extend(trades);
-                }
-                Err(e) => {
-                    warn!(address = %address, error = %e, "Failed to poll wallet");
-                }
-            }
-        }
-
-        Ok(all_new_trades)
+        self.poll_all_wallets().await
     }
 
     // Private methods
 
     fn clone_for_task(&self) -> Self {
         Self {
-            polygon_client: self.polygon_client.clone(),
+            clob_client: self.clob_client.clone(),
             config: self.config.clone(),
             monitored_wallets: self.monitored_wallets.clone(),
             recent_trades: self.recent_trades.clone(),
-            last_block: self.last_block.clone(),
+            seen_tx_hashes: self.seen_tx_hashes.clone(),
             trade_tx: self.trade_tx.clone(),
             active: self.active.clone(),
         }
@@ -248,117 +256,112 @@ impl TradeMonitor {
                 break;
             }
 
-            let wallets = self.monitored_wallets.read().await.clone();
-
-            for address in wallets {
-                if !*self.active.read().await {
-                    break;
-                }
-
-                match self.poll_wallet(&address).await {
-                    Ok(trades) => {
-                        for trade in trades {
-                            if trade.is_significant(self.config.min_trade_value) {
-                                if self.trade_tx.send(trade).is_err() {
-                                    debug!("No subscribers for trade notifications");
-                                }
+            match self.poll_all_wallets().await {
+                Ok(trades) => {
+                    for trade in trades {
+                        if trade.is_significant(self.config.min_trade_value) {
+                            if self.trade_tx.send(trade).is_err() {
+                                debug!("No subscribers for trade notifications");
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(address = %address, error = %e, "Failed to poll wallet");
-                    }
                 }
-
-                // Small delay between wallets to avoid rate limiting
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(e) => {
+                    warn!(error = %e, "Failed to poll Data API for trades");
+                }
             }
 
-            // Cleanup old trades
+            // Cleanup old trades and stale tx hashes
             self.cleanup_old_trades();
         }
 
         info!("Trade monitoring loop stopped");
     }
 
-    async fn poll_wallet(&self, address: &str) -> Result<Vec<WalletTrade>> {
-        let last_block = self.last_block.get(address).map(|b| *b);
+    /// Fetch recent trades from Data API and filter for monitored wallets.
+    async fn poll_all_wallets(&self) -> Result<Vec<WalletTrade>> {
+        let wallets = self.monitored_wallets.read().await;
+        if wallets.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Clone to release lock before async work
+        let wallet_set = wallets.clone();
+        drop(wallets);
 
-        // Fetch recent transfers
-        let transfers = self
-            .polygon_client
-            .get_asset_transfers(address, None, None)
-            .await?;
+        let clob_trades = self
+            .clob_client
+            .get_recent_trades(200, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Data API trade fetch failed: {}", e))?;
 
         let mut new_trades = Vec::new();
+        let mut seen = self.seen_tx_hashes.write().await;
 
-        for transfer in transfers {
-            // Skip if we've already processed this block
-            let block_num: u64 = transfer.block_num.parse().unwrap_or(0);
-            if let Some(last) = last_block {
-                if block_num <= last {
-                    continue;
-                }
+        for ct in &clob_trades {
+            let addr = ct.wallet_address.to_lowercase();
+            if !wallet_set.contains(&addr) {
+                continue;
             }
 
-            // Parse the transfer into a trade
-            if let Some(trade) = self.parse_transfer_to_trade(address, &transfer) {
-                // Check if trade is recent enough
-                if trade.age_seconds() <= self.config.max_trade_age_secs as i64 {
-                    new_trades.push(trade.clone());
+            // Dedup by tx hash
+            if seen.contains(&ct.transaction_hash) {
+                continue;
+            }
 
-                    // Store in recent trades
-                    self.recent_trades
-                        .entry(address.to_lowercase())
-                        .or_default()
-                        .push(trade);
+            if let Some(trade) = Self::clob_trade_to_wallet_trade(ct) {
+                // Check age
+                if trade.age_seconds() > self.config.max_trade_age_secs as i64 {
+                    continue;
                 }
 
-                // Update last block
-                self.last_block.insert(address.to_lowercase(), block_num);
+                seen.insert(ct.transaction_hash.clone());
+
+                // Store in recent trades
+                self.recent_trades
+                    .entry(addr.clone())
+                    .or_default()
+                    .push(trade.clone());
+
+                new_trades.push(trade);
             }
         }
 
         if !new_trades.is_empty() {
             info!(
-                address = %address,
                 count = new_trades.len(),
-                "Detected new trades from wallet"
+                "Detected new trades from monitored wallets"
             );
         }
 
         Ok(new_trades)
     }
 
-    fn parse_transfer_to_trade(
-        &self,
-        wallet_address: &str,
-        transfer: &polymarket_core::api::polygon::AssetTransfer,
-    ) -> Option<WalletTrade> {
-        let timestamp = transfer
-            .metadata
-            .as_ref()
-            .and_then(|m| m.block_timestamp.as_ref())
-            .and_then(|ts| ts.parse::<DateTime<Utc>>().ok())?;
+    /// Convert a ClobTrade from the Data API into a WalletTrade.
+    fn clob_trade_to_wallet_trade(ct: &ClobTrade) -> Option<WalletTrade> {
+        let timestamp = DateTime::from_timestamp(ct.timestamp, 0)?;
+        let price = Decimal::from_f64(ct.price).unwrap_or(Decimal::ZERO);
+        let quantity = Decimal::from_f64(ct.size).unwrap_or(Decimal::ZERO);
+        let value = price * quantity;
 
-        let value = transfer.value.map(|v| Decimal::try_from(v).ok())??;
-        let quantity = value; // Simplified - would need price data
-
-        let direction = if transfer.from.to_lowercase() == wallet_address.to_lowercase() {
-            TradeDirection::Sell
-        } else {
-            TradeDirection::Buy
+        let direction = match ct.side.to_uppercase().as_str() {
+            "BUY" => TradeDirection::Buy,
+            "SELL" => TradeDirection::Sell,
+            _ => return None,
         };
 
+        let market_id = ct
+            .condition_id
+            .clone()
+            .unwrap_or_else(|| ct.asset_id.clone());
+
         Some(WalletTrade {
-            wallet_address: wallet_address.to_string(),
-            tx_hash: transfer.hash.clone(),
-            block_number: transfer.block_num.parse().unwrap_or(0),
+            wallet_address: ct.wallet_address.to_lowercase(),
+            tx_hash: ct.transaction_hash.clone(),
             timestamp,
-            market_id: transfer.asset.clone().unwrap_or_default(),
-            token_id: transfer.asset.clone().unwrap_or_default(),
+            market_id,
+            token_id: ct.asset_id.clone(),
             direction,
-            price: Decimal::ONE, // Would need price oracle
+            price,
             quantity,
             value,
             processed: false,
@@ -376,6 +379,13 @@ impl TradeMonitor {
             // Also limit total size
             if trades.len() > self.config.max_history_size {
                 trades.drain(0..(trades.len() - self.config.max_history_size));
+            }
+        }
+
+        // Prune seen_tx_hashes if it gets too large (keep bounded)
+        if let Ok(mut seen) = self.seen_tx_hashes.try_write() {
+            if seen.len() > 50_000 {
+                seen.clear();
             }
         }
     }
@@ -430,7 +440,6 @@ mod tests {
         let trade = WalletTrade {
             wallet_address: "0x1234".to_string(),
             tx_hash: "0xabcd".to_string(),
-            block_number: 1000,
             timestamp: Utc::now(),
             market_id: "market1".to_string(),
             token_id: "yes".to_string(),
@@ -450,7 +459,6 @@ mod tests {
         let recent_trade = WalletTrade {
             wallet_address: "0x1234".to_string(),
             tx_hash: "0xabcd".to_string(),
-            block_number: 1000,
             timestamp: Utc::now() - chrono::Duration::seconds(30),
             market_id: "market1".to_string(),
             token_id: "yes".to_string(),
@@ -468,15 +476,24 @@ mod tests {
     #[test]
     fn test_monitor_config_default() {
         let config = MonitorConfig::default();
-        assert_eq!(config.poll_interval_secs, 10);
-        assert_eq!(config.min_trade_value, Decimal::new(100, 0));
-        assert_eq!(config.max_trade_age_secs, 300);
+        assert_eq!(config.poll_interval_secs, 15);
+        assert_eq!(config.min_trade_value, Decimal::new(10, 0));
+        assert_eq!(config.max_trade_age_secs, 120);
+    }
+
+    #[test]
+    fn test_monitor_config_from_env() {
+        // Without env vars set, should use defaults
+        let config = MonitorConfig::from_env();
+        assert_eq!(config.poll_interval_secs, 15);
+        assert_eq!(config.min_trade_value, Decimal::new(10, 0));
+        assert_eq!(config.max_trade_age_secs, 120);
     }
 
     #[tokio::test]
     async fn test_add_remove_wallet() {
-        let polygon_client = Arc::new(PolygonClient::new("test_key".to_string()));
-        let monitor = TradeMonitor::new(polygon_client, MonitorConfig::default());
+        let clob_client = Arc::new(ClobClient::new(None, None));
+        let monitor = TradeMonitor::new(clob_client, MonitorConfig::default());
 
         monitor.add_wallet("0xAAAA").await;
         monitor.add_wallet("0xBBBB").await;
@@ -490,5 +507,72 @@ mod tests {
 
         let wallets = monitor.monitored_wallets().await;
         assert_eq!(wallets.len(), 1);
+    }
+
+    #[test]
+    fn test_clob_trade_to_wallet_trade_buy() {
+        let ct = ClobTrade {
+            transaction_hash: "0xtx123".to_string(),
+            wallet_address: "0xWALLET".to_string(),
+            side: "BUY".to_string(),
+            asset_id: "token_abc".to_string(),
+            condition_id: Some("condition_xyz".to_string()),
+            size: 100.0,
+            price: 0.65,
+            timestamp: Utc::now().timestamp(),
+            title: None,
+            slug: None,
+            outcome: None,
+        };
+
+        let wt = TradeMonitor::clob_trade_to_wallet_trade(&ct).unwrap();
+        assert_eq!(wt.wallet_address, "0xwallet");
+        assert_eq!(wt.tx_hash, "0xtx123");
+        assert_eq!(wt.market_id, "condition_xyz");
+        assert_eq!(wt.token_id, "token_abc");
+        assert_eq!(wt.direction, TradeDirection::Buy);
+        assert_eq!(wt.price, Decimal::from_f64(0.65).unwrap());
+        assert_eq!(wt.quantity, Decimal::from_f64(100.0).unwrap());
+    }
+
+    #[test]
+    fn test_clob_trade_to_wallet_trade_sell() {
+        let ct = ClobTrade {
+            transaction_hash: "0xtx456".to_string(),
+            wallet_address: "0xSELLER".to_string(),
+            side: "SELL".to_string(),
+            asset_id: "token_def".to_string(),
+            condition_id: None,
+            size: 50.0,
+            price: 0.30,
+            timestamp: Utc::now().timestamp(),
+            title: None,
+            slug: None,
+            outcome: None,
+        };
+
+        let wt = TradeMonitor::clob_trade_to_wallet_trade(&ct).unwrap();
+        assert_eq!(wt.direction, TradeDirection::Sell);
+        // When condition_id is None, market_id falls back to asset_id
+        assert_eq!(wt.market_id, "token_def");
+    }
+
+    #[test]
+    fn test_clob_trade_to_wallet_trade_invalid_side() {
+        let ct = ClobTrade {
+            transaction_hash: "0xtx789".to_string(),
+            wallet_address: "0xBAD".to_string(),
+            side: "UNKNOWN".to_string(),
+            asset_id: "token".to_string(),
+            condition_id: None,
+            size: 10.0,
+            price: 0.50,
+            timestamp: Utc::now().timestamp(),
+            title: None,
+            slug: None,
+            outcome: None,
+        };
+
+        assert!(TradeMonitor::clob_trade_to_wallet_trade(&ct).is_none());
     }
 }
