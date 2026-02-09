@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToastStore } from '@/stores/toast-store';
 import { useWalletQuery, useWalletMetricsQuery } from '@/hooks/queries/useWalletsQuery';
-import { useLiveTradesQuery } from '@/hooks/queries/useDiscoverQuery';
+import { useLiveTradesQuery, useDiscoveredWalletQuery } from '@/hooks/queries/useDiscoverQuery';
 import {
   useAllocationsQuery,
   useDemoteAllocationMutation,
@@ -67,6 +67,8 @@ export default function WalletDetailPage() {
   // Fetch wallet data from API
   const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(mode, address);
   const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(mode, address);
+  // Fallback to discovery data when wallet isn't tracked
+  const { data: discoveredWallet, isLoading: isLoadingDiscovered } = useDiscoveredWalletQuery(mode, address);
   const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery(mode, {
     wallet: address,
     limit: 10,
@@ -122,6 +124,28 @@ export default function WalletDetailPage() {
         addedAt: apiWallet.added_at ?? new Date().toISOString(),
       };
     }
+    // Fallback to discovery data for untracked wallets
+    if (discoveredWallet) {
+      return {
+        address: discoveredWallet.address,
+        label: undefined,
+        tier: 'bench' as const,
+        roi30d: Number(discoveredWallet.roi_30d),
+        roi7d: Number(discoveredWallet.roi_7d),
+        roi90d: Number(discoveredWallet.roi_90d),
+        sharpe: Number(discoveredWallet.sharpe_ratio),
+        winRate: Number(discoveredWallet.win_rate),
+        trades: discoveredWallet.total_trades,
+        maxDrawdown: Number(discoveredWallet.max_drawdown),
+        confidence: discoveredWallet.confidence,
+        copySettings: {
+          copy_behavior: 'events_only' as const,
+          allocation_pct: 0,
+          max_position_size: 100,
+        },
+        addedAt: new Date().toISOString(),
+      };
+    }
     // Return minimal wallet for display while loading
     return {
       address: address,
@@ -140,7 +164,7 @@ export default function WalletDetailPage() {
       },
       addedAt: new Date().toISOString(),
     };
-  }, [storedWallet, apiWallet, walletMetrics, address]);
+  }, [storedWallet, apiWallet, walletMetrics, discoveredWallet, address]);
 
   const decisionBrief = undefined as DecisionBrief | undefined;
 
@@ -153,7 +177,7 @@ export default function WalletDetailPage() {
 
   const isActive = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'active');
   const isBench = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'bench');
-  const isLoading = isLoadingWallet || isLoadingMetrics;
+  const isLoading = isLoadingWallet || isLoadingMetrics || isLoadingDiscovered;
   const isRosterFull = () => allocations.filter((a) => a.tier === 'active').length >= 5;
 
   const handlePromote = () => {

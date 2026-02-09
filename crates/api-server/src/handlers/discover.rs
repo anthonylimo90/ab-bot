@@ -2,7 +2,7 @@
 //!
 //! Provides endpoints for discovering top wallets and viewing live trades.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use wallet_tracker::discovery::DiscoveryCriteria;
 
@@ -500,6 +500,48 @@ fn generate_simulation(amount: Decimal, period: &str, _wallets: Option<&str>) ->
                 trades: 12,
             },
         ],
+    }
+}
+
+/// Get a single discovered wallet by address.
+#[utoipa::path(
+    get,
+    path = "/api/v1/discover/wallets/{address}",
+    tag = "discover",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Discovered wallet profile", body = DiscoveredWallet),
+        (status = 404, description = "Wallet not found in discovery data")
+    )
+)]
+pub async fn get_discovered_wallet(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> ApiResult<Json<DiscoveredWallet>> {
+    let address = address.to_lowercase();
+
+    match state.wallet_discovery.query_single_wallet_public(&address).await {
+        Ok(Some(dw)) => {
+            let is_tracked = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
+            )
+            .bind(&address)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(false);
+
+            Ok(Json(map_to_api_wallet(&dw, 0, is_tracked)))
+        }
+        Ok(None) => Err(ApiError::NotFound(format!(
+            "Wallet {} not found in discovery data",
+            address
+        ))),
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address, "Failed to query discovered wallet");
+            Err(ApiError::Internal("Failed to query wallet".into()))
+        }
     }
 }
 
