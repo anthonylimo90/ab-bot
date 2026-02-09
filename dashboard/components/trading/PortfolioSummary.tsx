@@ -28,7 +28,7 @@ export const PortfolioSummary = memo(function PortfolioSummary({
   const pnlPercent = totalValue > 0 ? (totalPnl / (totalValue - totalPnl)) * 100 : 0;
 
   return (
-    <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-5">
+    <div className={cn("grid gap-4 md:grid-cols-2", availableBalance != null ? "lg:grid-cols-5" : "lg:grid-cols-4")}>
       {/* Unrealized P&L */}
       <Card>
         <CardContent className="p-4">
@@ -133,23 +133,23 @@ export const PortfolioSummary = memo(function PortfolioSummary({
       </Card>
 
       {/* Available Balance (Demo only) */}
-      <Card>
-        <CardContent className="p-4">
-          <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-full bg-blue-500/10 flex items-center justify-center">
-              <Wallet className="h-5 w-5 text-blue-500" />
+      {availableBalance != null && (
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 rounded-full bg-blue-500/10 flex items-center justify-center">
+                <Wallet className="h-5 w-5 text-blue-500" />
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Demo Cash</p>
+                <p className="text-2xl font-bold tabular-nums">
+                  {formatCurrency(availableBalance)}
+                </p>
+              </div>
             </div>
-            <div>
-              <p className="text-sm text-muted-foreground">
-                {isDemo ? 'Demo Cash' : 'Available'}
-              </p>
-              <p className="text-2xl font-bold tabular-nums">
-                {formatCurrency(availableBalance ?? 0)}
-              </p>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 });

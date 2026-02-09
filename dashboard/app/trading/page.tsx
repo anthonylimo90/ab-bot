@@ -286,7 +286,7 @@ export default function TradingPage() {
         positionCount={positionCount}
         winRate={winRate}
         realizedPnl={realizedPnl}
-        availableBalance={demoBalance}
+        availableBalance={isDemo ? demoBalance : undefined}
         isDemo={isDemo}
       />
 
