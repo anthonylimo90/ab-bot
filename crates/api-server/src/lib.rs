@@ -276,6 +276,33 @@ impl ApiServer {
         // Spawn copy trading monitor + wallet trade monitor if enabled
         let copy_config = CopyTradingConfig::from_env();
         if copy_config.enabled {
+            // Sync active allocations → tracked_wallets.copy_enabled on startup
+            sqlx::query(
+                r#"
+                UPDATE tracked_wallets tw
+                SET copy_enabled = TRUE
+                FROM workspace_wallet_allocations wwa
+                WHERE LOWER(tw.address) = LOWER(wwa.wallet_address)
+                  AND wwa.tier = 'active'
+                  AND tw.copy_enabled = FALSE
+                "#,
+            )
+            .execute(&self.state.pool)
+            .await?;
+
+            sqlx::query(
+                r#"
+                UPDATE tracked_wallets
+                SET copy_enabled = FALSE
+                WHERE copy_enabled = TRUE
+                  AND LOWER(address) NOT IN (
+                    SELECT LOWER(wallet_address) FROM workspace_wallet_allocations WHERE tier = 'active'
+                  )
+                "#,
+            )
+            .execute(&self.state.pool)
+            .await?;
+
             #[derive(sqlx::FromRow)]
             struct TrackedWalletRow {
                 address: String,

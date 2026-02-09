@@ -19,11 +19,11 @@ CREATE TABLE IF NOT EXISTS markets (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_markets_category ON markets(category);
-CREATE INDEX idx_markets_active ON markets(active);
-CREATE INDEX idx_markets_end_date ON markets(end_date);
-CREATE INDEX idx_markets_volume ON markets(volume_24h DESC);
-CREATE INDEX idx_markets_liquidity ON markets(liquidity DESC);
+CREATE INDEX IF NOT EXISTS idx_markets_category ON markets(category);
+CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(active);
+CREATE INDEX IF NOT EXISTS idx_markets_end_date ON markets(end_date);
+CREATE INDEX IF NOT EXISTS idx_markets_volume ON markets(volume_24h DESC);
+CREATE INDEX IF NOT EXISTS idx_markets_liquidity ON markets(liquidity DESC);
 
 -- ===================
 -- Orders Table
@@ -53,11 +53,11 @@ CREATE TABLE IF NOT EXISTS orders (
     CONSTRAINT valid_status CHECK (status IN ('pending', 'open', 'partially_filled', 'filled', 'cancelled', 'rejected', 'expired'))
 );
 
-CREATE INDEX idx_orders_market ON orders(market_id);
-CREATE INDEX idx_orders_status ON orders(status);
-CREATE INDEX idx_orders_client_id ON orders(client_order_id) WHERE client_order_id IS NOT NULL;
-CREATE INDEX idx_orders_created ON orders(created_at);
-CREATE UNIQUE INDEX idx_orders_client_id_unique ON orders(client_order_id) WHERE client_order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_market ON orders(market_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_client_id ON orders(client_order_id) WHERE client_order_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_id_unique ON orders(client_order_id) WHERE client_order_id IS NOT NULL;
 
 -- ===================
 -- Extend Backtest Results Table (created in timescale migration)
@@ -103,8 +103,8 @@ ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ;
 -- Update existing positions to have opened_at from entry_timestamp
 UPDATE positions SET opened_at = entry_timestamp WHERE opened_at IS NULL;
 
-CREATE INDEX idx_positions_is_open ON positions(is_open);
-CREATE INDEX idx_positions_is_copy ON positions(is_copy_trade);
+CREATE INDEX IF NOT EXISTS idx_positions_is_open ON positions(is_open);
+CREATE INDEX IF NOT EXISTS idx_positions_is_copy ON positions(is_copy_trade);
 
 -- ===================
 -- Extend Tracked Wallets for API
@@ -120,8 +120,8 @@ ADD COLUMN IF NOT EXISTS last_activity TIMESTAMPTZ;
 -- Create alias for label if needed
 UPDATE tracked_wallets SET label = alias WHERE label IS NULL AND alias IS NOT NULL;
 
-CREATE INDEX idx_tracked_wallets_success ON tracked_wallets(success_score DESC);
-CREATE INDEX idx_tracked_wallets_copy ON tracked_wallets(copy_enabled);
+CREATE INDEX IF NOT EXISTS idx_tracked_wallets_success ON tracked_wallets(success_score DESC);
+CREATE INDEX IF NOT EXISTS idx_tracked_wallets_copy ON tracked_wallets(copy_enabled);
 
 -- ===================
 -- Extend Wallet Success Metrics for API
@@ -145,7 +145,7 @@ UPDATE wallet_success_metrics SET calculated_at = last_computed WHERE calculated
 -- Update roi from roi_all_time
 UPDATE wallet_success_metrics SET roi = roi_all_time WHERE roi IS NULL;
 
-CREATE INDEX idx_wsm_wallet ON wallet_success_metrics(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_wsm_wallet ON wallet_success_metrics(wallet_address);
 
 -- ===================
 -- Update Triggers

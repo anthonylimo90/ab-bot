@@ -153,10 +153,10 @@ CREATE TABLE IF NOT EXISTS backtest_results (
     notes TEXT
 );
 
-CREATE INDEX idx_backtest_strategy ON backtest_results(strategy_name);
-CREATE INDEX idx_backtest_computed ON backtest_results(computed_at);
-CREATE INDEX idx_backtest_sharpe ON backtest_results(sharpe_ratio DESC);
-CREATE INDEX idx_backtest_return ON backtest_results(return_pct DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_strategy ON backtest_results(strategy_name);
+CREATE INDEX IF NOT EXISTS idx_backtest_computed ON backtest_results(computed_at);
+CREATE INDEX IF NOT EXISTS idx_backtest_sharpe ON backtest_results(sharpe_ratio DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_return ON backtest_results(return_pct DESC);
 
 -- ===================
 -- Strategy Configurations
@@ -173,8 +173,8 @@ CREATE TABLE IF NOT EXISTS strategy_configs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_strat_config_type ON strategy_configs(strategy_type);
-CREATE INDEX idx_strat_config_enabled ON strategy_configs(enabled) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_strat_config_type ON strategy_configs(strategy_type);
+CREATE INDEX IF NOT EXISTS idx_strat_config_enabled ON strategy_configs(enabled) WHERE enabled = TRUE;
 
 CREATE TRIGGER update_strategy_configs_updated_at
     BEFORE UPDATE ON strategy_configs
@@ -198,9 +198,9 @@ CREATE TABLE IF NOT EXISTS data_ingestion_jobs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_ingestion_status ON data_ingestion_jobs(status);
-CREATE INDEX idx_ingestion_type ON data_ingestion_jobs(job_type);
-CREATE INDEX idx_ingestion_market ON data_ingestion_jobs(market_id) WHERE market_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ingestion_status ON data_ingestion_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_ingestion_type ON data_ingestion_jobs(job_type);
+CREATE INDEX IF NOT EXISTS idx_ingestion_market ON data_ingestion_jobs(market_id) WHERE market_id IS NOT NULL;
 
 CREATE TRIGGER update_ingestion_jobs_updated_at
     BEFORE UPDATE ON data_ingestion_jobs

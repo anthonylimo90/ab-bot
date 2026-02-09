@@ -26,9 +26,9 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 
 -- Indexes for positions
-CREATE INDEX idx_positions_market_id ON positions(market_id);
-CREATE INDEX idx_positions_state ON positions(state);
-CREATE INDEX idx_positions_entry_timestamp ON positions(entry_timestamp);
+CREATE INDEX IF NOT EXISTS idx_positions_market_id ON positions(market_id);
+CREATE INDEX IF NOT EXISTS idx_positions_state ON positions(state);
+CREATE INDEX IF NOT EXISTS idx_positions_entry_timestamp ON positions(entry_timestamp);
 
 -- ===================
 -- Wallet Features (Bot Scanner)
@@ -66,10 +66,10 @@ CREATE TABLE IF NOT EXISTS bot_scores (
 );
 
 -- Indexes for bot_scores
-CREATE INDEX idx_bot_scores_address ON bot_scores(address);
-CREATE INDEX idx_bot_scores_classification ON bot_scores(classification);
-CREATE INDEX idx_bot_scores_total_score ON bot_scores(total_score DESC);
-CREATE INDEX idx_bot_scores_computed_at ON bot_scores(computed_at);
+CREATE INDEX IF NOT EXISTS idx_bot_scores_address ON bot_scores(address);
+CREATE INDEX IF NOT EXISTS idx_bot_scores_classification ON bot_scores(classification);
+CREATE INDEX IF NOT EXISTS idx_bot_scores_total_score ON bot_scores(total_score DESC);
+CREATE INDEX IF NOT EXISTS idx_bot_scores_computed_at ON bot_scores(computed_at);
 
 -- ===================
 -- Arbitrage Opportunities (Historical)
@@ -88,9 +88,9 @@ CREATE TABLE IF NOT EXISTS arb_opportunities (
 );
 
 -- Indexes for arb_opportunities
-CREATE INDEX idx_arb_opportunities_market_id ON arb_opportunities(market_id);
-CREATE INDEX idx_arb_opportunities_timestamp ON arb_opportunities(timestamp);
-CREATE INDEX idx_arb_opportunities_net_profit ON arb_opportunities(net_profit DESC);
+CREATE INDEX IF NOT EXISTS idx_arb_opportunities_market_id ON arb_opportunities(market_id);
+CREATE INDEX IF NOT EXISTS idx_arb_opportunities_timestamp ON arb_opportunities(timestamp);
+CREATE INDEX IF NOT EXISTS idx_arb_opportunities_net_profit ON arb_opportunities(net_profit DESC);
 
 -- ===================
 -- Update timestamp trigger

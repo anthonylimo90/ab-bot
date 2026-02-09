@@ -44,19 +44,19 @@ CREATE TABLE IF NOT EXISTS wallet_trades (
 );
 
 -- Index for profitability queries: get all trades for a wallet in time window
-CREATE INDEX idx_wallet_trades_wallet_timestamp
+CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet_timestamp
     ON wallet_trades (wallet_address, timestamp DESC);
 
 -- Index for transaction hash lookups (deduplication check)
-CREATE INDEX idx_wallet_trades_tx_hash
+CREATE INDEX IF NOT EXISTS idx_wallet_trades_tx_hash
     ON wallet_trades (transaction_hash);
 
 -- Index for market analysis queries
-CREATE INDEX idx_wallet_trades_asset
+CREATE INDEX IF NOT EXISTS idx_wallet_trades_asset
     ON wallet_trades (asset_id, timestamp DESC);
 
 -- Composite index for condition-based queries
-CREATE INDEX idx_wallet_trades_condition
+CREATE INDEX IF NOT EXISTS idx_wallet_trades_condition
     ON wallet_trades (condition_id, timestamp DESC)
     WHERE condition_id IS NOT NULL;
 

@@ -24,6 +24,8 @@ import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/auth-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useActivity } from '@/hooks/useActivity';
+import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
 
 const mobileNavSections = [
   {
@@ -64,6 +66,7 @@ export function Header() {
   const mobileMenuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
   const { currentWorkspace } = useWorkspaceStore();
+  const { status: wsStatus } = useActivity();
 
   // Get mode label
   const modeLabel = currentWorkspace?.setup_mode === 'automatic' ? 'Guided' : 'Custom';
@@ -184,6 +187,7 @@ export function Header() {
 
         {/* Mode Toggle & Actions */}
         <div className="flex items-center gap-2">
+          <ConnectionStatus status={wsStatus} />
           <ModeToggle />
 
           <Link href="/settings">
