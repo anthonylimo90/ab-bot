@@ -20,10 +20,10 @@ CREATE TABLE IF NOT EXISTS pending_wallet_orders (
 );
 
 -- Index for user lookup
-CREATE INDEX idx_pending_wallet_orders_user ON pending_wallet_orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_pending_wallet_orders_user ON pending_wallet_orders(user_id);
 
 -- Index for cleanup of expired orders
-CREATE INDEX idx_pending_wallet_orders_expires ON pending_wallet_orders(expires_at);
+CREATE INDEX IF NOT EXISTS idx_pending_wallet_orders_expires ON pending_wallet_orders(expires_at);
 
 -- Comment
 COMMENT ON TABLE pending_wallet_orders IS 'Pending orders awaiting wallet signature for MetaMask trade signing flow';

@@ -41,12 +41,12 @@ CREATE TABLE IF NOT EXISTS wallet_success_metrics (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_wsm_address ON wallet_success_metrics(address);
-CREATE INDEX idx_wsm_roi_30d ON wallet_success_metrics(roi_30d DESC);
-CREATE INDEX idx_wsm_sharpe ON wallet_success_metrics(sharpe_30d DESC);
-CREATE INDEX idx_wsm_prediction ON wallet_success_metrics(predicted_success_prob DESC);
-CREATE INDEX idx_wsm_consistency ON wallet_success_metrics(consistency_score DESC);
-CREATE INDEX idx_wsm_category ON wallet_success_metrics(prediction_category);
+CREATE INDEX IF NOT EXISTS idx_wsm_address ON wallet_success_metrics(address);
+CREATE INDEX IF NOT EXISTS idx_wsm_roi_30d ON wallet_success_metrics(roi_30d DESC);
+CREATE INDEX IF NOT EXISTS idx_wsm_sharpe ON wallet_success_metrics(sharpe_30d DESC);
+CREATE INDEX IF NOT EXISTS idx_wsm_prediction ON wallet_success_metrics(predicted_success_prob DESC);
+CREATE INDEX IF NOT EXISTS idx_wsm_consistency ON wallet_success_metrics(consistency_score DESC);
+CREATE INDEX IF NOT EXISTS idx_wsm_category ON wallet_success_metrics(prediction_category);
 
 -- ===================
 -- Discovered Wallets History
@@ -79,11 +79,11 @@ CREATE TABLE IF NOT EXISTS discovered_wallets (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_dw_address ON discovered_wallets(address);
-CREATE INDEX idx_dw_discovered ON discovered_wallets(discovered_at);
-CREATE INDEX idx_dw_roi ON discovered_wallets(roi DESC);
-CREATE INDEX idx_dw_win_rate ON discovered_wallets(win_rate DESC);
-CREATE INDEX idx_dw_is_bot ON discovered_wallets(is_bot);
+CREATE INDEX IF NOT EXISTS idx_dw_address ON discovered_wallets(address);
+CREATE INDEX IF NOT EXISTS idx_dw_discovered ON discovered_wallets(discovered_at);
+CREATE INDEX IF NOT EXISTS idx_dw_roi ON discovered_wallets(roi DESC);
+CREATE INDEX IF NOT EXISTS idx_dw_win_rate ON discovered_wallets(win_rate DESC);
+CREATE INDEX IF NOT EXISTS idx_dw_is_bot ON discovered_wallets(is_bot);
 
 -- ===================
 -- Copy Trade History
@@ -123,12 +123,12 @@ CREATE TABLE IF NOT EXISTS copy_trade_history (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_cth_source_wallet ON copy_trade_history(source_wallet);
-CREATE INDEX idx_cth_source_tx ON copy_trade_history(source_tx_hash);
-CREATE INDEX idx_cth_market ON copy_trade_history(source_market_id);
-CREATE INDEX idx_cth_status ON copy_trade_history(status);
-CREATE INDEX idx_cth_created ON copy_trade_history(created_at);
-CREATE INDEX idx_cth_execution ON copy_trade_history(copy_execution_id) WHERE copy_execution_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_cth_source_wallet ON copy_trade_history(source_wallet);
+CREATE INDEX IF NOT EXISTS idx_cth_source_tx ON copy_trade_history(source_tx_hash);
+CREATE INDEX IF NOT EXISTS idx_cth_market ON copy_trade_history(source_market_id);
+CREATE INDEX IF NOT EXISTS idx_cth_status ON copy_trade_history(status);
+CREATE INDEX IF NOT EXISTS idx_cth_created ON copy_trade_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_cth_execution ON copy_trade_history(copy_execution_id) WHERE copy_execution_id IS NOT NULL;
 
 -- ===================
 -- Wallet Trade Signals (real-time monitoring)
@@ -159,13 +159,13 @@ CREATE TABLE IF NOT EXISTS wallet_trade_signals (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_wts_wallet ON wallet_trade_signals(wallet_address);
-CREATE INDEX idx_wts_tx ON wallet_trade_signals(tx_hash);
-CREATE INDEX idx_wts_block ON wallet_trade_signals(block_number);
-CREATE INDEX idx_wts_market ON wallet_trade_signals(market_id);
-CREATE INDEX idx_wts_processed ON wallet_trade_signals(processed) WHERE processed = FALSE;
-CREATE INDEX idx_wts_trade_ts ON wallet_trade_signals(trade_timestamp);
-CREATE UNIQUE INDEX idx_wts_unique_tx ON wallet_trade_signals(tx_hash, wallet_address);
+CREATE INDEX IF NOT EXISTS idx_wts_wallet ON wallet_trade_signals(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_wts_tx ON wallet_trade_signals(tx_hash);
+CREATE INDEX IF NOT EXISTS idx_wts_block ON wallet_trade_signals(block_number);
+CREATE INDEX IF NOT EXISTS idx_wts_market ON wallet_trade_signals(market_id);
+CREATE INDEX IF NOT EXISTS idx_wts_processed ON wallet_trade_signals(processed) WHERE processed = FALSE;
+CREATE INDEX IF NOT EXISTS idx_wts_trade_ts ON wallet_trade_signals(trade_timestamp);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wts_unique_tx ON wallet_trade_signals(tx_hash, wallet_address);
 
 -- ===================
 -- Tracked Wallet Performance (extend tracked_wallets)
@@ -181,8 +181,8 @@ ADD COLUMN IF NOT EXISTS trades_skipped INTEGER NOT NULL DEFAULT 0,
 ADD COLUMN IF NOT EXISTS avg_slippage DECIMAL(8, 6),
 ADD COLUMN IF NOT EXISTS last_analyzed TIMESTAMPTZ;
 
-CREATE INDEX idx_tw_win_rate ON tracked_wallets(win_rate DESC) WHERE enabled = TRUE;
-CREATE INDEX idx_tw_roi ON tracked_wallets(roi_30d DESC) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_tw_win_rate ON tracked_wallets(win_rate DESC) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_tw_roi ON tracked_wallets(roi_30d DESC) WHERE enabled = TRUE;
 
 -- ===================
 -- Update Triggers

@@ -3,6 +3,7 @@
 import { useState, useCallback } from 'react';
 import { useWebSocket, ConnectionStatus } from './useWebSocket';
 import { useModeStore } from '@/stores/mode-store';
+import { useToastStore } from '@/stores/toast-store';
 import type { Activity, ActivityType, WebSocketMessage, SignalUpdate } from '@/types/api';
 
 interface UseActivityReturn {
@@ -109,6 +110,32 @@ export function useActivity(): UseActivityReturn {
     const activity = signalToActivity(message.data as SignalUpdate);
     setActivities((prev) => [activity, ...prev].slice(0, 50));
     setUnreadCount((prev) => prev + 1);
+
+    // Fire toast notification
+    const toast = useToastStore.getState();
+    switch (activity.type) {
+      case 'TRADE_COPIED':
+        toast.success('Trade Copied', activity.message);
+        break;
+      case 'ARB_POSITION_OPENED':
+        toast.success('Arb Position Opened', activity.message);
+        break;
+      case 'ARB_POSITION_CLOSED':
+        toast.info('Arb Position Closed', activity.message);
+        break;
+      case 'TRADE_COPY_FAILED':
+      case 'ARB_EXECUTION_FAILED':
+      case 'ARB_EXIT_FAILED':
+        toast.error('Trading Error', activity.message);
+        break;
+      case 'TRADE_COPY_SKIPPED':
+        toast.warning('Trade Skipped', activity.message);
+        break;
+      case 'STOP_LOSS_TRIGGERED':
+      case 'TAKE_PROFIT_TRIGGERED':
+        toast.warning('Risk Alert', activity.message);
+        break;
+    }
   }, []);
 
   // WebSocket connection for live signals (only in live mode)

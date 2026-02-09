@@ -355,6 +355,22 @@ pub async fn add_allocation(
     .execute(&state.pool)
     .await?;
 
+    // Sync copy_enabled on tracked_wallets
+    if tier == "active" {
+        sqlx::query(
+            r#"
+            INSERT INTO tracked_wallets (address, label, copy_enabled, allocation_pct, copy_delay_ms)
+            VALUES ($1, $2, TRUE, $3, 500)
+            ON CONFLICT (address) DO UPDATE SET copy_enabled = TRUE, allocation_pct = $3
+            "#,
+        )
+        .bind(&address)
+        .bind(&address)
+        .bind(req.allocation_pct)
+        .execute(&state.pool)
+        .await?;
+    }
+
     // Audit log
     let event = AuditEvent::builder(
         AuditAction::Custom("roster_wallet_added".to_string()),
@@ -604,6 +620,12 @@ pub async fn remove_allocation(
         return Err(ApiError::NotFound("Wallet not in roster".into()));
     }
 
+    // Sync copy_enabled on tracked_wallets
+    sqlx::query("UPDATE tracked_wallets SET copy_enabled = FALSE WHERE address = $1")
+        .bind(&address)
+        .execute(&state.pool)
+        .await?;
+
     // Audit log
     state.audit_logger.log_user_action(
         &claims.sub,
@@ -698,6 +720,12 @@ pub async fn promote_allocation(
     .bind(&address)
     .execute(&state.pool)
     .await?;
+
+    // Sync copy_enabled on tracked_wallets
+    sqlx::query("UPDATE tracked_wallets SET copy_enabled = TRUE WHERE address = $1")
+        .bind(&address)
+        .execute(&state.pool)
+        .await?;
 
     // Log rotation history
     sqlx::query(
@@ -831,6 +859,12 @@ pub async fn demote_allocation(
     .bind(&address)
     .execute(&state.pool)
     .await?;
+
+    // Sync copy_enabled on tracked_wallets
+    sqlx::query("UPDATE tracked_wallets SET copy_enabled = FALSE WHERE address = $1")
+        .bind(&address)
+        .execute(&state.pool)
+        .await?;
 
     // Log rotation history
     sqlx::query(
