@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { LiveIndicator } from '@/components/shared/LiveIndicator';
 import { cn, formatCurrency, formatTimeAgo, shortenAddress } from '@/lib/utils';
@@ -22,7 +22,7 @@ export function LiveActivityFeed({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchTrades = async () => {
+  const fetchTrades = useCallback(async () => {
     try {
       const data = await api.getLiveTrades({ limit: maxItems });
       setTrades(data);
@@ -32,13 +32,13 @@ export function LiveActivityFeed({
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [maxItems]);
 
   useEffect(() => {
     fetchTrades();
     const interval = setInterval(fetchTrades, refreshInterval);
     return () => clearInterval(interval);
-  }, [maxItems, refreshInterval]);
+  }, [fetchTrades, refreshInterval]);
 
   return (
     <Card className={cn('overflow-hidden', className)}>

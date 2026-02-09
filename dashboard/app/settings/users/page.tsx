@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -64,14 +64,7 @@ export default function UsersPage() {
     }
   }, [currentUser, router, toast]);
 
-  // Load users
-  useEffect(() => {
-    if (currentUser?.role === 'PlatformAdmin') {
-      loadUsers();
-    }
-  }, [currentUser]);
-
-  const loadUsers = async () => {
+  const loadUsers = useCallback(async () => {
     setIsLoading(true);
     try {
       const data = await api.listUsers();
@@ -81,7 +74,14 @@ export default function UsersPage() {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [toast]);
+
+  // Load users
+  useEffect(() => {
+    if (currentUser?.role === 'PlatformAdmin') {
+      loadUsers();
+    }
+  }, [currentUser, loadUsers]);
 
   const handleCreate = async () => {
     if (!formData.email || !formData.password) {
