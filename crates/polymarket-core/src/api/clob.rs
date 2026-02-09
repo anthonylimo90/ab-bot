@@ -132,37 +132,39 @@ impl ClobClient {
         Ok(book.into())
     }
 
-    /// Fetch recent trades from the CLOB API.
+    /// Fetch recent trades from the Data API.
     ///
     /// This is a public endpoint (no auth needed) that returns recent trades
-    /// with maker/taker addresses — the primary source for wallet discovery.
+    /// with wallet addresses — the primary source for wallet discovery.
+    ///
+    /// Note: Switched from CLOB API to Data API because CLOB /trades endpoint
+    /// now requires authentication.
     pub async fn get_recent_trades(
         &self,
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Vec<ClobTrade>> {
-        let mut url = format!("{}/trades?limit={}", self.base_url, limit);
+        // Use Data API instead of CLOB API - it's public and doesn't require auth
+        let data_api_url = "https://data-api.polymarket.com";
+        let mut url = format!("{}/trades?limit={}", data_api_url, limit);
         if let Some(c) = cursor {
-            url.push_str(&format!("&next_cursor={}", c));
+            url.push_str(&format!("&offset={}", c));
         }
 
         let response = self.get_with_retry(&url).await?;
         let text = response.text().await?;
 
-        // The CLOB API may return trades as a top-level array or wrapped in { data: [...] }
-        if let Ok(trades) = serde_json::from_str::<Vec<ClobTrade>>(&text) {
-            return Ok(trades);
-        }
-
-        if let Ok(wrapper) = serde_json::from_str::<TradesResponse>(&text) {
-            if let Some(trades) = wrapper.data {
-                return Ok(trades);
+        // Data API returns trades as a top-level array
+        match serde_json::from_str::<Vec<ClobTrade>>(&text) {
+            Ok(trades) => Ok(trades),
+            Err(e) => {
+                warn!(
+                    "Could not parse Data API trades response: {} - returning empty",
+                    e
+                );
+                Ok(Vec::new())
             }
         }
-
-        // If neither format works, return empty rather than failing
-        warn!("Could not parse CLOB trades response, returning empty");
-        Ok(Vec::new())
     }
 
     /// Subscribe to real-time order book updates via WebSocket.
@@ -238,42 +240,42 @@ impl ClobClient {
     }
 }
 
-/// A trade from the CLOB API.
+/// A trade from the Data API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClobTrade {
-    /// Unique trade ID.
-    pub id: String,
-    /// Taker order ID.
-    #[serde(default)]
-    pub taker_order_id: String,
-    /// Market condition ID.
-    #[serde(default)]
-    pub market: String,
-    /// Asset/token ID.
-    pub asset_id: String,
+    /// Transaction hash (unique identifier).
+    #[serde(alias = "transactionHash", alias = "id")]
+    pub transaction_hash: String,
+    /// Wallet address (proxy wallet in Data API).
+    #[serde(alias = "proxyWallet", alias = "maker_address")]
+    pub wallet_address: String,
     /// Trade side (BUY/SELL).
     pub side: String,
-    /// Trade size.
-    pub size: String,
+    /// Asset/token ID.
+    #[serde(alias = "asset")]
+    pub asset_id: String,
+    /// Market condition ID.
+    #[serde(alias = "conditionId", default)]
+    pub condition_id: Option<String>,
+    /// Trade size (quantity).
+    pub size: f64,
     /// Trade price.
-    pub price: String,
-    /// Maker address.
-    pub maker_address: String,
-    /// Trader address (taker).
+    pub price: f64,
+    /// Unix timestamp.
+    pub timestamp: i64,
+    /// Market title.
     #[serde(default)]
-    pub trader_address: Option<String>,
-    /// Timestamp string.
+    pub title: Option<String>,
+    /// Market slug.
     #[serde(default)]
-    pub created_at: Option<String>,
-    /// Status of the trade.
+    pub slug: Option<String>,
+    /// Outcome name.
     #[serde(default)]
-    pub status: Option<String>,
-    /// Match time (Unix timestamp).
-    #[serde(default)]
-    pub match_time: Option<String>,
+    pub outcome: Option<String>,
 }
 
-/// Response wrapper for paginated trades.
+/// Response wrapper for paginated trades (legacy CLOB API format - no longer used).
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct TradesResponse {
     #[serde(default)]
