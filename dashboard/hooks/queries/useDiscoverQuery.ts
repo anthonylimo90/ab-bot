@@ -75,6 +75,16 @@ export function useDemoPnlSimulationQuery(mode: TradingMode, params?: {
   });
 }
 
+export function useDiscoveredWalletQuery(mode: TradingMode, address: string) {
+  return useQuery({
+    queryKey: ['discover', 'wallet', mode, address],
+    queryFn: () => api.getDiscoveredWallet(address),
+    enabled: !!address,
+    staleTime: 60 * 1000,
+    retry: false,
+  });
+}
+
 export function useLeaderboardQuery(mode: TradingMode, workspaceId?: string) {
   return useDiscoverWalletsQuery(mode, {
     sortBy: 'roi',

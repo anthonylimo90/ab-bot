@@ -418,6 +418,14 @@ impl WalletDiscovery {
         }))
     }
 
+    /// Look up a single wallet's discovery data by address.
+    pub async fn query_single_wallet_public(
+        &self,
+        address: &str,
+    ) -> Result<Option<DiscoveredWallet>> {
+        self.query_single_wallet(address).await
+    }
+
     fn calculate_wallet_metrics(
         &self,
         address: &str,

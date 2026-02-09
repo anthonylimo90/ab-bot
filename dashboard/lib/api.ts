@@ -416,6 +416,10 @@ class ApiClient {
     return this.request<DiscoveredWallet[]>(`/api/v1/discover/wallets${query ? `?${query}` : ''}`);
   }
 
+  async getDiscoveredWallet(address: string): Promise<DiscoveredWallet> {
+    return this.request<DiscoveredWallet>(`/api/v1/discover/wallets/${address}`);
+  }
+
   async simulateDemoPnl(params?: {
     amount?: number;
     period?: '7d' | '30d' | '90d';

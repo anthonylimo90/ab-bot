@@ -61,6 +61,7 @@ use crate::websocket;
         backtest::get_backtest_result,
         discover::get_live_trades,
         discover::discover_wallets,
+        discover::get_discovered_wallet,
         discover::simulate_demo_pnl,
         vault::store_wallet,
         vault::list_wallets,
@@ -328,6 +329,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Discovery/demo endpoints (public for demo purposes)
         .route("/api/v1/discover/trades", get(discover::get_live_trades))
         .route("/api/v1/discover/wallets", get(discover::discover_wallets))
+        .route(
+            "/api/v1/discover/wallets/:address",
+            get(discover::get_discovered_wallet),
+        )
         .route(
             "/api/v1/discover/simulate",
             get(discover::simulate_demo_pnl),
