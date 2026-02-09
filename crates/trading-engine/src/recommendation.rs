@@ -25,6 +25,7 @@ struct WalletMetricsRow {
 }
 
 /// Row type for arb_opportunities query.
+#[allow(dead_code)]
 #[derive(Debug, FromRow)]
 struct ArbOpportunityRow {
     market_id: String,
@@ -35,6 +36,7 @@ struct ArbOpportunityRow {
 }
 
 /// Row type for positions query.
+#[allow(dead_code)]
 #[derive(Debug, FromRow)]
 struct PositionRow {
     id: Uuid,
