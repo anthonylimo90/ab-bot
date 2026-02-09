@@ -34,7 +34,8 @@ import {
   History,
   Bot,
 } from 'lucide-react';
-import type { WorkspaceAllocation } from '@/types/api';
+import { useDiscoverWalletsQuery } from '@/hooks/queries/useDiscoverQuery';
+import type { WorkspaceAllocation, DiscoveredWallet } from '@/types/api';
 
 // Position format expected by WalletCard
 interface WalletPosition {
@@ -90,7 +91,8 @@ function toWalletPosition(p: DemoPosition): WalletPosition {
   };
 }
 
-function toTradingWallet(allocation: WorkspaceAllocation): TradingWallet {
+function toTradingWallet(allocation: WorkspaceAllocation, discovered?: DiscoveredWallet): TradingWallet {
+  const hasBacktest = allocation.backtest_roi != null && allocation.backtest_roi !== 0;
   return {
     address: allocation.wallet_address,
     label: allocation.wallet_label,
@@ -101,12 +103,16 @@ function toTradingWallet(allocation: WorkspaceAllocation): TradingWallet {
       max_position_size: allocation.max_position_size ?? 100,
       arb_threshold_pct: allocation.arb_threshold_pct,
     },
-    roi30d: ratioOrPercentToPercent(allocation.backtest_roi),
-    sharpe: allocation.backtest_sharpe ?? 0,
-    winRate: ratioOrPercentToPercent(allocation.backtest_win_rate),
-    trades: 0,
-    maxDrawdown: 0,
-    confidence: allocation.confidence_score ?? 0,
+    roi30d: hasBacktest
+      ? ratioOrPercentToPercent(allocation.backtest_roi)
+      : (discovered ? Number(discovered.roi_30d) : 0),
+    sharpe: allocation.backtest_sharpe ?? (discovered ? Number(discovered.sharpe_ratio) : 0),
+    winRate: hasBacktest
+      ? ratioOrPercentToPercent(allocation.backtest_win_rate)
+      : (discovered ? Number(discovered.win_rate) : 0),
+    trades: discovered?.total_trades ?? 0,
+    maxDrawdown: discovered ? Number(discovered.max_drawdown) : 0,
+    confidence: allocation.confidence_score ?? (discovered?.confidence ?? 0),
     addedAt: allocation.added_at,
     pinned: allocation.pinned,
     pinnedAt: allocation.pinned_at,
@@ -128,13 +134,31 @@ export default function TradingPage() {
   const currentTab = searchParams.get('tab') || 'active';
 
   const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
+  const { data: discoveredWallets = [] } = useDiscoverWalletsQuery(mode, {
+    minTrades: 1,
+    limit: 250,
+  });
   const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id, mode);
   const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id, mode);
   const removeMutation = useRemoveAllocationMutation(currentWorkspace?.id, mode);
   const pinMutation = usePinAllocationMutation(currentWorkspace?.id, mode);
   const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id, mode);
-  const activeWallets = allocations.filter((a) => a.tier === 'active').map(toTradingWallet);
-  const benchWallets = allocations.filter((a) => a.tier === 'bench').map(toTradingWallet);
+
+  // Build lookup map of discovered wallets by address
+  const discoveryMap = useMemo(() => {
+    const map = new Map<string, DiscoveredWallet>();
+    for (const dw of discoveredWallets) {
+      map.set(dw.address.toLowerCase(), dw);
+    }
+    return map;
+  }, [discoveredWallets]);
+
+  const activeWallets = allocations.filter((a) => a.tier === 'active').map((a) =>
+    toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase()))
+  );
+  const benchWallets = allocations.filter((a) => a.tier === 'bench').map((a) =>
+    toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase()))
+  );
   const isRosterFull = () => activeWallets.length >= 5;
 
   // Demo portfolio store
