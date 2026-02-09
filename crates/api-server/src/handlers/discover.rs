@@ -522,7 +522,11 @@ pub async fn get_discovered_wallet(
 ) -> ApiResult<Json<DiscoveredWallet>> {
     let address = address.to_lowercase();
 
-    match state.wallet_discovery.query_single_wallet_public(&address).await {
+    match state
+        .wallet_discovery
+        .query_single_wallet_public(&address)
+        .await
+    {
         Ok(Some(dw)) => {
             let is_tracked = sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
