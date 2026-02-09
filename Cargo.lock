@@ -479,6 +479,7 @@ checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 name = "api-server"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "alloy-primitives",
  "alloy-sol-types",
  "anyhow",
@@ -487,6 +488,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "backtester",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dotenvy",
@@ -514,6 +516,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "trading-engine",
+ "url",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",

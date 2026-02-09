@@ -108,6 +108,12 @@ dashmap = "5.5"
 hex = "0.4"
 base64 = "0.22"
 
+# URL parsing
+url = "2.5"
+
+# Encryption
+aes-gcm = "0.10"
+
 # Async traits
 async-trait = "0.1"
 

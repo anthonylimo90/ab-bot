@@ -70,6 +70,11 @@ anyhow.workspace = true
 # Logging
 tracing.workspace = true
 
+# URL parsing & encryption
+url.workspace = true
+aes-gcm.workspace = true
+base64.workspace = true
+
 # Database
 sqlx.workspace = true
 

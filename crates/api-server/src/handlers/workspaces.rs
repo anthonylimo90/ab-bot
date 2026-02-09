@@ -7,12 +7,15 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::sync::Arc;
+use url::Url;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use auth::{AuditAction, Claims};
 
+use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -320,10 +323,14 @@ pub async fn get_workspace(
         ApiError::Forbidden("Not a member of this workspace or workspace not found".into())
     })?;
 
-    // Mask sensitive values: show only last 4 chars of alchemy key
-    let masked_alchemy_key = workspace.alchemy_api_key.as_ref().map(|key| {
-        if key.len() > 4 {
-            format!("••••••{}", &key[key.len() - 4..])
+    // Decrypt then mask: show only last 4 chars of alchemy key
+    let masked_alchemy_key = workspace.alchemy_api_key.as_ref().map(|stored| {
+        // Try to decrypt (encrypted values); fall back to treating as plaintext
+        // for backward compatibility with pre-encryption rows.
+        let plaintext =
+            crypto::decrypt_field(stored, &state.encryption_key).unwrap_or_else(|| stored.clone());
+        if plaintext.len() > 4 {
+            format!("••••••{}", &plaintext[plaintext.len() - 4..])
         } else {
             "••••••".to_string()
         }
@@ -413,12 +420,30 @@ pub async fn update_workspace(
         }
     }
 
-    // Validate Polygon RPC URL format if provided
-    if let Some(ref url) = req.polygon_rpc_url {
-        if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(ApiError::BadRequest(
-                "Polygon RPC URL must start with http:// or https://".into(),
-            ));
+    // Validate Polygon RPC URL format if provided (SSRF protection)
+    if let Some(ref url_str) = req.polygon_rpc_url {
+        if !url_str.is_empty() {
+            let parsed = Url::parse(url_str)
+                .map_err(|_| ApiError::BadRequest("Invalid Polygon RPC URL format".into()))?;
+
+            if parsed.scheme() != "https" {
+                return Err(ApiError::BadRequest(
+                    "Polygon RPC URL must use HTTPS".into(),
+                ));
+            }
+
+            // Block private/internal network addresses
+            if let Some(host) = parsed.host_str() {
+                if is_private_host(host) {
+                    return Err(ApiError::BadRequest(
+                        "Polygon RPC URL must not point to a private/internal address".into(),
+                    ));
+                }
+            } else {
+                return Err(ApiError::BadRequest(
+                    "Polygon RPC URL must include a valid host".into(),
+                ));
+            }
         }
     }
 
@@ -427,8 +452,10 @@ pub async fn update_workspace(
     let mut set_parts = vec!["updated_at = $2".to_string()];
     let mut param_idx = 3;
 
+    // SAFETY: The $col arguments below MUST be hardcoded string literals (column names).
+    // Never pass user-controlled input as $col — that would be SQL injection.
     macro_rules! add_param {
-        ($field:ident, $col:expr) => {
+        ($field:ident, $col:literal) => {
             if req.$field.is_some() {
                 set_parts.push(format!("{} = ${}", $col, param_idx));
                 param_idx += 1;
@@ -501,7 +528,9 @@ pub async fn update_workspace(
         q = q.bind(polygon_rpc_url);
     }
     if let Some(ref alchemy_api_key) = req.alchemy_api_key {
-        q = q.bind(alchemy_api_key);
+        let encrypted = crypto::encrypt_field(alchemy_api_key, &state.encryption_key)
+            .ok_or_else(|| ApiError::Internal("Failed to encrypt API key".into()))?;
+        q = q.bind(encrypted);
     }
     if let Some(arb_auto_execute) = req.arb_auto_execute {
         q = q.bind(arb_auto_execute);
@@ -1131,4 +1160,36 @@ pub async fn get_service_status(
 fn is_valid_walletconnect_project_id(project_id: &str) -> bool {
     // WalletConnect project IDs are typically 32 character hex strings
     project_id.len() == 32 && project_id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Check if a hostname resolves to a private/internal network address.
+/// Used to prevent SSRF attacks via user-supplied URLs.
+fn is_private_host(host: &str) -> bool {
+    // Check common private hostnames
+    let lower = host.to_lowercase();
+    if lower == "localhost"
+        || lower == "0.0.0.0"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+    {
+        return true;
+    }
+
+    // Check if the host is a private IP address
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                v4.is_loopback()          // 127.0.0.0/8
+                    || v4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                    || v4.is_link_local()  // 169.254.0.0/16
+                    || v4.is_unspecified() // 0.0.0.0
+            }
+            IpAddr::V6(v6) => {
+                v6.is_loopback()          // ::1
+                    || v6.is_unspecified() // ::
+            }
+        };
+    }
+
+    false
 }
