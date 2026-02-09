@@ -293,7 +293,10 @@ pub async fn discover_wallets(
         .min_win_rate(
             query
                 .min_win_rate
-                .map(|w| w.try_into().unwrap_or(0.0))
+                .map(|w| {
+                    let pct: f64 = w.try_into().unwrap_or(0.0);
+                    pct / 100.0
+                })
                 .unwrap_or(0.0),
         )
         .min_volume(Decimal::ZERO)
