@@ -74,7 +74,7 @@ impl OrderSigner {
             .await
             .context("Failed to sign order")?;
 
-        Ok(format!("0x{}", hex::encode(signature.as_bytes())))
+        Ok(signature_to_hex(&signature))
     }
 
     /// Sign a CLOB auth message using EIP-712 typed data (L1 authentication).
@@ -95,7 +95,7 @@ impl OrderSigner {
             .await
             .context("Failed to sign CLOB auth message")?;
 
-        Ok(format!("0x{}", hex::encode(signature.as_bytes())))
+        Ok(signature_to_hex(&signature))
     }
 
     /// Sign a message for L1 authentication (API key derivation).
@@ -125,8 +125,19 @@ impl OrderSigner {
             .await
             .context("Failed to sign message")?;
 
-        Ok(format!("0x{}", hex::encode(signature.as_bytes())))
+        Ok(signature_to_hex(&signature))
     }
+}
+
+/// Encode a signature as a hex string with Ethereum-standard v value (27/28).
+///
+/// alloy's `PrimitiveSignature::as_bytes()` returns v as 0/1 (raw parity),
+/// but Ethereum signatures and Polymarket expect v = 27/28.
+fn signature_to_hex(sig: &alloy_primitives::PrimitiveSignature) -> String {
+    let mut bytes = sig.as_bytes();
+    // Convert v from 0/1 (alloy parity) to 27/28 (Ethereum standard)
+    bytes[64] += 27;
+    format!("0x{}", hex::encode(bytes))
 }
 
 /// Compute the EIP-712 typed data hash.
