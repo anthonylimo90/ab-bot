@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 const POLYGON_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 /// Polygon RPC client for querying blockchain data.
+#[derive(Clone)]
 pub struct PolygonClient {
     rpc_url: String,
     http_client: reqwest::Client,
