@@ -105,6 +105,17 @@ export function useUpdateWalletMutation(mode: TradingMode) {
   });
 }
 
+export function useWalletBalanceQuery(address: string | null) {
+  return useQuery({
+    queryKey: ['wallet-balance', address],
+    queryFn: () => api.getWalletBalance(address!),
+    enabled: !!address,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    retry: 1,
+  });
+}
+
 // Derived hooks for roster/bench separation
 export function useRosterWallets(mode: TradingMode) {
   const query = useWalletsQuery(mode);

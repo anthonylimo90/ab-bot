@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToastStore } from '@/stores/toast-store';
-import { useWalletQuery, useWalletMetricsQuery } from '@/hooks/queries/useWalletsQuery';
+import { useWalletQuery, useWalletMetricsQuery, useWalletBalanceQuery } from '@/hooks/queries/useWalletsQuery';
 import { useLiveTradesQuery, useDiscoveredWalletQuery } from '@/hooks/queries/useDiscoverQuery';
 import {
   useAllocationsQuery,
@@ -33,6 +33,7 @@ import {
 } from 'lucide-react';
 import { WalletAllocationSection } from '@/components/trading/WalletAllocationSection';
 import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
+import { useWalletStore } from '@/stores/wallet-store';
 import type { TradingStyle, DecisionBrief, TradeClassification } from '@/types/api';
 
 const tradingStyleLabels: Record<TradingStyle, string> = {
@@ -62,7 +63,12 @@ export default function WalletDetailPage() {
   const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
   const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id, mode);
   const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id, mode);
-  const { balance, positions } = useDemoPortfolioStore();
+  const { balance: demoBalance, positions } = useDemoPortfolioStore();
+  const { primaryWallet } = useWalletStore();
+  const { data: walletBalance } = useWalletBalanceQuery(
+    mode === 'live' ? primaryWallet : null
+  );
+  const balance = mode === 'live' && walletBalance ? walletBalance.usdc_balance : demoBalance;
 
   // Fetch wallet data from API
   const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(mode, address);
@@ -349,7 +355,7 @@ export default function WalletDetailPage() {
           walletAddress={address}
           totalBalance={balance}
           positionsValue={walletPositionsValue}
-          isDemo={true}
+          isDemo={mode === 'demo'}
         />
       )}
 

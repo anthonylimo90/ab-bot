@@ -37,6 +37,40 @@ pub struct Eip712Domain {
     pub verifying_contract: Address,
 }
 
+/// EIP-712 domain separator for CLOB authentication (no verifyingContract).
+#[derive(Debug, Clone)]
+pub struct ClobAuthDomain {
+    pub name: String,
+    pub version: String,
+    pub chain_id: U256,
+}
+
+impl ClobAuthDomain {
+    /// Create the ClobAuthDomain for Polygon mainnet.
+    pub fn polygon() -> Self {
+        Self {
+            name: "ClobAuthDomain".to_string(),
+            version: "1".to_string(),
+            chain_id: U256::from(POLYGON_CHAIN_ID),
+        }
+    }
+
+    /// Compute the EIP-712 domain separator hash.
+    pub fn separator(&self) -> B256 {
+        let domain_type_hash = alloy_primitives::keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId)",
+        );
+
+        let name_hash = alloy_primitives::keccak256(self.name.as_bytes());
+        let version_hash = alloy_primitives::keccak256(self.version.as_bytes());
+
+        let encoded =
+            (domain_type_hash, name_hash, version_hash, self.chain_id).abi_encode_packed();
+
+        alloy_primitives::keccak256(&encoded)
+    }
+}
+
 impl Eip712Domain {
     /// Create domain for CTF Exchange on Polygon mainnet.
     pub fn ctf_exchange() -> Self {

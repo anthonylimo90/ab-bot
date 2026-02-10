@@ -187,7 +187,7 @@ impl OrderExecutor {
             )
         })?;
         client
-            .derive_api_key()
+            .create_or_derive_api_key()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to derive API credentials: {}", e))?;
 
@@ -221,7 +221,7 @@ impl OrderExecutor {
         let mut auth_client = Self::build_auth_client(wallet);
         let address = auth_client.address();
         auth_client
-            .derive_api_key()
+            .create_or_derive_api_key()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to derive API credentials: {}", e))?;
 

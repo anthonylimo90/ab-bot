@@ -3,6 +3,9 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+/// USDC contract on Polygon (PoS bridged, 6 decimals) — used by Polymarket.
+const POLYGON_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
 /// Polygon RPC client for querying blockchain data.
 pub struct PolygonClient {
     rpc_url: String,
@@ -91,6 +94,35 @@ impl PolygonClient {
             self.rpc_call("alchemy_getAssetTransfers", params).await?;
 
         Ok(response.result.map(|r| r.transfers).unwrap_or_default())
+    }
+
+    /// Get the USDC balance for a wallet address (returns human-readable amount).
+    pub async fn get_usdc_balance(&self, wallet_address: &str) -> Result<f64> {
+        // balanceOf(address) selector = 0x70a08231 + 32-byte left-padded address
+        let addr = wallet_address.trim_start_matches("0x");
+        let data = format!("0x70a08231{:0>64}", addr);
+
+        let params = serde_json::json!([
+            { "to": POLYGON_USDC_ADDRESS, "data": data },
+            "latest"
+        ]);
+
+        let response: JsonRpcResponse<String> = self.rpc_call("eth_call", params).await?;
+        let hex_balance = response.result.ok_or_else(|| Error::Api {
+            message: "No result from eth_call".to_string(),
+            status: None,
+        })?;
+
+        let balance =
+            u128::from_str_radix(hex_balance.trim_start_matches("0x"), 16).map_err(|e| {
+                Error::Api {
+                    message: format!("Failed to parse balance: {}", e),
+                    status: None,
+                }
+            })?;
+
+        // USDC has 6 decimals
+        Ok(balance as f64 / 1_000_000.0)
     }
 
     async fn rpc_call<T: for<'de> Deserialize<'de>>(

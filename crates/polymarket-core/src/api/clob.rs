@@ -600,41 +600,38 @@ impl AuthenticatedClobClient {
         }
     }
 
-    /// Get the wallet address.
+    /// Get the wallet address (EIP-55 checksummed).
     pub fn address(&self) -> String {
-        format!("{:?}", self.signer.address())
+        format!("{}", self.signer.address())
     }
 
     /// Derive API credentials from wallet signature (L1 authentication).
     ///
-    /// This authenticates with Polymarket using your wallet signature
+    /// This authenticates with Polymarket using EIP-712 signed ClobAuth
     /// and returns API credentials for subsequent requests.
     pub async fn derive_api_key(&mut self) -> Result<ApiCredentials> {
         let timestamp = current_timestamp();
+        let nonce: u64 = 0;
 
-        // Sign the auth message with timestamp
+        // Sign the CLOB auth message using EIP-712 typed data
         let signature = self
             .signer
-            .sign_auth_message_with_timestamp(timestamp)
+            .sign_clob_auth_message(timestamp, nonce)
             .await
             .map_err(|e| Error::Signing {
-                message: format!("Failed to sign auth message: {}", e),
+                message: format!("Failed to sign CLOB auth message: {}", e),
             })?;
 
         let url = format!("{}/auth/derive-api-key", self.client.base_url);
 
-        let body = serde_json::json!({
-            "address": self.address(),
-            "signature": signature,
-            "timestamp": timestamp,
-            "nonce": 0
-        });
-
         let response = self
             .client
             .http_client
-            .post(&url)
-            .json(&body)
+            .get(&url)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", &signature)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_NONCE", nonce.to_string())
             .send()
             .await?;
 
@@ -659,6 +656,66 @@ impl AuthenticatedClobClient {
         info!("Successfully derived API credentials");
 
         Ok(credentials)
+    }
+
+    /// Create new API credentials via POST /auth/api-key (L1 authentication).
+    pub async fn create_api_key(&mut self) -> Result<ApiCredentials> {
+        let timestamp = current_timestamp();
+        let nonce: u64 = 0;
+
+        let signature = self
+            .signer
+            .sign_clob_auth_message(timestamp, nonce)
+            .await
+            .map_err(|e| Error::Signing {
+                message: format!("Failed to sign CLOB auth message: {}", e),
+            })?;
+
+        let url = format!("{}/auth/api-key", self.client.base_url);
+
+        let response = self
+            .client
+            .http_client
+            .post(&url)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", &signature)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_NONCE", nonce.to_string())
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to create API key: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        let derive_response: DeriveApiKeyResponse = response.json().await?;
+
+        let credentials = ApiCredentials::new(
+            derive_response.api_key,
+            derive_response.secret,
+            derive_response.passphrase,
+        );
+
+        self.credentials = Some(credentials.clone());
+        info!("Successfully created API credentials");
+
+        Ok(credentials)
+    }
+
+    /// Create or derive API credentials (tries create first, then derive).
+    pub async fn create_or_derive_api_key(&mut self) -> Result<ApiCredentials> {
+        match self.create_api_key().await {
+            Ok(creds) => Ok(creds),
+            Err(create_err) => {
+                warn!("create_api_key failed, trying derive: {}", create_err);
+                self.derive_api_key().await
+            }
+        }
     }
 
     /// Set API credentials directly (if already have them).

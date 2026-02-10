@@ -461,6 +461,10 @@ class ApiClient {
     });
   }
 
+  async getWalletBalance(address: string): Promise<{ address: string; usdc_balance: number }> {
+    return this.request<{ address: string; usdc_balance: number }>(`/api/v1/vault/wallets/${address}/balance`);
+  }
+
   // User Management (Admin only)
   async listUsers(): Promise<UserListItem[]> {
     return this.request<UserListItem[]>('/api/v1/users');

@@ -68,6 +68,7 @@ use crate::websocket;
         vault::get_wallet,
         vault::remove_wallet,
         vault::set_primary_wallet,
+        vault::get_wallet_balance,
         recommendations::get_rotation_recommendations,
         recommendations::dismiss_recommendation,
         recommendations::accept_recommendation,
@@ -186,6 +187,7 @@ use crate::websocket;
             discover::EquityPoint,
             vault::StoreWalletRequest,
             vault::WalletInfo,
+            vault::WalletBalanceResponse,
             recommendations::RotationRecommendation,
             recommendations::RecommendationType,
             recommendations::RecommendationReason,
@@ -393,6 +395,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Vault endpoints (read-only)
         .route("/api/v1/vault/wallets", get(vault::list_wallets))
         .route("/api/v1/vault/wallets/:address", get(vault::get_wallet))
+        .route(
+            "/api/v1/vault/wallets/:address/balance",
+            get(vault::get_wallet_balance),
+        )
         // Order endpoints (read-only)
         .route("/api/v1/orders/:order_id", get(trading::get_order_status))
         // Backtest endpoints (read-only)

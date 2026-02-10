@@ -77,6 +77,8 @@ pub struct AppState {
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     /// Wallet discovery service for querying profitable wallets from DB.
     pub wallet_discovery: Arc<WalletDiscovery>,
+    /// Polygon RPC client for on-chain queries (balance, etc.).
+    pub polygon_client: Option<PolygonClient>,
 }
 
 impl AppState {
@@ -150,12 +152,22 @@ impl AppState {
                 match key_vault.get_wallet_key(&address).await {
                     Ok(Some(key_bytes)) => {
                         let key_hex = format!("0x{}", hex::encode(key_bytes));
-                        let wallet = TradingWallet::from_private_key(&key_hex)
-                            .context("Failed to build trading wallet from vault key bytes")?;
-                        let loaded_address = order_executor.reload_wallet(wallet).await.context(
-                            "Failed to initialize live trading executor from vault wallet",
-                        )?;
-                        tracing::info!(wallet = %loaded_address, "Live trading executor initialized from vault");
+                        match TradingWallet::from_private_key(&key_hex) {
+                            Ok(wallet) => match order_executor.reload_wallet(wallet).await {
+                                Ok(loaded_address) => {
+                                    tracing::info!(wallet = %loaded_address, "Live trading executor initialized from vault");
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "Failed to derive API credentials from vault wallet. Server will start without live trading."
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                tracing::error!(error = %e, "Failed to build trading wallet from vault key bytes");
+                            }
+                        }
                     }
                     Ok(None) => {
                         tracing::warn!(
@@ -181,13 +193,28 @@ impl AppState {
                 tracing::warn!(
                     "Falling back to WALLET_PRIVATE_KEY for live trading wallet initialization"
                 );
-                let wallet = TradingWallet::from_env().context(
-                    "LIVE_TRADING=true but no valid wallet found. Connect a primary vault wallet or set WALLET_PRIVATE_KEY",
-                )?;
-                let loaded_address = order_executor.reload_wallet(wallet).await.context(
-                    "Failed to initialize live trading executor from WALLET_PRIVATE_KEY",
-                )?;
-                tracing::info!(wallet = %loaded_address, "Live trading executor initialized from WALLET_PRIVATE_KEY");
+                match TradingWallet::from_env() {
+                    Ok(wallet) => match order_executor.reload_wallet(wallet).await {
+                        Ok(loaded_address) => {
+                            tracing::info!(wallet = %loaded_address, "Live trading executor initialized from WALLET_PRIVATE_KEY");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "Failed to derive Polymarket API credentials. \
+                                 Server will start without live trading. \
+                                 Use the /api/trading/wallet/reload endpoint to retry."
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "LIVE_TRADING=true but no valid wallet found. \
+                             Server will start without live trading."
+                        );
+                    }
+                }
             }
         }
 
@@ -214,6 +241,9 @@ impl AppState {
             }
         }
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
+
+        // Create Polygon client for on-chain queries (balance, etc.)
+        let polygon_client = build_polygon_client_for_discovery();
 
         // Create wallet discovery service (works without Polygon — DB queries only)
         let wallet_discovery = match build_polygon_client_for_discovery() {
@@ -253,6 +283,7 @@ impl AppState {
             automation_tx,
             arb_entry_tx,
             wallet_discovery,
+            polygon_client,
         })
     }
 

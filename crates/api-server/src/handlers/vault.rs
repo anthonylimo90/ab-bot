@@ -438,3 +438,68 @@ pub async fn set_primary_wallet(
         created_at: wallet.created_at,
     }))
 }
+
+/// Response for wallet USDC balance.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WalletBalanceResponse {
+    /// Wallet address.
+    pub address: String,
+    /// USDC balance (human-readable, 6 decimal places on-chain).
+    pub usdc_balance: f64,
+}
+
+/// Get the on-chain USDC balance for a connected wallet.
+#[utoipa::path(
+    get,
+    path = "/api/v1/vault/wallets/{address}/balance",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Wallet USDC balance", body = WalletBalanceResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Wallet not found"),
+        (status = 503, description = "Polygon RPC not configured"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "vault"
+)]
+pub async fn get_wallet_balance(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> ApiResult<Json<WalletBalanceResponse>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let address = address.to_lowercase();
+
+    // Verify user owns this wallet
+    let wallet_exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM user_wallets WHERE user_id = $1 AND address = $2")
+            .bind(user_id)
+            .bind(&address)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    if wallet_exists.is_none() {
+        return Err(ApiError::NotFound("Wallet not connected".into()));
+    }
+
+    let polygon_client = state
+        .polygon_client
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Polygon RPC not configured".into()))?;
+
+    let usdc_balance = polygon_client
+        .get_usdc_balance(&address)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch USDC balance: {}", e)))?;
+
+    Ok(Json(WalletBalanceResponse {
+        address,
+        usdc_balance,
+    }))
+}
