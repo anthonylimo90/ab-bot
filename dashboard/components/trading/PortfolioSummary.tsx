@@ -141,7 +141,7 @@ export const PortfolioSummary = memo(function PortfolioSummary({
                 <Wallet className="h-5 w-5 text-blue-500" />
               </div>
               <div>
-                <p className="text-sm text-muted-foreground">Demo Cash</p>
+                <p className="text-sm text-muted-foreground">{isDemo ? 'Demo Cash' : 'USDC Balance'}</p>
                 <p className="text-2xl font-bold tabular-nums">
                   {formatCurrency(availableBalance)}
                 </p>

@@ -18,7 +18,7 @@ interface AllocationPieProps {
   outerRadius?: number;
 }
 
-const CustomTooltip = ({ active, payload, totalBalance = 10000 }: any) => {
+const CustomTooltip = ({ active, payload, totalBalance = 0 }: any) => {
   if (active && payload && payload.length) {
     const data = payload[0].payload;
     return (
@@ -35,7 +35,7 @@ const CustomTooltip = ({ active, payload, totalBalance = 10000 }: any) => {
 
 export function AllocationPie({
   data,
-  totalBalance = 10000,
+  totalBalance = 0,
   className,
   showLegend = true,
   innerRadius = 60,

@@ -34,6 +34,7 @@ import {
 import { WalletAllocationSection } from '@/components/trading/WalletAllocationSection';
 import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import { useWalletStore } from '@/stores/wallet-store';
+import { usePositionsQuery } from '@/hooks/queries/usePositionsQuery';
 import type { TradingStyle, DecisionBrief, TradeClassification } from '@/types/api';
 
 const tradingStyleLabels: Record<TradingStyle, string> = {
@@ -69,6 +70,7 @@ export default function WalletDetailPage() {
     mode === 'live' ? primaryWallet : null
   );
   const balance = mode === 'live' && walletBalance ? walletBalance.usdc_balance : demoBalance;
+  const { data: livePositions = [] } = usePositionsQuery(mode, { status: 'open' });
 
   // Fetch wallet data from API
   const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(mode, address);
@@ -182,10 +184,15 @@ export default function WalletDetailPage() {
 
   // Calculate positions value for this wallet
   const walletPositionsValue = useMemo(() => {
-    return positions
-      .filter((p) => p.walletAddress?.toLowerCase() === address?.toLowerCase())
-      .reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
-  }, [positions, address]);
+    if (mode === 'demo') {
+      return positions
+        .filter((p) => p.walletAddress?.toLowerCase() === address?.toLowerCase())
+        .reduce((sum, p) => sum + (p.entryPrice * p.quantity), 0);
+    }
+    return livePositions
+      .filter((p) => p.source_wallet?.toLowerCase() === address?.toLowerCase())
+      .reduce((sum, p) => sum + (p.entry_price * p.quantity), 0);
+  }, [mode, positions, livePositions, address]);
 
   const isActive = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'active');
   const isBench = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'bench');
