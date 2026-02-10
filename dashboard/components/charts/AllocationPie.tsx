@@ -11,20 +11,21 @@ interface AllocationData {
 
 interface AllocationPieProps {
   data: AllocationData[];
+  totalBalance?: number;
   className?: string;
   showLegend?: boolean;
   innerRadius?: number;
   outerRadius?: number;
 }
 
-const CustomTooltip = ({ active, payload }: any) => {
+const CustomTooltip = ({ active, payload, totalBalance = 10000 }: any) => {
   if (active && payload && payload.length) {
     const data = payload[0].payload;
     return (
       <div className="bg-popover/90 backdrop-blur border rounded-lg px-3 py-2 text-sm shadow-lg">
         <div className="font-medium">{data.name}</div>
         <div className="text-muted-foreground">
-          {data.value.toFixed(1)}% (${((data.value / 100) * 10000).toLocaleString()})
+          {data.value.toFixed(1)}% (${((data.value / 100) * totalBalance).toLocaleString()})
         </div>
       </div>
     );
@@ -34,6 +35,7 @@ const CustomTooltip = ({ active, payload }: any) => {
 
 export function AllocationPie({
   data,
+  totalBalance = 10000,
   className,
   showLegend = true,
   innerRadius = 60,
@@ -60,7 +62,7 @@ export function AllocationPie({
               <Cell key={`cell-${index}`} fill={entry.color} strokeWidth={0} />
             ))}
           </Pie>
-          <Tooltip content={<CustomTooltip />} />
+          <Tooltip content={<CustomTooltip totalBalance={totalBalance} />} />
         </PieChart>
       </ResponsiveContainer>
 

@@ -77,6 +77,8 @@ pub struct AppState {
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     /// Wallet discovery service for querying profitable wallets from DB.
     pub wallet_discovery: Arc<WalletDiscovery>,
+    /// Polygon RPC client for on-chain queries (balance, etc.).
+    pub polygon_client: Option<PolygonClient>,
 }
 
 impl AppState {
@@ -240,6 +242,9 @@ impl AppState {
         }
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
 
+        // Create Polygon client for on-chain queries (balance, etc.)
+        let polygon_client = build_polygon_client_for_discovery();
+
         // Create wallet discovery service (works without Polygon — DB queries only)
         let wallet_discovery = match build_polygon_client_for_discovery() {
             Some(pc) => Arc::new(WalletDiscovery::new(pc, pool.clone())),
@@ -278,6 +283,7 @@ impl AppState {
             automation_tx,
             arb_entry_tx,
             wallet_discovery,
+            polygon_client,
         })
     }
 
