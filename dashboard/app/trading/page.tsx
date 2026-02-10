@@ -13,6 +13,11 @@ import { useDemoPortfolioStore, DemoPosition } from '@/stores/demo-portfolio-sto
 import { useModeStore } from '@/stores/mode-store';
 import { useToastStore } from '@/stores/toast-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { usePortfolioStats } from '@/hooks/usePortfolioStats';
+import { usePositionsQuery } from '@/hooks/queries/usePositionsQuery';
+import { useWalletStore } from '@/stores/wallet-store';
+import { useWalletBalanceQuery } from '@/hooks/queries/useWalletsQuery';
+import type { Position } from '@/types/api';
 import {
   useAllocationsQuery,
   usePromoteAllocationMutation,
@@ -88,6 +93,20 @@ function toWalletPosition(p: DemoPosition): WalletPosition {
     currentPrice: p.currentPrice,
     pnl,
     pnlPercent,
+  };
+}
+
+function livePositionToWalletPosition(p: Position): WalletPosition {
+  return {
+    id: p.id,
+    marketId: p.market_id,
+    marketQuestion: undefined,
+    outcome: p.outcome as 'yes' | 'no',
+    quantity: p.quantity,
+    entryPrice: p.entry_price,
+    currentPrice: p.current_price,
+    pnl: p.unrealized_pnl,
+    pnlPercent: p.unrealized_pnl_pct,
   };
 }
 
@@ -172,6 +191,13 @@ export default function TradingPage() {
     getTotalPnl,
   } = useDemoPortfolioStore();
 
+  // Live data hooks (no-ops in demo mode due to enabled: mode === 'live')
+  const { stats: liveStats } = usePortfolioStats('30D');
+  const { data: liveOpenPositions = [] } = usePositionsQuery(mode, { status: 'open' });
+  const { data: liveClosedPositions = [] } = usePositionsQuery(mode, { status: 'closed' });
+  const { primaryWallet } = useWalletStore();
+  const { data: walletBalance } = useWalletBalanceQuery(mode === 'live' ? primaryWallet : null);
+
   // Fetch positions on mount
   useEffect(() => {
     if (isDemo) {
@@ -182,15 +208,21 @@ export default function TradingPage() {
   // Group positions by wallet address
   const positionsByWallet = useMemo(() => {
     const grouped: Record<string, WalletPosition[]> = {};
-    demoPositions.forEach((p) => {
-      const wallet = p.walletAddress || 'manual';
-      if (!grouped[wallet]) {
-        grouped[wallet] = [];
-      }
-      grouped[wallet].push(toWalletPosition(p));
-    });
+    if (isDemo) {
+      demoPositions.forEach((p) => {
+        const wallet = p.walletAddress || 'manual';
+        if (!grouped[wallet]) grouped[wallet] = [];
+        grouped[wallet].push(toWalletPosition(p));
+      });
+    } else {
+      liveOpenPositions.forEach((p) => {
+        const wallet = p.source_wallet || 'manual';
+        if (!grouped[wallet]) grouped[wallet] = [];
+        grouped[wallet].push(livePositionToWalletPosition(p));
+      });
+    }
     return grouped;
-  }, [demoPositions]);
+  }, [isDemo, demoPositions, liveOpenPositions]);
 
   // Manual positions (no source wallet)
   const manualPositions = positionsByWallet['manual'] || [];
@@ -199,13 +231,19 @@ export default function TradingPage() {
   const { balance: demoBalance } = useDemoPortfolioStore();
 
   // Calculate summary stats
-  const totalValue = isDemo ? getTotalValue() : 0;
-  const totalPnl = isDemo ? getTotalPnl() : 0;
-  const positionCount = demoPositions.length;
-  const closedCount = demoClosedPositions.length;
-  const winCount = demoClosedPositions.filter((p) => (p.realizedPnl || 0) > 0).length;
-  const winRate = closedCount > 0 ? (winCount / closedCount) * 100 : 0;
-  const realizedPnl = demoClosedPositions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0);
+  const totalValue = isDemo ? getTotalValue() : liveStats.total_value;
+  const totalPnl = isDemo ? getTotalPnl() : liveStats.unrealized_pnl;
+  const positionCount = isDemo ? demoPositions.length : liveOpenPositions.length;
+  const closedCount = isDemo ? demoClosedPositions.length : liveClosedPositions.length;
+  const winCount = isDemo
+    ? demoClosedPositions.filter((p) => (p.realizedPnl || 0) > 0).length
+    : liveStats.winning_trades;
+  const winRate = isDemo
+    ? (closedCount > 0 ? (winCount / closedCount) * 100 : 0)
+    : liveStats.win_rate;
+  const realizedPnl = isDemo
+    ? demoClosedPositions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0)
+    : liveStats.realized_pnl;
 
   // Handle tab change
   const handleTabChange = (value: string) => {
@@ -266,6 +304,52 @@ export default function TradingPage() {
   const maxPins = 3;
   const pinsRemaining = maxPins - pinnedCount;
 
+  // Normalized closed positions for both modes
+  interface ClosedPositionDisplay {
+    id: string;
+    marketQuestion?: string;
+    marketId: string;
+    outcome: string;
+    entryPrice: number;
+    exitPrice?: number;
+    quantity: number;
+    realizedPnl: number;
+    walletAddress?: string;
+    walletLabel?: string;
+    closedAt?: string;
+  }
+
+  const closedDisplayPositions: ClosedPositionDisplay[] = useMemo(() => {
+    if (isDemo) {
+      return demoClosedPositions.map((p) => ({
+        id: p.id,
+        marketQuestion: p.marketQuestion,
+        marketId: p.marketId,
+        outcome: p.outcome,
+        entryPrice: p.entryPrice,
+        exitPrice: p.exitPrice ?? p.currentPrice,
+        quantity: p.quantity,
+        realizedPnl: p.realizedPnl || 0,
+        walletAddress: p.walletAddress,
+        walletLabel: p.walletLabel,
+        closedAt: p.closedAt,
+      }));
+    }
+    return liveClosedPositions.map((p) => ({
+      id: p.id,
+      marketQuestion: undefined,
+      marketId: p.market_id,
+      outcome: p.outcome,
+      entryPrice: p.entry_price,
+      exitPrice: p.current_price,
+      quantity: p.quantity,
+      realizedPnl: p.unrealized_pnl,
+      walletAddress: p.source_wallet,
+      walletLabel: undefined,
+      closedAt: p.updated_at,
+    }));
+  }, [isDemo, demoClosedPositions, liveClosedPositions]);
+
   return (
     <div className="space-y-6">
       {/* Page Header */}
@@ -310,7 +394,7 @@ export default function TradingPage() {
         positionCount={positionCount}
         winRate={winRate}
         realizedPnl={realizedPnl}
-        availableBalance={isDemo ? demoBalance : undefined}
+        availableBalance={isDemo ? demoBalance : (walletBalance?.usdc_balance ?? undefined)}
         isDemo={isDemo}
       />
 
@@ -476,7 +560,7 @@ export default function TradingPage() {
 
         {/* Closed Positions Tab */}
         <TabsContent value="closed" className="space-y-4">
-          {demoClosedPositions.length === 0 ? (
+          {closedDisplayPositions.length === 0 ? (
             <Card>
               <CardContent className="p-12 text-center">
                 <History className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
@@ -515,63 +599,54 @@ export default function TradingPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {demoClosedPositions.map((position) => {
-                        const pnl = position.realizedPnl || 0;
-                        const sourceWallet = position.walletAddress
-                          ? [...activeWallets, ...benchWallets].find(
-                              (w) => w.address === position.walletAddress
-                            )
-                          : null;
-
-                        return (
-                          <tr key={position.id} className="border-b hover:bg-muted/30">
-                            <td className="p-4">
-                              <p className="font-medium text-sm">
-                                {position.marketQuestion || position.marketId}
-                              </p>
-                            </td>
-                            <td className="p-4">
-                              <span
-                                className={cn(
-                                  'px-2 py-1 rounded text-xs font-medium uppercase',
-                                  position.outcome === 'yes'
-                                    ? 'bg-profit/10 text-profit'
-                                    : 'bg-loss/10 text-loss'
-                                )}
-                              >
-                                {position.outcome}
-                              </span>
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              ${position.entryPrice.toFixed(2)}
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              ${position.exitPrice?.toFixed(2) || position.currentPrice?.toFixed(2) || '-'}
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              {formatCurrency(position.quantity * position.entryPrice)}
-                            </td>
-                            <td className="p-4 text-right">
-                              <span
-                                className={cn(
-                                  'tabular-nums font-medium',
-                                  pnl >= 0 ? 'text-profit' : 'text-loss'
-                                )}
-                              >
-                                {formatCurrency(pnl, { showSign: true })}
-                              </span>
-                            </td>
-                            <td className="p-4 text-right text-muted-foreground text-sm">
-                              {position.walletLabel || (position.walletAddress ? shortenAddress(position.walletAddress) : 'Manual')}
-                            </td>
-                            <td className="p-4 text-right text-muted-foreground text-sm">
-                              {position.closedAt
-                                ? new Date(position.closedAt).toLocaleDateString()
-                                : '-'}
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      {closedDisplayPositions.map((position) => (
+                        <tr key={position.id} className="border-b hover:bg-muted/30">
+                          <td className="p-4">
+                            <p className="font-medium text-sm">
+                              {position.marketQuestion || position.marketId}
+                            </p>
+                          </td>
+                          <td className="p-4">
+                            <span
+                              className={cn(
+                                'px-2 py-1 rounded text-xs font-medium uppercase',
+                                position.outcome === 'yes'
+                                  ? 'bg-profit/10 text-profit'
+                                  : 'bg-loss/10 text-loss'
+                              )}
+                            >
+                              {position.outcome}
+                            </span>
+                          </td>
+                          <td className="p-4 text-right tabular-nums">
+                            ${position.entryPrice.toFixed(2)}
+                          </td>
+                          <td className="p-4 text-right tabular-nums">
+                            ${position.exitPrice?.toFixed(2) || '-'}
+                          </td>
+                          <td className="p-4 text-right tabular-nums">
+                            {formatCurrency(position.quantity * position.entryPrice)}
+                          </td>
+                          <td className="p-4 text-right">
+                            <span
+                              className={cn(
+                                'tabular-nums font-medium',
+                                position.realizedPnl >= 0 ? 'text-profit' : 'text-loss'
+                              )}
+                            >
+                              {formatCurrency(position.realizedPnl, { showSign: true })}
+                            </span>
+                          </td>
+                          <td className="p-4 text-right text-muted-foreground text-sm">
+                            {position.walletLabel || (position.walletAddress ? shortenAddress(position.walletAddress) : 'Manual')}
+                          </td>
+                          <td className="p-4 text-right text-muted-foreground text-sm">
+                            {position.closedAt
+                              ? new Date(position.closedAt).toLocaleDateString()
+                              : '-'}
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>

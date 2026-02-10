@@ -6,23 +6,15 @@ export type TradingMode = 'demo' | 'live';
 
 interface ModeStore {
   mode: TradingMode;
-  demoBalance: number;
-  initialDemoBalance: number;
   setMode: (mode: TradingMode, queryClient?: QueryClient) => Promise<void>;
-  updateDemoBalance: (balance: number) => void;
-  resetDemoBalance: () => void;
   isDemo: () => boolean;
   isLive: () => boolean;
 }
-
-const DEFAULT_DEMO_BALANCE = 10000;
 
 export const useModeStore = create<ModeStore>()(
   persist(
     (set, get) => ({
       mode: 'demo',
-      demoBalance: DEFAULT_DEMO_BALANCE,
-      initialDemoBalance: DEFAULT_DEMO_BALANCE,
 
       setMode: async (mode, queryClient) => {
         const oldMode = get().mode;
@@ -53,14 +45,6 @@ export const useModeStore = create<ModeStore>()(
         }
       },
 
-      updateDemoBalance: (balance) => set({ demoBalance: balance }),
-
-      resetDemoBalance: () =>
-        set({
-          demoBalance: DEFAULT_DEMO_BALANCE,
-          initialDemoBalance: DEFAULT_DEMO_BALANCE,
-        }),
-
       isDemo: () => get().mode === 'demo',
       isLive: () => get().mode === 'live',
     }),
@@ -68,8 +52,6 @@ export const useModeStore = create<ModeStore>()(
       name: 'ab-bot-mode',
       partialize: (state) => ({
         mode: state.mode,
-        demoBalance: state.demoBalance,
-        initialDemoBalance: state.initialDemoBalance,
       }),
     }
   )
