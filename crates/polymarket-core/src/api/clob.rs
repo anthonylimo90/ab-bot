@@ -600,9 +600,9 @@ impl AuthenticatedClobClient {
         }
     }
 
-    /// Get the wallet address.
+    /// Get the wallet address (EIP-55 checksummed).
     pub fn address(&self) -> String {
-        format!("{:?}", self.signer.address())
+        format!("{}", self.signer.address())
     }
 
     /// Derive API credentials from wallet signature (L1 authentication).

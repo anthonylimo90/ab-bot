@@ -139,6 +139,8 @@ fn compute_typed_data_hash(domain_separator: B256, struct_hash: B256) -> B256 {
 /// Compute the EIP-712 struct hash for ClobAuth.
 ///
 /// ClobAuth(address address, string timestamp, uint256 nonce, string message)
+///
+/// Uses standard ABI encoding (each field padded to 32 bytes) per EIP-712 spec.
 fn clob_auth_struct_hash(address: Address, timestamp: u64, nonce: u64) -> B256 {
     const CLOB_AUTH_MSG: &str = "This message attests that I control the given wallet";
 
@@ -149,9 +151,12 @@ fn clob_auth_struct_hash(address: Address, timestamp: u64, nonce: u64) -> B256 {
     let timestamp_hash = alloy_primitives::keccak256(timestamp.to_string().as_bytes());
     let message_hash = alloy_primitives::keccak256(CLOB_AUTH_MSG.as_bytes());
 
+    // EIP-712 encodeData uses standard ABI encoding: address left-padded to 32 bytes
+    let address_padded = B256::left_padding_from(address.as_slice());
+
     let encoded = (
         type_hash,
-        address,
+        address_padded,
         timestamp_hash,
         U256::from(nonce),
         message_hash,
