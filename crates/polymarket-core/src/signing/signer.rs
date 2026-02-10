@@ -3,13 +3,13 @@
 //! Provides EIP-712 typed data signing for orders and L1 authentication
 //! messages required by the Polymarket CLOB API.
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolValue;
 use anyhow::{Context, Result};
 
-use super::domain::Eip712Domain;
+use super::domain::{ClobAuthDomain, Eip712Domain};
 use super::order_types::{OrderBuilder, OrderData, SignedOrder};
 
 /// Order signer for Polymarket CLOB.
@@ -77,6 +77,27 @@ impl OrderSigner {
         Ok(format!("0x{}", hex::encode(signature.as_bytes())))
     }
 
+    /// Sign a CLOB auth message using EIP-712 typed data (L1 authentication).
+    ///
+    /// This matches Polymarket's ClobAuth EIP-712 struct:
+    /// ClobAuth(address address, string timestamp, uint256 nonce, string message)
+    pub async fn sign_clob_auth_message(&self, timestamp: u64, nonce: u64) -> Result<String> {
+        let auth_domain = ClobAuthDomain::polygon();
+        let domain_separator = auth_domain.separator();
+
+        let struct_hash = clob_auth_struct_hash(self.address(), timestamp, nonce);
+
+        let digest = compute_typed_data_hash(domain_separator, struct_hash);
+
+        let signature = self
+            .signer
+            .sign_hash(&digest)
+            .await
+            .context("Failed to sign CLOB auth message")?;
+
+        Ok(format!("0x{}", hex::encode(signature.as_bytes())))
+    }
+
     /// Sign a message for L1 authentication (API key derivation).
     ///
     /// The message format is: "I am signing this message to authenticate with Polymarket"
@@ -113,6 +134,31 @@ fn compute_typed_data_hash(domain_separator: B256, struct_hash: B256) -> B256 {
     let prefix = [0x19, 0x01];
     let data = (prefix, domain_separator, struct_hash).abi_encode_packed();
     alloy_primitives::keccak256(&data)
+}
+
+/// Compute the EIP-712 struct hash for ClobAuth.
+///
+/// ClobAuth(address address, string timestamp, uint256 nonce, string message)
+fn clob_auth_struct_hash(address: Address, timestamp: u64, nonce: u64) -> B256 {
+    const CLOB_AUTH_MSG: &str = "This message attests that I control the given wallet";
+
+    let type_hash = alloy_primitives::keccak256(
+        b"ClobAuth(address address,string timestamp,uint256 nonce,string message)",
+    );
+
+    let timestamp_hash = alloy_primitives::keccak256(timestamp.to_string().as_bytes());
+    let message_hash = alloy_primitives::keccak256(CLOB_AUTH_MSG.as_bytes());
+
+    let encoded = (
+        type_hash,
+        address,
+        timestamp_hash,
+        U256::from(nonce),
+        message_hash,
+    )
+        .abi_encode_packed();
+
+    alloy_primitives::keccak256(&encoded)
 }
 
 impl std::fmt::Debug for OrderSigner {
