@@ -129,20 +129,19 @@ impl OrderSigner {
     }
 }
 
-/// Encode a signature as a hex string with Ethereum-standard v value (27/28).
+/// Encode a signature as a 0x-prefixed hex string.
 ///
-/// alloy's `PrimitiveSignature::as_bytes()` returns v as 0/1 (raw parity),
-/// but Ethereum signatures and Polymarket expect v = 27/28.
+/// alloy-primitives 0.8's `as_bytes()` already returns v as 27/28
+/// (Ethereum standard), so no conversion is needed.
 fn signature_to_hex(sig: &alloy_primitives::PrimitiveSignature) -> String {
-    let mut bytes = sig.as_bytes();
-    // Convert v from 0/1 (alloy parity) to 27/28 (Ethereum standard)
-    bytes[64] += 27;
-    format!("0x{}", hex::encode(bytes))
+    format!("0x{}", hex::encode(sig.as_bytes()))
 }
 
 /// Compute the EIP-712 typed data hash.
 fn compute_typed_data_hash(domain_separator: B256, struct_hash: B256) -> B256 {
-    let prefix = [0x19, 0x01];
+    // NOTE: The u8 type annotation is critical here. Without it, Rust infers
+    // [i32; 2] and abi_encode_packed writes 4 bytes per element instead of 1.
+    let prefix: [u8; 2] = [0x19, 0x01];
     let data = (prefix, domain_separator, struct_hash).abi_encode_packed();
     alloy_primitives::keccak256(&data)
 }
@@ -307,6 +306,141 @@ mod tests {
         assert!(debug_str.contains("OrderSigner"));
         assert!(debug_str.contains("address"));
         assert!(!debug_str.contains(TEST_PRIVATE_KEY));
+    }
+
+    #[test]
+    fn test_clob_auth_eip712_encoding() {
+        // Verify EIP-712 encoding matches the reference implementation.
+        // Use a fixed key, timestamp, nonce for reproducibility.
+        let address: Address = TEST_ADDRESS.parse().unwrap();
+        let timestamp = 1700000000u64;
+        let nonce = 0u64;
+
+        // 1. Domain separator for ClobAuthDomain
+        let auth_domain = ClobAuthDomain::polygon();
+        let domain_separator = auth_domain.separator();
+
+        let domain_type_hash = alloy_primitives::keccak256(
+            b"EIP712Domain(string name,string version,uint256 chainId)",
+        );
+        let name_hash = alloy_primitives::keccak256(b"ClobAuthDomain");
+        let version_hash = alloy_primitives::keccak256(b"1");
+
+        // Print intermediate values for comparison with reference impl
+        println!("Domain type hash: 0x{}", hex::encode(domain_type_hash));
+        println!("Name hash:        0x{}", hex::encode(name_hash));
+        println!("Version hash:     0x{}", hex::encode(version_hash));
+        println!(
+            "Chain ID (U256):  0x{}",
+            hex::encode(U256::from(137u64).to_be_bytes::<32>())
+        );
+        println!("Domain separator: 0x{}", hex::encode(domain_separator));
+
+        // 2. Struct hash
+        let struct_hash = clob_auth_struct_hash(address, timestamp, nonce);
+
+        let type_hash = alloy_primitives::keccak256(
+            b"ClobAuth(address address,string timestamp,uint256 nonce,string message)",
+        );
+        let ts_hash = alloy_primitives::keccak256(b"1700000000");
+        let msg_hash =
+            alloy_primitives::keccak256(b"This message attests that I control the given wallet");
+        let addr_padded = B256::left_padding_from(address.as_slice());
+
+        println!("\nStruct type hash:  0x{}", hex::encode(type_hash));
+        println!("Address padded:    0x{}", hex::encode(addr_padded));
+        println!("Timestamp hash:    0x{}", hex::encode(ts_hash));
+        println!(
+            "Nonce (U256):      0x{}",
+            hex::encode(U256::from(0u64).to_be_bytes::<32>())
+        );
+        println!("Message hash:      0x{}", hex::encode(msg_hash));
+        println!("Struct hash:       0x{}", hex::encode(struct_hash));
+
+        // 3. Typed data hash
+        let digest = compute_typed_data_hash(domain_separator, struct_hash);
+        println!("\nTyped data hash:   0x{}", hex::encode(digest));
+        // Must match Python reference: keccak256(b"\x19\x01" || domainSep || structHash)
+        assert_eq!(
+            hex::encode(digest),
+            "c85352894b3c41f3ea6152479d64b9233fbaf2de87eabc7e4bba3a161fd28493",
+            "Typed data hash must match Python reference implementation"
+        );
+
+        // 4. Verify the packed encoding produces correct length
+        let domain_encoded = (
+            domain_type_hash,
+            name_hash,
+            version_hash,
+            U256::from(137u64),
+        )
+            .abi_encode_packed();
+        println!("\nDomain encoded len: {}", domain_encoded.len());
+        assert_eq!(
+            domain_encoded.len(),
+            128,
+            "Domain should be 4 x 32 = 128 bytes"
+        );
+
+        let struct_encoded =
+            (type_hash, addr_padded, ts_hash, U256::from(0u64), msg_hash).abi_encode_packed();
+        println!("Struct encoded len: {}", struct_encoded.len());
+        assert_eq!(
+            struct_encoded.len(),
+            160,
+            "Struct should be 5 x 32 = 160 bytes"
+        );
+
+        let prefix = [0x19u8, 0x01];
+        let typed_data_encoded = (prefix, domain_separator, struct_hash).abi_encode_packed();
+        println!("Typed data encoded len: {}", typed_data_encoded.len());
+        println!(
+            "Typed data encoded hex: 0x{}",
+            hex::encode(&typed_data_encoded)
+        );
+
+        // Manual concatenation (the correct way per EIP-712)
+        let mut manual = Vec::with_capacity(66);
+        manual.extend_from_slice(&[0x19, 0x01]);
+        manual.extend_from_slice(domain_separator.as_slice());
+        manual.extend_from_slice(struct_hash.as_slice());
+        let manual_hash = alloy_primitives::keccak256(&manual);
+        println!("Manual typed data hash: 0x{}", hex::encode(manual_hash));
+        println!(
+            "Packed typed data hash: 0x{}",
+            hex::encode(alloy_primitives::keccak256(&typed_data_encoded))
+        );
+
+        assert_eq!(
+            typed_data_encoded.len(),
+            66,
+            "Typed data should be 2 + 32 + 32 = 66 bytes"
+        );
+        assert_eq!(
+            typed_data_encoded,
+            manual.as_slice(),
+            "Packed encoding should match manual concatenation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clob_auth_signature_matches_python() {
+        let signer = test_signer();
+        let timestamp = 1700000000u64;
+        let nonce = 0u64;
+
+        let signature = signer
+            .sign_clob_auth_message(timestamp, nonce)
+            .await
+            .unwrap();
+
+        // Python reference: Account._sign_hash(typed_data_hash, key).signature.hex()
+        // With 0x prefix and v=27/28
+        assert_eq!(
+            signature,
+            "0x659ed4b28ae28e0f038fdf0023c00863c9559caacb9ebc83f44eea87059a099a36f1e1dee110e7faa1c4f65d17489b2da1333ebef78bbe2116d81207b975052d1c",
+            "Signature must match Python reference implementation"
+        );
     }
 
     #[test]
