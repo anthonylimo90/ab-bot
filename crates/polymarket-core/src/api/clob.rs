@@ -711,7 +711,10 @@ impl AuthenticatedClobClient {
     pub async fn create_or_derive_api_key(&mut self) -> Result<ApiCredentials> {
         match self.create_api_key().await {
             Ok(creds) => Ok(creds),
-            Err(_) => self.derive_api_key().await,
+            Err(create_err) => {
+                warn!("create_api_key failed, trying derive: {}", create_err);
+                self.derive_api_key().await
+            }
         }
     }
 
