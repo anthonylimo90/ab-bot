@@ -11,9 +11,9 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health, invites,
-    markets, onboarding, order_signing, positions, recommendations, risk_allocations, trading,
-    users, vault, wallet_auth, wallets, workspaces,
+    activity, admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health,
+    invites, markets, onboarding, order_signing, positions, recommendations, risk_allocations,
+    trading, users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -133,6 +133,8 @@ use crate::websocket;
         // Order signing (MetaMask)
         order_signing::prepare_order,
         order_signing::submit_order,
+        // Activity
+        activity::list_activity,
     ),
     components(
         schemas(
@@ -251,6 +253,8 @@ use crate::websocket;
             order_signing::Eip712Types,
             order_signing::TypeDefinition,
             order_signing::OrderSummary,
+            // Activity
+            activity::ActivityResponse,
         )
     ),
     tags(
@@ -273,6 +277,7 @@ use crate::websocket;
         (name = "onboarding", description = "Setup wizard and onboarding"),
         (name = "demo", description = "Demo trading positions and balance"),
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
+        (name = "activity", description = "Activity feed from copy trade history"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -436,6 +441,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/workspaces/:workspace_id/invites",
             get(invites::list_invites),
         )
+        // Activity feed (read-only for all members)
+        .route("/api/v1/activity", get(activity::list_activity))
         // Allocations (read-only for all members)
         .route("/api/v1/allocations", get(allocations::list_allocations))
         // Auto-rotation history (read-only for all members)

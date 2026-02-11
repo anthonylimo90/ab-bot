@@ -298,6 +298,87 @@ impl CopyTradingMonitor {
                     warn!(error = %e, "Failed to record copy trade history");
                 }
 
+                // Insert position for dashboard visibility
+                let position_id = uuid::Uuid::new_v4();
+                let side_str = match trade.direction {
+                    TradeDirection::Buy => "long",
+                    TradeDirection::Sell => "short",
+                };
+                let outcome_str = match trade.direction {
+                    TradeDirection::Buy => "yes",
+                    TradeDirection::Sell => "no",
+                };
+
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO positions (
+                        id, market_id, outcome, side, quantity,
+                        entry_price, current_price, unrealized_pnl,
+                        is_copy_trade, source_wallet, is_open, opened_at,
+                        yes_entry_price, no_entry_price, entry_timestamp,
+                        exit_strategy, state, source
+                    ) VALUES (
+                        $1, $2, $3, $4, $5,
+                        $6, $6, 0,
+                        true, $7, true, NOW(),
+                        $8, $9, NOW(),
+                        1, 1, 2
+                    )
+                    "#,
+                )
+                .bind(position_id)
+                .bind(&trade.market_id)
+                .bind(outcome_str)
+                .bind(side_str)
+                .bind(report.filled_quantity)
+                .bind(report.average_price)
+                .bind(&trade.wallet_address)
+                .bind(if side_str == "long" {
+                    report.average_price
+                } else {
+                    Decimal::ZERO
+                })
+                .bind(if side_str == "short" {
+                    report.average_price
+                } else {
+                    Decimal::ZERO
+                })
+                .execute(&self.pool)
+                .await
+                {
+                    warn!(error = %e, "Failed to insert copy trade position");
+                }
+
+                // Insert execution report
+                let exec_side: i16 = match trade.direction {
+                    TradeDirection::Buy => 0,
+                    TradeDirection::Sell => 1,
+                };
+
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO execution_reports (
+                        order_id, market_id, outcome_id, side, status,
+                        requested_quantity, filled_quantity, average_price,
+                        fees_paid, executed_at, source
+                    ) VALUES ($1, $2, $3, $4, 3, $5, $6, $7, $8, $9, 2)
+                    "#,
+                )
+                .bind(report.order_id)
+                .bind(&trade.market_id)
+                .bind(&trade.token_id)
+                .bind(exec_side)
+                .bind(report.filled_quantity)
+                .bind(report.filled_quantity)
+                .bind(report.average_price)
+                .bind(report.fees_paid)
+                .bind(report.executed_at)
+                .execute(&self.pool)
+                .await
+                {
+                    warn!(error = %e, "Failed to insert execution report");
+                }
+
                 // Publish success signal
                 let success_signal = SignalUpdate {
                     signal_id: uuid::Uuid::new_v4(),

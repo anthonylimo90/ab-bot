@@ -3,7 +3,7 @@
 use anyhow::Context;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 
 use auth::jwt::{JwtAuth, JwtConfig};
 use auth::key_vault::KeyVault;
@@ -12,9 +12,11 @@ use auth::{AuditLogger, AuditStorage, PostgresAuditStorage, TradingWallet};
 use polymarket_core::api::{ClobClient, PolygonClient};
 use polymarket_core::types::ArbOpportunity;
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use trading_engine::copy_trader::CopyTrader;
 use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
 use wallet_tracker::discovery::WalletDiscovery;
+use wallet_tracker::trade_monitor::TradeMonitor;
 
 use crate::auto_optimizer::AutomationEvent;
 use crate::email::{EmailClient, EmailConfig};
@@ -79,6 +81,10 @@ pub struct AppState {
     pub wallet_discovery: Arc<WalletDiscovery>,
     /// Polygon RPC client for on-chain queries (balance, etc.).
     pub polygon_client: Option<PolygonClient>,
+    /// Trade monitor for copy trading (None if copy trading disabled).
+    pub trade_monitor: Option<Arc<TradeMonitor>>,
+    /// Copy trader (None if copy trading disabled).
+    pub copy_trader: Option<Arc<RwLock<CopyTrader>>>,
 }
 
 impl AppState {
@@ -284,6 +290,8 @@ impl AppState {
             arb_entry_tx,
             wallet_discovery,
             polygon_client,
+            trade_monitor: None,
+            copy_trader: None,
         })
     }
 
