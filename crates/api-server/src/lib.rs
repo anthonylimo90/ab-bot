@@ -161,14 +161,14 @@ impl ApiServer {
 
         if copy_config.enabled {
             // Sync active allocations → tracked_wallets.copy_enabled on startup
+            // First, upsert rows for active allocations that may not exist in tracked_wallets
             sqlx::query(
                 r#"
-                UPDATE tracked_wallets tw
-                SET copy_enabled = TRUE
+                INSERT INTO tracked_wallets (address, label, copy_enabled, allocation_pct, copy_delay_ms)
+                SELECT wwa.wallet_address, wwa.wallet_address, TRUE, wwa.allocation_pct, 500
                 FROM workspace_wallet_allocations wwa
-                WHERE LOWER(tw.address) = LOWER(wwa.wallet_address)
-                  AND wwa.tier = 'active'
-                  AND tw.copy_enabled = FALSE
+                WHERE wwa.tier = 'active'
+                ON CONFLICT (address) DO UPDATE SET copy_enabled = TRUE, allocation_pct = EXCLUDED.allocation_pct
                 "#,
             )
             .execute(&self.state.pool)

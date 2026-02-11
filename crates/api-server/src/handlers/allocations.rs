@@ -741,28 +741,36 @@ pub async fn promote_allocation(
     .execute(&state.pool)
     .await?;
 
-    // Sync copy_enabled on tracked_wallets
-    sqlx::query("UPDATE tracked_wallets SET copy_enabled = TRUE WHERE address = $1")
-        .bind(&address)
-        .execute(&state.pool)
-        .await?;
+    // Fetch allocation_pct for upsert + in-memory sync
+    let alloc_pct: Decimal = sqlx::query_scalar(
+        "SELECT allocation_pct FROM workspace_wallet_allocations WHERE workspace_id = $1 AND wallet_address = $2",
+    )
+    .bind(workspace_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or(Decimal::new(20, 0));
+
+    // Sync copy_enabled on tracked_wallets (upsert — row may not exist if added as bench/watchlist)
+    sqlx::query(
+        r#"
+        INSERT INTO tracked_wallets (address, label, copy_enabled, allocation_pct, copy_delay_ms)
+        VALUES ($1, $1, TRUE, $2, 500)
+        ON CONFLICT (address) DO UPDATE SET copy_enabled = TRUE, allocation_pct = $2
+        "#,
+    )
+    .bind(&address)
+    .bind(alloc_pct)
+    .execute(&state.pool)
+    .await?;
 
     // Sync to in-memory trade monitor + copy trader
     if let Some(monitor) = &state.trade_monitor {
         monitor.add_wallet(&address).await;
     }
     if let Some(trader) = &state.copy_trader {
-        // Fetch allocation_pct for this wallet
-        let alloc_pct: Option<(Decimal,)> = sqlx::query_as(
-            "SELECT allocation_pct FROM workspace_wallet_allocations WHERE workspace_id = $1 AND wallet_address = $2",
-        )
-        .bind(workspace_id)
-        .bind(&address)
-        .fetch_optional(&state.pool)
-        .await?;
-        let pct = alloc_pct.map(|(p,)| p).unwrap_or(Decimal::new(20, 0));
         let trader = trader.read().await;
-        let wallet = TrackedWallet::new(address.clone(), pct);
+        let wallet = TrackedWallet::new(address.clone(), alloc_pct);
         trader.add_tracked_wallet(wallet);
     }
 
