@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { useWebSocket, ConnectionStatus } from './useWebSocket';
 import { useModeStore } from '@/stores/mode-store';
 import { useToastStore } from '@/stores/toast-store';
+import { api } from '@/lib/api';
 import type { Activity, ActivityType, WebSocketMessage, SignalUpdate } from '@/types/api';
 
 interface UseActivityReturn {
@@ -102,12 +103,46 @@ export function useActivity(): UseActivityReturn {
   const { mode } = useModeStore();
   const [activities, setActivities] = useState<Activity[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
+  const seenIds = useRef(new Set<string>());
+
+  // Fetch persisted activity on mount (live mode only)
+  useEffect(() => {
+    if (mode !== 'live') {
+      setActivities([]);
+      seenIds.current.clear();
+      return;
+    }
+
+    let cancelled = false;
+    api
+      .getActivity({ limit: 50 })
+      .then((data) => {
+        if (cancelled) return;
+        // Track IDs for deduplication
+        for (const item of data) {
+          seenIds.current.add(item.id);
+        }
+        setActivities(data);
+      })
+      .catch(() => {
+        // Silently fail — WebSocket will still work
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
 
   // Handle WebSocket messages (signals)
   const handleMessage = useCallback((message: WebSocketMessage) => {
     if (message.type !== 'Signal') return;
 
     const activity = signalToActivity(message.data as SignalUpdate);
+
+    // Deduplicate against REST-loaded activities
+    if (seenIds.current.has(activity.id)) return;
+    seenIds.current.add(activity.id);
+
     setActivities((prev) => [activity, ...prev].slice(0, 50));
     setUnreadCount((prev) => prev + 1);
 

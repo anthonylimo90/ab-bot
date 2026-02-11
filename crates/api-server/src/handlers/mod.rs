@@ -1,5 +1,6 @@
 //! API request handlers.
 
+pub mod activity;
 pub mod admin_workspaces;
 pub mod allocations;
 pub mod auth;

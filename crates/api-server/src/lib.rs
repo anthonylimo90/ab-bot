@@ -48,7 +48,6 @@ pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
-use axum::Router;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -122,8 +121,7 @@ impl ServerConfig {
 /// The API server.
 pub struct ApiServer {
     config: ServerConfig,
-    router: Router,
-    state: Arc<AppState>,
+    state: AppState,
 }
 
 impl ApiServer {
@@ -136,145 +134,31 @@ impl ApiServer {
         let (automation_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (arb_entry_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
-        // Create app state
-        let state = Arc::new(
-            AppState::new(
-                pool,
-                config.jwt_secret.clone(),
-                orderbook_tx,
-                position_tx,
-                signal_tx,
-                automation_tx,
-                arb_entry_tx,
-            )
-            .await?,
-        );
+        // Create app state (not yet Arc-wrapped so copy trading fields can be set)
+        let state = AppState::new(
+            pool,
+            config.jwt_secret.clone(),
+            orderbook_tx,
+            position_tx,
+            signal_tx,
+            automation_tx,
+            arb_entry_tx,
+        )
+        .await?;
 
-        // Build router
-        let router = create_router(state.clone());
-
-        // Add middleware - use minimal tracing to avoid log spam
-        // Only log errors (not every request) to stay under Railway's 500 logs/sec limit
-        let router = router
-            .layer(
-                TraceLayer::new_for_http()
-                    // Log request starts for debugging (temporarily at ERROR level to see them)
-                    .on_request(|request: &Request<_>, _span: &tracing::Span| {
-                        tracing::info!(
-                            method = %request.method(),
-                            uri = %request.uri(),
-                            "Incoming request"
-                        );
-                    })
-                    // Only log responses at DEBUG level
-                    .on_response(DefaultOnResponse::new().level(Level::DEBUG))
-                    // Log failures at ERROR level with request details
-                    .on_failure(
-                        |error: tower_http::classify::ServerErrorsFailureClass,
-                         latency: std::time::Duration,
-                         _span: &tracing::Span| {
-                            tracing::error!(
-                                error = %error,
-                                latency_ms = latency.as_millis(),
-                                "Request failed"
-                            );
-                        },
-                    ),
-            )
-            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
-            .layer(if config.cors_permissive {
-                CorsLayer::permissive()
-            } else {
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods(Any)
-                    .allow_headers(Any)
-            });
-
-        Ok(Self {
-            config,
-            router,
-            state,
-        })
-    }
-
-    /// Get a reference to the app state.
-    pub fn state(&self) -> Arc<AppState> {
-        self.state.clone()
+        Ok(Self { config, state })
     }
 
     /// Run the server.
-    pub async fn run(self) -> anyhow::Result<()> {
-        // Spawn Redis forwarder for signal bridging
-        let redis_config = RedisForwarderConfig::from_env();
-        spawn_redis_forwarder(
-            redis_config,
-            self.state.signal_tx.clone(),
-            self.state.orderbook_tx.clone(),
-            self.state.arb_entry_tx.clone(),
-        );
-
-        // Shared dedup set for arb executor + exit handler
-        let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
-
-        // Spawn arb auto-executor if enabled
-        let arb_config = ArbExecutorConfig::from_env();
-        if arb_config.enabled {
-            spawn_arb_auto_executor(
-                arb_config,
-                self.state.subscribe_arb_entry(),
-                self.state.signal_tx.clone(),
-                self.state.order_executor.clone(),
-                self.state.circuit_breaker.clone(),
-                self.state.clob_client.clone(),
-                self.state.pool.clone(),
-                arb_dedup.clone(),
-            );
-        }
-
-        // Spawn exit handler if enabled
-        let exit_config = ExitHandlerConfig::from_env();
-        if exit_config.enabled {
-            spawn_exit_handler(
-                exit_config,
-                self.state.order_executor.clone(),
-                self.state.circuit_breaker.clone(),
-                self.state.clob_client.clone(),
-                self.state.signal_tx.clone(),
-                self.state.pool.clone(),
-                arb_dedup.clone(),
-            );
-        }
-
-        // Spawn auto-optimizer background service
-        let optimizer = Arc::new(AutoOptimizer::new(self.state.pool.clone()));
-        tokio::spawn(optimizer.start(None));
-
-        // Spawn wallet harvester (discovers wallets from CLOB trades)
-        let harvester_config = WalletHarvesterConfig::from_env();
-        spawn_wallet_harvester(
-            harvester_config,
-            self.state.clob_client.clone(),
-            self.state.pool.clone(),
-        );
-
-        // Spawn metrics calculator (populates wallet_success_metrics)
-        let metrics_config = MetricsCalculatorConfig::from_env();
-        if metrics_config.enabled {
-            let calculator = Arc::new(MetricsCalculator::new(
-                self.state.pool.clone(),
-                metrics_config.clone(),
-            ));
-            tokio::spawn(calculator.run());
-            info!(
-                interval_secs = metrics_config.interval_secs,
-                batch_size = metrics_config.batch_size,
-                "Metrics calculator background job spawned"
-            );
-        }
-
-        // Spawn copy trading monitor + wallet trade monitor if enabled
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        // ── Copy trading setup (must happen before Arc-wrapping state) ──
         let copy_config = CopyTradingConfig::from_env();
+        let mut copy_monitor_args: Option<(
+            CopyTradingConfig,
+            Arc<TradeMonitor>,
+            Arc<RwLock<CopyTrader>>,
+        )> = None;
+
         if copy_config.enabled {
             // Sync active allocations → tracked_wallets.copy_enabled on startup
             sqlx::query(
@@ -327,54 +211,169 @@ impl ApiServer {
                 tracing::warn!(
                     "Copy trading is enabled but no tracked wallets have copy_enabled=true"
                 );
-            } else {
-                let trade_monitor = Arc::new(TradeMonitor::new(
-                    self.state.clob_client.clone(),
-                    MonitorConfig::from_env(),
-                ));
-                let total_capital = std::env::var("COPY_TOTAL_CAPITAL")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(Decimal::new(10000, 0));
-                let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital);
-
-                for row in tracked_wallets {
-                    trade_monitor.add_wallet(&row.address).await;
-
-                    let mut wallet = TrackedWallet::new(row.address.clone(), row.allocation_pct)
-                        .with_delay(row.copy_delay_ms.max(0) as u64);
-                    if let Some(label) = row.label {
-                        wallet = wallet.with_alias(label);
-                    }
-                    if let Some(max_size) = row.max_position_size {
-                        wallet = wallet.with_max_size(max_size);
-                    }
-                    copy_trader.add_tracked_wallet(wallet);
-                }
-
-                trade_monitor.start().await?;
-                spawn_copy_trading_monitor(
-                    copy_config,
-                    trade_monitor,
-                    Arc::new(RwLock::new(copy_trader)),
-                    self.state.signal_tx.clone(),
-                    self.state.pool.clone(),
-                );
-                tracing::info!("Copy trading monitor stack initialized");
             }
+
+            // Always create the monitor + trader so runtime promotions work,
+            // even if no wallets are currently active.
+            let trade_monitor = Arc::new(TradeMonitor::new(
+                self.state.clob_client.clone(),
+                MonitorConfig::from_env(),
+            ));
+            let total_capital = std::env::var("COPY_TOTAL_CAPITAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(10000, 0));
+            let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital);
+
+            for row in &tracked_wallets {
+                trade_monitor.add_wallet(&row.address).await;
+
+                let mut wallet = TrackedWallet::new(row.address.clone(), row.allocation_pct)
+                    .with_delay(row.copy_delay_ms.max(0) as u64);
+                if let Some(ref label) = row.label {
+                    wallet = wallet.with_alias(label.clone());
+                }
+                if let Some(max_size) = row.max_position_size {
+                    wallet = wallet.with_max_size(max_size);
+                }
+                copy_trader.add_tracked_wallet(wallet);
+            }
+
+            let copy_trader = Arc::new(RwLock::new(copy_trader));
+
+            // Store in AppState so allocation handlers can sync at runtime
+            self.state.trade_monitor = Some(trade_monitor.clone());
+            self.state.copy_trader = Some(copy_trader.clone());
+
+            copy_monitor_args = Some((copy_config, trade_monitor, copy_trader));
+        }
+
+        // ── Wrap state in Arc and build router ──
+        let state = Arc::new(self.state);
+
+        let router = create_router(state.clone());
+        let router = router
+            .layer(
+                TraceLayer::new_for_http()
+                    .on_request(|request: &Request<_>, _span: &tracing::Span| {
+                        tracing::info!(
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            "Incoming request"
+                        );
+                    })
+                    .on_response(DefaultOnResponse::new().level(Level::DEBUG))
+                    .on_failure(
+                        |error: tower_http::classify::ServerErrorsFailureClass,
+                         latency: std::time::Duration,
+                         _span: &tracing::Span| {
+                            tracing::error!(
+                                error = %error,
+                                latency_ms = latency.as_millis(),
+                                "Request failed"
+                            );
+                        },
+                    ),
+            )
+            .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
+            .layer(if self.config.cors_permissive {
+                CorsLayer::permissive()
+            } else {
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any)
+            });
+
+        // ── Spawn background tasks ──
+
+        // Spawn Redis forwarder for signal bridging
+        let redis_config = RedisForwarderConfig::from_env();
+        spawn_redis_forwarder(
+            redis_config,
+            state.signal_tx.clone(),
+            state.orderbook_tx.clone(),
+            state.arb_entry_tx.clone(),
+        );
+
+        // Shared dedup set for arb executor + exit handler
+        let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
+
+        // Spawn arb auto-executor if enabled
+        let arb_config = ArbExecutorConfig::from_env();
+        if arb_config.enabled {
+            spawn_arb_auto_executor(
+                arb_config,
+                state.subscribe_arb_entry(),
+                state.signal_tx.clone(),
+                state.order_executor.clone(),
+                state.circuit_breaker.clone(),
+                state.clob_client.clone(),
+                state.pool.clone(),
+                arb_dedup.clone(),
+            );
+        }
+
+        // Spawn exit handler if enabled
+        let exit_config = ExitHandlerConfig::from_env();
+        if exit_config.enabled {
+            spawn_exit_handler(
+                exit_config,
+                state.order_executor.clone(),
+                state.circuit_breaker.clone(),
+                state.clob_client.clone(),
+                state.signal_tx.clone(),
+                state.pool.clone(),
+                arb_dedup.clone(),
+            );
+        }
+
+        // Spawn auto-optimizer background service
+        let optimizer = Arc::new(AutoOptimizer::new(state.pool.clone()));
+        tokio::spawn(optimizer.start(None));
+
+        // Spawn wallet harvester (discovers wallets from CLOB trades)
+        let harvester_config = WalletHarvesterConfig::from_env();
+        spawn_wallet_harvester(
+            harvester_config,
+            state.clob_client.clone(),
+            state.pool.clone(),
+        );
+
+        // Spawn metrics calculator (populates wallet_success_metrics)
+        let metrics_config = MetricsCalculatorConfig::from_env();
+        if metrics_config.enabled {
+            let calculator = Arc::new(MetricsCalculator::new(
+                state.pool.clone(),
+                metrics_config.clone(),
+            ));
+            tokio::spawn(calculator.run());
+            info!(
+                interval_secs = metrics_config.interval_secs,
+                batch_size = metrics_config.batch_size,
+                "Metrics calculator background job spawned"
+            );
+        }
+
+        // Start copy trading monitor (objects were created above, before Arc wrap)
+        if let Some((copy_config, trade_monitor, copy_trader)) = copy_monitor_args {
+            trade_monitor.start().await?;
+            spawn_copy_trading_monitor(
+                copy_config,
+                trade_monitor,
+                copy_trader,
+                state.signal_tx.clone(),
+                state.pool.clone(),
+            );
+            tracing::info!("Copy trading monitor stack initialized");
         }
 
         let addr = self.config.socket_addr();
         info!(address = %addr, "Starting API server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, self.router).await?;
+        axum::serve(listener, router).await?;
 
         Ok(())
-    }
-
-    /// Get the router for testing.
-    pub fn router(&self) -> Router {
-        self.router.clone()
     }
 }

@@ -12,6 +12,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use auth::{AuditAction, AuditEvent, Claims};
+use trading_engine::copy_trader::TrackedWallet;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -369,6 +370,16 @@ pub async fn add_allocation(
         .bind(req.allocation_pct)
         .execute(&state.pool)
         .await?;
+
+        // Sync to in-memory trade monitor + copy trader
+        if let Some(monitor) = &state.trade_monitor {
+            monitor.add_wallet(&address).await;
+        }
+        if let Some(trader) = &state.copy_trader {
+            let trader = trader.read().await;
+            let wallet = TrackedWallet::new(address.clone(), req.allocation_pct);
+            trader.add_tracked_wallet(wallet);
+        }
     }
 
     // Audit log
@@ -626,6 +637,15 @@ pub async fn remove_allocation(
         .execute(&state.pool)
         .await?;
 
+    // Sync to in-memory trade monitor + copy trader
+    if let Some(monitor) = &state.trade_monitor {
+        monitor.remove_wallet(&address).await;
+    }
+    if let Some(trader) = &state.copy_trader {
+        let trader = trader.read().await;
+        trader.remove_tracked_wallet(&address);
+    }
+
     // Audit log
     state.audit_logger.log_user_action(
         &claims.sub,
@@ -726,6 +746,25 @@ pub async fn promote_allocation(
         .bind(&address)
         .execute(&state.pool)
         .await?;
+
+    // Sync to in-memory trade monitor + copy trader
+    if let Some(monitor) = &state.trade_monitor {
+        monitor.add_wallet(&address).await;
+    }
+    if let Some(trader) = &state.copy_trader {
+        // Fetch allocation_pct for this wallet
+        let alloc_pct: Option<(Decimal,)> = sqlx::query_as(
+            "SELECT allocation_pct FROM workspace_wallet_allocations WHERE workspace_id = $1 AND wallet_address = $2",
+        )
+        .bind(workspace_id)
+        .bind(&address)
+        .fetch_optional(&state.pool)
+        .await?;
+        let pct = alloc_pct.map(|(p,)| p).unwrap_or(Decimal::new(20, 0));
+        let trader = trader.read().await;
+        let wallet = TrackedWallet::new(address.clone(), pct);
+        trader.add_tracked_wallet(wallet);
+    }
 
     // Log rotation history
     sqlx::query(
@@ -865,6 +904,15 @@ pub async fn demote_allocation(
         .bind(&address)
         .execute(&state.pool)
         .await?;
+
+    // Sync to in-memory trade monitor + copy trader
+    if let Some(monitor) = &state.trade_monitor {
+        monitor.remove_wallet(&address).await;
+    }
+    if let Some(trader) = &state.copy_trader {
+        let trader = trader.read().await;
+        trader.remove_tracked_wallet(&address);
+    }
 
     // Log rotation history
     sqlx::query(

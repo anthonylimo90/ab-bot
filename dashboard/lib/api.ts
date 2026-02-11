@@ -50,6 +50,7 @@ import type {
   UpdateDemoPositionRequest,
   DemoBalance,
   ServiceStatus,
+  Activity,
 } from '@/types/api';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -805,6 +806,18 @@ class ApiClient {
     return this.request<DemoBalance>('/api/v1/demo/reset', {
       method: 'POST',
     });
+  }
+
+  // Activity Feed
+  async getActivity(params?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<Activity[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    const query = searchParams.toString();
+    return this.request<Activity[]>(`/api/v1/activity${query ? `?${query}` : ''}`);
   }
 }
 
