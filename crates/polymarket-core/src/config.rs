@@ -18,6 +18,10 @@ pub struct Config {
 pub struct DatabaseConfig {
     pub url: String,
     pub max_connections: u32,
+    pub max_retries: u32,
+    pub retry_base_delay_ms: u64,
+    pub retry_max_delay_ms: u64,
+    pub acquire_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +73,21 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(5),
+                max_retries: env::var("DB_RETRY_MAX_ATTEMPTS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5),
+                retry_base_delay_ms: env::var("DB_RETRY_BASE_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000),
+                retry_max_delay_ms: env::var("DB_RETRY_MAX_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(30000),
+                acquire_timeout_secs: env::var("DB_ACQUIRE_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
             },
             redis: RedisConfig {
                 url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
@@ -96,6 +115,10 @@ impl Config {
             database: DatabaseConfig {
                 url: "postgres://localhost/polymarket_test".to_string(),
                 max_connections: 2,
+                max_retries: 1,
+                retry_base_delay_ms: 100,
+                retry_max_delay_ms: 500,
+                acquire_timeout_secs: Some(5),
             },
             redis: RedisConfig {
                 url: "redis://127.0.0.1:6379".to_string(),
