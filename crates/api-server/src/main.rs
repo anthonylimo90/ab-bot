@@ -2,7 +2,7 @@
 
 use api_server::{ApiServer, ServerConfig};
 use clap::{Parser, Subcommand};
-use sqlx::postgres::PgPoolOptions;
+use polymarket_core::config::DatabaseConfig;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod seed;
@@ -52,15 +52,33 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // Get database URL (required for all commands)
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-
-    // Create database connection pool
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&database_url)
-        .await?;
+    // Create database connection pool with retry
+    let db_config = DatabaseConfig {
+        url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
+        max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20),
+        max_retries: std::env::var("DB_RETRY_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5),
+        retry_base_delay_ms: std::env::var("DB_RETRY_BASE_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000),
+        retry_max_delay_ms: std::env::var("DB_RETRY_MAX_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30000),
+        acquire_timeout_secs: Some(
+            std::env::var("DB_ACQUIRE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+        ),
+    };
+    let pool = polymarket_core::db::create_pool(&db_config).await?;
 
     // Run migrations
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
