@@ -43,6 +43,10 @@ export function WalletAllocationSection({
   const { mode } = useModeStore();
   const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id, mode);
 
+  // Local state for optimistic slider display during drag (must be before early return)
+  const [localAllocationPct, setLocalAllocationPct] = useState<number | null>(null);
+  const [localMaxPosition, setLocalMaxPosition] = useState<number | null>(null);
+
   // Find wallet in roster
   const wallet = allocations.find(
     (w) => w.wallet_address.toLowerCase() === walletAddress.toLowerCase()
@@ -58,10 +62,6 @@ export function WalletAllocationSection({
   const maxAllocation = (allocationPct / 100) * totalBalance;
   const inUse = positionsValue;
   const available = Math.max(0, maxAllocation - inUse);
-
-  // Local state for optimistic slider display during drag
-  const [localAllocationPct, setLocalAllocationPct] = useState<number | null>(null);
-  const [localMaxPosition, setLocalMaxPosition] = useState<number | null>(null);
 
   const displayAllocationPct = localAllocationPct ?? allocationPct;
   const displayMaxAllocation = (displayAllocationPct / 100) * totalBalance;
