@@ -54,7 +54,7 @@ interface DemoPortfolioStore {
   setWorkspaceId: (workspaceId: string | null) => void;
 }
 
-const DEFAULT_BALANCE = 10000;
+const DEFAULT_BALANCE = 0;
 
 // Convert API response to local format
 function apiToLocal(apiPosition: ApiDemoPosition): DemoPosition {
@@ -315,6 +315,7 @@ export const useDemoPortfolioStore = create<DemoPortfolioStore>()((set, get) => 
   getTotalPnlPercent: () => {
     const state = get();
     const pnl = state.getTotalPnl();
+    if (state.initialBalance === 0) return 0;
     return (pnl / state.initialBalance) * 100;
   },
 }));

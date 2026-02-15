@@ -103,7 +103,7 @@ export const WalletCard = memo(function WalletCard({
     <Card className="hover:border-primary/50 transition-colors">
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0">
             <div
               className={cn(
                 'h-10 w-10 rounded-full flex items-center justify-center font-bold text-primary-foreground',
@@ -113,7 +113,7 @@ export const WalletCard = memo(function WalletCard({
               {wallet.label?.charAt(0) || wallet.address.charAt(2).toUpperCase()}
             </div>
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 min-w-0">
                 <p className="font-medium truncate">
                   {wallet.label || shortenAddress(wallet.address)}
                 </p>
