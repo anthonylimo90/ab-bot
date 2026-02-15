@@ -5,6 +5,7 @@ import type {
   Orderbook,
   TrackedWallet,
   WalletMetrics,
+  WalletTrade,
   Order,
   PlaceOrderRequest,
   BacktestParams,
@@ -339,6 +340,17 @@ class ApiClient {
 
   async getWalletMetrics(address: string): Promise<WalletMetrics> {
     return this.request<WalletMetrics>(`/api/v1/wallets/${address}/metrics`);
+  }
+
+  async getWalletTrades(address: string, params?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<WalletTrade[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    const query = searchParams.toString();
+    return this.request<WalletTrade[]>(`/api/v1/wallets/${address}/trades${query ? `?${query}` : ''}`);
   }
 
   // Orders

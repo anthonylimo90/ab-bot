@@ -3,7 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { queryKeys } from '@/lib/queryClient';
-import type { Wallet, WalletMetrics } from '@/types/api';
+import type { Wallet, WalletMetrics, WalletTrade } from '@/types/api';
 import type { TradingMode } from '@/stores/mode-store';
 
 interface WalletFilters {
@@ -25,20 +25,32 @@ export function useWalletsQuery(mode: TradingMode, filters?: WalletFilters) {
   });
 }
 
-export function useWalletQuery(mode: TradingMode, address: string) {
+export function useWalletQuery(mode: TradingMode, address: string, enabled = true) {
   return useQuery({
     queryKey: queryKeys.wallets.detail(mode, address),
     queryFn: () => api.getWallet(address),
-    enabled: !!address,
+    enabled: !!address && enabled,
   });
 }
 
-export function useWalletMetricsQuery(mode: TradingMode, address: string) {
+export function useWalletMetricsQuery(mode: TradingMode, address: string, enabled = true) {
   return useQuery({
     queryKey: queryKeys.wallets.metrics(mode, address),
     queryFn: () => api.getWalletMetrics(address),
-    enabled: !!address,
+    enabled: !!address && enabled,
     staleTime: 5 * 60 * 1000,
+  });
+}
+
+export function useWalletTradesQuery(mode: TradingMode, address: string, params?: {
+  limit?: number;
+  offset?: number;
+}) {
+  return useQuery({
+    queryKey: [...queryKeys.wallets.all(mode), 'trades', address, params] as const,
+    queryFn: () => api.getWalletTrades(address, params),
+    enabled: !!address,
+    staleTime: 30 * 1000,
   });
 }
 

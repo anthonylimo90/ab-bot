@@ -460,6 +460,19 @@ export type WebSocketMessage =
 // Discovery/Live trades types
 export type PredictionCategory = 'HIGH_POTENTIAL' | 'MODERATE' | 'LOW_POTENTIAL' | 'INSUFFICIENT_DATA';
 
+export interface WalletTrade {
+  transaction_hash: string;
+  wallet_address: string;
+  asset_id: string;
+  side: string;
+  price: number;
+  quantity: number;
+  value: number;
+  timestamp: string;
+  title?: string;
+  outcome?: string;
+}
+
 export interface LiveTrade {
   wallet_address: string;
   wallet_label?: string;

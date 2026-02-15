@@ -527,6 +527,87 @@ pub async fn get_wallet_metrics(
     }
 }
 
+/// Query parameters for listing wallet trades.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct WalletTradesQuery {
+    /// Maximum results.
+    #[serde(default = "default_trades_limit")]
+    pub limit: i64,
+    /// Offset for pagination.
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_trades_limit() -> i64 {
+    20
+}
+
+/// Wallet trade response.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct WalletTradeResponse {
+    /// Transaction hash.
+    pub transaction_hash: String,
+    /// Wallet address.
+    pub wallet_address: String,
+    /// Asset identifier.
+    pub asset_id: String,
+    /// Trade side (BUY/SELL).
+    pub side: String,
+    /// Trade price.
+    pub price: Decimal,
+    /// Trade quantity.
+    pub quantity: Decimal,
+    /// Trade value (price * quantity).
+    pub value: Decimal,
+    /// Trade timestamp.
+    pub timestamp: DateTime<Utc>,
+    /// Market title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// Get trades for a specific wallet.
+#[utoipa::path(
+    get,
+    path = "/api/v1/wallets/{address}/trades",
+    tag = "wallets",
+    params(
+        ("address" = String, Path, description = "Wallet address"),
+        WalletTradesQuery,
+    ),
+    responses(
+        (status = 200, description = "Wallet trades", body = Vec<WalletTradeResponse>),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_wallet_trades(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(query): Query<WalletTradesQuery>,
+) -> ApiResult<Json<Vec<WalletTradeResponse>>> {
+    let trades: Vec<WalletTradeResponse> = sqlx::query_as(
+        r#"
+        SELECT transaction_hash, wallet_address, asset_id, side,
+               price, quantity, value, timestamp, title, outcome
+        FROM wallet_trades
+        WHERE LOWER(wallet_address) = LOWER($1)
+        ORDER BY timestamp DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(&address)
+    .bind(query.limit)
+    .bind(query.offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(trades))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

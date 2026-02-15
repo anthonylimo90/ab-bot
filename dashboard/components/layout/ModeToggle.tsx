@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import { useModeStore } from '@/stores/mode-store';
 import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import { useWalletStore, selectHasConnectedWallet, selectPrimaryWallet } from '@/stores/wallet-store';
+import { useWalletBalanceQuery } from '@/hooks/queries/useWalletsQuery';
 import { useQueryClient } from '@tanstack/react-query';
 import { Wallet, TestTube2, Plus, Loader2 } from 'lucide-react';
 import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
@@ -21,6 +22,9 @@ export function ModeToggle() {
   const [showConnectModal, setShowConnectModal] = useState(false);
 
   const isDemo = mode === 'demo';
+  const { data: walletBalance } = useWalletBalanceQuery(
+    !isDemo && primaryWallet ? primaryWallet.address : null
+  );
 
   // Fetch wallets on mount when in live mode
   useEffect(() => {
@@ -119,6 +123,12 @@ export function ModeToggle() {
             <span className="font-mono text-xs">
               {primaryWallet.label || truncateAddress(primaryWallet.address)}
             </span>
+            {walletBalance != null && (
+              <>
+                <span className="text-muted-foreground">&middot;</span>
+                <span className="font-medium">{formatBalance(walletBalance.usdc_balance)}</span>
+              </>
+            )}
           </div>
         ) : (
           <button
