@@ -78,8 +78,8 @@ impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: 15,
-            min_trade_value: Decimal::new(10, 0),
-            max_trade_age_secs: 120,
+            min_trade_value: Decimal::new(1, 0),
+            max_trade_age_secs: 300,
             max_history_size: 10000,
         }
     }
@@ -96,11 +96,11 @@ impl MonitorConfig {
             min_trade_value: std::env::var("TRADE_MONITOR_MIN_VALUE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(10, 0)),
+                .unwrap_or(Decimal::new(1, 0)),
             max_trade_age_secs: std::env::var("TRADE_MONITOR_MAX_AGE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(120),
+                .unwrap_or(300),
             max_history_size: 10000,
         }
     }
@@ -278,51 +278,71 @@ impl TradeMonitor {
         info!("Trade monitoring loop stopped");
     }
 
-    /// Fetch recent trades from Data API and filter for monitored wallets.
+    /// Poll each monitored wallet individually via the Data API `/activity`
+    /// endpoint and return any new trades detected since the last poll.
     async fn poll_all_wallets(&self) -> Result<Vec<WalletTrade>> {
         let wallets = self.monitored_wallets.read().await;
         if wallets.is_empty() {
             return Ok(Vec::new());
         }
-        // Clone to release lock before async work
-        let wallet_set = wallets.clone();
+        let wallet_list: Vec<String> = wallets.iter().cloned().collect();
         drop(wallets);
 
-        let clob_trades = self
-            .clob_client
-            .get_recent_trades(200, None)
-            .await
-            .map_err(|e| anyhow::anyhow!("Data API trade fetch failed: {}", e))?;
+        // Poll all wallets concurrently
+        let futures: Vec<_> = wallet_list
+            .iter()
+            .map(|addr| self.clob_client.get_wallet_activity(addr, 50))
+            .collect();
+        let results = futures_util::future::join_all(futures).await;
 
         let mut new_trades = Vec::new();
         let mut seen = self.seen_tx_hashes.write().await;
 
-        for ct in &clob_trades {
-            let addr = ct.wallet_address.to_lowercase();
-            if !wallet_set.contains(&addr) {
-                continue;
-            }
+        for (wallet_addr, result) in wallet_list.iter().zip(results) {
+            let clob_trades = match result {
+                Ok(trades) => trades,
+                Err(e) => {
+                    warn!(
+                        wallet = %wallet_addr,
+                        error = %e,
+                        "Failed to fetch activity for wallet"
+                    );
+                    continue;
+                }
+            };
 
-            // Dedup by tx hash
-            if seen.contains(&ct.transaction_hash) {
-                continue;
-            }
-
-            if let Some(trade) = Self::clob_trade_to_wallet_trade(ct) {
-                // Check age
-                if trade.age_seconds() > self.config.max_trade_age_secs as i64 {
+            for ct in &clob_trades {
+                // Validate the trade belongs to the wallet we requested
+                if ct.wallet_address.to_lowercase() != *wallet_addr {
+                    warn!(
+                        expected = %wallet_addr,
+                        actual = %ct.wallet_address,
+                        "Activity endpoint returned trade for wrong wallet, skipping"
+                    );
                     continue;
                 }
 
-                seen.insert(ct.transaction_hash.clone());
+                // Dedup by tx hash
+                if seen.contains(&ct.transaction_hash) {
+                    continue;
+                }
 
-                // Store in recent trades
-                self.recent_trades
-                    .entry(addr.clone())
-                    .or_default()
-                    .push(trade.clone());
+                if let Some(trade) = Self::clob_trade_to_wallet_trade(ct) {
+                    // Check age
+                    if trade.age_seconds() > self.config.max_trade_age_secs as i64 {
+                        continue;
+                    }
 
-                new_trades.push(trade);
+                    seen.insert(ct.transaction_hash.clone());
+
+                    // Store in recent trades
+                    self.recent_trades
+                        .entry(wallet_addr.clone())
+                        .or_default()
+                        .push(trade.clone());
+
+                    new_trades.push(trade);
+                }
             }
         }
 
@@ -477,8 +497,8 @@ mod tests {
     fn test_monitor_config_default() {
         let config = MonitorConfig::default();
         assert_eq!(config.poll_interval_secs, 15);
-        assert_eq!(config.min_trade_value, Decimal::new(10, 0));
-        assert_eq!(config.max_trade_age_secs, 120);
+        assert_eq!(config.min_trade_value, Decimal::new(1, 0));
+        assert_eq!(config.max_trade_age_secs, 300);
     }
 
     #[test]
@@ -486,8 +506,8 @@ mod tests {
         // Without env vars set, should use defaults
         let config = MonitorConfig::from_env();
         assert_eq!(config.poll_interval_secs, 15);
-        assert_eq!(config.min_trade_value, Decimal::new(10, 0));
-        assert_eq!(config.max_trade_age_secs, 120);
+        assert_eq!(config.min_trade_value, Decimal::new(1, 0));
+        assert_eq!(config.max_trade_age_secs, 300);
     }
 
     #[tokio::test]
