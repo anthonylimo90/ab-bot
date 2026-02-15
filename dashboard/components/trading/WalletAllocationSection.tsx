@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Slider } from '@/components/ui/slider';
 import {
@@ -14,14 +15,15 @@ import { Settings, Info } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useModeStore } from '@/stores/mode-store';
-import { useActiveAllocationsQuery, useUpdateAllocationMutation } from '@/hooks/queries/useAllocationsQuery';
-import type { CopyBehavior } from '@/types/api';
+import { useUpdateAllocationMutation } from '@/hooks/queries/useAllocationsQuery';
+import type { CopyBehavior, WorkspaceAllocation } from '@/types/api';
 
 interface WalletAllocationSectionProps {
   walletAddress: string;
   totalBalance: number;
   positionsValue: number;
   isDemo?: boolean;
+  allocations: WorkspaceAllocation[];
 }
 
 const copyBehaviorDescriptions: Record<CopyBehavior, string> = {
@@ -35,14 +37,18 @@ export function WalletAllocationSection({
   totalBalance,
   positionsValue,
   isDemo = false,
+  allocations,
 }: WalletAllocationSectionProps) {
   const { currentWorkspace } = useWorkspaceStore();
   const { mode } = useModeStore();
-  const { data: activeWallets = [] } = useActiveAllocationsQuery(currentWorkspace?.id, mode);
   const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id, mode);
 
+  // Local state for optimistic slider display during drag (must be before early return)
+  const [localAllocationPct, setLocalAllocationPct] = useState<number | null>(null);
+  const [localMaxPosition, setLocalMaxPosition] = useState<number | null>(null);
+
   // Find wallet in roster
-  const wallet = activeWallets.find(
+  const wallet = allocations.find(
     (w) => w.wallet_address.toLowerCase() === walletAddress.toLowerCase()
   );
 
@@ -57,7 +63,17 @@ export function WalletAllocationSection({
   const inUse = positionsValue;
   const available = Math.max(0, maxAllocation - inUse);
 
-  const handleAllocationChange = (value: number[]) => {
+  const displayAllocationPct = localAllocationPct ?? allocationPct;
+  const displayMaxAllocation = (displayAllocationPct / 100) * totalBalance;
+
+  const displayMaxPosition = localMaxPosition ?? (wallet.max_position_size ?? 100);
+
+  // Safe division helpers
+  const usagePct = maxAllocation > 0 ? Math.min(100, (inUse / maxAllocation) * 100) : 0;
+  const remainingPct = maxAllocation > 0 ? Math.max(0, 100 - usagePct) : 100;
+
+  const handleAllocationCommit = (value: number[]) => {
+    setLocalAllocationPct(null);
     updateAllocationMutation.mutate({
       address: walletAddress,
       params: { allocation_pct: value[0] },
@@ -71,7 +87,8 @@ export function WalletAllocationSection({
     });
   };
 
-  const handleMaxPositionChange = (value: number[]) => {
+  const handleMaxPositionCommit = (value: number[]) => {
+    setLocalMaxPosition(null);
     updateAllocationMutation.mutate({
       address: walletAddress,
       params: { max_position_size: value[0] },
@@ -124,20 +141,26 @@ export function WalletAllocationSection({
           {/* Allocation bar visualization */}
           <div className="mt-3 space-y-1">
             <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
-              <div className="h-full flex">
-                <div
-                  className="bg-primary h-full transition-all"
-                  style={{ width: `${Math.min(100, (inUse / maxAllocation) * 100)}%` }}
-                />
-                <div
-                  className="bg-primary/30 h-full transition-all"
-                  style={{ width: `${Math.max(0, 100 - (inUse / maxAllocation) * 100)}%` }}
-                />
-              </div>
+              {maxAllocation > 0 ? (
+                <div className="h-full flex">
+                  <div
+                    className="bg-primary h-full transition-all"
+                    style={{ width: `${usagePct}%` }}
+                  />
+                  <div
+                    className="bg-primary/30 h-full transition-all"
+                    style={{ width: `${remainingPct}%` }}
+                  />
+                </div>
+              ) : (
+                <div className="h-full bg-muted" />
+              )}
             </div>
             <p className="text-xs text-muted-foreground text-center">
-              {inUse > 0
-                ? `${((inUse / maxAllocation) * 100).toFixed(1)}% of allocation in use`
+              {maxAllocation <= 0
+                ? 'Set allocation percentage to enable trading'
+                : inUse > 0
+                ? `${usagePct.toFixed(1)}% of allocation in use`
                 : 'No positions open'}
             </p>
           </div>
@@ -165,19 +188,20 @@ export function WalletAllocationSection({
                 </TooltipProvider>
               </div>
               <span className="text-sm font-medium tabular-nums">
-                {allocationPct}%
+                {displayAllocationPct}%
               </span>
             </div>
             <Slider
-              value={[allocationPct]}
-              onValueChange={handleAllocationChange}
+              value={[displayAllocationPct]}
+              onValueChange={(v) => setLocalAllocationPct(v[0])}
+              onValueCommit={handleAllocationCommit}
               min={0}
               max={100}
               step={5}
               className="w-full"
             />
             <p className="text-xs text-muted-foreground">
-              Max: {formatCurrency(maxAllocation)} of {formatCurrency(totalBalance)}
+              Max: {formatCurrency(displayMaxAllocation)} of {formatCurrency(totalBalance)}
             </p>
           </div>
 
@@ -200,12 +224,13 @@ export function WalletAllocationSection({
                 </TooltipProvider>
               </div>
               <span className="text-sm font-medium tabular-nums">
-                ${wallet.max_position_size ?? 100}
+                ${displayMaxPosition}
               </span>
             </div>
             <Slider
-              value={[wallet.max_position_size ?? 100]}
-              onValueChange={handleMaxPositionChange}
+              value={[displayMaxPosition]}
+              onValueChange={(v) => setLocalMaxPosition(v[0])}
+              onValueCommit={handleMaxPositionCommit}
               min={10}
               max={500}
               step={10}

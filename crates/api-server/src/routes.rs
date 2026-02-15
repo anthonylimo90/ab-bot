@@ -53,6 +53,7 @@ use crate::websocket;
         wallets::update_wallet,
         wallets::remove_wallet,
         wallets::get_wallet_metrics,
+        wallets::get_wallet_trades,
         trading::place_order,
         trading::cancel_order,
         trading::get_order_status,
@@ -171,6 +172,7 @@ use crate::websocket;
             wallets::AddWalletRequest,
             wallets::UpdateWalletRequest,
             wallets::WalletMetricsResponse,
+            wallets::WalletTradeResponse,
             trading::PlaceOrderRequest,
             trading::OrderResponse,
             trading::OrderSide,
@@ -396,6 +398,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/wallets/:address/metrics",
             get(wallets::get_wallet_metrics),
+        )
+        .route(
+            "/api/v1/wallets/:address/trades",
+            get(wallets::get_wallet_trades),
         )
         // Vault endpoints (read-only)
         .route("/api/v1/vault/wallets", get(vault::list_wallets))

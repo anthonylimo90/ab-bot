@@ -75,11 +75,11 @@ export function useDemoPnlSimulationQuery(mode: TradingMode, params?: {
   });
 }
 
-export function useDiscoveredWalletQuery(mode: TradingMode, address: string) {
+export function useDiscoveredWalletQuery(mode: TradingMode, address: string, enabled = true) {
   return useQuery({
     queryKey: ['discover', 'wallet', mode, address],
     queryFn: () => api.getDiscoveredWallet(address),
-    enabled: !!address,
+    enabled: !!address && enabled,
     staleTime: 60 * 1000,
     retry: false,
   });

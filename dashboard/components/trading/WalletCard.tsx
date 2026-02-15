@@ -112,9 +112,9 @@ export const WalletCard = memo(function WalletCard({
             >
               {wallet.label?.charAt(0) || wallet.address.charAt(2).toUpperCase()}
             </div>
-            <div>
+            <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <p className="font-medium">
+                <p className="font-medium truncate">
                   {wallet.label || shortenAddress(wallet.address)}
                 </p>
                 {/* Pinned indicator */}

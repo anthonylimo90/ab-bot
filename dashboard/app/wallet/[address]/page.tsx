@@ -1,14 +1,14 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useToastStore } from '@/stores/toast-store';
-import { useWalletQuery, useWalletMetricsQuery, useWalletBalanceQuery } from '@/hooks/queries/useWalletsQuery';
-import { useLiveTradesQuery, useDiscoveredWalletQuery } from '@/hooks/queries/useDiscoverQuery';
+import { useWalletQuery, useWalletMetricsQuery, useWalletBalanceQuery, useWalletTradesQuery } from '@/hooks/queries/useWalletsQuery';
+import { useDiscoveredWalletQuery } from '@/hooks/queries/useDiscoverQuery';
 import {
   useAllocationsQuery,
   useDemoteAllocationMutation,
@@ -22,38 +22,21 @@ import {
   Wallet,
   TrendingUp,
   TrendingDown,
-  Shield,
   Target,
-  CheckCircle,
   ChevronUp,
   ChevronDown,
   Zap,
   Activity,
   AlertCircle,
+  Copy,
+  Check,
+  Loader2,
 } from 'lucide-react';
 import { WalletAllocationSection } from '@/components/trading/WalletAllocationSection';
+import { ErrorDisplay } from '@/components/shared/ErrorDisplay';
 import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import { useWalletStore } from '@/stores/wallet-store';
 import { usePositionsQuery } from '@/hooks/queries/usePositionsQuery';
-import type { TradingStyle, DecisionBrief, TradeClassification } from '@/types/api';
-
-const tradingStyleLabels: Record<TradingStyle, string> = {
-  event_trader: 'Event Trader',
-  arb_trader: 'Arb Trader',
-  mixed: 'Mixed Strategy',
-};
-
-const tradingStyleDescriptions: Record<TradingStyle, string> = {
-  event_trader: 'Focuses on directional event trades with longer hold times',
-  arb_trader: 'Primarily executes mathematical arbitrage opportunities',
-  mixed: 'Combines event trading and arbitrage strategies',
-};
-
-const slippageColors = {
-  tight: 'text-profit',
-  moderate: 'text-yellow-500',
-  loose: 'text-loss',
-};
 
 export default function WalletDetailPage() {
   const params = useParams();
@@ -72,21 +55,30 @@ export default function WalletDetailPage() {
   const balance = mode === 'live' && walletBalance ? walletBalance.usdc_balance : demoBalance;
   const { data: livePositions = [] } = usePositionsQuery(mode, { status: 'open' });
 
-  // Fetch wallet data from API
-  const { data: apiWallet, isLoading: isLoadingWallet, error: walletError } = useWalletQuery(mode, address);
-  const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(mode, address);
-  // Fallback to discovery data when wallet isn't tracked
-  const { data: discoveredWallet, isLoading: isLoadingDiscovered } = useDiscoveredWalletQuery(mode, address);
-  const { data: recentTrades, isLoading: isLoadingTrades } = useLiveTradesQuery(mode, {
-    wallet: address,
-    limit: 10,
-    workspaceId: currentWorkspace?.id,
-  });
-
-  // Find wallet in workspace allocations
+  // Find wallet in workspace allocations (compute before queries for conditional execution)
   const storedWallet = useMemo(() => {
     return allocations.find((w) => w.wallet_address.toLowerCase() === address?.toLowerCase());
   }, [allocations, address]);
+
+  // Fetch wallet data from API - skip if already found in allocations
+  const { data: apiWallet, isLoading: isLoadingWallet, error: walletError, refetch: refetchWallet } = useWalletQuery(mode, address, !storedWallet);
+  const { data: walletMetrics, isLoading: isLoadingMetrics } = useWalletMetricsQuery(mode, address, !storedWallet);
+  // Fallback to discovery data when wallet isn't tracked
+  const { data: discoveredWallet, isLoading: isLoadingDiscovered } = useDiscoveredWalletQuery(mode, address, !storedWallet);
+
+  // Wallet trades from wallet_trades table (not live trades)
+  const [tradesLimit, setTradesLimit] = useState(10);
+  const { data: walletTrades, isLoading: isLoadingTrades } = useWalletTradesQuery(mode, address, {
+    limit: tradesLimit,
+  });
+
+  // Copy address to clipboard
+  const [copied, setCopied] = useState(false);
+  const handleCopyAddress = async () => {
+    await navigator.clipboard.writeText(address);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   // Merge API data with stored wallet data
   const wallet = useMemo(() => {
@@ -123,8 +115,8 @@ export default function WalletDetailPage() {
         label: apiWallet.label,
         tier: apiWallet.copy_enabled ? 'active' as const : 'bench' as const,
         roi30d: ratioOrPercentToPercent(walletMetrics?.roi),
-        roi7d: 0, // Not available in WalletMetrics
-        roi90d: 0, // Not available in WalletMetrics
+        roi7d: 0,
+        roi90d: 0,
         sharpe: walletMetrics?.sharpe_ratio ?? 0,
         winRate: ratioOrPercentToPercent(apiWallet?.win_rate),
         trades: apiWallet?.total_trades ?? 0,
@@ -180,8 +172,6 @@ export default function WalletDetailPage() {
     };
   }, [storedWallet, apiWallet, walletMetrics, discoveredWallet, address]);
 
-  const decisionBrief = undefined as DecisionBrief | undefined;
-
   // Calculate positions value for this wallet
   const walletPositionsValue = useMemo(() => {
     if (mode === 'demo') {
@@ -197,10 +187,10 @@ export default function WalletDetailPage() {
   const isActive = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'active');
   const isBench = allocations.some((w) => w.wallet_address.toLowerCase() === address?.toLowerCase() && w.tier === 'bench');
   const isLoading = isLoadingWallet || isLoadingMetrics || isLoadingDiscovered;
-  const isRosterFull = () => allocations.filter((a) => a.tier === 'active').length >= 5;
+  const isRosterFull = useMemo(() => allocations.filter((a) => a.tier === 'active').length >= 5, [allocations]);
 
   const handlePromote = () => {
-    if (isRosterFull()) {
+    if (isRosterFull) {
       toast.error('Roster Full', 'Demote a wallet first to make room');
       return;
     }
@@ -216,6 +206,28 @@ export default function WalletDetailPage() {
       onError: () => toast.error('Demotion Failed', 'Could not demote wallet'),
     });
   };
+
+  // Show error state if wallet data failed to load
+  if (walletError && !storedWallet && !discoveredWallet) {
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center gap-4">
+          <Link href="/trading">
+            <Button variant="ghost" size="icon">
+              <ArrowLeft className="h-5 w-5" />
+            </Button>
+          </Link>
+          <h1 className="text-3xl font-bold tracking-tight">Wallet Details</h1>
+        </div>
+        <ErrorDisplay
+          error={walletError}
+          onRetry={() => refetchWallet()}
+          variant="card"
+          title="Failed to load wallet"
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -240,7 +252,20 @@ export default function WalletDetailPage() {
                   <h1 className="text-3xl font-bold tracking-tight">
                     {wallet.label || shortenAddress(address)}
                   </h1>
-                  <p className="text-muted-foreground font-mono">{shortenAddress(address)}</p>
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-muted-foreground font-mono">{shortenAddress(address)}</p>
+                    <button
+                      onClick={handleCopyAddress}
+                      className="p-1 rounded hover:bg-muted transition-colors"
+                      title="Copy address"
+                    >
+                      {copied ? (
+                        <Check className="h-3.5 w-3.5 text-profit" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5 text-muted-foreground" />
+                      )}
+                    </button>
+                  </div>
                 </>
               )}
             </div>
@@ -261,14 +286,22 @@ export default function WalletDetailPage() {
             </span>
           )}
           {isActive && (
-            <Button variant="outline" onClick={handleDemote}>
-              <ChevronDown className="mr-1 h-4 w-4" />
+            <Button variant="outline" onClick={handleDemote} disabled={demoteMutation.isPending}>
+              {demoteMutation.isPending ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <ChevronDown className="mr-1 h-4 w-4" />
+              )}
               Demote
             </Button>
           )}
           {isBench && (
-            <Button onClick={handlePromote} disabled={isRosterFull()}>
-              <ChevronUp className="mr-1 h-4 w-4" />
+            <Button onClick={handlePromote} disabled={isRosterFull || promoteMutation.isPending}>
+              {promoteMutation.isPending ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <ChevronUp className="mr-1 h-4 w-4" />
+              )}
               Promote
             </Button>
           )}
@@ -363,119 +396,18 @@ export default function WalletDetailPage() {
           totalBalance={balance}
           positionsValue={walletPositionsValue}
           isDemo={mode === 'demo'}
+          allocations={allocations}
         />
       )}
 
-      {/* Decision Brief - Only show if data is available */}
-      {decisionBrief && (
-        <Card className="border-primary/50">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Shield className="h-5 w-5" />
-              Decision Brief
-            </CardTitle>
-            <CardDescription>
-              Strategy profile and fitness assessment for copy trading
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-6">
-            {/* Trading Style */}
-            <div className="grid md:grid-cols-2 gap-6">
-              <div className="space-y-4">
-                <div>
-                  <p className="text-sm text-muted-foreground mb-1">Trading Style</p>
-                  <p className="text-lg font-semibold">
-                    {tradingStyleLabels[decisionBrief.trading_style]}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    {tradingStyleDescriptions[decisionBrief.trading_style]}
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <p className="text-sm text-muted-foreground mb-1">Event Trades</p>
-                    <p className="text-lg font-semibold">
-                      {Math.round(decisionBrief.event_trade_ratio * 100)}%
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-sm text-muted-foreground mb-1">Arb Trades</p>
-                    <p className="text-lg font-semibold">
-                      {Math.round(decisionBrief.arb_trade_ratio * 100)}%
-                    </p>
-                  </div>
-                </div>
-
-                <div>
-                  <p className="text-sm text-muted-foreground mb-1">Slippage Tolerance</p>
-                  <p className={`text-lg font-semibold capitalize ${slippageColors[decisionBrief.slippage_tolerance]}`}>
-                    {decisionBrief.slippage_tolerance}
-                  </p>
-                </div>
-
-                <div>
-                  <p className="text-sm text-muted-foreground mb-1">Typical Hold Time</p>
-                  <p className="text-lg font-semibold">{decisionBrief.typical_hold_time}</p>
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                <div>
-                  <p className="text-sm text-muted-foreground mb-1">Preferred Categories</p>
-                  <div className="flex flex-wrap gap-2 mt-2">
-                    {decisionBrief.preferred_categories.map((cat) => (
-                      <span
-                        key={cat}
-                        className="px-3 py-1 rounded-full bg-primary/10 text-primary text-sm"
-                      >
-                        {cat}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <p className="text-sm text-muted-foreground mb-2">Fitness Score</p>
-                  <div className="flex items-center gap-3">
-                    <div className="flex-1 h-3 bg-muted rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-profit rounded-full transition-all"
-                        style={{ width: `${decisionBrief.fitness_score}%` }}
-                      />
-                    </div>
-                    <span className="text-lg font-bold">{decisionBrief.fitness_score}/100</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Fitness Reasons */}
-            <div>
-              <p className="text-sm text-muted-foreground mb-3 font-medium uppercase">
-                Assessment
-              </p>
-              <ul className="space-y-2">
-                {decisionBrief.fitness_reasons.map((reason, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm">
-                    <CheckCircle className="h-4 w-4 text-profit mt-0.5 shrink-0" />
-                    {reason}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* No Decision Brief Placeholder */}
-      {!decisionBrief && !isLoading && (
+      {/* Decision Brief - Coming Soon */}
+      {!isLoading && (
         <Card className="border-muted">
           <CardContent className="p-8 text-center">
             <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-            <h3 className="text-lg font-medium mb-2">No Decision Brief Available</h3>
+            <h3 className="text-lg font-medium mb-2">Decision Brief Coming Soon</h3>
             <p className="text-muted-foreground">
-              Strategy profile data is not yet available for this wallet.
+              Strategy profile and fitness assessment data will be available in a future update.
             </p>
           </CardContent>
         </Card>
@@ -500,47 +432,60 @@ export default function WalletDetailPage() {
                 </div>
               ))}
             </div>
-          ) : recentTrades && recentTrades.length > 0 ? (
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead className="border-b bg-muted/50">
-                  <tr>
-                    <th className="text-left p-4 font-medium">Market</th>
-                    <th className="text-left p-4 font-medium">Side</th>
-                    <th className="text-right p-4 font-medium">Price</th>
-                    <th className="text-right p-4 font-medium">Value</th>
-                    <th className="text-right p-4 font-medium">Time</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recentTrades.map((trade) => (
-                    <tr key={trade.tx_hash} className="border-b hover:bg-muted/30">
-                      <td className="p-4">
-                        <p className="font-medium text-sm">{trade.market_question || trade.market_id}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {new Date(trade.timestamp).toLocaleDateString()}
-                        </p>
-                      </td>
-                      <td className="p-4">
-                        <span
-                          className={`px-2 py-1 rounded text-xs font-medium uppercase ${
-                            trade.direction === 'buy'
-                              ? 'bg-profit/10 text-profit'
-                              : 'bg-loss/10 text-loss'
-                          }`}
-                        >
-                          {trade.direction}
-                        </span>
-                      </td>
-                      <td className="p-4 text-right tabular-nums">${Number(trade.price).toFixed(2)}</td>
-                      <td className="p-4 text-right tabular-nums">{formatCurrency(trade.value)}</td>
-                      <td className="p-4 text-right text-muted-foreground text-sm">
-                        {new Date(trade.timestamp).toLocaleTimeString()}
-                      </td>
+          ) : walletTrades && walletTrades.length > 0 ? (
+            <div className="space-y-0">
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead className="border-b bg-muted/50">
+                    <tr>
+                      <th className="text-left p-4 font-medium">Market</th>
+                      <th className="text-left p-4 font-medium">Side</th>
+                      <th className="text-right p-4 font-medium">Price</th>
+                      <th className="text-right p-4 font-medium">Value</th>
+                      <th className="text-right p-4 font-medium">Time</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {walletTrades.map((trade) => (
+                      <tr key={trade.transaction_hash} className="border-b hover:bg-muted/30">
+                        <td className="p-4">
+                          <p className="font-medium text-sm">{trade.title || trade.asset_id}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {new Date(trade.timestamp).toLocaleDateString()}
+                          </p>
+                        </td>
+                        <td className="p-4">
+                          <span
+                            className={`px-2 py-1 rounded text-xs font-medium uppercase ${
+                              trade.side === 'BUY'
+                                ? 'bg-profit/10 text-profit'
+                                : 'bg-loss/10 text-loss'
+                            }`}
+                          >
+                            {trade.side}
+                          </span>
+                        </td>
+                        <td className="p-4 text-right tabular-nums">${Number(trade.price).toFixed(2)}</td>
+                        <td className="p-4 text-right tabular-nums">{formatCurrency(trade.value)}</td>
+                        <td className="p-4 text-right text-muted-foreground text-sm">
+                          {new Date(trade.timestamp).toLocaleTimeString()}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {walletTrades.length >= tradesLimit && (
+                <div className="flex justify-center pt-4">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setTradesLimit((prev) => prev + 10)}
+                  >
+                    Load More
+                  </Button>
+                </div>
+              )}
             </div>
           ) : (
             <div className="py-12 text-center">
