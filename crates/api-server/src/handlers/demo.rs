@@ -172,6 +172,19 @@ async fn get_current_workspace(
     Ok(settings.and_then(|(id,)| id))
 }
 
+/// Get the workspace's configured total_budget (falls back to 0 if not set).
+async fn get_workspace_budget(
+    pool: &sqlx::PgPool,
+    workspace_id: Uuid,
+) -> Result<Decimal, sqlx::Error> {
+    let row: Option<(Decimal,)> =
+        sqlx::query_as("SELECT total_budget FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(b,)| b).unwrap_or(Decimal::ZERO))
+}
+
 /// Check if user is a member of the workspace.
 async fn is_workspace_member(
     pool: &sqlx::PgPool,
@@ -329,14 +342,17 @@ pub async fn create_demo_position(
     let mut tx = state.pool.begin().await?;
 
     // Ensure balance row exists, then lock it for atomic debit.
+    let budget = get_workspace_budget(&state.pool, workspace_id).await
+        .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
     sqlx::query(
         r#"
         INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at)
-        VALUES ($1, 10000, 10000, $2)
+        VALUES ($1, $2, $2, $3)
         ON CONFLICT (workspace_id) DO NOTHING
         "#,
     )
     .bind(workspace_id)
+    .bind(budget)
     .bind(now)
     .execute(&mut *tx)
     .await?;
@@ -477,14 +493,17 @@ pub async fn update_demo_position(
             .unwrap_or((exit_price - entry_price) * quantity);
         let exit_value = quantity * exit_price;
 
+        let budget = get_workspace_budget(&state.pool, workspace_id).await
+            .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
         sqlx::query(
             r#"
             INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at)
-            VALUES ($1, 10000, 10000, $2)
+            VALUES ($1, $2, $2, $3)
             ON CONFLICT (workspace_id) DO NOTHING
             "#,
         )
         .bind(workspace_id)
+        .bind(budget)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -673,9 +692,10 @@ pub async fn get_demo_balance(
             updated_at: b.updated_at,
         },
         None => {
-            // Create default balance
+            // Create default balance from workspace's configured budget
             let now = Utc::now();
-            let default_balance = Decimal::new(10000, 0);
+            let default_balance = get_workspace_budget(&state.pool, workspace_id).await
+                .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
             sqlx::query(
                 "INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at) VALUES ($1, $2, $2, $3)",
             )
@@ -736,10 +756,12 @@ pub async fn update_demo_balance(
     let now = Utc::now();
 
     // Upsert balance
+    let budget = get_workspace_budget(&state.pool, workspace_id).await
+        .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
     let row: DemoBalanceRow = sqlx::query_as(
         r#"
         INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at)
-        VALUES ($1, $2, 10000, $3)
+        VALUES ($1, $2, $4, $3)
         ON CONFLICT (workspace_id)
         DO UPDATE SET balance = $2, updated_at = $3
         RETURNING workspace_id, balance, initial_balance, updated_at
@@ -748,6 +770,7 @@ pub async fn update_demo_balance(
     .bind(workspace_id)
     .bind(req.balance)
     .bind(now)
+    .bind(budget)
     .fetch_one(&state.pool)
     .await?;
 
@@ -788,7 +811,8 @@ pub async fn reset_demo_portfolio(
     }
 
     let now = Utc::now();
-    let default_balance = Decimal::new(10000, 0);
+    let default_balance = get_workspace_budget(&state.pool, workspace_id).await
+        .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
     let mut tx = state.pool.begin().await?;
 
     // Delete all positions
@@ -861,7 +885,7 @@ mod tests {
         let response = DemoBalanceResponse {
             workspace_id: "ws-123".to_string(),
             balance: Decimal::new(9500, 0),
-            initial_balance: Decimal::new(10000, 0),
+            initial_balance: Decimal::new(5000, 0),
             updated_at: now,
         };
 
@@ -870,7 +894,7 @@ mod tests {
 
         assert_eq!(parsed["workspace_id"], "ws-123");
         assert_eq!(parsed["balance"], "9500");
-        assert_eq!(parsed["initial_balance"], "10000");
+        assert_eq!(parsed["initial_balance"], "5000");
         assert!(parsed["updated_at"].is_string());
     }
 
