@@ -176,6 +176,57 @@ impl ClobClient {
         }
     }
 
+    /// Fetch recent activity for a specific wallet from the Data API.
+    ///
+    /// Calls `https://data-api.polymarket.com/activity?user=ADDRESS&limit=N`
+    /// and returns only entries of type `TRADE`, mapped to `ClobTrade`.
+    pub async fn get_wallet_activity(
+        &self,
+        wallet_address: &str,
+        limit: u32,
+    ) -> Result<Vec<ClobTrade>> {
+        let data_api_url = "https://data-api.polymarket.com";
+        let url = format!(
+            "{}/activity?user={}&limit={}",
+            data_api_url, wallet_address, limit
+        );
+
+        let response = self.get_with_retry(&url).await?;
+        let text = response.text().await?;
+
+        match serde_json::from_str::<Vec<ActivityEntry>>(&text) {
+            Ok(entries) => {
+                let trades: Vec<ClobTrade> = entries
+                    .into_iter()
+                    .filter_map(|e| e.into_clob_trade())
+                    .collect();
+                debug!(
+                    wallet = %wallet_address,
+                    trade_count = trades.len(),
+                    "Fetched wallet activity"
+                );
+                Ok(trades)
+            }
+            Err(e) => {
+                let preview = if text.len() > 500 {
+                    &text[..500]
+                } else {
+                    &text
+                };
+                warn!(
+                    error = %e,
+                    wallet = %wallet_address,
+                    response_preview = %preview,
+                    "Could not parse wallet activity response"
+                );
+                Err(Error::Api {
+                    message: format!("Wallet activity parse error: {}", e),
+                    status: None,
+                })
+            }
+        }
+    }
+
     /// Subscribe to real-time order book updates via WebSocket.
     /// Returns a channel receiver that yields order book updates.
     pub async fn subscribe_orderbook(
@@ -281,6 +332,115 @@ pub struct ClobTrade {
     /// Outcome name.
     #[serde(default)]
     pub outcome: Option<String>,
+}
+
+/// A single entry from the Data API `/activity` endpoint.
+///
+/// Field names differ from the `/trades` endpoint (e.g. `usdcSize` instead of
+/// `size`, plus a `type` discriminator).
+#[derive(Debug, Deserialize)]
+struct ActivityEntry {
+    /// Transaction hash.
+    #[serde(alias = "transactionHash", default)]
+    transaction_hash: Option<String>,
+    /// Unique identifier (fallback when transaction_hash is absent).
+    #[serde(default)]
+    id: Option<String>,
+    /// Proxy wallet address.
+    #[serde(alias = "proxyWallet", default)]
+    proxy_wallet: Option<String>,
+    /// Trade side (BUY / SELL).
+    #[serde(default)]
+    side: Option<String>,
+    /// Asset / token ID.
+    #[serde(default)]
+    asset: Option<String>,
+    /// Condition (market) ID.
+    #[serde(alias = "conditionId", default)]
+    condition_id: Option<String>,
+    /// USDC size of the trade.
+    #[serde(alias = "usdcSize", default)]
+    usdc_size: Option<f64>,
+    /// Quantity / shares.
+    #[serde(default)]
+    size: Option<f64>,
+    /// Trade price.
+    #[serde(default)]
+    price: Option<f64>,
+    /// Unix timestamp (seconds).
+    #[serde(default)]
+    timestamp: Option<i64>,
+    /// ISO-8601 timestamp (fallback).
+    #[serde(alias = "createdAt", default)]
+    created_at: Option<String>,
+    /// Activity type — we only care about "TRADE".
+    #[serde(alias = "type", default)]
+    activity_type: Option<String>,
+    /// Market title.
+    #[serde(default)]
+    title: Option<String>,
+    /// Market slug.
+    #[serde(default)]
+    slug: Option<String>,
+    /// Outcome name.
+    #[serde(default)]
+    outcome: Option<String>,
+}
+
+impl ActivityEntry {
+    /// Convert to a `ClobTrade`, returning `None` for non-TRADE entries or
+    /// entries missing required fields.
+    fn into_clob_trade(self) -> Option<ClobTrade> {
+        // Only process TRADE activity types
+        let activity_type = self.activity_type.unwrap_or_default();
+        if !activity_type.eq_ignore_ascii_case("TRADE") {
+            return None;
+        }
+
+        let transaction_hash = self
+            .transaction_hash
+            .or(self.id)
+            .filter(|s| !s.is_empty())?;
+        let wallet_address = self.proxy_wallet.filter(|s| !s.is_empty())?;
+        let side = self.side.filter(|s| !s.is_empty())?;
+        let asset_id = self.asset.filter(|s| !s.is_empty())?;
+        let price = self.price.unwrap_or(0.0);
+
+        // usdcSize is a dollar amount — divide by price to get share quantity.
+        // size is already in shares — use directly.
+        let computed_size = if let Some(usdc) = self.usdc_size {
+            if price > 0.0 {
+                usdc / price
+            } else {
+                0.0
+            }
+        } else {
+            self.size.unwrap_or(0.0)
+        };
+
+        // Parse timestamp: prefer unix seconds, fall back to ISO-8601
+        let timestamp = self.timestamp.unwrap_or_else(|| {
+            self.created_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp())
+                .unwrap_or(0)
+        });
+
+        Some(ClobTrade {
+            transaction_hash,
+            wallet_address,
+            side,
+            asset_id,
+            condition_id: self.condition_id,
+            size: computed_size,
+            price,
+            timestamp,
+            title: self.title,
+            slug: self.slug,
+            outcome: self.outcome,
+        })
+    }
 }
 
 /// Response wrapper for paginated trades (legacy CLOB API format - no longer used).

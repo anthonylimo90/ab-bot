@@ -35,6 +35,10 @@ cd dashboard && npm run dev      # Run dashboard (port 3002)
 **Types:** feat, fix, refactor, perf, test, docs, chore, ci
 **Scopes:** arb, bot, core, db, api, dashboard
 
+## Subagent Preferences
+
+- Always use `sonnet` model for subagents (never haiku)
+
 ## Dos and Don'ts
 
 - DO run `cargo fmt --all && cargo clippy` before committing
