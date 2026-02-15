@@ -78,7 +78,7 @@ impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: 15,
-            min_trade_value: Decimal::new(1, 0),
+            min_trade_value: Decimal::new(5, 2), // $0.05
             max_trade_age_secs: 300,
             max_history_size: 10000,
         }
@@ -96,7 +96,7 @@ impl MonitorConfig {
             min_trade_value: std::env::var("TRADE_MONITOR_MIN_VALUE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(1, 0)),
+                .unwrap_or(Decimal::new(5, 2)), // $0.05
             max_trade_age_secs: std::env::var("TRADE_MONITOR_MAX_AGE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -497,7 +497,7 @@ mod tests {
     fn test_monitor_config_default() {
         let config = MonitorConfig::default();
         assert_eq!(config.poll_interval_secs, 15);
-        assert_eq!(config.min_trade_value, Decimal::new(1, 0));
+        assert_eq!(config.min_trade_value, Decimal::new(5, 2));
         assert_eq!(config.max_trade_age_secs, 300);
     }
 
@@ -506,7 +506,7 @@ mod tests {
         // Without env vars set, should use defaults
         let config = MonitorConfig::from_env();
         assert_eq!(config.poll_interval_secs, 15);
-        assert_eq!(config.min_trade_value, Decimal::new(1, 0));
+        assert_eq!(config.min_trade_value, Decimal::new(5, 2));
         assert_eq!(config.max_trade_age_secs, 300);
     }
 
