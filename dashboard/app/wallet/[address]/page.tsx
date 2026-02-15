@@ -60,7 +60,7 @@ export default function WalletDetailPage() {
   const { data: walletBalance } = useWalletBalanceQuery(
     mode === 'live' ? primaryWallet : null
   );
-  const balance = mode === 'live' && walletBalance ? walletBalance.usdc_balance : demoBalance;
+  const balance = mode === 'live' ? (walletBalance?.usdc_balance ?? 0) : demoBalance;
   const { data: livePositions = [] } = usePositionsQuery(mode, { status: 'open' });
 
   // ROI period toggle
