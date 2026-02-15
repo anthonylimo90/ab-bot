@@ -1,8 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { useParams } from 'next/navigation';
-import Link from 'next/link';
+import { useParams, useRouter } from 'next/navigation';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -27,19 +26,28 @@ import {
   ChevronDown,
   Zap,
   Activity,
-  AlertCircle,
   Copy,
   Check,
   Loader2,
+  ExternalLink,
+  Pin,
+  AlertTriangle,
+  Clock,
+  BarChart3,
+  ShoppingCart,
 } from 'lucide-react';
 import { WalletAllocationSection } from '@/components/trading/WalletAllocationSection';
+import { ErrorBoundary } from '@/components/shared/ErrorBoundary';
 import { ErrorDisplay } from '@/components/shared/ErrorDisplay';
 import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
 import { useWalletStore } from '@/stores/wallet-store';
 import { usePositionsQuery } from '@/hooks/queries/usePositionsQuery';
 
+type RoiPeriod = '7d' | '30d' | '90d';
+
 export default function WalletDetailPage() {
   const params = useParams();
+  const router = useRouter();
   const address = params.address as string;
   const toast = useToastStore();
   const { currentWorkspace } = useWorkspaceStore();
@@ -55,6 +63,9 @@ export default function WalletDetailPage() {
   const balance = mode === 'live' && walletBalance ? walletBalance.usdc_balance : demoBalance;
   const { data: livePositions = [] } = usePositionsQuery(mode, { status: 'open' });
 
+  // ROI period toggle
+  const [roiPeriod, setRoiPeriod] = useState<RoiPeriod>('30d');
+
   // Find wallet in workspace allocations (compute before queries for conditional execution)
   const storedWallet = useMemo(() => {
     return allocations.find((w) => w.wallet_address.toLowerCase() === address?.toLowerCase());
@@ -68,7 +79,7 @@ export default function WalletDetailPage() {
 
   // Wallet trades from wallet_trades table (not live trades)
   const [tradesLimit, setTradesLimit] = useState(10);
-  const { data: walletTrades, isLoading: isLoadingTrades } = useWalletTradesQuery(mode, address, {
+  const { data: walletTrades, isLoading: isLoadingTrades, error: tradesError, refetch: refetchTrades } = useWalletTradesQuery(mode, address, {
     limit: tradesLimit,
   });
 
@@ -83,7 +94,6 @@ export default function WalletDetailPage() {
   // Merge API data with stored wallet data
   const wallet = useMemo(() => {
     if (storedWallet) {
-      // Use backtest data if available, otherwise fall back to discovery data
       const hasBacktest = storedWallet.backtest_roi != null && storedWallet.backtest_roi !== 0;
       return {
         address: storedWallet.wallet_address,
@@ -130,7 +140,6 @@ export default function WalletDetailPage() {
         addedAt: apiWallet.added_at ?? new Date().toISOString(),
       };
     }
-    // Fallback to discovery data for untracked wallets
     if (discoveredWallet) {
       return {
         address: discoveredWallet.address,
@@ -152,12 +161,13 @@ export default function WalletDetailPage() {
         addedAt: new Date().toISOString(),
       };
     }
-    // Return minimal wallet for display while loading
     return {
       address: address,
       label: undefined,
       tier: 'bench' as const,
       roi30d: 0,
+      roi7d: 0,
+      roi90d: 0,
       sharpe: 0,
       winRate: 0,
       trades: 0,
@@ -189,6 +199,32 @@ export default function WalletDetailPage() {
   const isLoading = isLoadingWallet || isLoadingMetrics || isLoadingDiscovered;
   const isRosterFull = useMemo(() => allocations.filter((a) => a.tier === 'active').length >= 5, [allocations]);
 
+  // ROI by period
+  const roiByPeriod: Record<RoiPeriod, number> = {
+    '7d': wallet.roi7d ?? 0,
+    '30d': wallet.roi30d ?? 0,
+    '90d': wallet.roi90d ?? 0,
+  };
+  const selectedRoi = roiByPeriod[roiPeriod];
+
+  // Trade summary stats
+  const tradeSummary = useMemo(() => {
+    if (!walletTrades || walletTrades.length === 0) return null;
+    const totalVolume = walletTrades.reduce((sum, t) => sum + (t.value || 0), 0);
+    const avgSize = totalVolume / walletTrades.length;
+    const buys = walletTrades.filter((t) => t.side === 'BUY').length;
+    const sells = walletTrades.length - buys;
+    return { totalVolume, avgSize, buys, sells };
+  }, [walletTrades]);
+
+  // Tracking since
+  const trackingSince = useMemo(() => {
+    if (!storedWallet?.added_at) return null;
+    const addedDate = new Date(storedWallet.added_at);
+    const days = Math.floor((Date.now() - addedDate.getTime()) / (1000 * 60 * 60 * 24));
+    return days;
+  }, [storedWallet]);
+
   const handlePromote = () => {
     if (isRosterFull) {
       toast.error('Roster Full', 'Demote a wallet first to make room');
@@ -212,11 +248,9 @@ export default function WalletDetailPage() {
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
-          <Link href="/trading">
-            <Button variant="ghost" size="icon">
-              <ArrowLeft className="h-5 w-5" />
-            </Button>
-          </Link>
+          <Button variant="ghost" size="icon" onClick={() => router.back()} aria-label="Go back">
+            <ArrowLeft className="h-5 w-5" />
+          </Button>
           <h1 className="text-3xl font-bold tracking-tight">Wallet Details</h1>
         </div>
         <ErrorDisplay
@@ -230,14 +264,13 @@ export default function WalletDetailPage() {
   }
 
   return (
+    <ErrorBoundary>
     <div className="space-y-6">
       {/* Breadcrumb & Header */}
       <div className="flex items-center gap-4">
-        <Link href="/trading">
-          <Button variant="ghost" size="icon">
-            <ArrowLeft className="h-5 w-5" />
-          </Button>
-        </Link>
+        <Button variant="ghost" size="icon" onClick={() => router.back()} aria-label="Go back">
+          <ArrowLeft className="h-5 w-5" />
+        </Button>
         <div className="flex-1">
           <div className="flex items-center gap-3">
             <Wallet className="h-8 w-8" />
@@ -257,7 +290,7 @@ export default function WalletDetailPage() {
                     <button
                       onClick={handleCopyAddress}
                       className="p-1 rounded hover:bg-muted transition-colors"
-                      title="Copy address"
+                      aria-label="Copy address"
                     >
                       {copied ? (
                         <Check className="h-3.5 w-3.5 text-profit" />
@@ -265,13 +298,29 @@ export default function WalletDetailPage() {
                         <Copy className="h-3.5 w-3.5 text-muted-foreground" />
                       )}
                     </button>
+                    <a
+                      href={`https://polymarket.com/profile/${address}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-1 rounded hover:bg-muted transition-colors"
+                      aria-label="View on Polymarket"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+                    </a>
                   </div>
+                  {trackingSince !== null && (
+                    <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      Tracking for {trackingSince} day{trackingSince !== 1 ? 's' : ''}
+                    </p>
+                  )}
                 </>
               )}
             </div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Tier badge */}
           {isActive ? (
             <span className="px-3 py-1 rounded-full bg-primary text-primary-foreground text-sm font-medium">
               Active
@@ -285,8 +334,32 @@ export default function WalletDetailPage() {
               Untracked
             </span>
           )}
+          {/* Status badges */}
+          {storedWallet?.pinned && (
+            <span className="px-2 py-1 rounded-full bg-yellow-500/10 text-yellow-600 text-xs font-medium flex items-center gap-1">
+              <Pin className="h-3 w-3" />
+              Pinned
+            </span>
+          )}
+          {storedWallet?.probation_until && new Date(storedWallet.probation_until) > new Date() && (
+            <span className="px-2 py-1 rounded-full bg-orange-500/10 text-orange-600 text-xs font-medium flex items-center gap-1">
+              <AlertTriangle className="h-3 w-3" />
+              Probation
+            </span>
+          )}
+          {storedWallet?.auto_assigned && (
+            <span className="px-2 py-1 rounded-full bg-blue-500/10 text-blue-600 text-xs font-medium">
+              Auto-selected
+            </span>
+          )}
+          {(storedWallet?.consecutive_losses ?? 0) >= 3 && (
+            <span className="px-2 py-1 rounded-full bg-loss/10 text-loss text-xs font-medium">
+              {storedWallet!.consecutive_losses} losses
+            </span>
+          )}
+          {/* Actions */}
           {isActive && (
-            <Button variant="outline" onClick={handleDemote} disabled={demoteMutation.isPending}>
+            <Button variant="outline" onClick={handleDemote} disabled={demoteMutation.isPending} aria-label="Demote wallet">
               {demoteMutation.isPending ? (
                 <Loader2 className="mr-1 h-4 w-4 animate-spin" />
               ) : (
@@ -296,7 +369,7 @@ export default function WalletDetailPage() {
             </Button>
           )}
           {isBench && (
-            <Button onClick={handlePromote} disabled={isRosterFull || promoteMutation.isPending}>
+            <Button onClick={handlePromote} disabled={isRosterFull || promoteMutation.isPending} aria-label="Promote wallet">
               {promoteMutation.isPending ? (
                 <Loader2 className="mr-1 h-4 w-4 animate-spin" />
               ) : (
@@ -309,18 +382,33 @@ export default function WalletDetailPage() {
       </div>
 
       {/* Stats Row */}
-      <div className="grid gap-4 md:grid-cols-5">
+      <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
+        {/* ROI Card with period toggle */}
         <Card>
           <CardContent className="p-4">
             <div className="flex items-center gap-3">
               <TrendingUp className="h-5 w-5 text-profit" />
-              <div>
-                <p className="text-xs text-muted-foreground">ROI (30d)</p>
+              <div className="flex-1">
+                <div className="flex items-center gap-1.5 mb-1">
+                  {(['7d', '30d', '90d'] as RoiPeriod[]).map((period) => (
+                    <button
+                      key={period}
+                      onClick={() => setRoiPeriod(period)}
+                      className={`text-xs px-1.5 py-0.5 rounded transition-colors ${
+                        roiPeriod === period
+                          ? 'bg-primary text-primary-foreground'
+                          : 'text-muted-foreground hover:bg-muted'
+                      }`}
+                    >
+                      {period}
+                    </button>
+                  ))}
+                </div>
                 {isLoading ? (
                   <Skeleton className="h-6 w-16" />
                 ) : (
-                  <p className={`text-xl font-bold ${Number(wallet.roi30d) >= 0 ? 'text-profit' : 'text-loss'}`}>
-                    {Number(wallet.roi30d) >= 0 ? '+' : ''}{Number(wallet.roi30d).toFixed(1)}%
+                  <p className={`text-xl font-bold tabular-nums ${Number(selectedRoi) >= 0 ? 'text-profit' : 'text-loss'}`}>
+                    {Number(selectedRoi) >= 0 ? '+' : ''}{Number(selectedRoi).toFixed(1)}%
                   </p>
                 )}
               </div>
@@ -336,7 +424,7 @@ export default function WalletDetailPage() {
                 {isLoading ? (
                   <Skeleton className="h-6 w-16" />
                 ) : (
-                  <p className="text-xl font-bold">{Number(wallet.winRate).toFixed(1)}%</p>
+                  <p className="text-xl font-bold tabular-nums">{Number(wallet.winRate).toFixed(1)}%</p>
                 )}
               </div>
             </div>
@@ -351,7 +439,7 @@ export default function WalletDetailPage() {
                 {isLoading ? (
                   <Skeleton className="h-6 w-12" />
                 ) : (
-                  <p className="text-xl font-bold">{Number(wallet.sharpe).toFixed(2)}</p>
+                  <p className="text-xl font-bold tabular-nums">{Number(wallet.sharpe).toFixed(2)}</p>
                 )}
               </div>
             </div>
@@ -366,7 +454,7 @@ export default function WalletDetailPage() {
                 {isLoading ? (
                   <Skeleton className="h-6 w-16" />
                 ) : (
-                  <p className="text-xl font-bold text-loss">{Number(wallet.maxDrawdown).toFixed(1)}%</p>
+                  <p className="text-xl font-bold text-loss tabular-nums">{Number(wallet.maxDrawdown).toFixed(1)}%</p>
                 )}
               </div>
             </div>
@@ -381,7 +469,7 @@ export default function WalletDetailPage() {
                 {isLoading ? (
                   <Skeleton className="h-6 w-12" />
                 ) : (
-                  <p className="text-xl font-bold">{wallet.trades}</p>
+                  <p className="text-xl font-bold tabular-nums">{wallet.trades}</p>
                 )}
               </div>
             </div>
@@ -389,28 +477,16 @@ export default function WalletDetailPage() {
         </Card>
       </div>
 
-      {/* Allocation Section - Only show for active wallets */}
-      {isActive && (
+      {/* Allocation Section - Show for active wallets (editable) and bench wallets (read-only) */}
+      {(isActive || isBench) && (
         <WalletAllocationSection
           walletAddress={address}
           totalBalance={balance}
           positionsValue={walletPositionsValue}
           isDemo={mode === 'demo'}
           allocations={allocations}
+          readOnly={isBench}
         />
-      )}
-
-      {/* Decision Brief - Coming Soon */}
-      {!isLoading && (
-        <Card className="border-muted">
-          <CardContent className="p-8 text-center">
-            <AlertCircle className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-            <h3 className="text-lg font-medium mb-2">Decision Brief Coming Soon</h3>
-            <p className="text-muted-foreground">
-              Strategy profile and fitness assessment data will be available in a future update.
-            </p>
-          </CardContent>
-        </Card>
       )}
 
       {/* Trade History */}
@@ -419,6 +495,28 @@ export default function WalletDetailPage() {
           <CardTitle>Recent Trades</CardTitle>
         </CardHeader>
         <CardContent>
+          {/* Trade summary stats */}
+          {tradeSummary && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4 p-3 bg-muted/30 rounded-lg border">
+              <div className="text-center">
+                <p className="text-xs text-muted-foreground mb-1">Total Volume</p>
+                <p className="font-bold tabular-nums">{formatCurrency(tradeSummary.totalVolume)}</p>
+              </div>
+              <div className="text-center">
+                <p className="text-xs text-muted-foreground mb-1">Avg Trade Size</p>
+                <p className="font-bold tabular-nums">{formatCurrency(tradeSummary.avgSize)}</p>
+              </div>
+              <div className="text-center">
+                <p className="text-xs text-muted-foreground mb-1">Buys</p>
+                <p className="font-bold text-profit tabular-nums">{tradeSummary.buys}</p>
+              </div>
+              <div className="text-center">
+                <p className="text-xs text-muted-foreground mb-1">Sells</p>
+                <p className="font-bold text-loss tabular-nums">{tradeSummary.sells}</p>
+              </div>
+            </div>
+          )}
+
           {isLoadingTrades ? (
             <div className="space-y-4">
               {[1, 2, 3].map((i) => (
@@ -432,6 +530,13 @@ export default function WalletDetailPage() {
                 </div>
               ))}
             </div>
+          ) : tradesError ? (
+            <ErrorDisplay
+              error={tradesError}
+              onRetry={() => refetchTrades()}
+              variant="card"
+              title="Failed to load trades"
+            />
           ) : walletTrades && walletTrades.length > 0 ? (
             <div className="space-y-0">
               <div className="overflow-x-auto">
@@ -489,13 +594,20 @@ export default function WalletDetailPage() {
             </div>
           ) : (
             <div className="py-12 text-center">
-              <p className="text-muted-foreground">
-                No recent trades found for this wallet.
+              <BarChart3 className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+              <h3 className="text-lg font-medium mb-2">No recent trades</h3>
+              <p className="text-muted-foreground mb-4">
+                No trade history found for this wallet yet.
               </p>
+              <Button variant="outline" size="sm" onClick={() => router.push('/discover')}>
+                <ShoppingCart className="mr-2 h-4 w-4" />
+                Discover Wallets
+              </Button>
             </div>
           )}
         </CardContent>
       </Card>
     </div>
+    </ErrorBoundary>
   );
 }

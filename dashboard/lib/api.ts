@@ -56,6 +56,23 @@ import type {
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
+export class ApiHttpError extends Error {
+  constructor(
+    public statusCode: number,
+    message: string,
+    public code?: string,
+  ) {
+    super(message);
+    this.name = 'ApiHttpError';
+  }
+
+  get isUnauthorized() { return this.statusCode === 401; }
+  get isForbidden() { return this.statusCode === 403; }
+  get isNotFound() { return this.statusCode === 404; }
+  get isRateLimited() { return this.statusCode === 429; }
+  get isServerError() { return this.statusCode >= 500; }
+}
+
 class ApiClient {
   private baseUrl: string;
   private token?: string;
@@ -116,14 +133,15 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      if (response.status === 429) {
-        throw new Error('Too many requests. Please wait a moment and try again.');
-      }
       const error: ApiError = await response.json().catch(() => ({
         code: 'UNKNOWN_ERROR',
         message: `HTTP ${response.status}`,
       }));
-      throw new Error(error.message || `HTTP ${response.status}`);
+      throw new ApiHttpError(
+        response.status,
+        error.message || `HTTP ${response.status}`,
+        error.code,
+      );
     }
 
     // Handle 204 No Content and 202 Accepted (no body)

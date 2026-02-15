@@ -20,12 +20,8 @@ export const useModeStore = create<ModeStore>()(
         const oldMode = get().mode;
         if (oldMode === mode) return;
 
-        // 1. Update mode
-        set({ mode });
-
-        // 2. Invalidate queries first to ensure clean cache state
+        // 1. Invalidate queries first to ensure clean cache state
         if (queryClient) {
-          // Invalidate only mode-specific queries for efficiency
           await Promise.all([
             queryClient.invalidateQueries({ queryKey: ['positions'] }),
             queryClient.invalidateQueries({ queryKey: ['wallets'] }),
@@ -35,6 +31,9 @@ export const useModeStore = create<ModeStore>()(
             queryClient.invalidateQueries({ queryKey: ['rotation-history'] }),
           ]);
         }
+
+        // 2. Update mode after cache is invalidated
+        set({ mode });
 
         // 3. Then clear demo store if switching to live
         if (mode === 'live') {

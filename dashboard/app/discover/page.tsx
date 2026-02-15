@@ -27,6 +27,7 @@ import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useModeStore } from '@/stores/mode-store';
 import { shortenAddress } from '@/lib/utils';
 import { Star, Plus, Check, Loader2, Search } from 'lucide-react';
+import { ErrorBoundary } from '@/components/shared/ErrorBoundary';
 import type { CopyBehavior, DiscoveredWallet, PredictionCategory, WorkspaceAllocation } from '@/types/api';
 
 // Transform API wallet to component format
@@ -246,6 +247,7 @@ export default function DiscoverPage() {
   const timePeriodLabel = timePeriod === '7d' ? '7 Days' : timePeriod === '90d' ? '90 Days' : '30 Days';
 
   return (
+    <ErrorBoundary>
     <div className="space-y-6">
       {/* Page Header */}
       <div className="flex items-center justify-between">
@@ -440,25 +442,25 @@ export default function DiscoverPage() {
                     <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 flex-1">
                       <div>
                         <p className="text-xs text-muted-foreground">ROI ({timePeriod})</p>
-                        <p className={`font-medium ${roi >= 0 ? 'text-profit' : 'text-loss'}`}>
+                        <p className={`font-medium tabular-nums ${roi >= 0 ? 'text-profit' : 'text-loss'}`}>
                           {roi >= 0 ? '+' : ''}{roi.toFixed(1)}%
                         </p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground">Sharpe</p>
-                        <p className="font-medium">{wallet.sharpe.toFixed(2)}</p>
+                        <p className="font-medium tabular-nums">{wallet.sharpe.toFixed(2)}</p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground">Trades</p>
-                        <p className="font-medium">{wallet.trades}</p>
+                        <p className="font-medium tabular-nums">{wallet.trades}</p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground">Win Rate</p>
-                        <p className="font-medium">{wallet.winRate.toFixed(1)}%</p>
+                        <p className="font-medium tabular-nums">{wallet.winRate.toFixed(1)}%</p>
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground">Max DD</p>
-                        <p className="font-medium text-loss">
+                        <p className="font-medium text-loss tabular-nums">
                           {wallet.maxDrawdown.toFixed(1)}%
                         </p>
                       </div>
@@ -544,5 +546,6 @@ export default function DiscoverPage() {
         rosterCount={rosterCount}
       />
     </div>
+    </ErrorBoundary>
   );
 }
