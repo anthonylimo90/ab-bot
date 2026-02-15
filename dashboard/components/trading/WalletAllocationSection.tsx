@@ -24,6 +24,7 @@ interface WalletAllocationSectionProps {
   positionsValue: number;
   isDemo?: boolean;
   allocations: WorkspaceAllocation[];
+  readOnly?: boolean;
 }
 
 const copyBehaviorDescriptions: Record<CopyBehavior, string> = {
@@ -38,6 +39,7 @@ export function WalletAllocationSection({
   positionsValue,
   isDemo = false,
   allocations,
+  readOnly = false,
 }: WalletAllocationSectionProps) {
   const { currentWorkspace } = useWorkspaceStore();
   const { mode } = useModeStore();
@@ -53,7 +55,12 @@ export function WalletAllocationSection({
   );
 
   // Not in roster - don't show allocation section
-  if (!wallet || wallet.tier !== 'active') {
+  if (!wallet) {
+    return null;
+  }
+
+  // Only show for active wallets or bench wallets in readOnly mode
+  if (wallet.tier !== 'active' && !readOnly) {
     return null;
   }
 
@@ -104,6 +111,11 @@ export function WalletAllocationSection({
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-6">
+        {readOnly && (
+          <div className="text-sm text-muted-foreground bg-muted/50 rounded-md px-3 py-2">
+            Preview of default allocation settings. Promote to Active to customize.
+          </div>
+        )}
         {/* Allocation Summary Bar */}
         <div className="p-4 bg-muted/30 rounded-lg border">
           <div className="flex items-center justify-between text-sm mb-3">
@@ -199,6 +211,7 @@ export function WalletAllocationSection({
               max={100}
               step={5}
               className="w-full"
+              disabled={readOnly}
             />
             <p className="text-xs text-muted-foreground">
               Max: {formatCurrency(displayMaxAllocation)} of {formatCurrency(totalBalance)}
@@ -235,6 +248,7 @@ export function WalletAllocationSection({
               max={500}
               step={10}
               className="w-full"
+              disabled={readOnly}
             />
           </div>
         </div>
@@ -259,6 +273,7 @@ export function WalletAllocationSection({
           <Select
             value={wallet.copy_behavior}
             onValueChange={(v) => handleBehaviorChange(v as CopyBehavior)}
+            disabled={readOnly}
           >
             <SelectTrigger className="w-full">
               <SelectValue placeholder="Select behavior" />

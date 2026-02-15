@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { api } from '@/lib/api';
 import type { BacktestParams, BacktestResult } from '@/types/api';
 
@@ -19,9 +19,22 @@ export function useBacktest(): UseBacktestReturn {
   const [history, setHistory] = useState<BacktestResult[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
 
   // Run a new backtest
   const runBacktest = useCallback(async (params: BacktestParams) => {
+    // Abort any existing poll
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setIsRunning(true);
     setError(null);
 
@@ -35,7 +48,10 @@ export function useBacktest(): UseBacktestReturn {
           const maxAttempts = 60; // 5 minutes max
 
           while (attempts < maxAttempts) {
+            if (controller.signal.aborted) return;
             await new Promise((resolve) => setTimeout(resolve, 5000));
+            if (controller.signal.aborted) return;
+
             const updated = await api.getBacktestResult(result.id);
 
             if (updated.status === 'completed') {
@@ -60,10 +76,13 @@ export function useBacktest(): UseBacktestReturn {
         setHistory((prev) => [result, ...prev]);
       }
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'Failed to run backtest');
       console.error('Failed to run backtest:', err);
     } finally {
-      setIsRunning(false);
+      if (!controller.signal.aborted) {
+        setIsRunning(false);
+      }
     }
   }, []);
 

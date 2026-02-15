@@ -64,9 +64,23 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
   const messageQueueRef = useRef<WebSocketMessage[]>([]);
   const flushTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Refs for latest callbacks to avoid stale closures
+  const onMessageRef = useRef(onMessage);
+  const onMessageBatchRef = useRef(onMessageBatch);
+  const onConnectRef = useRef(onConnect);
+  const onDisconnectRef = useRef(onDisconnect);
+  const onErrorRef = useRef(onError);
+
+  // Keep refs up to date
+  useEffect(() => { onMessageRef.current = onMessage; }, [onMessage]);
+  useEffect(() => { onMessageBatchRef.current = onMessageBatch; }, [onMessageBatch]);
+  useEffect(() => { onConnectRef.current = onConnect; }, [onConnect]);
+  useEffect(() => { onDisconnectRef.current = onDisconnect; }, [onDisconnect]);
+  useEffect(() => { onErrorRef.current = onError; }, [onError]);
+
   const url = `${WS_BASE_URL}/ws/${channel}`;
 
-  // Flush batched messages
+  // Flush batched messages - uses refs to avoid stale closures
   const flushBatch = useCallback(() => {
     if (messageQueueRef.current.length === 0) return;
 
@@ -74,23 +88,20 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     messageQueueRef.current = [];
     flushTimeoutRef.current = null;
 
-    // Call batch handler if provided
-    if (onMessageBatch) {
-      onMessageBatch(messages);
+    if (onMessageBatchRef.current) {
+      onMessageBatchRef.current(messages);
     }
 
-    // Also call individual handler for each message
-    if (onMessage) {
-      messages.forEach((msg) => onMessage(msg));
+    if (onMessageRef.current) {
+      messages.forEach((msg) => onMessageRef.current!(msg));
     }
-  }, [onMessage, onMessageBatch]);
+  }, []);
 
   // Queue message for batching
   const queueMessage = useCallback(
     (message: WebSocketMessage) => {
       messageQueueRef.current.push(message);
 
-      // Schedule flush if not already scheduled
       if (!flushTimeoutRef.current) {
         flushTimeoutRef.current = setTimeout(flushBatch, batchInterval);
       }
@@ -98,19 +109,18 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     [flushBatch, batchInterval]
   );
 
-  // Process incoming message
+  // Process incoming message - uses refs for latest callbacks
   const handleMessage = useCallback(
     (message: WebSocketMessage) => {
-      // Handle pong silently
       if (message.type === 'Pong') return;
 
       if (batchMessages) {
         queueMessage(message);
       } else {
-        onMessage?.(message);
+        onMessageRef.current?.(message);
       }
     },
-    [batchMessages, queueMessage, onMessage]
+    [batchMessages, queueMessage]
   );
 
   const connect = useCallback(() => {
@@ -125,9 +135,8 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
       ws.onopen = () => {
         setStatus('connected');
         reconnectAttemptsRef.current = 0;
-        onConnect?.();
+        onConnectRef.current?.();
 
-        // Start ping interval to keep connection alive
         pingIntervalRef.current = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ action: 'ping' }));
@@ -146,20 +155,17 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
 
       ws.onclose = () => {
         setStatus('disconnected');
-        onDisconnect?.();
+        onDisconnectRef.current?.();
 
-        // Clear ping interval
         if (pingIntervalRef.current) {
           clearInterval(pingIntervalRef.current);
         }
 
-        // Flush any remaining batched messages
         if (flushTimeoutRef.current) {
           clearTimeout(flushTimeoutRef.current);
           flushBatch();
         }
 
-        // Attempt reconnection
         if (
           reconnect &&
           reconnectAttemptsRef.current < maxReconnectAttempts &&
@@ -174,7 +180,7 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
 
       ws.onerror = (error) => {
         setStatus('error');
-        onError?.(error);
+        onErrorRef.current?.(error);
       };
 
       wsRef.current = ws;
@@ -185,9 +191,6 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
   }, [
     url,
     handleMessage,
-    onConnect,
-    onDisconnect,
-    onError,
     reconnect,
     reconnectInterval,
     maxReconnectAttempts,
@@ -248,7 +251,21 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
       connect();
     }
 
+    // Reconnect when tab becomes visible again
+    const handleVisibilityChange = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        enabled &&
+        wsRef.current?.readyState !== WebSocket.OPEN
+      ) {
+        reconnectAttemptsRef.current = 0;
+        connect();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }

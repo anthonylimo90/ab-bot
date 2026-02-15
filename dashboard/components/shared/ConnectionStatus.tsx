@@ -48,6 +48,8 @@ export function ConnectionStatus({ status, className, showLabel = false }: Conne
         config.bgColor,
         className
       )}
+      role="status"
+      aria-label={config.label}
     >
       <Icon
         className={cn(

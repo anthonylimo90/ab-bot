@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -9,6 +9,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Skeleton } from '@/components/ui/skeleton';
 import { PortfolioSummary, WalletCard, ManualPositions, AutomationPanel } from '@/components/trading';
 import { AllocationAdjustmentPanel } from '@/components/allocations/AllocationAdjustmentPanel';
+import { ErrorBoundary } from '@/components/shared/ErrorBoundary';
 import { useDemoPortfolioStore, DemoPosition } from '@/stores/demo-portfolio-store';
 import { useModeStore } from '@/stores/mode-store';
 import { useToastStore } from '@/stores/toast-store';
@@ -145,6 +146,7 @@ export default function TradingPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const toast = useToastStore();
+  const [walletSearch, setWalletSearch] = useState('');
   const { currentWorkspace } = useWorkspaceStore();
   const { mode } = useModeStore();
   const isDemo = mode === 'demo';
@@ -172,13 +174,28 @@ export default function TradingPage() {
     return map;
   }, [discoveredWallets]);
 
-  const activeWallets = allocations.filter((a) => a.tier === 'active').map((a) =>
+  const allActiveWallets = allocations.filter((a) => a.tier === 'active').map((a) =>
     toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase()))
   );
-  const benchWallets = allocations.filter((a) => a.tier === 'bench').map((a) =>
+  const allBenchWallets = allocations.filter((a) => a.tier === 'bench').map((a) =>
     toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase()))
   );
-  const isRosterFull = () => activeWallets.length >= 5;
+
+  // Filter wallets by search query
+  const searchLower = walletSearch.toLowerCase().trim();
+  const activeWallets = searchLower
+    ? allActiveWallets.filter((w) =>
+        w.address.toLowerCase().includes(searchLower) ||
+        (w.label && w.label.toLowerCase().includes(searchLower))
+      )
+    : allActiveWallets;
+  const benchWallets = searchLower
+    ? allBenchWallets.filter((w) =>
+        w.address.toLowerCase().includes(searchLower) ||
+        (w.label && w.label.toLowerCase().includes(searchLower))
+      )
+    : allBenchWallets;
+  const isRosterFull = () => allActiveWallets.length >= 5;
 
   // Demo portfolio store
   const {
@@ -300,7 +317,7 @@ export default function TradingPage() {
   };
 
   // Count pinned wallets
-  const pinnedCount = activeWallets.filter((w) => w.pinned).length;
+  const pinnedCount = allActiveWallets.filter((w) => w.pinned).length;
   const maxPins = 3;
   const pinsRemaining = maxPins - pinnedCount;
 
@@ -351,6 +368,7 @@ export default function TradingPage() {
   }, [isDemo, demoClosedPositions, liveClosedPositions]);
 
   return (
+    <ErrorBoundary>
     <div className="space-y-6">
       {/* Page Header */}
       <div className="flex items-center justify-between">
@@ -398,16 +416,28 @@ export default function TradingPage() {
         isDemo={isDemo}
       />
 
+      {/* Search */}
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <input
+          type="text"
+          value={walletSearch}
+          onChange={(e) => setWalletSearch(e.target.value)}
+          placeholder="Search wallets by address or label..."
+          className="w-full rounded-md border bg-background pl-10 pr-4 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        />
+      </div>
+
       {/* Tabs */}
       <Tabs value={currentTab} onValueChange={handleTabChange}>
         <TabsList>
           <TabsTrigger value="active" className="flex items-center gap-2">
             <Star className="h-4 w-4" />
-            Active ({activeWallets.length}/5)
+            Active ({allActiveWallets.length}/5)
           </TabsTrigger>
           <TabsTrigger value="watching" className="flex items-center gap-2">
             <Eye className="h-4 w-4" />
-            Watching ({benchWallets.length})
+            Watching ({allBenchWallets.length})
           </TabsTrigger>
           <TabsTrigger value="closed" className="flex items-center gap-2">
             <History className="h-4 w-4" />
@@ -479,14 +509,14 @@ export default function TradingPage() {
               ))}
 
               {/* Empty slots */}
-              {Array.from({ length: 5 - activeWallets.length }).map((_, i) => (
+              {!searchLower && Array.from({ length: 5 - allActiveWallets.length }).map((_, i) => (
                 <Card key={`empty-${i}`} className="border-dashed">
                   <CardContent className="p-6 flex flex-col items-center justify-center min-h-[200px] text-center">
                     <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
                       <Plus className="h-6 w-6 text-muted-foreground" />
                     </div>
                     <p className="font-medium text-muted-foreground mb-2">
-                      Slot {activeWallets.length + i + 1} Available
+                      Slot {allActiveWallets.length + i + 1} Available
                     </p>
                     <p className="text-sm text-muted-foreground mb-4">
                       Add a wallet from Watching to start copying
@@ -664,5 +694,6 @@ export default function TradingPage() {
         </TabsContent>
       </Tabs>
     </div>
+    </ErrorBoundary>
   );
 }

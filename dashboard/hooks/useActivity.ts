@@ -7,6 +7,21 @@ import { useToastStore } from '@/stores/toast-store';
 import { api } from '@/lib/api';
 import type { Activity, ActivityType, WebSocketMessage, SignalUpdate } from '@/types/api';
 
+const SEEN_IDS_MAX = 1000;
+const SEEN_IDS_TRIM_TO = 500;
+
+function isSignalUpdate(data: unknown): data is SignalUpdate {
+  if (typeof data !== 'object' || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.signal_id === 'string' &&
+    typeof d.signal_type === 'string' &&
+    typeof d.market_id === 'string' &&
+    typeof d.action === 'string' &&
+    typeof d.timestamp === 'string'
+  );
+}
+
 interface UseActivityReturn {
   activities: Activity[];
   status: ConnectionStatus;
@@ -136,12 +151,19 @@ export function useActivity(): UseActivityReturn {
   // Handle WebSocket messages (signals)
   const handleMessage = useCallback((message: WebSocketMessage) => {
     if (message.type !== 'Signal') return;
+    if (!isSignalUpdate(message.data)) return;
 
-    const activity = signalToActivity(message.data as SignalUpdate);
+    const activity = signalToActivity(message.data);
 
     // Deduplicate against REST-loaded activities
     if (seenIds.current.has(activity.id)) return;
     seenIds.current.add(activity.id);
+
+    // Cap seenIds to prevent unbounded growth
+    if (seenIds.current.size > SEEN_IDS_MAX) {
+      const entries = Array.from(seenIds.current);
+      seenIds.current = new Set(entries.slice(entries.length - SEEN_IDS_TRIM_TO));
+    }
 
     setActivities((prev) => [activity, ...prev].slice(0, 50));
     setUnreadCount((prev) => prev + 1);

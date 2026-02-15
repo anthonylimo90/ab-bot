@@ -54,7 +54,11 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
           // Sync demo positions for current workspace
           const demoStore = useDemoPortfolioStore.getState();
           demoStore.setWorkspaceId(workspace.id);
-          demoStore.fetchAll();
+          try {
+            await demoStore.fetchAll();
+          } catch (e) {
+            console.warn('Failed to sync demo positions:', e);
+          }
         } catch (err) {
           // If 404, user has no workspace set
           if (err instanceof Error && err.message.includes('No workspace set')) {
@@ -79,7 +83,11 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
           // Sync demo positions for new workspace
           const demoStore = useDemoPortfolioStore.getState();
           demoStore.setWorkspaceId(workspaceId);
-          demoStore.fetchAll();
+          try {
+            await demoStore.fetchAll();
+          } catch (e) {
+            console.warn('Failed to sync demo positions:', e);
+          }
         } catch (err) {
           set({
             error: err instanceof Error ? err.message : 'Failed to switch workspace',

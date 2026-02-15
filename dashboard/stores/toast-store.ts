@@ -12,6 +12,12 @@ interface ToastStore {
   info: (title: string, description?: string) => void;
 }
 
+const DURATION_BY_TYPE: Record<string, number> = {
+  success: 5000,
+  info: 6000,
+  warning: 8000,
+  error: 10000,
+};
 const DEFAULT_DURATION = 5000;
 
 export const useToastStore = create<ToastStore>((set, get) => ({
@@ -22,7 +28,7 @@ export const useToastStore = create<ToastStore>((set, get) => ({
     const newToast: Toast = {
       ...toast,
       id,
-      duration: toast.duration ?? DEFAULT_DURATION,
+      duration: toast.duration ?? DURATION_BY_TYPE[toast.type] ?? DEFAULT_DURATION,
     };
 
     set((state) => ({
