@@ -342,7 +342,8 @@ pub async fn create_demo_position(
     let mut tx = state.pool.begin().await?;
 
     // Ensure balance row exists, then lock it for atomic debit.
-    let budget = get_workspace_budget(&state.pool, workspace_id).await
+    let budget = get_workspace_budget(&state.pool, workspace_id)
+        .await
         .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
     sqlx::query(
         r#"
@@ -493,7 +494,8 @@ pub async fn update_demo_position(
             .unwrap_or((exit_price - entry_price) * quantity);
         let exit_value = quantity * exit_price;
 
-        let budget = get_workspace_budget(&state.pool, workspace_id).await
+        let budget = get_workspace_budget(&state.pool, workspace_id)
+            .await
             .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
         sqlx::query(
             r#"
@@ -694,7 +696,8 @@ pub async fn get_demo_balance(
         None => {
             // Create default balance from workspace's configured budget
             let now = Utc::now();
-            let default_balance = get_workspace_budget(&state.pool, workspace_id).await
+            let default_balance = get_workspace_budget(&state.pool, workspace_id)
+                .await
                 .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
             sqlx::query(
                 "INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at) VALUES ($1, $2, $2, $3)",
@@ -756,7 +759,8 @@ pub async fn update_demo_balance(
     let now = Utc::now();
 
     // Upsert balance
-    let budget = get_workspace_budget(&state.pool, workspace_id).await
+    let budget = get_workspace_budget(&state.pool, workspace_id)
+        .await
         .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
     let row: DemoBalanceRow = sqlx::query_as(
         r#"
@@ -811,7 +815,8 @@ pub async fn reset_demo_portfolio(
     }
 
     let now = Utc::now();
-    let default_balance = get_workspace_budget(&state.pool, workspace_id).await
+    let default_balance = get_workspace_budget(&state.pool, workspace_id)
+        .await
         .map_err(|e| ApiError::Internal(format!("Failed to get workspace budget: {e}")))?;
     let mut tx = state.pool.begin().await?;
 
