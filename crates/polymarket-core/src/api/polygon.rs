@@ -3,8 +3,11 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
-/// USDC contract on Polygon (PoS bridged, 6 decimals) — used by Polymarket.
+/// USDC.e contract on Polygon (PoS bridged, 6 decimals) — used by Polymarket.
 const POLYGON_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+/// Native USDC contract on Polygon (CCTP, 6 decimals) — NOT used by Polymarket.
+const POLYGON_NATIVE_USDC_ADDRESS: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 
 /// Polygon RPC client for querying blockchain data.
 #[derive(Clone)]
@@ -97,14 +100,26 @@ impl PolygonClient {
         Ok(response.result.map(|r| r.transfers).unwrap_or_default())
     }
 
-    /// Get the USDC balance for a wallet address (returns human-readable amount).
+    /// Get the USDC.e (PoS bridged) balance for a wallet — the token Polymarket uses.
     pub async fn get_usdc_balance(&self, wallet_address: &str) -> Result<f64> {
+        self.get_erc20_balance(wallet_address, POLYGON_USDC_ADDRESS)
+            .await
+    }
+
+    /// Get the native USDC (CCTP) balance for a wallet — NOT used by Polymarket.
+    pub async fn get_native_usdc_balance(&self, wallet_address: &str) -> Result<f64> {
+        self.get_erc20_balance(wallet_address, POLYGON_NATIVE_USDC_ADDRESS)
+            .await
+    }
+
+    /// Get a 6-decimal ERC-20 balance for a wallet address (returns human-readable amount).
+    async fn get_erc20_balance(&self, wallet_address: &str, token_address: &str) -> Result<f64> {
         // balanceOf(address) selector = 0x70a08231 + 32-byte left-padded address
         let addr = wallet_address.trim_start_matches("0x");
         let data = format!("0x70a08231{:0>64}", addr);
 
         let params = serde_json::json!([
-            { "to": POLYGON_USDC_ADDRESS, "data": data },
+            { "to": token_address, "data": data },
             "latest"
         ]);
 

@@ -695,6 +695,17 @@ pub struct PostOrderRequest {
     pub post_only: Option<bool>,
 }
 
+/// Response from the balance-allowance endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BalanceAllowanceResponse {
+    /// Balance in base units (as string).
+    #[serde(default)]
+    pub balance: String,
+    /// Allowance in base units (as string).
+    #[serde(default)]
+    pub allowance: String,
+}
+
 /// Response from posting an order.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PostOrderResponse {
@@ -969,6 +980,58 @@ impl AuthenticatedClobClient {
         Ok(fee)
     }
 
+    /// Query the CLOB's view of balance and allowance for the authenticated user.
+    ///
+    /// This checks what the CLOB server sees (on-chain) for the maker address.
+    /// Useful for diagnosing "not enough balance / allowance" errors.
+    pub async fn get_balance_allowance(
+        &self,
+        token_id: Option<&str>,
+        asset_type: &str,
+    ) -> Result<BalanceAllowanceResponse> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set".to_string(),
+        })?;
+
+        let mut url = format!(
+            "{}/balance-allowance?asset_type={}&signature_type=0",
+            self.client.base_url, asset_type
+        );
+        if let Some(tid) = token_id {
+            url.push_str(&format!("&token_id={}", tid));
+        }
+
+        let timestamp = current_timestamp().to_string();
+        let method = "GET";
+        // L2 HMAC signs only the path (no query string) per the official SDK
+        let path = "/balance-allowance";
+        let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
+
+        let response = self
+            .client
+            .http_client
+            .get(&url)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to get balance-allowance: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        let result: BalanceAllowanceResponse = response.json().await?;
+        Ok(result)
+    }
+
     /// Create and sign an order.
     ///
     /// For GTC/FOK orders, expiration is forced to 0 per the CLOB API contract.
@@ -981,6 +1044,21 @@ impl AuthenticatedClobClient {
         size: Decimal,
         order_type: OrderType,
     ) -> Result<SignedOrder> {
+        // Diagnostic: check CLOB's view of our balance before placing order
+        match self.get_balance_allowance(None, "COLLATERAL").await {
+            Ok(ba) => {
+                info!(
+                    balance = %ba.balance,
+                    allowance = %ba.allowance,
+                    maker = %self.address(),
+                    "CLOB USDC balance/allowance check"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to check CLOB balance/allowance (continuing)");
+            }
+        }
+
         // Determine which exchange contract to use for signing
         let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
         let signer = if neg_risk {
@@ -991,6 +1069,17 @@ impl AuthenticatedClobClient {
 
         // Fetch the market's required fee rate
         let fee_rate = self.get_fee_rate_bps(token_id).await.unwrap_or(0);
+
+        info!(
+            token_id = token_id,
+            side = ?side,
+            price = %price,
+            size = %size,
+            fee_rate_bps = fee_rate,
+            neg_risk = neg_risk,
+            order_type = ?order_type,
+            "Building order"
+        );
 
         let mut builder = signer
             .order_builder()
@@ -1009,6 +1098,13 @@ impl AuthenticatedClobClient {
         let order = builder.build().ok_or_else(|| Error::Order {
             message: "Failed to build order - missing required fields".to_string(),
         })?;
+
+        info!(
+            maker_amount = %order.maker_amount,
+            taker_amount = %order.taker_amount,
+            salt = %order.salt,
+            "Order built with amounts"
+        );
 
         let signed = signer
             .sign_order(&order)
@@ -1122,15 +1218,16 @@ impl AuthenticatedClobClient {
             message: "API credentials not set - call derive_api_key() first".to_string(),
         })?;
 
-        let path = match market {
-            Some(m) => format!("/orders?market={}", m),
-            None => "/orders".to_string(),
+        let url = match market {
+            Some(m) => format!("{}/orders?market={}", self.client.base_url, m),
+            None => format!("{}/orders", self.client.base_url),
         };
-        let url = format!("{}{}", self.client.base_url, path);
         let timestamp = current_timestamp().to_string();
         let method = "GET";
+        // L2 HMAC signs only the path (no query string) per the official SDK
+        let path = "/orders";
 
-        let signature = sign_l2_request(credentials, method, &path, &timestamp, None)?;
+        let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
 
         let response = self
             .client

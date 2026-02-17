@@ -1,0 +1,55 @@
+# ==============================================================================
+# Runtime-only Dockerfile - Uses pre-built binaries from local build
+# ==============================================================================
+# Usage:
+#   1. cargo build --release --workspace
+#   2. docker build -f Dockerfile.runtime -t ab-bot-api-server:latest .
+# ==============================================================================
+
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libpq5 \
+    curl \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -u 1000 -s /bin/bash appuser
+
+WORKDIR /app
+
+# Copy pre-built binaries from local target/release
+COPY target/release/api-server /app/api-server
+COPY target/release/arb-monitor /app/arb-monitor
+COPY target/release/bot-scanner /app/bot-scanner
+
+# Copy migrations
+COPY migrations /app/migrations
+
+# Create entrypoint script
+RUN echo '#!/bin/bash\n\
+SERVICE=${SERVICE:-api-server}\n\
+echo "Starting service: $SERVICE"\n\
+exec ./$SERVICE' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+# Set ownership
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+# Default environment variables
+ENV RUST_LOG=info
+ENV API_HOST=0.0.0.0
+ENV API_PORT=3000
+ENV SERVICE=api-server
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:3000/health || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]
