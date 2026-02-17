@@ -539,7 +539,7 @@ pub async fn submit_order(
     };
 
     let signed_order = SignedOrder {
-        salt: pending_order.salt.clone(),
+        salt: pending_order.salt.parse::<u64>().unwrap_or(0),
         maker: pending_order.maker_address.clone(),
         signer: pending_order.maker_address.clone(),
         taker: "0x0000000000000000000000000000000000000000".to_string(),

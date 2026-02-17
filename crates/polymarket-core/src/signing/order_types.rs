@@ -98,14 +98,16 @@ impl OrderData {
 }
 
 /// Generate a random salt for order uniqueness.
+/// Masked to 2^53-1 (IEEE 754 safe integer range) as required by the CLOB API.
 fn rand_salt() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    // Mix timestamp with process id for uniqueness, truncate to u64
-    (nanos ^ ((std::process::id() as u128) << 32)) as u64
+    // Mix timestamp with process id, then mask to IEEE 754 safe integer range
+    let raw = (nanos ^ ((std::process::id() as u128) << 32)) as u64;
+    raw & ((1u64 << 53) - 1)
 }
 
 /// A signed order ready for submission.
