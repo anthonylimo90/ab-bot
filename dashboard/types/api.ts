@@ -1,6 +1,6 @@
 // Auth types
 // Platform-level roles (distinct from WorkspaceRole which controls per-workspace access)
-export type UserRole = 'Viewer' | 'Trader' | 'PlatformAdmin';
+export type UserRole = "Viewer" | "Trader" | "PlatformAdmin";
 
 export interface User {
   id: string;
@@ -54,9 +54,9 @@ export interface UpdateUserRequest {
 }
 
 // Position types
-export type PositionSide = 'long' | 'short';
-export type PositionOutcome = 'yes' | 'no';
-export type PositionStatus = 'open' | 'closed' | 'all';
+export type PositionSide = "long" | "short";
+export type PositionOutcome = "yes" | "no";
+export type PositionStatus = "open" | "closed" | "all";
 
 export interface Position {
   id: string;
@@ -72,6 +72,7 @@ export interface Position {
   take_profit?: number;
   is_copy_trade: boolean;
   source_wallet?: string;
+  realized_pnl?: number;
   opened_at: string;
   updated_at: string;
 }
@@ -147,14 +148,25 @@ export interface Wallet extends TrackedWallet {
   prediction?: {
     success_probability: number;
     confidence: number;
-    category: 'HIGH_POTENTIAL' | 'MODERATE' | 'LOW_POTENTIAL' | 'INSUFFICIENT_DATA';
+    category:
+      | "HIGH_POTENTIAL"
+      | "MODERATE"
+      | "LOW_POTENTIAL"
+      | "INSUFFICIENT_DATA";
   };
 }
 
 // Order types
-export type OrderSide = 'Buy' | 'Sell';
-export type OrderType = 'Market' | 'Limit' | 'StopLoss' | 'TakeProfit';
-export type OrderStatus = 'Pending' | 'Open' | 'PartiallyFilled' | 'Filled' | 'Cancelled' | 'Rejected' | 'Expired';
+export type OrderSide = "Buy" | "Sell";
+export type OrderType = "Market" | "Limit" | "StopLoss" | "TakeProfit";
+export type OrderStatus =
+  | "Pending"
+  | "Open"
+  | "PartiallyFilled"
+  | "Filled"
+  | "Cancelled"
+  | "Rejected"
+  | "Expired";
 
 export interface PlaceOrderRequest {
   market_id: string;
@@ -189,12 +201,16 @@ export interface Order {
 }
 
 // Backtest types
-export type StrategyType = 'arbitrage' | 'momentum' | 'mean_reversion' | 'copy_trading';
+export type StrategyType =
+  | "arbitrage"
+  | "momentum"
+  | "mean_reversion"
+  | "copy_trading";
 
 export type SlippageModel =
-  | { type: 'none' }
-  | { type: 'fixed'; pct: number }
-  | { type: 'volume_based'; base_pct: number; volume_factor: number };
+  | { type: "none" }
+  | { type: "fixed"; pct: number }
+  | { type: "volume_based"; base_pct: number; volume_factor: number };
 
 export interface StrategyConfig {
   type: StrategyType;
@@ -251,7 +267,7 @@ export interface BacktestResult {
   profit_factor: number;
   total_fees: number;
   created_at: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: "pending" | "running" | "completed" | "failed";
   error?: string;
   equity_curve?: EquityPoint[];
 }
@@ -278,11 +294,15 @@ export interface PortfolioHistory {
 }
 
 // Allocation types
-export type AllocationStrategy = 'EQUAL_WEIGHT' | 'PERFORMANCE_WEIGHTED' | 'RISK_ADJUSTED' | 'CUSTOM';
+export type AllocationStrategy =
+  | "EQUAL_WEIGHT"
+  | "PERFORMANCE_WEIGHTED"
+  | "RISK_ADJUSTED"
+  | "CUSTOM";
 
 export interface StrategyAllocation {
   strategy_id: string;
-  strategy_type: 'WALLET' | 'ARBITRAGE';
+  strategy_type: "WALLET" | "ARBITRAGE";
   wallet_address?: string;
   allocation_percent: number;
   allocation_amount: number;
@@ -300,20 +320,20 @@ export interface AllocationConfig {
 
 // Activity types
 export type ActivityType =
-  | 'TRADE_COPIED'
-  | 'TRADE_COPY_SKIPPED'
-  | 'TRADE_COPY_FAILED'
-  | 'POSITION_OPENED'
-  | 'POSITION_CLOSED'
-  | 'STOP_LOSS_TRIGGERED'
-  | 'TAKE_PROFIT_TRIGGERED'
-  | 'ARBITRAGE_DETECTED'
-  | 'ARB_POSITION_OPENED'
-  | 'ARB_POSITION_CLOSED'
-  | 'ARB_EXECUTION_FAILED'
-  | 'ARB_EXIT_FAILED'
-  | 'RECOMMENDATION_NEW'
-  | 'ALLOCATION_ACTIVATED';
+  | "TRADE_COPIED"
+  | "TRADE_COPY_SKIPPED"
+  | "TRADE_COPY_FAILED"
+  | "POSITION_OPENED"
+  | "POSITION_CLOSED"
+  | "STOP_LOSS_TRIGGERED"
+  | "TAKE_PROFIT_TRIGGERED"
+  | "ARBITRAGE_DETECTED"
+  | "ARB_POSITION_OPENED"
+  | "ARB_POSITION_CLOSED"
+  | "ARB_EXECUTION_FAILED"
+  | "ARB_EXIT_FAILED"
+  | "RECOMMENDATION_NEW"
+  | "ALLOCATION_ACTIVATED";
 
 export interface Activity {
   id: string;
@@ -327,21 +347,21 @@ export interface Activity {
 // Recommendation types
 export interface Recommendation {
   id: string;
-  type: 'COPY_WALLET' | 'ARBITRAGE' | 'POSITION_EXIT';
+  type: "COPY_WALLET" | "ARBITRAGE" | "POSITION_EXIT";
   confidence: number;
   wallet?: Wallet;
   expected_return?: number;
-  risk_level: 'LOW' | 'MEDIUM' | 'HIGH';
+  risk_level: "LOW" | "MEDIUM" | "HIGH";
   reason: string;
   created_at: string;
   expires_at?: string;
 }
 
 // Trade classification types (Event vs Arb)
-export type TradeClassification = 'event' | 'arbitrage' | 'mixed';
-export type TradingStyle = 'event_trader' | 'arb_trader' | 'mixed';
-export type CopyBehavior = 'copy_all' | 'events_only' | 'arb_threshold';
-export type WalletTier = 'active' | 'bench' | 'untracked';
+export type TradeClassification = "event" | "arbitrage" | "mixed";
+export type TradingStyle = "event_trader" | "arb_trader" | "mixed";
+export type CopyBehavior = "copy_all" | "events_only" | "arb_threshold";
+export type WalletTier = "active" | "bench" | "untracked";
 
 // Copy settings for a wallet
 export interface CopySettings {
@@ -354,7 +374,7 @@ export interface CopySettings {
 // Decision Brief for wallet strategy profiling
 export interface DecisionBrief {
   trading_style: TradingStyle;
-  slippage_tolerance: 'tight' | 'moderate' | 'loose';
+  slippage_tolerance: "tight" | "moderate" | "loose";
   preferred_categories: string[];
   typical_hold_time: string;
   event_trade_ratio: number;
@@ -416,8 +436,17 @@ export interface PaginatedResponse<T> {
 }
 
 // WebSocket types
-export type PositionUpdateType = 'Opened' | 'Updated' | 'Closed' | 'PriceChanged';
-export type SignalType = 'Arbitrage' | 'CopyTrade' | 'StopLoss' | 'TakeProfit' | 'Alert';
+export type PositionUpdateType =
+  | "Opened"
+  | "Updated"
+  | "Closed"
+  | "PriceChanged";
+export type SignalType =
+  | "Arbitrage"
+  | "CopyTrade"
+  | "StopLoss"
+  | "TakeProfit"
+  | "Alert";
 
 export interface OrderbookUpdate {
   market_id: string;
@@ -451,17 +480,21 @@ export interface SignalUpdate {
 }
 
 export type WebSocketMessage =
-  | { type: 'Orderbook'; data: OrderbookUpdate }
-  | { type: 'Position'; data: PositionUpdate }
-  | { type: 'Signal'; data: SignalUpdate }
-  | { type: 'Subscribed'; channel: string }
-  | { type: 'Unsubscribed'; channel: string }
-  | { type: 'Error'; code: string; message: string }
-  | { type: 'Ping' }
-  | { type: 'Pong' };
+  | { type: "Orderbook"; data: OrderbookUpdate }
+  | { type: "Position"; data: PositionUpdate }
+  | { type: "Signal"; data: SignalUpdate }
+  | { type: "Subscribed"; channel: string }
+  | { type: "Unsubscribed"; channel: string }
+  | { type: "Error"; code: string; message: string }
+  | { type: "Ping" }
+  | { type: "Pong" };
 
 // Discovery/Live trades types
-export type PredictionCategory = 'HIGH_POTENTIAL' | 'MODERATE' | 'LOW_POTENTIAL' | 'INSUFFICIENT_DATA';
+export type PredictionCategory =
+  | "HIGH_POTENTIAL"
+  | "MODERATE"
+  | "LOW_POTENTIAL"
+  | "INSUFFICIENT_DATA";
 
 export interface WalletTrade {
   transaction_hash: string;
@@ -484,7 +517,7 @@ export interface LiveTrade {
   market_id: string;
   market_question?: string;
   outcome: string;
-  direction: 'buy' | 'sell';
+  direction: "buy" | "sell";
   price: number;
   quantity: number;
   value: number;
@@ -524,8 +557,8 @@ export interface DemoPnlSimulation {
 }
 
 // Workspace types
-export type SetupMode = 'manual' | 'automatic';
-export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
+export type SetupMode = "manual" | "automatic";
+export type WorkspaceRole = "owner" | "admin" | "member" | "viewer";
 
 export interface Workspace {
   id: string;
@@ -593,7 +626,7 @@ export interface WorkspaceAllocation {
   wallet_address: string;
   allocation_pct: number;
   max_position_size?: number;
-  tier: 'active' | 'bench';
+  tier: "active" | "bench";
   auto_assigned: boolean;
   auto_assigned_reason?: string;
   backtest_roi?: number;
@@ -730,7 +763,7 @@ export interface AcceptInviteResponse {
 export interface AddAllocationRequest {
   allocation_pct?: number;
   max_position_size?: number;
-  tier?: 'active' | 'bench';
+  tier?: "active" | "bench";
   copy_behavior?: CopyBehavior;
   arb_threshold_pct?: number;
 }
@@ -816,7 +849,7 @@ export interface DemoPosition {
   wallet_label?: string;
   market_id: string;
   market_question?: string;
-  outcome: 'yes' | 'no';
+  outcome: "yes" | "no";
   quantity: number;
   entry_price: number;
   current_price?: number;
@@ -833,7 +866,7 @@ export interface CreateDemoPositionRequest {
   wallet_label?: string;
   market_id: string;
   market_question?: string;
-  outcome: 'yes' | 'no';
+  outcome: "yes" | "no";
   quantity: number;
   entry_price: number;
   current_price?: number;
@@ -898,7 +931,7 @@ export interface OrderSummary {
 
 export interface PrepareOrderRequest {
   token_id: string;
-  side: 'BUY' | 'SELL';
+  side: "BUY" | "SELL";
   price: number;
   size: number;
   maker_address: string;

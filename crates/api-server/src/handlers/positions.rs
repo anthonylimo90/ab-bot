@@ -46,6 +46,9 @@ pub struct PositionResponse {
     /// Source wallet (for copy trades).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_wallet: Option<String>,
+    /// Realized P&L (for closed positions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realized_pnl: Option<Decimal>,
     /// Position opened timestamp.
     pub opened_at: DateTime<Utc>,
     /// Last update timestamp.
@@ -105,6 +108,7 @@ struct PositionRow {
     take_profit: Option<Decimal>,
     is_copy_trade: bool,
     source_wallet: Option<String>,
+    realized_pnl: Option<Decimal>,
     opened_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     is_open: bool,
@@ -135,7 +139,8 @@ pub async fn list_positions(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
-               is_copy_trade, source_wallet, opened_at, updated_at, is_open
+               is_copy_trade, source_wallet, realized_pnl,
+               opened_at, updated_at, is_open
         FROM positions
         WHERE ($1::text IS NULL OR market_id = $1)
           AND ($2::text IS NULL OR outcome = $2)
@@ -180,6 +185,7 @@ pub async fn list_positions(
                 take_profit: row.take_profit,
                 is_copy_trade: row.is_copy_trade,
                 source_wallet: row.source_wallet,
+                realized_pnl: row.realized_pnl,
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
             }
@@ -210,7 +216,8 @@ pub async fn get_position(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
-               is_copy_trade, source_wallet, opened_at, updated_at, is_open
+               is_copy_trade, source_wallet, realized_pnl,
+               opened_at, updated_at, is_open
         FROM positions
         WHERE id = $1
         "#,
@@ -244,6 +251,7 @@ pub async fn get_position(
                 take_profit: row.take_profit,
                 is_copy_trade: row.is_copy_trade,
                 source_wallet: row.source_wallet,
+                realized_pnl: row.realized_pnl,
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
             }))
@@ -280,7 +288,8 @@ pub async fn close_position(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
-               is_copy_trade, source_wallet, opened_at, updated_at, is_open
+               is_copy_trade, source_wallet, realized_pnl,
+               opened_at, updated_at, is_open
         FROM positions
         WHERE id = $1 AND is_open = true
         "#,
@@ -364,6 +373,7 @@ pub async fn close_position(
         take_profit: row.take_profit,
         is_copy_trade: row.is_copy_trade,
         source_wallet: row.source_wallet,
+        realized_pnl: row.realized_pnl,
         opened_at: row.opened_at,
         updated_at: Utc::now(),
     }))
@@ -389,6 +399,7 @@ mod tests {
             take_profit: None,
             is_copy_trade: false,
             source_wallet: None,
+            realized_pnl: None,
             opened_at: Utc::now(),
             updated_at: Utc::now(),
         };

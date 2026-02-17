@@ -1,19 +1,19 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useMemo } from 'react';
-import Link from 'next/link';
-import { usePortfolioStats } from '@/hooks/usePortfolioStats';
-import { useActivity } from '@/hooks/useActivity';
-import { useWorkspaceStore } from '@/stores/workspace-store';
-import { useModeStore } from '@/stores/mode-store';
-import { useDemoPortfolioStore } from '@/stores/demo-portfolio-store';
-import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
-import { MetricCard } from '@/components/shared/MetricCard';
-import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
-import { LiveIndicator } from '@/components/shared/LiveIndicator';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
+import { useState, useEffect, useMemo } from "react";
+import Link from "next/link";
+import { usePortfolioStats } from "@/hooks/usePortfolioStats";
+import { useActivity } from "@/hooks/useActivity";
+import { useWorkspaceStore } from "@/stores/workspace-store";
+import { useModeStore } from "@/stores/mode-store";
+import { useDemoPortfolioStore } from "@/stores/demo-portfolio-store";
+import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
+import { MetricCard } from "@/components/shared/MetricCard";
+import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
+import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import {
   Activity,
   ArrowRight,
@@ -31,11 +31,11 @@ import {
   Target,
   Settings2,
   Star,
-} from 'lucide-react';
-import { formatCurrency, formatTimeAgo } from '@/lib/utils';
-import { cn } from '@/lib/utils';
+} from "lucide-react";
+import { formatCurrency, formatTimeAgo } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 
-type Period = '1D' | '7D' | '30D' | 'ALL';
+type Period = "1D" | "7D" | "30D" | "ALL";
 
 const activityIcons: Record<string, React.ReactNode> = {
   TRADE_COPIED: <Copy className="h-4 w-4 text-blue-500" />,
@@ -53,15 +53,18 @@ const activityIcons: Record<string, React.ReactNode> = {
 };
 
 export function DashboardHome() {
-  const [selectedPeriod, setSelectedPeriod] = useState<Period>('30D');
+  const [selectedPeriod, setSelectedPeriod] = useState<Period>("30D");
   const { currentWorkspace } = useWorkspaceStore();
   const { mode } = useModeStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
-  const activeWallets = allocations.filter((a) => a.tier === 'active');
+  const { data: allocations = [] } = useAllocationsQuery(
+    currentWorkspace?.id,
+    mode,
+  );
+  const activeWallets = allocations.filter((a) => a.tier === "active");
   const { stats, status: portfolioStatus } = usePortfolioStats(selectedPeriod);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
-  const isDemo = mode === 'demo';
+  const isDemo = mode === "demo";
   const {
     positions: demoPositions,
     closedPositions: demoClosedPositions,
@@ -78,16 +81,21 @@ export function DashboardHome() {
   const displayStats = useMemo(() => {
     if (!isDemo) return stats;
     const closedCount = demoClosedPositions.length;
-    const winCount = demoClosedPositions.filter((p) => (p.realizedPnl || 0) > 0).length;
-    const realizedPnl = demoClosedPositions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0);
+    const winCount = demoClosedPositions.filter(
+      (p) => (p.realizedPnl || 0) > 0,
+    ).length;
+    const realizedPnl = demoClosedPositions.reduce(
+      (sum, p) => sum + (p.realizedPnl || 0),
+      0,
+    );
     const totalPnl = getTotalPnl();
     return {
       ...stats,
       total_value: getTotalValue(),
       total_pnl: totalPnl,
       total_pnl_percent: getTotalPnlPercent(),
-      today_pnl: totalPnl,
-      today_pnl_percent: getTotalPnlPercent(),
+      today_pnl: 0, // Today's PnL not tracked separately yet
+      today_pnl_percent: 0,
       unrealized_pnl: totalPnl - realizedPnl,
       realized_pnl: realizedPnl,
       win_rate: closedCount > 0 ? (winCount / closedCount) * 100 : 0,
@@ -95,10 +103,18 @@ export function DashboardHome() {
       winning_trades: winCount,
       active_positions: demoPositions.length,
     };
-  }, [isDemo, stats, demoPositions, demoClosedPositions, getTotalValue, getTotalPnl, getTotalPnlPercent]);
+  }, [
+    isDemo,
+    stats,
+    demoPositions,
+    demoClosedPositions,
+    getTotalValue,
+    getTotalPnl,
+    getTotalPnlPercent,
+  ]);
 
-  const isAutomatic = currentWorkspace?.setup_mode === 'automatic';
-  const modeLabel = isAutomatic ? 'Guided' : 'Custom';
+  const isAutomatic = currentWorkspace?.setup_mode === "automatic";
+  const modeLabel = isAutomatic ? "Guided" : "Custom";
   const ModeIcon = isAutomatic ? Target : Settings2;
 
   return (
@@ -127,24 +143,28 @@ export function DashboardHome() {
           title="Portfolio Value"
           value={formatCurrency(displayStats.total_value)}
           change={displayStats.total_pnl_percent}
-          trend={displayStats.total_pnl_percent >= 0 ? 'up' : 'down'}
+          trend={displayStats.total_pnl_percent >= 0 ? "up" : "down"}
         />
         <MetricCard
           title="Today's P&L"
           value={formatCurrency(displayStats.today_pnl, { showSign: true })}
           change={displayStats.today_pnl_percent}
-          trend={displayStats.today_pnl >= 0 ? 'up' : 'down'}
+          trend={displayStats.today_pnl >= 0 ? "up" : "down"}
         />
         <MetricCard
           title="Active Wallets"
           value={`${activeWallets.length}/5`}
-          changeLabel={activeWallets.length < 5 ? `${5 - activeWallets.length} slots available` : 'Roster full'}
+          changeLabel={
+            activeWallets.length < 5
+              ? `${5 - activeWallets.length} slots available`
+              : "Roster full"
+          }
           trend="neutral"
         />
         <MetricCard
           title="Open Positions"
           value={displayStats.active_positions.toString()}
-          changeLabel={`Win rate: ${displayStats.win_rate}%`}
+          changeLabel={`Win rate: ${(displayStats.win_rate || 0).toFixed(0)}%`}
           trend="neutral"
         />
       </div>
@@ -174,19 +194,22 @@ export function DashboardHome() {
             <div className="space-y-4 max-h-[350px] overflow-y-auto">
               {activities.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">
-                  No recent activity yet. Activity will appear here when wallets make trades.
+                  No recent activity yet. Activity will appear here when wallets
+                  make trades.
                 </p>
               ) : (
                 activities.slice(0, 8).map((item, index) => (
                   <div
                     key={item.id}
                     className={cn(
-                      'flex items-start gap-3',
-                      index === 0 && 'animate-slide-in'
+                      "flex items-start gap-3",
+                      index === 0 && "animate-slide-in",
                     )}
                   >
                     <div className="mt-1">
-                      {activityIcons[item.type] || <Activity className="h-4 w-4" />}
+                      {activityIcons[item.type] || (
+                        <Activity className="h-4 w-4" />
+                      )}
                     </div>
                     <div className="flex-1 space-y-1">
                       <p className="text-sm">{item.message}</p>
@@ -197,11 +220,11 @@ export function DashboardHome() {
                     {item.pnl !== undefined && (
                       <span
                         className={cn(
-                          'text-sm font-medium tabular-nums',
-                          item.pnl >= 0 ? 'text-profit' : 'text-loss'
+                          "text-sm font-medium tabular-nums",
+                          item.pnl >= 0 ? "text-profit" : "text-loss",
                         )}
                       >
-                        {item.pnl >= 0 ? '+' : ''}
+                        {item.pnl >= 0 ? "+" : ""}
                         {formatCurrency(item.pnl)}
                       </span>
                     )}
@@ -224,7 +247,10 @@ export function DashboardHome() {
 
             <div className="grid gap-3">
               <Link href="/discover">
-                <Button variant="outline" className="w-full justify-start h-auto py-3">
+                <Button
+                  variant="outline"
+                  className="w-full justify-start h-auto py-3"
+                >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-500/10">
                       <Search className="h-5 w-5 text-blue-500" />
@@ -240,7 +266,10 @@ export function DashboardHome() {
               </Link>
 
               <Link href="/portfolio">
-                <Button variant="outline" className="w-full justify-start h-auto py-3">
+                <Button
+                  variant="outline"
+                  className="w-full justify-start h-auto py-3"
+                >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-green-500/10">
                       <PieChart className="h-5 w-5 text-green-500" />
@@ -248,7 +277,8 @@ export function DashboardHome() {
                     <div className="text-left">
                       <p className="font-medium">View Positions</p>
                       <p className="text-xs text-muted-foreground">
-                        {displayStats.active_positions} open position{displayStats.active_positions !== 1 ? 's' : ''}
+                        {displayStats.active_positions} open position
+                        {displayStats.active_positions !== 1 ? "s" : ""}
                       </p>
                     </div>
                   </div>
@@ -256,7 +286,10 @@ export function DashboardHome() {
               </Link>
 
               <Link href="/backtest">
-                <Button variant="outline" className="w-full justify-start h-auto py-3">
+                <Button
+                  variant="outline"
+                  className="w-full justify-start h-auto py-3"
+                >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-purple-500/10">
                       <TrendingUp className="h-5 w-5 text-purple-500" />
@@ -272,7 +305,10 @@ export function DashboardHome() {
               </Link>
 
               <Link href="/roster">
-                <Button variant="outline" className="w-full justify-start h-auto py-3">
+                <Button
+                  variant="outline"
+                  className="w-full justify-start h-auto py-3"
+                >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-yellow-500/10">
                       <Star className="h-5 w-5 text-yellow-500" />

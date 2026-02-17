@@ -1,24 +1,32 @@
-'use client';
+"use client";
 
-import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams, useRouter } from 'next/navigation';
-import Link from 'next/link';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Skeleton } from '@/components/ui/skeleton';
-import { PortfolioSummary, WalletCard, ManualPositions, AutomationPanel } from '@/components/trading';
-import { AllocationAdjustmentPanel } from '@/components/allocations/AllocationAdjustmentPanel';
-import { ErrorBoundary } from '@/components/shared/ErrorBoundary';
-import { useDemoPortfolioStore, DemoPosition } from '@/stores/demo-portfolio-store';
-import { useModeStore } from '@/stores/mode-store';
-import { useToastStore } from '@/stores/toast-store';
-import { useWorkspaceStore } from '@/stores/workspace-store';
-import { usePortfolioStats } from '@/hooks/usePortfolioStats';
-import { usePositionsQuery } from '@/hooks/queries/usePositionsQuery';
-import { useWalletStore } from '@/stores/wallet-store';
-import { useWalletBalanceQuery } from '@/hooks/queries/useWalletsQuery';
-import type { Position } from '@/types/api';
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  PortfolioSummary,
+  WalletCard,
+  ManualPositions,
+  AutomationPanel,
+} from "@/components/trading";
+import { AllocationAdjustmentPanel } from "@/components/allocations/AllocationAdjustmentPanel";
+import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import {
+  useDemoPortfolioStore,
+  DemoPosition,
+} from "@/stores/demo-portfolio-store";
+import { useModeStore } from "@/stores/mode-store";
+import { useToastStore } from "@/stores/toast-store";
+import { useWorkspaceStore } from "@/stores/workspace-store";
+import { usePortfolioStats } from "@/hooks/usePortfolioStats";
+import { usePositionsQuery } from "@/hooks/queries/usePositionsQuery";
+import { useWalletStore } from "@/stores/wallet-store";
+import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
+import type { Position } from "@/types/api";
 import {
   useAllocationsQuery,
   usePromoteAllocationMutation,
@@ -26,8 +34,13 @@ import {
   useRemoveAllocationMutation,
   usePinAllocationMutation,
   useUnpinAllocationMutation,
-} from '@/hooks/queries/useAllocationsQuery';
-import { shortenAddress, formatCurrency, cn, ratioOrPercentToPercent } from '@/lib/utils';
+} from "@/hooks/queries/useAllocationsQuery";
+import {
+  shortenAddress,
+  formatCurrency,
+  cn,
+  ratioOrPercentToPercent,
+} from "@/lib/utils";
 import {
   TrendingUp,
   TrendingDown,
@@ -39,16 +52,16 @@ import {
   TestTube2,
   History,
   Bot,
-} from 'lucide-react';
-import { useDiscoverWalletsQuery } from '@/hooks/queries/useDiscoverQuery';
-import type { WorkspaceAllocation, DiscoveredWallet } from '@/types/api';
+} from "lucide-react";
+import { useDiscoverWalletsQuery } from "@/hooks/queries/useDiscoverQuery";
+import type { WorkspaceAllocation, DiscoveredWallet } from "@/types/api";
 
 // Position format expected by WalletCard
 interface WalletPosition {
   id: string;
   marketId: string;
   marketQuestion?: string;
-  outcome: 'yes' | 'no';
+  outcome: "yes" | "no";
   quantity: number;
   entryPrice: number;
   currentPrice: number;
@@ -59,9 +72,9 @@ interface WalletPosition {
 interface TradingWallet {
   address: string;
   label?: string;
-  tier: 'active' | 'bench';
+  tier: "active" | "bench";
   copySettings: {
-    copy_behavior: 'copy_all' | 'events_only' | 'arb_threshold';
+    copy_behavior: "copy_all" | "events_only" | "arb_threshold";
     allocation_pct: number;
     max_position_size: number;
     arb_threshold_pct?: number;
@@ -83,7 +96,10 @@ interface TradingWallet {
 // Convert demo position to wallet position format
 function toWalletPosition(p: DemoPosition): WalletPosition {
   const pnl = (p.currentPrice - p.entryPrice) * p.quantity;
-  const pnlPercent = ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100;
+  const pnlPercent =
+    p.entryPrice !== 0
+      ? ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100
+      : 0;
   return {
     id: p.id,
     marketId: p.marketId,
@@ -102,7 +118,7 @@ function livePositionToWalletPosition(p: Position): WalletPosition {
     id: p.id,
     marketId: p.market_id,
     marketQuestion: undefined,
-    outcome: p.outcome as 'yes' | 'no',
+    outcome: p.outcome as "yes" | "no",
     quantity: p.quantity,
     entryPrice: p.entry_price,
     currentPrice: p.current_price,
@@ -111,8 +127,12 @@ function livePositionToWalletPosition(p: Position): WalletPosition {
   };
 }
 
-function toTradingWallet(allocation: WorkspaceAllocation, discovered?: DiscoveredWallet): TradingWallet {
-  const hasBacktest = allocation.backtest_roi != null && allocation.backtest_roi !== 0;
+function toTradingWallet(
+  allocation: WorkspaceAllocation,
+  discovered?: DiscoveredWallet,
+): TradingWallet {
+  const hasBacktest =
+    allocation.backtest_roi != null && allocation.backtest_roi !== 0;
   return {
     address: allocation.wallet_address,
     label: allocation.wallet_label,
@@ -125,14 +145,20 @@ function toTradingWallet(allocation: WorkspaceAllocation, discovered?: Discovere
     },
     roi30d: hasBacktest
       ? ratioOrPercentToPercent(allocation.backtest_roi)
-      : (discovered ? Number(discovered.roi_30d) : 0),
-    sharpe: allocation.backtest_sharpe ?? (discovered ? Number(discovered.sharpe_ratio) : 0),
+      : discovered
+        ? Number(discovered.roi_30d)
+        : 0,
+    sharpe:
+      allocation.backtest_sharpe ??
+      (discovered ? Number(discovered.sharpe_ratio) : 0),
     winRate: hasBacktest
       ? ratioOrPercentToPercent(allocation.backtest_win_rate)
-      : (discovered ? Number(discovered.win_rate) : 0),
+      : discovered
+        ? Number(discovered.win_rate)
+        : 0,
     trades: discovered?.total_trades ?? 0,
     maxDrawdown: discovered ? Number(discovered.max_drawdown) : 0,
-    confidence: allocation.confidence_score ?? (discovered?.confidence ?? 0),
+    confidence: allocation.confidence_score ?? discovered?.confidence ?? 0,
     addedAt: allocation.added_at,
     pinned: allocation.pinned,
     pinnedAt: allocation.pinned_at,
@@ -146,22 +172,34 @@ export default function TradingPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const toast = useToastStore();
-  const [walletSearch, setWalletSearch] = useState('');
+  const [walletSearch, setWalletSearch] = useState("");
   const { currentWorkspace } = useWorkspaceStore();
   const { mode } = useModeStore();
-  const isDemo = mode === 'demo';
+  const isDemo = mode === "demo";
 
   // Get tab from URL, default to 'active'
-  const currentTab = searchParams.get('tab') || 'active';
+  const currentTab = searchParams.get("tab") || "active";
 
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
+  const { data: allocations = [] } = useAllocationsQuery(
+    currentWorkspace?.id,
+    mode,
+  );
   const { data: discoveredWallets = [] } = useDiscoverWalletsQuery(mode, {
     minTrades: 1,
     limit: 250,
   });
-  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id, mode);
-  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id, mode);
-  const removeMutation = useRemoveAllocationMutation(currentWorkspace?.id, mode);
+  const promoteMutation = usePromoteAllocationMutation(
+    currentWorkspace?.id,
+    mode,
+  );
+  const demoteMutation = useDemoteAllocationMutation(
+    currentWorkspace?.id,
+    mode,
+  );
+  const removeMutation = useRemoveAllocationMutation(
+    currentWorkspace?.id,
+    mode,
+  );
   const pinMutation = usePinAllocationMutation(currentWorkspace?.id, mode);
   const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id, mode);
 
@@ -174,25 +212,31 @@ export default function TradingPage() {
     return map;
   }, [discoveredWallets]);
 
-  const allActiveWallets = allocations.filter((a) => a.tier === 'active').map((a) =>
-    toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase()))
-  );
-  const allBenchWallets = allocations.filter((a) => a.tier === 'bench').map((a) =>
-    toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase()))
-  );
+  const allActiveWallets = allocations
+    .filter((a) => a.tier === "active")
+    .map((a) =>
+      toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase())),
+    );
+  const allBenchWallets = allocations
+    .filter((a) => a.tier === "bench")
+    .map((a) =>
+      toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase())),
+    );
 
   // Filter wallets by search query
   const searchLower = walletSearch.toLowerCase().trim();
   const activeWallets = searchLower
-    ? allActiveWallets.filter((w) =>
-        w.address.toLowerCase().includes(searchLower) ||
-        (w.label && w.label.toLowerCase().includes(searchLower))
+    ? allActiveWallets.filter(
+        (w) =>
+          w.address.toLowerCase().includes(searchLower) ||
+          (w.label && w.label.toLowerCase().includes(searchLower)),
       )
     : allActiveWallets;
   const benchWallets = searchLower
-    ? allBenchWallets.filter((w) =>
-        w.address.toLowerCase().includes(searchLower) ||
-        (w.label && w.label.toLowerCase().includes(searchLower))
+    ? allBenchWallets.filter(
+        (w) =>
+          w.address.toLowerCase().includes(searchLower) ||
+          (w.label && w.label.toLowerCase().includes(searchLower)),
       )
     : allBenchWallets;
   const isRosterFull = () => allActiveWallets.length >= 5;
@@ -209,11 +253,17 @@ export default function TradingPage() {
   } = useDemoPortfolioStore();
 
   // Live data hooks (no-ops in demo mode due to enabled: mode === 'live')
-  const { stats: liveStats } = usePortfolioStats('30D');
-  const { data: liveOpenPositions = [] } = usePositionsQuery(mode, { status: 'open' });
-  const { data: liveClosedPositions = [] } = usePositionsQuery(mode, { status: 'closed' });
+  const { stats: liveStats } = usePortfolioStats("30D");
+  const { data: liveOpenPositions = [] } = usePositionsQuery(mode, {
+    status: "open",
+  });
+  const { data: liveClosedPositions = [] } = usePositionsQuery(mode, {
+    status: "closed",
+  });
   const { primaryWallet } = useWalletStore();
-  const { data: walletBalance } = useWalletBalanceQuery(mode === 'live' ? primaryWallet : null);
+  const { data: walletBalance } = useWalletBalanceQuery(
+    mode === "live" ? primaryWallet : null,
+  );
 
   // Fetch positions on mount
   useEffect(() => {
@@ -227,13 +277,13 @@ export default function TradingPage() {
     const grouped: Record<string, WalletPosition[]> = {};
     if (isDemo) {
       demoPositions.forEach((p) => {
-        const wallet = p.walletAddress || 'manual';
+        const wallet = p.walletAddress || "manual";
         if (!grouped[wallet]) grouped[wallet] = [];
         grouped[wallet].push(toWalletPosition(p));
       });
     } else {
       liveOpenPositions.forEach((p) => {
-        const wallet = p.source_wallet || 'manual';
+        const wallet = p.source_wallet || "manual";
         if (!grouped[wallet]) grouped[wallet] = [];
         grouped[wallet].push(livePositionToWalletPosition(p));
       });
@@ -242,7 +292,7 @@ export default function TradingPage() {
   }, [isDemo, demoPositions, liveOpenPositions]);
 
   // Manual positions (no source wallet)
-  const manualPositions = positionsByWallet['manual'] || [];
+  const manualPositions = positionsByWallet["manual"] || [];
 
   // Get balance from store
   const { balance: demoBalance } = useDemoPortfolioStore();
@@ -250,17 +300,30 @@ export default function TradingPage() {
   // Calculate summary stats
   const totalValue = isDemo ? getTotalValue() : liveStats.total_value;
   const totalPnl = isDemo ? getTotalPnl() : liveStats.unrealized_pnl;
-  const positionCount = isDemo ? demoPositions.length : liveOpenPositions.length;
-  const closedCount = isDemo ? demoClosedPositions.length : liveClosedPositions.length;
+  const positionCount = isDemo
+    ? demoPositions.length
+    : liveOpenPositions.length;
+  const closedCount = isDemo
+    ? demoClosedPositions.length
+    : liveClosedPositions.length;
   const winCount = isDemo
     ? demoClosedPositions.filter((p) => (p.realizedPnl || 0) > 0).length
-    : liveStats.winning_trades;
+    : liveClosedPositions.filter(
+        (p) => (p.realized_pnl ?? p.unrealized_pnl) > 0,
+      ).length;
   const winRate = isDemo
-    ? (closedCount > 0 ? (winCount / closedCount) * 100 : 0)
-    : liveStats.win_rate;
+    ? closedCount > 0
+      ? (winCount / closedCount) * 100
+      : 0
+    : closedCount > 0
+      ? (winCount / closedCount) * 100
+      : 0;
   const realizedPnl = isDemo
     ? demoClosedPositions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0)
-    : liveStats.realized_pnl;
+    : liveClosedPositions.reduce(
+        (sum, p) => sum + (p.realized_pnl ?? p.unrealized_pnl),
+        0,
+      );
 
   // Handle tab change
   const handleTabChange = (value: string) => {
@@ -270,26 +333,33 @@ export default function TradingPage() {
   // Handle wallet actions
   const handlePromote = (address: string) => {
     if (isRosterFull()) {
-      toast.error('Roster Full', 'Demote a wallet from Active first');
+      toast.error("Roster Full", "Demote a wallet from Active first");
       return;
     }
     promoteMutation.mutate(address, {
-      onSuccess: () => toast.success('Promoted!', `${shortenAddress(address)} is now active`),
-      onError: () => toast.error('Promotion Failed', 'Could not promote wallet'),
+      onSuccess: () =>
+        toast.success("Promoted!", `${shortenAddress(address)} is now active`),
+      onError: () =>
+        toast.error("Promotion Failed", "Could not promote wallet"),
     });
   };
 
   const handleDemote = (address: string) => {
     demoteMutation.mutate(address, {
-      onSuccess: () => toast.info('Demoted', `${shortenAddress(address)} moved to Watching`),
-      onError: () => toast.error('Demotion Failed', 'Could not demote wallet'),
+      onSuccess: () =>
+        toast.info("Demoted", `${shortenAddress(address)} moved to Watching`),
+      onError: () => toast.error("Demotion Failed", "Could not demote wallet"),
     });
   };
 
   const handleRemove = (address: string) => {
     removeMutation.mutate(address, {
-      onSuccess: () => toast.info('Removed', `${shortenAddress(address)} removed from Watching`),
-      onError: () => toast.error('Remove Failed', 'Could not remove wallet'),
+      onSuccess: () =>
+        toast.info(
+          "Removed",
+          `${shortenAddress(address)} removed from Watching`,
+        ),
+      onError: () => toast.error("Remove Failed", "Could not remove wallet"),
     });
   };
 
@@ -297,22 +367,30 @@ export default function TradingPage() {
     const position = demoPositions.find((p) => p.id === id);
     if (position) {
       closeDemoPosition(id, position.currentPrice);
-      toast.success('Position Closed', 'Position has been closed');
+      toast.success("Position Closed", "Position has been closed");
     }
   };
 
   // Pin/Unpin handlers
   const handlePin = (address: string) => {
     pinMutation.mutate(address, {
-      onSuccess: () => toast.success('Wallet Pinned', `${shortenAddress(address)} is protected from auto-demotion`),
-      onError: () => toast.error('Pin Failed', 'Could not pin wallet'),
+      onSuccess: () =>
+        toast.success(
+          "Wallet Pinned",
+          `${shortenAddress(address)} is protected from auto-demotion`,
+        ),
+      onError: () => toast.error("Pin Failed", "Could not pin wallet"),
     });
   };
 
   const handleUnpin = (address: string) => {
     unpinMutation.mutate(address, {
-      onSuccess: () => toast.info('Wallet Unpinned', `${shortenAddress(address)} can now be auto-demoted`),
-      onError: () => toast.error('Unpin Failed', 'Could not unpin wallet'),
+      onSuccess: () =>
+        toast.info(
+          "Wallet Unpinned",
+          `${shortenAddress(address)} can now be auto-demoted`,
+        ),
+      onError: () => toast.error("Unpin Failed", "Could not unpin wallet"),
     });
   };
 
@@ -360,7 +438,7 @@ export default function TradingPage() {
       entryPrice: p.entry_price,
       exitPrice: p.current_price,
       quantity: p.quantity,
-      realizedPnl: p.unrealized_pnl,
+      realizedPnl: p.realized_pnl ?? p.unrealized_pnl,
       walletAddress: p.source_wallet,
       walletLabel: undefined,
       closedAt: p.updated_at,
@@ -369,331 +447,365 @@ export default function TradingPage() {
 
   return (
     <ErrorBoundary>
-    <div className="space-y-6">
-      {/* Page Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
-              <TrendingUp className="h-8 w-8" />
-              Trading
-            </h1>
-            <p className="text-muted-foreground">
-              Manage your copy trading wallets and positions
-            </p>
+      <div className="space-y-6">
+        {/* Page Header */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div>
+              <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
+                <TrendingUp className="h-8 w-8" />
+                Trading
+              </h1>
+              <p className="text-muted-foreground">
+                Manage your copy trading wallets and positions
+              </p>
+            </div>
+            {isDemo && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-demo/10 text-demo text-sm font-medium">
+                <TestTube2 className="h-4 w-4" />
+                Demo Mode
+              </div>
+            )}
           </div>
-          {isDemo && (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-demo/10 text-demo text-sm font-medium">
-              <TestTube2 className="h-4 w-4" />
-              Demo Mode
-            </div>
-          )}
+          <div className="flex gap-2">
+            {isDemo && (
+              <Button variant="outline" size="sm" onClick={() => fetchAll()}>
+                <RefreshCw className="mr-2 h-4 w-4" />
+                Refresh
+              </Button>
+            )}
+            <Link href="/discover">
+              <Button>
+                <Search className="mr-2 h-4 w-4" />
+                Discover Wallets
+              </Button>
+            </Link>
+          </div>
         </div>
-        <div className="flex gap-2">
-          {isDemo && (
-            <Button variant="outline" size="sm" onClick={() => fetchAll()}>
-              <RefreshCw className="mr-2 h-4 w-4" />
-              Refresh
-            </Button>
-          )}
-          <Link href="/discover">
-            <Button>
-              <Search className="mr-2 h-4 w-4" />
-              Discover Wallets
-            </Button>
-          </Link>
-        </div>
-      </div>
 
-      {/* Portfolio Summary */}
-      <PortfolioSummary
-        totalValue={totalValue}
-        totalPnl={totalPnl}
-        positionCount={positionCount}
-        winRate={winRate}
-        realizedPnl={realizedPnl}
-        availableBalance={isDemo ? demoBalance : (walletBalance?.usdc_balance ?? undefined)}
-        isDemo={isDemo}
-      />
-
-      {/* Search */}
-      <div className="relative">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-        <input
-          type="text"
-          value={walletSearch}
-          onChange={(e) => setWalletSearch(e.target.value)}
-          placeholder="Search wallets by address or label..."
-          className="w-full rounded-md border bg-background pl-10 pr-4 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        {/* Portfolio Summary */}
+        <PortfolioSummary
+          totalValue={totalValue}
+          totalPnl={totalPnl}
+          positionCount={positionCount}
+          winRate={winRate}
+          realizedPnl={realizedPnl}
+          availableBalance={
+            isDemo ? demoBalance : (walletBalance?.usdc_balance ?? undefined)
+          }
+          isDemo={isDemo}
         />
-      </div>
 
-      {/* Tabs */}
-      <Tabs value={currentTab} onValueChange={handleTabChange}>
-        <TabsList>
-          <TabsTrigger value="active" className="flex items-center gap-2">
-            <Star className="h-4 w-4" />
-            Active ({allActiveWallets.length}/5)
-          </TabsTrigger>
-          <TabsTrigger value="watching" className="flex items-center gap-2">
-            <Eye className="h-4 w-4" />
-            Watching ({allBenchWallets.length})
-          </TabsTrigger>
-          <TabsTrigger value="closed" className="flex items-center gap-2">
-            <History className="h-4 w-4" />
-            Closed ({closedCount})
-          </TabsTrigger>
-          <TabsTrigger value="automation" className="flex items-center gap-2">
-            <Bot className="h-4 w-4" />
-            Automation
-          </TabsTrigger>
-        </TabsList>
+        {/* Search */}
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <input
+            type="text"
+            value={walletSearch}
+            onChange={(e) => setWalletSearch(e.target.value)}
+            placeholder="Search wallets by address or label..."
+            className="w-full rounded-md border bg-background pl-10 pr-4 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+        </div>
 
-        {/* Active Tab */}
-        <TabsContent value="active" className="space-y-4">
-          {isLoadingPositions ? (
-            <div className="space-y-4">
-              {[1, 2].map((i) => (
-                <Card key={i}>
-                  <CardContent className="p-6">
-                    <div className="flex items-center gap-4">
-                      <Skeleton className="h-10 w-10 rounded-full" />
-                      <div className="flex-1 space-y-2">
-                        <Skeleton className="h-4 w-32" />
-                        <Skeleton className="h-3 w-24" />
+        {/* Tabs */}
+        <Tabs value={currentTab} onValueChange={handleTabChange}>
+          <TabsList>
+            <TabsTrigger value="active" className="flex items-center gap-2">
+              <Star className="h-4 w-4" />
+              Active ({allActiveWallets.length}/5)
+            </TabsTrigger>
+            <TabsTrigger value="watching" className="flex items-center gap-2">
+              <Eye className="h-4 w-4" />
+              Watching ({allBenchWallets.length})
+            </TabsTrigger>
+            <TabsTrigger value="closed" className="flex items-center gap-2">
+              <History className="h-4 w-4" />
+              Closed ({closedCount})
+            </TabsTrigger>
+            <TabsTrigger value="automation" className="flex items-center gap-2">
+              <Bot className="h-4 w-4" />
+              Automation
+            </TabsTrigger>
+          </TabsList>
+
+          {/* Active Tab */}
+          <TabsContent value="active" className="space-y-4">
+            {isLoadingPositions ? (
+              <div className="space-y-4">
+                {[1, 2].map((i) => (
+                  <Card key={i}>
+                    <CardContent className="p-6">
+                      <div className="flex items-center gap-4">
+                        <Skeleton className="h-10 w-10 rounded-full" />
+                        <div className="flex-1 space-y-2">
+                          <Skeleton className="h-4 w-32" />
+                          <Skeleton className="h-3 w-24" />
+                        </div>
+                        <Skeleton className="h-8 w-24" />
                       </div>
-                      <Skeleton className="h-8 w-24" />
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-          ) : activeWallets.length === 0 ? (
-            <Card>
-              <CardContent className="p-12 text-center">
-                <Star className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-                <h3 className="text-lg font-medium mb-2">No active wallets</h3>
-                <p className="text-muted-foreground mb-4">
-                  Promote wallets from Watching or discover new wallets to start copying
-                </p>
-                <div className="flex gap-2 justify-center">
-                  <Button variant="outline" onClick={() => handleTabChange('watching')}>
-                    <Eye className="mr-2 h-4 w-4" />
-                    View Watching
-                  </Button>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            ) : activeWallets.length === 0 ? (
+              <Card>
+                <CardContent className="p-12 text-center">
+                  <Star className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                  <h3 className="text-lg font-medium mb-2">
+                    No active wallets
+                  </h3>
+                  <p className="text-muted-foreground mb-4">
+                    Promote wallets from Watching or discover new wallets to
+                    start copying
+                  </p>
+                  <div className="flex gap-2 justify-center">
+                    <Button
+                      variant="outline"
+                      onClick={() => handleTabChange("watching")}
+                    >
+                      <Eye className="mr-2 h-4 w-4" />
+                      View Watching
+                    </Button>
+                    <Link href="/discover">
+                      <Button>
+                        <Search className="mr-2 h-4 w-4" />
+                        Discover Wallets
+                      </Button>
+                    </Link>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : (
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {activeWallets.map((wallet) => (
+                  <WalletCard
+                    key={wallet.address}
+                    wallet={wallet}
+                    positions={positionsByWallet[wallet.address] || []}
+                    onDemote={handleDemote}
+                    onClosePosition={handleClosePosition}
+                    onPin={handlePin}
+                    onUnpin={handleUnpin}
+                    isActive={true}
+                    isRosterFull={isRosterFull()}
+                    pinsRemaining={pinsRemaining}
+                    maxPins={maxPins}
+                  />
+                ))}
+
+                {/* Empty slots */}
+                {!searchLower &&
+                  Array.from({ length: 5 - allActiveWallets.length }).map(
+                    (_, i) => (
+                      <Card key={`empty-${i}`} className="border-dashed">
+                        <CardContent className="p-6 flex flex-col items-center justify-center min-h-[200px] text-center">
+                          <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
+                            <Plus className="h-6 w-6 text-muted-foreground" />
+                          </div>
+                          <p className="font-medium text-muted-foreground mb-2">
+                            Slot {allActiveWallets.length + i + 1} Available
+                          </p>
+                          <p className="text-sm text-muted-foreground mb-4">
+                            Add a wallet from Watching to start copying
+                          </p>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => handleTabChange("watching")}
+                          >
+                            Browse Watching
+                          </Button>
+                        </CardContent>
+                      </Card>
+                    ),
+                  )}
+              </div>
+            )}
+
+            {/* Manual Positions Section */}
+            {manualPositions.length > 0 && (
+              <ManualPositions
+                positions={manualPositions}
+                onClosePosition={handleClosePosition}
+              />
+            )}
+
+            {/* Risk-Based Allocation Adjustment */}
+            {activeWallets.length > 0 && (
+              <AllocationAdjustmentPanel tier="active" className="mt-6" />
+            )}
+          </TabsContent>
+
+          {/* Watching Tab */}
+          <TabsContent value="watching" className="space-y-4">
+            {benchWallets.length === 0 ? (
+              <Card>
+                <CardContent className="p-12 text-center">
+                  <Eye className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                  <h3 className="text-lg font-medium mb-2">
+                    No wallets being watched
+                  </h3>
+                  <p className="text-muted-foreground mb-4">
+                    Discover promising wallets to monitor before copying
+                  </p>
                   <Link href="/discover">
                     <Button>
                       <Search className="mr-2 h-4 w-4" />
                       Discover Wallets
                     </Button>
                   </Link>
-                </div>
-              </CardContent>
-            </Card>
-          ) : (
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-              {activeWallets.map((wallet) => (
-                <WalletCard
-                  key={wallet.address}
-                  wallet={wallet}
-                  positions={positionsByWallet[wallet.address] || []}
-                  onDemote={handleDemote}
-                  onClosePosition={handleClosePosition}
-                  onPin={handlePin}
-                  onUnpin={handleUnpin}
-                  isActive={true}
-                  isRosterFull={isRosterFull()}
-                  pinsRemaining={pinsRemaining}
-                  maxPins={maxPins}
-                />
-              ))}
+                </CardContent>
+              </Card>
+            ) : (
+              <div className="grid gap-4">
+                {benchWallets.map((wallet) => (
+                  <WalletCard
+                    key={wallet.address}
+                    wallet={wallet}
+                    positions={[]}
+                    onPromote={handlePromote}
+                    onRemove={() => handleRemove(wallet.address)}
+                    isActive={false}
+                    isRosterFull={isRosterFull()}
+                  />
+                ))}
+              </div>
+            )}
 
-              {/* Empty slots */}
-              {!searchLower && Array.from({ length: 5 - allActiveWallets.length }).map((_, i) => (
-                <Card key={`empty-${i}`} className="border-dashed">
-                  <CardContent className="p-6 flex flex-col items-center justify-center min-h-[200px] text-center">
-                    <div className="h-12 w-12 rounded-full bg-muted flex items-center justify-center mb-4">
-                      <Plus className="h-6 w-6 text-muted-foreground" />
-                    </div>
-                    <p className="font-medium text-muted-foreground mb-2">
-                      Slot {allActiveWallets.length + i + 1} Available
-                    </p>
-                    <p className="text-sm text-muted-foreground mb-4">
-                      Add a wallet from Watching to start copying
-                    </p>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleTabChange('watching')}
+            {/* Risk-Based Allocation Adjustment */}
+            {benchWallets.length > 0 && (
+              <AllocationAdjustmentPanel tier="bench" className="mt-6" />
+            )}
+          </TabsContent>
+
+          {/* Closed Positions Tab */}
+          <TabsContent value="closed" className="space-y-4">
+            {closedDisplayPositions.length === 0 ? (
+              <Card>
+                <CardContent className="p-12 text-center">
+                  <History className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                  <h3 className="text-lg font-medium mb-2">
+                    No closed positions
+                  </h3>
+                  <p className="text-muted-foreground">
+                    Your realized gains and losses will appear here after
+                    closing positions.
+                  </p>
+                </CardContent>
+              </Card>
+            ) : (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center justify-between">
+                    <span>Closed Positions</span>
+                    <span
+                      className={cn(
+                        "text-lg font-bold",
+                        realizedPnl >= 0 ? "text-profit" : "text-loss",
+                      )}
                     >
-                      Browse Watching
-                    </Button>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-          )}
-
-          {/* Manual Positions Section */}
-          {manualPositions.length > 0 && (
-            <ManualPositions
-              positions={manualPositions}
-              onClosePosition={handleClosePosition}
-            />
-          )}
-
-          {/* Risk-Based Allocation Adjustment */}
-          {activeWallets.length > 0 && (
-            <AllocationAdjustmentPanel tier="active" className="mt-6" />
-          )}
-        </TabsContent>
-
-        {/* Watching Tab */}
-        <TabsContent value="watching" className="space-y-4">
-          {benchWallets.length === 0 ? (
-            <Card>
-              <CardContent className="p-12 text-center">
-                <Eye className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-                <h3 className="text-lg font-medium mb-2">No wallets being watched</h3>
-                <p className="text-muted-foreground mb-4">
-                  Discover promising wallets to monitor before copying
-                </p>
-                <Link href="/discover">
-                  <Button>
-                    <Search className="mr-2 h-4 w-4" />
-                    Discover Wallets
-                  </Button>
-                </Link>
-              </CardContent>
-            </Card>
-          ) : (
-            <div className="grid gap-4">
-              {benchWallets.map((wallet) => (
-                <WalletCard
-                  key={wallet.address}
-                  wallet={wallet}
-                  positions={[]}
-                  onPromote={handlePromote}
-                  onRemove={() => handleRemove(wallet.address)}
-                  isActive={false}
-                  isRosterFull={isRosterFull()}
-                />
-              ))}
-            </div>
-          )}
-
-          {/* Risk-Based Allocation Adjustment */}
-          {benchWallets.length > 0 && (
-            <AllocationAdjustmentPanel tier="bench" className="mt-6" />
-          )}
-        </TabsContent>
-
-        {/* Closed Positions Tab */}
-        <TabsContent value="closed" className="space-y-4">
-          {closedDisplayPositions.length === 0 ? (
-            <Card>
-              <CardContent className="p-12 text-center">
-                <History className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-                <h3 className="text-lg font-medium mb-2">No closed positions</h3>
-                <p className="text-muted-foreground">
-                  Your realized gains and losses will appear here after closing positions.
-                </p>
-              </CardContent>
-            </Card>
-          ) : (
-            <Card>
-              <CardHeader>
-                <CardTitle className="flex items-center justify-between">
-                  <span>Closed Positions</span>
-                  <span className={cn(
-                    'text-lg font-bold',
-                    realizedPnl >= 0 ? 'text-profit' : 'text-loss'
-                  )}>
-                    Total: {formatCurrency(realizedPnl, { showSign: true })}
-                  </span>
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="overflow-x-auto">
-                  <table className="w-full">
-                    <thead className="border-b bg-muted/50">
-                      <tr>
-                        <th className="text-left p-4 font-medium">Market</th>
-                        <th className="text-left p-4 font-medium">Outcome</th>
-                        <th className="text-right p-4 font-medium">Entry</th>
-                        <th className="text-right p-4 font-medium">Exit</th>
-                        <th className="text-right p-4 font-medium">Size</th>
-                        <th className="text-right p-4 font-medium">Realized P&L</th>
-                        <th className="text-right p-4 font-medium">Source</th>
-                        <th className="text-right p-4 font-medium">Closed</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {closedDisplayPositions.map((position) => (
-                        <tr key={position.id} className="border-b hover:bg-muted/30">
-                          <td className="p-4">
-                            <p className="font-medium text-sm">
-                              {position.marketQuestion || position.marketId}
-                            </p>
-                          </td>
-                          <td className="p-4">
-                            <span
-                              className={cn(
-                                'px-2 py-1 rounded text-xs font-medium uppercase',
-                                position.outcome === 'yes'
-                                  ? 'bg-profit/10 text-profit'
-                                  : 'bg-loss/10 text-loss'
-                              )}
-                            >
-                              {position.outcome}
-                            </span>
-                          </td>
-                          <td className="p-4 text-right tabular-nums">
-                            ${position.entryPrice.toFixed(2)}
-                          </td>
-                          <td className="p-4 text-right tabular-nums">
-                            ${position.exitPrice?.toFixed(2) || '-'}
-                          </td>
-                          <td className="p-4 text-right tabular-nums">
-                            {formatCurrency(position.quantity * position.entryPrice)}
-                          </td>
-                          <td className="p-4 text-right">
-                            <span
-                              className={cn(
-                                'tabular-nums font-medium',
-                                position.realizedPnl >= 0 ? 'text-profit' : 'text-loss'
-                              )}
-                            >
-                              {formatCurrency(position.realizedPnl, { showSign: true })}
-                            </span>
-                          </td>
-                          <td className="p-4 text-right text-muted-foreground text-sm">
-                            {position.walletLabel || (position.walletAddress ? shortenAddress(position.walletAddress) : 'Manual')}
-                          </td>
-                          <td className="p-4 text-right text-muted-foreground text-sm">
-                            {position.closedAt
-                              ? new Date(position.closedAt).toLocaleDateString()
-                              : '-'}
-                          </td>
+                      Total: {formatCurrency(realizedPnl, { showSign: true })}
+                    </span>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <table className="w-full">
+                      <thead className="border-b bg-muted/50">
+                        <tr>
+                          <th className="text-left p-4 font-medium">Market</th>
+                          <th className="text-left p-4 font-medium">Outcome</th>
+                          <th className="text-right p-4 font-medium">Entry</th>
+                          <th className="text-right p-4 font-medium">Exit</th>
+                          <th className="text-right p-4 font-medium">Size</th>
+                          <th className="text-right p-4 font-medium">
+                            Realized P&L
+                          </th>
+                          <th className="text-right p-4 font-medium">Source</th>
+                          <th className="text-right p-4 font-medium">Closed</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </TabsContent>
+                      </thead>
+                      <tbody>
+                        {closedDisplayPositions.map((position) => (
+                          <tr
+                            key={position.id}
+                            className="border-b hover:bg-muted/30"
+                          >
+                            <td className="p-4">
+                              <p className="font-medium text-sm">
+                                {position.marketQuestion || position.marketId}
+                              </p>
+                            </td>
+                            <td className="p-4">
+                              <span
+                                className={cn(
+                                  "px-2 py-1 rounded text-xs font-medium uppercase",
+                                  position.outcome === "yes"
+                                    ? "bg-profit/10 text-profit"
+                                    : "bg-loss/10 text-loss",
+                                )}
+                              >
+                                {position.outcome}
+                              </span>
+                            </td>
+                            <td className="p-4 text-right tabular-nums">
+                              ${position.entryPrice.toFixed(2)}
+                            </td>
+                            <td className="p-4 text-right tabular-nums">
+                              ${position.exitPrice?.toFixed(2) || "-"}
+                            </td>
+                            <td className="p-4 text-right tabular-nums">
+                              {formatCurrency(
+                                position.quantity * position.entryPrice,
+                              )}
+                            </td>
+                            <td className="p-4 text-right">
+                              <span
+                                className={cn(
+                                  "tabular-nums font-medium",
+                                  position.realizedPnl >= 0
+                                    ? "text-profit"
+                                    : "text-loss",
+                                )}
+                              >
+                                {formatCurrency(position.realizedPnl, {
+                                  showSign: true,
+                                })}
+                              </span>
+                            </td>
+                            <td className="p-4 text-right text-muted-foreground text-sm">
+                              {position.walletLabel ||
+                                (position.walletAddress
+                                  ? shortenAddress(position.walletAddress)
+                                  : "Manual")}
+                            </td>
+                            <td className="p-4 text-right text-muted-foreground text-sm">
+                              {position.closedAt
+                                ? new Date(
+                                    position.closedAt,
+                                  ).toLocaleDateString()
+                                : "-"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+          </TabsContent>
 
-        {/* Automation Tab */}
-        <TabsContent value="automation" className="space-y-4">
-          <AutomationPanel
-            workspaceId={currentWorkspace?.id ?? ''}
-            onRefresh={() => fetchAll()}
-          />
-        </TabsContent>
-      </Tabs>
-    </div>
+          {/* Automation Tab */}
+          <TabsContent value="automation" className="space-y-4">
+            <AutomationPanel
+              workspaceId={currentWorkspace?.id ?? ""}
+              onRefresh={() => fetchAll()}
+            />
+          </TabsContent>
+        </Tabs>
+      </div>
     </ErrorBoundary>
   );
 }
