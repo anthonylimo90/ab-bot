@@ -189,8 +189,12 @@ export interface Order {
 }
 
 // Backtest types
-export type StrategyType = 'Arbitrage' | 'Momentum' | 'MeanReversion' | 'CopyTrading';
-export type SlippageModel = 'None' | 'Fixed' | 'VolumeBased';
+export type StrategyType = 'arbitrage' | 'momentum' | 'mean_reversion' | 'copy_trading';
+
+export type SlippageModel =
+  | { type: 'none' }
+  | { type: 'fixed'; pct: number }
+  | { type: 'volume_based'; base_pct: number; volume_factor: number };
 
 export interface StrategyConfig {
   type: StrategyType;
@@ -216,7 +220,6 @@ export interface BacktestParams {
   initial_capital: number;
   markets?: string[];
   slippage_model?: SlippageModel;
-  slippage_pct?: number;
   fee_pct?: number;
 }
 

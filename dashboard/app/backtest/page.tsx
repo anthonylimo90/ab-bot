@@ -64,16 +64,18 @@ export default function BacktestPage() {
 
   // Handle backtest run
   const handleRunBacktest = async () => {
+    const wallets = selectedWallets.length > 0 ? selectedWallets : allWallets.map(w => w.address);
     await runBacktest({
       strategy: {
-        type: 'CopyTrading',
-        wallets: selectedWallets.length > 0 ? selectedWallets : allWallets.map(w => w.address),
+        type: 'copy_trading',
+        wallets,
+        allocation_pct: 1 / Math.max(1, wallets.length),
       },
-      start_date: startDate,
-      end_date: endDate,
+      start_date: startDate + 'T00:00:00Z',
+      end_date: endDate + 'T00:00:00Z',
       initial_capital: capital,
-      slippage_pct: slippage,
-      fee_pct: fees,
+      slippage_model: slippage > 0 ? { type: 'fixed', pct: slippage / 100 } : { type: 'none' },
+      fee_pct: fees / 100,
     });
   };
 
@@ -365,8 +367,8 @@ export default function BacktestPage() {
                   onClick={() => loadResult(result.id)}
                 >
                   <div>
-                    <p className="font-medium text-sm">
-                      {result.strategy.type}
+                    <p className="font-medium text-sm capitalize">
+                      {result.strategy.type.replace(/_/g, ' ')}
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {new Date(result.created_at).toLocaleDateString()} |
