@@ -1116,9 +1116,14 @@ fn sign_l2_request(
         None => format!("{}{}{}", timestamp, method, path),
     };
 
-    // Decode the secret (it's base64 encoded)
-    let secret_bytes = base64::engine::general_purpose::STANDARD
+    // Decode the secret — Polymarket uses URL-safe base64 encoding for API secrets,
+    // but fall back to standard base64 for compatibility.
+    let secret_bytes = base64::engine::general_purpose::URL_SAFE
         .decode(&credentials.api_secret)
+        .or_else(|_| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&credentials.api_secret)
+        })
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&credentials.api_secret))
         .map_err(|e| Error::Signing {
             message: format!("Invalid API secret encoding: {}", e),
         })?;
