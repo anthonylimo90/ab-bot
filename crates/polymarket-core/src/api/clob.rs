@@ -1136,8 +1136,8 @@ fn sign_l2_request(
     mac.update(message.as_bytes());
     let result = mac.finalize();
 
-    // Return as base64
-    Ok(base64::engine::general_purpose::STANDARD.encode(result.into_bytes()))
+    // Return as URL-safe base64 (matching Polymarket's Python/TypeScript clients)
+    Ok(base64::engine::general_purpose::URL_SAFE.encode(result.into_bytes()))
 }
 
 impl std::fmt::Debug for AuthenticatedClobClient {
@@ -1222,8 +1222,8 @@ mod authenticated_tests {
         )
         .unwrap();
 
-        // Should be valid base64
-        assert!(base64::engine::general_purpose::STANDARD
+        // Should be valid URL-safe base64
+        assert!(base64::engine::general_purpose::URL_SAFE
             .decode(&signature)
             .is_ok());
     }
@@ -1239,7 +1239,7 @@ mod authenticated_tests {
         let signature =
             sign_l2_request(&credentials, "GET", "/orders", "1700000000", None).unwrap();
 
-        assert!(base64::engine::general_purpose::STANDARD
+        assert!(base64::engine::general_purpose::URL_SAFE
             .decode(&signature)
             .is_ok());
     }
