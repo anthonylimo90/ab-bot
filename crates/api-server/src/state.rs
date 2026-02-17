@@ -222,6 +222,45 @@ impl AppState {
                     }
                 }
             }
+
+            // Ensure on-chain Polymarket approvals are set for the trading wallet.
+            // This is a one-time operation per wallet; existing approvals are detected and skipped.
+            if order_executor.is_live_ready().await {
+                let rpc_url = std::env::var("POLYGON_RPC_URL")
+                    .or_else(|_| {
+                        std::env::var("ALCHEMY_API_KEY")
+                            .map(|k| format!("https://polygon-mainnet.g.alchemy.com/v2/{}", k))
+                    })
+                    .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+
+                // Build a signer from the same key the executor used
+                let approval_wallet = TradingWallet::from_env().ok();
+
+                if let Some(wallet) = approval_wallet {
+                    let signer = wallet.signer();
+                    match polymarket_core::api::approvals::ensure_polymarket_approvals(
+                        &signer, &rpc_url,
+                    )
+                    .await
+                    {
+                        Ok(count) => {
+                            if count > 0 {
+                                tracing::info!(
+                                    approvals_sent = count,
+                                    "Set Polymarket contract approvals"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to set Polymarket approvals (trading may fail). \
+                                 Set approvals manually or ensure POLYGON_RPC_URL is correct."
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Create circuit breaker for risk management

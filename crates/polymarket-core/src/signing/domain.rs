@@ -21,8 +21,11 @@ pub const NEG_RISK_CTF_EXCHANGE_ADDRESS: &str = "0xC5d563A36AE78145C45a50134d48A
 /// Neg Risk Adapter address on Polygon mainnet.
 pub const NEG_RISK_ADAPTER_ADDRESS: &str = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 
-/// USDC contract address on Polygon mainnet.
+/// USDC.e contract address on Polygon mainnet (PoS bridged).
 pub const USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+/// CTF (Conditional Token Framework) ERC-1155 contract on Polygon mainnet.
+pub const CTF_ADDRESS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 
 /// EIP-712 domain separator for order signing.
 #[derive(Debug, Clone)]

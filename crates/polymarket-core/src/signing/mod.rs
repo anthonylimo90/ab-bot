@@ -49,7 +49,7 @@ pub mod order_types;
 pub mod signer;
 
 pub use domain::{
-    ClobAuthDomain, Eip712Domain, OrderSide, SignatureType, CTF_EXCHANGE_ADDRESS,
+    ClobAuthDomain, Eip712Domain, OrderSide, SignatureType, CTF_ADDRESS, CTF_EXCHANGE_ADDRESS,
     NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS, POLYGON_AMOY_CHAIN_ID,
     POLYGON_CHAIN_ID, USDC_ADDRESS,
 };

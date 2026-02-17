@@ -3486,6 +3486,8 @@ dependencies = [
 name = "polymarket-core"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-network",
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",

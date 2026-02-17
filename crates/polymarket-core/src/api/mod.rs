@@ -1,5 +1,6 @@
 //! API clients for external services.
 
+pub mod approvals;
 pub mod clob;
 pub mod polygon;
 
