@@ -690,12 +690,9 @@ pub struct PostOrderRequest {
     pub order_type: OrderType,
     /// API key of the order owner.
     pub owner: String,
-    /// Post-only flag (default false).
-    #[serde(rename = "postOnly")]
-    pub post_only: bool,
-    /// Defer execution flag (default false).
-    #[serde(rename = "deferExec")]
-    pub defer_exec: bool,
+    /// Post-only flag (default false). Omitted when None.
+    #[serde(rename = "postOnly", skip_serializing_if = "Option::is_none")]
+    pub post_only: Option<bool>,
 }
 
 /// Response from posting an order.
@@ -739,8 +736,10 @@ pub struct DeriveApiKeyResponse {
 pub struct AuthenticatedClobClient {
     /// Base read-only client.
     pub client: ClobClient,
-    /// Order signer for EIP-712 signing.
+    /// Order signer for standard CTF Exchange markets.
     signer: OrderSigner,
+    /// Order signer for neg-risk CTF Exchange markets.
+    neg_risk_signer: OrderSigner,
     /// API credentials for L2 authentication (optional until derived).
     credentials: Option<ApiCredentials>,
 }
@@ -748,9 +747,11 @@ pub struct AuthenticatedClobClient {
 impl AuthenticatedClobClient {
     /// Create a new authenticated client.
     pub fn new(client: ClobClient, signer: OrderSigner) -> Self {
+        let neg_risk_signer = signer.to_neg_risk();
         Self {
             client,
             signer,
+            neg_risk_signer,
             credentials: None,
         }
     }
@@ -761,9 +762,11 @@ impl AuthenticatedClobClient {
         signer: OrderSigner,
         credentials: ApiCredentials,
     ) -> Self {
+        let neg_risk_signer = signer.to_neg_risk();
         Self {
             client,
             signer,
+            neg_risk_signer,
             credentials: Some(credentials),
         }
     }
@@ -896,6 +899,39 @@ impl AuthenticatedClobClient {
         self.credentials.is_some()
     }
 
+    /// Query the CLOB API for whether a token uses the neg-risk exchange.
+    async fn is_neg_risk(&self, token_id: &str) -> Result<bool> {
+        let url = format!("{}/neg-risk?token_id={}", self.client.base_url, token_id);
+        let response = self.client.http_client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            // Default to neg_risk=true since most Polymarket markets are neg-risk
+            warn!(
+                token_id = token_id,
+                status = response.status().as_u16(),
+                "Failed to query neg-risk status, defaulting to true"
+            );
+            return Ok(true);
+        }
+
+        #[derive(Deserialize)]
+        struct NegRiskResponse {
+            neg_risk: bool,
+        }
+
+        let result: NegRiskResponse = response.json().await.map_err(|e| {
+            warn!(error = %e, "Failed to parse neg-risk response, defaulting to true");
+            e
+        })?;
+
+        debug!(
+            token_id = token_id,
+            neg_risk = result.neg_risk,
+            "Queried neg-risk status"
+        );
+        Ok(result.neg_risk)
+    }
+
     /// Create and sign an order.
     pub async fn create_order(
         &self,
@@ -905,8 +941,15 @@ impl AuthenticatedClobClient {
         size: Decimal,
         expiration_secs: u64,
     ) -> Result<SignedOrder> {
-        let order = self
-            .signer
+        // Determine which exchange contract to use for signing
+        let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
+        let signer = if neg_risk {
+            &self.neg_risk_signer
+        } else {
+            &self.signer
+        };
+
+        let order = signer
             .order_builder()
             .token_id_str(token_id)
             .side(side)
@@ -918,8 +961,7 @@ impl AuthenticatedClobClient {
                 message: "Failed to build order - missing required fields".to_string(),
             })?;
 
-        let signed = self
-            .signer
+        let signed = signer
             .sign_order(&order)
             .await
             .map_err(|e| Error::Signing {
@@ -948,11 +990,12 @@ impl AuthenticatedClobClient {
             order: signed_order,
             order_type,
             owner: credentials.api_key.clone(),
-            post_only: false,
-            defer_exec: false,
+            post_only: None,
         };
 
         let body = serde_json::to_string(&request)?;
+
+        debug!(payload = %body, "POST /order request body");
 
         // Sign the request with L2 HMAC
         let signature = sign_l2_request(credentials, method, path, &timestamp, Some(&body))?;

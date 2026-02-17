@@ -43,6 +43,14 @@ impl OrderSigner {
         Self { signer, domain }
     }
 
+    /// Create a neg-risk variant using the same private key.
+    pub fn to_neg_risk(&self) -> Self {
+        Self {
+            signer: self.signer.clone(),
+            domain: Eip712Domain::neg_risk_ctf_exchange(),
+        }
+    }
+
     /// Get the signer's address.
     pub fn address(&self) -> Address {
         self.signer.address()
