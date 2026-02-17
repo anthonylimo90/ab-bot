@@ -933,13 +933,16 @@ impl AuthenticatedClobClient {
     }
 
     /// Create and sign an order.
+    ///
+    /// For GTC/FOK orders, expiration is forced to 0 per the CLOB API contract.
+    /// Only GTD orders use a real expiration timestamp.
     pub async fn create_order(
         &self,
         token_id: &str,
         side: crate::signing::OrderSide,
         price: Decimal,
         size: Decimal,
-        expiration_secs: u64,
+        order_type: OrderType,
     ) -> Result<SignedOrder> {
         // Determine which exchange contract to use for signing
         let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
@@ -949,17 +952,22 @@ impl AuthenticatedClobClient {
             &self.signer
         };
 
-        let order = signer
+        let mut builder = signer
             .order_builder()
             .token_id_str(token_id)
             .side(side)
             .price(price)
-            .size(size)
-            .expires_in(expiration_secs)
-            .build()
-            .ok_or_else(|| Error::Order {
-                message: "Failed to build order - missing required fields".to_string(),
-            })?;
+            .size(size);
+
+        // Only GTD orders have a real expiration; GTC/FOK must be 0
+        builder = match order_type {
+            OrderType::Gtd => builder.expires_in(3600), // 1 hour default for GTD
+            _ => builder.expires_at(0),
+        };
+
+        let order = builder.build().ok_or_else(|| Error::Order {
+            message: "Failed to build order - missing required fields".to_string(),
+        })?;
 
         let signed = signer
             .sign_order(&order)
@@ -1250,7 +1258,7 @@ mod authenticated_tests {
                 crate::signing::OrderSide::Buy,
                 Decimal::new(50, 2), // 0.50
                 Decimal::from(100),  // 100 USDC
-                3600,                // 1 hour
+                OrderType::Gtc,
             )
             .await
             .unwrap();
