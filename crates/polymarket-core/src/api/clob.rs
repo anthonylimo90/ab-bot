@@ -1042,13 +1042,13 @@ impl AuthenticatedClobClient {
         })?;
 
         let url = format!(
-            "{}/balance-allowance?asset_type={}&signature_type=0",
+            "{}/balance-allowance/update?asset_type={}&signature_type=0",
             self.client.base_url, asset_type
         );
 
         let timestamp = current_timestamp().to_string();
         let method = "GET";
-        let path = "/balance-allowance";
+        let path = "/balance-allowance/update";
         let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
 
         let response = self
