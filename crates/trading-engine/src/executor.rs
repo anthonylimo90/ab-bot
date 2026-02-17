@@ -554,14 +554,14 @@ impl OrderExecutor {
             ));
         }
 
-        // Create signed order (1 hour expiration for market orders)
+        // Create signed order (FOK for market orders, expiration=0)
         let signed_order = client
             .create_order(
                 &order.outcome_id,
                 signing_side,
                 price,
                 order.quantity,
-                3600, // 1 hour expiration
+                OrderType::Fok,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
@@ -617,15 +617,14 @@ impl OrderExecutor {
             ));
         }
 
-        // Create signed order (use configured expiration or default 24 hours)
-        let expiration_secs = 24 * 3600; // 24 hours for limit orders
+        // Create signed order (GTC for limit orders, expiration=0)
         let signed_order = client
             .create_order(
                 &order.outcome_id,
                 signing_side,
                 order.price,
                 order.quantity,
-                expiration_secs,
+                OrderType::Gtc,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
