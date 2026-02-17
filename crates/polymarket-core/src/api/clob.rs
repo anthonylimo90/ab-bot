@@ -688,6 +688,8 @@ pub struct PostOrderRequest {
     pub order: SignedOrder,
     #[serde(rename = "orderType")]
     pub order_type: OrderType,
+    /// Wallet address that owns the order.
+    pub owner: String,
 }
 
 /// Response from posting an order.
@@ -939,6 +941,7 @@ impl AuthenticatedClobClient {
         let request = PostOrderRequest {
             order: signed_order,
             order_type,
+            owner: self.address(),
         };
 
         let body = serde_json::to_string(&request)?;
