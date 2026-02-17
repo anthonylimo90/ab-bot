@@ -932,6 +932,43 @@ impl AuthenticatedClobClient {
         Ok(result.neg_risk)
     }
 
+    /// Query the CLOB API for the taker fee rate for a token.
+    async fn get_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
+        let url = format!("{}/fee-rate?token_id={}", self.client.base_url, token_id);
+        let response = self.client.http_client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            warn!(
+                token_id = token_id,
+                status = response.status().as_u16(),
+                "Failed to query fee-rate, defaulting to 0"
+            );
+            return Ok(0);
+        }
+
+        #[derive(Deserialize)]
+        struct FeeRateResponse {
+            #[serde(alias = "base_fee", alias = "baseFee", alias = "fee")]
+            fee: Option<u64>,
+            #[serde(alias = "fee_rate_bps", alias = "feeRateBps")]
+            fee_rate_bps: Option<u64>,
+        }
+
+        // Try to parse as structured response first, fall back to plain number
+        let text = response.text().await?;
+        let fee = if let Ok(resp) = serde_json::from_str::<FeeRateResponse>(&text) {
+            resp.fee_rate_bps.or(resp.fee).unwrap_or(0)
+        } else if let Ok(val) = text.trim().trim_matches('"').parse::<u64>() {
+            val
+        } else {
+            warn!(token_id = token_id, response = %text, "Could not parse fee-rate response");
+            0
+        };
+
+        debug!(token_id = token_id, fee_rate_bps = fee, "Fetched fee rate");
+        Ok(fee)
+    }
+
     /// Create and sign an order.
     ///
     /// For GTC/FOK orders, expiration is forced to 0 per the CLOB API contract.
@@ -952,12 +989,16 @@ impl AuthenticatedClobClient {
             &self.signer
         };
 
+        // Fetch the market's required fee rate
+        let fee_rate = self.get_fee_rate_bps(token_id).await.unwrap_or(0);
+
         let mut builder = signer
             .order_builder()
             .token_id_str(token_id)
             .side(side)
             .price(price)
-            .size(size);
+            .size(size)
+            .fee_rate_bps(fee_rate);
 
         // Only GTD orders have a real expiration; GTC/FOK must be 0
         builder = match order_type {
