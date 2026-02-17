@@ -950,11 +950,11 @@ impl AuthenticatedClobClient {
             .client
             .http_client
             .post(&url)
-            .header("POLY-ADDRESS", self.address())
-            .header("POLY-SIGNATURE", signature)
-            .header("POLY-TIMESTAMP", &timestamp)
-            .header("POLY-API-KEY", &credentials.api_key)
-            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
             .header("Content-Type", "application/json")
             .body(body)
             .send()
@@ -992,11 +992,11 @@ impl AuthenticatedClobClient {
             .client
             .http_client
             .delete(&url)
-            .header("POLY-ADDRESS", self.address())
-            .header("POLY-SIGNATURE", signature)
-            .header("POLY-TIMESTAMP", &timestamp)
-            .header("POLY-API-KEY", &credentials.api_key)
-            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
             .send()
             .await?;
 
@@ -1033,11 +1033,11 @@ impl AuthenticatedClobClient {
             .client
             .http_client
             .get(&url)
-            .header("POLY-ADDRESS", self.address())
-            .header("POLY-SIGNATURE", signature)
-            .header("POLY-TIMESTAMP", &timestamp)
-            .header("POLY-API-KEY", &credentials.api_key)
-            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
             .send()
             .await?;
 
@@ -1071,11 +1071,11 @@ impl AuthenticatedClobClient {
             .client
             .http_client
             .delete(&url)
-            .header("POLY-ADDRESS", self.address())
-            .header("POLY-SIGNATURE", signature)
-            .header("POLY-TIMESTAMP", &timestamp)
-            .header("POLY-API-KEY", &credentials.api_key)
-            .header("POLY-PASSPHRASE", &credentials.api_passphrase)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
             .send()
             .await?;
 
