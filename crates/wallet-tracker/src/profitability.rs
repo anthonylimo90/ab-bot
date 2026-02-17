@@ -87,10 +87,10 @@ impl WalletMetrics {
 
     /// Get a composite score (0-100) combining multiple factors.
     pub fn composite_score(&self) -> f64 {
-        let roi_score = (self.roi_percentage * 100.0).min(30.0).max(0.0);
-        let sharpe_score = (self.sharpe_ratio * 10.0).min(25.0).max(0.0);
-        let win_rate_score = (self.win_rate * 25.0).min(25.0).max(0.0);
-        let consistency_score = (self.consistency_score * 20.0).min(20.0).max(0.0);
+        let roi_score = (self.roi_percentage * 100.0).clamp(0.0, 30.0);
+        let sharpe_score = (self.sharpe_ratio * 10.0).clamp(0.0, 25.0);
+        let win_rate_score = (self.win_rate * 25.0).clamp(0.0, 25.0);
+        let consistency_score = (self.consistency_score * 20.0).clamp(0.0, 20.0);
 
         roi_score + sharpe_score + win_rate_score + consistency_score
     }
@@ -304,11 +304,30 @@ impl ProfitabilityAnalyzer {
         Ok(results)
     }
 
+    /// Clamp an f64 to a range safe for PostgreSQL DECIMAL(20,8).
+    /// Replaces NaN and Infinity with 0.0, then clamps to [-999_999_999_999.0, 999_999_999_999.0].
+    fn clamp_for_decimal(value: f64) -> f64 {
+        if value.is_nan() || value.is_infinite() {
+            return 0.0;
+        }
+        value.clamp(-999_999_999_999.0, 999_999_999_999.0)
+    }
+
     /// Store metrics in the database.
     pub async fn store_metrics(&self, metrics: &WalletMetrics) -> Result<()> {
         let total_trades = i32::try_from(metrics.total_trades).unwrap_or(i32::MAX);
         let winning_trades = i32::try_from(metrics.winning_trades).unwrap_or(i32::MAX);
         let losing_trades = i32::try_from(metrics.losing_trades).unwrap_or(i32::MAX);
+
+        let roi = Self::clamp_for_decimal(metrics.roi_percentage);
+        let annualized = Self::clamp_for_decimal(metrics.annualized_return);
+        let sharpe = Self::clamp_for_decimal(metrics.sharpe_ratio);
+        let sortino = Self::clamp_for_decimal(metrics.sortino_ratio);
+        let max_drawdown = Self::clamp_for_decimal(metrics.max_drawdown);
+        let volatility = Self::clamp_for_decimal(metrics.volatility);
+        let consistency = Self::clamp_for_decimal(metrics.consistency_score);
+        let win_rate = Self::clamp_for_decimal(metrics.win_rate);
+        let composite = Self::clamp_for_decimal(metrics.composite_score() / 100.0);
 
         sqlx::query(
             r#"
@@ -345,19 +364,19 @@ impl ProfitabilityAnalyzer {
             "#,
         )
         .bind(&metrics.address)
-        .bind(metrics.roi_percentage)
-        .bind(metrics.annualized_return)
-        .bind(metrics.sharpe_ratio)
-        .bind(metrics.sortino_ratio)
-        .bind(metrics.max_drawdown)
-        .bind(metrics.volatility)
-        .bind(metrics.consistency_score)
-        .bind(metrics.win_rate)
+        .bind(roi)
+        .bind(annualized)
+        .bind(sharpe)
+        .bind(sortino)
+        .bind(max_drawdown)
+        .bind(volatility)
+        .bind(consistency)
+        .bind(win_rate)
         .bind(total_trades)
         .bind(winning_trades)
         .bind(losing_trades)
-        .bind(metrics.composite_score() / 100.0)
-        .bind(&metrics.computed_at)
+        .bind(composite)
+        .bind(metrics.computed_at)
         .execute(&self.pool)
         .await?;
 
@@ -1130,6 +1149,33 @@ mod tests {
         // Less than 5 PnLs => 0.0
         let pnls = vec![1.0, 2.0, -1.0];
         assert_eq!(analyzer.calculate_consistency_score(&pnls), 0.0);
+    }
+
+    #[test]
+    fn test_clamp_for_decimal() {
+        // Normal values pass through
+        assert_eq!(ProfitabilityAnalyzer::clamp_for_decimal(1.5), 1.5);
+        assert_eq!(ProfitabilityAnalyzer::clamp_for_decimal(-0.5), -0.5);
+
+        // NaN becomes 0
+        assert_eq!(ProfitabilityAnalyzer::clamp_for_decimal(f64::NAN), 0.0);
+
+        // Infinity becomes 0
+        assert_eq!(ProfitabilityAnalyzer::clamp_for_decimal(f64::INFINITY), 0.0);
+        assert_eq!(
+            ProfitabilityAnalyzer::clamp_for_decimal(f64::NEG_INFINITY),
+            0.0
+        );
+
+        // Extreme values are clamped
+        assert_eq!(
+            ProfitabilityAnalyzer::clamp_for_decimal(1e15),
+            999_999_999_999.0
+        );
+        assert_eq!(
+            ProfitabilityAnalyzer::clamp_for_decimal(-1e15),
+            -999_999_999_999.0
+        );
     }
 
     #[test]
