@@ -1,26 +1,32 @@
-'use client';
+"use client";
 
-import { useState, useMemo, useEffect } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Skeleton } from '@/components/ui/skeleton';
-import { MetricCard } from '@/components/shared/MetricCard';
-import { BacktestChart } from '@/components/charts/BacktestChart';
-import { useBacktest } from '@/hooks/useBacktest';
-import { useWorkspaceStore } from '@/stores/workspace-store';
-import { useModeStore } from '@/stores/mode-store';
-import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
-import { formatCurrency, shortenAddress } from '@/lib/utils';
-import { Play, ChevronDown, Loader2, AlertCircle, History } from 'lucide-react';
+import { useState, useMemo, useEffect } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { MetricCard } from "@/components/shared/MetricCard";
+import { BacktestChart } from "@/components/charts/BacktestChart";
+import { useBacktest } from "@/hooks/useBacktest";
+import { useWorkspaceStore } from "@/stores/workspace-store";
+import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
+import { formatCurrency, shortenAddress } from "@/lib/utils";
+import { Play, ChevronDown, Loader2, AlertCircle, History } from "lucide-react";
 
 export default function BacktestPage() {
   const { currentWorkspace } = useWorkspaceStore();
-  const { mode } = useModeStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
-  const { results, history, isRunning, error, runBacktest, loadHistory, loadResult } = useBacktest();
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const {
+    results,
+    history,
+    isRunning,
+    error,
+    runBacktest,
+    loadHistory,
+    loadResult,
+  } = useBacktest();
 
   // Date helpers
-  const formatDate = (date: Date) => date.toISOString().split('T')[0];
+  const formatDate = (date: Date) => date.toISOString().split("T")[0];
   const today = useMemo(() => new Date(), []);
   const getDateDaysAgo = (days: number) => {
     const date = new Date(today);
@@ -30,17 +36,28 @@ export default function BacktestPage() {
 
   // Form state
   const [capital, setCapital] = useState(1000);
-  const [startDate, setStartDate] = useState(() => formatDate(getDateDaysAgo(30)));
+  const [startDate, setStartDate] = useState(() =>
+    formatDate(getDateDaysAgo(30)),
+  );
   const [endDate, setEndDate] = useState(() => formatDate(today));
   const [slippage, setSlippage] = useState(0.1);
 
   // Date presets
-  const datePresets = useMemo(() => [
-    { label: '7D', days: 7 },
-    { label: '30D', days: 30 },
-    { label: '90D', days: 90 },
-    { label: 'YTD', days: Math.ceil((today.getTime() - new Date(today.getFullYear(), 0, 1).getTime()) / (1000 * 60 * 60 * 24)) },
-  ], [today]);
+  const datePresets = useMemo(
+    () => [
+      { label: "7D", days: 7 },
+      { label: "30D", days: 30 },
+      { label: "90D", days: 90 },
+      {
+        label: "YTD",
+        days: Math.ceil(
+          (today.getTime() - new Date(today.getFullYear(), 0, 1).getTime()) /
+            (1000 * 60 * 60 * 24),
+        ),
+      },
+    ],
+    [today],
+  );
 
   const applyDatePreset = (days: number) => {
     setStartDate(formatDate(getDateDaysAgo(days)));
@@ -64,34 +81,40 @@ export default function BacktestPage() {
 
   // Handle backtest run
   const handleRunBacktest = async () => {
-    const wallets = selectedWallets.length > 0 ? selectedWallets : allWallets.map(w => w.address);
+    const wallets =
+      selectedWallets.length > 0
+        ? selectedWallets
+        : allWallets.map((w) => w.address);
     await runBacktest({
       strategy: {
-        type: 'copy_trading',
+        type: "copy_trading",
         wallets,
         allocation_pct: 1 / Math.max(1, wallets.length),
       },
-      start_date: startDate + 'T00:00:00Z',
-      end_date: endDate + 'T00:00:00Z',
+      start_date: startDate + "T00:00:00Z",
+      end_date: endDate + "T00:00:00Z",
       initial_capital: capital,
-      slippage_model: slippage > 0 ? { type: 'fixed', pct: slippage / 100 } : { type: 'none' },
+      slippage_model:
+        slippage > 0
+          ? { type: "fixed", pct: slippage / 100 }
+          : { type: "none" },
       fee_pct: fees / 100,
     });
   };
 
   // Toggle wallet selection
   const toggleWallet = (address: string) => {
-    setSelectedWallets(prev =>
+    setSelectedWallets((prev) =>
       prev.includes(address)
-        ? prev.filter(a => a !== address)
-        : [...prev, address]
+        ? prev.filter((a) => a !== address)
+        : [...prev, address],
     );
   };
 
   // Generate equity curve from results
   const backtestData = useMemo(() => {
     if (!results?.equity_curve) return [];
-    return results.equity_curve.map(point => ({
+    return results.equity_curve.map((point) => ({
       time: point.timestamp,
       value: point.value,
     }));
@@ -113,7 +136,7 @@ export default function BacktestPage() {
           ) : (
             <Play className="mr-2 h-4 w-4" />
           )}
-          {isRunning ? 'Running...' : 'Run Backtest'}
+          {isRunning ? "Running..." : "Run Backtest"}
         </Button>
       </div>
 
@@ -215,7 +238,11 @@ export default function BacktestPage() {
                 {allWallets.map((wallet) => (
                   <Button
                     key={wallet.address}
-                    variant={selectedWallets.includes(wallet.address) ? 'default' : 'outline'}
+                    variant={
+                      selectedWallets.includes(wallet.address)
+                        ? "default"
+                        : "outline"
+                    }
                     size="sm"
                     onClick={() => toggleWallet(wallet.address)}
                   >
@@ -230,7 +257,8 @@ export default function BacktestPage() {
               </div>
             ) : (
               <p className="text-sm text-muted-foreground">
-                No wallets being tracked. Add wallets from the Trading page first.
+                No wallets being tracked. Add wallets from the Trading page
+                first.
               </p>
             )}
           </div>
@@ -253,14 +281,14 @@ export default function BacktestPage() {
       )}
 
       {/* Results */}
-      {results && results.status === 'completed' && (
+      {results && results.status === "completed" && (
         <>
           <div className="grid gap-4 md:grid-cols-4">
             <MetricCard
               title="Total Return"
-              value={`${results.total_return_pct >= 0 ? '+' : ''}${results.total_return_pct.toFixed(1)}%`}
+              value={`${results.total_return_pct >= 0 ? "+" : ""}${results.total_return_pct.toFixed(1)}%`}
               changeLabel={formatCurrency(results.total_return)}
-              trend={results.total_return_pct >= 0 ? 'up' : 'down'}
+              trend={results.total_return_pct >= 0 ? "up" : "down"}
             />
             <MetricCard
               title="Sharpe Ratio"
@@ -302,19 +330,27 @@ export default function BacktestPage() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div>
                   <p className="text-sm text-muted-foreground">Final Value</p>
-                  <p className="font-medium">{formatCurrency(results.final_value)}</p>
+                  <p className="font-medium">
+                    {formatCurrency(results.final_value)}
+                  </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Total Fees</p>
-                  <p className="font-medium text-loss">{formatCurrency(results.total_fees)}</p>
+                  <p className="font-medium text-loss">
+                    {formatCurrency(results.total_fees)}
+                  </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Profit Factor</p>
-                  <p className="font-medium">{results.profit_factor.toFixed(2)}</p>
+                  <p className="font-medium">
+                    {results.profit_factor.toFixed(2)}
+                  </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Sortino Ratio</p>
-                  <p className="font-medium">{results.sortino_ratio.toFixed(2)}</p>
+                  <p className="font-medium">
+                    {results.sortino_ratio.toFixed(2)}
+                  </p>
                 </div>
               </div>
             </CardContent>
@@ -327,8 +363,8 @@ export default function BacktestPage() {
         <Card>
           <CardContent className="py-20">
             <p className="text-center text-muted-foreground">
-              Configure your backtest parameters and click &quot;Run Backtest&quot; to see
-              results
+              Configure your backtest parameters and click &quot;Run
+              Backtest&quot; to see results
             </p>
           </CardContent>
         </Card>
@@ -342,7 +378,13 @@ export default function BacktestPage() {
               <Loader2 className="h-8 w-8 animate-spin text-primary" />
               <p className="text-muted-foreground">Running backtest...</p>
               <p className="text-xs text-muted-foreground">
-                Simulating {Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / (1000 * 60 * 60 * 24))} days of trading
+                Simulating{" "}
+                {Math.ceil(
+                  (new Date(endDate).getTime() -
+                    new Date(startDate).getTime()) /
+                    (1000 * 60 * 60 * 24),
+                )}{" "}
+                days of trading
               </p>
             </div>
           </CardContent>
@@ -368,7 +410,7 @@ export default function BacktestPage() {
                 >
                   <div>
                     <p className="font-medium text-sm capitalize">
-                      {result.strategy.type.replace(/_/g, ' ')}
+                      {result.strategy.type.replace(/_/g, " ")}
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {new Date(result.created_at).toLocaleDateString()} |
@@ -376,8 +418,11 @@ export default function BacktestPage() {
                     </p>
                   </div>
                   <div className="text-right">
-                    <p className={`font-medium ${result.total_return_pct >= 0 ? 'text-profit' : 'text-loss'}`}>
-                      {result.total_return_pct >= 0 ? '+' : ''}{result.total_return_pct.toFixed(1)}%
+                    <p
+                      className={`font-medium ${result.total_return_pct >= 0 ? "text-profit" : "text-loss"}`}
+                    >
+                      {result.total_return_pct >= 0 ? "+" : ""}
+                      {result.total_return_pct.toFixed(1)}%
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {result.total_trades} trades

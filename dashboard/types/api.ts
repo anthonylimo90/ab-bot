@@ -390,14 +390,6 @@ export interface RosterWallet extends Wallet {
   decision_brief?: DecisionBrief;
 }
 
-// Demo mode types
-export interface DemoBalance {
-  balance: number;
-  initial_balance: number;
-  pnl: number;
-  pnl_percent: number;
-}
-
 // Vault types (connected user wallets for live trading)
 export interface ConnectedWallet {
   id: string;
@@ -538,22 +530,6 @@ export interface DiscoveredWallet {
   is_tracked: boolean;
   trades_24h: number;
   total_pnl: number;
-}
-
-export interface WalletSimulation {
-  address: string;
-  allocation_pct: number;
-  pnl: number;
-  trades: number;
-}
-
-export interface DemoPnlSimulation {
-  initial_amount: number;
-  current_value: number;
-  pnl: number;
-  pnl_pct: number;
-  equity_curve: { date: string; value: number }[];
-  wallets: WalletSimulation[];
 }
 
 // Workspace types
@@ -838,53 +814,6 @@ export interface OptimizationResult {
     min_trades_30d?: number;
   };
   message?: string;
-}
-
-// Demo position types
-export interface DemoPosition {
-  id: string;
-  workspace_id: string;
-  created_by: string;
-  wallet_address: string;
-  wallet_label?: string;
-  market_id: string;
-  market_question?: string;
-  outcome: "yes" | "no";
-  quantity: number;
-  entry_price: number;
-  current_price?: number;
-  opened_at: string;
-  closed_at?: string;
-  exit_price?: number;
-  realized_pnl?: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface CreateDemoPositionRequest {
-  wallet_address: string;
-  wallet_label?: string;
-  market_id: string;
-  market_question?: string;
-  outcome: "yes" | "no";
-  quantity: number;
-  entry_price: number;
-  current_price?: number;
-  opened_at: string;
-}
-
-export interface UpdateDemoPositionRequest {
-  current_price?: number;
-  closed_at?: string;
-  exit_price?: number;
-  realized_pnl?: number;
-}
-
-export interface DemoBalance {
-  workspace_id: string;
-  balance: number;
-  initial_balance: number;
-  updated_at: string;
 }
 
 // Order Signing Types (for MetaMask trade signing)

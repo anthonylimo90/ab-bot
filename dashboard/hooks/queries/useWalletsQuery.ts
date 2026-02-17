@@ -1,19 +1,18 @@
-'use client';
+"use client";
 
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
-import { queryKeys } from '@/lib/queryClient';
-import type { Wallet, WalletMetrics, WalletTrade } from '@/types/api';
-import type { TradingMode } from '@/stores/mode-store';
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+import { queryKeys } from "@/lib/queryClient";
+import type { Wallet, WalletMetrics, WalletTrade } from "@/types/api";
 
 interface WalletFilters {
   copyEnabled?: boolean;
   minScore?: number;
 }
 
-export function useWalletsQuery(mode: TradingMode, filters?: WalletFilters) {
+export function useWalletsQuery(filters?: WalletFilters) {
   return useQuery({
-    queryKey: queryKeys.wallets.all(mode),
+    queryKey: queryKeys.wallets.all(),
     queryFn: async () => {
       const data = await api.getWallets({
         copy_enabled: filters?.copyEnabled,
@@ -25,36 +24,39 @@ export function useWalletsQuery(mode: TradingMode, filters?: WalletFilters) {
   });
 }
 
-export function useWalletQuery(mode: TradingMode, address: string, enabled = true) {
+export function useWalletQuery(address: string, enabled = true) {
   return useQuery({
-    queryKey: queryKeys.wallets.detail(mode, address),
+    queryKey: queryKeys.wallets.detail(address),
     queryFn: () => api.getWallet(address),
-    enabled: !!address && enabled,
+    enabled: Boolean(address) && enabled,
   });
 }
 
-export function useWalletMetricsQuery(mode: TradingMode, address: string, enabled = true) {
+export function useWalletMetricsQuery(address: string, enabled = true) {
   return useQuery({
-    queryKey: queryKeys.wallets.metrics(mode, address),
+    queryKey: queryKeys.wallets.metrics(address),
     queryFn: () => api.getWalletMetrics(address),
-    enabled: !!address && enabled,
+    enabled: Boolean(address) && enabled,
     staleTime: 5 * 60 * 1000,
   });
 }
 
-export function useWalletTradesQuery(mode: TradingMode, address: string, params?: {
-  limit?: number;
-  offset?: number;
-}) {
+export function useWalletTradesQuery(
+  address: string,
+  params?: {
+    limit?: number;
+    offset?: number;
+  },
+) {
   return useQuery({
-    queryKey: [...queryKeys.wallets.all(mode), 'trades', address, params] as const,
+    queryKey: [...queryKeys.wallets.all(), "trades", address, params] as const,
     queryFn: () => api.getWalletTrades(address, params),
-    enabled: !!address,
+    enabled: Boolean(address),
     staleTime: 30 * 1000,
   });
 }
 
-export function useTrackWalletMutation(mode: TradingMode) {
+export function useTrackWalletMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
@@ -68,12 +70,12 @@ export function useTrackWalletMutation(mode: TradingMode) {
       return api.addWallet({ address, label });
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all(mode) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all() });
     },
   });
 }
 
-export function useUntrackWalletMutation(mode: TradingMode) {
+export function useUntrackWalletMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
@@ -82,15 +84,15 @@ export function useUntrackWalletMutation(mode: TradingMode) {
       return { success: true };
     },
     onSuccess: (_, address) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all(mode) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all() });
       queryClient.removeQueries({
-        queryKey: queryKeys.wallets.detail(mode, address),
+        queryKey: queryKeys.wallets.detail(address),
       });
     },
   });
 }
 
-export function useUpdateWalletMutation(mode: TradingMode) {
+export function useUpdateWalletMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
@@ -109,9 +111,9 @@ export function useUpdateWalletMutation(mode: TradingMode) {
       return api.updateWallet(address, params);
     },
     onSuccess: (_, { address }) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all(mode) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all() });
       queryClient.invalidateQueries({
-        queryKey: queryKeys.wallets.detail(mode, address),
+        queryKey: queryKeys.wallets.detail(address),
       });
     },
   });
@@ -119,9 +121,9 @@ export function useUpdateWalletMutation(mode: TradingMode) {
 
 export function useWalletBalanceQuery(address: string | null) {
   return useQuery({
-    queryKey: ['wallet-balance', address],
+    queryKey: ["wallet-balance", address],
     queryFn: () => api.getWalletBalance(address!),
-    enabled: !!address,
+    enabled: Boolean(address),
     staleTime: 30_000,
     refetchInterval: 60_000,
     retry: 1,
@@ -129,8 +131,8 @@ export function useWalletBalanceQuery(address: string | null) {
 }
 
 // Derived hooks for roster/bench separation
-export function useRosterWallets(mode: TradingMode) {
-  const query = useWalletsQuery(mode);
+export function useRosterWallets() {
+  const query = useWalletsQuery();
 
   return {
     ...query,
@@ -138,8 +140,8 @@ export function useRosterWallets(mode: TradingMode) {
   };
 }
 
-export function useBenchWallets(mode: TradingMode) {
-  const query = useWalletsQuery(mode);
+export function useBenchWallets() {
+  const query = useWalletsQuery();
 
   return {
     ...query,
@@ -150,11 +152,11 @@ export function useBenchWallets(mode: TradingMode) {
 // Recommendations query - fetches top wallets for discovery
 export function useRecommendationsQuery(limit = 5) {
   return useQuery({
-    queryKey: ['recommendations', limit],
+    queryKey: ["recommendations", limit],
     queryFn: async () => {
       const wallets = await api.discoverWallets({
-        sort_by: 'roi',
-        period: '30d',
+        sort_by: "roi",
+        period: "30d",
         min_trades: 10,
         min_win_rate: 50,
         limit,

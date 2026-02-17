@@ -6,7 +6,7 @@ pub mod allocations;
 pub mod auth;
 pub mod auto_rotation;
 pub mod backtest;
-pub mod demo;
+
 pub mod discover;
 pub mod health;
 pub mod invites;

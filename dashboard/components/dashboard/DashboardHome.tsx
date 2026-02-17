@@ -1,12 +1,10 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState } from "react";
 import Link from "next/link";
 import { usePortfolioStats } from "@/hooks/usePortfolioStats";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { useModeStore } from "@/stores/mode-store";
-import { useDemoPortfolioStore } from "@/stores/demo-portfolio-store";
 import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
@@ -55,63 +53,10 @@ const activityIcons: Record<string, React.ReactNode> = {
 export function DashboardHome() {
   const [selectedPeriod, setSelectedPeriod] = useState<Period>("30D");
   const { currentWorkspace } = useWorkspaceStore();
-  const { mode } = useModeStore();
-  const { data: allocations = [] } = useAllocationsQuery(
-    currentWorkspace?.id,
-    mode,
-  );
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
   const activeWallets = allocations.filter((a) => a.tier === "active");
   const { stats, status: portfolioStatus } = usePortfolioStats(selectedPeriod);
   const { activities, status: activityStatus, unreadCount } = useActivity();
-
-  const isDemo = mode === "demo";
-  const {
-    positions: demoPositions,
-    closedPositions: demoClosedPositions,
-    getTotalValue,
-    getTotalPnl,
-    getTotalPnlPercent,
-    fetchAll: fetchDemoData,
-  } = useDemoPortfolioStore();
-
-  useEffect(() => {
-    if (isDemo) fetchDemoData();
-  }, [isDemo, fetchDemoData]);
-
-  const displayStats = useMemo(() => {
-    if (!isDemo) return stats;
-    const closedCount = demoClosedPositions.length;
-    const winCount = demoClosedPositions.filter(
-      (p) => (p.realizedPnl || 0) > 0,
-    ).length;
-    const realizedPnl = demoClosedPositions.reduce(
-      (sum, p) => sum + (p.realizedPnl || 0),
-      0,
-    );
-    const totalPnl = getTotalPnl();
-    return {
-      ...stats,
-      total_value: getTotalValue(),
-      total_pnl: totalPnl,
-      total_pnl_percent: getTotalPnlPercent(),
-      today_pnl: 0, // Today's PnL not tracked separately yet
-      today_pnl_percent: 0,
-      unrealized_pnl: totalPnl - realizedPnl,
-      realized_pnl: realizedPnl,
-      win_rate: closedCount > 0 ? (winCount / closedCount) * 100 : 0,
-      total_trades: closedCount,
-      winning_trades: winCount,
-      active_positions: demoPositions.length,
-    };
-  }, [
-    isDemo,
-    stats,
-    demoPositions,
-    demoClosedPositions,
-    getTotalValue,
-    getTotalPnl,
-    getTotalPnlPercent,
-  ]);
 
   const isAutomatic = currentWorkspace?.setup_mode === "automatic";
   const modeLabel = isAutomatic ? "Guided" : "Custom";
@@ -141,15 +86,15 @@ export function DashboardHome() {
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
           title="Portfolio Value"
-          value={formatCurrency(displayStats.total_value)}
-          change={displayStats.total_pnl_percent}
-          trend={displayStats.total_pnl_percent >= 0 ? "up" : "down"}
+          value={formatCurrency(stats.total_value)}
+          change={stats.total_pnl_percent}
+          trend={stats.total_pnl_percent >= 0 ? "up" : "down"}
         />
         <MetricCard
           title="Today's P&L"
-          value={formatCurrency(displayStats.today_pnl, { showSign: true })}
-          change={displayStats.today_pnl_percent}
-          trend={displayStats.today_pnl >= 0 ? "up" : "down"}
+          value={formatCurrency(stats.today_pnl, { showSign: true })}
+          change={stats.today_pnl_percent}
+          trend={stats.today_pnl >= 0 ? "up" : "down"}
         />
         <MetricCard
           title="Active Wallets"
@@ -163,8 +108,8 @@ export function DashboardHome() {
         />
         <MetricCard
           title="Open Positions"
-          value={displayStats.active_positions.toString()}
-          changeLabel={`Win rate: ${(displayStats.win_rate || 0).toFixed(0)}%`}
+          value={stats.active_positions.toString()}
+          changeLabel={`Win rate: ${(stats.win_rate || 0).toFixed(0)}%`}
           trend="neutral"
         />
       </div>
@@ -277,8 +222,8 @@ export function DashboardHome() {
                     <div className="text-left">
                       <p className="font-medium">View Positions</p>
                       <p className="text-xs text-muted-foreground">
-                        {displayStats.active_positions} open position
-                        {displayStats.active_positions !== 1 ? "s" : ""}
+                        {stats.active_positions} open position
+                        {stats.active_positions !== 1 ? "s" : ""}
                       </p>
                     </div>
                   </div>

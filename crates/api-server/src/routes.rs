@@ -11,7 +11,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    activity, admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health,
+    activity, admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health,
     invites, markets, onboarding, order_signing, positions, recommendations, risk_allocations,
     trading, users, vault, wallet_auth, wallets, workspaces,
 };
@@ -63,7 +63,7 @@ use crate::websocket;
         discover::get_live_trades,
         discover::discover_wallets,
         discover::get_discovered_wallet,
-        discover::simulate_demo_pnl,
+
         vault::store_wallet,
         vault::list_wallets,
         vault::get_wallet,
@@ -123,14 +123,7 @@ use crate::websocket;
         onboarding::set_budget,
         onboarding::auto_setup,
         onboarding::complete_onboarding,
-        // Demo positions
-        demo::list_demo_positions,
-        demo::create_demo_position,
-        demo::update_demo_position,
-        demo::delete_demo_position,
-        demo::get_demo_balance,
-        demo::update_demo_balance,
-        demo::reset_demo_portfolio,
+
         // Order signing (MetaMask)
         order_signing::prepare_order,
         order_signing::submit_order,
@@ -186,9 +179,7 @@ use crate::websocket;
             discover::LiveTrade,
             discover::DiscoveredWallet,
             discover::PredictionCategory,
-            discover::DemoPnlSimulation,
-            discover::WalletSimulation,
-            discover::EquityPoint,
+
             vault::StoreWalletRequest,
             vault::WalletInfo,
             vault::WalletBalanceResponse,
@@ -238,12 +229,7 @@ use crate::websocket;
             onboarding::AutoSetupRequest,
             onboarding::AutoSetupResponse,
             onboarding::AutoSelectedWallet,
-            // Demo
-            demo::DemoPositionResponse,
-            demo::CreateDemoPositionRequest,
-            demo::UpdateDemoPositionRequest,
-            demo::DemoBalanceResponse,
-            demo::UpdateDemoBalanceRequest,
+
             // Order signing
             order_signing::PrepareOrderRequest,
             order_signing::PrepareOrderResponse,
@@ -277,7 +263,7 @@ use crate::websocket;
         (name = "allocations", description = "Wallet roster allocations"),
         (name = "auto_rotation", description = "Auto-rotation history and optimization"),
         (name = "onboarding", description = "Setup wizard and onboarding"),
-        (name = "demo", description = "Demo trading positions and balance"),
+
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "activity", description = "Activity feed from copy trade history"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
@@ -341,10 +327,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/discover/wallets/:address",
             get(discover::get_discovered_wallet),
-        )
-        .route(
-            "/api/v1/discover/simulate",
-            get(discover::simulate_demo_pnl),
         )
         // Recommendations (public for demo purposes)
         .route(
@@ -458,9 +440,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Onboarding status (read for all)
         .route("/api/v1/onboarding/status", get(onboarding::get_status))
-        // Demo positions (read for all workspace members)
-        .route("/api/v1/demo/positions", get(demo::list_demo_positions))
-        .route("/api/v1/demo/balance", get(demo::get_demo_balance))
         // Apply auth middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -583,18 +562,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/onboarding/complete",
             put(onboarding::complete_onboarding),
         )
-        // Demo positions (write requires trader role)
-        .route("/api/v1/demo/positions", post(demo::create_demo_position))
-        .route(
-            "/api/v1/demo/positions/:position_id",
-            put(demo::update_demo_position),
-        )
-        .route(
-            "/api/v1/demo/positions/:position_id",
-            delete(demo::delete_demo_position),
-        )
-        .route("/api/v1/demo/balance", put(demo::update_demo_balance))
-        .route("/api/v1/demo/reset", post(demo::reset_demo_portfolio))
         // Apply trader check first, then auth
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

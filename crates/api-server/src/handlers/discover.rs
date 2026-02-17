@@ -86,45 +86,6 @@ pub enum PredictionCategory {
     InsufficientData,
 }
 
-/// Equity curve point for demo simulation.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct EquityPoint {
-    /// Date as ISO string.
-    pub date: String,
-    /// Portfolio value.
-    pub value: Decimal,
-}
-
-/// Demo P&L simulation result.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct DemoPnlSimulation {
-    /// Initial investment amount.
-    pub initial_amount: Decimal,
-    /// Current simulated value.
-    pub current_value: Decimal,
-    /// Absolute P&L.
-    pub pnl: Decimal,
-    /// P&L percentage.
-    pub pnl_pct: Decimal,
-    /// Simulated equity curve.
-    pub equity_curve: Vec<EquityPoint>,
-    /// Wallets included in simulation.
-    pub wallets: Vec<WalletSimulation>,
-}
-
-/// Individual wallet contribution to simulation.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct WalletSimulation {
-    /// Wallet address.
-    pub address: String,
-    /// Allocation percentage.
-    pub allocation_pct: Decimal,
-    /// P&L contribution.
-    pub pnl: Decimal,
-    /// Number of trades simulated.
-    pub trades: i64,
-}
-
 /// Query parameters for live trades.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct LiveTradesQuery {
@@ -169,23 +130,6 @@ fn default_period() -> String {
 
 fn default_discover_limit() -> i64 {
     20
-}
-
-/// Query parameters for demo P&L simulation.
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct DemoSimulationQuery {
-    /// Initial investment amount in USD.
-    #[serde(default = "default_amount")]
-    pub amount: Decimal,
-    /// Time period for simulation.
-    #[serde(default = "default_period")]
-    pub period: String,
-    /// Wallet addresses to include (comma-separated).
-    pub wallets: Option<String>,
-}
-
-fn default_amount() -> Decimal {
-    Decimal::new(100, 0)
 }
 
 /// Get live trades from monitored wallets.
@@ -413,96 +357,6 @@ fn sort_wallets(wallets: &mut [DiscoveredWallet], sort_by: &str, period: &str) {
     }
 }
 
-/// Run a demo P&L simulation.
-#[utoipa::path(
-    get,
-    path = "/api/v1/discover/simulate",
-    tag = "discover",
-    params(DemoSimulationQuery),
-    responses(
-        (status = 200, description = "Simulation results", body = DemoPnlSimulation),
-        (status = 500, description = "Internal server error")
-    )
-)]
-pub async fn simulate_demo_pnl(
-    State(_state): State<Arc<AppState>>,
-    Query(query): Query<DemoSimulationQuery>,
-) -> ApiResult<Json<DemoPnlSimulation>> {
-    let simulation = generate_simulation(query.amount, &query.period, query.wallets.as_deref());
-    Ok(Json(simulation))
-}
-
-fn generate_simulation(amount: Decimal, period: &str, _wallets: Option<&str>) -> DemoPnlSimulation {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-
-    let days = match period {
-        "7d" => 7,
-        "90d" => 90,
-        _ => 30,
-    };
-
-    // Generate equity curve
-    let mut value = amount;
-    let daily_return = 0.008; // ~0.8% daily average
-    let volatility = 0.03;
-
-    let mut equity_curve = Vec::with_capacity(days);
-    let now = Utc::now();
-
-    for i in (0..=days).rev() {
-        let date = (now - chrono::Duration::days(i as i64))
-            .format("%Y-%m-%d")
-            .to_string();
-
-        let random_factor = 1.0 + (rng.gen::<f64>() - 0.5) * volatility * 2.0;
-        value = value
-            * Decimal::from_f64_retain(1.0 + daily_return).unwrap_or(Decimal::ONE)
-            * Decimal::from_f64_retain(random_factor).unwrap_or(Decimal::ONE);
-
-        equity_curve.push(EquityPoint {
-            date,
-            value: value.round_dp(2),
-        });
-    }
-
-    let final_value = equity_curve.last().map(|e| e.value).unwrap_or(amount);
-    let pnl = final_value - amount;
-    let pnl_pct = if amount > Decimal::ZERO {
-        (pnl / amount) * Decimal::new(100, 0)
-    } else {
-        Decimal::ZERO
-    };
-
-    DemoPnlSimulation {
-        initial_amount: amount,
-        current_value: final_value,
-        pnl,
-        pnl_pct: pnl_pct.round_dp(2),
-        equity_curve,
-        wallets: vec![
-            WalletSimulation {
-                address: "0x1234...5678".to_string(),
-                allocation_pct: Decimal::new(40, 0),
-                pnl: pnl * Decimal::new(40, 2),
-                trades: 23,
-            },
-            WalletSimulation {
-                address: "0xabcd...ef12".to_string(),
-                allocation_pct: Decimal::new(35, 0),
-                pnl: pnl * Decimal::new(35, 2),
-                trades: 18,
-            },
-            WalletSimulation {
-                address: "0x5678...9012".to_string(),
-                allocation_pct: Decimal::new(25, 0),
-                pnl: pnl * Decimal::new(25, 2),
-                trades: 12,
-            },
-        ],
-    }
-}
-
 /// Get a single discovered wallet by address.
 #[utoipa::path(
     get,
@@ -546,18 +400,5 @@ pub async fn get_discovered_wallet(
             tracing::warn!(error = %e, address = %address, "Failed to query discovered wallet");
             Err(ApiError::Internal("Failed to query wallet".into()))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_simulation_pnl() {
-        let sim = generate_simulation(Decimal::new(100, 0), "30d", None);
-        assert_eq!(sim.initial_amount, Decimal::new(100, 0));
-        assert!(!sim.equity_curve.is_empty());
-        assert_eq!(sim.wallets.len(), 3);
     }
 }

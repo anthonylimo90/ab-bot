@@ -348,21 +348,6 @@ pub async fn set_budget(
     .execute(&state.pool)
     .await?;
 
-    // Sync demo balance with the configured budget
-    sqlx::query(
-        r#"
-        INSERT INTO demo_balances (workspace_id, balance, initial_balance, updated_at)
-        VALUES ($1, $2, $2, $3)
-        ON CONFLICT (workspace_id)
-        DO UPDATE SET balance = $2, initial_balance = $2, updated_at = $3
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(req.total_budget)
-    .bind(now)
-    .execute(&state.pool)
-    .await?;
-
     // Update onboarding step
     sqlx::query(
         r#"

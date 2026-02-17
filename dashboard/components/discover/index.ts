@@ -1,3 +1,2 @@
-export { LiveActivityFeed } from './LiveActivityFeed';
-export { DemoPnlCalculator } from './DemoPnlCalculator';
-export { WalletLeaderboard } from './WalletLeaderboard';
+export { LiveActivityFeed } from "./LiveActivityFeed";
+export { WalletLeaderboard } from "./WalletLeaderboard";

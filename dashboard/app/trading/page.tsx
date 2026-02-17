@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,11 +15,6 @@ import {
 } from "@/components/trading";
 import { AllocationAdjustmentPanel } from "@/components/allocations/AllocationAdjustmentPanel";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
-import {
-  useDemoPortfolioStore,
-  DemoPosition,
-} from "@/stores/demo-portfolio-store";
-import { useModeStore } from "@/stores/mode-store";
 import { useToastStore } from "@/stores/toast-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { usePortfolioStats } from "@/hooks/usePortfolioStats";
@@ -43,13 +38,10 @@ import {
 } from "@/lib/utils";
 import {
   TrendingUp,
-  TrendingDown,
   Eye,
   Star,
   Search,
   Plus,
-  RefreshCw,
-  TestTube2,
   History,
   Bot,
 } from "lucide-react";
@@ -91,26 +83,6 @@ interface TradingWallet {
   probationUntil?: string;
   isAutoSelected?: boolean;
   consecutiveLosses?: number;
-}
-
-// Convert demo position to wallet position format
-function toWalletPosition(p: DemoPosition): WalletPosition {
-  const pnl = (p.currentPrice - p.entryPrice) * p.quantity;
-  const pnlPercent =
-    p.entryPrice !== 0
-      ? ((p.currentPrice - p.entryPrice) / p.entryPrice) * 100
-      : 0;
-  return {
-    id: p.id,
-    marketId: p.marketId,
-    marketQuestion: p.marketQuestion,
-    outcome: p.outcome,
-    quantity: p.quantity,
-    entryPrice: p.entryPrice,
-    currentPrice: p.currentPrice,
-    pnl,
-    pnlPercent,
-  };
 }
 
 function livePositionToWalletPosition(p: Position): WalletPosition {
@@ -174,34 +146,20 @@ export default function TradingPage() {
   const toast = useToastStore();
   const [walletSearch, setWalletSearch] = useState("");
   const { currentWorkspace } = useWorkspaceStore();
-  const { mode } = useModeStore();
-  const isDemo = mode === "demo";
 
   // Get tab from URL, default to 'active'
   const currentTab = searchParams.get("tab") || "active";
 
-  const { data: allocations = [] } = useAllocationsQuery(
-    currentWorkspace?.id,
-    mode,
-  );
-  const { data: discoveredWallets = [] } = useDiscoverWalletsQuery(mode, {
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const { data: discoveredWallets = [] } = useDiscoverWalletsQuery({
     minTrades: 1,
     limit: 250,
   });
-  const promoteMutation = usePromoteAllocationMutation(
-    currentWorkspace?.id,
-    mode,
-  );
-  const demoteMutation = useDemoteAllocationMutation(
-    currentWorkspace?.id,
-    mode,
-  );
-  const removeMutation = useRemoveAllocationMutation(
-    currentWorkspace?.id,
-    mode,
-  );
-  const pinMutation = usePinAllocationMutation(currentWorkspace?.id, mode);
-  const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id, mode);
+  const promoteMutation = usePromoteAllocationMutation(currentWorkspace?.id);
+  const demoteMutation = useDemoteAllocationMutation(currentWorkspace?.id);
+  const removeMutation = useRemoveAllocationMutation(currentWorkspace?.id);
+  const pinMutation = usePinAllocationMutation(currentWorkspace?.id);
+  const unpinMutation = useUnpinAllocationMutation(currentWorkspace?.id);
 
   // Build lookup map of discovered wallets by address
   const discoveryMap = useMemo(() => {
@@ -241,89 +199,42 @@ export default function TradingPage() {
     : allBenchWallets;
   const isRosterFull = () => allActiveWallets.length >= 5;
 
-  // Demo portfolio store
-  const {
-    positions: demoPositions,
-    closedPositions: demoClosedPositions,
-    isLoading: isLoadingPositions,
-    fetchAll,
-    closePosition: closeDemoPosition,
-    getTotalValue,
-    getTotalPnl,
-  } = useDemoPortfolioStore();
-
-  // Live data hooks (no-ops in demo mode due to enabled: mode === 'live')
   const { stats: liveStats } = usePortfolioStats("30D");
-  const { data: liveOpenPositions = [] } = usePositionsQuery(mode, {
-    status: "open",
-  });
-  const { data: liveClosedPositions = [] } = usePositionsQuery(mode, {
+  const { data: liveOpenPositions = [], isLoading: isLoadingPositions } =
+    usePositionsQuery({ status: "open" });
+  const { data: liveClosedPositions = [] } = usePositionsQuery({
     status: "closed",
   });
   const { primaryWallet } = useWalletStore();
-  const { data: walletBalance } = useWalletBalanceQuery(
-    mode === "live" ? primaryWallet : null,
-  );
+  const { data: walletBalance } = useWalletBalanceQuery(primaryWallet);
 
-  // Fetch positions on mount
-  useEffect(() => {
-    if (isDemo) {
-      fetchAll();
-    }
-  }, [isDemo, fetchAll]);
-
-  // Group positions by wallet address
+  // Group open positions by wallet address
   const positionsByWallet = useMemo(() => {
     const grouped: Record<string, WalletPosition[]> = {};
-    if (isDemo) {
-      demoPositions.forEach((p) => {
-        const wallet = p.walletAddress || "manual";
-        if (!grouped[wallet]) grouped[wallet] = [];
-        grouped[wallet].push(toWalletPosition(p));
-      });
-    } else {
-      liveOpenPositions.forEach((p) => {
-        const wallet = p.source_wallet || "manual";
-        if (!grouped[wallet]) grouped[wallet] = [];
-        grouped[wallet].push(livePositionToWalletPosition(p));
-      });
-    }
+    liveOpenPositions.forEach((p) => {
+      const wallet = p.source_wallet || "manual";
+      if (!grouped[wallet]) grouped[wallet] = [];
+      grouped[wallet].push(livePositionToWalletPosition(p));
+    });
     return grouped;
-  }, [isDemo, demoPositions, liveOpenPositions]);
+  }, [liveOpenPositions]);
 
   // Manual positions (no source wallet)
   const manualPositions = positionsByWallet["manual"] || [];
 
-  // Get balance from store
-  const { balance: demoBalance } = useDemoPortfolioStore();
-
-  // Calculate summary stats
-  const totalValue = isDemo ? getTotalValue() : liveStats.total_value;
-  const totalPnl = isDemo ? getTotalPnl() : liveStats.unrealized_pnl;
-  const positionCount = isDemo
-    ? demoPositions.length
-    : liveOpenPositions.length;
-  const closedCount = isDemo
-    ? demoClosedPositions.length
-    : liveClosedPositions.length;
-  const winCount = isDemo
-    ? demoClosedPositions.filter((p) => (p.realizedPnl || 0) > 0).length
-    : liveClosedPositions.filter(
-        (p) => (p.realized_pnl ?? p.unrealized_pnl) > 0,
-      ).length;
-  const winRate = isDemo
-    ? closedCount > 0
-      ? (winCount / closedCount) * 100
-      : 0
-    : closedCount > 0
-      ? (winCount / closedCount) * 100
-      : 0;
-  const realizedPnl = isDemo
-    ? demoClosedPositions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0)
-    : liveClosedPositions.reduce(
-        (sum, p) => sum + (p.realized_pnl ?? p.unrealized_pnl),
-        0,
-      );
+  // Summary stats
+  const totalValue = liveStats.total_value;
+  const totalPnl = liveStats.unrealized_pnl;
+  const positionCount = liveOpenPositions.length;
+  const closedCount = liveClosedPositions.length;
+  const winCount = liveClosedPositions.filter(
+    (p) => (p.realized_pnl ?? p.unrealized_pnl) > 0,
+  ).length;
+  const winRate = closedCount > 0 ? (winCount / closedCount) * 100 : 0;
+  const realizedPnl = liveClosedPositions.reduce(
+    (sum, p) => sum + (p.realized_pnl ?? p.unrealized_pnl),
+    0,
+  );
 
   // Handle tab change
   const handleTabChange = (value: string) => {
@@ -363,14 +274,6 @@ export default function TradingPage() {
     });
   };
 
-  const handleClosePosition = (id: string) => {
-    const position = demoPositions.find((p) => p.id === id);
-    if (position) {
-      closeDemoPosition(id, position.currentPrice);
-      toast.success("Position Closed", "Position has been closed");
-    }
-  };
-
   // Pin/Unpin handlers
   const handlePin = (address: string) => {
     pinMutation.mutate(address, {
@@ -399,7 +302,7 @@ export default function TradingPage() {
   const maxPins = 3;
   const pinsRemaining = maxPins - pinnedCount;
 
-  // Normalized closed positions for both modes
+  // Normalized closed positions for display
   interface ClosedPositionDisplay {
     id: string;
     marketQuestion?: string;
@@ -415,21 +318,6 @@ export default function TradingPage() {
   }
 
   const closedDisplayPositions: ClosedPositionDisplay[] = useMemo(() => {
-    if (isDemo) {
-      return demoClosedPositions.map((p) => ({
-        id: p.id,
-        marketQuestion: p.marketQuestion,
-        marketId: p.marketId,
-        outcome: p.outcome,
-        entryPrice: p.entryPrice,
-        exitPrice: p.exitPrice ?? p.currentPrice,
-        quantity: p.quantity,
-        realizedPnl: p.realizedPnl || 0,
-        walletAddress: p.walletAddress,
-        walletLabel: p.walletLabel,
-        closedAt: p.closedAt,
-      }));
-    }
     return liveClosedPositions.map((p) => ({
       id: p.id,
       marketQuestion: undefined,
@@ -443,44 +331,28 @@ export default function TradingPage() {
       walletLabel: undefined,
       closedAt: p.updated_at,
     }));
-  }, [isDemo, demoClosedPositions, liveClosedPositions]);
+  }, [liveClosedPositions]);
 
   return (
     <ErrorBoundary>
       <div className="space-y-6">
         {/* Page Header */}
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div>
-              <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
-                <TrendingUp className="h-8 w-8" />
-                Trading
-              </h1>
-              <p className="text-muted-foreground">
-                Manage your copy trading wallets and positions
-              </p>
-            </div>
-            {isDemo && (
-              <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-demo/10 text-demo text-sm font-medium">
-                <TestTube2 className="h-4 w-4" />
-                Demo Mode
-              </div>
-            )}
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
+              <TrendingUp className="h-8 w-8" />
+              Trading
+            </h1>
+            <p className="text-muted-foreground">
+              Manage your copy trading wallets and positions
+            </p>
           </div>
-          <div className="flex gap-2">
-            {isDemo && (
-              <Button variant="outline" size="sm" onClick={() => fetchAll()}>
-                <RefreshCw className="mr-2 h-4 w-4" />
-                Refresh
-              </Button>
-            )}
-            <Link href="/discover">
-              <Button>
-                <Search className="mr-2 h-4 w-4" />
-                Discover Wallets
-              </Button>
-            </Link>
-          </div>
+          <Link href="/discover">
+            <Button>
+              <Search className="mr-2 h-4 w-4" />
+              Discover Wallets
+            </Button>
+          </Link>
         </div>
 
         {/* Portfolio Summary */}
@@ -490,10 +362,7 @@ export default function TradingPage() {
           positionCount={positionCount}
           winRate={winRate}
           realizedPnl={realizedPnl}
-          availableBalance={
-            isDemo ? demoBalance : (walletBalance?.usdc_balance ?? undefined)
-          }
-          isDemo={isDemo}
+          availableBalance={walletBalance?.usdc_balance ?? undefined}
         />
 
         {/* Search */}
@@ -584,7 +453,6 @@ export default function TradingPage() {
                     wallet={wallet}
                     positions={positionsByWallet[wallet.address] || []}
                     onDemote={handleDemote}
-                    onClosePosition={handleClosePosition}
                     onPin={handlePin}
                     onUnpin={handleUnpin}
                     isActive={true}
@@ -625,10 +493,7 @@ export default function TradingPage() {
 
             {/* Manual Positions Section */}
             {manualPositions.length > 0 && (
-              <ManualPositions
-                positions={manualPositions}
-                onClosePosition={handleClosePosition}
-              />
+              <ManualPositions positions={manualPositions} />
             )}
 
             {/* Risk-Based Allocation Adjustment */}
@@ -799,10 +664,7 @@ export default function TradingPage() {
 
           {/* Automation Tab */}
           <TabsContent value="automation" className="space-y-4">
-            <AutomationPanel
-              workspaceId={currentWorkspace?.id ?? ""}
-              onRefresh={() => fetchAll()}
-            />
+            <AutomationPanel workspaceId={currentWorkspace?.id ?? ""} />
           </TabsContent>
         </Tabs>
       </div>

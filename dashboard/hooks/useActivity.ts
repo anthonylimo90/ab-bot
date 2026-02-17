@@ -1,24 +1,28 @@
-'use client';
+"use client";
 
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { useWebSocket, ConnectionStatus } from './useWebSocket';
-import { useModeStore } from '@/stores/mode-store';
-import { useToastStore } from '@/stores/toast-store';
-import { api } from '@/lib/api';
-import type { Activity, ActivityType, WebSocketMessage, SignalUpdate } from '@/types/api';
+import { useState, useCallback, useEffect, useRef } from "react";
+import { useWebSocket, ConnectionStatus } from "./useWebSocket";
+import { useToastStore } from "@/stores/toast-store";
+import { api } from "@/lib/api";
+import type {
+  Activity,
+  ActivityType,
+  WebSocketMessage,
+  SignalUpdate,
+} from "@/types/api";
 
 const SEEN_IDS_MAX = 1000;
 const SEEN_IDS_TRIM_TO = 500;
 
 function isSignalUpdate(data: unknown): data is SignalUpdate {
-  if (typeof data !== 'object' || data === null) return false;
+  if (typeof data !== "object" || data === null) return false;
   const d = data as Record<string, unknown>;
   return (
-    typeof d.signal_id === 'string' &&
-    typeof d.signal_type === 'string' &&
-    typeof d.market_id === 'string' &&
-    typeof d.action === 'string' &&
-    typeof d.timestamp === 'string'
+    typeof d.signal_id === "string" &&
+    typeof d.signal_type === "string" &&
+    typeof d.market_id === "string" &&
+    typeof d.action === "string" &&
+    typeof d.timestamp === "string"
   );
 }
 
@@ -31,68 +35,68 @@ interface UseActivityReturn {
 
 // Map signal type to activity type
 function signalToActivity(signal: SignalUpdate): Activity {
-  let type: ActivityType = 'RECOMMENDATION_NEW';
-  let message = '';
+  let type: ActivityType = "RECOMMENDATION_NEW";
+  let message = "";
 
   switch (signal.signal_type) {
-    case 'Arbitrage': {
+    case "Arbitrage": {
       switch (signal.action) {
-        case 'executed':
-          type = 'ARB_POSITION_OPENED';
+        case "executed":
+          type = "ARB_POSITION_OPENED";
           message = `Arb position opened on ${signal.market_id.slice(0, 20)}...`;
           break;
-        case 'execution_failed':
-          type = 'ARB_EXECUTION_FAILED';
-          message = `Arb execution failed: ${signal.metadata?.reason || 'Unknown'}`;
+        case "execution_failed":
+          type = "ARB_EXECUTION_FAILED";
+          message = `Arb execution failed: ${signal.metadata?.reason || "Unknown"}`;
           break;
-        case 'closed_via_exit':
-          type = 'ARB_POSITION_CLOSED';
+        case "closed_via_exit":
+          type = "ARB_POSITION_CLOSED";
           message = `Arb position closed via exit`;
           break;
-        case 'closed_via_resolution':
-          type = 'ARB_POSITION_CLOSED';
+        case "closed_via_resolution":
+          type = "ARB_POSITION_CLOSED";
           message = `Arb position closed via resolution`;
           break;
-        case 'exit':
-          type = 'ARB_POSITION_CLOSED';
+        case "exit":
+          type = "ARB_POSITION_CLOSED";
           message = `Arb position exited`;
           break;
         default:
-          type = 'ARBITRAGE_DETECTED';
+          type = "ARBITRAGE_DETECTED";
           message = `Arbitrage opportunity on ${signal.market_id.slice(0, 20)}...`;
           break;
       }
       break;
     }
-    case 'CopyTrade':
-      if (signal.action === 'skipped') {
-        type = 'TRADE_COPY_SKIPPED';
-        message = `Skipped: ${signal.metadata?.reason || 'Unknown reason'}`;
-      } else if (signal.action === 'failed') {
-        type = 'TRADE_COPY_FAILED';
-        message = `Failed: ${signal.metadata?.error || 'Unknown error'}`;
-      } else if (signal.action === 'copied') {
-        type = 'TRADE_COPIED';
+    case "CopyTrade":
+      if (signal.action === "skipped") {
+        type = "TRADE_COPY_SKIPPED";
+        message = `Skipped: ${signal.metadata?.reason || "Unknown reason"}`;
+      } else if (signal.action === "failed") {
+        type = "TRADE_COPY_FAILED";
+        message = `Failed: ${signal.metadata?.error || "Unknown error"}`;
+      } else if (signal.action === "copied") {
+        type = "TRADE_COPIED";
         message = `Copied trade on ${signal.market_id}`;
       } else {
-        type = 'TRADE_COPIED';
+        type = "TRADE_COPIED";
         message = `Copy trade signal: ${signal.action} on ${signal.market_id}`;
       }
       break;
-    case 'StopLoss':
-      type = 'STOP_LOSS_TRIGGERED';
+    case "StopLoss":
+      type = "STOP_LOSS_TRIGGERED";
       message = `Stop-loss triggered on ${signal.market_id}`;
       break;
-    case 'TakeProfit':
-      type = 'TAKE_PROFIT_TRIGGERED';
+    case "TakeProfit":
+      type = "TAKE_PROFIT_TRIGGERED";
       message = `Take-profit triggered on ${signal.market_id}`;
       break;
-    case 'Alert':
-      if (signal.action === 'exit_failed') {
-        type = 'ARB_EXIT_FAILED';
-        message = `Exit failed: ${signal.metadata?.reason || 'Unknown reason'}`;
+    case "Alert":
+      if (signal.action === "exit_failed") {
+        type = "ARB_EXIT_FAILED";
+        message = `Exit failed: ${signal.metadata?.reason || "Unknown reason"}`;
       } else {
-        type = 'RECOMMENDATION_NEW';
+        type = "RECOMMENDATION_NEW";
         message = String(signal.metadata?.message || signal.action);
       }
       break;
@@ -115,19 +119,12 @@ function signalToActivity(signal: SignalUpdate): Activity {
 }
 
 export function useActivity(): UseActivityReturn {
-  const { mode } = useModeStore();
   const [activities, setActivities] = useState<Activity[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const seenIds = useRef(new Set<string>());
 
-  // Fetch persisted activity on mount (live mode only)
+  // Fetch persisted activity on mount
   useEffect(() => {
-    if (mode !== 'live') {
-      setActivities([]);
-      seenIds.current.clear();
-      return;
-    }
-
     let cancelled = false;
     api
       .getActivity({ limit: 50 })
@@ -146,11 +143,11 @@ export function useActivity(): UseActivityReturn {
     return () => {
       cancelled = true;
     };
-  }, [mode]);
+  }, []);
 
   // Handle WebSocket messages (signals)
   const handleMessage = useCallback((message: WebSocketMessage) => {
-    if (message.type !== 'Signal') return;
+    if (message.type !== "Signal") return;
     if (!isSignalUpdate(message.data)) return;
 
     const activity = signalToActivity(message.data);
@@ -162,7 +159,9 @@ export function useActivity(): UseActivityReturn {
     // Cap seenIds to prevent unbounded growth
     if (seenIds.current.size > SEEN_IDS_MAX) {
       const entries = Array.from(seenIds.current);
-      seenIds.current = new Set(entries.slice(entries.length - SEEN_IDS_TRIM_TO));
+      seenIds.current = new Set(
+        entries.slice(entries.length - SEEN_IDS_TRIM_TO),
+      );
     }
 
     setActivities((prev) => [activity, ...prev].slice(0, 50));
@@ -171,35 +170,34 @@ export function useActivity(): UseActivityReturn {
     // Fire toast notification
     const toast = useToastStore.getState();
     switch (activity.type) {
-      case 'TRADE_COPIED':
-        toast.success('Trade Copied', activity.message);
+      case "TRADE_COPIED":
+        toast.success("Trade Copied", activity.message);
         break;
-      case 'ARB_POSITION_OPENED':
-        toast.success('Arb Position Opened', activity.message);
+      case "ARB_POSITION_OPENED":
+        toast.success("Arb Position Opened", activity.message);
         break;
-      case 'ARB_POSITION_CLOSED':
-        toast.info('Arb Position Closed', activity.message);
+      case "ARB_POSITION_CLOSED":
+        toast.info("Arb Position Closed", activity.message);
         break;
-      case 'TRADE_COPY_FAILED':
-      case 'ARB_EXECUTION_FAILED':
-      case 'ARB_EXIT_FAILED':
-        toast.error('Trading Error', activity.message);
+      case "TRADE_COPY_FAILED":
+      case "ARB_EXECUTION_FAILED":
+      case "ARB_EXIT_FAILED":
+        toast.error("Trading Error", activity.message);
         break;
-      case 'TRADE_COPY_SKIPPED':
-        toast.warning('Trade Skipped', activity.message);
+      case "TRADE_COPY_SKIPPED":
+        toast.warning("Trade Skipped", activity.message);
         break;
-      case 'STOP_LOSS_TRIGGERED':
-      case 'TAKE_PROFIT_TRIGGERED':
-        toast.warning('Risk Alert', activity.message);
+      case "STOP_LOSS_TRIGGERED":
+      case "TAKE_PROFIT_TRIGGERED":
+        toast.warning("Risk Alert", activity.message);
         break;
     }
   }, []);
 
-  // WebSocket connection for live signals (only in live mode)
+  // WebSocket connection for live signals
   const { status } = useWebSocket({
-    channel: 'signals',
+    channel: "signals",
     onMessage: handleMessage,
-    enabled: mode === 'live',
   });
 
   const markAsRead = useCallback(() => {

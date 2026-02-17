@@ -19,7 +19,6 @@ interface PortfolioSummaryProps {
   winRate: number;
   realizedPnl?: number;
   availableBalance?: number;
-  isDemo?: boolean;
 }
 
 export const PortfolioSummary = memo(function PortfolioSummary({
@@ -29,7 +28,6 @@ export const PortfolioSummary = memo(function PortfolioSummary({
   winRate,
   realizedPnl = 0,
   availableBalance,
-  isDemo = false,
 }: PortfolioSummaryProps) {
   const unrealizedPnl = totalPnl - realizedPnl;
 
@@ -154,9 +152,7 @@ export const PortfolioSummary = memo(function PortfolioSummary({
                 <Wallet className="h-5 w-5 text-blue-500" />
               </div>
               <div>
-                <p className="text-sm text-muted-foreground">
-                  {isDemo ? "Demo Cash" : "USDC Balance"}
-                </p>
+                <p className="text-sm text-muted-foreground">USDC Balance</p>
                 <p className="text-2xl font-bold tabular-nums">
                   {formatCurrency(availableBalance)}
                 </p>

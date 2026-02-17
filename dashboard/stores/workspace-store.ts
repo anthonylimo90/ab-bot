@@ -1,8 +1,7 @@
-import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
-import type { Workspace, WorkspaceListItem } from '@/types/api';
-import api from '@/lib/api';
-import { useDemoPortfolioStore } from './demo-portfolio-store';
+import { create } from "zustand";
+import { persist, createJSONStorage } from "zustand/middleware";
+import type { Workspace, WorkspaceListItem } from "@/types/api";
+import api from "@/lib/api";
 
 interface WorkspaceStore {
   workspaces: WorkspaceListItem[];
@@ -39,7 +38,8 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
           set({ workspaces, isLoading: false });
         } catch (err) {
           set({
-            error: err instanceof Error ? err.message : 'Failed to fetch workspaces',
+            error:
+              err instanceof Error ? err.message : "Failed to fetch workspaces",
             isLoading: false,
           });
         }
@@ -50,22 +50,19 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
         try {
           const workspace = await api.getCurrentWorkspace();
           set({ currentWorkspace: workspace, isLoading: false });
-
-          // Sync demo positions for current workspace
-          const demoStore = useDemoPortfolioStore.getState();
-          demoStore.setWorkspaceId(workspace.id);
-          try {
-            await demoStore.fetchAll();
-          } catch (e) {
-            console.warn('Failed to sync demo positions:', e);
-          }
         } catch (err) {
           // If 404, user has no workspace set
-          if (err instanceof Error && err.message.includes('No workspace set')) {
+          if (
+            err instanceof Error &&
+            err.message.includes("No workspace set")
+          ) {
             set({ currentWorkspace: null, isLoading: false });
           } else {
             set({
-              error: err instanceof Error ? err.message : 'Failed to fetch current workspace',
+              error:
+                err instanceof Error
+                  ? err.message
+                  : "Failed to fetch current workspace",
               isLoading: false,
             });
           }
@@ -79,18 +76,10 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
           // Fetch the new current workspace details
           const workspace = await api.getWorkspace(workspaceId);
           set({ currentWorkspace: workspace, isLoading: false });
-
-          // Sync demo positions for new workspace
-          const demoStore = useDemoPortfolioStore.getState();
-          demoStore.setWorkspaceId(workspaceId);
-          try {
-            await demoStore.fetchAll();
-          } catch (e) {
-            console.warn('Failed to sync demo positions:', e);
-          }
         } catch (err) {
           set({
-            error: err instanceof Error ? err.message : 'Failed to switch workspace',
+            error:
+              err instanceof Error ? err.message : "Failed to switch workspace",
             isLoading: false,
           });
           throw err;
@@ -111,7 +100,7 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
       },
     }),
     {
-      name: 'ab-bot-workspace',
+      name: "ab-bot-workspace",
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
         currentWorkspace: state.currentWorkspace,
@@ -119,6 +108,6 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true);
       },
-    }
-  )
+    },
+  ),
 );
