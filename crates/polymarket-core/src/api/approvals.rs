@@ -321,7 +321,7 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
                 chain_id: Some(CHAIN_ID),
                 nonce,
                 gas_price,
-                gas_limit: 60_000,
+                gas_limit: 100_000, // USDC.e proxy uses ~67k gas
                 to: TxKind::Call(usdc),
                 value: U256::ZERO,
                 input: encode_approve(*spender),
@@ -343,7 +343,7 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
                 chain_id: Some(CHAIN_ID),
                 nonce,
                 gas_price,
-                gas_limit: 60_000,
+                gas_limit: 100_000,
                 to: TxKind::Call(ctf),
                 value: U256::ZERO,
                 input: encode_set_approval_for_all(*spender),
