@@ -1032,6 +1032,53 @@ impl AuthenticatedClobClient {
         Ok(result)
     }
 
+    /// Tell the CLOB server to re-read on-chain balance/allowance state.
+    ///
+    /// Must be called after setting on-chain approvals so the CLOB picks up the
+    /// new allowance values. `signature_type` is 0 for EOA wallets.
+    pub async fn update_balance_allowance(&self, asset_type: &str) -> Result<()> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set".to_string(),
+        })?;
+
+        let url = format!(
+            "{}/balance-allowance?asset_type={}&signature_type=0",
+            self.client.base_url, asset_type
+        );
+
+        let timestamp = current_timestamp().to_string();
+        let method = "GET";
+        let path = "/balance-allowance";
+        let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
+
+        let response = self
+            .client
+            .http_client
+            .get(&url)
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", &signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            warn!(
+                status,
+                response = %text,
+                asset_type,
+                "Failed to update CLOB balance-allowance cache"
+            );
+        } else {
+            info!(asset_type, "CLOB balance-allowance cache updated");
+        }
+
+        Ok(())
+    }
+
     /// Create and sign an order.
     ///
     /// For GTC/FOK orders, expiration is forced to 0 per the CLOB API contract.

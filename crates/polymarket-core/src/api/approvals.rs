@@ -20,6 +20,9 @@ use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+/// Minimum POL balance needed for approval transactions (~6 txns × 60k gas × ~50 gwei).
+const MIN_GAS_WEI: u128 = 20_000_000_000_000_000; // 0.02 POL
+
 /// Polygon chain ID.
 const CHAIN_ID: u64 = 137;
 
@@ -231,6 +234,24 @@ async fn check_erc1155_approval(
     Ok(approved)
 }
 
+/// Check native POL/MATIC balance for gas.
+async fn get_native_balance(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    address: &Address,
+) -> Result<u128> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBalance",
+        "params": [format!("{:?}", address), "latest"]
+    });
+
+    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let hex = resp["result"].as_str().unwrap_or("0x0");
+    Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0))
+}
+
 /// Ensure all 6 Polymarket approvals are set for the given wallet.
 ///
 /// Checks existing approvals first and only sends transactions for missing ones.
@@ -262,6 +283,26 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
 
     let usdc: Address = USDC_ADDRESS.parse().expect("invalid USDC address");
     let ctf: Address = CTF_ADDRESS.parse().expect("invalid CTF address");
+
+    // Check POL balance for gas before attempting any transactions
+    let pol_balance = get_native_balance(&http, rpc_url, &address)
+        .await
+        .unwrap_or(0);
+    info!(
+        wallet = %address,
+        pol_balance_wei = pol_balance,
+        pol_balance_human = format!("{:.6}", pol_balance as f64 / 1e18),
+        "Checking POL balance for approval gas"
+    );
+    if pol_balance < MIN_GAS_WEI {
+        anyhow::bail!(
+            "Wallet {:?} needs POL for gas to set approvals ({:.6} POL available, need >= {:.4} POL). \
+             Send at least 0.1 POL to this address on Polygon.",
+            address,
+            pol_balance as f64 / 1e18,
+            MIN_GAS_WEI as f64 / 1e18
+        );
+    }
 
     let mut nonce = get_nonce(&http, rpc_url, &address).await?;
     let gas_price = get_gas_price(&http, rpc_url).await?;
