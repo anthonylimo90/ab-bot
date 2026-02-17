@@ -304,50 +304,40 @@ impl Default for OrderBuilder {
     }
 }
 
+/// USDC has 6 decimal places.
+const USDC_DECIMALS: u32 = 6;
+
+/// Convert a decimal value to fixed-point u128 with USDC_DECIMALS precision.
+/// Truncates (floors) to avoid exceeding precision limits.
+fn to_fixed_u128(d: Decimal) -> u128 {
+    d.trunc_with_scale(USDC_DECIMALS).mantissa().unsigned_abs()
+}
+
 /// Calculate maker and taker amounts from price and size.
 ///
 /// Price is in the range 0.0 to 1.0 (probability).
-/// Size is the USDC amount for the trade.
+/// Size is the number of outcome tokens to trade.
+///
+/// Follows the Polymarket convention:
+/// - BUY:  taker_amount = size, maker_amount = size * price
+/// - SELL: maker_amount = size, taker_amount = size * price
+///
+/// Amounts are truncated to USDC 6-decimal precision to satisfy the CLOB
+/// precision constraints (max 2 decimal accuracy for maker, 4 for taker on sells).
 fn calculate_amounts(side: OrderSide, price: Decimal, size: Decimal) -> (U256, U256) {
-    // USDC has 6 decimals
-    let usdc_decimals = Decimal::from(1_000_000u64);
-
-    // Convert to base units
-    let size_base = (size * usdc_decimals).round();
+    let raw_cost = size * price;
 
     match side {
         OrderSide::Buy => {
-            // Buying tokens: pay size USDC, receive (size / price) tokens
-            let maker_amount = U256::from(size_base.to_string().parse::<u128>().unwrap_or(0));
-            let token_amount = if price > Decimal::ZERO {
-                size / price
-            } else {
-                Decimal::ZERO
-            };
-            let taker_amount = U256::from(
-                (token_amount * usdc_decimals)
-                    .round()
-                    .to_string()
-                    .parse::<u128>()
-                    .unwrap_or(0),
-            );
+            // BUY: maker pays USDC (size * price), taker provides tokens (size)
+            let maker_amount = U256::from(to_fixed_u128(raw_cost));
+            let taker_amount = U256::from(to_fixed_u128(size));
             (maker_amount, taker_amount)
         }
         OrderSide::Sell => {
-            // Selling tokens: provide (size / price) tokens, receive size USDC
-            let token_amount = if price > Decimal::ZERO {
-                size / price
-            } else {
-                Decimal::ZERO
-            };
-            let maker_amount = U256::from(
-                (token_amount * usdc_decimals)
-                    .round()
-                    .to_string()
-                    .parse::<u128>()
-                    .unwrap_or(0),
-            );
-            let taker_amount = U256::from(size_base.to_string().parse::<u128>().unwrap_or(0));
+            // SELL: maker provides tokens (size), taker pays USDC (size * price)
+            let maker_amount = U256::from(to_fixed_u128(size));
+            let taker_amount = U256::from(to_fixed_u128(raw_cost));
             (maker_amount, taker_amount)
         }
     }
@@ -451,26 +441,26 @@ mod tests {
     #[test]
     fn test_calculate_amounts_buy() {
         let price = Decimal::new(50, 2); // 0.50
-        let size = Decimal::from(100u64); // 100 USDC
+        let size = Decimal::from(100u64); // 100 tokens
 
         let (maker_amount, taker_amount) = calculate_amounts(OrderSide::Buy, price, size);
 
-        // Maker pays 100 USDC (100 * 1_000_000 = 100_000_000)
-        assert_eq!(maker_amount, U256::from(100_000_000u64));
-        // Taker provides 200 tokens (100 / 0.5 * 1_000_000 = 200_000_000)
-        assert_eq!(taker_amount, U256::from(200_000_000u64));
+        // BUY: maker pays USDC (size * price = 100 * 0.50 = 50 USDC = 50_000_000)
+        assert_eq!(maker_amount, U256::from(50_000_000u64));
+        // BUY: taker provides tokens (size = 100 tokens = 100_000_000)
+        assert_eq!(taker_amount, U256::from(100_000_000u64));
     }
 
     #[test]
     fn test_calculate_amounts_sell() {
         let price = Decimal::new(50, 2); // 0.50
-        let size = Decimal::from(100u64); // 100 USDC worth
+        let size = Decimal::from(100u64); // 100 tokens
 
         let (maker_amount, taker_amount) = calculate_amounts(OrderSide::Sell, price, size);
 
-        // Maker provides 200 tokens
-        assert_eq!(maker_amount, U256::from(200_000_000u64));
-        // Taker pays 100 USDC
-        assert_eq!(taker_amount, U256::from(100_000_000u64));
+        // SELL: maker provides tokens (size = 100 tokens = 100_000_000)
+        assert_eq!(maker_amount, U256::from(100_000_000u64));
+        // SELL: taker pays USDC (size * price = 100 * 0.50 = 50 USDC = 50_000_000)
+        assert_eq!(taker_amount, U256::from(50_000_000u64));
     }
 }
