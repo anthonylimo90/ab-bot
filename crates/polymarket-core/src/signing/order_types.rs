@@ -52,7 +52,7 @@ impl OrderData {
         expiration_secs: u64,
     ) -> Self {
         // Generate random salt
-        let salt = U256::from(rand_salt());
+        let salt = U256::from(rand_salt() as u128);
 
         Self {
             salt,
@@ -98,21 +98,21 @@ impl OrderData {
 }
 
 /// Generate a random salt for order uniqueness.
-fn rand_salt() -> u128 {
+fn rand_salt() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    // Mix with random bytes if available
-    timestamp ^ (std::process::id() as u128) << 64
+    // Mix timestamp with process id for uniqueness, truncate to u64
+    (nanos ^ ((std::process::id() as u128) << 32)) as u64
 }
 
 /// A signed order ready for submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedOrder {
-    /// Order salt as hex string.
-    pub salt: String,
+    /// Order salt (must be a JSON number).
+    pub salt: u64,
     /// Maker address as hex string.
     pub maker: String,
     /// Signer address as hex string.
@@ -150,7 +150,7 @@ impl SignedOrder {
         let side = if order.side == 0 { "BUY" } else { "SELL" };
 
         Self {
-            salt: format!("{}", order.salt),
+            salt: order.salt.to::<u64>(),
             maker: format!("{:?}", order.maker),
             signer: format!("{:?}", order.signer),
             taker: format!("{:?}", order.taker),

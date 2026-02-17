@@ -688,8 +688,14 @@ pub struct PostOrderRequest {
     pub order: SignedOrder,
     #[serde(rename = "orderType")]
     pub order_type: OrderType,
-    /// Wallet address that owns the order.
+    /// API key of the order owner.
     pub owner: String,
+    /// Post-only flag (default false).
+    #[serde(rename = "postOnly")]
+    pub post_only: bool,
+    /// Defer execution flag (default false).
+    #[serde(rename = "deferExec")]
+    pub defer_exec: bool,
 }
 
 /// Response from posting an order.
@@ -941,7 +947,9 @@ impl AuthenticatedClobClient {
         let request = PostOrderRequest {
             order: signed_order,
             order_type,
-            owner: self.address(),
+            owner: credentials.api_key.clone(),
+            post_only: false,
+            defer_exec: false,
         };
 
         let body = serde_json::to_string(&request)?;
