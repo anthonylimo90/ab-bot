@@ -307,10 +307,17 @@ impl Default for OrderBuilder {
 /// USDC has 6 decimal places.
 const USDC_DECIMALS: u32 = 6;
 
-/// Convert a decimal value to fixed-point u128 with USDC_DECIMALS precision.
-/// Truncates (floors) to avoid exceeding precision limits.
-fn to_fixed_u128(d: Decimal) -> u128 {
-    d.trunc_with_scale(USDC_DECIMALS).mantissa().unsigned_abs()
+/// Lot size scale — token sizes have max 2 decimal places.
+const LOT_SIZE_SCALE: u32 = 2;
+
+/// Convert a decimal to fixed-point u128 with the given decimal scale.
+/// The value is first truncated to `scale` decimal places, then scaled up
+/// to USDC_DECIMALS (6) for the on-chain representation.
+fn to_fixed_u128(d: Decimal, scale: u32) -> u128 {
+    d.trunc_with_scale(scale)
+        .trunc_with_scale(USDC_DECIMALS)
+        .mantissa()
+        .unsigned_abs()
 }
 
 /// Calculate maker and taker amounts from price and size.
@@ -322,22 +329,28 @@ fn to_fixed_u128(d: Decimal) -> u128 {
 /// - BUY:  taker_amount = size, maker_amount = size * price
 /// - SELL: maker_amount = size, taker_amount = size * price
 ///
-/// Amounts are truncated to USDC 6-decimal precision to satisfy the CLOB
-/// precision constraints (max 2 decimal accuracy for maker, 4 for taker on sells).
+/// Token amounts (size) are truncated to LOT_SIZE_SCALE (2) decimals.
+/// USDC amounts (cost) are truncated to LOT_SIZE_SCALE + tick_decimals decimals.
+/// Default tick_decimals = 2 (for tick_size 0.01), giving 4 decimal USDC precision.
 fn calculate_amounts(side: OrderSide, price: Decimal, size: Decimal) -> (U256, U256) {
     let raw_cost = size * price;
+
+    // Token amounts: max 2 decimal places (lot size)
+    let token_scale = LOT_SIZE_SCALE;
+    // USDC amounts: lot_size + tick_size decimals (default 2+2=4)
+    let cost_scale = LOT_SIZE_SCALE + LOT_SIZE_SCALE;
 
     match side {
         OrderSide::Buy => {
             // BUY: maker pays USDC (size * price), taker provides tokens (size)
-            let maker_amount = U256::from(to_fixed_u128(raw_cost));
-            let taker_amount = U256::from(to_fixed_u128(size));
+            let maker_amount = U256::from(to_fixed_u128(raw_cost, cost_scale));
+            let taker_amount = U256::from(to_fixed_u128(size, token_scale));
             (maker_amount, taker_amount)
         }
         OrderSide::Sell => {
             // SELL: maker provides tokens (size), taker pays USDC (size * price)
-            let maker_amount = U256::from(to_fixed_u128(size));
-            let taker_amount = U256::from(to_fixed_u128(raw_cost));
+            let maker_amount = U256::from(to_fixed_u128(size, token_scale));
+            let taker_amount = U256::from(to_fixed_u128(raw_cost, cost_scale));
             (maker_amount, taker_amount)
         }
     }
