@@ -76,12 +76,18 @@ impl OrderData {
             b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
         );
 
+        // EIP-712 encodeData: all values must be padded to 32 bytes.
+        // Addresses are left-padded from 20 bytes to 32 bytes.
+        let maker_padded = B256::left_padding_from(self.maker.as_slice());
+        let signer_padded = B256::left_padding_from(self.signer.as_slice());
+        let taker_padded = B256::left_padding_from(self.taker.as_slice());
+
         let encoded = (
             order_type_hash,
             self.salt,
-            self.maker,
-            self.signer,
-            self.taker,
+            maker_padded,
+            signer_padded,
+            taker_padded,
             self.token_id,
             self.maker_amount,
             self.taker_amount,
