@@ -118,12 +118,15 @@ impl Eip712Domain {
         let name_hash = alloy_primitives::keccak256(self.name.as_bytes());
         let version_hash = alloy_primitives::keccak256(self.version.as_bytes());
 
+        // EIP-712: address must be left-padded to 32 bytes
+        let contract_padded = B256::left_padding_from(self.verifying_contract.as_slice());
+
         let encoded = (
             domain_type_hash,
             name_hash,
             version_hash,
             self.chain_id,
-            self.verifying_contract,
+            contract_padded,
         )
             .abi_encode_packed();
 
