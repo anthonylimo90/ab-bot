@@ -302,6 +302,7 @@ impl CopyTradingMonitor {
         match result {
             Ok(Some(report)) => {
                 let trade_value = report.filled_quantity * report.average_price;
+                let has_open_fill = report.filled_quantity > Decimal::ZERO;
 
                 info!(
                     wallet = %trade.wallet_address,
@@ -312,10 +313,18 @@ impl CopyTradingMonitor {
                     "Successfully copied trade"
                 );
 
-                // Record position opening with the copy trader for daily/position tracking
-                {
+                if has_open_fill {
+                    // Record position opening with the copy trader for daily/position tracking.
                     let mut ct = self.copy_trader.write().await;
                     ct.record_position_opened(trade_value);
+                } else {
+                    warn!(
+                        wallet = %trade.wallet_address,
+                        market = %trade.market_id,
+                        order_id = %report.order_id,
+                        filled_quantity = %report.filled_quantity,
+                        "Copy trade execution reported success with non-positive fill; skipping open position tracking"
+                    );
                 }
 
                 // Record in copy_trade_history
@@ -366,58 +375,60 @@ impl CopyTradingMonitor {
                     warn!(error = %e, "Failed to record copy trade history");
                 }
 
-                // Insert position for dashboard visibility
-                let position_id = uuid::Uuid::new_v4();
-                let side_str = match trade.direction {
-                    TradeDirection::Buy => "long",
-                    TradeDirection::Sell => "short",
-                };
-                let outcome_str = match trade.direction {
-                    TradeDirection::Buy => "yes",
-                    TradeDirection::Sell => "no",
-                };
+                // Insert position for dashboard visibility only when we actually hold size.
+                if has_open_fill {
+                    let position_id = uuid::Uuid::new_v4();
+                    let side_str = match trade.direction {
+                        TradeDirection::Buy => "long",
+                        TradeDirection::Sell => "short",
+                    };
+                    let outcome_str = match trade.direction {
+                        TradeDirection::Buy => "yes",
+                        TradeDirection::Sell => "no",
+                    };
 
-                if let Err(e) = sqlx::query(
-                    r#"
-                    INSERT INTO positions (
-                        id, market_id, outcome, side, quantity,
-                        entry_price, current_price, unrealized_pnl,
-                        is_copy_trade, source_wallet, is_open, opened_at,
-                        source_token_id,
-                        yes_entry_price, no_entry_price, entry_timestamp,
-                        exit_strategy, state, source
-                    ) VALUES (
-                        $1, $2, $3, $4, $5,
-                        $6, $6, 0,
-                        true, $7, true, NOW(),
-                        $8,
-                        $9, $10, NOW(),
-                        1, 1, 2
+                    if let Err(e) = sqlx::query(
+                        r#"
+                        INSERT INTO positions (
+                            id, market_id, outcome, side, quantity,
+                            entry_price, current_price, unrealized_pnl,
+                            is_copy_trade, source_wallet, is_open, opened_at,
+                            source_token_id,
+                            yes_entry_price, no_entry_price, entry_timestamp,
+                            exit_strategy, state, source
+                        ) VALUES (
+                            $1, $2, $3, $4, $5,
+                            $6, $6, 0,
+                            true, $7, true, NOW(),
+                            $8,
+                            $9, $10, NOW(),
+                            1, 1, 2
+                        )
+                        "#,
                     )
-                    "#,
-                )
-                .bind(position_id)
-                .bind(&trade.market_id)
-                .bind(outcome_str)
-                .bind(side_str)
-                .bind(report.filled_quantity)
-                .bind(report.average_price)
-                .bind(&trade.wallet_address)
-                .bind(&trade.token_id)
-                .bind(if side_str == "long" {
-                    report.average_price
-                } else {
-                    Decimal::ZERO
-                })
-                .bind(if side_str == "short" {
-                    report.average_price
-                } else {
-                    Decimal::ZERO
-                })
-                .execute(&self.pool)
-                .await
-                {
-                    warn!(error = %e, "Failed to insert copy trade position");
+                    .bind(position_id)
+                    .bind(&trade.market_id)
+                    .bind(outcome_str)
+                    .bind(side_str)
+                    .bind(report.filled_quantity)
+                    .bind(report.average_price)
+                    .bind(&trade.wallet_address)
+                    .bind(&trade.token_id)
+                    .bind(if side_str == "long" {
+                        report.average_price
+                    } else {
+                        Decimal::ZERO
+                    })
+                    .bind(if side_str == "short" {
+                        report.average_price
+                    } else {
+                        Decimal::ZERO
+                    })
+                    .execute(&self.pool)
+                    .await
+                    {
+                        warn!(error = %e, "Failed to insert copy trade position");
+                    }
                 }
 
                 // Insert execution report
