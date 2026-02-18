@@ -8,6 +8,7 @@
 
 use chrono::Utc;
 use polymarket_core::api::ClobClient;
+use polymarket_core::Error as PolyError;
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -83,6 +84,29 @@ impl CopyStopLossConfig {
     }
 }
 
+/// Distinguishes recoverable vs terminal price-fetch failures.
+enum PriceFetchError {
+    /// The CLOB returned 404 — market is resolved, delisted, or the token ID is invalid.
+    MarketNotFound,
+    /// Order book exists but has no bids (illiquid market).
+    NoBids,
+    /// Transient / unexpected error.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for PriceFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MarketNotFound => write!(f, "market not found (404)"),
+            Self::NoBids => write!(f, "no bids available"),
+            Self::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+/// How many consecutive 404s before we auto-close a position.
+const MAX_NOT_FOUND_STRIKES: u32 = 5;
+
 /// A copy trade position loaded from the database for monitoring.
 #[derive(Debug, Clone)]
 struct CopyPosition {
@@ -111,6 +135,9 @@ pub struct CopyStopLossMonitor {
     copy_trader: Arc<RwLock<CopyTrader>>,
     trade_monitor: Option<Arc<TradeMonitor>>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    /// Tracks consecutive 404s per (market_id, token_id) so we can auto-close
+    /// positions whose markets have been resolved or delisted.
+    not_found_strikes: HashMap<(String, String), u32>,
 }
 
 impl CopyStopLossMonitor {
@@ -133,11 +160,12 @@ impl CopyStopLossMonitor {
             copy_trader,
             trade_monitor,
             signal_tx,
+            not_found_strikes: HashMap::new(),
         }
     }
 
     /// Main run loop.
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         if !self.config.enabled {
             info!("Copy trade stop-loss monitor is disabled");
             return Ok(());
@@ -195,7 +223,7 @@ impl CopyStopLossMonitor {
     }
 
     /// Check all open copy-trade positions for stop-loss, take-profit, and time exits.
-    async fn check_positions(&self) -> anyhow::Result<()> {
+    async fn check_positions(&mut self) -> anyhow::Result<()> {
         let positions = self.load_open_copy_positions().await?;
         if positions.is_empty() {
             return Ok(());
@@ -203,8 +231,18 @@ impl CopyStopLossMonitor {
 
         debug!(count = positions.len(), "Checking copy trade positions");
 
+        /// Outcome of a price lookup for a (market, token) pair.
+        enum PriceOutcome {
+            /// We got a live price.
+            Price(Decimal),
+            /// The CLOB says this market/token no longer exists (404).
+            NotFound,
+            /// Transient error — skip this cycle but don't count a strike.
+            Unavailable,
+        }
+
         // Fetch current prices keyed by source token ID where available.
-        let mut outcome_prices: HashMap<(String, String), Decimal> = HashMap::new();
+        let mut outcome_prices: HashMap<(String, String), PriceOutcome> = HashMap::new();
         for pos in &positions {
             let token_id = pos.orderbook_token_id().to_string();
             let key = (pos.market_id.clone(), token_id.clone());
@@ -213,7 +251,25 @@ impl CopyStopLossMonitor {
             }
             match self.fetch_current_price(&pos.market_id, &token_id).await {
                 Ok(price) => {
-                    outcome_prices.insert(key, price);
+                    // Got a live price — clear any previous 404 strikes
+                    self.not_found_strikes.remove(&key);
+                    outcome_prices.insert(key, PriceOutcome::Price(price));
+                }
+                Err(PriceFetchError::MarketNotFound) => {
+                    warn!(
+                        market_id = %pos.market_id,
+                        token_id = %token_id,
+                        "Market/token not found on CLOB (404) — may be resolved or delisted"
+                    );
+                    outcome_prices.insert(key, PriceOutcome::NotFound);
+                }
+                Err(PriceFetchError::NoBids) => {
+                    debug!(
+                        market_id = %pos.market_id,
+                        token_id = %token_id,
+                        "No bids on order book — illiquid market"
+                    );
+                    outcome_prices.insert(key, PriceOutcome::Unavailable);
                 }
                 Err(e) => {
                     warn!(
@@ -222,6 +278,7 @@ impl CopyStopLossMonitor {
                         error = %e,
                         "Failed to fetch price for stop-loss check"
                     );
+                    outcome_prices.insert(key, PriceOutcome::Unavailable);
                 }
             }
         }
@@ -243,41 +300,71 @@ impl CopyStopLossMonitor {
                 continue;
             }
 
-            let current_price = match outcome_prices
-                .get(&(pos.market_id.clone(), pos.orderbook_token_id().to_string()))
-            {
-                Some(p) => *p,
-                None => continue,
-            };
+            let key = (pos.market_id.clone(), pos.orderbook_token_id().to_string());
 
-            let pnl_pct = if pos.entry_price > Decimal::ZERO {
-                (current_price - pos.entry_price) / pos.entry_price
-            } else {
-                Decimal::ZERO
-            };
+            match outcome_prices.get(&key) {
+                Some(PriceOutcome::Price(current_price)) => {
+                    let current_price = *current_price;
+                    let pnl_pct = if pos.entry_price > Decimal::ZERO {
+                        (current_price - pos.entry_price) / pos.entry_price
+                    } else {
+                        Decimal::ZERO
+                    };
 
-            // Stop-loss: close if loss exceeds threshold
-            if pnl_pct < Decimal::ZERO && pnl_pct.abs() >= self.config.stop_loss_pct {
-                info!(
-                    position_id = %pos.id,
-                    market = %pos.market_id,
-                    pnl_pct = %pnl_pct,
-                    "Stop-loss triggered for copy trade"
-                );
-                self.close_position(pos, "stop_loss").await;
-                continue;
-            }
+                    // Stop-loss: close if loss exceeds threshold
+                    if pnl_pct < Decimal::ZERO && pnl_pct.abs() >= self.config.stop_loss_pct {
+                        info!(
+                            position_id = %pos.id,
+                            market = %pos.market_id,
+                            pnl_pct = %pnl_pct,
+                            "Stop-loss triggered for copy trade"
+                        );
+                        self.close_position(pos, "stop_loss").await;
+                        continue;
+                    }
 
-            // Take-profit: close if profit exceeds threshold
-            if pnl_pct > Decimal::ZERO && pnl_pct >= self.config.take_profit_pct {
-                info!(
-                    position_id = %pos.id,
-                    market = %pos.market_id,
-                    pnl_pct = %pnl_pct,
-                    "Take-profit triggered for copy trade"
-                );
-                self.close_position(pos, "take_profit").await;
-                continue;
+                    // Take-profit: close if profit exceeds threshold
+                    if pnl_pct > Decimal::ZERO && pnl_pct >= self.config.take_profit_pct {
+                        info!(
+                            position_id = %pos.id,
+                            market = %pos.market_id,
+                            pnl_pct = %pnl_pct,
+                            "Take-profit triggered for copy trade"
+                        );
+                        self.close_position(pos, "take_profit").await;
+                        continue;
+                    }
+                }
+                Some(PriceOutcome::NotFound) => {
+                    // Market is gone from the CLOB — count strikes and auto-close
+                    // after a threshold to avoid acting on a transient CLOB glitch.
+                    let strikes = self.not_found_strikes.entry(key).or_insert(0);
+                    *strikes += 1;
+
+                    if *strikes >= MAX_NOT_FOUND_STRIKES {
+                        warn!(
+                            position_id = %pos.id,
+                            market = %pos.market_id,
+                            strikes = *strikes,
+                            "Market not found for {} consecutive checks — closing position as market_resolved",
+                            MAX_NOT_FOUND_STRIKES
+                        );
+                        self.close_position(pos, "market_resolved").await;
+                    } else {
+                        debug!(
+                            position_id = %pos.id,
+                            market = %pos.market_id,
+                            strikes = *strikes,
+                            max = MAX_NOT_FOUND_STRIKES,
+                            "Market not found, strike {}/{}",
+                            strikes,
+                            MAX_NOT_FOUND_STRIKES
+                        );
+                    }
+                }
+                Some(PriceOutcome::Unavailable) | None => {
+                    // Transient error or no bids — skip this cycle
+                }
             }
         }
 
@@ -546,17 +633,23 @@ impl CopyStopLossMonitor {
             .collect())
     }
 
-    /// Fetch the current best bid price for an outcome.
+    /// Result of a price fetch, distinguishing "market gone" from transient errors.
     async fn fetch_current_price(
         &self,
         _market_id: &str,
         outcome_id: &str,
-    ) -> anyhow::Result<Decimal> {
-        let book = self.clob_client.get_order_book(outcome_id).await?;
-        book.bids
-            .first()
-            .map(|l| l.price)
-            .ok_or_else(|| anyhow::anyhow!("No bids available"))
+    ) -> std::result::Result<Decimal, PriceFetchError> {
+        match self.clob_client.get_order_book(outcome_id).await {
+            Ok(book) => book
+                .bids
+                .first()
+                .map(|l| l.price)
+                .ok_or(PriceFetchError::NoBids),
+            Err(PolyError::Api {
+                status: Some(404), ..
+            }) => Err(PriceFetchError::MarketNotFound),
+            Err(e) => Err(PriceFetchError::Other(e.into())),
+        }
     }
 }
 
