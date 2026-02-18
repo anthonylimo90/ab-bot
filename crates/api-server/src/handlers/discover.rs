@@ -12,6 +12,7 @@ use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::error::{ApiError, ApiResult};
+use crate::schema::wallet_features_has_strategy_type;
 use crate::state::AppState;
 use wallet_tracker::discovery::DiscoveryCriteria;
 
@@ -388,6 +389,9 @@ async fn fetch_strategy_types(
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     if addresses.is_empty() {
+        return map;
+    }
+    if !wallet_features_has_strategy_type(pool).await {
         return map;
     }
 

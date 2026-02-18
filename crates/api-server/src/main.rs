@@ -88,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
     if !skip_migrations {
         tracing::info!("Running database migrations...");
         sqlx::migrate!("../../migrations").run(&pool).await?;
+    } else {
+        tracing::warn!("Skipping database migrations because SKIP_MIGRATIONS is enabled");
     }
 
     match cli.command {

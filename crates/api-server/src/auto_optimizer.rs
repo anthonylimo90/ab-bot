@@ -19,6 +19,8 @@ use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::schema::wallet_features_has_strategy_type;
+
 /// Allocation strategy for workspace
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1335,7 +1337,19 @@ impl AutoOptimizer {
         thresholds: &CandidateThresholds,
         limit: i64,
     ) -> anyhow::Result<Vec<WalletCandidate>> {
-        let candidates: Vec<WalletCandidate> = sqlx::query_as(
+        let has_strategy_type = wallet_features_has_strategy_type(&self.pool).await;
+        let strategy_type_select = if has_strategy_type {
+            "wf_st.strategy_type"
+        } else {
+            "NULL::TEXT AS strategy_type"
+        };
+        let strategy_type_join = if has_strategy_type {
+            "LEFT JOIN wallet_features wf_st ON wf_st.address = cm.address"
+        } else {
+            ""
+        };
+
+        let sql = format!(
             r#"
             WITH candidate_metrics AS (
                 SELECT
@@ -1385,10 +1399,10 @@ impl AutoOptimizer {
                 cm.trade_count_30d, cm.max_drawdown_30d, cm.last_trade_at,
                 cm.recency_adjusted_roi, cm.staleness_days,
                 cp.copy_win_rate,
-                wf_st.strategy_type
+                {strategy_type_select}
             FROM candidate_metrics cm
             LEFT JOIN copy_performance cp ON cp.address = cm.address
-            LEFT JOIN wallet_features wf_st ON wf_st.address = cm.address
+            {strategy_type_join}
             WHERE cm.roi_30d >= $1::numeric
               AND cm.sharpe_30d >= $2::numeric
               AND cm.win_rate_30d >= $3::numeric
@@ -1397,15 +1411,17 @@ impl AutoOptimizer {
             ORDER BY cm.recency_adjusted_roi DESC
             LIMIT $6
             "#,
-        )
-        .bind(thresholds.min_roi)
-        .bind(thresholds.min_sharpe)
-        .bind(thresholds.min_win_rate)
-        .bind(thresholds.min_trades)
-        .bind(thresholds.max_drawdown)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        );
+
+        let candidates: Vec<WalletCandidate> = sqlx::query_as(&sql)
+            .bind(thresholds.min_roi)
+            .bind(thresholds.min_sharpe)
+            .bind(thresholds.min_win_rate)
+            .bind(thresholds.min_trades)
+            .bind(thresholds.max_drawdown)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(candidates)
     }
