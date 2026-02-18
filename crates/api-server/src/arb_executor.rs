@@ -27,7 +27,7 @@ use crate::websocket::{SignalType, SignalUpdate};
 pub struct ArbExecutorConfig {
     /// Whether auto-execution is enabled.
     pub enabled: bool,
-    /// Dollar amount per position (split across YES + NO).
+    /// Base dollar amount per position (used when dynamic sizing is off).
     pub position_size: Decimal,
     /// Minimum net profit to consider a signal worth executing.
     pub min_net_profit: Decimal,
@@ -35,16 +35,31 @@ pub struct ArbExecutorConfig {
     pub max_signal_age_secs: i64,
     /// How often to refresh the outcome token cache (seconds).
     pub cache_refresh_secs: u64,
+    /// Enable dynamic position sizing based on spread width.
+    pub dynamic_sizing: bool,
+    /// Minimum position size for dynamic sizing.
+    pub min_position_size: Decimal,
+    /// Maximum position size for dynamic sizing.
+    pub max_position_size: Decimal,
+    /// Minimum orderbook depth (in $) on each side to enter.
+    pub min_book_depth: Decimal,
+    /// Fee rate for tracking fee drag (2% on Polymarket).
+    pub fee_rate: Decimal,
 }
 
 impl Default for ArbExecutorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            position_size: Decimal::new(50, 0), // $50
+            position_size: Decimal::new(50, 0), // $50 base
             min_net_profit: Decimal::new(1, 3), // 0.001
             max_signal_age_secs: 30,
             cache_refresh_secs: 300,
+            dynamic_sizing: true,
+            min_position_size: Decimal::new(25, 0),  // $25 min
+            max_position_size: Decimal::new(200, 0), // $200 max
+            min_book_depth: Decimal::new(100, 0),    // $100 minimum depth
+            fee_rate: Decimal::new(2, 2),            // 2%
         }
     }
 }
@@ -72,6 +87,22 @@ impl ArbExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
+            dynamic_sizing: std::env::var("ARB_DYNAMIC_SIZING")
+                .map(|v| v != "false")
+                .unwrap_or(true),
+            min_position_size: std::env::var("ARB_MIN_POSITION_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(25, 0)),
+            max_position_size: std::env::var("ARB_MAX_POSITION_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(200, 0)),
+            min_book_depth: std::env::var("ARB_MIN_BOOK_DEPTH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(100, 0)),
+            fee_rate: Decimal::new(2, 2), // Always 2% on Polymarket
         }
     }
 }
@@ -291,18 +322,81 @@ impl ArbAutoExecutor {
             }
         };
 
-        // 6. Calculate quantity: position_size / total_cost
-        let quantity = self.config.position_size / arb.total_cost;
+        // 6. Market quality check — verify orderbook depth on both sides
+        {
+            let yes_book = self
+                .order_executor
+                .clob_client()
+                .get_order_book(&yes_token_id)
+                .await;
+            let no_book = self
+                .order_executor
+                .clob_client()
+                .get_order_book(&no_token_id)
+                .await;
+
+            if let (Ok(yb), Ok(nb)) = (&yes_book, &no_book) {
+                let yes_depth: Decimal = yb.asks.iter().map(|l| l.price * l.size).sum();
+                let no_depth: Decimal = nb.asks.iter().map(|l| l.price * l.size).sum();
+
+                if yes_depth < self.config.min_book_depth || no_depth < self.config.min_book_depth {
+                    debug!(
+                        market_id = %market_id,
+                        yes_depth = %yes_depth,
+                        no_depth = %no_depth,
+                        min_depth = %self.config.min_book_depth,
+                        "Insufficient orderbook depth, skipping"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // 7. Dynamic position sizing based on spread width
+        let position_size = if self.config.dynamic_sizing {
+            // Scale position size proportionally to net profit margin.
+            // Wider spreads (higher profit) → larger positions.
+            // net_profit is per-share profit (e.g. 0.04 = 4 cents per $1 payout).
+            // Scale factor: net_profit * 1000, clamped to [min, max].
+            let scale = arb.net_profit * Decimal::new(1000, 0);
+            let sized = scale
+                .max(self.config.min_position_size)
+                .min(self.config.max_position_size);
+            debug!(
+                market_id = %market_id,
+                net_profit = %arb.net_profit,
+                dynamic_size = %sized,
+                "Dynamic arb position sizing"
+            );
+            sized
+        } else {
+            self.config.position_size
+        };
+
+        if arb.total_cost.is_zero() {
+            warn!(market_id = %market_id, "Zero total_cost, skipping");
+            return Ok(());
+        }
+        let quantity = position_size / arb.total_cost;
+
+        // Fee drag tracking: log the expected fees vs expected profit
+        let expected_fees = quantity * arb.total_cost * self.config.fee_rate;
+        let expected_gross = arb.gross_profit * quantity;
+        let expected_net = arb.net_profit * quantity;
 
         info!(
             market_id = %market_id,
-            net_profit = %arb.net_profit,
+            net_profit_per_share = %arb.net_profit,
             total_cost = %arb.total_cost,
+            position_size = %position_size,
             quantity = %quantity,
+            expected_fees = %expected_fees,
+            expected_gross = %expected_gross,
+            expected_net = %expected_net,
             "Executing arb trade"
         );
 
-        // 7. Create position in PENDING state
+        // 8. Create position in PENDING state
         let mut position = Position::new(
             market_id.clone(),
             arb.yes_ask,
@@ -316,7 +410,7 @@ impl ArbAutoExecutor {
             return Err(anyhow::anyhow!("Failed to persist position: {e}"));
         }
 
-        // 8. Execute YES market order
+        // 9. Execute YES market order
         let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity);
 
         let yes_report = match self.order_executor.execute_market_order(yes_order).await {
@@ -332,7 +426,7 @@ impl ArbAutoExecutor {
             }
         };
 
-        // 9. If YES order rejected/failed → mark EntryFailed
+        // 10. If YES order rejected/failed → mark EntryFailed
         if !yes_report.is_success() {
             let msg = yes_report
                 .error_message
@@ -344,7 +438,7 @@ impl ArbAutoExecutor {
             return Ok(());
         }
 
-        // 10. Execute NO market order
+        // 11. Execute NO market order
         let no_order = MarketOrder::new(market_id.clone(), no_token_id, OrderSide::Buy, quantity);
 
         let no_report = match self.order_executor.execute_market_order(no_order).await {
@@ -360,7 +454,7 @@ impl ArbAutoExecutor {
             }
         };
 
-        // 11. If NO order failed → one-legged position
+        // 12. If NO order failed → one-legged position
         if !no_report.is_success() {
             let msg = no_report
                 .error_message
@@ -378,7 +472,7 @@ impl ArbAutoExecutor {
             return Ok(());
         }
 
-        // 12. Both filled → mark position OPEN
+        // 13. Both filled → mark position OPEN
         if let Err(e) = position.mark_open() {
             error!(error = %e, "Failed to transition position to OPEN");
         }
@@ -389,13 +483,13 @@ impl ArbAutoExecutor {
         // Add to dedup set
         self.active_markets.write().await.insert(market_id.clone());
 
-        // 13. Record trade with circuit breaker (estimated profit)
+        // 14. Record trade with circuit breaker (estimated profit)
         let estimated_pnl = arb.net_profit * quantity;
         if let Err(e) = self.circuit_breaker.record_trade(estimated_pnl, true).await {
             warn!(error = %e, "Failed to record trade with circuit breaker");
         }
 
-        // 14. Publish success signal
+        // 15. Publish success signal
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
             signal_type: SignalType::Arbitrage,
@@ -489,6 +583,11 @@ mod tests {
         assert_eq!(config.min_net_profit, Decimal::new(1, 3));
         assert_eq!(config.max_signal_age_secs, 30);
         assert_eq!(config.cache_refresh_secs, 300);
+        assert!(config.dynamic_sizing);
+        assert_eq!(config.min_position_size, Decimal::new(25, 0));
+        assert_eq!(config.max_position_size, Decimal::new(200, 0));
+        assert_eq!(config.min_book_depth, Decimal::new(100, 0));
+        assert_eq!(config.fee_rate, Decimal::new(2, 2));
     }
 
     #[test]

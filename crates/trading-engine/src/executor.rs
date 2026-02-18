@@ -511,6 +511,11 @@ impl OrderExecutor {
         self.config.live_trading
     }
 
+    /// Get a reference to the underlying CLOB client.
+    pub fn clob_client(&self) -> &ClobClient {
+        &self.clob_client
+    }
+
     // Private methods
 
     async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {

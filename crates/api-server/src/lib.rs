@@ -21,6 +21,7 @@
 
 pub mod arb_executor;
 pub mod auto_optimizer;
+pub mod copy_trade_stop_loss;
 pub mod copy_trading;
 pub mod crypto;
 pub mod email;
@@ -37,6 +38,7 @@ pub mod websocket;
 
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
 pub use auto_optimizer::AutoOptimizer;
+pub use copy_trade_stop_loss::{spawn_copy_stop_loss_monitor, CopyStopLossConfig};
 pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
@@ -223,7 +225,8 @@ impl ApiServer {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(Decimal::new(10000, 0));
-            let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital);
+            let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital)
+                .with_policy(trading_engine::CopyTradingPolicy::from_env());
 
             for row in &tracked_wallets {
                 trade_monitor.add_wallet(&row.address).await;
@@ -360,12 +363,29 @@ impl ApiServer {
             trade_monitor.start().await?;
             spawn_copy_trading_monitor(
                 copy_config,
-                trade_monitor,
-                copy_trader,
+                trade_monitor.clone(),
+                copy_trader.clone(),
+                state.circuit_breaker.clone(),
                 state.signal_tx.clone(),
                 state.pool.clone(),
             );
-            tracing::info!("Copy trading monitor stack initialized");
+
+            // Spawn copy-trade stop-loss / mirror-exit monitor
+            let stop_loss_config = CopyStopLossConfig::from_env();
+            spawn_copy_stop_loss_monitor(
+                stop_loss_config,
+                state.pool.clone(),
+                state.order_executor.clone(),
+                state.circuit_breaker.clone(),
+                state.clob_client.clone(),
+                copy_trader,
+                Some(trade_monitor),
+                state.signal_tx.clone(),
+            );
+
+            tracing::info!(
+                "Copy trading monitor stack initialized (with stop-loss + mirror exits)"
+            );
         }
 
         let addr = self.config.socket_addr();

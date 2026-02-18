@@ -13,6 +13,61 @@ use uuid::Uuid;
 
 use crate::OrderExecutor;
 
+/// Copy trading risk policy applied before every trade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyTradingPolicy {
+    /// Minimum trade value to copy (skip dust trades).
+    pub min_trade_value: Decimal,
+    /// Maximum slippage tolerance (fraction, e.g. 0.01 = 1%).
+    pub max_slippage_pct: Decimal,
+    /// Per-day capital deployment cap.
+    pub daily_capital_limit: Decimal,
+    /// Automatic stop-loss percentage for every copy position.
+    pub auto_stop_loss_pct: Decimal,
+    /// Maximum number of concurrent open copy positions.
+    pub max_open_positions: usize,
+}
+
+impl Default for CopyTradingPolicy {
+    fn default() -> Self {
+        Self {
+            min_trade_value: Decimal::new(10, 0),       // $10 minimum
+            max_slippage_pct: Decimal::new(1, 2),       // 1% max slippage
+            daily_capital_limit: Decimal::new(5000, 0), // $5,000/day cap
+            auto_stop_loss_pct: Decimal::new(15, 2),    // 15% stop-loss
+            max_open_positions: 15,
+        }
+    }
+}
+
+impl CopyTradingPolicy {
+    /// Create policy from environment variables with sane defaults.
+    pub fn from_env() -> Self {
+        Self {
+            min_trade_value: std::env::var("COPY_MIN_TRADE_VALUE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(10, 0)),
+            max_slippage_pct: std::env::var("COPY_MAX_SLIPPAGE_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(1, 2)),
+            daily_capital_limit: std::env::var("COPY_DAILY_CAPITAL_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(5000, 0)),
+            auto_stop_loss_pct: std::env::var("COPY_AUTO_STOP_LOSS_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(15, 2)),
+            max_open_positions: std::env::var("COPY_MAX_OPEN_POSITIONS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15),
+        }
+    }
+}
+
 /// Configuration for a tracked wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedWallet {
@@ -45,7 +100,7 @@ impl TrackedWallet {
             alias: None,
             allocation_pct,
             copy_delay_ms: 0,
-            max_position_size: Decimal::new(1000, 0),
+            max_position_size: Decimal::new(500, 0), // Reduced from $1,000 to $500
             enabled: true,
             added_at: Utc::now(),
             last_copied_trade: None,
@@ -97,6 +152,16 @@ pub struct DetectedTrade {
     pub tx_hash: String,
 }
 
+/// Reason a copy trade was rejected by the policy engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyTradeRejection {
+    CircuitBreakerTripped,
+    DailyCapitalLimitReached { deployed: Decimal, limit: Decimal },
+    TooManyOpenPositions { current: usize, limit: usize },
+    BelowMinTradeValue { value: Decimal, min: Decimal },
+}
+
 /// Copy trading engine that mirrors trades from successful wallets.
 pub struct CopyTrader {
     /// Wallets being tracked, keyed by address.
@@ -113,6 +178,14 @@ pub struct CopyTrader {
     trade_tx: mpsc::Sender<DetectedTrade>,
     /// Whether copy trading is active.
     active: bool,
+    /// Risk policy for copy trades.
+    policy: CopyTradingPolicy,
+    /// Capital deployed today (reset daily).
+    daily_deployed: Decimal,
+    /// Date of last daily reset.
+    daily_reset_date: chrono::NaiveDate,
+    /// Current count of open copy positions.
+    open_position_count: usize,
 }
 
 impl CopyTrader {
@@ -127,6 +200,10 @@ impl CopyTrader {
             trade_rx: Some(trade_rx),
             trade_tx,
             active: true,
+            policy: CopyTradingPolicy::default(),
+            daily_deployed: Decimal::ZERO,
+            daily_reset_date: Utc::now().date_naive(),
+            open_position_count: 0,
         }
     }
 
@@ -134,6 +211,76 @@ impl CopyTrader {
     pub fn with_strategy(mut self, strategy: AllocationStrategy) -> Self {
         self.allocation_strategy = strategy;
         self
+    }
+
+    /// Set the copy trading policy.
+    pub fn with_policy(mut self, policy: CopyTradingPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Get the current policy.
+    pub fn policy(&self) -> &CopyTradingPolicy {
+        &self.policy
+    }
+
+    /// Record that a copy position was opened (for position count tracking).
+    pub fn record_position_opened(&mut self, capital_deployed: Decimal) {
+        self.maybe_reset_daily();
+        self.open_position_count += 1;
+        self.daily_deployed += capital_deployed;
+    }
+
+    /// Record that a copy position was closed.
+    pub fn record_position_closed(&mut self) {
+        self.open_position_count = self.open_position_count.saturating_sub(1);
+    }
+
+    /// Set current open position count (e.g. on startup from DB).
+    pub fn set_open_position_count(&mut self, count: usize) {
+        self.open_position_count = count;
+    }
+
+    /// Reset daily deployed capital if the date has changed.
+    fn maybe_reset_daily(&mut self) {
+        let today = Utc::now().date_naive();
+        if today > self.daily_reset_date {
+            self.daily_deployed = Decimal::ZERO;
+            self.daily_reset_date = today;
+            info!("Daily capital deployment counter reset");
+        }
+    }
+
+    /// Check all policy conditions before executing a trade.
+    /// Returns Ok(()) if the trade is allowed, Err with the rejection reason otherwise.
+    pub fn check_policy(&mut self, trade_value: Decimal) -> Result<(), CopyTradeRejection> {
+        self.maybe_reset_daily();
+
+        // Check minimum trade value
+        if trade_value < self.policy.min_trade_value {
+            return Err(CopyTradeRejection::BelowMinTradeValue {
+                value: trade_value,
+                min: self.policy.min_trade_value,
+            });
+        }
+
+        // Check daily capital limit
+        if self.daily_deployed + trade_value > self.policy.daily_capital_limit {
+            return Err(CopyTradeRejection::DailyCapitalLimitReached {
+                deployed: self.daily_deployed,
+                limit: self.policy.daily_capital_limit,
+            });
+        }
+
+        // Check open position count
+        if self.open_position_count >= self.policy.max_open_positions {
+            return Err(CopyTradeRejection::TooManyOpenPositions {
+                current: self.open_position_count,
+                limit: self.policy.max_open_positions,
+            });
+        }
+
+        Ok(())
     }
 
     /// Add a wallet to track.
@@ -313,12 +460,36 @@ impl CopyTrader {
                 }
             }
             AllocationStrategy::RiskAdjusted => {
-                // TODO: Implement Sharpe-ratio based weighting
-                tracing::warn!(
+                // Half-Kelly sizing based on historical P&L ratio.
+                // Wallets with negative or zero P&L get zero allocation
+                // (they should not receive capital).
+                let pnl_ratio = wallet.total_pnl / wallet.total_copied_value.max(Decimal::ONE);
+
+                if pnl_ratio <= Decimal::ZERO {
+                    debug!(
+                        wallet = %wallet.address,
+                        pnl_ratio = %pnl_ratio,
+                        "Negative/zero P&L ratio, zero allocation"
+                    );
+                    return Decimal::ZERO;
+                }
+
+                // Half-Kelly: divide by 2 for safety
+                let kelly_raw = pnl_ratio / Decimal::new(2, 0);
+                // Clamp to [2%, 15%] of capital
+                let kelly_clamped = kelly_raw
+                    .max(Decimal::new(2, 2)) // min 2%
+                    .min(Decimal::new(15, 2)); // max 15%
+
+                let allocated = self.total_capital * kelly_clamped;
+                debug!(
                     wallet = %wallet.address,
-                    "RiskAdjusted allocation not yet implemented, falling back to ConfiguredWeight"
+                    kelly_raw = %kelly_raw,
+                    kelly_clamped = %kelly_clamped,
+                    allocated = %allocated,
+                    "Risk-adjusted (Kelly) allocation"
                 );
-                self.total_capital * wallet.allocation_pct / Decimal::new(100, 0)
+                allocated
             }
         }
     }

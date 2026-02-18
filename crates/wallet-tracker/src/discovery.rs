@@ -30,13 +30,13 @@ pub struct DiscoveryCriteria {
 impl Default for DiscoveryCriteria {
     fn default() -> Self {
         Self {
-            min_trades: 10,
-            min_win_rate: 0.52, // Lowered from 0.55 to include more wallets
-            min_volume: Decimal::new(500, 0), // Lowered from 1000 to include smaller traders
-            time_window_days: 30,
-            exclude_bots: false, // Changed from true - include profitable bots
-            min_roi: Some(0.02), // Lowered from 0.05 (2% minimum ROI)
-            limit: 100,
+            min_trades: 30,                    // 30+ trades for statistical significance (was 10)
+            min_win_rate: 0.60,                // 60%+ net-positive after fees (was 0.52)
+            min_volume: Decimal::new(5000, 0), // $5,000+ volume (was $500)
+            time_window_days: 90,              // 90-day window for longer track record (was 30)
+            exclude_bots: true,                // Exclude bots by default (was false)
+            min_roi: Some(0.10),               // 10%+ ROI (was 2%)
+            limit: 50,                         // Focus on top 50 (was 100)
         }
     }
 }
@@ -531,11 +531,10 @@ impl WalletDiscovery {
             return false;
         }
 
-        // Only filter out very high confidence bots (score > 70)
-        // Include profitable bots with lower scores
+        // Filter out likely bots (score >= 50, the standard threshold)
         if criteria.exclude_bots {
             if let Some(bot_score) = wallet.bot_score {
-                if bot_score > 70 {
+                if bot_score >= 50 {
                     return false;
                 }
             }
@@ -611,13 +610,13 @@ mod tests {
         let wallet = DiscoveredWallet {
             address: "0x1234".to_string(),
             total_trades: 50,
-            win_count: 30,
-            loss_count: 20,
-            win_rate: 0.6,
-            total_volume: Decimal::new(5000, 0),
-            total_pnl: Decimal::new(500, 0),
-            roi: 0.10,
-            first_trade: Utc::now() - Duration::days(30),
+            win_count: 35,
+            loss_count: 15,
+            win_rate: 0.70,
+            total_volume: Decimal::new(10000, 0),
+            total_pnl: Decimal::new(1500, 0),
+            roi: 0.15,
+            first_trade: Utc::now() - Duration::days(90),
             last_trade: Utc::now(),
             is_bot: false,
             bot_score: Some(10),
@@ -626,8 +625,15 @@ mod tests {
 
         let criteria = DiscoveryCriteria::default();
 
-        // Create a mock discovery instance isn't practical here,
-        // so we test the logic directly
+        // Verify the tightened thresholds
+        assert_eq!(criteria.min_trades, 30);
+        assert_eq!(criteria.min_win_rate, 0.60);
+        assert_eq!(criteria.min_volume, Decimal::new(5000, 0));
+        assert_eq!(criteria.time_window_days, 90);
+        assert!(criteria.exclude_bots);
+        assert_eq!(criteria.min_roi, Some(0.10));
+
+        // Wallet should pass the tightened criteria
         assert!(wallet.total_trades >= criteria.min_trades);
         assert!(wallet.win_rate >= criteria.min_win_rate);
         assert!(wallet.total_volume >= criteria.min_volume);
