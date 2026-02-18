@@ -504,7 +504,11 @@ pub async fn get_wallet_balance(
             Some(active_address) => active_address.to_lowercase(),
             None => match resolve_primary_wallet_address(&state.pool, user_id).await? {
                 Some(primary_address) => primary_address,
-                None => return Err(ApiError::NotFound("No active or primary wallet connected".into())),
+                None => {
+                    return Err(ApiError::NotFound(
+                        "No active or primary wallet connected".into(),
+                    ))
+                }
             },
         }
     } else {
