@@ -532,10 +532,10 @@ impl OrderExecutor {
         // Get the best price from orderbook
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
 
-        let price = match order.side {
+        let (price, available_size) = match order.side {
             OrderSide::Buy => {
                 if let Some(ask) = book.asks.first() {
-                    ask.price
+                    (ask.price, ask.size)
                 } else {
                     return Ok(ExecutionReport::rejected(
                         order.id,
@@ -548,7 +548,7 @@ impl OrderExecutor {
             }
             OrderSide::Sell => {
                 if let Some(bid) = book.bids.first() {
-                    bid.price
+                    (bid.price, bid.size)
                 } else {
                     return Ok(ExecutionReport::rejected(
                         order.id,
@@ -560,6 +560,68 @@ impl OrderExecutor {
                 }
             }
         };
+
+        // Check liquidity depth: reject if best level has < $100 notional
+        let min_depth = Decimal::new(100, 0);
+        let notional_at_best = available_size * price;
+        if notional_at_best < min_depth {
+            return Ok(ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                format!(
+                    "Insufficient liquidity: ${:.2} at best level (min ${:.0})",
+                    notional_at_best, min_depth
+                ),
+            ));
+        }
+
+        // Check size availability: reject if our order is larger than available
+        if order.quantity > available_size {
+            return Ok(ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                format!(
+                    "Order size {} exceeds available {} at best price",
+                    order.quantity, available_size
+                ),
+            ));
+        }
+
+        // Slippage check: reject if price moved beyond tolerance
+        if let Some(max_slippage) = order.max_slippage {
+            let slippage = match order.side {
+                OrderSide::Buy => {
+                    if order.expected_price > Decimal::ZERO {
+                        (price - order.expected_price) / order.expected_price
+                    } else {
+                        Decimal::ZERO
+                    }
+                }
+                OrderSide::Sell => {
+                    if order.expected_price > Decimal::ZERO {
+                        (order.expected_price - price) / order.expected_price
+                    } else {
+                        Decimal::ZERO
+                    }
+                }
+            };
+            if slippage > max_slippage {
+                return Ok(ExecutionReport::rejected(
+                    order.id,
+                    order.market_id.clone(),
+                    order.outcome_id.clone(),
+                    order.side,
+                    format!(
+                        "Slippage {:.4} exceeds max {:.4} (expected={}, actual={})",
+                        slippage, max_slippage, order.expected_price, price
+                    ),
+                ));
+            }
+        }
 
         // Convert order side to signing order side
         let signing_side = match order.side {
@@ -598,10 +660,25 @@ impl OrderExecutor {
             "Live market order submitted"
         );
 
+        // Verify FOK fill status — don't blindly assume success
+        if response.is_unfilled() {
+            warn!(
+                order_id = %order.id,
+                clob_status = %response.status,
+                "FOK order was NOT filled"
+            );
+            return Ok(ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                format!("FOK order unfilled: status={}", response.status),
+            ));
+        }
+
         // Calculate fees
         let fees = order.quantity * price * self.config.fee_rate;
 
-        // Return success (actual fill status would come from webhook/polling)
         Ok(ExecutionReport::success(
             order.id,
             order.market_id.clone(),

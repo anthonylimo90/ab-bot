@@ -199,9 +199,10 @@ fn test_position_pnl_calculation() {
 
     // Exit value: (0.48 + 0.52) * 100 = 100
     // Entry cost: 95
-    // Fees: 0.02 * 2 * 100 = 4
-    // Expected P&L: 100 - 95 - 4 = 1
-    assert_eq!(position.unrealized_pnl, Decimal::new(1, 0));
+    // Entry fees: 0.02 * 95 = 1.90
+    // Exit fees: 0.02 * 100 = 2.00
+    // Expected P&L: 100 - 95 - 1.90 - 2.00 = 1.10
+    assert_eq!(position.unrealized_pnl, Decimal::new(110, 2)); // 1.10
 }
 
 /// Test RBAC permission checking.

@@ -57,6 +57,9 @@ pub struct MarketOrder {
     pub status: OrderStatus,
     /// Maximum slippage tolerance (e.g., 0.01 = 1%).
     pub max_slippage: Option<Decimal>,
+    /// Expected execution price at signal detection time (for slippage checks).
+    #[serde(default)]
+    pub expected_price: Decimal,
 }
 
 impl MarketOrder {
@@ -70,11 +73,18 @@ impl MarketOrder {
             created_at: Utc::now(),
             status: OrderStatus::Created,
             max_slippage: None,
+            expected_price: Decimal::ZERO,
         }
     }
 
     pub fn with_slippage(mut self, slippage: Decimal) -> Self {
         self.max_slippage = Some(slippage);
+        self
+    }
+
+    /// Set the expected price at signal detection time (for slippage validation).
+    pub fn with_expected_price(mut self, price: Decimal) -> Self {
+        self.expected_price = price;
         self
     }
 }
