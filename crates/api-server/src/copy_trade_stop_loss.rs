@@ -256,7 +256,7 @@ impl CopyStopLossMonitor {
                     outcome_prices.insert(key, PriceOutcome::Price(price));
                 }
                 Err(PriceFetchError::MarketNotFound) => {
-                    warn!(
+                    debug!(
                         market_id = %pos.market_id,
                         token_id = %token_id,
                         "Market/token not found on CLOB (404) — may be resolved or delisted"
@@ -342,7 +342,7 @@ impl CopyStopLossMonitor {
                     *strikes += 1;
 
                     if *strikes >= MAX_NOT_FOUND_STRIKES {
-                        warn!(
+                        info!(
                             position_id = %pos.id,
                             market = %pos.market_id,
                             strikes = *strikes,
