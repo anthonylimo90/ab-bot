@@ -80,6 +80,29 @@ export class ApiHttpError extends Error {
   }
 }
 
+/**
+ * Coerce Decimal-serialized string fields on a Position to real numbers.
+ *
+ * rust_decimal serializes Decimal as a JSON string (e.g. "0.45") by default.
+ * TypeScript's `response.json()` preserves strings, but our Position interface
+ * declares these fields as `number`. This helper ensures runtime values match
+ * the declared types so that `.toFixed()`, arithmetic, etc. work correctly.
+ */
+function parsePosition(raw: Position): Position {
+  return {
+    ...raw,
+    quantity: Number(raw.quantity),
+    entry_price: Number(raw.entry_price),
+    current_price: Number(raw.current_price),
+    unrealized_pnl: Number(raw.unrealized_pnl),
+    unrealized_pnl_pct: Number(raw.unrealized_pnl_pct),
+    stop_loss: raw.stop_loss != null ? Number(raw.stop_loss) : undefined,
+    take_profit: raw.take_profit != null ? Number(raw.take_profit) : undefined,
+    realized_pnl:
+      raw.realized_pnl != null ? Number(raw.realized_pnl) : undefined,
+  };
+}
+
 class ApiClient {
   private baseUrl: string;
   private token?: string;
@@ -302,13 +325,17 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Position[]>(
+    const raw = await this.request<Position[]>(
       `/api/v1/positions${query ? `?${query}` : ""}`,
     );
+    return raw.map(parsePosition);
   }
 
   async getPosition(positionId: string): Promise<Position> {
-    return this.request<Position>(`/api/v1/positions/${positionId}`);
+    const raw = await this.request<Position>(
+      `/api/v1/positions/${positionId}`,
+    );
+    return parsePosition(raw);
   }
 
   async closePosition(
@@ -318,10 +345,14 @@ class ApiClient {
       limit_price?: number;
     },
   ): Promise<Position> {
-    return this.request<Position>(`/api/v1/positions/${positionId}/close`, {
-      method: "POST",
-      body: JSON.stringify(params || {}),
-    });
+    const raw = await this.request<Position>(
+      `/api/v1/positions/${positionId}/close`,
+      {
+        method: "POST",
+        body: JSON.stringify(params || {}),
+      },
+    );
+    return parsePosition(raw);
   }
 
   // Wallets
