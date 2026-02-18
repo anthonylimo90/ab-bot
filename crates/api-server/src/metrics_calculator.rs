@@ -7,9 +7,12 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 use wallet_tracker::profitability::{ProfitabilityAnalyzer, TimePeriod};
+use wallet_tracker::strategy_classifier::StrategyClassifier;
+use wallet_tracker::{MarketConditionAnalyzer, MarketRegime};
 
 /// Configuration for the metrics calculator background job.
 #[derive(Debug, Clone)]
@@ -63,6 +66,8 @@ pub struct MetricsCalculator {
     pool: PgPool,
     config: MetricsCalculatorConfig,
     analyzer: Arc<ProfitabilityAnalyzer>,
+    /// Shared market regime state, updated each cycle.
+    regime_state: Option<Arc<RwLock<MarketRegime>>>,
 }
 
 impl MetricsCalculator {
@@ -73,7 +78,28 @@ impl MetricsCalculator {
             pool,
             config,
             analyzer,
+            regime_state: None,
         }
+    }
+
+    /// Create a metrics calculator that also updates the shared market regime.
+    pub fn with_regime(
+        pool: PgPool,
+        config: MetricsCalculatorConfig,
+        regime_state: Arc<RwLock<MarketRegime>>,
+    ) -> Self {
+        let analyzer = Arc::new(ProfitabilityAnalyzer::new(pool.clone()));
+        Self {
+            pool,
+            config,
+            analyzer,
+            regime_state: Some(regime_state),
+        }
+    }
+
+    /// Compute metrics for a single wallet address (for on-demand recomputation).
+    pub async fn compute_single_wallet(&self, address: &str) -> Result<()> {
+        self.calculate_wallet_metrics(address).await
     }
 
     /// Start the background calculation loop.
@@ -158,6 +184,33 @@ impl MetricsCalculator {
             "Metrics calculation cycle complete"
         );
 
+        // Classify strategies for wallets that lack a classification.
+        // This uses a lightweight rule-based classifier from wallet_features data.
+        if let Err(e) = self.classify_wallet_strategies().await {
+            warn!(error = %e, "Failed to classify wallet strategies");
+        }
+
+        // Update market regime detection after metrics are fresh
+        if let Some(ref regime_state) = self.regime_state {
+            let market_analyzer = MarketConditionAnalyzer::new(self.pool.clone());
+            match market_analyzer.detect_regime_from_metrics().await {
+                Ok(regime) => {
+                    let mut current = regime_state.write().await;
+                    if *current != regime {
+                        info!(
+                            previous = ?*current,
+                            detected = ?regime,
+                            "Market regime changed"
+                        );
+                    }
+                    *current = regime;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to detect market regime from metrics");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -196,6 +249,91 @@ impl MetricsCalculator {
         .await?;
 
         Ok(rows)
+    }
+
+    /// Classify trading strategies for wallets that haven't been classified yet.
+    ///
+    /// Fetches wallets from `wallet_features` where `strategy_type IS NULL`,
+    /// runs the rule-based classifier, and stores the primary strategy label.
+    async fn classify_wallet_strategies(&self) -> Result<()> {
+        use polymarket_core::types::WalletFeatures;
+
+        // Fetch wallets missing a strategy classification (limit per batch)
+        let rows: Vec<(
+            String,
+            i64,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            bool,
+            i64,
+            f64,
+        )> = sqlx::query_as(
+            r#"
+                SELECT address, total_trades, win_rate, avg_latency_ms, interval_cv,
+                       has_opposing_positions, opposing_position_count, activity_spread
+                FROM wallet_features
+                WHERE strategy_type IS NULL
+                  AND total_trades >= 10
+                ORDER BY last_trade DESC NULLS LAST
+                LIMIT 100
+                "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            debug!("No wallets need strategy classification");
+            return Ok(());
+        }
+
+        let classifier = StrategyClassifier::new();
+        let mut classified = 0u32;
+
+        for (
+            address,
+            total_trades,
+            win_rate,
+            avg_latency_ms,
+            interval_cv,
+            has_opposing,
+            opposing_count,
+            activity_spread,
+        ) in &rows
+        {
+            let features = WalletFeatures {
+                address: address.clone(),
+                total_trades: *total_trades as u64,
+                win_rate: *win_rate,
+                avg_latency_ms: *avg_latency_ms,
+                interval_cv: *interval_cv,
+                has_opposing_positions: *has_opposing,
+                opposing_position_count: *opposing_count as u64,
+                activity_spread: *activity_spread,
+                ..Default::default()
+            };
+
+            let classification = classifier.classify_basic(&features);
+            let strategy_label = format!("{:?}", classification.primary_strategy);
+
+            if let Err(e) =
+                sqlx::query("UPDATE wallet_features SET strategy_type = $1 WHERE address = $2")
+                    .bind(&strategy_label)
+                    .bind(address)
+                    .execute(&self.pool)
+                    .await
+            {
+                warn!(address = %address, error = %e, "Failed to store strategy classification");
+            } else {
+                classified += 1;
+            }
+        }
+
+        if classified > 0 {
+            info!(classified, "Classified wallet strategies");
+        }
+
+        Ok(())
     }
 
     /// Calculate and store metrics for a single wallet.

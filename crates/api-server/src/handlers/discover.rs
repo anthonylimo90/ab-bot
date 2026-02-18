@@ -232,6 +232,10 @@ pub async fn discover_wallets(
         _ => 30,
     };
 
+    // Use market regime-aware base criteria when no explicit filters are provided
+    let current_regime = *state.current_regime.read().await;
+    let base = wallet_tracker::discovery::DiscoveryCriteria::from_market_regime(current_regime);
+
     let criteria = DiscoveryCriteria::new()
         .min_trades(query.min_trades.unwrap_or(1) as u64)
         .min_win_rate(
@@ -241,10 +245,10 @@ pub async fn discover_wallets(
                     let pct: f64 = w.try_into().unwrap_or(0.0);
                     pct / 100.0
                 })
-                .unwrap_or(0.0),
+                .unwrap_or(base.min_win_rate),
         )
-        .min_volume(Decimal::ZERO)
-        .no_min_roi()
+        .min_volume(base.min_volume)
+        .min_roi(base.min_roi.unwrap_or(0.0))
         .time_window(time_window)
         .limit(query.limit as usize);
 

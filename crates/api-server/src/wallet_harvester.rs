@@ -31,8 +31,8 @@ impl Default for WalletHarvesterConfig {
         Self {
             enabled: true,
             interval_secs: 300,
-            trades_per_fetch: 200,
-            max_new_per_cycle: 20,
+            trades_per_fetch: 500,
+            max_new_per_cycle: 50,
         }
     }
 }
@@ -51,11 +51,11 @@ impl WalletHarvesterConfig {
             trades_per_fetch: std::env::var("HARVESTER_TRADES_PER_FETCH")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(200),
+                .unwrap_or(500),
             max_new_per_cycle: std::env::var("HARVESTER_MAX_NEW_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(20),
+                .unwrap_or(50),
         }
     }
 }

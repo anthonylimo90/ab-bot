@@ -25,6 +25,8 @@ pub struct DiscoveryCriteria {
     pub min_roi: Option<f64>,
     /// Maximum number of results.
     pub limit: usize,
+    /// Maximum days since last trade before wallet is considered stale.
+    pub max_staleness_days: u32,
 }
 
 impl Default for DiscoveryCriteria {
@@ -37,6 +39,7 @@ impl Default for DiscoveryCriteria {
             exclude_bots: true,                // Exclude bots by default (was false)
             min_roi: Some(0.10),               // 10%+ ROI (was 2%)
             limit: 50,                         // Focus on top 50 (was 100)
+            max_staleness_days: 60,            // Reject wallets inactive > 60 days
         }
     }
 }
@@ -44,6 +47,42 @@ impl Default for DiscoveryCriteria {
 impl DiscoveryCriteria {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create discovery criteria adapted to the current market regime.
+    ///
+    /// During bear/volatile markets, thresholds are relaxed to prevent empty candidate
+    /// pools while still maintaining quality standards. During bull/calm markets,
+    /// defaults (or slightly stricter thresholds) are used.
+    pub fn from_market_regime(regime: crate::advanced_predictor::MarketRegime) -> Self {
+        use crate::advanced_predictor::MarketRegime;
+        let base = Self::default();
+        match regime {
+            MarketRegime::BullCalm => base, // Keep strict defaults — best conditions
+            MarketRegime::BullVolatile => Self {
+                min_win_rate: 0.58,  // Slight relaxation; more variance expected
+                min_roi: Some(0.08), // 8% ROI in volatile uptrend
+                ..base
+            },
+            MarketRegime::BearCalm => Self {
+                min_win_rate: 0.55,
+                min_roi: Some(0.05),
+                min_volume: Decimal::new(3000, 0), // Lower volume threshold
+                ..base
+            },
+            MarketRegime::BearVolatile => Self {
+                min_win_rate: 0.52, // Most relaxed — hard conditions
+                min_roi: Some(0.03),
+                min_volume: Decimal::new(2000, 0),
+                min_trades: 20, // Fewer trades available in bear
+                ..base
+            },
+            MarketRegime::Ranging | MarketRegime::Uncertain => Self {
+                min_win_rate: 0.57,
+                min_roi: Some(0.07),
+                ..base
+            },
+        }
     }
 
     pub fn min_trades(mut self, min: u64) -> Self {
@@ -85,6 +124,11 @@ impl DiscoveryCriteria {
         self.limit = limit;
         self
     }
+
+    pub fn max_staleness_days(mut self, days: u32) -> Self {
+        self.max_staleness_days = days;
+        self
+    }
 }
 
 /// A discovered wallet with basic metrics.
@@ -103,6 +147,9 @@ pub struct DiscoveredWallet {
     pub is_bot: bool,
     pub bot_score: Option<u32>,
     pub discovered_at: DateTime<Utc>,
+    /// Composite score from success prediction (0.0 - 1.0), used for multi-factor ranking.
+    /// Falls back to ROI-based ranking when unavailable.
+    pub composite_score: Option<f64>,
 }
 
 impl DiscoveredWallet {
@@ -179,10 +226,12 @@ impl WalletDiscovery {
             .filter(|w| self.meets_criteria(w, criteria))
             .collect();
 
-        // Sort by ROI (descending)
+        // Sort by composite score (falls back to ROI when composite unavailable)
         discovered.sort_by(|a, b| {
-            b.roi
-                .partial_cmp(&a.roi)
+            let score_a = a.composite_score.unwrap_or(a.roi);
+            let score_b = b.composite_score.unwrap_or(b.roi);
+            score_b
+                .partial_cmp(&score_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -323,14 +372,15 @@ impl WalletDiscovery {
                 COALESCE(bs.total_score, 0)::INT4 as bot_score,
                 COALESCE(bs.classification, 0)::INT2 as classification,
                 COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
-                COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl
+                COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl,
+                COALESCE(wsm.predicted_success_prob, 0)::FLOAT8 as composite_score
             FROM wallet_features wf
             LEFT JOIN bot_scores bs ON bs.address = wf.address
             LEFT JOIN wallet_success_metrics wsm ON wsm.address = wf.address
             WHERE wf.last_trade >= $1
               AND wf.total_trades >= $2
               AND wf.total_volume >= $3
-            ORDER BY COALESCE(wsm.roi_30d, 0) DESC
+            ORDER BY COALESCE(wsm.predicted_success_prob, wsm.roi_30d, 0) DESC
             LIMIT $4
             "#,
         )
@@ -348,6 +398,12 @@ impl WalletDiscovery {
                 let total_trades: i64 = row.get("total_trades");
                 let win_rate: f64 = row.get("win_rate");
                 let win_count = (total_trades as f64 * win_rate) as u64;
+                let raw_composite: f64 = row.get("composite_score");
+                let composite_score = if raw_composite > 0.0 {
+                    Some(raw_composite)
+                } else {
+                    None
+                };
 
                 DiscoveredWallet {
                     address: row.get("address"),
@@ -363,6 +419,7 @@ impl WalletDiscovery {
                     is_bot: row.get::<i16, _>("classification") >= 2,
                     bot_score: Some(row.get::<i32, _>("bot_score") as u32),
                     discovered_at: Utc::now(),
+                    composite_score,
                 }
             })
             .collect();
@@ -383,7 +440,8 @@ impl WalletDiscovery {
                 COALESCE(bs.total_score, 0)::INT4 as bot_score,
                 COALESCE(bs.classification, 0)::INT2 as classification,
                 COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
-                COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl
+                COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl,
+                COALESCE(wsm.predicted_success_prob, 0)::FLOAT8 as composite_score
             FROM wallet_features wf
             LEFT JOIN bot_scores bs ON bs.address = wf.address
             LEFT JOIN wallet_success_metrics wsm ON wsm.address = wf.address
@@ -399,6 +457,12 @@ impl WalletDiscovery {
             let total_trades: i64 = r.get("total_trades");
             let win_rate: f64 = r.get("win_rate");
             let win_count = (total_trades as f64 * win_rate) as u64;
+            let raw_composite: f64 = r.get("composite_score");
+            let composite_score = if raw_composite > 0.0 {
+                Some(raw_composite)
+            } else {
+                None
+            };
 
             DiscoveredWallet {
                 address: r.get("address"),
@@ -414,6 +478,7 @@ impl WalletDiscovery {
                 is_bot: r.get::<i16, _>("classification") >= 2,
                 bot_score: Some(r.get::<i32, _>("bot_score") as u32),
                 discovered_at: Utc::now(),
+                composite_score,
             }
         }))
     }
@@ -489,6 +554,7 @@ impl WalletDiscovery {
             is_bot: false,
             bot_score: None,
             discovered_at: Utc::now(),
+            composite_score: None, // Not available from on-chain refresh; computed by MetricsCalculator
         })
     }
 
@@ -546,6 +612,14 @@ impl WalletDiscovery {
             }
         }
 
+        // Reject stale wallets that haven't traded within max_staleness_days
+        if criteria.max_staleness_days > 0 {
+            let staleness_cutoff = Utc::now() - Duration::days(criteria.max_staleness_days as i64);
+            if wallet.last_trade < staleness_cutoff {
+                return false;
+            }
+        }
+
         true
     }
 }
@@ -598,6 +672,7 @@ mod tests {
             is_bot: false,
             bot_score: Some(10),
             discovered_at: Utc::now(),
+            composite_score: Some(0.72),
         };
 
         assert_eq!(wallet.days_active(), 30);
@@ -621,6 +696,7 @@ mod tests {
             is_bot: false,
             bot_score: Some(10),
             discovered_at: Utc::now(),
+            composite_score: Some(0.80),
         };
 
         let criteria = DiscoveryCriteria::default();
@@ -632,10 +708,105 @@ mod tests {
         assert_eq!(criteria.time_window_days, 90);
         assert!(criteria.exclude_bots);
         assert_eq!(criteria.min_roi, Some(0.10));
+        assert_eq!(criteria.max_staleness_days, 60);
 
         // Wallet should pass the tightened criteria
         assert!(wallet.total_trades >= criteria.min_trades);
         assert!(wallet.win_rate >= criteria.min_win_rate);
         assert!(wallet.total_volume >= criteria.min_volume);
+    }
+
+    #[test]
+    fn test_composite_score_sort_order() {
+        // Wallet A: high ROI but low composite (one-hit wonder)
+        let wallet_a = DiscoveredWallet {
+            address: "0xaaaa".to_string(),
+            total_trades: 50,
+            win_count: 35,
+            loss_count: 15,
+            win_rate: 0.70,
+            total_volume: Decimal::new(10000, 0),
+            total_pnl: Decimal::new(2000, 0),
+            roi: 0.20,
+            first_trade: Utc::now() - Duration::days(30),
+            last_trade: Utc::now(),
+            is_bot: false,
+            bot_score: Some(5),
+            discovered_at: Utc::now(),
+            composite_score: Some(0.45), // Low composite despite high ROI
+        };
+
+        // Wallet B: lower ROI but high composite (consistent performer)
+        let wallet_b = DiscoveredWallet {
+            address: "0xbbbb".to_string(),
+            total_trades: 100,
+            win_count: 65,
+            loss_count: 35,
+            win_rate: 0.65,
+            total_volume: Decimal::new(15000, 0),
+            total_pnl: Decimal::new(1500, 0),
+            roi: 0.10,
+            first_trade: Utc::now() - Duration::days(60),
+            last_trade: Utc::now(),
+            is_bot: false,
+            bot_score: Some(8),
+            discovered_at: Utc::now(),
+            composite_score: Some(0.78), // High composite despite lower ROI
+        };
+
+        let mut wallets = vec![wallet_a.clone(), wallet_b.clone()];
+        wallets.sort_by(|a, b| {
+            let score_a = a.composite_score.unwrap_or(a.roi);
+            let score_b = b.composite_score.unwrap_or(b.roi);
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Wallet B should rank first due to higher composite despite lower ROI
+        assert_eq!(wallets[0].address, "0xbbbb");
+        assert_eq!(wallets[1].address, "0xaaaa");
+    }
+
+    #[tokio::test]
+    async fn test_staleness_filter() {
+        let discovery = WalletDiscovery::from_pool(
+            // We only need the meets_criteria method which doesn't use the pool
+            sqlx::PgPool::connect_lazy("postgres://fake").unwrap(),
+        );
+
+        // Stale wallet: last traded 70 days ago
+        let stale_wallet = DiscoveredWallet {
+            address: "0xstale".to_string(),
+            total_trades: 50,
+            win_count: 35,
+            loss_count: 15,
+            win_rate: 0.70,
+            total_volume: Decimal::new(10000, 0),
+            total_pnl: Decimal::new(1500, 0),
+            roi: 0.15,
+            first_trade: Utc::now() - Duration::days(120),
+            last_trade: Utc::now() - Duration::days(70),
+            is_bot: false,
+            bot_score: Some(5),
+            discovered_at: Utc::now(),
+            composite_score: Some(0.80),
+        };
+
+        let criteria = DiscoveryCriteria::default(); // max_staleness_days = 60
+        assert!(
+            !discovery.meets_criteria(&stale_wallet, &criteria),
+            "Wallet inactive for 70 days should be rejected with 60-day staleness limit"
+        );
+
+        // Recent wallet should pass
+        let recent_wallet = DiscoveredWallet {
+            last_trade: Utc::now() - Duration::days(10),
+            ..stale_wallet
+        };
+        assert!(
+            discovery.meets_criteria(&recent_wallet, &criteria),
+            "Wallet active 10 days ago should pass staleness check"
+        );
     }
 }
