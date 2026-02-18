@@ -26,6 +26,11 @@ import {
   ratioOrPercentToPercent,
 } from "@/lib/utils";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   ArrowLeft,
   Wallet,
   TrendingUp,
@@ -44,6 +49,8 @@ import {
   Clock,
   BarChart3,
   ShoppingCart,
+  Shield,
+  BarChart2,
 } from "lucide-react";
 import { WalletAllocationSection } from "@/components/trading/WalletAllocationSection";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
@@ -120,6 +127,16 @@ export default function WalletDetailPage() {
         sharpe:
           storedWallet.backtest_sharpe ??
           (discoveredWallet ? Number(discoveredWallet.sharpe_ratio) : 0),
+        sortino:
+          walletMetrics?.sortino_ratio ??
+          (discoveredWallet?.sortino_ratio
+            ? Number(discoveredWallet.sortino_ratio)
+            : undefined),
+        volatility:
+          walletMetrics?.volatility ??
+          (discoveredWallet?.volatility
+            ? Number(discoveredWallet.volatility)
+            : undefined),
         winRate: hasBacktest
           ? ratioOrPercentToPercent(storedWallet.backtest_win_rate)
           : discoveredWallet
@@ -148,6 +165,8 @@ export default function WalletDetailPage() {
         roi7d: 0,
         roi90d: 0,
         sharpe: walletMetrics?.sharpe_ratio ?? 0,
+        sortino: walletMetrics?.sortino_ratio,
+        volatility: walletMetrics?.volatility,
         winRate: ratioOrPercentToPercent(apiWallet?.win_rate),
         trades: apiWallet?.total_trades ?? 0,
         maxDrawdown: ratioOrPercentToPercent(walletMetrics?.max_drawdown),
@@ -169,6 +188,12 @@ export default function WalletDetailPage() {
         roi7d: Number(discoveredWallet.roi_7d),
         roi90d: Number(discoveredWallet.roi_90d),
         sharpe: Number(discoveredWallet.sharpe_ratio),
+        sortino: discoveredWallet.sortino_ratio
+          ? Number(discoveredWallet.sortino_ratio)
+          : undefined,
+        volatility: discoveredWallet.volatility
+          ? Number(discoveredWallet.volatility)
+          : undefined,
         winRate: Number(discoveredWallet.win_rate),
         trades: discoveredWallet.total_trades,
         maxDrawdown: Number(discoveredWallet.max_drawdown),
@@ -189,6 +214,8 @@ export default function WalletDetailPage() {
       roi7d: 0,
       roi90d: 0,
       sharpe: 0,
+      sortino: undefined as number | undefined,
+      volatility: undefined as number | undefined,
       winRate: 0,
       trades: 0,
       maxDrawdown: 0,
@@ -436,7 +463,7 @@ export default function WalletDetailPage() {
         </div>
 
         {/* Stats Row */}
-        <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
+        <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-7">
           {/* ROI Card with period toggle */}
           <Card>
             <CardContent className="p-4">
@@ -494,7 +521,19 @@ export default function WalletDetailPage() {
               <div className="flex items-center gap-3">
                 <Activity className="h-5 w-5 text-blue-500" />
                 <div>
-                  <p className="text-xs text-muted-foreground">Sharpe</p>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <p className="text-xs text-muted-foreground cursor-help underline decoration-dotted">
+                        Sharpe
+                      </p>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p className="text-xs max-w-[200px]">
+                        Risk-adjusted return ratio. Annualized over 365 days
+                        (crypto markets trade daily).
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
                   {isLoading ? (
                     <Skeleton className="h-6 w-12" />
                   ) : (
@@ -534,6 +573,60 @@ export default function WalletDetailPage() {
                   ) : (
                     <p className="text-xl font-bold tabular-nums">
                       {wallet.trades}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <Shield className="h-5 w-5 text-purple-500" />
+                <div>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <p className="text-xs text-muted-foreground cursor-help underline decoration-dotted">
+                        Sortino
+                      </p>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p className="text-xs max-w-[200px]">
+                        Like Sharpe but only penalizes downside volatility.
+                        Annualized over 365 days.
+                      </p>
+                    </TooltipContent>
+                  </Tooltip>
+                  {isLoading ? (
+                    <Skeleton className="h-6 w-12" />
+                  ) : wallet.sortino != null ? (
+                    <p className="text-xl font-bold tabular-nums">
+                      {wallet.sortino.toFixed(2)}
+                    </p>
+                  ) : (
+                    <p className="text-xl font-bold text-muted-foreground">
+                      &mdash;
+                    </p>
+                  )}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <BarChart2 className="h-5 w-5 text-orange-500" />
+                <div>
+                  <p className="text-xs text-muted-foreground">Volatility</p>
+                  {isLoading ? (
+                    <Skeleton className="h-6 w-16" />
+                  ) : wallet.volatility != null ? (
+                    <p className="text-xl font-bold tabular-nums">
+                      {(wallet.volatility * 100).toFixed(1)}%
+                    </p>
+                  ) : (
+                    <p className="text-xl font-bold text-muted-foreground">
+                      &mdash;
                     </p>
                   )}
                 </div>
