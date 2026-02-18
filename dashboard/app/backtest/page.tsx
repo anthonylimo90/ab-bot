@@ -56,7 +56,7 @@ export default function BacktestPage() {
   );
   const [endDate, setEndDate] = useState(() => formatDate(today));
   const [slippage, setSlippage] = useState(0.1);
-  const [fees, setFees] = useState(0.1);
+  const [fees, setFees] = useState(2.0);
 
   // Strategy state
   const [strategyType, setStrategyType] = useState<StrategyType>("arbitrage");

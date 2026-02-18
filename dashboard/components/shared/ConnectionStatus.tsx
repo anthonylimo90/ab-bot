@@ -1,13 +1,22 @@
 'use client';
 
 import { cn } from '@/lib/utils';
-import { Wifi, WifiOff, Loader2 } from 'lucide-react';
+import { Wifi, WifiOff, Loader2, RefreshCw } from 'lucide-react';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 import type { ConnectionStatus as Status } from '@/hooks/useWebSocket';
 
 interface ConnectionStatusProps {
   status: Status;
   className?: string;
   showLabel?: boolean;
+  /** Current reconnection attempt (only meaningful when status is 'connecting') */
+  reconnectAttempt?: number;
+  /** Maximum reconnection attempts */
+  maxReconnectAttempts?: number;
 }
 
 const statusConfig = {
@@ -37,11 +46,22 @@ const statusConfig = {
   },
 };
 
-export function ConnectionStatus({ status, className, showLabel = false }: ConnectionStatusProps) {
+export function ConnectionStatus({
+  status,
+  className,
+  showLabel = false,
+  reconnectAttempt,
+  maxReconnectAttempts,
+}: ConnectionStatusProps) {
   const config = statusConfig[status];
-  const Icon = config.icon;
+  const isReconnecting =
+    status === 'connecting' && reconnectAttempt != null && reconnectAttempt > 0;
+  const Icon = isReconnecting ? RefreshCw : config.icon;
+  const label = isReconnecting
+    ? `Reconnecting (${reconnectAttempt}/${maxReconnectAttempts ?? '?'})...`
+    : config.label;
 
-  return (
+  const indicator = (
     <div
       className={cn(
         'flex items-center gap-2 rounded-full px-2 py-1',
@@ -49,20 +69,37 @@ export function ConnectionStatus({ status, className, showLabel = false }: Conne
         className
       )}
       role="status"
-      aria-label={config.label}
+      aria-label={label}
     >
       <Icon
         className={cn(
           'h-3 w-3',
           config.color,
-          status === 'connecting' && 'animate-spin'
+          (status === 'connecting' || isReconnecting) && 'animate-spin'
         )}
       />
       {showLabel && (
         <span className={cn('text-xs font-medium', config.color)}>
-          {config.label}
+          {label}
         </span>
       )}
     </div>
   );
+
+  // Show tooltip with reconnection details when reconnecting
+  if (isReconnecting) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>{indicator}</TooltipTrigger>
+        <TooltipContent>
+          <p className="text-xs">
+            Reconnecting: attempt {reconnectAttempt} of{' '}
+            {maxReconnectAttempts ?? '?'}
+          </p>
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  return indicator;
 }

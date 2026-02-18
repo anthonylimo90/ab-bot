@@ -24,7 +24,7 @@ import {
 } from "@/hooks/queries/usePositionsQuery";
 import { useWalletStore } from "@/stores/wallet-store";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
-import type { Position, WalletPosition } from "@/types/api";
+import type { Position, WalletPosition, PositionState } from "@/types/api";
 import {
   useAllocationsQuery,
   usePromoteAllocationMutation,
@@ -39,6 +39,12 @@ import {
   cn,
   ratioOrPercentToPercent,
 } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   TrendingUp,
   Eye,
@@ -75,6 +81,31 @@ interface TradingWallet {
   consecutiveLosses?: number;
 }
 
+/** Position lifecycle state badge configuration */
+const POSITION_STATE_CONFIG: Record<
+  PositionState,
+  { label: string; variant: "default" | "secondary" | "destructive" | "outline" }
+> = {
+  pending: { label: "Pending", variant: "outline" },
+  open: { label: "Open", variant: "default" },
+  exit_ready: { label: "Exit Ready", variant: "secondary" },
+  closing: { label: "Closing", variant: "secondary" },
+  closed: { label: "Closed", variant: "outline" },
+  entry_failed: { label: "Entry Failed", variant: "destructive" },
+  exit_failed: { label: "Exit Failed", variant: "destructive" },
+  stalled: { label: "Stalled", variant: "destructive" },
+};
+
+function PositionStateBadge({ state }: { state?: PositionState }) {
+  if (!state) return null;
+  const config = POSITION_STATE_CONFIG[state];
+  return (
+    <Badge variant={config.variant} className="text-xs">
+      {config.label}
+    </Badge>
+  );
+}
+
 interface ClosedPositionDisplay {
   id: string;
   marketQuestion?: string;
@@ -87,6 +118,9 @@ interface ClosedPositionDisplay {
   walletAddress?: string;
   walletLabel?: string;
   closedAt?: string;
+  state?: PositionState;
+  entryFees?: number;
+  exitFees?: number;
 }
 
 function livePositionToWalletPosition(p: Position): WalletPosition {
@@ -353,20 +387,27 @@ export default function TradingPage() {
   const pinsRemaining = maxPins - pinnedCount;
 
   const closedDisplayPositions = useMemo((): ClosedPositionDisplay[] => {
-    return liveClosedPositions.map((p) => ({
-      id: p.id,
-      marketQuestion: undefined,
-      marketId: p.market_id,
-      outcome: p.outcome,
-      entryPrice: p.entry_price,
-      // Note: API does not expose a separate exit_price; current_price is the last recorded price
-      exitPrice: p.current_price,
-      quantity: p.quantity,
-      realizedPnl: p.realized_pnl ?? 0,
-      walletAddress: p.source_wallet,
-      walletLabel: undefined,
-      closedAt: p.updated_at,
-    }));
+    return liveClosedPositions.map((p) => {
+      // Use actual exit prices from backend when available, fallback to current_price
+      const exitPrice =
+        p.yes_exit_price ?? p.no_exit_price ?? p.current_price;
+      return {
+        id: p.id,
+        marketQuestion: undefined,
+        marketId: p.market_id,
+        outcome: p.outcome,
+        entryPrice: p.entry_price,
+        exitPrice,
+        quantity: p.quantity,
+        realizedPnl: p.realized_pnl ?? 0,
+        walletAddress: p.source_wallet,
+        walletLabel: undefined,
+        closedAt: p.updated_at,
+        state: p.state,
+        entryFees: p.entry_fees,
+        exitFees: p.exit_fees,
+      };
+    });
   }, [liveClosedPositions]);
 
   return (
@@ -622,9 +663,11 @@ export default function TradingPage() {
                         <tr>
                           <th className="text-left p-4 font-medium">Market</th>
                           <th className="text-left p-4 font-medium">Outcome</th>
+                          <th className="text-left p-4 font-medium">State</th>
                           <th className="text-right p-4 font-medium">Entry</th>
                           <th className="text-right p-4 font-medium">Exit</th>
                           <th className="text-right p-4 font-medium">Size</th>
+                          <th className="text-right p-4 font-medium">Fees</th>
                           <th className="text-right p-4 font-medium">
                             Realized P&L
                           </th>
@@ -633,69 +676,108 @@ export default function TradingPage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {closedDisplayPositions.map((position) => (
-                          <tr
-                            key={position.id}
-                            className="border-b hover:bg-muted/30"
-                          >
-                            <td className="p-4">
-                              <p className="font-medium text-sm">
-                                {position.marketQuestion ||
-                                  shortenAddress(position.marketId)}
-                              </p>
-                            </td>
-                            <td className="p-4">
-                              <span
-                                className={cn(
-                                  "px-2 py-1 rounded text-xs font-medium uppercase",
-                                  position.outcome === "yes"
-                                    ? "bg-profit/10 text-profit"
-                                    : "bg-loss/10 text-loss",
+                        {closedDisplayPositions.map((position) => {
+                          const totalFees =
+                            (position.entryFees ?? 0) +
+                            (position.exitFees ?? 0);
+                          return (
+                            <tr
+                              key={position.id}
+                              className="border-b hover:bg-muted/30"
+                            >
+                              <td className="p-4">
+                                <p className="font-medium text-sm">
+                                  {position.marketQuestion ||
+                                    shortenAddress(position.marketId)}
+                                </p>
+                              </td>
+                              <td className="p-4">
+                                <span
+                                  className={cn(
+                                    "px-2 py-1 rounded text-xs font-medium uppercase",
+                                    position.outcome === "yes"
+                                      ? "bg-profit/10 text-profit"
+                                      : "bg-loss/10 text-loss",
+                                  )}
+                                >
+                                  {position.outcome}
+                                </span>
+                              </td>
+                              <td className="p-4">
+                                <PositionStateBadge state={position.state} />
+                              </td>
+                              <td className="p-4 text-right tabular-nums">
+                                ${position.entryPrice.toFixed(2)}
+                              </td>
+                              <td className="p-4 text-right tabular-nums">
+                                ${position.exitPrice?.toFixed(2) || "-"}
+                              </td>
+                              <td className="p-4 text-right tabular-nums">
+                                {formatCurrency(
+                                  position.quantity * position.entryPrice,
                                 )}
-                              >
-                                {position.outcome}
-                              </span>
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              ${position.entryPrice.toFixed(2)}
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              ${position.exitPrice?.toFixed(2) || "-"}
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              {formatCurrency(
-                                position.quantity * position.entryPrice,
-                              )}
-                            </td>
-                            <td className="p-4 text-right">
-                              <span
-                                className={cn(
-                                  "tabular-nums font-medium",
-                                  position.realizedPnl >= 0
-                                    ? "text-profit"
-                                    : "text-loss",
+                              </td>
+                              <td className="p-4 text-right">
+                                {totalFees > 0 ? (
+                                  <Tooltip>
+                                    <TooltipTrigger asChild>
+                                      <span className="tabular-nums text-sm text-loss cursor-help">
+                                        {formatCurrency(totalFees)}
+                                      </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent>
+                                      <div className="text-xs space-y-1">
+                                        <p>
+                                          Entry:{" "}
+                                          {formatCurrency(
+                                            position.entryFees ?? 0,
+                                          )}
+                                        </p>
+                                        <p>
+                                          Exit:{" "}
+                                          {formatCurrency(
+                                            position.exitFees ?? 0,
+                                          )}
+                                        </p>
+                                      </div>
+                                    </TooltipContent>
+                                  </Tooltip>
+                                ) : (
+                                  <span className="text-sm text-muted-foreground">
+                                    -
+                                  </span>
                                 )}
-                              >
-                                {formatCurrency(position.realizedPnl, {
-                                  showSign: true,
-                                })}
-                              </span>
-                            </td>
-                            <td className="p-4 text-right text-muted-foreground text-sm">
-                              {position.walletLabel ||
-                                (position.walletAddress
-                                  ? shortenAddress(position.walletAddress)
-                                  : "Manual")}
-                            </td>
-                            <td className="p-4 text-right text-muted-foreground text-sm">
-                              {position.closedAt
-                                ? new Date(
-                                    position.closedAt,
-                                  ).toLocaleDateString()
-                                : "-"}
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                              <td className="p-4 text-right">
+                                <span
+                                  className={cn(
+                                    "tabular-nums font-medium",
+                                    position.realizedPnl >= 0
+                                      ? "text-profit"
+                                      : "text-loss",
+                                  )}
+                                >
+                                  {formatCurrency(position.realizedPnl, {
+                                    showSign: true,
+                                  })}
+                                </span>
+                              </td>
+                              <td className="p-4 text-right text-muted-foreground text-sm">
+                                {position.walletLabel ||
+                                  (position.walletAddress
+                                    ? shortenAddress(position.walletAddress)
+                                    : "Manual")}
+                              </td>
+                              <td className="p-4 text-right text-muted-foreground text-sm">
+                                {position.closedAt
+                                  ? new Date(
+                                      position.closedAt,
+                                    ).toLocaleDateString()
+                                  : "-"}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

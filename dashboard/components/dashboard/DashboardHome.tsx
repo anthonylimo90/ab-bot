@@ -9,6 +9,7 @@ import {
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
+import { useRiskStatusQuery } from "@/hooks/queries/useRiskQuery";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
@@ -56,6 +57,7 @@ export function DashboardHome() {
   const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
   const activeWallets = allocations.filter((a) => a.tier === "active");
   const { openPositions, totalUnrealizedPnl } = useOpenPositions();
+  const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: closedPositions = [] } = usePositionsQuery({ status: "closed" });
   const stats = useMemo(() => {
     const totalValue = openPositions.reduce(
@@ -69,13 +71,15 @@ export function DashboardHome() {
     return {
       total_value: totalValue,
       total_pnl_percent: totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
-      // TODO: today_pnl requires backend-computed daily P&L; not available from position queries
-      today_pnl: 0,
-      today_pnl_percent: 0,
+      today_pnl: riskStatus?.circuit_breaker?.daily_pnl ?? 0,
+      today_pnl_percent:
+        totalValue > 0
+          ? ((riskStatus?.circuit_breaker?.daily_pnl ?? 0) / totalValue) * 100
+          : 0,
       active_positions: openPositions.length,
       win_rate: closedCount > 0 ? (winCount / closedCount) * 100 : 0,
     };
-  }, [openPositions, totalUnrealizedPnl, closedPositions]);
+  }, [openPositions, totalUnrealizedPnl, closedPositions, riskStatus]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
   const isAutomatic = currentWorkspace?.setup_mode === "automatic";
