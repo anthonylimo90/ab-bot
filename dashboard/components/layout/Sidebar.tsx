@@ -8,6 +8,7 @@ import {
   TrendingUp,
   Settings,
   LineChart,
+  History,
   Star,
   type LucideIcon,
 } from "lucide-react";
@@ -38,6 +39,7 @@ const navSections: NavSection[] = [
       { href: "/discover", label: "Discover", icon: Search },
       { href: "/trading", label: "Trading", icon: TrendingUp, badge: "active" },
       { href: "/backtest", label: "Backtest", icon: LineChart },
+      { href: "/history", label: "History", icon: History },
     ],
   },
   {

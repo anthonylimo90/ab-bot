@@ -46,6 +46,9 @@ export {
   useUnacknowledgedRotationCount,
 } from "./useOptimizerQuery";
 
+// History queries
+export { useClosedPositionsQuery } from "./useHistoryQuery";
+
 // Allocation queries
 export {
   useAllocationsQuery,
