@@ -582,6 +582,72 @@ impl MarketConditionAnalyzer {
         // Would typically use price data
         Ok(0.0)
     }
+
+    /// Detect market regime using wallet performance aggregates from `wallet_success_metrics`.
+    ///
+    /// Uses rolling 7-day averages across all recently-computed wallets:
+    /// - Average win rate classifies bull (>0.60), bear (<0.50), or ranging
+    /// - Standard deviation of ROI classifies volatility
+    ///
+    /// This is a lightweight alternative to `detect_regime()` that doesn't require
+    /// arb_opportunities data and is suitable for hourly MetricsCalculator integration.
+    pub async fn detect_regime_from_metrics(&self) -> Result<MarketRegime> {
+        let row: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
+            r#"
+            SELECT
+                AVG(
+                    CASE
+                        WHEN ABS(COALESCE(win_rate_30d, 0)) > 1
+                            THEN COALESCE(win_rate_30d, 0)::FLOAT8 / 100.0
+                        ELSE COALESCE(win_rate_30d, 0)::FLOAT8
+                    END
+                ) AS avg_win_rate,
+                STDDEV_POP(
+                    CASE
+                        WHEN ABS(COALESCE(roi_30d, 0)) > 1
+                            THEN COALESCE(roi_30d, 0)::FLOAT8 / 100.0
+                        ELSE COALESCE(roi_30d, 0)::FLOAT8
+                    END
+                ) AS roi_stddev
+            FROM wallet_success_metrics
+            WHERE last_computed > NOW() - INTERVAL '7 days'
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (avg_win_rate, roi_stddev) = row.unwrap_or((None, None));
+        let avg_win_rate = avg_win_rate.unwrap_or(0.50);
+        let roi_stddev = roi_stddev.unwrap_or(0.15);
+
+        let is_bullish = avg_win_rate > 0.58;
+        let is_bearish = avg_win_rate < 0.48;
+        let is_volatile = roi_stddev > self.volatility_threshold_high;
+        let is_calm = roi_stddev < self.volatility_threshold_low;
+
+        let regime = if is_bullish && is_volatile {
+            MarketRegime::BullVolatile
+        } else if is_bullish && is_calm {
+            MarketRegime::BullCalm
+        } else if is_bearish && is_volatile {
+            MarketRegime::BearVolatile
+        } else if is_bearish && is_calm {
+            MarketRegime::BearCalm
+        } else if !is_bullish && !is_bearish {
+            MarketRegime::Ranging
+        } else {
+            MarketRegime::Uncertain
+        };
+
+        debug!(
+            avg_win_rate = avg_win_rate,
+            roi_stddev = roi_stddev,
+            regime = ?regime,
+            "Detected market regime from wallet metrics"
+        );
+
+        Ok(regime)
+    }
 }
 
 #[cfg(test)]

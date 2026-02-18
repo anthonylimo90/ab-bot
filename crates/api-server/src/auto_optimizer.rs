@@ -71,6 +71,7 @@ mod tests {
             win_rate_score: 65.0,
             consistency_score: 80.0,
             confidence: 0.9,
+            strategy_type: None,
         };
         let exploratory = WalletCompositeScore {
             address: "0x2".to_string(),
@@ -80,6 +81,7 @@ mod tests {
             win_rate_score: 62.0,
             consistency_score: 70.0,
             confidence: 0.35,
+            strategy_type: None,
         };
 
         assert!(
@@ -148,6 +150,7 @@ mod tests {
             win_rate_score: 70.0,
             consistency_score: 70.0,
             confidence: 0.9,
+            strategy_type: None,
         };
         let low_conf = WalletCompositeScore {
             confidence: 0.3,
@@ -273,6 +276,17 @@ pub struct WalletCandidate {
     pub trade_count_30d: Option<i32>,
     pub max_drawdown_30d: Option<Decimal>,
     pub last_trade_at: Option<DateTime<Utc>>,
+    /// Recency-adjusted ROI blending 30d (70%) and 90d (30%) metrics.
+    pub recency_adjusted_roi: Option<Decimal>,
+    /// Days since last metrics computation or trade activity.
+    pub staleness_days: Option<f64>,
+    /// Copy trade win rate from actual execution history (if available).
+    /// When this diverges significantly from reported win_rate_30d, it signals
+    /// that the wallet's metrics don't translate well to copy trading.
+    pub copy_win_rate: Option<f64>,
+    /// Classified trading strategy (e.g., "Arbitrage", "Momentum", "Unknown").
+    /// Used for diversity-aware selection to avoid correlated picks.
+    pub strategy_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +403,8 @@ pub struct WalletCompositeScore {
     pub win_rate_score: f64,    // 25% weight
     pub consistency_score: f64, // 20% weight
     pub confidence: f64,
+    /// Classified strategy type for diversity-aware selection.
+    pub strategy_type: Option<String>,
 }
 
 /// Automation action result for history logging
@@ -794,7 +810,38 @@ impl AutoOptimizer {
             .min(empty_slots.saturating_sub(1));
         let core_slots = empty_slots.saturating_sub(exploration_slots);
 
-        let mut selected: Vec<&WalletCompositeScore> = ranked.iter().take(core_slots).collect();
+        // Apply strategy diversity penalty: penalize candidates that duplicate
+        // a strategy type already selected. This ensures the final roster covers
+        // at least 2 distinct strategies when possible.
+        let mut selected: Vec<&WalletCompositeScore> = Vec::with_capacity(core_slots);
+        let mut strategy_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for candidate in ranked.iter() {
+            if selected.len() >= core_slots {
+                break;
+            }
+
+            let strategy = candidate
+                .strategy_type
+                .as_deref()
+                .unwrap_or("Unknown")
+                .to_string();
+            let count = strategy_counts.get(&strategy).copied().unwrap_or(0);
+
+            // Apply a 20% diversity penalty per duplicate strategy type.
+            // The first wallet of each strategy gets no penalty.
+            let diversity_factor = 1.0 - (count as f64 * 0.20).min(0.60);
+            let adjusted_score = candidate.total_score * diversity_factor;
+
+            // Accept the candidate if its adjusted score still beats the
+            // threshold of 50% of the top score (prevents very weak picks).
+            let top_score = ranked.first().map(|r| r.total_score).unwrap_or(1.0);
+            if adjusted_score >= top_score * 0.50 || selected.is_empty() {
+                selected.push(candidate);
+                *strategy_counts.entry(strategy).or_insert(0) += 1;
+            }
+        }
 
         if exploration_slots > 0 {
             let mut exploration_pool: Vec<&WalletCompositeScore> = ranked
@@ -1310,21 +1357,44 @@ impl AutoOptimizer {
                             THEN COALESCE(wsm.max_drawdown_30d, 0.2) / 100
                         ELSE COALESCE(wsm.max_drawdown_30d, 0.2)
                     END AS max_drawdown_30d,
-                    COALESCE(wsm.last_computed, wf.last_trade, NOW()) AS last_trade_at
+                    COALESCE(wsm.last_computed, wf.last_trade, NOW()) AS last_trade_at,
+                    -- Recency-adjusted ROI: blend 30d (70%) and 90d (30%) metrics
+                    (0.70 * COALESCE(
+                        CASE WHEN ABS(COALESCE(wsm.roi_30d, 0)) > 1 THEN wsm.roi_30d / 100 ELSE COALESCE(wsm.roi_30d, 0) END,
+                        0
+                    ) + 0.30 * COALESCE(
+                        CASE WHEN ABS(COALESCE(wsm.roi_90d, wsm.roi_30d, 0)) > 1 THEN COALESCE(wsm.roi_90d, wsm.roi_30d, 0) / 100 ELSE COALESCE(wsm.roi_90d, wsm.roi_30d, 0) END,
+                        0
+                    )) AS recency_adjusted_roi,
+                    -- Staleness: days since last data update
+                    EXTRACT(EPOCH FROM (NOW() - COALESCE(wsm.last_computed, wf.last_trade, NOW()))) / 86400.0 AS staleness_days
                 FROM wallet_success_metrics wsm
                 FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
                 WHERE COALESCE(wsm.address, wf.address) IS NOT NULL
+            ),
+            copy_performance AS (
+                SELECT
+                    source_wallet AS address,
+                    AVG(CASE WHEN pnl > 0 THEN 1.0 ELSE 0.0 END)::FLOAT8 AS copy_win_rate
+                FROM copy_trade_history
+                WHERE created_at > NOW() - INTERVAL '30 days'
+                GROUP BY source_wallet
             )
             SELECT
-                address, roi_30d, sharpe_30d, win_rate_30d,
-                trade_count_30d, max_drawdown_30d, last_trade_at
-            FROM candidate_metrics
-            WHERE roi_30d >= $1::numeric
-              AND sharpe_30d >= $2::numeric
-              AND win_rate_30d >= $3::numeric
-              AND trade_count_30d >= $4
-              AND max_drawdown_30d <= $5::numeric
-            ORDER BY roi_30d DESC
+                cm.address, cm.roi_30d, cm.sharpe_30d, cm.win_rate_30d,
+                cm.trade_count_30d, cm.max_drawdown_30d, cm.last_trade_at,
+                cm.recency_adjusted_roi, cm.staleness_days,
+                cp.copy_win_rate,
+                wf_st.strategy_type
+            FROM candidate_metrics cm
+            LEFT JOIN copy_performance cp ON cp.address = cm.address
+            LEFT JOIN wallet_features wf_st ON wf_st.address = cm.address
+            WHERE cm.roi_30d >= $1::numeric
+              AND cm.sharpe_30d >= $2::numeric
+              AND cm.win_rate_30d >= $3::numeric
+              AND cm.trade_count_30d >= $4
+              AND cm.max_drawdown_30d <= $5::numeric
+            ORDER BY cm.recency_adjusted_roi DESC
             LIMIT $6
             "#,
         )
@@ -1340,7 +1410,7 @@ impl AutoOptimizer {
         Ok(candidates)
     }
 
-    /// Rank candidates by composite score.
+    /// Rank candidates by composite score with recency weighting.
     async fn rank_candidates(
         &self,
         candidates: &[&WalletCandidate],
@@ -1348,8 +1418,10 @@ impl AutoOptimizer {
         let mut scores = Vec::new();
 
         for candidate in candidates {
+            // Prefer recency-adjusted ROI when available, fall back to raw 30d ROI
             let roi = candidate
-                .roi_30d
+                .recency_adjusted_roi
+                .or(candidate.roi_30d)
                 .map(|d| d.to_string().parse::<f64>().unwrap_or(0.0))
                 .map(Self::normalize_ratio)
                 .unwrap_or(0.0);
@@ -1381,10 +1453,31 @@ impl AutoOptimizer {
 
             // Weighted composite score
             // ROI: 30%, Sharpe: 25%, Win Rate: 25%, Consistency: 20%
-            let total_score = roi_score * 0.30
+            let raw_score = roi_score * 0.30
                 + sharpe_score * 0.25
                 + win_rate_score * 0.25
                 + consistency_score * 0.20;
+
+            // Apply staleness penalty: score decays linearly over 60 days, floored at 50%
+            let staleness = candidate.staleness_days.unwrap_or(0.0).max(0.0);
+            let staleness_multiplier = (1.0 - staleness / 60.0).max(0.5);
+
+            // Apply copy trade divergence penalty: if actual copy performance is
+            // significantly worse than reported metrics, penalize the score by 10%.
+            // This closes the feedback loop between paper metrics and live execution.
+            let copy_penalty = if let Some(copy_wr) = candidate.copy_win_rate {
+                let reported_wr = win_rate;
+                if reported_wr - copy_wr > 0.15 {
+                    // Copy win rate is >15pp below reported — apply 10% penalty
+                    0.90
+                } else {
+                    1.0
+                }
+            } else {
+                1.0 // No copy history — no penalty
+            };
+
+            let total_score = raw_score * staleness_multiplier * copy_penalty;
 
             // Confidence based on data quality
             let confidence = self.calculate_data_confidence(trade_count as i32, sharpe, win_rate);
@@ -1397,6 +1490,7 @@ impl AutoOptimizer {
                 win_rate_score,
                 consistency_score,
                 confidence,
+                strategy_type: candidate.strategy_type.clone(),
             });
         }
 
@@ -2127,6 +2221,28 @@ impl AutoOptimizer {
                 }
             }
         }
+
+        // Trigger immediate single-wallet metric recompute for faster feedback.
+        // This updates wallet_success_metrics so the next optimization cycle
+        // has fresh data instead of waiting up to 1 hour for the batch job.
+        let pool = self.pool.clone();
+        let address = wallet_address.to_string();
+        tokio::spawn(async move {
+            let config = crate::metrics_calculator::MetricsCalculatorConfig {
+                enabled: true,
+                ..Default::default()
+            };
+            let calculator = crate::metrics_calculator::MetricsCalculator::new(pool, config);
+            if let Err(e) = calculator.compute_single_wallet(&address).await {
+                warn!(
+                    address = %address,
+                    error = %e,
+                    "Failed to recompute metrics after position close"
+                );
+            } else {
+                debug!(address = %address, "Recomputed metrics after position close");
+            }
+        });
 
         Ok(())
     }

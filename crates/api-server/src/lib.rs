@@ -343,18 +343,19 @@ impl ApiServer {
             state.pool.clone(),
         );
 
-        // Spawn metrics calculator (populates wallet_success_metrics)
+        // Spawn metrics calculator (populates wallet_success_metrics + market regime)
         let metrics_config = MetricsCalculatorConfig::from_env();
         if metrics_config.enabled {
-            let calculator = Arc::new(MetricsCalculator::new(
+            let calculator = Arc::new(MetricsCalculator::with_regime(
                 state.pool.clone(),
                 metrics_config.clone(),
+                state.current_regime.clone(),
             ));
             tokio::spawn(calculator.run());
             info!(
                 interval_secs = metrics_config.interval_secs,
                 batch_size = metrics_config.batch_size,
-                "Metrics calculator background job spawned"
+                "Metrics calculator background job spawned (with regime detection)"
             );
         }
 

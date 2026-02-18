@@ -73,6 +73,60 @@ impl Default for RiskScorerConfig {
     }
 }
 
+impl RiskScorerConfig {
+    /// Return a regime-adapted configuration that shifts weights
+    /// based on current market conditions.
+    ///
+    /// - Bear/Volatile: leans heavily on Sortino (downside protection)
+    ///   and tightens max allocation to 20%.
+    /// - Bull/Calm: favors ROI/MaxDD for growth capture,
+    ///   relaxes max allocation to 30%.
+    /// - Ranging/Uncertain: uses the conservative default.
+    pub fn for_regime(regime: crate::advanced_predictor::MarketRegime) -> Self {
+        use crate::advanced_predictor::MarketRegime;
+
+        match regime {
+            MarketRegime::BearVolatile => Self {
+                sortino_weight: 0.45,
+                consistency_weight: 0.25,
+                roi_drawdown_weight: 0.15,
+                win_rate_weight: 0.15,
+                max_allocation_pct: 20.0,
+                min_allocation_pct: 5.0,
+                volatility_scale: 1.5, // More aggressive vol scaling
+            },
+            MarketRegime::BearCalm => Self {
+                sortino_weight: 0.35,
+                consistency_weight: 0.25,
+                roi_drawdown_weight: 0.20,
+                win_rate_weight: 0.20,
+                max_allocation_pct: 22.0,
+                min_allocation_pct: 5.0,
+                volatility_scale: 1.2,
+            },
+            MarketRegime::BullCalm => Self {
+                sortino_weight: 0.20,
+                consistency_weight: 0.20,
+                roi_drawdown_weight: 0.35,
+                win_rate_weight: 0.25,
+                max_allocation_pct: 30.0,
+                min_allocation_pct: 5.0,
+                volatility_scale: 0.8, // Less cautious in calm bull
+            },
+            MarketRegime::BullVolatile => Self {
+                sortino_weight: 0.30,
+                consistency_weight: 0.25,
+                roi_drawdown_weight: 0.25,
+                win_rate_weight: 0.20,
+                max_allocation_pct: 25.0,
+                min_allocation_pct: 5.0,
+                volatility_scale: 1.1,
+            },
+            MarketRegime::Ranging | MarketRegime::Uncertain => Self::default(),
+        }
+    }
+}
+
 /// Risk scorer for calculating composite scores and allocations.
 pub struct RiskScorer {
     pool: PgPool,
@@ -424,6 +478,58 @@ mod tests {
             + config.roi_drawdown_weight
             + config.win_rate_weight;
         assert!((total_weight - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_for_regime_weights_sum_to_one() {
+        use crate::advanced_predictor::MarketRegime;
+
+        let regimes = [
+            MarketRegime::BullVolatile,
+            MarketRegime::BullCalm,
+            MarketRegime::BearVolatile,
+            MarketRegime::BearCalm,
+            MarketRegime::Ranging,
+            MarketRegime::Uncertain,
+        ];
+
+        for regime in regimes {
+            let config = RiskScorerConfig::for_regime(regime);
+            let total = config.sortino_weight
+                + config.consistency_weight
+                + config.roi_drawdown_weight
+                + config.win_rate_weight;
+            assert!(
+                (total - 1.0).abs() < 0.01,
+                "for_regime({:?}) weights sum to {} instead of 1.0",
+                regime,
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn test_bear_volatile_more_conservative() {
+        use crate::advanced_predictor::MarketRegime;
+
+        let default = RiskScorerConfig::default();
+        let bear_vol = RiskScorerConfig::for_regime(MarketRegime::BearVolatile);
+
+        // Bear volatile should have higher sortino weight (downside protection)
+        assert!(
+            bear_vol.sortino_weight > default.sortino_weight,
+            "Bear volatile should emphasize Sortino"
+        );
+        // And tighter max allocation
+        assert!(
+            bear_vol.max_allocation_pct < default.max_allocation_pct,
+            "Bear volatile should cap allocation lower"
+        );
+        // And higher volatility scaling
+        assert!(
+            bear_vol.volatility_scale > default.volatility_scale,
+            "Bear volatile should scale vol more aggressively"
+        );
     }
 
     #[test]
