@@ -89,10 +89,16 @@ struct CopyPosition {
     id: uuid::Uuid,
     market_id: String,
     outcome: String,
+    source_token_id: Option<String>,
     quantity: Decimal,
     entry_price: Decimal,
-    source_wallet: Option<String>,
     opened_at: chrono::DateTime<Utc>,
+}
+
+impl CopyPosition {
+    fn orderbook_token_id(&self) -> &str {
+        self.source_token_id.as_deref().unwrap_or(&self.outcome)
+    }
 }
 
 /// Background service that monitors copy trade positions.
@@ -197,22 +203,22 @@ impl CopyStopLossMonitor {
 
         debug!(count = positions.len(), "Checking copy trade positions");
 
-        // Fetch current prices keyed by (market_id, outcome) to handle
-        // multiple outcomes in the same market correctly
+        // Fetch current prices keyed by source token ID where available.
         let mut outcome_prices: HashMap<(String, String), Decimal> = HashMap::new();
         for pos in &positions {
-            let key = (pos.market_id.clone(), pos.outcome.clone());
+            let token_id = pos.orderbook_token_id().to_string();
+            let key = (pos.market_id.clone(), token_id.clone());
             if outcome_prices.contains_key(&key) {
                 continue;
             }
-            match self.fetch_current_price(&pos.market_id, &pos.outcome).await {
+            match self.fetch_current_price(&pos.market_id, &token_id).await {
                 Ok(price) => {
                     outcome_prices.insert(key, price);
                 }
                 Err(e) => {
                     warn!(
                         market_id = %pos.market_id,
-                        outcome = %pos.outcome,
+                        token_id = %token_id,
                         error = %e,
                         "Failed to fetch price for stop-loss check"
                     );
@@ -223,19 +229,32 @@ impl CopyStopLossMonitor {
         let now = Utc::now();
 
         for pos in &positions {
-            let current_price =
-                match outcome_prices.get(&(pos.market_id.clone(), pos.outcome.clone())) {
-                    Some(p) => *p,
-                    None => continue,
-                };
+            let hold_hours = now.signed_duration_since(pos.opened_at).num_hours();
+
+            // Time-based exit does not require a live price lookup.
+            if hold_hours >= self.config.max_hold_hours {
+                warn!(
+                    position_id = %pos.id,
+                    market = %pos.market_id,
+                    hold_hours = hold_hours,
+                    "Max hold time exceeded for copy trade"
+                );
+                self.close_position(pos, "time_exit").await;
+                continue;
+            }
+
+            let current_price = match outcome_prices
+                .get(&(pos.market_id.clone(), pos.orderbook_token_id().to_string()))
+            {
+                Some(p) => *p,
+                None => continue,
+            };
 
             let pnl_pct = if pos.entry_price > Decimal::ZERO {
                 (current_price - pos.entry_price) / pos.entry_price
             } else {
                 Decimal::ZERO
             };
-
-            let hold_hours = now.signed_duration_since(pos.opened_at).num_hours();
 
             // Stop-loss: close if loss exceeds threshold
             if pnl_pct < Decimal::ZERO && pnl_pct.abs() >= self.config.stop_loss_pct {
@@ -260,17 +279,6 @@ impl CopyStopLossMonitor {
                 self.close_position(pos, "take_profit").await;
                 continue;
             }
-
-            // Time-based exit: close if held too long
-            if hold_hours >= self.config.max_hold_hours {
-                warn!(
-                    position_id = %pos.id,
-                    market = %pos.market_id,
-                    hold_hours = hold_hours,
-                    "Max hold time exceeded for copy trade"
-                );
-                self.close_position(pos, "time_exit").await;
-            }
         }
 
         Ok(())
@@ -281,28 +289,56 @@ impl CopyStopLossMonitor {
         &self,
         wallet_trade: &wallet_tracker::trade_monitor::WalletTrade,
     ) -> anyhow::Result<()> {
-        // Find open copy positions from this wallet in this market
-        let rows =
-            sqlx::query_as::<_, (uuid::Uuid, String, Decimal, Decimal, chrono::DateTime<Utc>)>(
-                r#"
-            SELECT id, outcome, quantity, entry_price, opened_at
-            FROM positions
-            WHERE is_copy_trade = true
-              AND source_wallet = $1
-              AND market_id = $2
-              AND is_open = true
+        // Find open copy positions from this wallet in this market/token.
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Decimal, Decimal, chrono::DateTime<Utc>)>(
+            r#"
+            SELECT
+              p.id,
+              p.outcome,
+              COALESCE(
+                p.source_token_id,
+                (
+                  SELECT cth.source_token_id
+                  FROM copy_trade_history cth
+                  WHERE LOWER(cth.source_wallet) = LOWER(p.source_wallet)
+                    AND cth.source_market_id = p.market_id
+                  ORDER BY ABS(EXTRACT(EPOCH FROM (cth.source_timestamp - COALESCE(p.opened_at, p.entry_timestamp)))) ASC
+                  LIMIT 1
+                )
+              ) AS resolved_token_id,
+              p.quantity,
+              p.entry_price,
+              p.opened_at
+            FROM positions p
+            WHERE p.is_copy_trade = true
+              AND p.source_wallet = $1
+              AND p.market_id = $2
+              AND p.is_open = true
+              AND COALESCE(
+                    p.source_token_id,
+                    (
+                      SELECT cth.source_token_id
+                      FROM copy_trade_history cth
+                      WHERE LOWER(cth.source_wallet) = LOWER(p.source_wallet)
+                        AND cth.source_market_id = p.market_id
+                      ORDER BY ABS(EXTRACT(EPOCH FROM (cth.source_timestamp - COALESCE(p.opened_at, p.entry_timestamp)))) ASC
+                      LIMIT 1
+                    )
+                  ) = $3
             "#,
-            )
-            .bind(&wallet_trade.wallet_address)
-            .bind(&wallet_trade.market_id)
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .bind(&wallet_trade.wallet_address)
+        .bind(&wallet_trade.market_id)
+        .bind(&wallet_trade.token_id)
+        .fetch_all(&self.pool)
+        .await?;
 
-        for (id, outcome, quantity, entry_price, opened_at) in rows {
+        for (id, outcome, source_token_id, quantity, entry_price, opened_at) in rows {
             info!(
                 position_id = %id,
                 source_wallet = %wallet_trade.wallet_address,
                 market = %wallet_trade.market_id,
+                token_id = %wallet_trade.token_id,
                 "Mirror exit: source wallet sold, closing our copy position"
             );
 
@@ -310,9 +346,9 @@ impl CopyStopLossMonitor {
                 id,
                 market_id: wallet_trade.market_id.clone(),
                 outcome,
+                source_token_id: Some(source_token_id),
                 quantity,
                 entry_price,
-                source_wallet: Some(wallet_trade.wallet_address.clone()),
                 opened_at,
             };
 
@@ -352,7 +388,7 @@ impl CopyStopLossMonitor {
         // Place sell order
         let order = MarketOrder::new(
             pos.market_id.clone(),
-            pos.outcome.clone(),
+            pos.orderbook_token_id().to_string(),
             OrderSide::Sell,
             pos.quantity,
         );
@@ -398,7 +434,7 @@ impl CopyStopLossMonitor {
                     signal_id: uuid::Uuid::new_v4(),
                     signal_type: SignalType::CopyTrade,
                     market_id: pos.market_id.clone(),
-                    outcome_id: pos.outcome.clone(),
+                    outcome_id: pos.orderbook_token_id().to_string(),
                     action: "closed".to_string(),
                     confidence: 1.0,
                     timestamp: Utc::now(),
@@ -448,18 +484,36 @@ impl CopyStopLossMonitor {
                 uuid::Uuid,
                 String,
                 String,
-                Decimal,
-                Decimal,
                 Option<String>,
+                Decimal,
+                Decimal,
                 Option<chrono::DateTime<Utc>>,
                 chrono::DateTime<Utc>,
             ),
         >(
             r#"
-            SELECT id, market_id, outcome, quantity, entry_price, source_wallet, opened_at, entry_timestamp
-            FROM positions
-            WHERE is_copy_trade = true AND is_open = true
-            ORDER BY COALESCE(opened_at, entry_timestamp) ASC
+            SELECT
+              p.id,
+              p.market_id,
+              p.outcome,
+              COALESCE(
+                p.source_token_id,
+                (
+                  SELECT cth.source_token_id
+                  FROM copy_trade_history cth
+                  WHERE LOWER(cth.source_wallet) = LOWER(p.source_wallet)
+                    AND cth.source_market_id = p.market_id
+                  ORDER BY ABS(EXTRACT(EPOCH FROM (cth.source_timestamp - COALESCE(p.opened_at, p.entry_timestamp)))) ASC
+                  LIMIT 1
+                )
+              ) AS resolved_token_id,
+              p.quantity,
+              p.entry_price,
+              p.opened_at,
+              p.entry_timestamp
+            FROM positions p
+            WHERE p.is_copy_trade = true AND p.is_open = true
+            ORDER BY COALESCE(p.opened_at, p.entry_timestamp) ASC
             "#,
         )
         .fetch_all(&self.pool)
@@ -472,9 +526,9 @@ impl CopyStopLossMonitor {
                     id,
                     market_id,
                     outcome,
+                    source_token_id,
                     quantity,
                     entry_price,
-                    source_wallet,
                     opened_at,
                     entry_timestamp,
                 )| {
@@ -482,9 +536,9 @@ impl CopyStopLossMonitor {
                         id,
                         market_id,
                         outcome,
+                        source_token_id,
                         quantity,
                         entry_price,
-                        source_wallet,
                         opened_at: opened_at.unwrap_or(entry_timestamp),
                     }
                 },

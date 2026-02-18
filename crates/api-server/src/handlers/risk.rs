@@ -33,6 +33,10 @@ async fn get_user_role(
     Ok(role.map(|(r,)| r))
 }
 
+fn can_manage_risk(role: &str) -> bool {
+    role == "owner" || role == "admin"
+}
+
 /// Circuit breaker configuration response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CircuitBreakerConfigResponse {
@@ -226,22 +230,33 @@ pub async fn get_risk_status(
             COUNT(*) FILTER (WHERE stop_type = 1) as percentage,
             COUNT(*) FILTER (WHERE stop_type = 2) as trailing,
             COUNT(*) FILTER (WHERE stop_type = 3) as time_based
-        FROM stop_loss_rules
+        FROM stop_loss_rules sl
+        JOIN positions p ON p.id = sl.position_id
+        JOIN workspace_wallet_allocations wwa
+          ON LOWER(wwa.wallet_address) = LOWER(p.source_wallet)
+        WHERE wwa.workspace_id = $1
         "#,
     )
+    .bind(workspace_id)
     .fetch_one(&state.pool)
     .await?;
 
     // Query recent executed stop-loss rules
     let recent_rows: Vec<RecentStopRow> = sqlx::query_as(
         r#"
-        SELECT id, position_id, market_id, stop_type, executed_at
-        FROM stop_loss_rules
-        WHERE executed = TRUE AND executed_at IS NOT NULL
+        SELECT sl.id, sl.position_id, sl.market_id, sl.stop_type, sl.executed_at
+        FROM stop_loss_rules sl
+        JOIN positions p ON p.id = sl.position_id
+        JOIN workspace_wallet_allocations wwa
+          ON LOWER(wwa.wallet_address) = LOWER(p.source_wallet)
+        WHERE wwa.workspace_id = $1
+          AND sl.executed = TRUE
+          AND sl.executed_at IS NOT NULL
         ORDER BY executed_at DESC
         LIMIT 10
         "#,
     )
+    .bind(workspace_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -300,8 +315,14 @@ pub async fn manual_trip_circuit_breaker(
 
     // Verify membership
     let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    let role = match role {
+        Some(r) => r,
+        None => return Err(ApiError::Forbidden("Not a member of this workspace".into())),
+    };
+    if !can_manage_risk(&role) {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners/admins can manage circuit breaker controls".into(),
+        ));
     }
 
     state
@@ -373,8 +394,14 @@ pub async fn reset_circuit_breaker(
 
     // Verify membership
     let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    let role = match role {
+        Some(r) => r,
+        None => return Err(ApiError::Forbidden("Not a member of this workspace".into())),
+    };
+    if !can_manage_risk(&role) {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners/admins can manage circuit breaker controls".into(),
+        ));
     }
 
     state.circuit_breaker.reset().await;

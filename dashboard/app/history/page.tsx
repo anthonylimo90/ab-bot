@@ -39,18 +39,17 @@ export default function HistoryPage() {
     error,
   } = useClosedPositionsQuery({
     outcome: outcomeFilter === "all" ? undefined : outcomeFilter,
-    copyTradesOnly: sourceFilter === "copy" ? true : undefined,
+    copyTradesOnly:
+      sourceFilter === "copy"
+        ? true
+        : sourceFilter === "manual"
+          ? false
+          : undefined,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   });
 
-  // Client-side filter for "manual" since API only has copy_trades_only=true
-  const filteredPositions = useMemo(() => {
-    if (sourceFilter === "manual") {
-      return positions.filter((p) => !p.is_copy_trade);
-    }
-    return positions;
-  }, [positions, sourceFilter]);
+  const filteredPositions = positions;
 
   // Summary stats
   const totalRealizedPnl = useMemo(
@@ -287,7 +286,7 @@ export default function HistoryPage() {
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={positions.length < PAGE_SIZE}
+                  disabled={filteredPositions.length < PAGE_SIZE}
                   onClick={() => setPage((p) => p + 1)}
                 >
                   Next
