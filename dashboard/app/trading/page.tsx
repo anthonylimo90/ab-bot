@@ -523,7 +523,7 @@ export default function TradingPage() {
                 </CardContent>
               </Card>
             ) : (
-              <div className="grid gap-4">
+              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
                 {benchWallets.map((wallet) => (
                   <WalletCard
                     key={wallet.address}

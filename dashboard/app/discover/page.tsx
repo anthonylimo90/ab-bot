@@ -24,7 +24,11 @@ import {
 } from "@/hooks/queries/useAllocationsQuery";
 import { useToastStore } from "@/stores/toast-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { shortenAddress } from "@/lib/utils";
+import {
+  shortenAddress,
+  formatLargePercent,
+  formatCurrency,
+} from "@/lib/utils";
 import { Star, Plus, Check, Loader2, Search } from "lucide-react";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import type {
@@ -516,8 +520,7 @@ export default function DiscoverPage() {
                             <p
                               className={`font-medium tabular-nums ${roi >= 0 ? "text-profit" : "text-loss"}`}
                             >
-                              {roi >= 0 ? "+" : ""}
-                              {roi.toFixed(1)}%
+                              {formatLargePercent(roi, { showSign: true })}
                             </p>
                           </div>
                           <div>
@@ -563,7 +566,7 @@ export default function DiscoverPage() {
                             <p
                               className={`font-medium text-lg ${hypotheticalReturn >= 0 ? "text-profit" : "text-loss"}`}
                             >
-                              ${hypotheticalTotal.toFixed(2)}
+                              {formatCurrency(hypotheticalTotal)}
                             </p>
                           </div>
                           <div className="flex gap-2">
