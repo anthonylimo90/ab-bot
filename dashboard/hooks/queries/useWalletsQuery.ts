@@ -126,6 +126,8 @@ export function useWalletBalanceQuery(address: string | null) {
     enabled: Boolean(address),
     staleTime: 30_000,
     refetchInterval: 60_000,
+    placeholderData: (previousData) => previousData,
+    refetchOnWindowFocus: false,
     retry: 1,
   });
 }

@@ -47,7 +47,10 @@ export {
 } from "./useOptimizerQuery";
 
 // History queries
-export { useClosedPositionsQuery } from "./useHistoryQuery";
+export {
+  useClosedPositionsQuery,
+  useActivityHistoryQuery,
+} from "./useHistoryQuery";
 
 // Risk monitoring queries
 export {

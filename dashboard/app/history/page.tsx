@@ -13,147 +13,144 @@ import {
 import { MetricCard } from "@/components/shared/MetricCard";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { PositionTableSkeleton } from "@/components/shared/Skeletons";
-import { useClosedPositionsQuery } from "@/hooks/queries/useHistoryQuery";
+import { useActivityHistoryQuery } from "@/hooks/queries/useHistoryQuery";
+import { formatCurrency, formatTimeAgo, cn } from "@/lib/utils";
 import {
-  formatCurrency,
-  formatPercent,
-  shortenAddress,
-  cn,
-} from "@/lib/utils";
-import { History, ChevronLeft, ChevronRight } from "lucide-react";
+  History,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  AlertCircle,
+  XCircle,
+  Activity as ActivityIcon,
+} from "lucide-react";
 
 const PAGE_SIZE = 50;
 
+type ActivityFilter = "all" | "copied" | "skipped" | "failed";
+
+const activityMeta = {
+  TRADE_COPIED: {
+    label: "Copied",
+    icon: <Copy className="h-4 w-4 text-blue-500" />,
+    badgeClass: "bg-blue-500/10 text-blue-600",
+  },
+  TRADE_COPY_SKIPPED: {
+    label: "Skipped",
+    icon: <AlertCircle className="h-4 w-4 text-yellow-500" />,
+    badgeClass: "bg-yellow-500/10 text-yellow-600",
+  },
+  TRADE_COPY_FAILED: {
+    label: "Failed",
+    icon: <XCircle className="h-4 w-4 text-red-500" />,
+    badgeClass: "bg-red-500/10 text-red-600",
+  },
+} as const;
+
+function matchesFilter(type: string, filter: ActivityFilter): boolean {
+  if (filter === "all") return true;
+  if (filter === "copied") return type === "TRADE_COPIED";
+  if (filter === "skipped") return type === "TRADE_COPY_SKIPPED";
+  if (filter === "failed") return type === "TRADE_COPY_FAILED";
+  return true;
+}
+
 export default function HistoryPage() {
-  const [outcomeFilter, setOutcomeFilter] = useState<"all" | "yes" | "no">(
-    "all",
-  );
-  const [sourceFilter, setSourceFilter] = useState<
-    "all" | "copy" | "manual"
-  >("all");
+  const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
   const [page, setPage] = useState(0);
 
   const {
-    data: positions = [],
+    data: activity = [],
     isLoading,
     error,
-  } = useClosedPositionsQuery({
-    outcome: outcomeFilter === "all" ? undefined : outcomeFilter,
-    copyTradesOnly: sourceFilter === "copy" ? true : undefined,
+  } = useActivityHistoryQuery({
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   });
 
-  // Client-side filter for "manual" since API only has copy_trades_only=true
-  const filteredPositions = useMemo(() => {
-    if (sourceFilter === "manual") {
-      return positions.filter((p) => !p.is_copy_trade);
-    }
-    return positions;
-  }, [positions, sourceFilter]);
+  const filteredActivity = useMemo(
+    () => activity.filter((item) => matchesFilter(item.type, activityFilter)),
+    [activity, activityFilter],
+  );
 
-  // Summary stats
-  const totalRealizedPnl = useMemo(
-    () =>
-      filteredPositions.reduce(
-        (sum, p) => sum + (p.realized_pnl ?? p.unrealized_pnl),
-        0,
-      ),
-    [filteredPositions],
+  const copiedCount = useMemo(
+    () => filteredActivity.filter((item) => item.type === "TRADE_COPIED").length,
+    [filteredActivity],
   );
-  const winners = useMemo(
+  const skippedCount = useMemo(
     () =>
-      filteredPositions.filter((p) => (p.realized_pnl ?? p.unrealized_pnl) > 0)
+      filteredActivity.filter((item) => item.type === "TRADE_COPY_SKIPPED")
         .length,
-    [filteredPositions],
+    [filteredActivity],
   );
-  const winRate =
-    filteredPositions.length > 0
-      ? (winners / filteredPositions.length) * 100
-      : 0;
-  const avgPnl =
-    filteredPositions.length > 0
-      ? totalRealizedPnl / filteredPositions.length
-      : 0;
-  const copyTrades = filteredPositions.filter((p) => p.is_copy_trade).length;
+  const failedCount = useMemo(
+    () =>
+      filteredActivity.filter((item) => item.type === "TRADE_COPY_FAILED")
+        .length,
+    [filteredActivity],
+  );
+  const netPnl = useMemo(
+    () =>
+      filteredActivity.reduce((sum, item) => sum + (item.pnl ?? 0), 0),
+    [filteredActivity],
+  );
 
   return (
     <ErrorBoundary>
       <div className="space-y-6">
-        {/* Header */}
         <div>
           <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
             <History className="h-8 w-8" />
             History
           </h1>
           <p className="text-muted-foreground">
-            Closed positions and realized performance
+            Persisted copy-trade activity and outcomes
           </p>
         </div>
 
-        {/* Summary MetricCards */}
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <MetricCard
-            title="Total Realized P&L"
-            value={formatCurrency(totalRealizedPnl, { showSign: true })}
-            trend={totalRealizedPnl >= 0 ? "up" : "down"}
+            title="Net P&L / Slippage"
+            value={formatCurrency(netPnl, { showSign: true })}
+            trend={netPnl >= 0 ? "up" : "down"}
           />
           <MetricCard
-            title="Win Rate"
-            value={formatPercent(winRate)}
-            trend={winRate >= 50 ? "up" : "down"}
-            changeLabel={`${winners} of ${filteredPositions.length} trades`}
-          />
-          <MetricCard
-            title="Avg P&L per Trade"
-            value={formatCurrency(avgPnl, { showSign: true })}
-            trend={avgPnl >= 0 ? "up" : "down"}
-          />
-          <MetricCard
-            title="Copy Trades"
-            value={String(copyTrades)}
-            changeLabel={`of ${filteredPositions.length} total`}
+            title="Copied"
+            value={String(copiedCount)}
             trend="neutral"
           />
+          <MetricCard
+            title="Skipped"
+            value={String(skippedCount)}
+            trend="neutral"
+          />
+          <MetricCard
+            title="Failed"
+            value={String(failedCount)}
+            trend={failedCount > 0 ? "down" : "neutral"}
+          />
         </div>
 
-        {/* Filters */}
         <div className="flex items-center gap-2">
           <Select
-            value={outcomeFilter}
+            value={activityFilter}
             onValueChange={(v) => {
-              setOutcomeFilter(v as typeof outcomeFilter);
+              setActivityFilter(v as ActivityFilter);
               setPage(0);
             }}
           >
-            <SelectTrigger className="w-[140px]">
-              <SelectValue placeholder="Outcome" />
+            <SelectTrigger className="w-[180px]">
+              <SelectValue placeholder="Activity Type" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All Outcomes</SelectItem>
-              <SelectItem value="yes">YES</SelectItem>
-              <SelectItem value="no">NO</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select
-            value={sourceFilter}
-            onValueChange={(v) => {
-              setSourceFilter(v as typeof sourceFilter);
-              setPage(0);
-            }}
-          >
-            <SelectTrigger className="w-[140px]">
-              <SelectValue placeholder="Source" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All Sources</SelectItem>
-              <SelectItem value="copy">Copy Trades</SelectItem>
-              <SelectItem value="manual">Manual</SelectItem>
+              <SelectItem value="all">All Activity</SelectItem>
+              <SelectItem value="copied">Copied</SelectItem>
+              <SelectItem value="skipped">Skipped</SelectItem>
+              <SelectItem value="failed">Failed</SelectItem>
             </SelectContent>
           </Select>
         </div>
 
-        {/* Table */}
         {isLoading ? (
           <PositionTableSkeleton rows={10} />
         ) : error ? (
@@ -162,15 +159,13 @@ export default function HistoryPage() {
               <p className="text-destructive">Failed to load history.</p>
             </CardContent>
           </Card>
-        ) : filteredPositions.length === 0 ? (
+        ) : filteredActivity.length === 0 ? (
           <Card>
             <CardContent className="p-12 text-center">
               <History className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-              <h3 className="text-lg font-medium mb-2">
-                No closed positions
-              </h3>
+              <h3 className="text-lg font-medium mb-2">No activity</h3>
               <p className="text-muted-foreground">
-                Your trade history will appear here.
+                Activity will appear here as copy trades are processed.
               </p>
             </CardContent>
           </Card>
@@ -178,87 +173,57 @@ export default function HistoryPage() {
           <>
             <Card>
               <CardHeader>
-                <CardTitle className="flex items-center justify-between">
-                  <span>Closed Positions</span>
-                  <span
-                    className={cn(
-                      "text-lg font-bold",
-                      totalRealizedPnl >= 0 ? "text-profit" : "text-loss",
-                    )}
-                  >
-                    Total:{" "}
-                    {formatCurrency(totalRealizedPnl, { showSign: true })}
-                  </span>
-                </CardTitle>
+                <CardTitle>Activity Log</CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="overflow-x-auto">
                   <table className="w-full">
                     <thead className="border-b bg-muted/50">
                       <tr>
-                        <th className="text-left p-4 font-medium">Market</th>
-                        <th className="text-left p-4 font-medium">Outcome</th>
-                        <th className="text-right p-4 font-medium">Entry</th>
-                        <th className="text-right p-4 font-medium">Exit</th>
-                        <th className="text-right p-4 font-medium">Size</th>
-                        <th className="text-right p-4 font-medium">
-                          Realized P&L
-                        </th>
-                        <th className="text-right p-4 font-medium">Source</th>
-                        <th className="text-right p-4 font-medium">Closed</th>
+                        <th className="text-left p-4 font-medium">Type</th>
+                        <th className="text-left p-4 font-medium">Message</th>
+                        <th className="text-right p-4 font-medium">P&L</th>
+                        <th className="text-right p-4 font-medium">Time</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredPositions.map((p) => {
-                        const pnl = p.realized_pnl ?? p.unrealized_pnl;
+                      {filteredActivity.map((item) => {
+                        const meta =
+                          activityMeta[
+                            item.type as keyof typeof activityMeta
+                          ];
+
                         return (
-                          <tr
-                            key={p.id}
-                            className="border-b hover:bg-muted/30"
-                          >
-                            <td className="p-4">
-                              <p className="font-medium text-sm">
-                                {p.market_id}
-                              </p>
-                            </td>
+                          <tr key={item.id} className="border-b hover:bg-muted/30">
                             <td className="p-4">
                               <span
                                 className={cn(
-                                  "px-2 py-1 rounded text-xs font-medium uppercase",
-                                  p.outcome === "yes"
-                                    ? "bg-profit/10 text-profit"
-                                    : "bg-loss/10 text-loss",
+                                  "inline-flex items-center gap-2 rounded px-2 py-1 text-xs font-medium",
+                                  meta?.badgeClass ?? "bg-muted text-foreground",
                                 )}
                               >
-                                {p.outcome}
+                                {meta?.icon ?? <ActivityIcon className="h-4 w-4" />}
+                                {meta?.label ?? item.type}
                               </span>
                             </td>
-                            <td className="p-4 text-right tabular-nums">
-                              ${p.entry_price.toFixed(2)}
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              ${p.current_price.toFixed(2)}
-                            </td>
-                            <td className="p-4 text-right tabular-nums">
-                              {formatCurrency(p.quantity * p.entry_price)}
-                            </td>
+                            <td className="p-4 text-sm">{item.message}</td>
                             <td className="p-4 text-right">
-                              <span
-                                className={cn(
-                                  "tabular-nums font-medium",
-                                  pnl >= 0 ? "text-profit" : "text-loss",
-                                )}
-                              >
-                                {formatCurrency(pnl, { showSign: true })}
-                              </span>
+                              {item.pnl === undefined ? (
+                                <span className="text-muted-foreground">-</span>
+                              ) : (
+                                <span
+                                  className={cn(
+                                    "tabular-nums font-medium",
+                                    item.pnl >= 0 ? "text-profit" : "text-loss",
+                                  )}
+                                >
+                                  {formatCurrency(item.pnl, { showSign: true })}
+                                </span>
+                              )}
                             </td>
                             <td className="p-4 text-right text-muted-foreground text-sm">
-                              {p.source_wallet
-                                ? shortenAddress(p.source_wallet)
-                                : "Manual"}
-                            </td>
-                            <td className="p-4 text-right text-muted-foreground text-sm">
-                              {new Date(p.updated_at).toLocaleDateString()}
+                              <div>{new Date(item.created_at).toLocaleString()}</div>
+                              <div>{formatTimeAgo(item.created_at)}</div>
                             </td>
                           </tr>
                         );
@@ -269,10 +234,9 @@ export default function HistoryPage() {
               </CardContent>
             </Card>
 
-            {/* Pagination */}
             <div className="flex items-center justify-between">
               <p className="text-sm text-muted-foreground">
-                Page {page + 1} &middot; {filteredPositions.length} records
+                Page {page + 1} &middot; {filteredActivity.length} records
               </p>
               <div className="flex gap-2">
                 <Button
@@ -287,7 +251,7 @@ export default function HistoryPage() {
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={positions.length < PAGE_SIZE}
+                  disabled={activity.length < PAGE_SIZE}
                   onClick={() => setPage((p) => p + 1)}
                 >
                   Next

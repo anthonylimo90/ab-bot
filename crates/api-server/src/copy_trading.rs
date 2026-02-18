@@ -312,15 +312,6 @@ impl CopyTradingMonitor {
                     "Successfully copied trade"
                 );
 
-                // Record with circuit breaker (P&L unknown at entry, don't reset consecutive loss counter)
-                if let Err(e) = self
-                    .circuit_breaker
-                    .record_trade(Decimal::ZERO, false)
-                    .await
-                {
-                    warn!(error = %e, "Failed to record copy trade with circuit breaker");
-                }
-
                 // Record position opening with the copy trader for daily/position tracking
                 {
                     let mut ct = self.copy_trader.write().await;
@@ -392,13 +383,15 @@ impl CopyTradingMonitor {
                         id, market_id, outcome, side, quantity,
                         entry_price, current_price, unrealized_pnl,
                         is_copy_trade, source_wallet, is_open, opened_at,
+                        source_token_id,
                         yes_entry_price, no_entry_price, entry_timestamp,
                         exit_strategy, state, source
                     ) VALUES (
                         $1, $2, $3, $4, $5,
                         $6, $6, 0,
                         true, $7, true, NOW(),
-                        $8, $9, NOW(),
+                        $8,
+                        $9, $10, NOW(),
                         1, 1, 2
                     )
                     "#,
@@ -410,6 +403,7 @@ impl CopyTradingMonitor {
                 .bind(report.filled_quantity)
                 .bind(report.average_price)
                 .bind(&trade.wallet_address)
+                .bind(&trade.token_id)
                 .bind(if side_str == "long" {
                     report.average_price
                 } else {
