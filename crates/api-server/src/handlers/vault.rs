@@ -14,8 +14,10 @@ use uuid::Uuid;
 
 use auth::jwt::Claims;
 
+use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use polymarket_core::api::PolygonClient;
 
 async fn resolve_primary_wallet_address(
     pool: &PgPool,
@@ -29,6 +31,62 @@ async fn resolve_primary_wallet_address(
     .await?;
 
     Ok(primary.map(|(address,)| address))
+}
+
+/// Resolve a [`PolygonClient`] for the given user.
+///
+/// Fallback chain:
+///   1. `state.polygon_client` (env-var-initialized at startup)
+///   2. User's default workspace `polygon_rpc_url`
+///   3. User's default workspace `alchemy_api_key` (decrypted)
+///   4. 503 ServiceUnavailable
+async fn resolve_polygon_client_for_user(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<PolygonClient, ApiError> {
+    // Fast path: env-var-based client is already present.
+    if let Some(client) = state.polygon_client.clone() {
+        return Ok(client);
+    }
+
+    // Slow path: look up the user's workspace RPC settings from DB.
+    warn!(
+        user_id = %user_id,
+        "polygon_client not in AppState; falling back to workspace-level RPC config"
+    );
+
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT w.polygon_rpc_url, w.alchemy_api_key
+        FROM workspaces w
+        INNER JOIN user_settings us ON us.default_workspace_id = w.id
+        WHERE us.user_id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (rpc_url_opt, alchemy_key_opt) = row.unwrap_or((None, None));
+
+    // Priority: explicit RPC URL > Alchemy key.
+    if let Some(rpc_url) = rpc_url_opt.filter(|s| !s.is_empty()) {
+        return Ok(PolygonClient::new(rpc_url));
+    }
+
+    if let Some(encrypted_key) = alchemy_key_opt.filter(|s| !s.is_empty()) {
+        // Decrypt the stored Alchemy key (AES-256-GCM).
+        // Fall back to treating value as plaintext for backward compat with pre-encryption rows.
+        let plaintext =
+            crypto::decrypt_field(&encrypted_key, &state.encryption_key).unwrap_or(encrypted_key);
+        return Ok(PolygonClient::with_alchemy(&plaintext));
+    }
+
+    Err(ApiError::ServiceUnavailable(
+        "Polygon RPC not configured. Set polygon_rpc_url or alchemy_api_key in workspace settings."
+            .into(),
+    ))
 }
 
 /// Request to store a wallet.
@@ -527,10 +585,7 @@ pub async fn get_wallet_balance(
         return Err(ApiError::NotFound("Wallet not connected".into()));
     }
 
-    let polygon_client = state
-        .polygon_client
-        .as_ref()
-        .ok_or_else(|| ApiError::ServiceUnavailable("Polygon RPC not configured".into()))?;
+    let polygon_client = resolve_polygon_client_for_user(&state, user_id).await?;
 
     let usdc_balance = polygon_client
         .get_usdc_balance(&address)
