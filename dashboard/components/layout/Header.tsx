@@ -19,6 +19,8 @@ import {
   TrendingUp,
   Wallet,
   Plus,
+  Pause,
+  Play,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -30,10 +32,13 @@ import {
   selectHasConnectedWallet,
   selectPrimaryWallet,
 } from "@/stores/wallet-store";
+import { useMutation } from "@tanstack/react-query";
 import { useActivity } from "@/hooks/useActivity";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
+import { useToastStore } from "@/stores/toast-store";
+import api from "@/lib/api";
 
 const mobileNavSections = [
   {
@@ -70,8 +75,42 @@ export function Header() {
   const menuRef = useRef<HTMLDivElement>(null);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
-  const { currentWorkspace } = useWorkspaceStore();
+  const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
+  const toast = useToastStore();
   const { status: wsStatus } = useActivity();
+
+  const isTradingActive =
+    currentWorkspace?.copy_trading_enabled ||
+    currentWorkspace?.live_trading_enabled ||
+    false;
+
+  const toggleTradingMutation = useMutation({
+    mutationFn: async () => {
+      if (!currentWorkspace) throw new Error("No workspace");
+      const pausing = isTradingActive;
+      return api.updateWorkspace(currentWorkspace.id, {
+        copy_trading_enabled: !pausing,
+        live_trading_enabled: !pausing,
+      });
+    },
+    onSuccess: (updatedWorkspace) => {
+      setCurrentWorkspace(updatedWorkspace);
+      const paused =
+        !updatedWorkspace.copy_trading_enabled &&
+        !updatedWorkspace.live_trading_enabled;
+      if (paused) {
+        toast.warning(
+          "Trading paused",
+          "All automated trading has been paused",
+        );
+      } else {
+        toast.success("Trading resumed", "Automated trading is now active");
+      }
+    },
+    onError: () => {
+      toast.error("Failed to update trading state");
+    },
+  });
   const hasWallet = useWalletStore(selectHasConnectedWallet);
   const primaryWallet = useWalletStore(selectPrimaryWallet);
   const { data: walletBalance } = useWalletBalanceQuery(
@@ -206,6 +245,33 @@ export function Header() {
 
         {/* Wallet Info & Actions */}
         <div className="flex items-center gap-2">
+          {/* Trading Pause/Resume */}
+          {currentWorkspace && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className={cn(
+                "gap-1.5 text-xs font-medium",
+                isTradingActive
+                  ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
+                  : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
+              )}
+              disabled={toggleTradingMutation.isPending}
+              onClick={() => toggleTradingMutation.mutate()}
+            >
+              {toggleTradingMutation.isPending ? (
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+              ) : isTradingActive ? (
+                <Pause className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              <span className="hidden sm:inline">
+                {isTradingActive ? "Pause" : "Resume"}
+              </span>
+            </Button>
+          )}
+
           <ConnectionStatus status={wsStatus} />
 
           {/* Wallet Info */}
