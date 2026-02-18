@@ -1,10 +1,15 @@
-'use client';
+"use client";
 
-import { useState, memo } from 'react';
-import Link from 'next/link';
-import { Card, CardContent, CardHeader } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { shortenAddress, formatCurrency, cn } from '@/lib/utils';
+import { useState, memo } from "react";
+import Link from "next/link";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import {
+  shortenAddress,
+  formatCurrency,
+  formatLargePercent,
+  cn,
+} from "@/lib/utils";
 import {
   ChevronDown,
   ChevronUp,
@@ -18,17 +23,22 @@ import {
   Clock,
   Zap,
   AlertTriangle,
-} from 'lucide-react';
-import { Badge } from '@/components/ui/badge';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { differenceInDays } from 'date-fns';
-import type { CopySettings } from '@/types/api';
+} from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { differenceInDays } from "date-fns";
+import type { CopySettings } from "@/types/api";
 
 interface Position {
   id: string;
   marketId: string;
   marketQuestion?: string;
-  outcome: 'yes' | 'no';
+  outcome: "yes" | "no";
   quantity: number;
   entryPrice: number;
   currentPrice: number;
@@ -87,16 +97,17 @@ export const WalletCard = memo(function WalletCard({
   const hasPositions = positions.length > 0;
 
   // Automation computed values
-  const isInProbation = wallet.probationUntil && new Date(wallet.probationUntil) > new Date();
+  const isInProbation =
+    wallet.probationUntil && new Date(wallet.probationUntil) > new Date();
   const probationDaysRemaining = wallet.probationUntil
     ? Math.max(0, differenceInDays(new Date(wallet.probationUntil), new Date()))
     : 0;
   const hasConsecutiveLosses = (wallet.consecutiveLosses || 0) >= 3;
 
   const copyBehaviorLabels: Record<string, string> = {
-    copy_all: 'All Trades',
-    events_only: 'Events Only',
-    arb_threshold: 'Arb Threshold',
+    copy_all: "All Trades",
+    events_only: "Events Only",
+    arb_threshold: "Arb Threshold",
   };
 
   return (
@@ -106,11 +117,12 @@ export const WalletCard = memo(function WalletCard({
           <div className="flex items-center gap-3 min-w-0">
             <div
               className={cn(
-                'h-10 w-10 rounded-full flex items-center justify-center font-bold text-primary-foreground',
-                isActive ? 'bg-primary' : 'bg-muted text-muted-foreground'
+                "h-10 w-10 rounded-full flex items-center justify-center font-bold text-primary-foreground",
+                isActive ? "bg-primary" : "bg-muted text-muted-foreground",
               )}
             >
-              {wallet.label?.charAt(0) || wallet.address.charAt(2).toUpperCase()}
+              {wallet.label?.charAt(0) ||
+                wallet.address.charAt(2).toUpperCase()}
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2 min-w-0">
@@ -132,7 +144,10 @@ export const WalletCard = memo(function WalletCard({
                 )}
                 {/* Probation badge */}
                 {isActive && isInProbation && (
-                  <Badge variant="outline" className="text-xs bg-blue-500/10 text-blue-500 border-blue-500/20">
+                  <Badge
+                    variant="outline"
+                    className="text-xs bg-blue-500/10 text-blue-500 border-blue-500/20"
+                  >
                     <Clock className="h-3 w-3 mr-1" />
                     {probationDaysRemaining}d left
                   </Badge>
@@ -172,7 +187,8 @@ export const WalletCard = memo(function WalletCard({
           <div className="flex items-center gap-2">
             {isActive && wallet.copySettings && (
               <span className="text-xs px-2 py-1 rounded-full bg-primary/10 text-primary">
-                {copyBehaviorLabels[wallet.copySettings.copy_behavior] || 'All Trades'}
+                {copyBehaviorLabels[wallet.copySettings.copy_behavior] ||
+                  "All Trades"}
               </span>
             )}
           </div>
@@ -186,36 +202,50 @@ export const WalletCard = memo(function WalletCard({
             <p className="text-xs text-muted-foreground">ROI (30d)</p>
             <p
               className={cn(
-                'font-medium',
-                wallet.roi30d >= 0 ? 'text-profit' : 'text-loss'
+                "font-medium tabular-nums",
+                wallet.roi30d >= 0 ? "text-profit" : "text-loss",
               )}
             >
-              {wallet.roi30d >= 0 ? '+' : ''}
-              {Number(wallet.roi30d).toFixed(1)}%
+              {formatLargePercent(wallet.roi30d, { showSign: true })}
             </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Sharpe</p>
-            <p className="font-medium">{Number(wallet.sharpe).toFixed(2)}</p>
+            <p className="font-medium tabular-nums">
+              {Number(wallet.sharpe).toFixed(2)}
+            </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Win Rate</p>
-            <p className="font-medium">{Number(wallet.winRate).toFixed(1)}%</p>
+            <p className="font-medium tabular-nums">
+              {Number(wallet.winRate).toFixed(1)}%
+            </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Confidence</p>
-            <p className={cn(
-              'font-medium',
-              wallet.confidence >= 80 ? 'text-profit' : wallet.confidence >= 60 ? 'text-yellow-500' : 'text-muted-foreground'
-            )}>
+            <p
+              className={cn(
+                "font-medium tabular-nums",
+                wallet.confidence >= 80
+                  ? "text-profit"
+                  : wallet.confidence >= 60
+                    ? "text-yellow-500"
+                    : "text-muted-foreground",
+              )}
+            >
               {Number(wallet.confidence).toFixed(0)}%
             </p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">
-              {isActive ? 'Allocation' : 'Max DD'}
+              {isActive ? "Allocation" : "Max DD"}
             </p>
-            <p className={cn('font-medium', !isActive && 'text-loss')}>
+            <p
+              className={cn(
+                "font-medium tabular-nums",
+                !isActive && "text-loss",
+              )}
+            >
               {isActive
                 ? `${wallet.copySettings?.allocation_pct || 0}%`
                 : `${Number(wallet.maxDrawdown).toFixed(1)}%`}
@@ -286,7 +316,10 @@ export const WalletCard = memo(function WalletCard({
                       </TooltipTrigger>
                       <TooltipContent>
                         {pinsRemaining > 0 ? (
-                          <p>Pin to protect from auto-demotion ({pinsRemaining} of {maxPins} remaining)</p>
+                          <p>
+                            Pin to protect from auto-demotion ({pinsRemaining}{" "}
+                            of {maxPins} remaining)
+                          </p>
                         ) : (
                           <p>No pins remaining (max {maxPins})</p>
                         )}
@@ -344,7 +377,7 @@ export const WalletCard = memo(function WalletCard({
               ) : (
                 <>
                   <ChevronDown className="mr-1 h-4 w-4" />
-                  {positions.length} Position{positions.length !== 1 ? 's' : ''}
+                  {positions.length} Position{positions.length !== 1 ? "s" : ""}
                 </>
               )}
             </Button>
@@ -366,10 +399,10 @@ export const WalletCard = memo(function WalletCard({
                   <div className="flex items-center gap-3">
                     <span
                       className={cn(
-                        'px-2 py-0.5 rounded text-xs font-medium uppercase',
-                        position.outcome === 'yes'
-                          ? 'bg-profit/10 text-profit'
-                          : 'bg-loss/10 text-loss'
+                        "px-2 py-0.5 rounded text-xs font-medium uppercase",
+                        position.outcome === "yes"
+                          ? "bg-profit/10 text-profit"
+                          : "bg-loss/10 text-loss",
                       )}
                     >
                       {position.outcome}
@@ -377,7 +410,7 @@ export const WalletCard = memo(function WalletCard({
                     <div>
                       <p className="text-sm font-medium">
                         {position.marketQuestion ||
-                          position.marketId.slice(0, 30) + '...'}
+                          position.marketId.slice(0, 30) + "..."}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {position.quantity} @ ${position.entryPrice.toFixed(2)}
@@ -394,15 +427,15 @@ export const WalletCard = memo(function WalletCard({
                         )}
                         <span
                           className={cn(
-                            'text-sm font-medium tabular-nums',
-                            position.pnl >= 0 ? 'text-profit' : 'text-loss'
+                            "text-sm font-medium tabular-nums",
+                            position.pnl >= 0 ? "text-profit" : "text-loss",
                           )}
                         >
                           {formatCurrency(position.pnl, { showSign: true })}
                         </span>
                       </div>
                       <p className="text-xs text-muted-foreground tabular-nums">
-                        {position.pnlPercent >= 0 ? '+' : ''}
+                        {position.pnlPercent >= 0 ? "+" : ""}
                         {position.pnlPercent.toFixed(1)}%
                       </p>
                     </div>
@@ -427,8 +460,8 @@ export const WalletCard = memo(function WalletCard({
                 </span>
                 <span
                   className={cn(
-                    'text-sm font-medium',
-                    totalPnl >= 0 ? 'text-profit' : 'text-loss'
+                    "text-sm font-medium",
+                    totalPnl >= 0 ? "text-profit" : "text-loss",
                   )}
                 >
                   {formatCurrency(totalPnl, { showSign: true })}

@@ -14,7 +14,6 @@ import type {
   ApiError,
   LiveTrade,
   DiscoveredWallet,
-  DemoPnlSimulation,
   User,
   WalletUser,
   AuthResponse,
@@ -46,15 +45,13 @@ import type {
   WorkspaceRole,
   OptimizerStatus,
   OptimizationResult,
-  DemoPosition,
-  CreateDemoPositionRequest,
-  UpdateDemoPositionRequest,
-  DemoBalance,
   ServiceStatus,
   Activity,
-} from '@/types/api';
+  RiskStatus,
+  CircuitBreakerStatus,
+} from "@/types/api";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
 export class ApiHttpError extends Error {
   constructor(
@@ -63,14 +60,24 @@ export class ApiHttpError extends Error {
     public code?: string,
   ) {
     super(message);
-    this.name = 'ApiHttpError';
+    this.name = "ApiHttpError";
   }
 
-  get isUnauthorized() { return this.statusCode === 401; }
-  get isForbidden() { return this.statusCode === 403; }
-  get isNotFound() { return this.statusCode === 404; }
-  get isRateLimited() { return this.statusCode === 429; }
-  get isServerError() { return this.statusCode >= 500; }
+  get isUnauthorized() {
+    return this.statusCode === 401;
+  }
+  get isForbidden() {
+    return this.statusCode === 403;
+  }
+  get isNotFound() {
+    return this.statusCode === 404;
+  }
+  get isRateLimited() {
+    return this.statusCode === 429;
+  }
+  get isServerError() {
+    return this.statusCode >= 500;
+  }
 }
 
 class ApiClient {
@@ -96,35 +103,36 @@ class ApiClient {
 
   async post<T>(endpoint: string, body: unknown): Promise<T> {
     return this.request<T>(endpoint, {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(body),
     });
   }
 
   async put<T>(endpoint: string, body: unknown): Promise<T> {
     return this.request<T>(endpoint, {
-      method: 'PUT',
+      method: "PUT",
       body: JSON.stringify(body),
     });
   }
 
   async delete<T>(endpoint: string): Promise<T> {
     return this.request<T>(endpoint, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
   ): Promise<T> {
     const headers: HeadersInit = {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
       ...options.headers,
     };
 
     if (this.token) {
-      (headers as Record<string, string>)['Authorization'] = `Bearer ${this.token}`;
+      (headers as Record<string, string>)["Authorization"] =
+        `Bearer ${this.token}`;
     }
 
     const response = await fetch(`${this.baseUrl}${endpoint}`, {
@@ -134,7 +142,7 @@ class ApiClient {
 
     if (!response.ok) {
       const error: ApiError = await response.json().catch(() => ({
-        code: 'UNKNOWN_ERROR',
+        code: "UNKNOWN_ERROR",
         message: `HTTP ${response.status}`,
       }));
       throw new ApiHttpError(
@@ -154,17 +162,17 @@ class ApiClient {
 
   // Health Check
   async healthCheck(): Promise<HealthResponse> {
-    return this.request<HealthResponse>('/health');
+    return this.request<HealthResponse>("/health");
   }
 
   async readyCheck(): Promise<HealthResponse> {
-    return this.request<HealthResponse>('/ready');
+    return this.request<HealthResponse>("/ready");
   }
 
   // Auth
   async login(email: string, password: string): Promise<AuthResponse> {
-    const response = await this.request<AuthResponse>('/api/v1/auth/login', {
-      method: 'POST',
+    const response = await this.request<AuthResponse>("/api/v1/auth/login", {
+      method: "POST",
       body: JSON.stringify({ email, password }),
     });
     this.setToken(response.token);
@@ -172,27 +180,30 @@ class ApiClient {
   }
 
   async refreshToken(): Promise<AuthResponse> {
-    const response = await this.request<AuthResponse>('/api/v1/auth/refresh', {
-      method: 'POST',
+    const response = await this.request<AuthResponse>("/api/v1/auth/refresh", {
+      method: "POST",
     });
     this.setToken(response.token);
     return response;
   }
 
   async getCurrentUser(): Promise<User> {
-    return this.request<User>('/api/v1/auth/me');
+    return this.request<User>("/api/v1/auth/me");
   }
 
   async forgotPassword(email: string): Promise<{ message: string }> {
-    return this.request<{ message: string }>('/api/v1/auth/forgot-password', {
-      method: 'POST',
+    return this.request<{ message: string }>("/api/v1/auth/forgot-password", {
+      method: "POST",
       body: JSON.stringify({ email }),
     });
   }
 
-  async resetPassword(token: string, password: string): Promise<{ message: string }> {
-    return this.request<{ message: string }>('/api/v1/auth/reset-password', {
-      method: 'POST',
+  async resetPassword(
+    token: string,
+    password: string,
+  ): Promise<{ message: string }> {
+    return this.request<{ message: string }>("/api/v1/auth/reset-password", {
+      method: "POST",
       body: JSON.stringify({ token, password }),
     });
   }
@@ -204,17 +215,17 @@ class ApiClient {
     expires_at: string;
   }> {
     return this.request<{ message: string; nonce: string; expires_at: string }>(
-      '/api/v1/auth/wallet/challenge',
+      "/api/v1/auth/wallet/challenge",
       {
-        method: 'POST',
+        method: "POST",
         body: JSON.stringify({ address }),
-      }
+      },
     );
   }
 
   async walletVerify(
     message: string,
-    signature: string
+    signature: string,
   ): Promise<{
     token: string;
     user: WalletUser;
@@ -224,8 +235,8 @@ class ApiClient {
       token: string;
       user: WalletUser;
       is_new_user: boolean;
-    }>('/api/v1/auth/wallet/verify', {
-      method: 'POST',
+    }>("/api/v1/auth/wallet/verify", {
+      method: "POST",
       body: JSON.stringify({ message, signature }),
     });
     this.setToken(response.token);
@@ -234,14 +245,14 @@ class ApiClient {
 
   async walletLink(
     message: string,
-    signature: string
+    signature: string,
   ): Promise<{ message: string; wallet_address: string }> {
     return this.request<{ message: string; wallet_address: string }>(
-      '/api/v1/auth/wallet/link',
+      "/api/v1/auth/wallet/link",
       {
-        method: 'POST',
+        method: "POST",
         body: JSON.stringify({ message, signature }),
-      }
+      },
     );
   }
 
@@ -254,13 +265,15 @@ class ApiClient {
     offset?: number;
   }): Promise<Market[]> {
     const searchParams = new URLSearchParams();
-    if (params?.category) searchParams.set('category', params.category);
-    if (params?.active !== undefined) searchParams.set('active', String(params.active));
-    if (params?.min_volume) searchParams.set('min_volume', String(params.min_volume));
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.category) searchParams.set("category", params.category);
+    if (params?.active !== undefined)
+      searchParams.set("active", String(params.active));
+    if (params?.min_volume)
+      searchParams.set("min_volume", String(params.min_volume));
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Market[]>(`/api/v1/markets${query ? `?${query}` : ''}`);
+    return this.request<Market[]>(`/api/v1/markets${query ? `?${query}` : ""}`);
   }
 
   async getMarket(marketId: string): Promise<Market> {
@@ -274,33 +287,39 @@ class ApiClient {
   // Positions
   async getPositions(params?: {
     market_id?: string;
-    outcome?: 'yes' | 'no';
+    outcome?: "yes" | "no";
     copy_trades_only?: boolean;
     status?: PositionStatus;
     limit?: number;
     offset?: number;
   }): Promise<Position[]> {
     const searchParams = new URLSearchParams();
-    if (params?.market_id) searchParams.set('market_id', params.market_id);
-    if (params?.outcome) searchParams.set('outcome', params.outcome);
-    if (params?.copy_trades_only !== undefined) searchParams.set('copy_trades_only', String(params.copy_trades_only));
-    if (params?.status) searchParams.set('status', params.status);
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.market_id) searchParams.set("market_id", params.market_id);
+    if (params?.outcome) searchParams.set("outcome", params.outcome);
+    if (params?.copy_trades_only !== undefined)
+      searchParams.set("copy_trades_only", String(params.copy_trades_only));
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Position[]>(`/api/v1/positions${query ? `?${query}` : ''}`);
+    return this.request<Position[]>(
+      `/api/v1/positions${query ? `?${query}` : ""}`,
+    );
   }
 
   async getPosition(positionId: string): Promise<Position> {
     return this.request<Position>(`/api/v1/positions/${positionId}`);
   }
 
-  async closePosition(positionId: string, params?: {
-    quantity?: number;
-    limit_price?: number;
-  }): Promise<Position> {
+  async closePosition(
+    positionId: string,
+    params?: {
+      quantity?: number;
+      limit_price?: number;
+    },
+  ): Promise<Position> {
     return this.request<Position>(`/api/v1/positions/${positionId}/close`, {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(params || {}),
     });
   }
@@ -313,12 +332,16 @@ class ApiClient {
     offset?: number;
   }): Promise<TrackedWallet[]> {
     const searchParams = new URLSearchParams();
-    if (params?.copy_enabled !== undefined) searchParams.set('copy_enabled', String(params.copy_enabled));
-    if (params?.min_score) searchParams.set('min_score', String(params.min_score));
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.copy_enabled !== undefined)
+      searchParams.set("copy_enabled", String(params.copy_enabled));
+    if (params?.min_score)
+      searchParams.set("min_score", String(params.min_score));
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<TrackedWallet[]>(`/api/v1/wallets${query ? `?${query}` : ''}`);
+    return this.request<TrackedWallet[]>(
+      `/api/v1/wallets${query ? `?${query}` : ""}`,
+    );
   }
 
   async getWallet(address: string): Promise<TrackedWallet> {
@@ -332,27 +355,30 @@ class ApiClient {
     allocation_pct?: number;
     max_position_size?: number;
   }): Promise<TrackedWallet> {
-    return this.request<TrackedWallet>('/api/v1/wallets', {
-      method: 'POST',
+    return this.request<TrackedWallet>("/api/v1/wallets", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
 
-  async updateWallet(address: string, params: {
-    label?: string;
-    copy_enabled?: boolean;
-    allocation_pct?: number;
-    max_position_size?: number;
-  }): Promise<TrackedWallet> {
+  async updateWallet(
+    address: string,
+    params: {
+      label?: string;
+      copy_enabled?: boolean;
+      allocation_pct?: number;
+      max_position_size?: number;
+    },
+  ): Promise<TrackedWallet> {
     return this.request<TrackedWallet>(`/api/v1/wallets/${address}`, {
-      method: 'PUT',
+      method: "PUT",
       body: JSON.stringify(params),
     });
   }
 
   async deleteWallet(address: string): Promise<void> {
     return this.request<void>(`/api/v1/wallets/${address}`, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
@@ -360,21 +386,26 @@ class ApiClient {
     return this.request<WalletMetrics>(`/api/v1/wallets/${address}/metrics`);
   }
 
-  async getWalletTrades(address: string, params?: {
-    limit?: number;
-    offset?: number;
-  }): Promise<WalletTrade[]> {
+  async getWalletTrades(
+    address: string,
+    params?: {
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<WalletTrade[]> {
     const searchParams = new URLSearchParams();
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<WalletTrade[]>(`/api/v1/wallets/${address}/trades${query ? `?${query}` : ''}`);
+    return this.request<WalletTrade[]>(
+      `/api/v1/wallets/${address}/trades${query ? `?${query}` : ""}`,
+    );
   }
 
   // Orders
   async placeOrder(params: PlaceOrderRequest): Promise<Order> {
-    return this.request<Order>('/api/v1/orders', {
-      method: 'POST',
+    return this.request<Order>("/api/v1/orders", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
@@ -385,14 +416,14 @@ class ApiClient {
 
   async cancelOrder(orderId: string): Promise<Order> {
     return this.request<Order>(`/api/v1/orders/${orderId}/cancel`, {
-      method: 'POST',
+      method: "POST",
     });
   }
 
   // Backtest
   async runBacktest(params: BacktestParams): Promise<BacktestResult> {
-    return this.request<BacktestResult>('/api/v1/backtest', {
-      method: 'POST',
+    return this.request<BacktestResult>("/api/v1/backtest", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
@@ -404,12 +435,15 @@ class ApiClient {
     offset?: number;
   }): Promise<BacktestResult[]> {
     const searchParams = new URLSearchParams();
-    if (params?.strategy_type) searchParams.set('strategy_type', params.strategy_type);
-    if (params?.status) searchParams.set('status', params.status);
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.strategy_type)
+      searchParams.set("strategy_type", params.strategy_type);
+    if (params?.status) searchParams.set("status", params.status);
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<BacktestResult[]>(`/api/v1/backtest/results${query ? `?${query}` : ''}`);
+    return this.request<BacktestResult[]>(
+      `/api/v1/backtest/results${query ? `?${query}` : ""}`,
+    );
   }
 
   async getBacktestResult(resultId: string): Promise<BacktestResult> {
@@ -423,50 +457,46 @@ class ApiClient {
     min_value?: number;
   }): Promise<LiveTrade[]> {
     const searchParams = new URLSearchParams();
-    if (params?.wallet) searchParams.set('wallet', params.wallet);
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.min_value) searchParams.set('min_value', String(params.min_value));
+    if (params?.wallet) searchParams.set("wallet", params.wallet);
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.min_value)
+      searchParams.set("min_value", String(params.min_value));
     const query = searchParams.toString();
-    return this.request<LiveTrade[]>(`/api/v1/discover/trades${query ? `?${query}` : ''}`);
+    return this.request<LiveTrade[]>(
+      `/api/v1/discover/trades${query ? `?${query}` : ""}`,
+    );
   }
 
   async discoverWallets(params?: {
-    sort_by?: 'roi' | 'sharpe' | 'winRate' | 'trades';
-    period?: '7d' | '30d' | '90d';
+    sort_by?: "roi" | "sharpe" | "winRate" | "trades";
+    period?: "7d" | "30d" | "90d";
     min_trades?: number;
     min_win_rate?: number;
     limit?: number;
   }): Promise<DiscoveredWallet[]> {
     const searchParams = new URLSearchParams();
-    if (params?.sort_by) searchParams.set('sort_by', params.sort_by);
-    if (params?.period) searchParams.set('period', params.period);
-    if (params?.min_trades) searchParams.set('min_trades', String(params.min_trades));
-    if (params?.min_win_rate) searchParams.set('min_win_rate', String(params.min_win_rate));
-    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.sort_by) searchParams.set("sort_by", params.sort_by);
+    if (params?.period) searchParams.set("period", params.period);
+    if (params?.min_trades)
+      searchParams.set("min_trades", String(params.min_trades));
+    if (params?.min_win_rate)
+      searchParams.set("min_win_rate", String(params.min_win_rate));
+    if (params?.limit) searchParams.set("limit", String(params.limit));
     const query = searchParams.toString();
-    return this.request<DiscoveredWallet[]>(`/api/v1/discover/wallets${query ? `?${query}` : ''}`);
+    return this.request<DiscoveredWallet[]>(
+      `/api/v1/discover/wallets${query ? `?${query}` : ""}`,
+    );
   }
 
   async getDiscoveredWallet(address: string): Promise<DiscoveredWallet> {
-    return this.request<DiscoveredWallet>(`/api/v1/discover/wallets/${address}`);
-  }
-
-  async simulateDemoPnl(params?: {
-    amount?: number;
-    period?: '7d' | '30d' | '90d';
-    wallets?: string;
-  }): Promise<DemoPnlSimulation> {
-    const searchParams = new URLSearchParams();
-    if (params?.amount) searchParams.set('amount', String(params.amount));
-    if (params?.period) searchParams.set('period', params.period);
-    if (params?.wallets) searchParams.set('wallets', params.wallets);
-    const query = searchParams.toString();
-    return this.request<DemoPnlSimulation>(`/api/v1/discover/simulate${query ? `?${query}` : ''}`);
+    return this.request<DiscoveredWallet>(
+      `/api/v1/discover/wallets/${address}`,
+    );
   }
 
   // Vault (Connected Wallets for Live Trading)
   async getConnectedWallets(): Promise<ConnectedWallet[]> {
-    return this.request<ConnectedWallet[]>('/api/v1/vault/wallets');
+    return this.request<ConnectedWallet[]>("/api/v1/vault/wallets");
   }
 
   async getConnectedWallet(address: string): Promise<ConnectedWallet> {
@@ -474,36 +504,43 @@ class ApiClient {
   }
 
   async connectWallet(params: StoreWalletRequest): Promise<ConnectedWallet> {
-    return this.request<ConnectedWallet>('/api/v1/vault/wallets', {
-      method: 'POST',
+    return this.request<ConnectedWallet>("/api/v1/vault/wallets", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
 
   async disconnectWallet(address: string): Promise<void> {
     return this.request<void>(`/api/v1/vault/wallets/${address}`, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
   async setPrimaryWallet(address: string): Promise<ConnectedWallet> {
-    return this.request<ConnectedWallet>(`/api/v1/vault/wallets/${address}/primary`, {
-      method: 'PUT',
-    });
+    return this.request<ConnectedWallet>(
+      `/api/v1/vault/wallets/${address}/primary`,
+      {
+        method: "PUT",
+      },
+    );
   }
 
-  async getWalletBalance(address: string): Promise<{ address: string; usdc_balance: number }> {
-    return this.request<{ address: string; usdc_balance: number }>(`/api/v1/vault/wallets/${address}/balance`);
+  async getWalletBalance(
+    address: string,
+  ): Promise<{ address: string; usdc_balance: number }> {
+    return this.request<{ address: string; usdc_balance: number }>(
+      `/api/v1/vault/wallets/${address}/balance`,
+    );
   }
 
   // User Management (Admin only)
   async listUsers(): Promise<UserListItem[]> {
-    return this.request<UserListItem[]>('/api/v1/users');
+    return this.request<UserListItem[]>("/api/v1/users");
   }
 
   async createUser(params: CreateUserRequest): Promise<UserListItem> {
-    return this.request<UserListItem>('/api/v1/users', {
-      method: 'POST',
+    return this.request<UserListItem>("/api/v1/users", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
@@ -512,27 +549,32 @@ class ApiClient {
     return this.request<UserListItem>(`/api/v1/users/${userId}`);
   }
 
-  async updateUser(userId: string, params: UpdateUserRequest): Promise<UserListItem> {
+  async updateUser(
+    userId: string,
+    params: UpdateUserRequest,
+  ): Promise<UserListItem> {
     return this.request<UserListItem>(`/api/v1/users/${userId}`, {
-      method: 'PATCH',
+      method: "PATCH",
       body: JSON.stringify(params),
     });
   }
 
   async deleteUser(userId: string): Promise<void> {
     return this.request<void>(`/api/v1/users/${userId}`, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
   // Admin Workspace Management (Platform Admin only)
   async adminListWorkspaces(): Promise<WorkspaceListItem[]> {
-    return this.request<WorkspaceListItem[]>('/api/v1/admin/workspaces');
+    return this.request<WorkspaceListItem[]>("/api/v1/admin/workspaces");
   }
 
-  async adminCreateWorkspace(params: CreateWorkspaceRequest): Promise<Workspace> {
-    return this.request<Workspace>('/api/v1/admin/workspaces', {
-      method: 'POST',
+  async adminCreateWorkspace(
+    params: CreateWorkspaceRequest,
+  ): Promise<Workspace> {
+    return this.request<Workspace>("/api/v1/admin/workspaces", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
@@ -541,152 +583,213 @@ class ApiClient {
     return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`);
   }
 
-  async adminUpdateWorkspace(workspaceId: string, params: UpdateWorkspaceRequest): Promise<Workspace> {
+  async adminUpdateWorkspace(
+    workspaceId: string,
+    params: UpdateWorkspaceRequest,
+  ): Promise<Workspace> {
     return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`, {
-      method: 'PUT',
+      method: "PUT",
       body: JSON.stringify(params),
     });
   }
 
   async adminDeleteWorkspace(workspaceId: string): Promise<void> {
     return this.request<void>(`/api/v1/admin/workspaces/${workspaceId}`, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
   // User Workspaces
   async listWorkspaces(): Promise<WorkspaceListItem[]> {
-    return this.request<WorkspaceListItem[]>('/api/v1/workspaces');
+    return this.request<WorkspaceListItem[]>("/api/v1/workspaces");
   }
 
   async getCurrentWorkspace(): Promise<Workspace> {
-    return this.request<Workspace>('/api/v1/workspaces/current');
+    return this.request<Workspace>("/api/v1/workspaces/current");
   }
 
   async getWorkspace(workspaceId: string): Promise<Workspace> {
     return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`);
   }
 
-  async updateWorkspace(workspaceId: string, params: UpdateWorkspaceRequest): Promise<Workspace> {
+  async updateWorkspace(
+    workspaceId: string,
+    params: UpdateWorkspaceRequest,
+  ): Promise<Workspace> {
     return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`, {
-      method: 'PUT',
+      method: "PUT",
       body: JSON.stringify(params),
     });
   }
 
   async switchWorkspace(workspaceId: string): Promise<void> {
     return this.request<void>(`/api/v1/workspaces/${workspaceId}/switch`, {
-      method: 'POST',
+      method: "POST",
     });
   }
 
   async listWorkspaceMembers(workspaceId: string): Promise<WorkspaceMember[]> {
-    return this.request<WorkspaceMember[]>(`/api/v1/workspaces/${workspaceId}/members`);
+    return this.request<WorkspaceMember[]>(
+      `/api/v1/workspaces/${workspaceId}/members`,
+    );
   }
 
-  async updateMemberRole(workspaceId: string, memberId: string, role: WorkspaceRole): Promise<WorkspaceMember> {
-    return this.request<WorkspaceMember>(`/api/v1/workspaces/${workspaceId}/members/${memberId}`, {
-      method: 'PUT',
-      body: JSON.stringify({ role }),
-    });
+  async updateMemberRole(
+    workspaceId: string,
+    memberId: string,
+    role: WorkspaceRole,
+  ): Promise<WorkspaceMember> {
+    return this.request<WorkspaceMember>(
+      `/api/v1/workspaces/${workspaceId}/members/${memberId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ role }),
+      },
+    );
   }
 
   async removeMember(workspaceId: string, memberId: string): Promise<void> {
-    return this.request<void>(`/api/v1/workspaces/${workspaceId}/members/${memberId}`, {
-      method: 'DELETE',
-    });
+    return this.request<void>(
+      `/api/v1/workspaces/${workspaceId}/members/${memberId}`,
+      {
+        method: "DELETE",
+      },
+    );
   }
 
   async getOptimizerStatus(workspaceId: string): Promise<OptimizerStatus> {
-    return this.request<OptimizerStatus>(`/api/v1/workspaces/${workspaceId}/optimizer-status`);
+    return this.request<OptimizerStatus>(
+      `/api/v1/workspaces/${workspaceId}/optimizer-status`,
+    );
   }
 
   async getServiceStatus(workspaceId: string): Promise<ServiceStatus> {
-    return this.request<ServiceStatus>(`/api/v1/workspaces/${workspaceId}/service-status`);
+    return this.request<ServiceStatus>(
+      `/api/v1/workspaces/${workspaceId}/service-status`,
+    );
   }
 
   // Workspace Invites
   async listWorkspaceInvites(workspaceId: string): Promise<WorkspaceInvite[]> {
-    return this.request<WorkspaceInvite[]>(`/api/v1/workspaces/${workspaceId}/invites`);
+    return this.request<WorkspaceInvite[]>(
+      `/api/v1/workspaces/${workspaceId}/invites`,
+    );
   }
 
-  async createInvite(workspaceId: string, params: CreateInviteRequest): Promise<WorkspaceInvite> {
-    return this.request<WorkspaceInvite>(`/api/v1/workspaces/${workspaceId}/invites`, {
-      method: 'POST',
-      body: JSON.stringify(params),
-    });
+  async createInvite(
+    workspaceId: string,
+    params: CreateInviteRequest,
+  ): Promise<WorkspaceInvite> {
+    return this.request<WorkspaceInvite>(
+      `/api/v1/workspaces/${workspaceId}/invites`,
+      {
+        method: "POST",
+        body: JSON.stringify(params),
+      },
+    );
   }
 
   async revokeInvite(workspaceId: string, inviteId: string): Promise<void> {
-    return this.request<void>(`/api/v1/workspaces/${workspaceId}/invites/${inviteId}`, {
-      method: 'DELETE',
-    });
+    return this.request<void>(
+      `/api/v1/workspaces/${workspaceId}/invites/${inviteId}`,
+      {
+        method: "DELETE",
+      },
+    );
   }
 
   async getInviteInfo(token: string): Promise<InviteInfo> {
     return this.request<InviteInfo>(`/api/v1/invites/${token}`);
   }
 
-  async acceptInvite(token: string, params?: AcceptInviteRequest): Promise<AcceptInviteResponse> {
-    return this.request<AcceptInviteResponse>(`/api/v1/invites/${token}/accept`, {
-      method: 'POST',
-      body: JSON.stringify(params || {}),
-    });
+  async acceptInvite(
+    token: string,
+    params?: AcceptInviteRequest,
+  ): Promise<AcceptInviteResponse> {
+    return this.request<AcceptInviteResponse>(
+      `/api/v1/invites/${token}/accept`,
+      {
+        method: "POST",
+        body: JSON.stringify(params || {}),
+      },
+    );
   }
 
   // Workspace Allocations
   async listAllocations(): Promise<WorkspaceAllocation[]> {
-    return this.request<WorkspaceAllocation[]>('/api/v1/allocations');
+    return this.request<WorkspaceAllocation[]>("/api/v1/allocations");
   }
 
-  async addAllocation(address: string, params?: AddAllocationRequest): Promise<WorkspaceAllocation> {
+  async addAllocation(
+    address: string,
+    params?: AddAllocationRequest,
+  ): Promise<WorkspaceAllocation> {
     return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}`, {
-      method: 'POST',
+      method: "POST",
       body: JSON.stringify(params || {}),
     });
   }
 
-  async updateAllocation(address: string, params: UpdateAllocationRequest): Promise<WorkspaceAllocation> {
+  async updateAllocation(
+    address: string,
+    params: UpdateAllocationRequest,
+  ): Promise<WorkspaceAllocation> {
     return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}`, {
-      method: 'PUT',
+      method: "PUT",
       body: JSON.stringify(params),
     });
   }
 
   async removeAllocation(address: string): Promise<void> {
     return this.request<void>(`/api/v1/allocations/${address}`, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
   async promoteAllocation(address: string): Promise<WorkspaceAllocation> {
-    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}/promote`, {
-      method: 'POST',
-    });
+    return this.request<WorkspaceAllocation>(
+      `/api/v1/allocations/${address}/promote`,
+      {
+        method: "POST",
+      },
+    );
   }
 
   async demoteAllocation(address: string): Promise<WorkspaceAllocation> {
-    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}/demote`, {
-      method: 'POST',
-    });
+    return this.request<WorkspaceAllocation>(
+      `/api/v1/allocations/${address}/demote`,
+      {
+        method: "POST",
+      },
+    );
   }
 
   // Pin/Unpin Wallet (prevents auto-demotion)
-  async pinAllocation(address: string): Promise<{ success: boolean; pinned: boolean; message: string }> {
-    return this.request<{ success: boolean; pinned: boolean; message: string }>(`/api/v1/allocations/${address}/pin`, {
-      method: 'PUT',
-    });
+  async pinAllocation(
+    address: string,
+  ): Promise<{ success: boolean; pinned: boolean; message: string }> {
+    return this.request<{ success: boolean; pinned: boolean; message: string }>(
+      `/api/v1/allocations/${address}/pin`,
+      {
+        method: "PUT",
+      },
+    );
   }
 
-  async unpinAllocation(address: string): Promise<{ success: boolean; pinned: boolean; message: string }> {
-    return this.request<{ success: boolean; pinned: boolean; message: string }>(`/api/v1/allocations/${address}/pin`, {
-      method: 'DELETE',
-    });
+  async unpinAllocation(
+    address: string,
+  ): Promise<{ success: boolean; pinned: boolean; message: string }> {
+    return this.request<{ success: boolean; pinned: boolean; message: string }>(
+      `/api/v1/allocations/${address}/pin`,
+      {
+        method: "DELETE",
+      },
+    );
   }
 
   // Wallet Bans (prevents auto-promotion)
   async listBans(): Promise<{ bans: WalletBan[] }> {
-    return this.request<{ bans: WalletBan[] }>('/api/v1/allocations/bans');
+    return this.request<{ bans: WalletBan[] }>("/api/v1/allocations/bans");
   }
 
   async banWallet(params: {
@@ -694,15 +797,15 @@ class ApiClient {
     reason?: string;
     expires_at?: string;
   }): Promise<WalletBan> {
-    return this.request<WalletBan>('/api/v1/allocations/bans', {
-      method: 'POST',
+    return this.request<WalletBan>("/api/v1/allocations/bans", {
+      method: "POST",
       body: JSON.stringify(params),
     });
   }
 
   async unbanWallet(address: string): Promise<void> {
     return this.request<void>(`/api/v1/allocations/bans/${address}`, {
-      method: 'DELETE',
+      method: "DELETE",
     });
   }
 
@@ -713,34 +816,45 @@ class ApiClient {
     unacknowledged_only?: boolean;
   }): Promise<RotationHistoryEntry[]> {
     const searchParams = new URLSearchParams();
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     if (params?.unacknowledged_only !== undefined) {
-      searchParams.set('unacknowledged_only', String(params.unacknowledged_only));
+      searchParams.set(
+        "unacknowledged_only",
+        String(params.unacknowledged_only),
+      );
     }
     const query = searchParams.toString();
-    return this.request<RotationHistoryEntry[]>(`/api/v1/auto-rotation/history${query ? `?${query}` : ''}`);
+    return this.request<RotationHistoryEntry[]>(
+      `/api/v1/auto-rotation/history${query ? `?${query}` : ""}`,
+    );
   }
 
   async acknowledgeRotation(entryId: string): Promise<RotationHistoryEntry> {
-    return this.request<RotationHistoryEntry>(`/api/v1/auto-rotation/${entryId}/acknowledge`, {
-      method: 'PUT',
-    });
+    return this.request<RotationHistoryEntry>(
+      `/api/v1/auto-rotation/${entryId}/acknowledge`,
+      {
+        method: "PUT",
+      },
+    );
   }
 
   async triggerOptimization(): Promise<OptimizationResult> {
     // The endpoint may return 200 OK with body or 202 Accepted without body
-    const response = await fetch(`${this.baseUrl}/api/v1/auto-rotation/trigger`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(this.token ? { 'Authorization': `Bearer ${this.token}` } : {}),
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/auto-rotation/trigger`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+        },
       },
-    });
+    );
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({
-        code: 'UNKNOWN_ERROR',
+        code: "UNKNOWN_ERROR",
         message: `HTTP ${response.status}`,
       }));
       throw new Error(error.message || `HTTP ${response.status}`);
@@ -761,81 +875,61 @@ class ApiClient {
 
   // Onboarding
   async getOnboardingStatus(): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>('/api/v1/onboarding/status');
+    return this.request<OnboardingStatus>("/api/v1/onboarding/status");
   }
 
   async setOnboardingMode(mode: SetupMode): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>('/api/v1/onboarding/mode', {
-      method: 'PUT',
+    return this.request<OnboardingStatus>("/api/v1/onboarding/mode", {
+      method: "PUT",
       body: JSON.stringify({ mode }),
     });
   }
 
-  async setOnboardingBudget(params: SetBudgetRequest): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>('/api/v1/onboarding/budget', {
-      method: 'PUT',
+  async setOnboardingBudget(
+    params: SetBudgetRequest,
+  ): Promise<OnboardingStatus> {
+    return this.request<OnboardingStatus>("/api/v1/onboarding/budget", {
+      method: "PUT",
       body: JSON.stringify(params),
     });
   }
 
   async runAutoSetup(config?: AutoSetupConfig): Promise<AutoSetupResponse> {
-    return this.request<AutoSetupResponse>('/api/v1/onboarding/auto-setup', {
-      method: 'POST',
+    return this.request<AutoSetupResponse>("/api/v1/onboarding/auto-setup", {
+      method: "POST",
       body: JSON.stringify(config || {}),
     });
   }
 
   async completeOnboarding(): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>('/api/v1/onboarding/complete', {
-      method: 'PUT',
+    return this.request<OnboardingStatus>("/api/v1/onboarding/complete", {
+      method: "PUT",
     });
   }
 
-  // Demo Positions
-  async listDemoPositions(params?: {
-    status?: 'open' | 'closed' | 'all';
-  }): Promise<DemoPosition[]> {
-    const searchParams = new URLSearchParams();
-    if (params?.status) searchParams.set('status', params.status);
-    const query = searchParams.toString();
-    return this.request<DemoPosition[]>(`/api/v1/demo/positions${query ? `?${query}` : ''}`);
+  // Risk Monitoring
+  async getRiskStatus(workspaceId: string): Promise<RiskStatus> {
+    return this.request<RiskStatus>(
+      `/api/v1/workspaces/${workspaceId}/risk/status`,
+    );
   }
 
-  async createDemoPosition(params: CreateDemoPositionRequest): Promise<DemoPosition> {
-    return this.request<DemoPosition>('/api/v1/demo/positions', {
-      method: 'POST',
-      body: JSON.stringify(params),
-    });
+  async manualTripCircuitBreaker(
+    workspaceId: string,
+  ): Promise<CircuitBreakerStatus> {
+    return this.request<CircuitBreakerStatus>(
+      `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/trip`,
+      { method: "POST" },
+    );
   }
 
-  async updateDemoPosition(positionId: string, params: UpdateDemoPositionRequest): Promise<DemoPosition> {
-    return this.request<DemoPosition>(`/api/v1/demo/positions/${positionId}`, {
-      method: 'PUT',
-      body: JSON.stringify(params),
-    });
-  }
-
-  async deleteDemoPosition(positionId: string): Promise<void> {
-    return this.request<void>(`/api/v1/demo/positions/${positionId}`, {
-      method: 'DELETE',
-    });
-  }
-
-  async getDemoBalance(): Promise<DemoBalance> {
-    return this.request<DemoBalance>('/api/v1/demo/balance');
-  }
-
-  async updateDemoBalance(balance: number): Promise<DemoBalance> {
-    return this.request<DemoBalance>('/api/v1/demo/balance', {
-      method: 'PUT',
-      body: JSON.stringify({ balance }),
-    });
-  }
-
-  async resetDemoPortfolio(): Promise<DemoBalance> {
-    return this.request<DemoBalance>('/api/v1/demo/reset', {
-      method: 'POST',
-    });
+  async resetCircuitBreaker(
+    workspaceId: string,
+  ): Promise<CircuitBreakerStatus> {
+    return this.request<CircuitBreakerStatus>(
+      `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/reset`,
+      { method: "POST" },
+    );
   }
 
   // Activity Feed
@@ -844,10 +938,12 @@ class ApiClient {
     offset?: number;
   }): Promise<Activity[]> {
     const searchParams = new URLSearchParams();
-    if (params?.limit) searchParams.set('limit', String(params.limit));
-    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Activity[]>(`/api/v1/activity${query ? `?${query}` : ''}`);
+    return this.request<Activity[]>(
+      `/api/v1/activity${query ? `?${query}` : ""}`,
+    );
   }
 }
 

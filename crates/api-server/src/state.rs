@@ -247,15 +247,29 @@ impl AppState {
                             if count > 0 {
                                 tracing::info!(
                                     approvals_sent = count,
-                                    "Set Polymarket contract approvals"
+                                    "Set Polymarket contract approvals, refreshing CLOB cache"
                                 );
+                                // Tell the CLOB server to re-read the on-chain allowance state
+                                if let Err(e) = order_executor.refresh_clob_allowance_cache().await
+                                {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "Failed to refresh CLOB allowance cache after approvals"
+                                    );
+                                }
+                            } else {
+                                tracing::info!("All Polymarket approvals already set");
+                                // Still refresh the CLOB cache in case it's stale
+                                let _ = order_executor.refresh_clob_allowance_cache().await;
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 error = %e,
-                                "Failed to set Polymarket approvals (trading may fail). \
-                                 Set approvals manually or ensure POLYGON_RPC_URL is correct."
+                                wallet = %signer.address(),
+                                "Failed to set Polymarket approvals. \
+                                 If the error mentions insufficient POL for gas, \
+                                 send 0.1 POL to the wallet address above on Polygon."
                             );
                         }
                     }

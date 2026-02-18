@@ -231,6 +231,20 @@ impl OrderExecutor {
         Ok(address)
     }
 
+    /// Tell the CLOB to re-read on-chain balance/allowance state.
+    ///
+    /// Call this after setting on-chain approvals so the CLOB picks up the new values.
+    pub async fn refresh_clob_allowance_cache(&self) -> anyhow::Result<()> {
+        let slot = self.auth_client.read().await;
+        let client = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No authenticated client"))?;
+        // Update both COLLATERAL (USDC.e) and CONDITIONAL (CTF tokens)
+        let _ = client.update_balance_allowance("COLLATERAL").await;
+        let _ = client.update_balance_allowance("CONDITIONAL").await;
+        Ok(())
+    }
+
     /// Take the execution report receiver (can only be called once).
     pub fn take_report_receiver(&mut self) -> Option<mpsc::Receiver<ExecutionReport>> {
         self.report_rx.take()
@@ -495,6 +509,11 @@ impl OrderExecutor {
     /// Check if executor is in live trading mode.
     pub fn is_live(&self) -> bool {
         self.config.live_trading
+    }
+
+    /// Get a reference to the underlying CLOB client.
+    pub fn clob_client(&self) -> &ClobClient {
+        &self.clob_client
     }
 
     // Private methods

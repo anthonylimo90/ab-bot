@@ -1,23 +1,21 @@
-'use client';
+"use client";
 
-import { useQuery } from '@tanstack/react-query';
-import { api } from '@/lib/api';
-import { queryKeys } from '@/lib/queryClient';
-import type { DiscoveredWallet, LiveTrade, DemoPnlSimulation } from '@/types/api';
-import type { TradingMode } from '@/stores/mode-store';
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+import { queryKeys } from "@/lib/queryClient";
 
 interface DiscoverFilters {
-  sortBy?: 'roi' | 'sharpe' | 'winRate' | 'trades';
-  period?: '7d' | '30d' | '90d';
+  sortBy?: "roi" | "sharpe" | "winRate" | "trades";
+  period?: "7d" | "30d" | "90d";
   minTrades?: number;
   minWinRate?: number;
   limit?: number;
   workspaceId?: string;
 }
 
-export function useDiscoverWalletsQuery(mode: TradingMode, filters?: DiscoverFilters) {
+export function useDiscoverWalletsQuery(filters?: DiscoverFilters) {
   return useQuery({
-    queryKey: queryKeys.discover.wallets(mode, filters, filters?.workspaceId),
+    queryKey: queryKeys.discover.wallets(filters, filters?.workspaceId),
     queryFn: () =>
       api.discoverWallets({
         sort_by: filters?.sortBy,
@@ -30,7 +28,7 @@ export function useDiscoverWalletsQuery(mode: TradingMode, filters?: DiscoverFil
   });
 }
 
-export function useLiveTradesQuery(mode: TradingMode, params?: {
+export function useLiveTradesQuery(params?: {
   wallet?: string;
   limit?: number;
   minValue?: number;
@@ -38,9 +36,12 @@ export function useLiveTradesQuery(mode: TradingMode, params?: {
 }) {
   return useQuery({
     queryKey: queryKeys.discover.trades(
-      mode,
-      { wallet: params?.wallet, limit: params?.limit, minValue: params?.minValue },
-      params?.workspaceId
+      {
+        wallet: params?.wallet,
+        limit: params?.limit,
+        minValue: params?.minValue,
+      },
+      params?.workspaceId,
     ),
     queryFn: () =>
       api.getLiveTrades({
@@ -53,42 +54,20 @@ export function useLiveTradesQuery(mode: TradingMode, params?: {
   });
 }
 
-export function useDemoPnlSimulationQuery(mode: TradingMode, params?: {
-  amount?: number;
-  period?: '7d' | '30d' | '90d';
-  wallets?: string[];
-  workspaceId?: string;
-}) {
+export function useDiscoveredWalletQuery(address: string, enabled = true) {
   return useQuery({
-    queryKey: queryKeys.discover.simulate(
-      mode,
-      { amount: params?.amount, period: params?.period, wallets: params?.wallets },
-      params?.workspaceId
-    ),
-    queryFn: () =>
-      api.simulateDemoPnl({
-        amount: params?.amount,
-        period: params?.period,
-        wallets: params?.wallets?.join(','),
-      }),
-    staleTime: 5 * 60 * 1000,
-  });
-}
-
-export function useDiscoveredWalletQuery(mode: TradingMode, address: string, enabled = true) {
-  return useQuery({
-    queryKey: ['discover', 'wallet', mode, address],
+    queryKey: ["discover", "wallet", address],
     queryFn: () => api.getDiscoveredWallet(address),
-    enabled: !!address && enabled,
+    enabled: Boolean(address) && enabled,
     staleTime: 60 * 1000,
     retry: false,
   });
 }
 
-export function useLeaderboardQuery(mode: TradingMode, workspaceId?: string) {
-  return useDiscoverWalletsQuery(mode, {
-    sortBy: 'roi',
-    period: '30d',
+export function useLeaderboardQuery(workspaceId?: string) {
+  return useDiscoverWalletsQuery({
+    sortBy: "roi",
+    period: "30d",
     minTrades: 10,
     limit: 10,
     ...(workspaceId ? { workspaceId } : {}),

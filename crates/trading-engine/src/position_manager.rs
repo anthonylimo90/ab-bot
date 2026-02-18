@@ -90,11 +90,11 @@ pub struct PositionLimits {
 impl Default for PositionLimits {
     fn default() -> Self {
         Self {
-            max_total_positions: 100,
-            max_per_market: 5,
-            max_total_exposure: Decimal::new(100000, 0),
-            max_market_exposure: Decimal::new(10000, 0),
-            max_position_size: Decimal::new(1000, 0),
+            max_total_positions: 20, // Reduced from 100 while proving strategy
+            max_per_market: 2,       // Reduced from 5
+            max_total_exposure: Decimal::new(25000, 0), // Reduced from $100K to $25K
+            max_market_exposure: Decimal::new(5000, 0), // Reduced from $10K to $5K
+            max_position_size: Decimal::new(500, 0), // Reduced from $1K to $500
         }
     }
 }
@@ -127,16 +127,21 @@ impl PositionManager {
     pub async fn add_position(&self, position: ManagedPosition) -> Result<()> {
         let limits = self.limits.read().await;
 
-        // Check limits
-        if self.positions.len() >= limits.max_total_positions {
+        // Check limits (only count active positions, not closed ones)
+        let active_count = self.active_positions().len();
+        if active_count >= limits.max_total_positions {
             anyhow::bail!(
                 "Maximum total positions ({}) reached",
                 limits.max_total_positions
             );
         }
 
-        let market_positions = self.positions_for_market(&position.position.market_id);
-        if market_positions.len() >= limits.max_per_market {
+        let active_market_count = self
+            .positions_for_market(&position.position.market_id)
+            .into_iter()
+            .filter(|p| p.position.is_active())
+            .count();
+        if active_market_count >= limits.max_per_market {
             anyhow::bail!(
                 "Maximum positions per market ({}) reached for {}",
                 limits.max_per_market,
@@ -333,14 +338,19 @@ impl PositionManager {
     pub async fn can_open_position(&self, market_id: &str, size: Decimal) -> Result<(), String> {
         let limits = self.limits.read().await;
 
-        if self.positions.len() >= limits.max_total_positions {
+        if self.active_positions().len() >= limits.max_total_positions {
             return Err(format!(
                 "Max positions ({}) reached",
                 limits.max_total_positions
             ));
         }
 
-        if self.positions_for_market(market_id).len() >= limits.max_per_market {
+        let active_market_count = self
+            .positions_for_market(market_id)
+            .into_iter()
+            .filter(|p| p.position.is_active())
+            .count();
+        if active_market_count >= limits.max_per_market {
             return Err(format!(
                 "Max positions per market ({}) reached",
                 limits.max_per_market

@@ -11,9 +11,9 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    activity, admin_workspaces, allocations, auth, auto_rotation, backtest, demo, discover, health,
-    invites, markets, onboarding, order_signing, positions, recommendations, risk_allocations,
-    trading, users, vault, wallet_auth, wallets, workspaces,
+    activity, admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health,
+    invites, markets, onboarding, order_signing, positions, recommendations, risk,
+    risk_allocations, trading, users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -63,7 +63,7 @@ use crate::websocket;
         discover::get_live_trades,
         discover::discover_wallets,
         discover::get_discovered_wallet,
-        discover::simulate_demo_pnl,
+
         vault::store_wallet,
         vault::list_wallets,
         vault::get_wallet,
@@ -123,19 +123,16 @@ use crate::websocket;
         onboarding::set_budget,
         onboarding::auto_setup,
         onboarding::complete_onboarding,
-        // Demo positions
-        demo::list_demo_positions,
-        demo::create_demo_position,
-        demo::update_demo_position,
-        demo::delete_demo_position,
-        demo::get_demo_balance,
-        demo::update_demo_balance,
-        demo::reset_demo_portfolio,
+
         // Order signing (MetaMask)
         order_signing::prepare_order,
         order_signing::submit_order,
         // Activity
         activity::list_activity,
+        // Risk monitoring
+        risk::get_risk_status,
+        risk::manual_trip_circuit_breaker,
+        risk::reset_circuit_breaker,
     ),
     components(
         schemas(
@@ -186,9 +183,7 @@ use crate::websocket;
             discover::LiveTrade,
             discover::DiscoveredWallet,
             discover::PredictionCategory,
-            discover::DemoPnlSimulation,
-            discover::WalletSimulation,
-            discover::EquityPoint,
+
             vault::StoreWalletRequest,
             vault::WalletInfo,
             vault::WalletBalanceResponse,
@@ -238,12 +233,7 @@ use crate::websocket;
             onboarding::AutoSetupRequest,
             onboarding::AutoSetupResponse,
             onboarding::AutoSelectedWallet,
-            // Demo
-            demo::DemoPositionResponse,
-            demo::CreateDemoPositionRequest,
-            demo::UpdateDemoPositionRequest,
-            demo::DemoBalanceResponse,
-            demo::UpdateDemoBalanceRequest,
+
             // Order signing
             order_signing::PrepareOrderRequest,
             order_signing::PrepareOrderResponse,
@@ -257,6 +247,13 @@ use crate::websocket;
             order_signing::OrderSummary,
             // Activity
             activity::ActivityResponse,
+            // Risk monitoring
+            risk::RiskStatusResponse,
+            risk::CircuitBreakerResponse,
+            risk::CircuitBreakerConfigResponse,
+            risk::RecoveryStateResponse,
+            risk::StopLossStatsResponse,
+            risk::RecentStopExecution,
         )
     ),
     tags(
@@ -277,9 +274,10 @@ use crate::websocket;
         (name = "allocations", description = "Wallet roster allocations"),
         (name = "auto_rotation", description = "Auto-rotation history and optimization"),
         (name = "onboarding", description = "Setup wizard and onboarding"),
-        (name = "demo", description = "Demo trading positions and balance"),
+
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "activity", description = "Activity feed from copy trade history"),
+        (name = "risk", description = "Risk monitoring and circuit breaker management"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -341,10 +339,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/discover/wallets/:address",
             get(discover::get_discovered_wallet),
-        )
-        .route(
-            "/api/v1/discover/simulate",
-            get(discover::simulate_demo_pnl),
         )
         // Recommendations (public for demo purposes)
         .route(
@@ -449,6 +443,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Activity feed (read-only for all members)
         .route("/api/v1/activity", get(activity::list_activity))
+        // Risk monitoring (read-only for all members)
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/status",
+            get(risk::get_risk_status),
+        )
         // Allocations (read-only for all members)
         .route("/api/v1/allocations", get(allocations::list_allocations))
         // Auto-rotation history (read-only for all members)
@@ -458,9 +457,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Onboarding status (read for all)
         .route("/api/v1/onboarding/status", get(onboarding::get_status))
-        // Demo positions (read for all workspace members)
-        .route("/api/v1/demo/positions", get(demo::list_demo_positions))
-        .route("/api/v1/demo/balance", get(demo::get_demo_balance))
         // Apply auth middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -563,6 +559,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/allocations/risk/recalculate",
             post(risk_allocations::recalculate_allocations),
         )
+        // Circuit breaker manual controls
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/trip",
+            post(risk::manual_trip_circuit_breaker),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/reset",
+            post(risk::reset_circuit_breaker),
+        )
         // Auto-rotation operations
         .route(
             "/api/v1/auto-rotation/:entry_id/acknowledge",
@@ -583,18 +588,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/onboarding/complete",
             put(onboarding::complete_onboarding),
         )
-        // Demo positions (write requires trader role)
-        .route("/api/v1/demo/positions", post(demo::create_demo_position))
-        .route(
-            "/api/v1/demo/positions/:position_id",
-            put(demo::update_demo_position),
-        )
-        .route(
-            "/api/v1/demo/positions/:position_id",
-            delete(demo::delete_demo_position),
-        )
-        .route("/api/v1/demo/balance", put(demo::update_demo_balance))
-        .route("/api/v1/demo/reset", post(demo::reset_demo_portfolio))
         // Apply trader check first, then auth
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

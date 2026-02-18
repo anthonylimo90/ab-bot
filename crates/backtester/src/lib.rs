@@ -39,6 +39,6 @@ pub use simulator::{
     BacktestResult, BacktestSimulator, SimulatorConfig, SlippageModel, TradeRecord, TradeType,
 };
 pub use strategy::{
-    ArbitrageStrategy, MeanReversionStrategy, MomentumStrategy, Position, Signal, SignalType,
-    Strategy, StrategyContext,
+    ArbitrageStrategy, GridStrategy, MeanReversionStrategy, MomentumStrategy, Position, Signal,
+    SignalType, Strategy, StrategyContext,
 };

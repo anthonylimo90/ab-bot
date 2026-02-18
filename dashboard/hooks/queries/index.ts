@@ -5,7 +5,7 @@ export {
   useClosePositionMutation,
   useOpenPositions,
   useCopyTradePositions,
-} from './usePositionsQuery';
+} from "./usePositionsQuery";
 
 // Wallet queries
 export {
@@ -17,15 +17,14 @@ export {
   useUpdateWalletMutation,
   useRosterWallets,
   useBenchWallets,
-} from './useWalletsQuery';
+} from "./useWalletsQuery";
 
 // Discovery queries
 export {
   useDiscoverWalletsQuery,
   useLiveTradesQuery,
-  useDemoPnlSimulationQuery,
   useLeaderboardQuery,
-} from './useDiscoverQuery';
+} from "./useDiscoverQuery";
 
 // Recommendations queries
 export {
@@ -36,7 +35,7 @@ export {
   type RecommendationType,
   type RecommendationReason,
   type Urgency,
-} from './useRecommendationsQuery';
+} from "./useRecommendationsQuery";
 
 // Optimizer queries
 export {
@@ -45,7 +44,17 @@ export {
   useTriggerOptimizationMutation,
   useAcknowledgeRotationMutation,
   useUnacknowledgedRotationCount,
-} from './useOptimizerQuery';
+} from "./useOptimizerQuery";
+
+// History queries
+export { useClosedPositionsQuery } from "./useHistoryQuery";
+
+// Risk monitoring queries
+export {
+  useRiskStatusQuery,
+  useManualTripMutation,
+  useResetCircuitBreakerMutation,
+} from "./useRiskQuery";
 
 // Allocation queries
 export {
@@ -59,4 +68,4 @@ export {
   useRemoveAllocationMutation,
   usePinAllocationMutation,
   useUnpinAllocationMutation,
-} from './useAllocationsQuery';
+} from "./useAllocationsQuery";

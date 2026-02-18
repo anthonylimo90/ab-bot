@@ -1,10 +1,9 @@
-'use client';
+"use client";
 
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
-import { queryKeys } from '@/lib/queryClient';
-import type { Position, PositionStatus } from '@/types/api';
-import type { TradingMode } from '@/stores/mode-store';
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+import { queryKeys } from "@/lib/queryClient";
+import type { Position, PositionStatus } from "@/types/api";
 
 interface PositionFilters {
   status?: PositionStatus;
@@ -12,30 +11,29 @@ interface PositionFilters {
   copyTradesOnly?: boolean;
 }
 
-export function usePositionsQuery(mode: TradingMode, filters?: PositionFilters) {
+export function usePositionsQuery(filters?: PositionFilters) {
   return useQuery({
-    queryKey: queryKeys.positions.list(mode, filters),
+    queryKey: queryKeys.positions.list(filters),
     queryFn: () =>
       api.getPositions({
         status: filters?.status,
         market_id: filters?.market,
         copy_trades_only: filters?.copyTradesOnly,
       }),
-    enabled: mode === 'live',
     staleTime: 30 * 1000,
     refetchInterval: 30 * 1000,
   });
 }
 
-export function usePositionQuery(mode: TradingMode, positionId: string) {
+export function usePositionQuery(positionId: string) {
   return useQuery({
-    queryKey: queryKeys.positions.detail(mode, positionId),
+    queryKey: queryKeys.positions.detail(positionId),
     queryFn: () => api.getPosition(positionId),
-    enabled: !!positionId && mode === 'live',
+    enabled: Boolean(positionId),
   });
 }
 
-export function useClosePositionMutation(mode: TradingMode) {
+export function useClosePositionMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
@@ -54,22 +52,22 @@ export function useClosePositionMutation(mode: TradingMode) {
       });
     },
     onSuccess: (_, { positionId }) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.positions.all(mode) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.positions.all() });
       queryClient.removeQueries({
-        queryKey: queryKeys.positions.detail(mode, positionId),
+        queryKey: queryKeys.positions.detail(positionId),
       });
     },
   });
 }
 
 // Derived hooks for common use cases
-export function useOpenPositions(mode: TradingMode) {
-  const query = usePositionsQuery(mode, { status: 'open' });
+export function useOpenPositions() {
+  const query = usePositionsQuery({ status: "open" });
 
   const openPositions = query.data ?? [];
   const totalUnrealizedPnl = openPositions.reduce(
     (sum, p) => sum + p.unrealized_pnl,
-    0
+    0,
   );
 
   return {
@@ -79,8 +77,8 @@ export function useOpenPositions(mode: TradingMode) {
   };
 }
 
-export function useCopyTradePositions(mode: TradingMode) {
-  const query = usePositionsQuery(mode, { copyTradesOnly: true });
+export function useCopyTradePositions() {
+  const query = usePositionsQuery({ copyTradesOnly: true });
 
   return {
     ...query,

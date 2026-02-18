@@ -1,57 +1,62 @@
-'use client';
+"use client";
 
-import { useState } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Slider } from '@/components/ui/slider';
+import { useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Slider } from "@/components/ui/slider";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from '@/components/ui/select';
-import { formatCurrency, cn } from '@/lib/utils';
-import { Settings, Info } from 'lucide-react';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-import { useWorkspaceStore } from '@/stores/workspace-store';
-import { useModeStore } from '@/stores/mode-store';
-import { useUpdateAllocationMutation } from '@/hooks/queries/useAllocationsQuery';
-import type { CopyBehavior, WorkspaceAllocation } from '@/types/api';
+} from "@/components/ui/select";
+import { formatCurrency, cn } from "@/lib/utils";
+import { Settings, Info } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useWorkspaceStore } from "@/stores/workspace-store";
+import { useUpdateAllocationMutation } from "@/hooks/queries/useAllocationsQuery";
+import type { CopyBehavior, WorkspaceAllocation } from "@/types/api";
 
 interface WalletAllocationSectionProps {
   walletAddress: string;
   totalBalance: number;
   positionsValue: number;
-  isDemo?: boolean;
   allocations: WorkspaceAllocation[];
   readOnly?: boolean;
 }
 
 const copyBehaviorDescriptions: Record<CopyBehavior, string> = {
-  copy_all: 'Copy all trades from this wallet regardless of type',
-  events_only: 'Only copy event-based trades (directional bets)',
-  arb_threshold: 'Only copy trades meeting arbitrage threshold criteria',
+  copy_all: "Copy all trades from this wallet regardless of type",
+  events_only: "Only copy event-based trades (directional bets)",
+  arb_threshold: "Only copy trades meeting arbitrage threshold criteria",
 };
 
 export function WalletAllocationSection({
   walletAddress,
   totalBalance,
   positionsValue,
-  isDemo = false,
   allocations,
   readOnly = false,
 }: WalletAllocationSectionProps) {
   const { currentWorkspace } = useWorkspaceStore();
-  const { mode } = useModeStore();
-  const updateAllocationMutation = useUpdateAllocationMutation(currentWorkspace?.id, mode);
+  const updateAllocationMutation = useUpdateAllocationMutation(
+    currentWorkspace?.id,
+  );
 
   // Local state for optimistic slider display during drag (must be before early return)
-  const [localAllocationPct, setLocalAllocationPct] = useState<number | null>(null);
+  const [localAllocationPct, setLocalAllocationPct] = useState<number | null>(
+    null,
+  );
   const [localMaxPosition, setLocalMaxPosition] = useState<number | null>(null);
 
   // Find wallet in roster
   const wallet = allocations.find(
-    (w) => w.wallet_address.toLowerCase() === walletAddress.toLowerCase()
+    (w) => w.wallet_address.toLowerCase() === walletAddress.toLowerCase(),
   );
 
   // Not in roster - don't show allocation section
@@ -60,7 +65,7 @@ export function WalletAllocationSection({
   }
 
   // Only show for active wallets or bench wallets in readOnly mode
-  if (wallet.tier !== 'active' && !readOnly) {
+  if (wallet.tier !== "active" && !readOnly) {
     return null;
   }
 
@@ -73,10 +78,12 @@ export function WalletAllocationSection({
   const displayAllocationPct = localAllocationPct ?? allocationPct;
   const displayMaxAllocation = (displayAllocationPct / 100) * totalBalance;
 
-  const displayMaxPosition = localMaxPosition ?? (wallet.max_position_size ?? 100);
+  const displayMaxPosition =
+    localMaxPosition ?? wallet.max_position_size ?? 100;
 
   // Safe division helpers
-  const usagePct = maxAllocation > 0 ? Math.min(100, (inUse / maxAllocation) * 100) : 0;
+  const usagePct =
+    maxAllocation > 0 ? Math.min(100, (inUse / maxAllocation) * 100) : 0;
   const remainingPct = maxAllocation > 0 ? Math.max(0, 100 - usagePct) : 100;
 
   const handleAllocationCommit = (value: number[]) => {
@@ -113,14 +120,17 @@ export function WalletAllocationSection({
       <CardContent className="space-y-6">
         {readOnly && (
           <div className="text-sm text-muted-foreground bg-muted/50 rounded-md px-3 py-2">
-            Preview of default allocation settings. Promote to Active to customize.
+            Preview of default allocation settings. Promote to Active to
+            customize.
           </div>
         )}
         {/* Allocation Summary Bar */}
         <div className="p-4 bg-muted/30 rounded-lg border">
           <div className="flex items-center justify-between text-sm mb-3">
             <span className="text-muted-foreground">Allocation Overview</span>
-            <span className="font-medium">{allocationPct}% of total balance</span>
+            <span className="font-medium">
+              {allocationPct}% of total balance
+            </span>
           </div>
           <div className="grid grid-cols-4 gap-4 text-center">
             <div>
@@ -129,23 +139,29 @@ export function WalletAllocationSection({
             </div>
             <div>
               <p className="text-xs text-muted-foreground mb-1">Max</p>
-              <p className="text-lg font-bold">{formatCurrency(maxAllocation)}</p>
+              <p className="text-lg font-bold">
+                {formatCurrency(maxAllocation)}
+              </p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground mb-1">In Use</p>
-              <p className={cn(
-                'text-lg font-bold',
-                inUse > 0 ? 'text-primary' : 'text-muted-foreground'
-              )}>
+              <p
+                className={cn(
+                  "text-lg font-bold",
+                  inUse > 0 ? "text-primary" : "text-muted-foreground",
+                )}
+              >
                 {formatCurrency(inUse)}
               </p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground mb-1">Available</p>
-              <p className={cn(
-                'text-lg font-bold',
-                available > 0 ? 'text-profit' : 'text-loss'
-              )}>
+              <p
+                className={cn(
+                  "text-lg font-bold",
+                  available > 0 ? "text-profit" : "text-loss",
+                )}
+              >
                 {formatCurrency(available)}
               </p>
             </div>
@@ -170,10 +186,10 @@ export function WalletAllocationSection({
             </div>
             <p className="text-xs text-muted-foreground text-center">
               {maxAllocation <= 0
-                ? 'Set allocation percentage to enable trading'
+                ? "Set allocation percentage to enable trading"
                 : inUse > 0
-                ? `${usagePct.toFixed(1)}% of allocation in use`
-                : 'No positions open'}
+                  ? `${usagePct.toFixed(1)}% of allocation in use`
+                  : "No positions open"}
             </p>
           </div>
         </div>
@@ -184,7 +200,9 @@ export function WalletAllocationSection({
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <label className="text-sm font-medium">Allocation Percentage</label>
+                <label className="text-sm font-medium">
+                  Allocation Percentage
+                </label>
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger>
@@ -192,8 +210,8 @@ export function WalletAllocationSection({
                     </TooltipTrigger>
                     <TooltipContent>
                       <p className="max-w-xs">
-                        Maximum percentage of your {isDemo ? 'demo' : 'total'} balance
-                        that can be allocated to positions from this wallet.
+                        Maximum percentage of your total balance that can be
+                        allocated to positions from this wallet.
                       </p>
                     </TooltipContent>
                   </Tooltip>
@@ -214,7 +232,8 @@ export function WalletAllocationSection({
               disabled={readOnly}
             />
             <p className="text-xs text-muted-foreground">
-              Max: {formatCurrency(displayMaxAllocation)} of {formatCurrency(totalBalance)}
+              Max: {formatCurrency(displayMaxAllocation)} of{" "}
+              {formatCurrency(totalBalance)}
             </p>
           </div>
 
@@ -230,7 +249,8 @@ export function WalletAllocationSection({
                     </TooltipTrigger>
                     <TooltipContent>
                       <p className="max-w-xs">
-                        Maximum size for any single position copied from this wallet.
+                        Maximum size for any single position copied from this
+                        wallet.
                       </p>
                     </TooltipContent>
                   </Tooltip>

@@ -271,7 +271,7 @@ impl RecommendationEngine {
         Self {
             pool,
             min_arb_profit: Decimal::new(2, 2), // 2% minimum
-            min_wallet_score: 0.65,
+            min_wallet_score: 0.75,             // Raised from 0.65 — higher confidence required
             max_recommendations: 10,
             cache: Arc::new(RwLock::new(HashMap::new())),
         }

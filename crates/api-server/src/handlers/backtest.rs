@@ -12,8 +12,9 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use backtester::{
-    ArbitrageStrategy, BacktestSimulator, DataQuery, HistoricalDataStore, MeanReversionStrategy,
-    MomentumStrategy, SimulatorConfig, SlippageModel as BacktesterSlippageModel, Strategy,
+    ArbitrageStrategy, BacktestSimulator, DataQuery, GridStrategy, HistoricalDataStore,
+    MeanReversionStrategy, MomentumStrategy, SimulatorConfig,
+    SlippageModel as BacktesterSlippageModel, Strategy,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -74,12 +75,14 @@ pub enum StrategyConfig {
         /// Position size.
         position_size: Decimal,
     },
-    /// Copy trading strategy.
-    CopyTrading {
-        /// Wallets to copy.
-        wallets: Vec<String>,
-        /// Allocation percentage per wallet.
-        allocation_pct: Decimal,
+    /// Grid trading strategy.
+    Grid {
+        /// Number of grid levels above and below center.
+        grid_levels: usize,
+        /// Spacing between levels as a fraction (e.g. 0.02 = 2%).
+        grid_spacing_pct: Decimal,
+        /// Order size per level as fraction of portfolio.
+        order_size: Decimal,
     },
 }
 
@@ -159,6 +162,70 @@ pub struct BacktestResultResponse {
     /// Equity curve (daily values).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub equity_curve: Option<Vec<EquityPoint>>,
+    /// Expectancy (average profit per trade).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expectancy: Option<Decimal>,
+    /// Calmar ratio (annualized return / max drawdown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calmar_ratio: Option<Decimal>,
+    /// Value at Risk at 95% confidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub var_95: Option<Decimal>,
+    /// Conditional VaR (Expected Shortfall) at 95%.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cvar_95: Option<Decimal>,
+    /// Recovery factor (net profit / max drawdown).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_factor: Option<Decimal>,
+    /// Best single trade return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_trade_return: Option<Decimal>,
+    /// Worst single trade return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worst_trade_return: Option<Decimal>,
+    /// Maximum consecutive wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_consecutive_wins: Option<i64>,
+    /// Maximum consecutive losses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_consecutive_losses: Option<i64>,
+    /// Average trade duration in hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_trade_duration_hours: Option<Decimal>,
+    /// Full trade log (only included in detail view).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_log: Option<Vec<TradeLogEntry>>,
+}
+
+/// A single trade from the backtest log.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TradeLogEntry {
+    /// Market ID.
+    pub market_id: String,
+    /// Outcome ID.
+    pub outcome_id: String,
+    /// Trade type (buy or close).
+    pub trade_type: String,
+    /// Entry timestamp.
+    pub entry_time: DateTime<Utc>,
+    /// Exit timestamp (if closed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_time: Option<DateTime<Utc>>,
+    /// Entry price.
+    pub entry_price: Decimal,
+    /// Exit price (if closed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_price: Option<Decimal>,
+    /// Quantity.
+    pub quantity: Decimal,
+    /// Fees paid.
+    pub fees: Decimal,
+    /// Realized P&L (if closed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pnl: Option<Decimal>,
+    /// Return percentage (if closed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_pct: Option<f64>,
 }
 
 /// Point on equity curve.
@@ -214,6 +281,16 @@ struct BacktestRow {
     avg_loss: Option<Decimal>,
     profit_factor: Option<Decimal>,
     total_fees: Option<Decimal>,
+    expectancy: Option<Decimal>,
+    calmar_ratio: Option<Decimal>,
+    var_95: Option<Decimal>,
+    cvar_95: Option<Decimal>,
+    recovery_factor: Option<Decimal>,
+    best_trade_return: Option<Decimal>,
+    worst_trade_return: Option<Decimal>,
+    max_consecutive_wins: Option<i32>,
+    max_consecutive_losses: Option<i32>,
+    avg_trade_duration_hours: Option<Decimal>,
     status: String,
     error: Option<String>,
     created_at: DateTime<Utc>,
@@ -242,10 +319,72 @@ struct BacktestRowWithCurve {
     avg_loss: Option<Decimal>,
     profit_factor: Option<Decimal>,
     total_fees: Option<Decimal>,
+    expectancy: Option<Decimal>,
+    calmar_ratio: Option<Decimal>,
+    var_95: Option<Decimal>,
+    cvar_95: Option<Decimal>,
+    recovery_factor: Option<Decimal>,
+    best_trade_return: Option<Decimal>,
+    worst_trade_return: Option<Decimal>,
+    max_consecutive_wins: Option<i32>,
+    max_consecutive_losses: Option<i32>,
+    avg_trade_duration_hours: Option<Decimal>,
     status: String,
     error: Option<String>,
     equity_curve: Option<serde_json::Value>,
+    trade_log: Option<serde_json::Value>,
     created_at: DateTime<Utc>,
+}
+
+fn dec(val: f64) -> Decimal {
+    Decimal::try_from(val).unwrap_or(Decimal::ZERO)
+}
+
+fn row_to_response(row: BacktestRow) -> BacktestResultResponse {
+    let strategy: StrategyConfig =
+        serde_json::from_value(row.strategy).unwrap_or(StrategyConfig::Arbitrage {
+            min_spread: Decimal::new(2, 2),
+            max_position: Decimal::new(1000, 0),
+        });
+
+    BacktestResultResponse {
+        id: row.id,
+        strategy,
+        start_date: row.start_date,
+        end_date: row.end_date,
+        initial_capital: row.initial_capital,
+        final_value: row.final_value.unwrap_or(Decimal::ZERO),
+        total_return: row.total_return.unwrap_or(Decimal::ZERO),
+        total_return_pct: row.total_return_pct.unwrap_or(Decimal::ZERO),
+        annualized_return: row.annualized_return.unwrap_or(Decimal::ZERO),
+        sharpe_ratio: row.sharpe_ratio.unwrap_or(Decimal::ZERO),
+        sortino_ratio: row.sortino_ratio.unwrap_or(Decimal::ZERO),
+        max_drawdown: row.max_drawdown.unwrap_or(Decimal::ZERO),
+        max_drawdown_pct: row.max_drawdown_pct.unwrap_or(Decimal::ZERO),
+        total_trades: row.total_trades.unwrap_or(0),
+        winning_trades: row.winning_trades.unwrap_or(0),
+        losing_trades: row.losing_trades.unwrap_or(0),
+        win_rate: row.win_rate.unwrap_or(Decimal::ZERO),
+        avg_win: row.avg_win.unwrap_or(Decimal::ZERO),
+        avg_loss: row.avg_loss.unwrap_or(Decimal::ZERO),
+        profit_factor: row.profit_factor.unwrap_or(Decimal::ZERO),
+        total_fees: row.total_fees.unwrap_or(Decimal::ZERO),
+        created_at: row.created_at,
+        status: row.status,
+        error: row.error,
+        equity_curve: None,
+        expectancy: row.expectancy,
+        calmar_ratio: row.calmar_ratio,
+        var_95: row.var_95,
+        cvar_95: row.cvar_95,
+        recovery_factor: row.recovery_factor,
+        best_trade_return: row.best_trade_return,
+        worst_trade_return: row.worst_trade_return,
+        max_consecutive_wins: row.max_consecutive_wins.map(|v| v as i64),
+        max_consecutive_losses: row.max_consecutive_losses.map(|v| v as i64),
+        avg_trade_duration_hours: row.avg_trade_duration_hours,
+        trade_log: None,
+    }
 }
 
 /// Run a backtest.
@@ -358,6 +497,17 @@ pub async fn run_backtest(
         status: "running".to_string(),
         error: None,
         equity_curve: None,
+        expectancy: None,
+        calmar_ratio: None,
+        var_95: None,
+        cvar_95: None,
+        recovery_factor: None,
+        best_trade_return: None,
+        worst_trade_return: None,
+        max_consecutive_wins: None,
+        max_consecutive_losses: None,
+        avg_trade_duration_hours: None,
+        trade_log: None,
     }))
 }
 
@@ -406,7 +556,6 @@ async fn run_backtest_task(
             min_spread,
             max_position,
         } => {
-            // ArbitrageStrategy::new takes (min_spread, position_size, max_positions)
             let mut strategy = ArbitrageStrategy::new(min_spread, max_position, 10);
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
@@ -431,33 +580,67 @@ async fn run_backtest_task(
             );
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
-        StrategyConfig::CopyTrading { .. } => {
-            // Copy trading strategy requires wallet tracking - not supported in backtest yet
-            Err(anyhow::anyhow!(
-                "Copy trading strategy not supported in backtests"
-            ))
+        StrategyConfig::Grid {
+            grid_levels,
+            grid_spacing_pct,
+            order_size,
+        } => {
+            let mut strategy = GridStrategy::new(grid_levels, grid_spacing_pct, order_size);
+            run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
     };
 
     // Update database with results
     match result {
         Ok(backtest_result) => {
-            // Serialize equity curve
+            // Build equity curve with running-peak drawdown
+            let mut peak = Decimal::ZERO;
             let equity_curve: Vec<EquityPoint> = backtest_result
                 .equity_curve
                 .iter()
-                .map(|(timestamp, value)| EquityPoint {
-                    timestamp: *timestamp,
-                    value: *value,
-                    drawdown_pct: Decimal::ZERO, // Simplified
+                .map(|(timestamp, value)| {
+                    if *value > peak {
+                        peak = *value;
+                    }
+                    let drawdown_pct = if peak > Decimal::ZERO {
+                        ((peak - *value) / peak) * Decimal::from(100u32)
+                    } else {
+                        Decimal::ZERO
+                    };
+                    EquityPoint {
+                        timestamp: *timestamp,
+                        value: *value,
+                        drawdown_pct,
+                    }
                 })
                 .collect();
             let equity_json = serde_json::to_value(&equity_curve).ok();
+
+            // Serialize trade log
+            let trade_log: Vec<TradeLogEntry> = backtest_result
+                .trades
+                .iter()
+                .map(|t| TradeLogEntry {
+                    market_id: t.market_id.clone(),
+                    outcome_id: t.outcome_id.clone(),
+                    trade_type: format!("{:?}", t.trade_type).to_lowercase(),
+                    entry_time: t.entry_time,
+                    exit_time: t.exit_time,
+                    entry_price: t.entry_price,
+                    exit_price: t.exit_price,
+                    quantity: t.quantity,
+                    fees: t.fees,
+                    pnl: t.pnl,
+                    return_pct: t.return_pct,
+                })
+                .collect();
+            let trade_log_json = serde_json::to_value(&trade_log).ok();
 
             let update_result = sqlx::query(
                 r#"
                 UPDATE backtest_results SET
                     status = 'completed',
+                    completed_at = NOW(),
                     final_value = $2,
                     total_return = $3,
                     total_return_pct = $4,
@@ -465,32 +648,59 @@ async fn run_backtest_task(
                     sharpe_ratio = $6,
                     sortino_ratio = $7,
                     max_drawdown = $8,
-                    max_drawdown_pct = $8,
-                    total_trades = $9,
-                    winning_trades = $10,
-                    losing_trades = $11,
-                    win_rate = $12,
-                    profit_factor = $13,
-                    total_fees = $14,
-                    equity_curve = $15
+                    max_drawdown_pct = $9,
+                    total_trades = $10,
+                    winning_trades = $11,
+                    losing_trades = $12,
+                    win_rate = $13,
+                    profit_factor = $14,
+                    total_fees = $15,
+                    avg_win = $16,
+                    avg_loss = $17,
+                    equity_curve = $18,
+                    trade_log = $19,
+                    expectancy = $20,
+                    calmar_ratio = $21,
+                    var_95 = $22,
+                    cvar_95 = $23,
+                    recovery_factor = $24,
+                    best_trade_return = $25,
+                    worst_trade_return = $26,
+                    max_consecutive_wins = $27,
+                    max_consecutive_losses = $28,
+                    avg_trade_duration_hours = $29
                 WHERE id = $1
                 "#,
             )
-            .bind(result_id)
-            .bind(backtest_result.final_value)
-            .bind(backtest_result.total_return)
-            .bind(Decimal::try_from(backtest_result.return_pct).unwrap_or(Decimal::ZERO))
-            .bind(Decimal::try_from(backtest_result.annualized_return).unwrap_or(Decimal::ZERO))
-            .bind(Decimal::try_from(backtest_result.sharpe_ratio).unwrap_or(Decimal::ZERO))
-            .bind(Decimal::try_from(backtest_result.sortino_ratio).unwrap_or(Decimal::ZERO))
-            .bind(Decimal::try_from(backtest_result.max_drawdown).unwrap_or(Decimal::ZERO))
-            .bind(backtest_result.total_trades as i64)
-            .bind(backtest_result.winning_trades as i64)
-            .bind(backtest_result.losing_trades as i64)
-            .bind(Decimal::try_from(backtest_result.win_rate).unwrap_or(Decimal::ZERO))
-            .bind(Decimal::try_from(backtest_result.profit_factor).unwrap_or(Decimal::ZERO))
-            .bind(backtest_result.total_fees)
-            .bind(equity_json)
+            .bind(result_id) // $1
+            .bind(backtest_result.final_value) // $2
+            .bind(backtest_result.total_return) // $3
+            .bind(dec(backtest_result.return_pct)) // $4
+            .bind(dec(backtest_result.annualized_return)) // $5
+            .bind(dec(backtest_result.sharpe_ratio)) // $6
+            .bind(dec(backtest_result.sortino_ratio)) // $7
+            .bind(dec(backtest_result.max_drawdown)) // $8
+            .bind(dec(backtest_result.max_drawdown * 100.0)) // $9
+            .bind(backtest_result.total_trades as i64) // $10
+            .bind(backtest_result.winning_trades as i64) // $11
+            .bind(backtest_result.losing_trades as i64) // $12
+            .bind(dec(backtest_result.win_rate)) // $13
+            .bind(dec(backtest_result.profit_factor)) // $14
+            .bind(backtest_result.total_fees) // $15
+            .bind(dec(backtest_result.avg_win)) // $16
+            .bind(dec(backtest_result.avg_loss)) // $17
+            .bind(equity_json) // $18
+            .bind(trade_log_json) // $19
+            .bind(dec(backtest_result.expectancy)) // $20
+            .bind(dec(backtest_result.calmar_ratio)) // $21
+            .bind(dec(backtest_result.var_95)) // $22
+            .bind(dec(backtest_result.cvar_95)) // $23
+            .bind(dec(backtest_result.recovery_factor)) // $24
+            .bind(dec(backtest_result.best_trade_return)) // $25
+            .bind(dec(backtest_result.worst_trade_return)) // $26
+            .bind(backtest_result.max_consecutive_wins as i32) // $27
+            .bind(backtest_result.max_consecutive_losses as i32) // $28
+            .bind(dec(backtest_result.avg_trade_duration_hours)) // $29
             .execute(&pool)
             .await;
 
@@ -538,6 +748,23 @@ async fn run_strategy<S: Strategy>(
     simulator.run(strategy, query).await
 }
 
+const LIST_QUERY: &str = r#"
+    SELECT id, strategy, start_date, end_date, initial_capital,
+           final_value, total_return, total_return_pct, annualized_return,
+           sharpe_ratio, sortino_ratio, max_drawdown, max_drawdown_pct,
+           total_trades, winning_trades, losing_trades, win_rate,
+           avg_win, avg_loss, profit_factor, total_fees,
+           expectancy, calmar_ratio, var_95, cvar_95,
+           recovery_factor, best_trade_return, worst_trade_return,
+           max_consecutive_wins, max_consecutive_losses,
+           avg_trade_duration_hours,
+           status, error, created_at
+    FROM backtest_results
+    WHERE ($1::text IS NULL OR status = $1)
+    ORDER BY created_at DESC
+    LIMIT $2 OFFSET $3
+"#;
+
 /// List backtest results.
 #[utoipa::path(
     get,
@@ -553,65 +780,15 @@ pub async fn list_backtest_results(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListBacktestQuery>,
 ) -> ApiResult<Json<Vec<BacktestResultResponse>>> {
-    let rows: Vec<BacktestRow> = sqlx::query_as(
-        r#"
-        SELECT id, strategy, start_date, end_date, initial_capital,
-               final_value, total_return, total_return_pct, annualized_return,
-               sharpe_ratio, sortino_ratio, max_drawdown, max_drawdown_pct,
-               total_trades, winning_trades, losing_trades, win_rate,
-               avg_win, avg_loss, profit_factor, total_fees,
-               status, error, created_at
-        FROM backtest_results
-        WHERE ($1::text IS NULL OR status = $1)
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3
-        "#,
-    )
-    .bind(&query.status)
-    .bind(query.limit)
-    .bind(query.offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rows: Vec<BacktestRow> = sqlx::query_as(LIST_QUERY)
+        .bind(&query.status)
+        .bind(query.limit)
+        .bind(query.offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let results: Vec<BacktestResultResponse> = rows
-        .into_iter()
-        .map(|row| {
-            let strategy: StrategyConfig =
-                serde_json::from_value(row.strategy).unwrap_or(StrategyConfig::Arbitrage {
-                    min_spread: Decimal::new(1, 2),
-                    max_position: Decimal::new(1000, 0),
-                });
-
-            BacktestResultResponse {
-                id: row.id,
-                strategy,
-                start_date: row.start_date,
-                end_date: row.end_date,
-                initial_capital: row.initial_capital,
-                final_value: row.final_value.unwrap_or(Decimal::ZERO),
-                total_return: row.total_return.unwrap_or(Decimal::ZERO),
-                total_return_pct: row.total_return_pct.unwrap_or(Decimal::ZERO),
-                annualized_return: row.annualized_return.unwrap_or(Decimal::ZERO),
-                sharpe_ratio: row.sharpe_ratio.unwrap_or(Decimal::ZERO),
-                sortino_ratio: row.sortino_ratio.unwrap_or(Decimal::ZERO),
-                max_drawdown: row.max_drawdown.unwrap_or(Decimal::ZERO),
-                max_drawdown_pct: row.max_drawdown_pct.unwrap_or(Decimal::ZERO),
-                total_trades: row.total_trades.unwrap_or(0),
-                winning_trades: row.winning_trades.unwrap_or(0),
-                losing_trades: row.losing_trades.unwrap_or(0),
-                win_rate: row.win_rate.unwrap_or(Decimal::ZERO),
-                avg_win: row.avg_win.unwrap_or(Decimal::ZERO),
-                avg_loss: row.avg_loss.unwrap_or(Decimal::ZERO),
-                profit_factor: row.profit_factor.unwrap_or(Decimal::ZERO),
-                total_fees: row.total_fees.unwrap_or(Decimal::ZERO),
-                created_at: row.created_at,
-                status: row.status,
-                error: row.error,
-                equity_curve: None, // Not included in list view
-            }
-        })
-        .collect();
+    let results: Vec<BacktestResultResponse> = rows.into_iter().map(row_to_response).collect();
 
     Ok(Json(results))
 }
@@ -640,7 +817,11 @@ pub async fn get_backtest_result(
                sharpe_ratio, sortino_ratio, max_drawdown, max_drawdown_pct,
                total_trades, winning_trades, losing_trades, win_rate,
                avg_win, avg_loss, profit_factor, total_fees,
-               status, error, equity_curve, created_at
+               expectancy, calmar_ratio, var_95, cvar_95,
+               recovery_factor, best_trade_return, worst_trade_return,
+               max_consecutive_wins, max_consecutive_losses,
+               avg_trade_duration_hours,
+               status, error, equity_curve, trade_log, created_at
         FROM backtest_results
         WHERE id = $1
         "#,
@@ -654,13 +835,16 @@ pub async fn get_backtest_result(
         Some(row) => {
             let strategy: StrategyConfig =
                 serde_json::from_value(row.strategy).unwrap_or(StrategyConfig::Arbitrage {
-                    min_spread: Decimal::new(1, 2),
+                    min_spread: Decimal::new(2, 2),
                     max_position: Decimal::new(1000, 0),
                 });
 
             let equity_curve: Option<Vec<EquityPoint>> = row
                 .equity_curve
                 .and_then(|v| serde_json::from_value(v).ok());
+
+            let trade_log: Option<Vec<TradeLogEntry>> =
+                row.trade_log.and_then(|v| serde_json::from_value(v).ok());
 
             Ok(Json(BacktestResultResponse {
                 id: row.id,
@@ -688,6 +872,17 @@ pub async fn get_backtest_result(
                 status: row.status,
                 error: row.error,
                 equity_curve,
+                expectancy: row.expectancy,
+                calmar_ratio: row.calmar_ratio,
+                var_95: row.var_95,
+                cvar_95: row.cvar_95,
+                recovery_factor: row.recovery_factor,
+                best_trade_return: row.best_trade_return,
+                worst_trade_return: row.worst_trade_return,
+                max_consecutive_wins: row.max_consecutive_wins.map(|v| v as i64),
+                max_consecutive_losses: row.max_consecutive_losses.map(|v| v as i64),
+                avg_trade_duration_hours: row.avg_trade_duration_hours,
+                trade_log,
             }))
         }
         None => Err(ApiError::NotFound(format!(
@@ -719,6 +914,15 @@ mod tests {
         let json = serde_json::to_string(&momentum).unwrap();
         assert!(json.contains("momentum"));
         assert!(json.contains("lookback_hours"));
+
+        let grid = StrategyConfig::Grid {
+            grid_levels: 5,
+            grid_spacing_pct: Decimal::new(2, 2),
+            order_size: Decimal::new(5, 2),
+        };
+        let json = serde_json::to_string(&grid).unwrap();
+        assert!(json.contains("grid"));
+        assert!(json.contains("grid_levels"));
     }
 
     #[test]
@@ -776,12 +980,25 @@ mod tests {
                     drawdown_pct: Decimal::ZERO,
                 },
             ]),
+            expectancy: Some(Decimal::new(50, 0)),
+            calmar_ratio: Some(Decimal::new(600, 2)),
+            var_95: Some(Decimal::new(3, 2)),
+            cvar_95: Some(Decimal::new(5, 2)),
+            recovery_factor: Some(Decimal::new(5, 0)),
+            best_trade_return: Some(Decimal::new(15, 2)),
+            worst_trade_return: Some(Decimal::new(-8, 2)),
+            max_consecutive_wins: Some(7),
+            max_consecutive_losses: Some(3),
+            avg_trade_duration_hours: Some(Decimal::new(48, 1)),
+            trade_log: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("completed"));
         assert!(json.contains("sharpe_ratio"));
         assert!(json.contains("equity_curve"));
+        assert!(json.contains("calmar_ratio"));
+        assert!(json.contains("expectancy"));
     }
 
     #[test]
@@ -807,5 +1024,26 @@ mod tests {
         assert!(json.contains("mean_reversion"));
         assert!(json.contains("window_hours"));
         assert!(json.contains("volume_based"));
+    }
+
+    #[test]
+    fn test_trade_log_entry_serialization() {
+        let entry = TradeLogEntry {
+            market_id: "market-123".to_string(),
+            outcome_id: "outcome-456".to_string(),
+            trade_type: "buy".to_string(),
+            entry_time: Utc::now(),
+            exit_time: Some(Utc::now()),
+            entry_price: Decimal::new(45, 2),
+            exit_price: Some(Decimal::new(55, 2)),
+            quantity: Decimal::new(100, 0),
+            fees: Decimal::new(2, 0),
+            pnl: Some(Decimal::new(8, 0)),
+            return_pct: Some(0.222),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("market-123"));
+        assert!(json.contains("buy"));
     }
 }

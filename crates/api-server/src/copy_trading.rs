@@ -4,6 +4,7 @@
 //! for execution, while publishing signals to WebSocket clients.
 
 use chrono::Utc;
+use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use polymarket_core::types::OrderSide;
-use trading_engine::copy_trader::{CopyTrader, DetectedTrade};
+use trading_engine::copy_trader::{CopyTradeRejection, CopyTrader, DetectedTrade};
 use wallet_tracker::trade_monitor::{TradeDirection, TradeMonitor, WalletTrade};
 
 use crate::websocket::{SignalType, SignalUpdate};
@@ -19,7 +20,7 @@ use crate::websocket::{SignalType, SignalUpdate};
 /// Configuration for the copy trading monitor.
 #[derive(Debug, Clone)]
 pub struct CopyTradingConfig {
-    /// Minimum trade value to trigger copy.
+    /// Minimum trade value to trigger copy (raised from $0.05 to $10).
     pub min_trade_value: Decimal,
     /// Maximum latency in seconds before skipping a trade.
     pub max_latency_secs: i64,
@@ -30,8 +31,8 @@ pub struct CopyTradingConfig {
 impl Default for CopyTradingConfig {
     fn default() -> Self {
         Self {
-            min_trade_value: Decimal::new(5, 2), // $0.05 minimum
-            max_latency_secs: 60,                // 1 minute max latency
+            min_trade_value: Decimal::new(10, 0), // $10 minimum (was $0.05)
+            max_latency_secs: 30,                 // 30 seconds max latency (was 60)
             enabled: true,
         }
     }
@@ -44,11 +45,11 @@ impl CopyTradingConfig {
             min_trade_value: std::env::var("COPY_MIN_TRADE_VALUE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(5, 2)),
+                .unwrap_or(Decimal::new(10, 0)),
             max_latency_secs: std::env::var("COPY_MAX_LATENCY_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(60),
+                .unwrap_or(30),
             enabled: std::env::var("COPY_TRADING_ENABLED")
                 .map(|v| v == "true")
                 .unwrap_or(true),
@@ -61,6 +62,7 @@ pub struct CopyTradingMonitor {
     config: CopyTradingConfig,
     trade_monitor: Arc<TradeMonitor>,
     copy_trader: Arc<RwLock<CopyTrader>>,
+    circuit_breaker: Arc<CircuitBreaker>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     pool: PgPool,
 }
@@ -71,6 +73,7 @@ impl CopyTradingMonitor {
         config: CopyTradingConfig,
         trade_monitor: Arc<TradeMonitor>,
         copy_trader: Arc<RwLock<CopyTrader>>,
+        circuit_breaker: Arc<CircuitBreaker>,
         signal_tx: broadcast::Sender<SignalUpdate>,
         pool: PgPool,
     ) -> Self {
@@ -78,6 +81,7 @@ impl CopyTradingMonitor {
             config,
             trade_monitor,
             copy_trader,
+            circuit_breaker,
             signal_tx,
             pool,
         }
@@ -194,6 +198,55 @@ impl CopyTradingMonitor {
             return Ok(());
         }
 
+        // Circuit breaker check — copy trades must respect it
+        if !self.circuit_breaker.can_trade().await {
+            warn!(
+                wallet = %trade.wallet_address,
+                "Circuit breaker tripped, skipping copy trade"
+            );
+            self.publish_skip_signal(
+                &trade,
+                "circuit_breaker",
+                "Circuit breaker is tripped — all trading halted",
+            );
+            return Ok(());
+        }
+
+        // Policy checks (daily limit, position count, min value)
+        {
+            let mut copy_trader = self.copy_trader.write().await;
+            if let Err(rejection) = copy_trader.check_policy(trade.value) {
+                let (skip_type, reason) = match &rejection {
+                    CopyTradeRejection::BelowMinTradeValue { value, min } => (
+                        "below_minimum",
+                        format!("Trade value ${value} below policy minimum ${min}"),
+                    ),
+                    CopyTradeRejection::DailyCapitalLimitReached { deployed, limit } => (
+                        "daily_limit",
+                        format!("Daily capital limit reached (${deployed}/${limit})"),
+                    ),
+                    CopyTradeRejection::TooManyOpenPositions { current, limit } => (
+                        "position_limit",
+                        format!("Too many open copy positions ({current}/{limit})"),
+                    ),
+                    CopyTradeRejection::CircuitBreakerTripped => {
+                        ("circuit_breaker", "Circuit breaker tripped".to_string())
+                    }
+                    CopyTradeRejection::SlippageTooHigh { slippage_pct, max } => (
+                        "slippage",
+                        format!("Slippage {slippage_pct} exceeds max {max}"),
+                    ),
+                };
+                warn!(
+                    wallet = %trade.wallet_address,
+                    rejection = ?rejection,
+                    "Copy trade rejected by policy"
+                );
+                self.publish_skip_signal(&trade, skip_type, &reason);
+                return Ok(());
+            }
+        }
+
         // Convert WalletTrade to DetectedTrade
         let detected = DetectedTrade {
             wallet_address: trade.wallet_address.clone(),
@@ -235,22 +288,46 @@ impl CopyTradingMonitor {
         let _ = self.signal_tx.send(signal);
 
         // Process the trade through CopyTrader
-        let copy_trader = self.copy_trader.read().await;
-        match copy_trader.process_detected_trade(&detected).await {
+        // Use a scoped read lock — drop it before any write lock to avoid deadlock
+        let (result, allocation_pct) = {
+            let copy_trader = self.copy_trader.read().await;
+            let result = copy_trader.process_detected_trade(&detected).await;
+            let alloc = copy_trader
+                .get_tracked_wallet(&trade.wallet_address)
+                .map(|w| w.allocation_pct)
+                .unwrap_or(Decimal::ZERO);
+            (result, alloc)
+        }; // read lock dropped here
+
+        match result {
             Ok(Some(report)) => {
+                let trade_value = report.filled_quantity * report.average_price;
+
                 info!(
                     wallet = %trade.wallet_address,
                     market = %trade.market_id,
                     direction = ?trade.direction,
                     copied_quantity = %report.filled_quantity,
+                    trade_value = %trade_value,
                     "Successfully copied trade"
                 );
 
+                // Record with circuit breaker (P&L unknown at entry, don't reset consecutive loss counter)
+                if let Err(e) = self
+                    .circuit_breaker
+                    .record_trade(Decimal::ZERO, false)
+                    .await
+                {
+                    warn!(error = %e, "Failed to record copy trade with circuit breaker");
+                }
+
+                // Record position opening with the copy trader for daily/position tracking
+                {
+                    let mut ct = self.copy_trader.write().await;
+                    ct.record_position_opened(trade_value);
+                }
+
                 // Record in copy_trade_history
-                let allocation_pct = copy_trader
-                    .get_tracked_wallet(&trade.wallet_address)
-                    .map(|w| w.allocation_pct)
-                    .unwrap_or(Decimal::ZERO);
                 let slippage = if trade.price > Decimal::ZERO {
                     report.average_price - trade.price
                 } else {
@@ -398,22 +475,15 @@ impl CopyTradingMonitor {
                 let _ = self.signal_tx.send(success_signal);
             }
             Ok(None) => {
-                let reason = if !copy_trader.is_active() {
-                    "Copy trading is paused"
-                } else if copy_trader
-                    .get_tracked_wallet(&trade.wallet_address)
-                    .is_none()
-                {
-                    "Wallet not tracked"
-                } else {
-                    "Wallet disabled or trade filtered"
-                };
                 debug!(
                     wallet = %trade.wallet_address,
-                    reason = reason,
-                    "Trade not copied"
+                    "Trade not copied (wallet not tracked, disabled, or trade filtered)"
                 );
-                self.publish_skip_signal(&trade, "not_copied", reason);
+                self.publish_skip_signal(
+                    &trade,
+                    "not_copied",
+                    "Wallet not tracked, disabled, or trade filtered",
+                );
             }
             Err(e) => {
                 error!(
@@ -434,10 +504,18 @@ pub fn spawn_copy_trading_monitor(
     config: CopyTradingConfig,
     trade_monitor: Arc<TradeMonitor>,
     copy_trader: Arc<RwLock<CopyTrader>>,
+    circuit_breaker: Arc<CircuitBreaker>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     pool: PgPool,
 ) {
-    let monitor = CopyTradingMonitor::new(config, trade_monitor, copy_trader, signal_tx, pool);
+    let monitor = CopyTradingMonitor::new(
+        config,
+        trade_monitor,
+        copy_trader,
+        circuit_breaker,
+        signal_tx,
+        pool,
+    );
 
     tokio::spawn(async move {
         if let Err(e) = monitor.run().await {
@@ -455,8 +533,8 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = CopyTradingConfig::default();
-        assert_eq!(config.min_trade_value, Decimal::new(5, 2));
-        assert_eq!(config.max_latency_secs, 60);
+        assert_eq!(config.min_trade_value, Decimal::new(10, 0));
+        assert_eq!(config.max_latency_secs, 30);
         assert!(config.enabled);
     }
 

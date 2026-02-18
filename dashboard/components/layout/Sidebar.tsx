@@ -1,26 +1,27 @@
-'use client';
+"use client";
 
-import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
   Search,
   TrendingUp,
   Settings,
   LineChart,
+  History,
+  ShieldAlert,
   Star,
   type LucideIcon,
-} from 'lucide-react';
-import { cn } from '@/lib/utils';
-import { useWorkspaceStore } from '@/stores/workspace-store';
-import { useModeStore } from '@/stores/mode-store';
-import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { useWorkspaceStore } from "@/stores/workspace-store";
+import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
 
 interface NavItem {
   href: string;
   label: string;
   icon: LucideIcon;
-  badge?: 'active' | 'watching';
+  badge?: "active" | "watching";
 }
 
 interface NavSection {
@@ -30,38 +31,35 @@ interface NavSection {
 
 const navSections: NavSection[] = [
   {
-    title: 'Overview',
+    title: "Overview",
+    items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }],
+  },
+  {
+    title: "Trading",
     items: [
-      { href: '/', label: 'Dashboard', icon: LayoutDashboard },
+      { href: "/discover", label: "Discover", icon: Search },
+      { href: "/trading", label: "Trading", icon: TrendingUp, badge: "active" },
+      { href: "/backtest", label: "Backtest", icon: LineChart },
+      { href: "/history", label: "History", icon: History },
+      { href: "/risk", label: "Risk Monitor", icon: ShieldAlert },
     ],
   },
   {
-    title: 'Trading',
-    items: [
-      { href: '/discover', label: 'Discover', icon: Search },
-      { href: '/trading', label: 'Trading', icon: TrendingUp, badge: 'active' },
-      { href: '/backtest', label: 'Backtest', icon: LineChart },
-    ],
-  },
-  {
-    title: 'Settings',
-    items: [
-      { href: '/settings', label: 'Settings', icon: Settings },
-    ],
+    title: "Settings",
+    items: [{ href: "/settings", label: "Settings", icon: Settings }],
   },
 ];
 
 export function Sidebar() {
   const pathname = usePathname();
   const { currentWorkspace } = useWorkspaceStore();
-  const { mode } = useModeStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id, mode);
-  const activeWallets = allocations.filter((a) => a.tier === 'active');
-  const benchWallets = allocations.filter((a) => a.tier === 'bench');
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
+  const activeWallets = allocations.filter((a) => a.tier === "active");
+  const benchWallets = allocations.filter((a) => a.tier === "bench");
 
-  const getBadgeCount = (badgeType?: 'active' | 'watching') => {
-    if (badgeType === 'active') return activeWallets.length;
-    if (badgeType === 'watching') return benchWallets.length;
+  const getBadgeCount = (badgeType?: "active" | "watching") => {
+    if (badgeType === "active") return activeWallets.length;
+    if (badgeType === "watching") return benchWallets.length;
     return null;
   };
 
@@ -75,8 +73,9 @@ export function Sidebar() {
             </h3>
             <div className="space-y-1">
               {section.items.map((item) => {
-                const isActive = pathname === item.href ||
-                  (item.href !== '/' && pathname.startsWith(item.href));
+                const isActive =
+                  pathname === item.href ||
+                  (item.href !== "/" && pathname.startsWith(item.href));
                 const Icon = item.icon;
                 const badgeCount = getBadgeCount(item.badge);
 
@@ -85,10 +84,10 @@ export function Sidebar() {
                     key={item.href}
                     href={item.href}
                     className={cn(
-                      'flex items-center justify-between rounded-lg px-3 py-2 text-sm font-medium transition-colors',
+                      "flex items-center justify-between rounded-lg px-3 py-2 text-sm font-medium transition-colors",
                       isActive
-                        ? 'bg-primary text-primary-foreground'
-                        : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
                     )}
                   >
                     <div className="flex items-center gap-3">
@@ -98,10 +97,10 @@ export function Sidebar() {
                     {badgeCount !== null && badgeCount > 0 && (
                       <span
                         className={cn(
-                          'flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-xs font-medium',
+                          "flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-xs font-medium",
                           isActive
-                            ? 'bg-primary-foreground/20 text-primary-foreground'
-                            : 'bg-muted text-muted-foreground'
+                            ? "bg-primary-foreground/20 text-primary-foreground"
+                            : "bg-muted text-muted-foreground",
                         )}
                       >
                         {badgeCount}
@@ -133,7 +132,8 @@ export function Sidebar() {
           </div>
           {activeWallets.length < 5 && (
             <p className="text-xs text-muted-foreground">
-              {5 - activeWallets.length} slot{5 - activeWallets.length !== 1 ? 's' : ''} available
+              {5 - activeWallets.length} slot
+              {5 - activeWallets.length !== 1 ? "s" : ""} available
             </p>
           )}
         </div>

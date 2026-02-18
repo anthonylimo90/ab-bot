@@ -1,8 +1,8 @@
-'use client';
+"use client";
 
-import { useEffect } from 'react';
-import { useForm, Controller } from 'react-hook-form';
-import { zodResolver } from '@hookform/resolvers/zod';
+import { useEffect } from "react";
+import { useForm, Controller } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
 import {
   Dialog,
   DialogContent,
@@ -10,22 +10,22 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-} from '@/components/ui/dialog';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Slider } from '@/components/ui/slider';
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Slider } from "@/components/ui/slider";
 import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from '@/components/ui/select';
-import { Wallet, Users, AlertTriangle, Zap } from 'lucide-react';
-import { shortenAddress, formatCurrency } from '@/lib/utils';
-import { copyWalletSchema, type CopyWalletFormData } from '@/lib/validations';
-import type { CopyBehavior } from '@/types/api';
+} from "@/components/ui/select";
+import { Wallet, Users, AlertTriangle, Zap } from "lucide-react";
+import { shortenAddress, formatCurrency } from "@/lib/utils";
+import { copyWalletSchema, type CopyWalletFormData } from "@/lib/validations";
+import type { CopyBehavior } from "@/types/api";
 
 interface WalletInfo {
   address: string;
@@ -45,24 +45,27 @@ interface CopyWalletModalProps {
     allocation_pct: number;
     copy_behavior: CopyBehavior;
     max_position_size: number;
-    tier: 'active' | 'bench';
+    tier: "active" | "bench";
   }) => void;
   rosterCount: number;
   maxRoster?: number;
 }
 
-const copyBehaviorLabels: Record<CopyBehavior, { label: string; description: string }> = {
+const copyBehaviorLabels: Record<
+  CopyBehavior,
+  { label: string; description: string }
+> = {
   copy_all: {
-    label: 'Copy All Trades',
-    description: 'Mirror all trades from this wallet',
+    label: "Copy All Trades",
+    description: "Mirror all trades from this wallet",
   },
   events_only: {
-    label: 'Events Only',
-    description: 'Only copy directional event trades, skip arbitrage',
+    label: "Events Only",
+    description: "Only copy directional event trades, skip arbitrage",
   },
   arb_threshold: {
-    label: 'Arb Threshold',
-    description: 'Replicate arb logic only when spread exceeds threshold',
+    label: "Arb Threshold",
+    description: "Replicate arb logic only when spread exceeds threshold",
   },
 };
 
@@ -84,19 +87,19 @@ export function CopyWalletModal({
     setValue,
     reset,
     formState: { errors, isValid },
-  } = useForm<CopyWalletFormData & { tier: 'active' | 'bench' }>({
+  } = useForm<CopyWalletFormData & { tier: "active" | "bench" }>({
     resolver: zodResolver(copyWalletSchema),
     defaultValues: {
       allocationPct: 10,
       maxPositionSize: 100,
-      copyBehavior: 'events_only',
-      tier: canAddToActive ? 'active' : 'bench',
+      copyBehavior: "events_only",
+      tier: canAddToActive ? "active" : "bench",
     },
-    mode: 'onChange',
+    mode: "onChange",
   });
 
-  const tier = watch('tier');
-  const copyBehavior = watch('copyBehavior');
+  const tier = watch("tier");
+  const copyBehavior = watch("copyBehavior");
 
   // Reset form when modal opens/closes or wallet changes
   useEffect(() => {
@@ -104,13 +107,15 @@ export function CopyWalletModal({
       reset({
         allocationPct: 10,
         maxPositionSize: 100,
-        copyBehavior: 'events_only',
-        tier: canAddToActive ? 'active' : 'bench',
+        copyBehavior: "events_only",
+        tier: canAddToActive ? "active" : "bench",
       });
     }
   }, [isOpen, wallet?.address, canAddToActive, reset]);
 
-  const onSubmit = (data: CopyWalletFormData & { tier: 'active' | 'bench' }) => {
+  const onSubmit = (
+    data: CopyWalletFormData & { tier: "active" | "bench" },
+  ) => {
     if (!wallet) return;
     onConfirm({
       address: wallet.address,
@@ -146,7 +151,7 @@ export function CopyWalletModal({
                   {shortenAddress(wallet.address)}
                 </span>
                 {wallet.confidence && (
-                  <span className="text-xs px-2 py-1 rounded-full bg-demo/10 text-demo">
+                  <span className="text-xs px-2 py-1 rounded-full bg-muted text-muted-foreground">
                     {wallet.confidence}% confidence
                   </span>
                 )}
@@ -192,28 +197,28 @@ export function CopyWalletModal({
                   <div className="grid grid-cols-2 gap-3">
                     <button
                       type="button"
-                      onClick={() => canAddToActive && field.onChange('active')}
+                      onClick={() => canAddToActive && field.onChange("active")}
                       disabled={!canAddToActive}
                       className={`p-3 rounded-lg border text-left transition-colors ${
-                        field.value === 'active'
-                          ? 'border-primary bg-primary/5'
-                          : 'border-border hover:border-muted-foreground'
-                      } ${!canAddToActive ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        field.value === "active"
+                          ? "border-primary bg-primary/5"
+                          : "border-border hover:border-muted-foreground"
+                      } ${!canAddToActive ? "opacity-50 cursor-not-allowed" : ""}`}
                     >
                       <div className="font-medium">Active</div>
                       <div className="text-xs text-muted-foreground">
                         {canAddToActive
-                          ? `${slotsRemaining} slot${slotsRemaining !== 1 ? 's' : ''} available`
-                          : 'Roster full'}
+                          ? `${slotsRemaining} slot${slotsRemaining !== 1 ? "s" : ""} available`
+                          : "Roster full"}
                       </div>
                     </button>
                     <button
                       type="button"
-                      onClick={() => field.onChange('bench')}
+                      onClick={() => field.onChange("bench")}
                       className={`p-3 rounded-lg border text-left transition-colors ${
-                        field.value === 'bench'
-                          ? 'border-primary bg-primary/5'
-                          : 'border-border hover:border-muted-foreground'
+                        field.value === "bench"
+                          ? "border-primary bg-primary/5"
+                          : "border-border hover:border-muted-foreground"
                       }`}
                     >
                       <div className="font-medium">Watching</div>
@@ -224,7 +229,7 @@ export function CopyWalletModal({
                   </div>
                 )}
               />
-              {!canAddToActive && tier === 'bench' && (
+              {!canAddToActive && tier === "bench" && (
                 <p className="text-xs text-muted-foreground flex items-center gap-1">
                   <AlertTriangle className="h-3 w-3" />
                   Active roster is full. Demote a wallet first to add to Active.
@@ -247,25 +252,31 @@ export function CopyWalletModal({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {Object.entries(copyBehaviorLabels).map(([key, { label, description }]) => (
-                        <SelectItem key={key} value={key}>
-                          <div>
-                            <div className="font-medium">{label}</div>
-                            <div className="text-xs text-muted-foreground">{description}</div>
-                          </div>
-                        </SelectItem>
-                      ))}
+                      {Object.entries(copyBehaviorLabels).map(
+                        ([key, { label, description }]) => (
+                          <SelectItem key={key} value={key}>
+                            <div>
+                              <div className="font-medium">{label}</div>
+                              <div className="text-xs text-muted-foreground">
+                                {description}
+                              </div>
+                            </div>
+                          </SelectItem>
+                        ),
+                      )}
                     </SelectContent>
                   </Select>
                 )}
               />
               {errors.copyBehavior && (
-                <p className="text-sm text-destructive">{errors.copyBehavior.message}</p>
+                <p className="text-sm text-destructive">
+                  {errors.copyBehavior.message}
+                </p>
               )}
             </div>
 
             {/* Arb Threshold (shown when arb_threshold selected) */}
-            {copyBehavior === 'arb_threshold' && (
+            {copyBehavior === "arb_threshold" && (
               <div className="space-y-3">
                 <Label htmlFor="arbThreshold">Arb Threshold (%)</Label>
                 <Controller
@@ -279,8 +290,10 @@ export function CopyWalletModal({
                       max={50}
                       step={0.5}
                       placeholder="2.0"
-                      value={field.value ?? ''}
-                      onChange={(e) => field.onChange(e.target.valueAsNumber || undefined)}
+                      value={field.value ?? ""}
+                      onChange={(e) =>
+                        field.onChange(e.target.valueAsNumber || undefined)
+                      }
                       error={!!errors.arbThresholdPct}
                     />
                   )}
@@ -289,13 +302,15 @@ export function CopyWalletModal({
                   Minimum spread percentage to replicate arbitrage trades
                 </p>
                 {errors.arbThresholdPct && (
-                  <p className="text-sm text-destructive">{errors.arbThresholdPct.message}</p>
+                  <p className="text-sm text-destructive">
+                    {errors.arbThresholdPct.message}
+                  </p>
                 )}
               </div>
             )}
 
             {/* Allocation */}
-            {tier === 'active' && (
+            {tier === "active" && (
               <div className="space-y-3">
                 <Controller
                   name="allocationPct"
@@ -304,7 +319,9 @@ export function CopyWalletModal({
                     <>
                       <div className="flex items-center justify-between">
                         <Label>Allocation</Label>
-                        <span className="text-sm font-medium">{field.value}%</span>
+                        <span className="text-sm font-medium">
+                          {field.value}%
+                        </span>
                       </div>
                       <Slider
                         value={[field.value]}
@@ -314,10 +331,13 @@ export function CopyWalletModal({
                         step={1}
                       />
                       <p className="text-xs text-muted-foreground">
-                        Percentage of your capital allocated to copying this wallet
+                        Percentage of your capital allocated to copying this
+                        wallet
                       </p>
                       {errors.allocationPct && (
-                        <p className="text-sm text-destructive">{errors.allocationPct.message}</p>
+                        <p className="text-sm text-destructive">
+                          {errors.allocationPct.message}
+                        </p>
                       )}
                     </>
                   )}
@@ -334,7 +354,9 @@ export function CopyWalletModal({
                   <>
                     <div className="flex items-center justify-between">
                       <Label>Max Position Size</Label>
-                      <span className="text-sm font-medium">{formatCurrency(field.value)}</span>
+                      <span className="text-sm font-medium">
+                        {formatCurrency(field.value)}
+                      </span>
                     </div>
                     <Slider
                       value={[field.value]}
@@ -347,7 +369,9 @@ export function CopyWalletModal({
                       Maximum size for any single copied position
                     </p>
                     {errors.maxPositionSize && (
-                      <p className="text-sm text-destructive">{errors.maxPositionSize.message}</p>
+                      <p className="text-sm text-destructive">
+                        {errors.maxPositionSize.message}
+                      </p>
                     )}
                   </>
                 )}
@@ -360,7 +384,7 @@ export function CopyWalletModal({
               Cancel
             </Button>
             <Button type="submit">
-              {tier === 'active' ? 'Add to Active' : 'Add to Watching'}
+              {tier === "active" ? "Add to Active" : "Add to Watching"}
             </Button>
           </DialogFooter>
         </form>

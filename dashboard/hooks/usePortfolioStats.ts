@@ -1,10 +1,14 @@
-'use client';
+"use client";
 
-import { useState, useEffect, useCallback } from 'react';
-import { useWebSocket, ConnectionStatus } from './useWebSocket';
-import { api } from '@/lib/api';
-import { useModeStore } from '@/stores/mode-store';
-import type { PortfolioStats, PortfolioHistory, WebSocketMessage, PositionUpdate } from '@/types/api';
+import { useState, useEffect, useCallback } from "react";
+import { useWebSocket, ConnectionStatus } from "./useWebSocket";
+import { api } from "@/lib/api";
+import type {
+  PortfolioStats,
+  PortfolioHistory,
+  WebSocketMessage,
+  PositionUpdate,
+} from "@/types/api";
 
 interface UsePortfolioStatsReturn {
   stats: PortfolioStats;
@@ -31,67 +35,68 @@ const defaultStats: PortfolioStats = {
   active_positions: 0,
 };
 
-export function usePortfolioStats(period: '1D' | '7D' | '30D' | 'ALL' = '30D'): UsePortfolioStatsReturn {
-  const { mode } = useModeStore();
+export function usePortfolioStats(
+  period: "1D" | "7D" | "30D" | "ALL" = "30D",
+): UsePortfolioStatsReturn {
   const [stats, setStats] = useState<PortfolioStats>(defaultStats);
   const [history, setHistory] = useState<PortfolioHistory[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch stats from API
   const fetchStats = useCallback(async () => {
-    // Only fetch in live mode
-    if (mode !== 'live') {
-      setIsLoading(false);
-      return;
-    }
-
     try {
       setIsLoading(true);
       setError(null);
-      const positions = await api.getPositions({ status: 'open' });
+      const positions = await api.getPositions({ status: "open" });
 
       // Compute stats from positions
-      const totalValue = positions.reduce((sum, p) => sum + p.quantity * p.current_price, 0);
-      const unrealizedPnl = positions.reduce((sum, p) => sum + p.unrealized_pnl, 0);
+      const totalValue = positions.reduce(
+        (sum, p) => sum + p.quantity * p.current_price,
+        0,
+      );
+      const unrealizedPnl = positions.reduce(
+        (sum, p) => sum + p.unrealized_pnl,
+        0,
+      );
 
-      setStats(prev => ({
+      setStats((prev) => ({
         ...prev,
         total_value: totalValue,
         unrealized_pnl: unrealizedPnl,
         active_positions: positions.length,
       }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch portfolio stats');
-      console.error('Failed to fetch portfolio stats:', err);
+      setError(
+        err instanceof Error ? err.message : "Failed to fetch portfolio stats",
+      );
+      console.error("Failed to fetch portfolio stats:", err);
     } finally {
       setIsLoading(false);
     }
-  }, [mode]);
+  }, []);
 
   // Handle WebSocket position updates
-  const handleMessage = useCallback((message: WebSocketMessage) => {
-    if (message.type !== 'Position') return;
+  const handleMessage = useCallback(
+    (message: WebSocketMessage) => {
+      if (message.type !== "Position") return;
 
-    const update = message.data as PositionUpdate;
+      const update = message.data as PositionUpdate;
 
-    // Refresh stats on position changes
-    if (update.update_type === 'Opened' || update.update_type === 'Closed') {
-      fetchStats();
-    } else {
-      // Update unrealized PnL for price changes
-      setStats(prev => ({
-        ...prev,
-        unrealized_pnl: prev.unrealized_pnl + update.unrealized_pnl,
-      }));
-    }
-  }, [fetchStats]);
+      // Refresh stats on position changes
+      if (update.update_type === "Opened" || update.update_type === "Closed") {
+        fetchStats();
+      } else {
+        // Re-fetch on price changes to get accurate totals (avoids accumulation bug)
+        fetchStats();
+      }
+    },
+    [fetchStats],
+  );
 
-  // WebSocket connection for live updates (only in live mode)
+  // WebSocket connection for live updates
   const { status } = useWebSocket({
-    channel: 'positions',
+    channel: "positions",
     onMessage: handleMessage,
-    enabled: mode === 'live',
   });
 
   // Initial fetch

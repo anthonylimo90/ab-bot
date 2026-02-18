@@ -1,8 +1,8 @@
-'use client';
+"use client";
 
-import { useState, useRef, useEffect } from 'react';
-import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { useState, useRef, useEffect } from "react";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
 import {
   Settings,
   LogOut,
@@ -17,43 +17,52 @@ import {
   Star,
   PieChart,
   TrendingUp,
-} from 'lucide-react';
-import { ModeToggle } from './ModeToggle';
-import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
-import { cn } from '@/lib/utils';
-import { useAuthStore } from '@/stores/auth-store';
-import { useWorkspaceStore } from '@/stores/workspace-store';
-import { useActivity } from '@/hooks/useActivity';
-import { ConnectionStatus } from '@/components/shared/ConnectionStatus';
+  Wallet,
+  Plus,
+  Pause,
+  Play,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
+import { useAuthStore } from "@/stores/auth-store";
+import { useWorkspaceStore } from "@/stores/workspace-store";
+import {
+  useWalletStore,
+  selectHasConnectedWallet,
+  selectPrimaryWallet,
+} from "@/stores/wallet-store";
+import { useMutation } from "@tanstack/react-query";
+import { useActivity } from "@/hooks/useActivity";
+import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
+import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
+import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
+import { useToastStore } from "@/stores/toast-store";
+import api from "@/lib/api";
 
 const mobileNavSections = [
   {
-    title: 'Overview',
+    title: "Overview",
+    items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }],
+  },
+  {
+    title: "Copy Trading",
     items: [
-      { href: '/', label: 'Dashboard', icon: LayoutDashboard },
+      { href: "/discover", label: "Discover", icon: Search },
+      { href: "/bench", label: "Watching", icon: Eye },
+      { href: "/roster", label: "Active", icon: Star },
     ],
   },
   {
-    title: 'Copy Trading',
+    title: "Portfolio",
     items: [
-      { href: '/discover', label: 'Discover', icon: Search },
-      { href: '/bench', label: 'Watching', icon: Eye },
-      { href: '/roster', label: 'Active', icon: Star },
+      { href: "/portfolio", label: "Positions", icon: PieChart },
+      { href: "/backtest", label: "Backtest", icon: TrendingUp },
     ],
   },
   {
-    title: 'Portfolio',
-    items: [
-      { href: '/portfolio', label: 'Positions', icon: PieChart },
-      { href: '/backtest', label: 'Backtest', icon: TrendingUp },
-    ],
-  },
-  {
-    title: 'Settings',
-    items: [
-      { href: '/settings', label: 'Settings', icon: Settings },
-    ],
+    title: "Settings",
+    items: [{ href: "/settings", label: "Settings", icon: Settings }],
   },
 ];
 
@@ -62,31 +71,73 @@ export function Header() {
   const router = useRouter();
   const [isUserMenuOpen, setIsUserMenuOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [showConnectModal, setShowConnectModal] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
-  const { currentWorkspace } = useWorkspaceStore();
+  const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
+  const toast = useToastStore();
   const { status: wsStatus } = useActivity();
 
-  // Get mode label
-  const modeLabel = currentWorkspace?.setup_mode === 'automatic' ? 'Guided' : 'Custom';
-  const ModeIcon = currentWorkspace?.setup_mode === 'automatic' ? Target : Settings2;
+  const isTradingActive =
+    currentWorkspace?.copy_trading_enabled ||
+    currentWorkspace?.live_trading_enabled ||
+    false;
 
-  // Close menus when clicking outside
+  const toggleTradingMutation = useMutation({
+    mutationFn: async () => {
+      if (!currentWorkspace) throw new Error("No workspace");
+      const pausing = isTradingActive;
+      return api.updateWorkspace(currentWorkspace.id, {
+        copy_trading_enabled: !pausing,
+        live_trading_enabled: !pausing,
+      });
+    },
+    onSuccess: (updatedWorkspace) => {
+      setCurrentWorkspace(updatedWorkspace);
+      const paused =
+        !updatedWorkspace.copy_trading_enabled &&
+        !updatedWorkspace.live_trading_enabled;
+      if (paused) {
+        toast.warning(
+          "Trading paused",
+          "All automated trading has been paused",
+        );
+      } else {
+        toast.success("Trading resumed", "Automated trading is now active");
+      }
+    },
+    onError: () => {
+      toast.error("Failed to update trading state");
+    },
+  });
+  const hasWallet = useWalletStore(selectHasConnectedWallet);
+  const primaryWallet = useWalletStore(selectPrimaryWallet);
+  const { data: walletBalance } = useWalletBalanceQuery(
+    primaryWallet?.address ?? null,
+  );
+
+  const modeLabel =
+    currentWorkspace?.setup_mode === "automatic" ? "Guided" : "Custom";
+  const ModeIcon =
+    currentWorkspace?.setup_mode === "automatic" ? Target : Settings2;
+
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         setIsUserMenuOpen(false);
       }
-      if (mobileMenuRef.current && !mobileMenuRef.current.contains(event.target as Node)) {
+      if (
+        mobileMenuRef.current &&
+        !mobileMenuRef.current.contains(event.target as Node)
+      ) {
         setIsMobileMenuOpen(false);
       }
     }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Close mobile menu on route change
   useEffect(() => {
     setIsMobileMenuOpen(false);
   }, [pathname]);
@@ -95,12 +146,17 @@ export function Header() {
     logout();
     setIsUserMenuOpen(false);
     setIsMobileMenuOpen(false);
-    router.push('/login');
+    router.push("/login");
   };
 
   const userInitials = user?.name
-    ? user.name.split(' ').map((n) => n[0]).join('').toUpperCase().slice(0, 2)
-    : user?.email?.slice(0, 2).toUpperCase() || 'U';
+    ? user.name
+        .split(" ")
+        .map((n) => n[0])
+        .join("")
+        .toUpperCase()
+        .slice(0, 2)
+    : user?.email?.slice(0, 2).toUpperCase() || "U";
 
   return (
     <header className="sticky top-0 z-40 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -111,14 +167,15 @@ export function Header() {
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground font-bold">
               AB
             </div>
-            <span className="hidden font-semibold sm:inline-block">
-              AB-Bot
-            </span>
+            <span className="hidden font-semibold sm:inline-block">AB-Bot</span>
           </Link>
 
           {/* Mode Indicator - Desktop */}
           {currentWorkspace && (
-            <Badge variant="secondary" className="hidden md:flex items-center gap-1">
+            <Badge
+              variant="secondary"
+              className="hidden md:flex items-center gap-1"
+            >
               <ModeIcon className="h-3 w-3" />
               {modeLabel}
             </Badge>
@@ -149,18 +206,19 @@ export function Header() {
                   </h3>
                   <div className="space-y-1">
                     {section.items.map((item) => {
-                      const isActive = pathname === item.href ||
-                        (item.href !== '/' && pathname.startsWith(item.href));
+                      const isActive =
+                        pathname === item.href ||
+                        (item.href !== "/" && pathname.startsWith(item.href));
                       const Icon = item.icon;
                       return (
                         <Link
                           key={item.href}
                           href={item.href}
                           className={cn(
-                            'flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
+                            "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
                             isActive
-                              ? 'bg-primary text-primary-foreground'
-                              : 'text-muted-foreground hover:bg-accent'
+                              ? "bg-primary text-primary-foreground"
+                              : "text-muted-foreground hover:bg-accent",
                           )}
                         >
                           <Icon className="h-4 w-4" />
@@ -185,10 +243,78 @@ export function Header() {
           )}
         </div>
 
-        {/* Mode Toggle & Actions */}
+        {/* Wallet Info & Actions */}
         <div className="flex items-center gap-2">
+          {/* Trading Pause/Resume */}
+          {currentWorkspace && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className={cn(
+                "gap-1.5 text-xs font-medium",
+                isTradingActive
+                  ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
+                  : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
+              )}
+              disabled={toggleTradingMutation.isPending}
+              onClick={() => toggleTradingMutation.mutate()}
+            >
+              {toggleTradingMutation.isPending ? (
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+              ) : isTradingActive ? (
+                <Pause className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4" />
+              )}
+              <span className="hidden sm:inline">
+                {isTradingActive ? "Pause" : "Resume"}
+              </span>
+            </Button>
+          )}
+
           <ConnectionStatus status={wsStatus} />
-          <ModeToggle />
+
+          {/* Wallet Balance & Info */}
+          {hasWallet && primaryWallet ? (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted text-sm">
+              <Wallet className="h-4 w-4 text-muted-foreground" />
+              {walletBalance != null ? (
+                <span className="font-medium">
+                  {new Intl.NumberFormat("en-US", {
+                    style: "currency",
+                    currency: "USD",
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  }).format(walletBalance.usdc_balance)}
+                </span>
+              ) : (
+                <span className="text-xs text-muted-foreground">...</span>
+              )}
+              <span className="hidden sm:inline text-[10px] text-muted-foreground">
+                USDC.e
+              </span>
+              <span className="hidden md:inline text-muted-foreground">
+                &middot;
+              </span>
+              <span className="hidden md:inline font-mono text-xs text-muted-foreground">
+                {primaryWallet.label ||
+                  `${primaryWallet.address.slice(0, 6)}...${primaryWallet.address.slice(-4)}`}
+              </span>
+            </div>
+          ) : (
+            <button
+              onClick={() => setShowConnectModal(true)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 text-sm font-medium transition-colors"
+            >
+              <Plus className="h-4 w-4" />
+              <span className="hidden sm:inline">Connect</span>
+              <Wallet className="h-4 w-4 sm:hidden" />
+            </button>
+          )}
+          <ConnectWalletModal
+            open={showConnectModal}
+            onOpenChange={setShowConnectModal}
+          />
 
           <Link href="/settings">
             <Button variant="ghost" size="icon" className="hidden sm:flex">
@@ -207,16 +333,18 @@ export function Header() {
               <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-primary-foreground text-xs font-medium">
                 {userInitials}
               </div>
-              <ChevronDown className={cn(
-                'h-4 w-4 transition-transform',
-                isUserMenuOpen && 'rotate-180'
-              )} />
+              <ChevronDown
+                className={cn(
+                  "h-4 w-4 transition-transform",
+                  isUserMenuOpen && "rotate-180",
+                )}
+              />
             </Button>
 
             {isUserMenuOpen && (
               <div className="absolute right-0 mt-2 w-56 rounded-md border bg-popover p-1 shadow-lg">
                 <div className="px-3 py-2 border-b mb-1">
-                  <p className="text-sm font-medium">{user?.name || 'User'}</p>
+                  <p className="text-sm font-medium">{user?.name || "User"}</p>
                   <p className="text-xs text-muted-foreground">{user?.email}</p>
                   <p className="text-xs text-muted-foreground capitalize mt-1">
                     Role: {currentWorkspace?.my_role || user?.role}

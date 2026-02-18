@@ -7,7 +7,7 @@ pub mod executor;
 pub mod position_manager;
 pub mod recommendation;
 
-pub use copy_trader::CopyTrader;
+pub use copy_trader::{CopyTradeRejection, CopyTrader, CopyTradingPolicy};
 pub use executor::OrderExecutor;
 pub use position_manager::PositionManager;
 pub use recommendation::{
