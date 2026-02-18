@@ -593,6 +593,53 @@ export interface DiscoveredWallet {
   is_tracked: boolean;
   trades_24h: number;
   total_pnl: number;
+  composite_score?: number;
+  strategy_type?: string;
+  staleness_days: number;
+}
+
+// Market regime types
+export type MarketRegimeType =
+  | "BullVolatile"
+  | "BullCalm"
+  | "BearVolatile"
+  | "BearCalm"
+  | "Ranging"
+  | "Uncertain";
+
+export interface MarketRegimeResponse {
+  regime: MarketRegimeType;
+  label: string;
+  icon: string;
+  description: string;
+}
+
+// Calibration types
+export interface CalibrationBucket {
+  lower: number;
+  upper: number;
+  avg_predicted: number;
+  observed_rate: number;
+  count: number;
+  gap: number;
+}
+
+export interface CalibrationReport {
+  buckets: CalibrationBucket[];
+  ece: number;
+  total_predictions: number;
+  recommended_threshold: number;
+}
+
+// Copy performance types
+export interface CopyPerformanceResponse {
+  address: string;
+  reported_win_rate: number;
+  copy_win_rate: number | null;
+  copy_trade_count: number;
+  copy_total_pnl: number;
+  divergence_pp: number | null;
+  has_significant_divergence: boolean;
 }
 
 // Workspace types
