@@ -49,6 +49,13 @@ export {
 // History queries
 export { useClosedPositionsQuery } from "./useHistoryQuery";
 
+// Risk monitoring queries
+export {
+  useRiskStatusQuery,
+  useManualTripMutation,
+  useResetCircuitBreakerMutation,
+} from "./useRiskQuery";
+
 // Allocation queries
 export {
   useAllocationsQuery,

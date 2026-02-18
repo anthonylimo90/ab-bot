@@ -9,6 +9,7 @@ import {
   Settings,
   LineChart,
   History,
+  ShieldAlert,
   Star,
   type LucideIcon,
 } from "lucide-react";
@@ -40,6 +41,7 @@ const navSections: NavSection[] = [
       { href: "/trading", label: "Trading", icon: TrendingUp, badge: "active" },
       { href: "/backtest", label: "Backtest", icon: LineChart },
       { href: "/history", label: "History", icon: History },
+      { href: "/risk", label: "Risk Monitor", icon: ShieldAlert },
     ],
   },
   {

@@ -47,6 +47,8 @@ import type {
   OptimizationResult,
   ServiceStatus,
   Activity,
+  RiskStatus,
+  CircuitBreakerStatus,
 } from "@/types/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
@@ -903,6 +905,31 @@ class ApiClient {
     return this.request<OnboardingStatus>("/api/v1/onboarding/complete", {
       method: "PUT",
     });
+  }
+
+  // Risk Monitoring
+  async getRiskStatus(workspaceId: string): Promise<RiskStatus> {
+    return this.request<RiskStatus>(
+      `/api/v1/workspaces/${workspaceId}/risk/status`,
+    );
+  }
+
+  async manualTripCircuitBreaker(
+    workspaceId: string,
+  ): Promise<CircuitBreakerStatus> {
+    return this.request<CircuitBreakerStatus>(
+      `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/trip`,
+      { method: "POST" },
+    );
+  }
+
+  async resetCircuitBreaker(
+    workspaceId: string,
+  ): Promise<CircuitBreakerStatus> {
+    return this.request<CircuitBreakerStatus>(
+      `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/reset`,
+      { method: "POST" },
+    );
   }
 
   // Activity Feed

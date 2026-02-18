@@ -12,8 +12,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     activity, admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health,
-    invites, markets, onboarding, order_signing, positions, recommendations, risk_allocations,
-    trading, users, vault, wallet_auth, wallets, workspaces,
+    invites, markets, onboarding, order_signing, positions, recommendations, risk,
+    risk_allocations, trading, users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -129,6 +129,10 @@ use crate::websocket;
         order_signing::submit_order,
         // Activity
         activity::list_activity,
+        // Risk monitoring
+        risk::get_risk_status,
+        risk::manual_trip_circuit_breaker,
+        risk::reset_circuit_breaker,
     ),
     components(
         schemas(
@@ -243,6 +247,13 @@ use crate::websocket;
             order_signing::OrderSummary,
             // Activity
             activity::ActivityResponse,
+            // Risk monitoring
+            risk::RiskStatusResponse,
+            risk::CircuitBreakerResponse,
+            risk::CircuitBreakerConfigResponse,
+            risk::RecoveryStateResponse,
+            risk::StopLossStatsResponse,
+            risk::RecentStopExecution,
         )
     ),
     tags(
@@ -266,6 +277,7 @@ use crate::websocket;
 
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "activity", description = "Activity feed from copy trade history"),
+        (name = "risk", description = "Risk monitoring and circuit breaker management"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -431,6 +443,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Activity feed (read-only for all members)
         .route("/api/v1/activity", get(activity::list_activity))
+        // Risk monitoring (read-only for all members)
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/status",
+            get(risk::get_risk_status),
+        )
         // Allocations (read-only for all members)
         .route("/api/v1/allocations", get(allocations::list_allocations))
         // Auto-rotation history (read-only for all members)
@@ -541,6 +558,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/allocations/risk/recalculate",
             post(risk_allocations::recalculate_allocations),
+        )
+        // Circuit breaker manual controls
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/trip",
+            post(risk::manual_trip_circuit_breaker),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/reset",
+            post(risk::reset_circuit_breaker),
         )
         // Auto-rotation operations
         .route(

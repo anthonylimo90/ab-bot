@@ -900,3 +900,68 @@ export interface ServiceStatus {
   arb_executor: ServiceStatusItem;
   live_trading: ServiceStatusItem;
 }
+
+// Risk monitoring types
+export type TripReason =
+  | "daily_loss_limit"
+  | "max_drawdown"
+  | "consecutive_losses"
+  | "manual"
+  | "connectivity"
+  | "market_conditions";
+
+export interface CircuitBreakerConfig {
+  max_daily_loss: number;
+  max_drawdown_pct: number;
+  max_consecutive_losses: number;
+  cooldown_minutes: number;
+  enabled: boolean;
+}
+
+export interface RecoveryState {
+  current_stage: number;
+  total_stages: number;
+  capacity_pct: number;
+  started_at: string;
+  next_stage_at: string | null;
+  trades_this_stage: number;
+  recovery_pnl: number;
+}
+
+export interface CircuitBreakerStatus {
+  tripped: boolean;
+  trip_reason: TripReason | null;
+  tripped_at: string | null;
+  resume_at: string | null;
+  daily_pnl: number;
+  peak_value: number;
+  current_value: number;
+  consecutive_losses: number;
+  trips_today: number;
+  recovery_state: RecoveryState | null;
+  config: CircuitBreakerConfig;
+}
+
+export interface RecentStopExecution {
+  id: string;
+  position_id: string;
+  market_id: string;
+  stop_type: string;
+  executed_at: string;
+}
+
+export interface StopLossStats {
+  total_rules: number;
+  active_rules: number;
+  executed_rules: number;
+  fixed_stops: number;
+  percentage_stops: number;
+  trailing_stops: number;
+  time_based_stops: number;
+  recent_executions: RecentStopExecution[];
+}
+
+export interface RiskStatus {
+  circuit_breaker: CircuitBreakerStatus;
+  stop_loss: StopLossStats;
+}

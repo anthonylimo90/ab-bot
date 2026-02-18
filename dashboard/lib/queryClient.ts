@@ -121,6 +121,13 @@ export const queryKeys = {
       [...queryKeys.allocations.byWorkspace(workspaceId), "bench"] as const,
   },
 
+  // Risk monitoring
+  risk: {
+    all: () => ["risk"] as const,
+    status: (workspaceId: string) =>
+      [...queryKeys.risk.all(), "status", workspaceId] as const,
+  },
+
   // Rotation history
   rotationHistory: {
     all: () => ["rotation-history"] as const,
