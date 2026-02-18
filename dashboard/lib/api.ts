@@ -49,6 +49,9 @@ import type {
   Activity,
   RiskStatus,
   CircuitBreakerStatus,
+  MarketRegimeResponse,
+  CalibrationReport,
+  CopyPerformanceResponse,
 } from "@/types/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
@@ -467,8 +470,22 @@ class ApiClient {
     );
   }
 
+  async getMarketRegime(): Promise<MarketRegimeResponse> {
+    return this.request<MarketRegimeResponse>("/api/v1/regime/current");
+  }
+
+  async getCalibrationReport(): Promise<CalibrationReport> {
+    return this.request<CalibrationReport>("/api/v1/discover/calibration");
+  }
+
+  async getCopyPerformance(address: string): Promise<CopyPerformanceResponse> {
+    return this.request<CopyPerformanceResponse>(
+      `/api/v1/discover/wallets/${address}/copy-performance`,
+    );
+  }
+
   async discoverWallets(params?: {
-    sort_by?: "roi" | "sharpe" | "winRate" | "trades";
+    sort_by?: "roi" | "sharpe" | "winRate" | "trades" | "composite";
     period?: "7d" | "30d" | "90d";
     min_trades?: number;
     min_win_rate?: number;

@@ -63,6 +63,9 @@ use crate::websocket;
         discover::get_live_trades,
         discover::discover_wallets,
         discover::get_discovered_wallet,
+        discover::get_current_regime,
+        discover::get_calibration_report,
+        discover::get_copy_performance,
 
         vault::store_wallet,
         vault::list_wallets,
@@ -183,6 +186,10 @@ use crate::websocket;
             discover::LiveTrade,
             discover::DiscoveredWallet,
             discover::PredictionCategory,
+            discover::MarketRegimeResponse,
+            discover::CalibrationBucketResponse,
+            discover::CalibrationReportResponse,
+            discover::CopyPerformanceResponse,
 
             vault::StoreWalletRequest,
             vault::WalletInfo,
@@ -339,6 +346,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/discover/wallets/:address",
             get(discover::get_discovered_wallet),
+        )
+        .route("/api/v1/regime/current", get(discover::get_current_regime))
+        .route(
+            "/api/v1/discover/calibration",
+            get(discover::get_calibration_report),
+        )
+        .route(
+            "/api/v1/discover/wallets/:address/copy-performance",
+            get(discover::get_copy_performance),
         )
         // Recommendations (public for demo purposes)
         .route(

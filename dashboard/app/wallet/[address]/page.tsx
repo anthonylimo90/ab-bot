@@ -49,6 +49,13 @@ import { WalletAllocationSection } from "@/components/trading/WalletAllocationSe
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { ErrorDisplay } from "@/components/shared/ErrorDisplay";
 import { usePositionsQuery } from "@/hooks/queries/usePositionsQuery";
+import {
+  StrategyBadge,
+  StalenessIndicator,
+  CompositeScoreGauge,
+  CalibrationChart,
+  CopyPerformance,
+} from "@/components/discover";
 
 type RoiPeriod = "7d" | "30d" | "90d";
 
@@ -402,6 +409,18 @@ export default function WalletDetailPage() {
                 {storedWallet!.consecutive_losses} losses
               </span>
             )}
+            {discoveredWallet && (
+              <>
+                <StrategyBadge strategy={discoveredWallet.strategy_type} size="md" />
+                <StalenessIndicator
+                  stalenessDays={discoveredWallet.staleness_days ?? 0}
+                  showWhenFresh
+                />
+                <CompositeScoreGauge
+                  score={discoveredWallet.composite_score != null ? Number(discoveredWallet.composite_score) : undefined}
+                />
+              </>
+            )}
             {/* Actions */}
             {isActive && (
               <Button
@@ -552,6 +571,12 @@ export default function WalletDetailPage() {
             readOnly={isBench}
           />
         )}
+
+        {/* Calibration + Copy Performance */}
+        <div className="grid gap-4 md:grid-cols-2">
+          <CalibrationChart />
+          <CopyPerformance address={address} />
+        </div>
 
         {/* Trade History */}
         <Card>

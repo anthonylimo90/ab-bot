@@ -1,6 +1,7 @@
 //! Wallet discovery and live trade monitoring handlers.
 //!
-//! Provides endpoints for discovering top wallets and viewing live trades.
+//! Provides endpoints for discovering top wallets, viewing live trades,
+//! and retrieving the current market regime.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -74,6 +75,14 @@ pub struct DiscoveredWallet {
     pub trades_24h: i64,
     /// Total PnL in USD.
     pub total_pnl: Decimal,
+    /// Composite multi-factor score (0-100), None if not yet computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composite_score: Option<Decimal>,
+    /// Trading strategy classification (e.g., "Momentum", "Arbitrage").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy_type: Option<String>,
+    /// Days since last trade (staleness indicator).
+    pub staleness_days: i64,
 }
 
 /// Prediction category for a wallet.
@@ -84,6 +93,19 @@ pub enum PredictionCategory {
     Moderate,
     LowPotential,
     InsufficientData,
+}
+
+/// Current market regime response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MarketRegimeResponse {
+    /// Current detected market regime.
+    pub regime: String,
+    /// Human-readable label for the regime.
+    pub label: String,
+    /// Emoji icon for the regime.
+    pub icon: String,
+    /// Brief description of what this regime means.
+    pub description: String,
 }
 
 /// Query parameters for live trades.
@@ -130,6 +152,63 @@ fn default_period() -> String {
 
 fn default_discover_limit() -> i64 {
     20
+}
+
+/// Get the current detected market regime.
+#[utoipa::path(
+    get,
+    path = "/api/v1/regime/current",
+    tag = "discover",
+    responses(
+        (status = 200, description = "Current market regime", body = MarketRegimeResponse),
+    )
+)]
+pub async fn get_current_regime(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<MarketRegimeResponse>> {
+    use wallet_tracker::MarketRegime;
+
+    let regime = *state.current_regime.read().await;
+
+    let (label, icon, description) = match regime {
+        MarketRegime::BullVolatile => (
+            "Bull Volatile",
+            "\u{1f4c8}",
+            "Strong uptrend with high volatility — expect large swings",
+        ),
+        MarketRegime::BullCalm => (
+            "Bull Calm",
+            "\u{2600}\u{fe0f}",
+            "Steady uptrend with low volatility — favorable conditions",
+        ),
+        MarketRegime::BearVolatile => (
+            "Bear Volatile",
+            "\u{26a1}",
+            "Downtrend with high volatility — elevated risk, tighter criteria",
+        ),
+        MarketRegime::BearCalm => (
+            "Bear Calm",
+            "\u{1f327}\u{fe0f}",
+            "Gradual downtrend with low volatility — cautious positioning",
+        ),
+        MarketRegime::Ranging => (
+            "Ranging",
+            "\u{2194}\u{fe0f}",
+            "Sideways market with no clear trend — default criteria",
+        ),
+        MarketRegime::Uncertain => (
+            "Uncertain",
+            "\u{2753}",
+            "Insufficient data to determine regime — using conservative defaults",
+        ),
+    };
+
+    Ok(Json(MarketRegimeResponse {
+        regime: format!("{:?}", regime),
+        label: label.to_string(),
+        icon: icon.to_string(),
+        description: description.to_string(),
+    }))
 }
 
 /// Get live trades from monitored wallets.
@@ -258,6 +337,10 @@ pub async fn discover_wallets(
         .await
     {
         Ok(discovered) if !discovered.is_empty() => {
+            // Batch-fetch strategy_type for all addresses
+            let addresses: Vec<String> = discovered.iter().map(|dw| dw.address.clone()).collect();
+            let strategy_map = fetch_strategy_types(&state.pool, &addresses).await;
+
             let mut wallets: Vec<DiscoveredWallet> = Vec::with_capacity(discovered.len());
             for (i, dw) in discovered.iter().enumerate() {
                 let is_tracked = sqlx::query_scalar::<_, bool>(
@@ -268,7 +351,13 @@ pub async fn discover_wallets(
                 .await
                 .unwrap_or(false);
 
-                wallets.push(map_to_api_wallet(dw, (i + 1) as i32, is_tracked));
+                let strategy_type = strategy_map.get(&dw.address.to_lowercase()).cloned();
+                wallets.push(map_to_api_wallet(
+                    dw,
+                    (i + 1) as i32,
+                    is_tracked,
+                    strategy_type,
+                ));
             }
 
             // Sort by requested field
@@ -292,11 +381,46 @@ pub async fn discover_wallets(
     }
 }
 
+/// Batch-fetch strategy types for a list of wallet addresses.
+async fn fetch_strategy_types(
+    pool: &sqlx::PgPool,
+    addresses: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if addresses.is_empty() {
+        return map;
+    }
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT LOWER(address), strategy_type
+        FROM wallet_features
+        WHERE strategy_type IS NOT NULL
+          AND LOWER(address) = ANY($1)
+        "#,
+    )
+    .bind(
+        &addresses
+            .iter()
+            .map(|a| a.to_lowercase())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (addr, strategy) in rows {
+        map.insert(addr, strategy);
+    }
+    map
+}
+
 /// Map a `wallet_tracker::DiscoveredWallet` to the API `DiscoveredWallet`.
 fn map_to_api_wallet(
     dw: &wallet_tracker::discovery::DiscoveredWallet,
     rank: i32,
     is_tracked: bool,
+    strategy_type: Option<String>,
 ) -> DiscoveredWallet {
     let roi_30d = Decimal::from_f64_retain(dw.roi * 100.0).unwrap_or_default();
     let roi_7d = roi_30d * Decimal::new(30, 2); // ~30% of monthly
@@ -314,6 +438,12 @@ fn map_to_api_wallet(
     };
 
     let trades_per_day = dw.trades_per_day();
+    let staleness_days = (Utc::now() - dw.last_trade).num_days().max(0);
+
+    // Composite score: scale from 0-1 to 0-100 for display
+    let composite_score = dw
+        .composite_score
+        .map(|s| Decimal::from_f64_retain(s * 100.0).unwrap_or_default());
 
     DiscoveredWallet {
         address: dw.address.clone(),
@@ -330,12 +460,20 @@ fn map_to_api_wallet(
         is_tracked,
         trades_24h: (trades_per_day.min(50.0)) as i64,
         total_pnl: dw.total_pnl,
+        composite_score,
+        strategy_type,
+        staleness_days,
     }
 }
 
 fn sort_wallets(wallets: &mut [DiscoveredWallet], sort_by: &str, period: &str) {
     use std::cmp::Ordering;
     match sort_by {
+        "composite" => wallets.sort_by(|a, b| {
+            let sa = a.composite_score.unwrap_or(a.roi_30d);
+            let sb = b.composite_score.unwrap_or(b.roi_30d);
+            sb.partial_cmp(&sa).unwrap_or(Ordering::Equal)
+        }),
         "sharpe" => wallets.sort_by(|a, b| {
             b.sharpe_ratio
                 .partial_cmp(&a.sharpe_ratio)
@@ -394,7 +532,10 @@ pub async fn get_discovered_wallet(
             .await
             .unwrap_or(false);
 
-            Ok(Json(map_to_api_wallet(&dw, 0, is_tracked)))
+            let strategy_map = fetch_strategy_types(&state.pool, &[address.clone()]).await;
+            let strategy_type = strategy_map.get(&address).cloned();
+
+            Ok(Json(map_to_api_wallet(&dw, 0, is_tracked, strategy_type)))
         }
         Ok(None) => Err(ApiError::NotFound(format!(
             "Wallet {} not found in discovery data",
@@ -405,4 +546,188 @@ pub async fn get_discovered_wallet(
             Err(ApiError::Internal("Failed to query wallet".into()))
         }
     }
+}
+
+/// Calibration bucket response for a probability range.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CalibrationBucketResponse {
+    /// Lower bound of the probability range (inclusive).
+    pub lower: f64,
+    /// Upper bound of the probability range (exclusive).
+    pub upper: f64,
+    /// Average predicted probability within this bucket.
+    pub avg_predicted: f64,
+    /// Observed success fraction (actual wins / total).
+    pub observed_rate: f64,
+    /// Number of predictions in this bucket.
+    pub count: usize,
+    /// Calibration gap: |avg_predicted - observed_rate|.
+    pub gap: f64,
+}
+
+/// Full calibration report for prediction reliability.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CalibrationReportResponse {
+    /// Per-bucket calibration statistics.
+    pub buckets: Vec<CalibrationBucketResponse>,
+    /// Expected Calibration Error (lower is better).
+    pub ece: f64,
+    /// Total predictions evaluated.
+    pub total_predictions: usize,
+    /// Recommended threshold based on calibration data.
+    pub recommended_threshold: f64,
+}
+
+/// Get the prediction calibration report.
+///
+/// Shows how well the ensemble predictions match actual copy trade outcomes,
+/// bucketed by probability range. Used to display a reliability diagram.
+#[utoipa::path(
+    get,
+    path = "/api/v1/discover/calibration",
+    tag = "discover",
+    responses(
+        (status = 200, description = "Calibration report", body = CalibrationReportResponse),
+        (status = 500, description = "Internal error")
+    )
+)]
+pub async fn get_calibration_report(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<CalibrationReportResponse>> {
+    let calibrator = wallet_tracker::PredictionCalibrator::new(state.pool.clone());
+
+    match calibrator.calibrate().await {
+        Ok(report) => {
+            let buckets = report
+                .buckets
+                .into_iter()
+                .map(|b| CalibrationBucketResponse {
+                    lower: b.lower,
+                    upper: b.upper,
+                    avg_predicted: b.avg_predicted,
+                    observed_rate: b.observed_rate,
+                    count: b.count,
+                    gap: b.gap,
+                })
+                .collect();
+
+            Ok(Json(CalibrationReportResponse {
+                buckets,
+                ece: report.ece,
+                total_predictions: report.total_predictions,
+                recommended_threshold: report.recommended_threshold,
+            }))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to generate calibration report");
+            Err(ApiError::Internal(
+                "Failed to generate calibration report".into(),
+            ))
+        }
+    }
+}
+
+/// Copy trade performance for a specific wallet.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CopyPerformanceResponse {
+    /// Wallet address.
+    pub address: String,
+    /// Reported win rate from wallet metrics (0-100).
+    pub reported_win_rate: f64,
+    /// Actual win rate from copy trade outcomes (0-100).
+    pub copy_win_rate: Option<f64>,
+    /// Number of copy trades executed for this wallet.
+    pub copy_trade_count: i64,
+    /// Total PnL from copy trades.
+    pub copy_total_pnl: f64,
+    /// Divergence: |reported - copy| in percentage points (null if no data).
+    pub divergence_pp: Option<f64>,
+    /// Whether there's a significant divergence (>15pp).
+    pub has_significant_divergence: bool,
+}
+
+/// Get copy trade performance for a wallet.
+///
+/// Compares the wallet's reported win rate against actual copy trade outcomes,
+/// identifying any divergence between on-paper and actual performance.
+#[utoipa::path(
+    get,
+    path = "/api/v1/discover/wallets/{address}/copy-performance",
+    tag = "discover",
+    params(
+        ("address" = String, Path, description = "Wallet address")
+    ),
+    responses(
+        (status = 200, description = "Copy performance comparison", body = CopyPerformanceResponse),
+        (status = 404, description = "Wallet not found")
+    )
+)]
+pub async fn get_copy_performance(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> ApiResult<Json<CopyPerformanceResponse>> {
+    let address = address.to_lowercase();
+
+    // Get the reported win rate from wallet metrics
+    let reported = sqlx::query_as::<_, (f64,)>(
+        r#"
+        SELECT COALESCE(win_rate_30d, 0)::FLOAT8
+        FROM wallet_success_metrics
+        WHERE LOWER(address) = $1
+        ORDER BY calculated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "Failed to query wallet metrics");
+        ApiError::Internal("Failed to query wallet metrics".into())
+    })?;
+
+    let reported_win_rate = reported.map(|r| r.0 * 100.0).unwrap_or(0.0);
+
+    // Get actual copy trade performance
+    let copy_stats = sqlx::query_as::<_, (i64, f64, f64)>(
+        r#"
+        SELECT
+            COUNT(*)::INT8 AS trade_count,
+            COALESCE(SUM(pnl), 0)::FLOAT8 AS total_pnl,
+            CASE WHEN COUNT(*) > 0
+                THEN (COUNT(CASE WHEN pnl > 0 THEN 1 END)::FLOAT8 / COUNT(*)::FLOAT8) * 100.0
+                ELSE 0
+            END AS copy_win_rate
+        FROM copy_trade_history
+        WHERE LOWER(source_wallet) = $1
+        "#,
+    )
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "Failed to query copy trade history");
+        ApiError::Internal("Failed to query copy trade performance".into())
+    })?;
+
+    let (copy_trade_count, copy_total_pnl, copy_wr) = copy_stats.unwrap_or((0, 0.0, 0.0));
+
+    let copy_win_rate = if copy_trade_count > 0 {
+        Some(copy_wr)
+    } else {
+        None
+    };
+
+    let divergence_pp = copy_win_rate.map(|cwr| (reported_win_rate - cwr).abs());
+    let has_significant_divergence = divergence_pp.map_or(false, |d| d > 15.0);
+
+    Ok(Json(CopyPerformanceResponse {
+        address,
+        reported_win_rate,
+        copy_win_rate,
+        copy_trade_count,
+        copy_total_pnl,
+        divergence_pp,
+        has_significant_divergence,
+    }))
 }
