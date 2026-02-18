@@ -103,7 +103,7 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
 
   const getChangeColor = (change: number) => {
     if (Math.abs(change) < 0.5) return 'text-muted-foreground';
-    return change > 0 ? 'text-green-600' : 'text-red-600';
+    return change > 0 ? 'text-profit' : 'text-loss';
   };
 
   const getChangeIcon = (change: number) => {
@@ -240,7 +240,7 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground mb-1">Recommended Allocation</p>
-                  <p className="text-2xl font-bold text-blue-600">
+                  <p className="text-2xl font-bold text-primary">
                     {formatPercentage(selectedWallet.recommended_allocation_pct)}
                   </p>
                 </div>

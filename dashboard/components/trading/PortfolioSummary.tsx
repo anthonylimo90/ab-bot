@@ -2,6 +2,7 @@
 
 import { memo } from "react";
 import { Card, CardContent } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   TrendingUp,
   TrendingDown,
@@ -13,23 +14,48 @@ import {
 import { formatCurrency, cn } from "@/lib/utils";
 
 interface PortfolioSummaryProps {
-  totalValue: number;
-  totalPnl: number;
+  unrealizedPnl: number;
   positionCount: number;
-  winRate: number;
+  winRate: number | null;
   realizedPnl?: number;
   availableBalance?: number;
+  isLoading?: boolean;
 }
 
 export const PortfolioSummary = memo(function PortfolioSummary({
-  totalValue,
-  totalPnl,
+  unrealizedPnl,
   positionCount,
   winRate,
   realizedPnl = 0,
   availableBalance,
+  isLoading = false,
 }: PortfolioSummaryProps) {
-  const unrealizedPnl = totalPnl - realizedPnl;
+  if (isLoading) {
+    return (
+      <div
+        className={cn(
+          "grid gap-4 md:grid-cols-2",
+          availableBalance != null ? "lg:grid-cols-5" : "lg:grid-cols-4",
+        )}
+      >
+        {Array.from({
+          length: availableBalance != null ? 5 : 4,
+        }).map((_, i) => (
+          <Card key={i}>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <Skeleton className="h-10 w-10 rounded-full" />
+                <div className="space-y-2">
+                  <Skeleton className="h-3 w-20" />
+                  <Skeleton className="h-7 w-24" />
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -123,20 +149,28 @@ export const PortfolioSummary = memo(function PortfolioSummary({
             <div
               className={cn(
                 "h-10 w-10 rounded-full flex items-center justify-center",
-                winRate >= 50 ? "bg-profit/10" : "bg-loss/10",
+                winRate === null
+                  ? "bg-muted"
+                  : winRate >= 50
+                    ? "bg-profit/10"
+                    : "bg-loss/10",
               )}
             >
               <Trophy
                 className={cn(
                   "h-5 w-5",
-                  winRate >= 50 ? "text-profit" : "text-loss",
+                  winRate === null
+                    ? "text-muted-foreground"
+                    : winRate >= 50
+                      ? "text-profit"
+                      : "text-loss",
                 )}
               />
             </div>
             <div>
               <p className="text-sm text-muted-foreground">Win Rate</p>
               <p className="text-2xl font-bold tabular-nums">
-                {(winRate || 0).toFixed(0)}%
+                {winRate === null ? "\u2014" : `${winRate.toFixed(0)}%`}
               </p>
             </div>
           </div>

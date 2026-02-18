@@ -53,6 +53,19 @@ export interface UpdateUserRequest {
   password?: string;
 }
 
+// WalletPosition - shared UI position format used by WalletCard and ManualPositions
+export interface WalletPosition {
+  id: string;
+  marketId: string;
+  marketQuestion?: string;
+  outcome: "yes" | "no";
+  quantity: number;
+  entryPrice: number;
+  currentPrice: number;
+  pnl: number;
+  pnlPercent: number;
+}
+
 // Position types
 export type PositionSide = "long" | "short";
 export type PositionOutcome = "yes" | "no";

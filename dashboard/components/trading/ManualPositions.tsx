@@ -3,23 +3,12 @@
 import { memo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { formatCurrency, cn } from '@/lib/utils';
+import { formatCurrency, shortenAddress, cn } from '@/lib/utils';
 import { Package, TrendingUp, TrendingDown, X } from 'lucide-react';
-
-interface Position {
-  id: string;
-  marketId: string;
-  marketQuestion?: string;
-  outcome: 'yes' | 'no';
-  quantity: number;
-  entryPrice: number;
-  currentPrice: number;
-  pnl: number;
-  pnlPercent: number;
-}
+import type { WalletPosition } from '@/types/api';
 
 interface ManualPositionsProps {
-  positions: Position[];
+  positions: WalletPosition[];
   onClosePosition?: (id: string) => void;
 }
 
@@ -64,7 +53,7 @@ export const ManualPositions = memo(function ManualPositions({
               <div>
                 <p className="text-sm font-medium">
                   {position.marketQuestion ||
-                    position.marketId.slice(0, 40) + '...'}
+                    shortenAddress(position.marketId)}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   {position.quantity} @ ${position.entryPrice.toFixed(2)}
@@ -99,6 +88,7 @@ export const ManualPositions = memo(function ManualPositions({
                   size="icon"
                   className="h-7 w-7"
                   onClick={() => onClosePosition(position.id)}
+                  aria-label={`Close position ${position.marketQuestion || position.marketId}`}
                 >
                   <X className="h-3 w-3" />
                 </Button>

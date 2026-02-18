@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
@@ -17,11 +18,13 @@ import { AllocationAdjustmentPanel } from "@/components/allocations/AllocationAd
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { useToastStore } from "@/stores/toast-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { usePortfolioStats } from "@/hooks/usePortfolioStats";
-import { usePositionsQuery } from "@/hooks/queries/usePositionsQuery";
+import {
+  usePositionsQuery,
+  useClosePositionMutation,
+} from "@/hooks/queries/usePositionsQuery";
 import { useWalletStore } from "@/stores/wallet-store";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
-import type { Position } from "@/types/api";
+import type { Position, WalletPosition } from "@/types/api";
 import {
   useAllocationsQuery,
   usePromoteAllocationMutation,
@@ -48,19 +51,6 @@ import {
 import { useDiscoverWalletsQuery } from "@/hooks/queries/useDiscoverQuery";
 import type { WorkspaceAllocation, DiscoveredWallet } from "@/types/api";
 
-// Position format expected by WalletCard
-interface WalletPosition {
-  id: string;
-  marketId: string;
-  marketQuestion?: string;
-  outcome: "yes" | "no";
-  quantity: number;
-  entryPrice: number;
-  currentPrice: number;
-  pnl: number;
-  pnlPercent: number;
-}
-
 interface TradingWallet {
   address: string;
   label?: string;
@@ -83,6 +73,20 @@ interface TradingWallet {
   probationUntil?: string;
   isAutoSelected?: boolean;
   consecutiveLosses?: number;
+}
+
+interface ClosedPositionDisplay {
+  id: string;
+  marketQuestion?: string;
+  marketId: string;
+  outcome: string;
+  entryPrice: number;
+  exitPrice?: number;
+  quantity: number;
+  realizedPnl: number;
+  walletAddress?: string;
+  walletLabel?: string;
+  closedAt?: string;
 }
 
 function livePositionToWalletPosition(p: Position): WalletPosition {
@@ -170,16 +174,24 @@ export default function TradingPage() {
     return map;
   }, [discoveredWallets]);
 
-  const allActiveWallets = allocations
-    .filter((a) => a.tier === "active")
-    .map((a) =>
-      toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase())),
-    );
-  const allBenchWallets = allocations
-    .filter((a) => a.tier === "bench")
-    .map((a) =>
-      toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase())),
-    );
+  const allActiveWallets = useMemo(
+    () =>
+      allocations
+        .filter((a) => a.tier === "active")
+        .map((a) =>
+          toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase())),
+        ),
+    [allocations, discoveryMap],
+  );
+  const allBenchWallets = useMemo(
+    () =>
+      allocations
+        .filter((a) => a.tier === "bench")
+        .map((a) =>
+          toTradingWallet(a, discoveryMap.get(a.wallet_address.toLowerCase())),
+        ),
+    [allocations, discoveryMap],
+  );
 
   // Filter wallets by search query
   const searchLower = walletSearch.toLowerCase().trim();
@@ -197,9 +209,9 @@ export default function TradingPage() {
           (w.label && w.label.toLowerCase().includes(searchLower)),
       )
     : allBenchWallets;
-  const isRosterFull = () => allActiveWallets.length >= 5;
+  const isRosterFull = allActiveWallets.length >= 5;
 
-  const { stats: liveStats } = usePortfolioStats("30D");
+  // Positions data (single source of truth via TanStack Query)
   const { data: liveOpenPositions = [], isLoading: isLoadingPositions } =
     usePositionsQuery({ status: "open" });
   const { data: liveClosedPositions = [] } = usePositionsQuery({
@@ -212,11 +224,30 @@ export default function TradingPage() {
     hasConnectedWallet ? "active" : null,
   );
 
-  // Group open positions by wallet address
+  // Close position mutation
+  const closePositionMutation = useClosePositionMutation();
+
+  const closeMutate = closePositionMutation.mutate;
+  const handleClosePosition = useCallback(
+    (positionId: string) => {
+      closeMutate(
+        { positionId },
+        {
+          onSuccess: () =>
+            toast.success("Position Closed", "Position has been closed"),
+          onError: () =>
+            toast.error("Close Failed", "Could not close position"),
+        },
+      );
+    },
+    [closeMutate, toast],
+  );
+
+  // Group open positions by wallet address (normalized to lowercase)
   const positionsByWallet = useMemo(() => {
     const grouped: Record<string, WalletPosition[]> = {};
     liveOpenPositions.forEach((p) => {
-      const wallet = p.source_wallet || "manual";
+      const wallet = p.source_wallet?.toLowerCase() || "manual";
       if (!grouped[wallet]) grouped[wallet] = [];
       grouped[wallet].push(livePositionToWalletPosition(p));
     });
@@ -224,30 +255,45 @@ export default function TradingPage() {
   }, [liveOpenPositions]);
 
   // Manual positions (no source wallet)
-  const manualPositions = positionsByWallet["manual"] || [];
-
-  // Summary stats
-  const totalValue = liveStats.total_value;
-  const totalPnl = liveStats.unrealized_pnl;
-  const positionCount = liveOpenPositions.length;
-  const closedCount = liveClosedPositions.length;
-  const winCount = liveClosedPositions.filter(
-    (p) => (p.realized_pnl ?? p.unrealized_pnl) > 0,
-  ).length;
-  const winRate = closedCount > 0 ? (winCount / closedCount) * 100 : 0;
-  const realizedPnl = liveClosedPositions.reduce(
-    (sum, p) => sum + (p.realized_pnl ?? p.unrealized_pnl),
-    0,
+  const manualPositions = useMemo(
+    () => positionsByWallet["manual"] || [],
+    [positionsByWallet],
   );
 
+  // Summary stats derived from position queries (no separate API call)
+  const unrealizedPnl = useMemo(
+    () => liveOpenPositions.reduce((sum, p) => sum + p.unrealized_pnl, 0),
+    [liveOpenPositions],
+  );
+  const positionCount = liveOpenPositions.length;
+
+  const { closedCount, winRate, realizedPnl } = useMemo(() => {
+    const count = liveClosedPositions.length;
+    const wins = liveClosedPositions.filter(
+      (p) => (p.realized_pnl ?? 0) > 0,
+    ).length;
+    const realized = liveClosedPositions.reduce(
+      (sum, p) => sum + (p.realized_pnl ?? 0),
+      0,
+    );
+    return {
+      closedCount: count,
+      winRate: count > 0 ? (wins / count) * 100 : null,
+      realizedPnl: realized,
+    };
+  }, [liveClosedPositions]);
+
   // Handle tab change
-  const handleTabChange = (value: string) => {
-    router.push(`/trading?tab=${value}`, { scroll: false });
-  };
+  const handleTabChange = useCallback(
+    (value: string) => {
+      router.push(`/trading?tab=${value}`, { scroll: false });
+    },
+    [router],
+  );
 
   // Handle wallet actions
   const handlePromote = (address: string) => {
-    if (isRosterFull()) {
+    if (isRosterFull) {
       toast.error("Roster Full", "Demote a wallet from Active first");
       return;
     }
@@ -306,31 +352,17 @@ export default function TradingPage() {
   const maxPins = 3;
   const pinsRemaining = maxPins - pinnedCount;
 
-  // Normalized closed positions for display
-  interface ClosedPositionDisplay {
-    id: string;
-    marketQuestion?: string;
-    marketId: string;
-    outcome: string;
-    entryPrice: number;
-    exitPrice?: number;
-    quantity: number;
-    realizedPnl: number;
-    walletAddress?: string;
-    walletLabel?: string;
-    closedAt?: string;
-  }
-
-  const closedDisplayPositions: ClosedPositionDisplay[] = useMemo(() => {
+  const closedDisplayPositions = useMemo((): ClosedPositionDisplay[] => {
     return liveClosedPositions.map((p) => ({
       id: p.id,
       marketQuestion: undefined,
       marketId: p.market_id,
       outcome: p.outcome,
       entryPrice: p.entry_price,
+      // Note: API does not expose a separate exit_price; current_price is the last recorded price
       exitPrice: p.current_price,
       quantity: p.quantity,
-      realizedPnl: p.realized_pnl ?? p.unrealized_pnl,
+      realizedPnl: p.realized_pnl ?? 0,
       walletAddress: p.source_wallet,
       walletLabel: undefined,
       closedAt: p.updated_at,
@@ -361,23 +393,24 @@ export default function TradingPage() {
 
         {/* Portfolio Summary */}
         <PortfolioSummary
-          totalValue={totalValue}
-          totalPnl={totalPnl}
+          unrealizedPnl={unrealizedPnl}
           positionCount={positionCount}
           winRate={winRate}
           realizedPnl={realizedPnl}
           availableBalance={walletBalance?.usdc_balance ?? undefined}
+          isLoading={isLoadingPositions}
         />
 
         {/* Search */}
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <input
+          <Input
             type="text"
             value={walletSearch}
             onChange={(e) => setWalletSearch(e.target.value)}
             placeholder="Search wallets by address or label..."
-            className="w-full rounded-md border bg-background pl-10 pr-4 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="pl-10"
+            aria-label="Search wallets"
           />
         </div>
 
@@ -455,12 +488,13 @@ export default function TradingPage() {
                   <WalletCard
                     key={wallet.address}
                     wallet={wallet}
-                    positions={positionsByWallet[wallet.address] || []}
+                    positions={positionsByWallet[wallet.address.toLowerCase()] || []}
                     onDemote={handleDemote}
                     onPin={handlePin}
                     onUnpin={handleUnpin}
+                    onClosePosition={handleClosePosition}
                     isActive={true}
-                    isRosterFull={isRosterFull()}
+                    isRosterFull={isRosterFull}
                     pinsRemaining={pinsRemaining}
                     maxPins={maxPins}
                   />
@@ -497,7 +531,10 @@ export default function TradingPage() {
 
             {/* Manual Positions Section */}
             {manualPositions.length > 0 && (
-              <ManualPositions positions={manualPositions} />
+              <ManualPositions
+                positions={manualPositions}
+                onClosePosition={handleClosePosition}
+              />
             )}
 
             {/* Risk-Based Allocation Adjustment */}
@@ -536,7 +573,7 @@ export default function TradingPage() {
                     onPromote={handlePromote}
                     onRemove={() => handleRemove(wallet.address)}
                     isActive={false}
-                    isRosterFull={isRosterFull()}
+                    isRosterFull={isRosterFull}
                   />
                 ))}
               </div>
@@ -603,7 +640,8 @@ export default function TradingPage() {
                           >
                             <td className="p-4">
                               <p className="font-medium text-sm">
-                                {position.marketQuestion || position.marketId}
+                                {position.marketQuestion ||
+                                  shortenAddress(position.marketId)}
                               </p>
                             </td>
                             <td className="p-4">

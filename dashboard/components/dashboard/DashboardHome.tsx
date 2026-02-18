@@ -1,8 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo } from "react";
 import Link from "next/link";
-import { usePortfolioStats } from "@/hooks/usePortfolioStats";
+import {
+  useOpenPositions,
+  usePositionsQuery,
+} from "@/hooks/queries/usePositionsQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
@@ -33,8 +36,6 @@ import {
 import { formatCurrency, formatTimeAgo } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 
-type Period = "1D" | "7D" | "30D" | "ALL";
-
 const activityIcons: Record<string, React.ReactNode> = {
   TRADE_COPIED: <Copy className="h-4 w-4 text-blue-500" />,
   TRADE_COPY_SKIPPED: <AlertCircle className="h-4 w-4 text-yellow-500" />,
@@ -51,11 +52,30 @@ const activityIcons: Record<string, React.ReactNode> = {
 };
 
 export function DashboardHome() {
-  const [selectedPeriod, setSelectedPeriod] = useState<Period>("30D");
   const { currentWorkspace } = useWorkspaceStore();
   const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
   const activeWallets = allocations.filter((a) => a.tier === "active");
-  const { stats, status: portfolioStatus } = usePortfolioStats(selectedPeriod);
+  const { openPositions, totalUnrealizedPnl } = useOpenPositions();
+  const { data: closedPositions = [] } = usePositionsQuery({ status: "closed" });
+  const stats = useMemo(() => {
+    const totalValue = openPositions.reduce(
+      (sum, p) => sum + p.quantity * p.current_price,
+      0,
+    );
+    const closedCount = closedPositions.length;
+    const winCount = closedPositions.filter(
+      (p) => (p.realized_pnl ?? 0) > 0,
+    ).length;
+    return {
+      total_value: totalValue,
+      total_pnl_percent: totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
+      // TODO: today_pnl requires backend-computed daily P&L; not available from position queries
+      today_pnl: 0,
+      today_pnl_percent: 0,
+      active_positions: openPositions.length,
+      win_rate: closedCount > 0 ? (winCount / closedCount) * 100 : 0,
+    };
+  }, [openPositions, totalUnrealizedPnl, closedPositions]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
   const isAutomatic = currentWorkspace?.setup_mode === "automatic";
@@ -74,7 +94,6 @@ export function DashboardHome() {
             </p>
           </div>
           <LiveIndicator />
-          <ConnectionStatus status={portfolioStatus} showLabel />
         </div>
         <Badge variant="secondary" className="flex items-center gap-1">
           <ModeIcon className="h-3 w-3" />

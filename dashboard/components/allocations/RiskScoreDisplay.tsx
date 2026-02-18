@@ -20,8 +20,8 @@ interface RiskScoreDisplayProps {
 }
 
 export function RiskScoreDisplay({ compositeScore, components, className }: RiskScoreDisplayProps) {
-  const scoreColor = compositeScore >= 0.7 ? 'text-green-600' : compositeScore >= 0.5 ? 'text-yellow-600' : 'text-red-600';
-  const scoreBg = compositeScore >= 0.7 ? 'bg-green-100' : compositeScore >= 0.5 ? 'bg-yellow-100' : 'bg-red-100';
+  const scoreColor = compositeScore >= 0.7 ? 'text-profit' : compositeScore >= 0.5 ? 'text-yellow-600' : 'text-loss';
+  const scoreBg = compositeScore >= 0.7 ? 'bg-profit/10' : compositeScore >= 0.5 ? 'bg-yellow-500/10' : 'bg-loss/10';
 
   const formatPercentage = (value: number) => `${(value * 100).toFixed(1)}%`;
 
@@ -43,7 +43,7 @@ export function RiskScoreDisplay({ compositeScore, components, className }: Risk
         <div className="space-y-2">
           <div className="flex items-center justify-between text-sm">
             <div className="flex items-center gap-2">
-              <Shield className="h-4 w-4 text-blue-600" />
+              <Shield className="h-4 w-4 text-primary" />
               <span className="font-medium">Sortino Ratio</span>
               <Badge variant="outline" className="text-xs">30%</Badge>
             </div>
@@ -69,7 +69,7 @@ export function RiskScoreDisplay({ compositeScore, components, className }: Risk
         <div className="space-y-2">
           <div className="flex items-center justify-between text-sm">
             <div className="flex items-center gap-2">
-              <TrendingUp className="h-4 w-4 text-green-600" />
+              <TrendingUp className="h-4 w-4 text-profit" />
               <span className="font-medium">ROI/MaxDD</span>
               <Badge variant="outline" className="text-xs">25%</Badge>
             </div>

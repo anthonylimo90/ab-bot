@@ -32,19 +32,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { differenceInDays } from "date-fns";
-import type { CopySettings } from "@/types/api";
-
-interface Position {
-  id: string;
-  marketId: string;
-  marketQuestion?: string;
-  outcome: "yes" | "no";
-  quantity: number;
-  entryPrice: number;
-  currentPrice: number;
-  pnl: number;
-  pnlPercent: number;
-}
+import type { CopySettings, WalletPosition } from "@/types/api";
 
 interface WalletCardProps {
   wallet: {
@@ -62,7 +50,7 @@ interface WalletCardProps {
     isAutoSelected?: boolean;
     consecutiveLosses?: number;
   };
-  positions: Position[];
+  positions: WalletPosition[];
   onDemote?: (address: string) => void;
   onPromote?: (address: string) => void;
   onRemove?: (address: string) => void;
@@ -410,7 +398,7 @@ export const WalletCard = memo(function WalletCard({
                     <div>
                       <p className="text-sm font-medium">
                         {position.marketQuestion ||
-                          position.marketId.slice(0, 30) + "..."}
+                          shortenAddress(position.marketId)}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {position.quantity} @ ${position.entryPrice.toFixed(2)}
@@ -445,6 +433,7 @@ export const WalletCard = memo(function WalletCard({
                         size="icon"
                         className="h-7 w-7"
                         onClick={() => onClosePosition(position.id)}
+                        aria-label={`Close position ${position.marketQuestion || position.marketId}`}
                       >
                         <X className="h-3 w-3" />
                       </Button>
