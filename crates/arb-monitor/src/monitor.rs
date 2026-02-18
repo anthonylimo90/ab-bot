@@ -3,6 +3,7 @@
 use crate::position_tracker::PositionTracker;
 use crate::signals::SignalPublisher;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use polymarket_core::api::clob::OrderBookUpdate;
 use polymarket_core::api::ClobClient;
 use polymarket_core::config::Config;
@@ -10,7 +11,16 @@ use polymarket_core::db;
 use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, OrderBook};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Minimum depth (in USD) at best ask for both sides.
+const MIN_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0); // $100
+
+/// Cooldown period between signals for the same market (seconds).
+const SIGNAL_COOLDOWN_SECS: i64 = 60;
+
+/// How often to check for stale positions (every N order book updates).
+const STALE_CHECK_INTERVAL: u64 = 500;
 
 /// Main arbitrage monitor service.
 pub struct ArbMonitor {
@@ -23,6 +33,8 @@ pub struct ArbMonitor {
     market_outcomes: HashMap<String, (String, String)>,
     /// Minimum net profit threshold for entry signals.
     min_profit_threshold: Decimal,
+    /// Last signal timestamp per market (for dedup/cooldown).
+    last_signal_time: HashMap<String, DateTime<Utc>>,
 }
 
 impl ArbMonitor {
@@ -49,10 +61,12 @@ impl ArbMonitor {
             signal_publisher,
             order_books: HashMap::new(),
             market_outcomes: HashMap::new(),
+            // Raised from 0.1% to 0.5% — must clear fees + slippage to be worth trading
             min_profit_threshold: std::env::var("ARB_MIN_PROFIT_THRESHOLD")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| Decimal::new(1, 3)), // default 0.001 = 0.1%
+                .unwrap_or_else(|| Decimal::new(5, 3)), // default 0.005 = 0.5%
+            last_signal_time: HashMap::new(),
         })
     }
 
@@ -102,6 +116,12 @@ impl ArbMonitor {
             if health_tick % 100 == 0 {
                 crate::touch_health_file();
             }
+            // Periodically check for stale positions and publish exit signals
+            if health_tick % STALE_CHECK_INTERVAL == 0 {
+                if let Err(e) = self.position_tracker.check_stale_positions().await {
+                    warn!(error = %e, "Failed to check stale positions");
+                }
+            }
         }
 
         Ok(())
@@ -136,12 +156,28 @@ impl ArbMonitor {
                     no_book: no_book.clone(),
                 };
 
+                // Check liquidity depth on both sides before considering arb
+                let has_depth = binary_book.entry_cost_with_depth(MIN_DEPTH_USD).is_some();
+
                 // Calculate arbitrage opportunity
                 if let Some(arb) =
                     ArbOpportunity::calculate(&binary_book, ArbOpportunity::DEFAULT_FEE)
                 {
-                    if arb.is_profitable() && arb.net_profit >= self.min_profit_threshold {
-                        self.handle_arb_opportunity(&arb, &binary_book).await?;
+                    if arb.is_profitable()
+                        && arb.net_profit >= self.min_profit_threshold
+                        && has_depth
+                    {
+                        // Dedup/cooldown: skip if we signaled this market recently
+                        let now = Utc::now();
+                        let should_signal = match self.last_signal_time.get(&arb.market_id) {
+                            Some(last) => (now - *last).num_seconds() >= SIGNAL_COOLDOWN_SECS,
+                            None => true,
+                        };
+
+                        if should_signal {
+                            self.last_signal_time.insert(arb.market_id.clone(), now);
+                            self.handle_arb_opportunity(&arb, &binary_book).await?;
+                        }
                     }
                 }
 

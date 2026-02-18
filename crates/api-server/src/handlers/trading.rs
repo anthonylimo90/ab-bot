@@ -292,16 +292,18 @@ pub async fn place_order(
     );
 
     // Record trade for circuit breaker tracking
-    // Note: PnL is calculated as: total_value for buys (cost), negative for sells (proceeds)
-    // This is a simplified approximation - real PnL requires position tracking
+    // For buy orders (opening positions), we record the cost as negative PnL (unrealized)
+    // For sell orders (closing positions), we record proceeds as positive PnL (realized estimate)
+    // Real PnL accuracy requires position-level tracking (entry price vs exit price)
     if report.is_success() {
         let trade_value = report.total_value();
-        // For now, we don't have realized PnL without position tracking
-        // Just record the trade value to track volume; actual PnL tracking needs position manager
-        let _ = state
-            .circuit_breaker
-            .record_trade(Decimal::ZERO, true)
-            .await;
+        let (pnl, is_win) = match request.side {
+            // Buys are costs — record as negative so circuit breaker tracks exposure
+            OrderSide::Buy => (-trade_value, false),
+            // Sells are proceeds — approximate win (actual PnL needs entry price)
+            OrderSide::Sell => (trade_value, true),
+        };
+        let _ = state.circuit_breaker.record_trade(pnl, is_win).await;
     }
 
     // Publish signal for successful fills

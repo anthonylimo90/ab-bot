@@ -137,20 +137,22 @@ impl Position {
     }
 
     /// Update unrealized P&L based on current market prices.
+    /// `fee` is the fee **rate** (e.g. 0.02 = 2%), applied to notional value of each leg.
     pub fn update_pnl(&mut self, yes_bid: Decimal, no_bid: Decimal, fee: Decimal) {
+        let entry_cost = self.entry_cost();
         match self.exit_strategy {
             ExitStrategy::ExitOnCorrection => {
                 let exit_value = (yes_bid + no_bid) * self.quantity;
-                let entry_cost = self.entry_cost();
-                // Fee on both entry and exit
-                let total_fees = fee * Decimal::TWO * self.quantity;
-                self.unrealized_pnl = exit_value - entry_cost - total_fees;
+                // Fee = rate * notional on entry + rate * notional on exit
+                let entry_fees = fee * entry_cost;
+                let exit_fees = fee * exit_value;
+                self.unrealized_pnl = exit_value - entry_cost - entry_fees - exit_fees;
             }
             ExitStrategy::HoldToResolution => {
                 let guaranteed_return = Decimal::ONE * self.quantity;
-                let entry_cost = self.entry_cost();
-                let total_fees = fee * self.quantity;
-                self.unrealized_pnl = guaranteed_return - entry_cost - total_fees;
+                // Fee = rate * notional on entry only (resolution has no trading fee)
+                let entry_fees = fee * entry_cost;
+                self.unrealized_pnl = guaranteed_return - entry_cost - entry_fees;
             }
         }
     }
@@ -197,7 +199,8 @@ impl Position {
         Ok(())
     }
 
-    /// Close the position via market exit.
+    /// Close the position via market exit (selling both sides).
+    /// `fee` is the fee **rate** (e.g. 0.02 = 2%), applied to notional value.
     pub fn close_via_exit(
         &mut self,
         yes_exit_price: Decimal,
@@ -211,20 +214,24 @@ impl Position {
 
         let exit_value = (yes_exit_price + no_exit_price) * self.quantity;
         let entry_cost = self.entry_cost();
-        let total_fees = fee * Decimal::TWO * self.quantity;
-        self.realized_pnl = Some(exit_value - entry_cost - total_fees);
+        // Fee = rate * notional on entry + rate * notional on exit
+        let entry_fees = fee * entry_cost;
+        let exit_fees = fee * exit_value;
+        self.realized_pnl = Some(exit_value - entry_cost - entry_fees - exit_fees);
         self.unrealized_pnl = Decimal::ZERO;
     }
 
-    /// Close the position via market resolution.
+    /// Close the position via market resolution (guaranteed $1.00 per share).
+    /// `fee` is the fee **rate** (e.g. 0.02 = 2%), applied to notional value.
     pub fn close_via_resolution(&mut self, fee: Decimal) {
         self.exit_timestamp = Some(Utc::now());
         self.state = PositionState::Closed;
 
         let guaranteed_return = Decimal::ONE * self.quantity;
         let entry_cost = self.entry_cost();
-        let total_fees = fee * self.quantity;
-        self.realized_pnl = Some(guaranteed_return - entry_cost - total_fees);
+        // Fee = rate * notional on entry only (resolution has no trading fee)
+        let entry_fees = fee * entry_cost;
+        self.realized_pnl = Some(guaranteed_return - entry_cost - entry_fees);
         self.unrealized_pnl = Decimal::ZERO;
     }
 
@@ -438,16 +445,17 @@ mod tests {
         pos.update_pnl(Decimal::new(50, 2), Decimal::new(50, 2), fee);
         // Exit value: (0.50 + 0.50) * 100 = 100
         // Entry cost: 94
-        // Fees: 0.02 * 2 * 100 = 4
-        // Unrealized P&L: 100 - 94 - 4 = 2
-        assert_eq!(pos.unrealized_pnl, Decimal::new(2, 0));
+        // Entry fees: 0.02 * 94 = 1.88
+        // Exit fees: 0.02 * 100 = 2.00
+        // Unrealized P&L: 100 - 94 - 1.88 - 2.00 = 2.12
+        assert_eq!(pos.unrealized_pnl, Decimal::new(212, 2));
 
         pos.mark_exit_ready().unwrap();
         assert_eq!(pos.state, PositionState::ExitReady);
 
         pos.close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee);
         assert_eq!(pos.state, PositionState::Closed);
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(2, 0)));
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(212, 2)));
         assert!(!pos.is_active());
     }
 
@@ -468,12 +476,12 @@ mod tests {
         pos.update_pnl(Decimal::new(40, 2), Decimal::new(40, 2), fee);
         // Guaranteed return: 1.00 * 100 = 100
         // Entry cost: 94
-        // Fees: 0.02 * 100 = 2
-        // Unrealized P&L: 100 - 94 - 2 = 4
-        assert_eq!(pos.unrealized_pnl, Decimal::new(4, 0));
+        // Entry fees: 0.02 * 94 = 1.88
+        // Unrealized P&L: 100 - 94 - 1.88 = 4.12
+        assert_eq!(pos.unrealized_pnl, Decimal::new(412, 2));
 
         pos.close_via_resolution(fee);
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(4, 0)));
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(412, 2)));
     }
 
     #[test]
