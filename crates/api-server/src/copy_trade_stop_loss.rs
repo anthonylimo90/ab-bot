@@ -290,7 +290,7 @@ impl CopyStopLossMonitor {
 
             // Time-based exit does not require a live price lookup.
             if hold_hours >= self.config.max_hold_hours {
-                warn!(
+                info!(
                     position_id = %pos.id,
                     market = %pos.market_id,
                     hold_hours = hold_hours,
@@ -476,7 +476,7 @@ impl CopyStopLossMonitor {
         // Also guard against zero-sized positions, which cannot be sold.
         if reason == "market_resolved" || pos.quantity <= Decimal::ZERO {
             if pos.quantity <= Decimal::ZERO {
-                warn!(
+                info!(
                     position_id = %pos.id,
                     quantity = %pos.quantity,
                     reason = reason,
