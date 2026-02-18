@@ -181,13 +181,18 @@ pub async fn register(
         return Err(ApiError::Conflict("Email already registered".into()));
     }
 
-    // Hash the password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.password.as_bytes(), &salt)
-        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?
-        .to_string();
+    // Hash the password (offloaded to blocking thread to avoid starving the async executor)
+    let password_to_hash = req.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
+        argon2
+            .hash_password(password_to_hash.as_bytes(), &salt)
+            .map(|h| h.to_string())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
+    .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
 
     // Create user
     let user_id = Uuid::new_v4();
@@ -273,29 +278,51 @@ pub async fn login(
     .fetch_optional(&state.pool)
     .await?;
 
-    let user = match user {
-        Some(u) => u,
+    // Perform password verification in a blocking thread regardless of whether user
+    // was found. This prevents timing side-channels: a missing user takes the same
+    // wall-clock time as a wrong password because Argon2 runs either way.
+    let (user, password_valid) = match user {
+        Some(u) => {
+            let hash_str = u.password_hash.clone();
+            let password = req.password.clone();
+            let valid = tokio::task::spawn_blocking(move || {
+                PasswordHash::new(&hash_str).ok().map_or(false, |parsed| {
+                    Argon2::default()
+                        .verify_password(password.as_bytes(), &parsed)
+                        .is_ok()
+                })
+            })
+            .await
+            .unwrap_or(false);
+            (Some(u), valid)
+        }
         None => {
+            // Perform a dummy Argon2 hash to equalize timing with the found-user path.
+            // This prevents attackers from distinguishing "user not found" (~1ms) from
+            // "wrong password" (~200ms) via response timing.
+            let dummy_password = req.password.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let salt = SaltString::generate(&mut OsRng);
+                let _ = Argon2::default().hash_password(dummy_password.as_bytes(), &salt);
+            })
+            .await;
+            (None, false)
+        }
+    };
+
+    let user = match (user, password_valid) {
+        (Some(u), true) => u,
+        (Some(u), false) => {
+            // Log failed login attempt (wrong password)
+            state.audit_logger.log_login(&u.id.to_string(), None, false);
+            return Err(ApiError::Unauthorized("Invalid credentials".into()));
+        }
+        (None, _) => {
             // Log failed login attempt (user not found)
             state.audit_logger.log_login(&req.email, None, false);
             return Err(ApiError::Unauthorized("Invalid credentials".into()));
         }
     };
-
-    // Verify password
-    let parsed_hash = PasswordHash::new(&user.password_hash)
-        .map_err(|_| ApiError::Internal("Invalid password hash in database".into()))?;
-
-    if Argon2::default()
-        .verify_password(req.password.as_bytes(), &parsed_hash)
-        .is_err()
-    {
-        // Log failed login attempt (wrong password)
-        state
-            .audit_logger
-            .log_login(&user.id.to_string(), None, false);
-        return Err(ApiError::Unauthorized("Invalid credentials".into()));
-    }
 
     // Update last login
     let _ = sqlx::query("UPDATE users SET last_login = $1 WHERE id = $2")
@@ -658,13 +685,18 @@ pub async fn reset_password(
         }
     };
 
-    // Hash the new password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.password.as_bytes(), &salt)
-        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?
-        .to_string();
+    // Hash the new password (offloaded to blocking thread)
+    let password_to_hash = req.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
+        argon2
+            .hash_password(password_to_hash.as_bytes(), &salt)
+            .map(|h| h.to_string())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
+    .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
 
     // Update password and mark token as used in a transaction
     let mut tx = state.pool.begin().await?;

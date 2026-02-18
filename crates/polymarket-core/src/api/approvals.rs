@@ -257,7 +257,11 @@ async fn get_native_balance(
 /// Checks existing approvals first and only sends transactions for missing ones.
 /// Returns the number of new approvals sent.
 pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &str) -> Result<u32> {
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
     let address = signer.address();
 
     let spenders: [(&str, Address); 3] = [

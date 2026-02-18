@@ -130,6 +130,15 @@ impl StopLossRule {
         match &self.stop_type {
             StopType::Fixed { trigger_price } => current_price <= *trigger_price,
             StopType::Percentage { loss_pct } => {
+                if self.entry_price <= Decimal::ZERO {
+                    // Cannot compute percentage loss without a valid entry price
+                    warn!(
+                        rule_id = %self.id,
+                        entry_price = %self.entry_price,
+                        "Percentage stop-loss skipped: entry_price is zero or negative"
+                    );
+                    return false;
+                }
                 let loss = (self.entry_price - current_price) / self.entry_price;
                 loss >= *loss_pct
             }

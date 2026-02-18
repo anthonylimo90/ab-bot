@@ -138,7 +138,31 @@ impl IntoResponse for ApiError {
             );
         }
 
-        let body = ErrorResponse::new(self.error_code(), self.to_string());
+        // Sanitize error messages for client responses:
+        // - Database errors may contain table/column/constraint names — never expose these.
+        // - Serialization errors may reveal internal type structure.
+        // - All other errors use their human-readable message.
+        let client_message = match &self {
+            ApiError::Database(db_err) => {
+                // Map specific DB error codes to user-friendly messages
+                if let sqlx::Error::Database(ref e) = db_err {
+                    match e.code().as_deref() {
+                        Some("23505") => {
+                            "A resource with this identifier already exists".to_string()
+                        }
+                        Some("23503") => "Referenced resource does not exist".to_string(),
+                        Some("23514") => "Value violates validation constraints".to_string(),
+                        _ => "An internal database error occurred".to_string(),
+                    }
+                } else {
+                    "An internal database error occurred".to_string()
+                }
+            }
+            ApiError::Serialization(_) => "An internal serialization error occurred".to_string(),
+            other => other.to_string(),
+        };
+
+        let body = ErrorResponse::new(self.error_code(), client_message);
 
         (status, Json(body)).into_response()
     }

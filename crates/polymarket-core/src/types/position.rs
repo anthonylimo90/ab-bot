@@ -93,6 +93,8 @@ pub struct Position {
     pub retry_count: u32,
     /// Last time this position was updated (for stale detection).
     pub last_updated: DateTime<Utc>,
+    /// State before entering Stalled (for reliable recovery).
+    pub pre_stall_state: Option<PositionState>,
 }
 
 /// Maximum retry attempts before giving up.
@@ -128,6 +130,7 @@ impl Position {
             failure_reason: None,
             retry_count: 0,
             last_updated: now,
+            pre_stall_state: None,
         }
     }
 
@@ -198,12 +201,21 @@ impl Position {
     }
 
     /// Close the position via market exit.
+    ///
+    /// Returns an error if the position is already closed or in a terminal state.
     pub fn close_via_exit(
         &mut self,
         yes_exit_price: Decimal,
         no_exit_price: Decimal,
         fee: Decimal,
-    ) {
+    ) -> std::result::Result<(), String> {
+        if self.state == PositionState::Closed {
+            return Err("Position is already closed".to_string());
+        }
+        if self.state == PositionState::EntryFailed {
+            return Err("Cannot close a position that failed to enter".to_string());
+        }
+
         self.yes_exit_price = Some(yes_exit_price);
         self.no_exit_price = Some(no_exit_price);
         self.exit_timestamp = Some(Utc::now());
@@ -214,10 +226,20 @@ impl Position {
         let total_fees = fee * Decimal::TWO * self.quantity;
         self.realized_pnl = Some(exit_value - entry_cost - total_fees);
         self.unrealized_pnl = Decimal::ZERO;
+        Ok(())
     }
 
     /// Close the position via market resolution.
-    pub fn close_via_resolution(&mut self, fee: Decimal) {
+    ///
+    /// Returns an error if the position is already closed or in a terminal state.
+    pub fn close_via_resolution(&mut self, fee: Decimal) -> std::result::Result<(), String> {
+        if self.state == PositionState::Closed {
+            return Err("Position is already closed".to_string());
+        }
+        if self.state == PositionState::EntryFailed {
+            return Err("Cannot close a position that failed to enter".to_string());
+        }
+
         self.exit_timestamp = Some(Utc::now());
         self.state = PositionState::Closed;
 
@@ -226,6 +248,7 @@ impl Position {
         let total_fees = fee * self.quantity;
         self.realized_pnl = Some(guaranteed_return - entry_cost - total_fees);
         self.unrealized_pnl = Decimal::ZERO;
+        Ok(())
     }
 
     /// Check if position is still active (not closed or permanently failed).
@@ -281,11 +304,12 @@ impl Position {
         self.last_updated = Utc::now();
     }
 
-    /// Mark position as stalled.
+    /// Mark position as stalled, preserving the current state for recovery.
     pub fn mark_stalled(&mut self) {
         let elapsed = Utc::now()
             .signed_duration_since(self.last_updated)
             .num_seconds() as u64;
+        self.pre_stall_state = Some(self.state);
         self.state = PositionState::Stalled;
         self.failure_reason = Some(FailureReason::StalePosition {
             last_update_secs: elapsed,
@@ -313,21 +337,32 @@ impl Position {
 
     /// Attempt to recover from Stalled state.
     /// Returns the previous state the position should return to.
+    ///
+    /// Uses the saved `pre_stall_state` if available (set by `mark_stalled`).
+    /// Falls back to heuristic detection for positions stalled before this field
+    /// was introduced.
     pub fn attempt_stalled_recovery(&mut self) -> Option<PositionState> {
         if self.state != PositionState::Stalled {
             return None;
         }
 
-        // Determine what state to recover to based on what we have
-        let recovered_state = if self.yes_exit_price.is_some() || self.no_exit_price.is_some() {
-            // Was in the middle of closing
-            PositionState::ExitReady
-        } else if self.unrealized_pnl != Decimal::ZERO {
-            // Was open and tracking P&L
-            PositionState::Open
+        // Prefer the explicitly saved pre-stall state
+        let recovered_state = if let Some(prev) = self.pre_stall_state.take() {
+            prev
         } else {
-            // Was pending
-            PositionState::Pending
+            // Fallback heuristic for legacy positions without pre_stall_state.
+            // is_stale() only fires for Pending, Open, and Closing states,
+            // so the recovery target must be one of those three.
+            if self.yes_exit_price.is_some() || self.no_exit_price.is_some() {
+                // Had exit prices set → was in the middle of closing
+                PositionState::ExitReady
+            } else if self.yes_entry_price > Decimal::ZERO && self.no_entry_price > Decimal::ZERO {
+                // Has valid entry prices → was likely open
+                // (even if unrealized_pnl happens to be zero)
+                PositionState::Open
+            } else {
+                PositionState::Pending
+            }
         };
 
         self.state = recovered_state;
@@ -445,10 +480,16 @@ mod tests {
         pos.mark_exit_ready().unwrap();
         assert_eq!(pos.state, PositionState::ExitReady);
 
-        pos.close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee);
+        pos.close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee)
+            .unwrap();
         assert_eq!(pos.state, PositionState::Closed);
         assert_eq!(pos.realized_pnl, Some(Decimal::new(2, 0)));
         assert!(!pos.is_active());
+
+        // Double-close should fail
+        assert!(pos
+            .close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee)
+            .is_err());
     }
 
     #[test]
@@ -472,8 +513,11 @@ mod tests {
         // Unrealized P&L: 100 - 94 - 2 = 4
         assert_eq!(pos.unrealized_pnl, Decimal::new(4, 0));
 
-        pos.close_via_resolution(fee);
+        pos.close_via_resolution(fee).unwrap();
         assert_eq!(pos.realized_pnl, Some(Decimal::new(4, 0)));
+
+        // Double-close via resolution should fail
+        assert!(pos.close_via_resolution(fee).is_err());
     }
 
     #[test]
@@ -557,11 +601,77 @@ mod tests {
         pos.mark_stalled();
         assert_eq!(pos.state, PositionState::Stalled);
         assert!(pos.needs_recovery());
+        // Pre-stall state should be saved
+        assert_eq!(pos.pre_stall_state, Some(PositionState::Open));
 
-        // Recovery should return to Open state (since we have unrealized P&L)
+        // Recovery should return to Open state via pre_stall_state
         let recovered = pos.attempt_stalled_recovery();
         assert_eq!(recovered, Some(PositionState::Open));
         assert_eq!(pos.state, PositionState::Open);
+        // pre_stall_state should be consumed
+        assert_eq!(pos.pre_stall_state, None);
+    }
+
+    #[test]
+    fn test_stalled_recovery_with_zero_pnl() {
+        // Regression: open position with unrealized_pnl == 0 should still
+        // recover to Open (not Pending).
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+
+        pos.mark_open().unwrap();
+        // Don't call update_pnl — unrealized_pnl stays at ZERO
+
+        pos.mark_stalled();
+        let recovered = pos.attempt_stalled_recovery();
+        assert_eq!(recovered, Some(PositionState::Open));
+        assert_eq!(pos.state, PositionState::Open);
+    }
+
+    #[test]
+    fn test_stalled_recovery_from_closing() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+
+        pos.mark_open().unwrap();
+        pos.mark_exit_ready().unwrap();
+        pos.mark_closing().unwrap();
+
+        pos.mark_stalled();
+        assert_eq!(pos.pre_stall_state, Some(PositionState::Closing));
+
+        let recovered = pos.attempt_stalled_recovery();
+        assert_eq!(recovered, Some(PositionState::Closing));
+        assert_eq!(pos.state, PositionState::Closing);
+    }
+
+    #[test]
+    fn test_stalled_recovery_from_pending() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+
+        // Stall while still pending
+        pos.mark_stalled();
+        assert_eq!(pos.pre_stall_state, Some(PositionState::Pending));
+
+        let recovered = pos.attempt_stalled_recovery();
+        assert_eq!(recovered, Some(PositionState::Pending));
+        assert_eq!(pos.state, PositionState::Pending);
     }
 
     #[test]
