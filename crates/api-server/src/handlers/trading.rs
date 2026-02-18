@@ -409,7 +409,23 @@ async fn store_conditional_order(
     }))
 }
 
+/// Maximum order quantity to prevent accidental enormous orders.
+const MAX_ORDER_QUANTITY: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0); // 1,000,000
+
 fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
+    // Validate market_id is non-empty and reasonable length
+    let market_id = request.market_id.trim();
+    if market_id.is_empty() {
+        return Err(ApiError::BadRequest(
+            "market_id must not be empty".to_string(),
+        ));
+    }
+    if market_id.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "market_id exceeds maximum length of 256 characters".to_string(),
+        ));
+    }
+
     // Validate outcome
     if request.outcome != "yes" && request.outcome != "no" {
         return Err(ApiError::BadRequest(
@@ -423,6 +439,12 @@ fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
             "Quantity must be positive".to_string(),
         ));
     }
+    if request.quantity > MAX_ORDER_QUANTITY {
+        return Err(ApiError::BadRequest(format!(
+            "Quantity exceeds maximum of {}",
+            MAX_ORDER_QUANTITY
+        )));
+    }
 
     // Validate price for limit orders
     if request.order_type == OrderType::Limit && request.price.is_none() {
@@ -435,7 +457,7 @@ fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
     if let Some(price) = request.price {
         if price <= Decimal::ZERO || price >= Decimal::ONE {
             return Err(ApiError::BadRequest(
-                "Price must be between 0 and 1".to_string(),
+                "Price must be between 0 and 1 (exclusive)".to_string(),
             ));
         }
     }
@@ -447,6 +469,34 @@ fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
         return Err(ApiError::BadRequest(
             "Stop orders require a stop_price".to_string(),
         ));
+    }
+
+    // Validate stop price range (must also be valid prediction market price)
+    if let Some(stop_price) = request.stop_price {
+        if stop_price <= Decimal::ZERO || stop_price >= Decimal::ONE {
+            return Err(ApiError::BadRequest(
+                "stop_price must be between 0 and 1 (exclusive)".to_string(),
+            ));
+        }
+    }
+
+    // Validate time_in_force
+    match request.time_in_force.as_str() {
+        "GTC" | "IOC" | "FOK" | "GTD" => {}
+        _ => {
+            return Err(ApiError::BadRequest(
+                "time_in_force must be one of: GTC, IOC, FOK, GTD".to_string(),
+            ));
+        }
+    }
+
+    // Validate client_order_id length (if provided)
+    if let Some(ref client_id) = request.client_order_id {
+        if client_id.len() > 128 {
+            return Err(ApiError::BadRequest(
+                "client_order_id exceeds maximum length of 128 characters".to_string(),
+            ));
+        }
     }
 
     Ok(())
@@ -696,6 +746,13 @@ mod tests {
         };
         assert!(validate_order_request(&zero_qty).is_err());
 
+        // Quantity exceeds maximum
+        let huge_qty = PlaceOrderRequest {
+            quantity: Decimal::new(2_000_000, 0),
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&huge_qty).is_err());
+
         // Limit order without price
         let limit_no_price = PlaceOrderRequest {
             order_type: OrderType::Limit,
@@ -703,6 +760,59 @@ mod tests {
             ..valid.clone()
         };
         assert!(validate_order_request(&limit_no_price).is_err());
+
+        // Empty market_id
+        let empty_market = PlaceOrderRequest {
+            market_id: "".to_string(),
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&empty_market).is_err());
+
+        // Whitespace-only market_id
+        let whitespace_market = PlaceOrderRequest {
+            market_id: "   ".to_string(),
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&whitespace_market).is_err());
+
+        // Invalid time_in_force
+        let bad_tif = PlaceOrderRequest {
+            time_in_force: "INVALID".to_string(),
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&bad_tif).is_err());
+
+        // Valid time_in_force values
+        for tif in &["GTC", "IOC", "FOK", "GTD"] {
+            let req = PlaceOrderRequest {
+                time_in_force: tif.to_string(),
+                ..valid.clone()
+            };
+            assert!(validate_order_request(&req).is_ok());
+        }
+
+        // Stop price out of range
+        let bad_stop = PlaceOrderRequest {
+            order_type: OrderType::StopLoss,
+            stop_price: Some(Decimal::new(150, 2)), // 1.50 — out of range
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&bad_stop).is_err());
+
+        // Valid stop-loss order
+        let good_stop = PlaceOrderRequest {
+            order_type: OrderType::StopLoss,
+            stop_price: Some(Decimal::new(40, 2)), // 0.40
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&good_stop).is_ok());
+
+        // client_order_id too long
+        let long_client_id = PlaceOrderRequest {
+            client_order_id: Some("x".repeat(200)),
+            ..valid.clone()
+        };
+        assert!(validate_order_request(&long_client_id).is_err());
     }
 
     #[test]

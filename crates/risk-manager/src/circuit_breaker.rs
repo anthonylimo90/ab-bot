@@ -92,6 +92,13 @@ pub struct CircuitBreakerState {
     pub trips_today: u32,
     /// Recovery mode state (if in gradual recovery).
     pub recovery_state: Option<RecoveryState>,
+    /// Date of last daily reset (for midnight rollover detection).
+    #[serde(default = "today_naive")]
+    pub last_reset_date: chrono::NaiveDate,
+}
+
+fn today_naive() -> chrono::NaiveDate {
+    Utc::now().date_naive()
 }
 
 /// State for gradual recovery mode.
@@ -155,6 +162,7 @@ impl Default for CircuitBreakerState {
             consecutive_losses: 0,
             trips_today: 0,
             recovery_state: None,
+            last_reset_date: Utc::now().date_naive(),
         }
     }
 }
@@ -417,6 +425,21 @@ impl CircuitBreaker {
         }
 
         let mut state = self.state.write().await;
+
+        // Check for midnight rollover — reset daily counters if the date has changed.
+        // This handles long-running processes that span midnight without restart.
+        let today = Utc::now().date_naive();
+        if state.last_reset_date != today {
+            info!(
+                last_reset = %state.last_reset_date,
+                today = %today,
+                "Midnight rollover detected in record_trade, resetting daily counters"
+            );
+            state.daily_pnl = Decimal::ZERO;
+            state.consecutive_losses = 0;
+            state.trips_today = 0;
+            state.last_reset_date = today;
+        }
 
         // Update daily P&L
         state.daily_pnl += pnl;

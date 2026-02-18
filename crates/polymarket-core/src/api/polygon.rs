@@ -2,6 +2,7 @@
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// USDC.e contract on Polygon (PoS bridged, 6 decimals) — used by Polymarket.
 const POLYGON_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
@@ -17,12 +18,21 @@ pub struct PolygonClient {
 }
 
 impl PolygonClient {
+    /// Build a shared HTTP client with sensible timeouts for RPC calls.
+    fn build_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to build HTTP client")
+    }
+
     /// Create a new Polygon client with an Alchemy API key.
     pub fn with_alchemy(api_key: &str) -> Self {
         let rpc_url = format!("https://polygon-mainnet.g.alchemy.com/v2/{}", api_key);
         Self {
             rpc_url,
-            http_client: reqwest::Client::new(),
+            http_client: Self::build_http_client(),
         }
     }
 
@@ -30,7 +40,7 @@ impl PolygonClient {
     pub fn new(rpc_url: String) -> Self {
         Self {
             rpc_url,
-            http_client: reqwest::Client::new(),
+            http_client: Self::build_http_client(),
         }
     }
 

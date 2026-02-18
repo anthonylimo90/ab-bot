@@ -50,6 +50,8 @@ impl CircuitBreakerRepository {
                 // Recovery state is transient and not persisted to database
                 // It will be re-initialized when recovery mode starts
                 recovery_state: None,
+                // Use today's date; actual reset check happens in load_state()
+                last_reset_date: chrono::Utc::now().date_naive(),
             }
         });
 

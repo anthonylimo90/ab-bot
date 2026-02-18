@@ -150,6 +150,7 @@ impl PositionRepository {
             failure_reason,
             retry_count: r.get::<Option<i32>, _>("retry_count").unwrap_or(0) as u32,
             last_updated,
+            pre_stall_state: None, // Runtime-only; not persisted to DB
         }
     }
 
