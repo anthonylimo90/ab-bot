@@ -325,7 +325,10 @@ impl ExitHandler {
         let fee = Decimal::new(2, 2); // 2%
 
         // Close position
-        position.close_via_exit(yes_price, no_price, fee);
+        if let Err(e) = position.close_via_exit(yes_price, no_price, fee) {
+            warn!(position_id = %position.id, error = %e, "Cannot close position via exit");
+            return Ok(());
+        }
         let _ = self.position_repo.update(position).await;
 
         // Record with circuit breaker
@@ -417,7 +420,10 @@ impl ExitHandler {
 
             let market_id = position.market_id.clone();
 
-            position.close_via_resolution(fee);
+            if let Err(e) = position.close_via_resolution(fee) {
+                warn!(position_id = %position.id, market_id = %market_id, error = %e, "Cannot close position via resolution");
+                continue;
+            }
             let _ = self.position_repo.update(&position).await;
 
             // Record with circuit breaker

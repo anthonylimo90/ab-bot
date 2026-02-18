@@ -246,6 +246,9 @@ pub struct ArbOrder {
 }
 
 impl ArbOrder {
+    /// Default fee rate (2%) — must match ArbOpportunity::DEFAULT_FEE.
+    const DEFAULT_FEE_RATE: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
+
     pub fn new(
         market_id: String,
         yes_outcome_id: String,
@@ -258,7 +261,9 @@ impl ArbOrder {
             MarketOrder::new(market_id.clone(), yes_outcome_id, OrderSide::Buy, quantity);
         let no_order = MarketOrder::new(market_id.clone(), no_outcome_id, OrderSide::Buy, quantity);
         let expected_cost = (expected_yes_price + expected_no_price) * quantity;
-        let expected_profit = quantity - expected_cost;
+        let gross_profit = quantity - expected_cost;
+        // Net profit after entry fees (fee applied to notional cost of both legs)
+        let expected_profit = gross_profit - (expected_cost * Self::DEFAULT_FEE_RATE);
 
         Self {
             id: Uuid::new_v4(),
@@ -327,7 +332,9 @@ mod tests {
 
         // Cost: (0.48 + 0.46) * 100 = 94
         assert_eq!(arb.expected_cost, Decimal::new(94, 0));
-        // Profit: 100 - 94 = 6
-        assert_eq!(arb.expected_profit, Decimal::new(6, 0));
+        // Gross profit: 100 - 94 = 6
+        // Fees: 94 * 0.02 = 1.88
+        // Net profit: 6 - 1.88 = 4.12
+        assert_eq!(arb.expected_profit, Decimal::new(412, 2));
     }
 }

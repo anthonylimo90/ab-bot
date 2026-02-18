@@ -33,10 +33,15 @@ impl ClobClient {
     pub const DEFAULT_WS_URL: &'static str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
     pub fn new(base_url: Option<String>, ws_url: Option<String>) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(30))
+            .connect_timeout(StdDuration::from_secs(10))
+            .build()
+            .expect("Failed to build HTTP client");
         Self {
             base_url: base_url.unwrap_or_else(|| Self::DEFAULT_BASE_URL.to_string()),
             ws_url: ws_url.unwrap_or_else(|| Self::DEFAULT_WS_URL.to_string()),
-            http_client: reqwest::Client::new(),
+            http_client,
         }
     }
 

@@ -99,8 +99,18 @@ impl ArbOpportunity {
     pub const DEFAULT_FEE: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
 
     /// Calculate arbitrage opportunity from a binary market book.
+    ///
+    /// Returns `None` if the order book has no valid asks, or if total cost is
+    /// zero/negative (which would indicate an empty or corrupted order book).
     pub fn calculate(book: &BinaryMarketBook, fee: Decimal) -> Option<Self> {
         let (yes_ask, no_ask, total_cost) = book.entry_cost()?;
+
+        // Guard: total_cost must be positive and within valid range (0, 1].
+        // A zero or negative cost means the order book is empty or corrupted.
+        if total_cost <= Decimal::ZERO {
+            return None;
+        }
+
         let gross_profit = Decimal::ONE - total_cost;
         // Fee is a rate (e.g. 0.02 = 2%) applied to the notional cost of both legs
         let net_profit = gross_profit - (total_cost * fee);

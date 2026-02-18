@@ -193,7 +193,12 @@ impl PositionTracker {
     ) -> Result<Option<Decimal>> {
         for positions in self.active_positions.values_mut() {
             if let Some(pos) = positions.iter_mut().find(|p| p.id == position_id) {
-                pos.close_via_exit(yes_exit_price, no_exit_price, ArbOpportunity::DEFAULT_FEE);
+                if let Err(e) =
+                    pos.close_via_exit(yes_exit_price, no_exit_price, ArbOpportunity::DEFAULT_FEE)
+                {
+                    warn!("Cannot close position {} via exit: {}", position_id, e);
+                    return Ok(None);
+                }
                 self.repo.update(pos).await?;
 
                 let pnl = pos.realized_pnl;
@@ -215,7 +220,13 @@ impl PositionTracker {
     ) -> Result<Option<Decimal>> {
         for positions in self.active_positions.values_mut() {
             if let Some(pos) = positions.iter_mut().find(|p| p.id == position_id) {
-                pos.close_via_resolution(ArbOpportunity::DEFAULT_FEE);
+                if let Err(e) = pos.close_via_resolution(ArbOpportunity::DEFAULT_FEE) {
+                    warn!(
+                        "Cannot close position {} via resolution: {}",
+                        position_id, e
+                    );
+                    return Ok(None);
+                }
                 self.repo.update(pos).await?;
 
                 let pnl = pos.realized_pnl;

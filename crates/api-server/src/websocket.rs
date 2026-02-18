@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::state::AppState;
@@ -213,12 +213,28 @@ async fn handle_orderbook_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
             // Handle orderbook updates
-            Ok(update) = orderbook_rx.recv() => {
-                let msg = WsMessage::Orderbook(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        break;
+            result = orderbook_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::Orderbook(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Orderbook WebSocket client lagged by {n} messages, resuming");
+                        // Notify client about missed messages
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} orderbook updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
@@ -257,12 +273,27 @@ async fn handle_positions_socket(socket: WebSocket, state: Arc<AppState>) {
                     _ => {}
                 }
             }
-            Ok(update) = position_rx.recv() => {
-                let msg = WsMessage::Position(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        break;
+            result = position_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::Position(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Positions WebSocket client lagged by {n} messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} position updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
@@ -301,12 +332,27 @@ async fn handle_signals_socket(socket: WebSocket, state: Arc<AppState>) {
                     _ => {}
                 }
             }
-            Ok(update) = signal_rx.recv() => {
-                let msg = WsMessage::Signal(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        break;
+            result = signal_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::Signal(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Signals WebSocket client lagged by {n} messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} signal updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
@@ -347,28 +393,73 @@ async fn handle_all_socket(socket: WebSocket, state: Arc<AppState>) {
                     _ => {}
                 }
             }
-            Ok(update) = orderbook_rx.recv() => {
-                let msg = WsMessage::Orderbook(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        break;
+            result = orderbook_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::Orderbook(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("All-channel WebSocket client lagged by {n} orderbook messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} orderbook updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            Ok(update) = position_rx.recv() => {
-                let msg = WsMessage::Position(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        break;
+            result = position_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::Position(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("All-channel WebSocket client lagged by {n} position messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} position updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            Ok(update) = signal_rx.recv() => {
-                let msg = WsMessage::Signal(update);
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    if sender.send(Message::Text(json)).await.is_err() {
-                        break;
+            result = signal_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::Signal(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("All-channel WebSocket client lagged by {n} signal messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} signal updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
