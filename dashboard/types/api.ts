@@ -201,11 +201,7 @@ export interface Order {
 }
 
 // Backtest types
-export type StrategyType =
-  | "arbitrage"
-  | "momentum"
-  | "mean_reversion"
-  | "copy_trading";
+export type StrategyType = "arbitrage" | "momentum" | "mean_reversion" | "grid";
 
 export type SlippageModel =
   | { type: "none" }
@@ -224,9 +220,10 @@ export interface StrategyConfig {
   // MeanReversion
   window_hours?: number;
   std_threshold?: number;
-  // CopyTrading
-  wallets?: string[];
-  allocation_pct?: number;
+  // Grid
+  grid_levels?: number;
+  grid_spacing_pct?: number;
+  order_size?: number;
 }
 
 export interface BacktestParams {
@@ -242,6 +239,20 @@ export interface BacktestParams {
 export interface EquityPoint {
   timestamp: string;
   value: number;
+}
+
+export interface TradeLogEntry {
+  market_id: string;
+  outcome_id: string;
+  trade_type: string;
+  entry_time: string;
+  exit_time?: string;
+  entry_price: number;
+  exit_price?: number;
+  quantity: number;
+  fees: number;
+  pnl?: number;
+  return_pct?: number;
 }
 
 export interface BacktestResult {
@@ -270,6 +281,18 @@ export interface BacktestResult {
   status: "pending" | "running" | "completed" | "failed";
   error?: string;
   equity_curve?: EquityPoint[];
+  // Extended metrics
+  expectancy?: number;
+  calmar_ratio?: number;
+  var_95?: number;
+  cvar_95?: number;
+  recovery_factor?: number;
+  best_trade_return?: number;
+  worst_trade_return?: number;
+  max_consecutive_wins?: number;
+  max_consecutive_losses?: number;
+  avg_trade_duration_hours?: number;
+  trade_log?: TradeLogEntry[];
 }
 
 // Portfolio types (derived from positions)

@@ -3,18 +3,32 @@
 import { useState, useMemo, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { BacktestChart } from "@/components/charts/BacktestChart";
 import { useBacktest } from "@/hooks/useBacktest";
-import { useWorkspaceStore } from "@/stores/workspace-store";
-import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
-import { formatCurrency, shortenAddress } from "@/lib/utils";
-import { Play, ChevronDown, Loader2, AlertCircle, History } from "lucide-react";
+import { formatCurrency, cn, shortenAddress } from "@/lib/utils";
+import type { StrategyConfig } from "@/types/api";
+import {
+  Play,
+  Loader2,
+  AlertCircle,
+  History,
+  ChevronLeft,
+  ChevronRight,
+} from "lucide-react";
+
+type StrategyType = "arbitrage" | "momentum" | "mean_reversion" | "grid";
+
+const STRATEGY_LABELS: Record<StrategyType, string> = {
+  arbitrage: "Arbitrage",
+  momentum: "Momentum",
+  mean_reversion: "Mean Reversion",
+  grid: "Grid",
+};
+
+const TRADE_LOG_PAGE_SIZE = 20;
 
 export default function BacktestPage() {
-  const { currentWorkspace } = useWorkspaceStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
   const {
     results,
     history,
@@ -23,6 +37,7 @@ export default function BacktestPage() {
     runBacktest,
     loadHistory,
     loadResult,
+    clearResults,
   } = useBacktest();
 
   // Date helpers
@@ -41,6 +56,35 @@ export default function BacktestPage() {
   );
   const [endDate, setEndDate] = useState(() => formatDate(today));
   const [slippage, setSlippage] = useState(0.1);
+  const [fees, setFees] = useState(0.1);
+
+  // Strategy state
+  const [strategyType, setStrategyType] = useState<StrategyType>("arbitrage");
+
+  // Arbitrage params
+  const [minSpread, setMinSpread] = useState(2.0);
+  const [maxPosition, setMaxPosition] = useState(1000);
+
+  // Momentum params
+  const [lookbackHours, setLookbackHours] = useState(24);
+  const [momentumThreshold, setMomentumThreshold] = useState(5.0);
+  const [momentumPositionSize, setMomentumPositionSize] = useState(10.0);
+
+  // Mean Reversion params
+  const [windowHours, setWindowHours] = useState(48);
+  const [stdThreshold, setStdThreshold] = useState(2.0);
+  const [mrPositionSize, setMrPositionSize] = useState(10.0);
+
+  // Grid params
+  const [gridLevels, setGridLevels] = useState(5);
+  const [gridSpacingPct, setGridSpacingPct] = useState(2.0);
+  const [orderSize, setOrderSize] = useState(5.0);
+
+  // Elapsed timer
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  // Trade log pagination
+  const [tradeLogPage, setTradeLogPage] = useState(0);
 
   // Date presets
   const datePresets = useMemo(
@@ -63,34 +107,60 @@ export default function BacktestPage() {
     setStartDate(formatDate(getDateDaysAgo(days)));
     setEndDate(formatDate(today));
   };
-  const [fees, setFees] = useState(0.1);
-  const [selectedWallets, setSelectedWallets] = useState<string[]>([]);
 
   // Load history on mount
   useEffect(() => {
     loadHistory();
   }, [loadHistory]);
 
-  // All tracked wallets
-  const allWallets = useMemo(() => {
-    return allocations.map((allocation) => ({
-      address: allocation.wallet_address,
-      label: allocation.wallet_label,
-    }));
-  }, [allocations]);
+  // Elapsed timer
+  useEffect(() => {
+    if (!isRunning) {
+      setElapsedSeconds(0);
+      return;
+    }
+    const interval = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+    return () => clearInterval(interval);
+  }, [isRunning]);
+
+  // Build strategy config from form state
+  const buildStrategyConfig = (): StrategyConfig => {
+    switch (strategyType) {
+      case "arbitrage":
+        return {
+          type: "arbitrage",
+          min_spread: minSpread / 100,
+          max_position: maxPosition,
+        };
+      case "momentum":
+        return {
+          type: "momentum",
+          lookback_hours: lookbackHours,
+          threshold: momentumThreshold / 100,
+          position_size: momentumPositionSize / 100,
+        };
+      case "mean_reversion":
+        return {
+          type: "mean_reversion",
+          window_hours: windowHours,
+          std_threshold: stdThreshold,
+          position_size: mrPositionSize / 100,
+        };
+      case "grid":
+        return {
+          type: "grid",
+          grid_levels: gridLevels,
+          grid_spacing_pct: gridSpacingPct / 100,
+          order_size: orderSize / 100,
+        };
+    }
+  };
 
   // Handle backtest run
   const handleRunBacktest = async () => {
-    const wallets =
-      selectedWallets.length > 0
-        ? selectedWallets
-        : allWallets.map((w) => w.address);
+    setTradeLogPage(0);
     await runBacktest({
-      strategy: {
-        type: "copy_trading",
-        wallets,
-        allocation_pct: 1 / Math.max(1, wallets.length),
-      },
+      strategy: buildStrategyConfig(),
       start_date: startDate + "T00:00:00Z",
       end_date: endDate + "T00:00:00Z",
       initial_capital: capital,
@@ -102,15 +172,6 @@ export default function BacktestPage() {
     });
   };
 
-  // Toggle wallet selection
-  const toggleWallet = (address: string) => {
-    setSelectedWallets((prev) =>
-      prev.includes(address)
-        ? prev.filter((a) => a !== address)
-        : [...prev, address],
-    );
-  };
-
   // Generate equity curve from results
   const backtestData = useMemo(() => {
     if (!results?.equity_curve) return [];
@@ -119,6 +180,17 @@ export default function BacktestPage() {
       value: point.value,
     }));
   }, [results]);
+
+  // Paginated trade log
+  const paginatedTradeLog = useMemo(() => {
+    if (!results?.trade_log) return [];
+    const start = tradeLogPage * TRADE_LOG_PAGE_SIZE;
+    return results.trade_log.slice(start, start + TRADE_LOG_PAGE_SIZE);
+  }, [results, tradeLogPage]);
+
+  const totalTradeLogPages = results?.trade_log
+    ? Math.ceil(results.trade_log.length / TRADE_LOG_PAGE_SIZE)
+    : 0;
 
   return (
     <div className="space-y-6">
@@ -143,16 +215,33 @@ export default function BacktestPage() {
       {/* Configuration */}
       <Card>
         <CardHeader>
-          <CardTitle>Backtest Configuration</CardTitle>
+          <CardTitle>Configuration</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Strategy</label>
-              <Button variant="outline" className="w-full justify-between">
-                Copy Trading <ChevronDown className="h-4 w-4" />
-              </Button>
+        <CardContent className="space-y-4">
+          {/* Strategy Selector */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Strategy</label>
+            <div className="flex gap-1 flex-wrap">
+              {(
+                ["arbitrage", "momentum", "mean_reversion", "grid"] as const
+              ).map((s) => (
+                <Button
+                  key={s}
+                  variant={strategyType === s ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => {
+                    setStrategyType(s);
+                    clearResults();
+                  }}
+                >
+                  {STRATEGY_LABELS[s]}
+                </Button>
+              ))}
             </div>
+          </div>
+
+          {/* Main config grid */}
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
             <div className="space-y-2">
               <label className="text-sm font-medium">Initial Capital</label>
               <div className="flex items-center border rounded-md">
@@ -223,44 +312,214 @@ export default function BacktestPage() {
                 <span className="px-3 text-muted-foreground">%</span>
               </div>
             </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Allocation</label>
-              <Button variant="outline" className="w-full justify-between">
-                Equal Weight <ChevronDown className="h-4 w-4" />
-              </Button>
-            </div>
           </div>
 
-          <div className="mt-4 space-y-2">
-            <label className="text-sm font-medium">Wallets to Copy</label>
-            {allWallets.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
-                {allWallets.map((wallet) => (
-                  <Button
-                    key={wallet.address}
-                    variant={
-                      selectedWallets.includes(wallet.address)
-                        ? "default"
-                        : "outline"
-                    }
-                    size="sm"
-                    onClick={() => toggleWallet(wallet.address)}
-                  >
-                    {wallet.label || shortenAddress(wallet.address)}
-                  </Button>
-                ))}
-                {selectedWallets.length === 0 && (
-                  <p className="text-sm text-muted-foreground ml-2">
-                    No wallets selected - will use all tracked wallets
-                  </p>
-                )}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                No wallets being tracked. Add wallets from the Trading page
-                first.
-              </p>
-            )}
+          {/* Strategy-specific parameters */}
+          <div className="border-t pt-4">
+            <label className="text-sm font-medium text-muted-foreground mb-3 block">
+              {STRATEGY_LABELS[strategyType]} Parameters
+            </label>
+            <div className="grid gap-4 md:grid-cols-3">
+              {strategyType === "arbitrage" && (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Min Spread (%)
+                    </label>
+                    <div className="flex items-center border rounded-md">
+                      <input
+                        type="number"
+                        value={minSpread}
+                        onChange={(e) => setMinSpread(Number(e.target.value))}
+                        step={0.1}
+                        className="flex-1 bg-transparent py-2 pl-3 outline-none"
+                      />
+                      <span className="px-3 text-muted-foreground">%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Minimum spread to trigger a trade
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Max Position ($)
+                    </label>
+                    <div className="flex items-center border rounded-md">
+                      <span className="px-3 text-muted-foreground">$</span>
+                      <input
+                        type="number"
+                        value={maxPosition}
+                        onChange={(e) => setMaxPosition(Number(e.target.value))}
+                        className="flex-1 bg-transparent py-2 pr-3 outline-none"
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Maximum size per position
+                    </p>
+                  </div>
+                </>
+              )}
+              {strategyType === "momentum" && (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Lookback (hours)
+                    </label>
+                    <input
+                      type="number"
+                      value={lookbackHours}
+                      onChange={(e) => setLookbackHours(Number(e.target.value))}
+                      className="w-full rounded-md border bg-transparent px-3 py-2"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Price momentum lookback period
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Threshold (%)</label>
+                    <div className="flex items-center border rounded-md">
+                      <input
+                        type="number"
+                        value={momentumThreshold}
+                        onChange={(e) =>
+                          setMomentumThreshold(Number(e.target.value))
+                        }
+                        step={0.1}
+                        className="flex-1 bg-transparent py-2 pl-3 outline-none"
+                      />
+                      <span className="px-3 text-muted-foreground">%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Momentum required to trigger entry
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Position Size (%)
+                    </label>
+                    <div className="flex items-center border rounded-md">
+                      <input
+                        type="number"
+                        value={momentumPositionSize}
+                        onChange={(e) =>
+                          setMomentumPositionSize(Number(e.target.value))
+                        }
+                        step={1}
+                        className="flex-1 bg-transparent py-2 pl-3 outline-none"
+                      />
+                      <span className="px-3 text-muted-foreground">%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Fraction of portfolio per trade
+                    </p>
+                  </div>
+                </>
+              )}
+              {strategyType === "mean_reversion" && (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Window (hours)
+                    </label>
+                    <input
+                      type="number"
+                      value={windowHours}
+                      onChange={(e) => setWindowHours(Number(e.target.value))}
+                      className="w-full rounded-md border bg-transparent px-3 py-2"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Moving average window for mean calculation
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Std Threshold</label>
+                    <input
+                      type="number"
+                      value={stdThreshold}
+                      onChange={(e) => setStdThreshold(Number(e.target.value))}
+                      step={0.1}
+                      className="w-full rounded-md border bg-transparent px-3 py-2"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Standard deviations below mean to trigger entry
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Position Size (%)
+                    </label>
+                    <div className="flex items-center border rounded-md">
+                      <input
+                        type="number"
+                        value={mrPositionSize}
+                        onChange={(e) =>
+                          setMrPositionSize(Number(e.target.value))
+                        }
+                        step={1}
+                        className="flex-1 bg-transparent py-2 pl-3 outline-none"
+                      />
+                      <span className="px-3 text-muted-foreground">%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Fraction of portfolio per trade
+                    </p>
+                  </div>
+                </>
+              )}
+              {strategyType === "grid" && (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Grid Levels</label>
+                    <input
+                      type="number"
+                      value={gridLevels}
+                      onChange={(e) => setGridLevels(Number(e.target.value))}
+                      min={1}
+                      className="w-full rounded-md border bg-transparent px-3 py-2"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Number of buy levels below center price
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Spacing (%)</label>
+                    <div className="flex items-center border rounded-md">
+                      <input
+                        type="number"
+                        value={gridSpacingPct}
+                        onChange={(e) =>
+                          setGridSpacingPct(Number(e.target.value))
+                        }
+                        step={0.1}
+                        className="flex-1 bg-transparent py-2 pl-3 outline-none"
+                      />
+                      <span className="px-3 text-muted-foreground">%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Price distance between grid levels
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">
+                      Order Size (%)
+                    </label>
+                    <div className="flex items-center border rounded-md">
+                      <input
+                        type="number"
+                        value={orderSize}
+                        onChange={(e) => setOrderSize(Number(e.target.value))}
+                        step={1}
+                        className="flex-1 bg-transparent py-2 pl-3 outline-none"
+                      />
+                      <span className="px-3 text-muted-foreground">%</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Portfolio fraction per grid order
+                    </p>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -280,9 +539,31 @@ export default function BacktestPage() {
         </Card>
       )}
 
+      {/* Running State */}
+      {isRunning && (
+        <Card>
+          <CardContent className="py-20">
+            <div className="flex flex-col items-center gap-4">
+              <Loader2 className="h-8 w-8 animate-spin text-primary" />
+              <p className="text-muted-foreground">Running backtest...</p>
+              <p className="text-xs text-muted-foreground">
+                Simulating{" "}
+                {Math.ceil(
+                  (new Date(endDate).getTime() -
+                    new Date(startDate).getTime()) /
+                    (1000 * 60 * 60 * 24),
+                )}{" "}
+                days of trading &middot; {elapsedSeconds}s elapsed
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Results */}
       {results && results.status === "completed" && (
         <>
+          {/* Primary metrics */}
           <div className="grid gap-4 md:grid-cols-4">
             <MetricCard
               title="Total Return"
@@ -308,6 +589,45 @@ export default function BacktestPage() {
             />
           </div>
 
+          {/* Extended metrics (if available) */}
+          {results.calmar_ratio != null && (
+            <div className="grid gap-4 md:grid-cols-4">
+              <MetricCard
+                title="Calmar Ratio"
+                value={results.calmar_ratio.toFixed(2)}
+                trend="neutral"
+              />
+              <MetricCard
+                title="Expectancy"
+                value={
+                  results.expectancy != null
+                    ? formatCurrency(results.expectancy)
+                    : "\u2014"
+                }
+                trend="neutral"
+              />
+              <MetricCard
+                title="VaR 95%"
+                value={
+                  results.var_95 != null
+                    ? `${(results.var_95 * 100).toFixed(2)}%`
+                    : "\u2014"
+                }
+                trend="down"
+              />
+              <MetricCard
+                title="Avg Duration"
+                value={
+                  results.avg_trade_duration_hours != null
+                    ? `${results.avg_trade_duration_hours.toFixed(1)}h`
+                    : "\u2014"
+                }
+                trend="neutral"
+              />
+            </div>
+          )}
+
+          {/* Equity Curve */}
           <Card>
             <CardHeader>
               <CardTitle>Equity Curve</CardTitle>
@@ -321,7 +641,7 @@ export default function BacktestPage() {
             </CardContent>
           </Card>
 
-          {/* Additional Stats */}
+          {/* Performance Breakdown */}
           <Card>
             <CardHeader>
               <CardTitle>Performance Breakdown</CardTitle>
@@ -330,31 +650,227 @@ export default function BacktestPage() {
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div>
                   <p className="text-sm text-muted-foreground">Final Value</p>
-                  <p className="font-medium">
+                  <p className="font-medium tabular-nums">
                     {formatCurrency(results.final_value)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Total Fees</p>
-                  <p className="font-medium text-loss">
+                  <p className="font-medium tabular-nums text-loss">
                     {formatCurrency(results.total_fees)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Profit Factor</p>
-                  <p className="font-medium">
+                  <p className="font-medium tabular-nums">
                     {results.profit_factor.toFixed(2)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Sortino Ratio</p>
-                  <p className="font-medium">
+                  <p className="font-medium tabular-nums">
                     {results.sortino_ratio.toFixed(2)}
                   </p>
                 </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Avg Win</p>
+                  <p className="font-medium tabular-nums text-profit">
+                    {formatCurrency(results.avg_win)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground">Avg Loss</p>
+                  <p className="font-medium tabular-nums text-loss">
+                    {formatCurrency(results.avg_loss)}
+                  </p>
+                </div>
+                {results.best_trade_return != null && (
+                  <div>
+                    <p className="text-sm text-muted-foreground">Best Trade</p>
+                    <p className="font-medium tabular-nums text-profit">
+                      {(results.best_trade_return * 100).toFixed(1)}%
+                    </p>
+                  </div>
+                )}
+                {results.worst_trade_return != null && (
+                  <div>
+                    <p className="text-sm text-muted-foreground">Worst Trade</p>
+                    <p className="font-medium tabular-nums text-loss">
+                      {(results.worst_trade_return * 100).toFixed(1)}%
+                    </p>
+                  </div>
+                )}
+                {results.recovery_factor != null && (
+                  <div>
+                    <p className="text-sm text-muted-foreground">
+                      Recovery Factor
+                    </p>
+                    <p className="font-medium tabular-nums">
+                      {results.recovery_factor.toFixed(2)}
+                    </p>
+                  </div>
+                )}
+                {results.max_consecutive_wins != null && (
+                  <div>
+                    <p className="text-sm text-muted-foreground">
+                      Max Consec. Wins
+                    </p>
+                    <p className="font-medium tabular-nums text-profit">
+                      {results.max_consecutive_wins}
+                    </p>
+                  </div>
+                )}
+                {results.max_consecutive_losses != null && (
+                  <div>
+                    <p className="text-sm text-muted-foreground">
+                      Max Consec. Losses
+                    </p>
+                    <p className="font-medium tabular-nums text-loss">
+                      {results.max_consecutive_losses}
+                    </p>
+                  </div>
+                )}
+                {results.cvar_95 != null && (
+                  <div>
+                    <p className="text-sm text-muted-foreground">CVaR 95%</p>
+                    <p className="font-medium tabular-nums">
+                      {(results.cvar_95 * 100).toFixed(2)}%
+                    </p>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>
+
+          {/* Trade Log */}
+          {results.trade_log && results.trade_log.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle>
+                  Trade Log ({results.trade_log.length} trades)
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b text-muted-foreground">
+                        <th className="text-left py-2 pr-4 font-medium">
+                          Market
+                        </th>
+                        <th className="text-left py-2 pr-4 font-medium">
+                          Type
+                        </th>
+                        <th className="text-right py-2 pr-4 font-medium">
+                          Entry
+                        </th>
+                        <th className="text-right py-2 pr-4 font-medium">
+                          Exit
+                        </th>
+                        <th className="text-right py-2 pr-4 font-medium">
+                          Qty
+                        </th>
+                        <th className="text-right py-2 pr-4 font-medium">
+                          P&L
+                        </th>
+                        <th className="text-right py-2 font-medium">Return</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paginatedTradeLog.map((trade, i) => (
+                        <tr
+                          key={`${trade.entry_time}-${i}`}
+                          className="border-b border-border/50"
+                        >
+                          <td className="py-2 pr-4">
+                            {shortenAddress(trade.market_id, 6)}
+                          </td>
+                          <td className="py-2 pr-4">
+                            <span
+                              className={cn(
+                                "inline-block rounded px-1.5 py-0.5 text-xs font-medium",
+                                trade.trade_type === "buy"
+                                  ? "bg-profit/10 text-profit"
+                                  : "bg-muted text-muted-foreground",
+                              )}
+                            >
+                              {trade.trade_type}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-4 text-right tabular-nums">
+                            ${trade.entry_price.toFixed(4)}
+                          </td>
+                          <td className="py-2 pr-4 text-right tabular-nums">
+                            {trade.exit_price != null
+                              ? `$${trade.exit_price.toFixed(4)}`
+                              : "\u2014"}
+                          </td>
+                          <td className="py-2 pr-4 text-right tabular-nums">
+                            {trade.quantity.toFixed(2)}
+                          </td>
+                          <td
+                            className={cn(
+                              "py-2 pr-4 text-right tabular-nums",
+                              trade.pnl != null && trade.pnl >= 0
+                                ? "text-profit"
+                                : "text-loss",
+                            )}
+                          >
+                            {trade.pnl != null
+                              ? formatCurrency(trade.pnl, { showSign: true })
+                              : "\u2014"}
+                          </td>
+                          <td
+                            className={cn(
+                              "py-2 text-right tabular-nums",
+                              trade.return_pct != null && trade.return_pct >= 0
+                                ? "text-profit"
+                                : "text-loss",
+                            )}
+                          >
+                            {trade.return_pct != null
+                              ? `${trade.return_pct >= 0 ? "+" : ""}${(trade.return_pct * 100).toFixed(1)}%`
+                              : "\u2014"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {totalTradeLogPages > 1 && (
+                  <div className="flex items-center justify-between pt-4">
+                    <p className="text-xs text-muted-foreground">
+                      Page {tradeLogPage + 1} of {totalTradeLogPages}
+                    </p>
+                    <div className="flex gap-1">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setTradeLogPage((p) => Math.max(0, p - 1))
+                        }
+                        disabled={tradeLogPage === 0}
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          setTradeLogPage((p) =>
+                            Math.min(totalTradeLogPages - 1, p + 1),
+                          )
+                        }
+                        disabled={tradeLogPage >= totalTradeLogPages - 1}
+                      >
+                        <ChevronRight className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
         </>
       )}
 
@@ -370,27 +886,6 @@ export default function BacktestPage() {
         </Card>
       )}
 
-      {/* Running State */}
-      {isRunning && (
-        <Card>
-          <CardContent className="py-20">
-            <div className="flex flex-col items-center gap-4">
-              <Loader2 className="h-8 w-8 animate-spin text-primary" />
-              <p className="text-muted-foreground">Running backtest...</p>
-              <p className="text-xs text-muted-foreground">
-                Simulating{" "}
-                {Math.ceil(
-                  (new Date(endDate).getTime() -
-                    new Date(startDate).getTime()) /
-                    (1000 * 60 * 60 * 24),
-                )}{" "}
-                days of trading
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       {/* History */}
       {history.length > 0 && (
         <Card>
@@ -402,34 +897,48 @@ export default function BacktestPage() {
           </CardHeader>
           <CardContent>
             <div className="space-y-2">
-              {history.slice(0, 5).map((result) => (
-                <div
-                  key={result.id}
-                  className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 cursor-pointer transition-colors"
-                  onClick={() => loadResult(result.id)}
-                >
-                  <div>
-                    <p className="font-medium text-sm capitalize">
-                      {result.strategy.type.replace(/_/g, " ")}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {new Date(result.created_at).toLocaleDateString()} |
-                      {result.start_date} to {result.end_date}
-                    </p>
+              {history
+                .filter((r) => r.status === "completed")
+                .slice(0, 10)
+                .map((result) => (
+                  <div
+                    key={result.id}
+                    className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 cursor-pointer transition-colors"
+                    onClick={() => {
+                      setTradeLogPage(0);
+                      loadResult(result.id);
+                    }}
+                  >
+                    <div>
+                      <p className="font-medium text-sm">
+                        {STRATEGY_LABELS[
+                          result.strategy.type as StrategyType
+                        ] ?? result.strategy.type}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {new Date(result.created_at).toLocaleDateString()} |{" "}
+                        {result.start_date?.split("T")[0]} to{" "}
+                        {result.end_date?.split("T")[0]}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p
+                        className={cn(
+                          "font-medium tabular-nums",
+                          result.total_return_pct >= 0
+                            ? "text-profit"
+                            : "text-loss",
+                        )}
+                      >
+                        {result.total_return_pct >= 0 ? "+" : ""}
+                        {result.total_return_pct.toFixed(1)}%
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {result.total_trades} trades
+                      </p>
+                    </div>
                   </div>
-                  <div className="text-right">
-                    <p
-                      className={`font-medium ${result.total_return_pct >= 0 ? "text-profit" : "text-loss"}`}
-                    >
-                      {result.total_return_pct >= 0 ? "+" : ""}
-                      {result.total_return_pct.toFixed(1)}%
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {result.total_trades} trades
-                    </p>
-                  </div>
-                </div>
-              ))}
+                ))}
             </div>
           </CardContent>
         </Card>

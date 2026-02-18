@@ -1,8 +1,8 @@
-'use client';
+"use client";
 
-import { useState, useCallback, useRef, useEffect } from 'react';
-import { api } from '@/lib/api';
-import type { BacktestParams, BacktestResult } from '@/types/api';
+import { useState, useCallback, useRef, useEffect } from "react";
+import { api } from "@/lib/api";
+import type { BacktestParams, BacktestResult } from "@/types/api";
 
 interface UseBacktestReturn {
   results: BacktestResult | null;
@@ -12,6 +12,7 @@ interface UseBacktestReturn {
   runBacktest: (params: BacktestParams) => Promise<void>;
   loadHistory: () => Promise<void>;
   loadResult: (id: string) => Promise<void>;
+  clearResults: () => void;
 }
 
 export function useBacktest(): UseBacktestReturn {
@@ -42,7 +43,7 @@ export function useBacktest(): UseBacktestReturn {
       const result = await api.runBacktest(params);
 
       // Poll for results if status is pending/running
-      if (result.status === 'pending' || result.status === 'running') {
+      if (result.status === "pending" || result.status === "running") {
         const pollForResults = async () => {
           let attempts = 0;
           const maxAttempts = 60; // 5 minutes max
@@ -54,20 +55,20 @@ export function useBacktest(): UseBacktestReturn {
 
             const updated = await api.getBacktestResult(result.id);
 
-            if (updated.status === 'completed') {
+            if (updated.status === "completed") {
               setResults(updated);
               setHistory((prev) => [updated, ...prev]);
               return;
             }
 
-            if (updated.status === 'failed') {
-              throw new Error(updated.error || 'Backtest failed');
+            if (updated.status === "failed") {
+              throw new Error(updated.error || "Backtest failed");
             }
 
             attempts++;
           }
 
-          throw new Error('Backtest timed out');
+          throw new Error("Backtest timed out");
         };
 
         await pollForResults();
@@ -77,8 +78,8 @@ export function useBacktest(): UseBacktestReturn {
       }
     } catch (err) {
       if (controller.signal.aborted) return;
-      setError(err instanceof Error ? err.message : 'Failed to run backtest');
-      console.error('Failed to run backtest:', err);
+      setError(err instanceof Error ? err.message : "Failed to run backtest");
+      console.error("Failed to run backtest:", err);
     } finally {
       if (!controller.signal.aborted) {
         setIsRunning(false);
@@ -92,7 +93,7 @@ export function useBacktest(): UseBacktestReturn {
       const data = await api.getBacktestResults({ limit: 20 });
       setHistory(data);
     } catch (err) {
-      console.error('Failed to load backtest history:', err);
+      console.error("Failed to load backtest history:", err);
     }
   }, []);
 
@@ -102,8 +103,14 @@ export function useBacktest(): UseBacktestReturn {
       const result = await api.getBacktestResult(id);
       setResults(result);
     } catch (err) {
-      console.error('Failed to load backtest result:', err);
+      console.error("Failed to load backtest result:", err);
     }
+  }, []);
+
+  // Clear current results
+  const clearResults = useCallback(() => {
+    setResults(null);
+    setError(null);
   }, []);
 
   return {
@@ -114,5 +121,6 @@ export function useBacktest(): UseBacktestReturn {
     runBacktest,
     loadHistory,
     loadResult,
+    clearResults,
   };
 }
