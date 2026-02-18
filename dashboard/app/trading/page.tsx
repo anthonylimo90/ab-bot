@@ -205,8 +205,12 @@ export default function TradingPage() {
   const { data: liveClosedPositions = [] } = usePositionsQuery({
     status: "closed",
   });
-  const { primaryWallet } = useWalletStore();
-  const { data: walletBalance } = useWalletBalanceQuery(primaryWallet);
+  const hasConnectedWallet = useWalletStore(
+    (state) => state.connectedWallets.length > 0,
+  );
+  const { data: walletBalance } = useWalletBalanceQuery(
+    hasConnectedWallet ? "active" : null,
+  );
 
   // Group open positions by wallet address
   const positionsByWallet = useMemo(() => {

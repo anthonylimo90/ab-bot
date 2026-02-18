@@ -6,6 +6,7 @@ use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -15,6 +16,20 @@ use auth::jwt::Claims;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+
+async fn resolve_primary_wallet_address(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let primary: Option<(String,)> = sqlx::query_as(
+        "SELECT address FROM user_wallets WHERE user_id = $1 AND is_primary = true LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(primary.map(|(address,)| address))
+}
 
 /// Request to store a wallet.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -453,7 +468,7 @@ pub struct WalletBalanceResponse {
     get,
     path = "/api/v1/vault/wallets/{address}/balance",
     params(
-        ("address" = String, Path, description = "Wallet address")
+        ("address" = String, Path, description = "Wallet address, 'primary', or 'active'")
     ),
     responses(
         (status = 200, description = "Wallet USDC balance", body = WalletBalanceResponse),
@@ -474,7 +489,27 @@ pub async fn get_wallet_balance(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
-    let address = address.to_lowercase();
+    let requested = address.to_lowercase();
+
+    // Support aliases:
+    // - "primary": user's primary connected wallet
+    // - "active": currently loaded live trading wallet (fallback to primary)
+    let address = if requested == "primary" {
+        match resolve_primary_wallet_address(&state.pool, user_id).await? {
+            Some(primary_address) => primary_address,
+            None => return Err(ApiError::NotFound("No primary wallet connected".into())),
+        }
+    } else if requested == "active" {
+        match state.order_executor.wallet_address().await {
+            Some(active_address) => active_address.to_lowercase(),
+            None => match resolve_primary_wallet_address(&state.pool, user_id).await? {
+                Some(primary_address) => primary_address,
+                None => return Err(ApiError::NotFound("No active or primary wallet connected".into())),
+            },
+        }
+    } else {
+        requested
+    };
 
     // Verify user owns this wallet
     let wallet_exists: Option<(Uuid,)> =

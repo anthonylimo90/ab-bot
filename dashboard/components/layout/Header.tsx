@@ -21,6 +21,7 @@ import {
   Plus,
   Pause,
   Play,
+  Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -39,6 +40,13 @@ import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
 import { useToastStore } from "@/stores/toast-store";
 import api from "@/lib/api";
+
+const usdFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
 
 const mobileNavSections = [
   {
@@ -113,9 +121,30 @@ export function Header() {
   });
   const hasWallet = useWalletStore(selectHasConnectedWallet);
   const primaryWallet = useWalletStore(selectPrimaryWallet);
-  const { data: walletBalance } = useWalletBalanceQuery(
-    primaryWallet?.address ?? null,
+  const {
+    data: walletBalance,
+    isPending: isWalletBalancePending,
+    isError: isWalletBalanceError,
+    isFetching: isWalletBalanceFetching,
+    error: walletBalanceError,
+  } = useWalletBalanceQuery(
+    hasWallet ? "active" : null,
   );
+
+  const usdcBalance =
+    typeof walletBalance?.usdc_balance === "number"
+      ? walletBalance.usdc_balance
+      : Number(walletBalance?.usdc_balance);
+  const hasUsdcBalance = Number.isFinite(usdcBalance);
+  const walletLabel =
+    primaryWallet?.label ||
+    (primaryWallet
+      ? `${primaryWallet.address.slice(0, 6)}...${primaryWallet.address.slice(-4)}`
+      : "");
+  const walletBalanceErrorMessage =
+    walletBalanceError instanceof Error
+      ? walletBalanceError.message
+      : "Unable to fetch wallet balance";
 
   const modeLabel =
     currentWorkspace?.setup_mode === "automatic" ? "Guided" : "Custom";
@@ -188,6 +217,7 @@ export function Header() {
             variant="ghost"
             size="icon"
             onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            aria-label={isMobileMenuOpen ? "Close navigation menu" : "Open navigation menu"}
           >
             {isMobileMenuOpen ? (
               <X className="h-5 w-5" />
@@ -276,34 +306,54 @@ export function Header() {
 
           {/* Wallet Balance & Info */}
           {hasWallet && primaryWallet ? (
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted text-sm">
-              <Wallet className="h-4 w-4 text-muted-foreground" />
-              {walletBalance != null ? (
-                <span className="font-medium">
-                  {new Intl.NumberFormat("en-US", {
-                    style: "currency",
-                    currency: "USD",
-                    minimumFractionDigits: 2,
-                    maximumFractionDigits: 2,
-                  }).format(walletBalance.usdc_balance)}
-                </span>
-              ) : (
-                <span className="text-xs text-muted-foreground">...</span>
+            <div
+              className={cn(
+                "flex max-w-[20rem] items-center gap-2 rounded-full border px-3 py-1.5",
+                isWalletBalanceError
+                  ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
+                  : "border-border/60 bg-card/70",
               )}
-              <span className="hidden sm:inline text-[10px] text-muted-foreground">
-                USDC.e
-              </span>
-              <span className="hidden md:inline text-muted-foreground">
-                &middot;
-              </span>
-              <span className="hidden md:inline font-mono text-xs text-muted-foreground">
-                {primaryWallet.label ||
-                  `${primaryWallet.address.slice(0, 6)}...${primaryWallet.address.slice(-4)}`}
-              </span>
+              title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
+              aria-live="polite"
+            >
+              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted">
+                {isWalletBalancePending ? (
+                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                ) : (
+                  <Wallet className="h-4 w-4 text-muted-foreground" />
+                )}
+              </div>
+              <div className="min-w-0">
+                <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  Available USDC.e
+                </div>
+                <div className="flex items-center gap-2">
+                  {hasUsdcBalance ? (
+                    <span className="text-sm font-semibold tabular-nums">
+                      {usdFormatter.format(usdcBalance)}
+                    </span>
+                  ) : isWalletBalancePending ? (
+                    <span className="text-xs text-muted-foreground">
+                      Loading balance
+                    </span>
+                  ) : (
+                    <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                      Balance unavailable
+                    </span>
+                  )}
+                  {isWalletBalanceFetching && hasUsdcBalance && (
+                    <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                  )}
+                  <span className="hidden max-w-[8.5rem] truncate text-xs text-muted-foreground lg:inline">
+                    {walletLabel}
+                  </span>
+                </div>
+              </div>
             </div>
           ) : (
             <button
               onClick={() => setShowConnectModal(true)}
+              aria-label="Connect trading wallet"
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 text-sm font-medium transition-colors"
             >
               <Plus className="h-4 w-4" />
@@ -317,7 +367,12 @@ export function Header() {
           />
 
           <Link href="/settings">
-            <Button variant="ghost" size="icon" className="hidden sm:flex">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="hidden sm:flex"
+              aria-label="Open settings"
+            >
               <Settings className="h-4 w-4" />
             </Button>
           </Link>
@@ -329,6 +384,9 @@ export function Header() {
               size="sm"
               className="gap-1"
               onClick={() => setIsUserMenuOpen(!isUserMenuOpen)}
+              aria-expanded={isUserMenuOpen}
+              aria-haspopup="menu"
+              aria-label="Open user menu"
             >
               <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-primary-foreground text-xs font-medium">
                 {userInitials}
