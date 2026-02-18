@@ -32,6 +32,7 @@ pub mod metrics_calculator;
 pub mod middleware;
 pub mod redis_forwarder;
 pub mod routes;
+pub mod schema;
 pub mod state;
 pub mod wallet_harvester;
 pub mod websocket;
