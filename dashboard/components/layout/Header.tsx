@@ -274,35 +274,41 @@ export function Header() {
 
           <ConnectionStatus status={wsStatus} />
 
-          {/* Wallet Info */}
+          {/* Wallet Balance & Info */}
           {hasWallet && primaryWallet ? (
-            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted text-sm">
+            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted text-sm">
               <Wallet className="h-4 w-4 text-muted-foreground" />
-              <span className="font-mono text-xs">
+              {walletBalance != null ? (
+                <span className="font-medium">
+                  {new Intl.NumberFormat("en-US", {
+                    style: "currency",
+                    currency: "USD",
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  }).format(walletBalance.usdc_balance)}
+                </span>
+              ) : (
+                <span className="text-xs text-muted-foreground">...</span>
+              )}
+              <span className="hidden sm:inline text-[10px] text-muted-foreground">
+                USDC.e
+              </span>
+              <span className="hidden md:inline text-muted-foreground">
+                &middot;
+              </span>
+              <span className="hidden md:inline font-mono text-xs text-muted-foreground">
                 {primaryWallet.label ||
                   `${primaryWallet.address.slice(0, 6)}...${primaryWallet.address.slice(-4)}`}
               </span>
-              {walletBalance != null && (
-                <>
-                  <span className="text-muted-foreground">&middot;</span>
-                  <span className="font-medium">
-                    {new Intl.NumberFormat("en-US", {
-                      style: "currency",
-                      currency: "USD",
-                      minimumFractionDigits: 0,
-                      maximumFractionDigits: 0,
-                    }).format(walletBalance.usdc_balance)}
-                  </span>
-                </>
-              )}
             </div>
           ) : (
             <button
               onClick={() => setShowConnectModal(true)}
-              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 text-sm font-medium transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 text-sm font-medium transition-colors"
             >
               <Plus className="h-4 w-4" />
-              <span>Connect</span>
+              <span className="hidden sm:inline">Connect</span>
+              <Wallet className="h-4 w-4 sm:hidden" />
             </button>
           )}
           <ConnectWalletModal
