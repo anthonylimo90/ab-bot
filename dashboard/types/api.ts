@@ -71,6 +71,17 @@ export type PositionSide = "long" | "short";
 export type PositionOutcome = "yes" | "no";
 export type PositionStatus = "open" | "closed" | "all";
 
+/** Full position lifecycle state from backend */
+export type PositionState =
+  | "pending"
+  | "open"
+  | "exit_ready"
+  | "closing"
+  | "closed"
+  | "entry_failed"
+  | "exit_failed"
+  | "stalled";
+
 export interface Position {
   id: string;
   market_id: string;
@@ -88,6 +99,14 @@ export interface Position {
   realized_pnl?: number;
   opened_at: string;
   updated_at: string;
+  /** Full lifecycle state (if returned by API) */
+  state?: PositionState;
+  /** Actual exit prices (from backend close_via_exit / close_via_resolution) */
+  yes_exit_price?: number;
+  no_exit_price?: number;
+  /** Fee breakdown */
+  entry_fees?: number;
+  exit_fees?: number;
 }
 
 // Market types
@@ -145,6 +164,8 @@ export interface WalletMetrics {
   address: string;
   roi: number;
   sharpe_ratio: number;
+  sortino_ratio?: number;
+  volatility?: number;
   max_drawdown: number;
   avg_trade_size: number;
   avg_hold_time_hours: number;
@@ -207,6 +228,10 @@ export interface Order {
   price?: number;
   avg_fill_price?: number;
   stop_price?: number;
+  /** Expected price at signal detection time (for slippage checks) */
+  expected_price?: number;
+  /** Calculated slippage: |avg_fill_price - expected_price| / expected_price */
+  slippage_pct?: number;
   time_in_force: string;
   created_at: string;
   updated_at: string;
@@ -558,6 +583,8 @@ export interface DiscoveredWallet {
   roi_30d: number;
   roi_90d: number;
   sharpe_ratio: number;
+  sortino_ratio?: number;
+  volatility?: number;
   total_trades: number;
   win_rate: number;
   max_drawdown: number;

@@ -73,6 +73,33 @@ impl BinaryMarketBook {
         Some((yes_ask, no_ask, yes_ask + no_ask))
     }
 
+    /// Calculate entry cost with liquidity depth validation.
+    /// Returns None if either side has less than `min_depth_usd` at best ask.
+    /// Returns (yes_ask, no_ask, total_cost, yes_size, no_size).
+    pub fn entry_cost_with_depth(
+        &self,
+        min_depth_usd: Decimal,
+    ) -> Option<(Decimal, Decimal, Decimal, Decimal, Decimal)> {
+        let yes_ask_level = self.yes_book.asks.first()?;
+        let no_ask_level = self.no_book.asks.first()?;
+
+        let yes_notional = yes_ask_level.price * yes_ask_level.size;
+        let no_notional = no_ask_level.price * no_ask_level.size;
+
+        // Both sides must have sufficient depth
+        if yes_notional < min_depth_usd || no_notional < min_depth_usd {
+            return None;
+        }
+
+        Some((
+            yes_ask_level.price,
+            no_ask_level.price,
+            yes_ask_level.price + no_ask_level.price,
+            yes_ask_level.size,
+            no_ask_level.size,
+        ))
+    }
+
     /// Calculate the total value if selling both positions now.
     /// Returns (yes_bid, no_bid, total_value).
     pub fn exit_value(&self) -> Option<(Decimal, Decimal, Decimal)> {

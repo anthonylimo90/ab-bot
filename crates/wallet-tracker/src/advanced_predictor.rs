@@ -578,9 +578,36 @@ impl MarketConditionAnalyzer {
     }
 
     async fn calculate_market_trend(&self) -> Result<f64> {
-        // Simplified trend calculation
-        // Would typically use price data
-        Ok(0.0)
+        // Compare recent 6h arb opportunity volume vs prior 6h to detect trend.
+        // Positive = more opportunities (spread widening / bear), negative = fewer (bull/calm).
+        let result: Option<(Option<Decimal>, Option<Decimal>)> = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT COUNT(*)::numeric FROM arb_opportunities
+                 WHERE timestamp > NOW() - INTERVAL '6 hours') as recent_count,
+                (SELECT COUNT(*)::numeric FROM arb_opportunities
+                 WHERE timestamp BETWEEN NOW() - INTERVAL '12 hours'
+                   AND NOW() - INTERVAL '6 hours') as prior_count
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match result {
+            Some((Some(recent), Some(prior))) => {
+                let recent_f = rust_decimal_to_f64(recent);
+                let prior_f = rust_decimal_to_f64(prior);
+                if prior_f == 0.0 {
+                    return Ok(0.0);
+                }
+                // Rate of change: positive = more arb opportunities = bearish market
+                // Negative = fewer opportunities = bullish/tighter spreads
+                let trend = (recent_f - prior_f) / prior_f;
+                // Negate so positive = bullish (fewer arbs = tighter spreads = healthy market)
+                Ok(-trend)
+            }
+            _ => Ok(0.0),
+        }
     }
 }
 

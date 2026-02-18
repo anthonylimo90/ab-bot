@@ -437,6 +437,59 @@ export default function RiskPage() {
           </div>
         )}
 
+        {/* Signal Quality Thresholds */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Zap className="h-4 w-4" />
+              Signal Quality Thresholds
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm text-muted-foreground mb-4">
+              Filters applied before arb entry signals are published.
+            </p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground mb-1">
+                  Min Net Profit
+                </p>
+                <p className="text-lg font-bold tabular-nums">0.5%</p>
+                <p className="text-xs text-muted-foreground">
+                  Must clear fees + slippage
+                </p>
+              </div>
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground mb-1">
+                  Signal Cooldown
+                </p>
+                <p className="text-lg font-bold tabular-nums">60s</p>
+                <p className="text-xs text-muted-foreground">
+                  Per-market dedup window
+                </p>
+              </div>
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground mb-1">
+                  Min Depth
+                </p>
+                <p className="text-lg font-bold tabular-nums">$100</p>
+                <p className="text-xs text-muted-foreground">
+                  Both sides at best ask
+                </p>
+              </div>
+              <div className="rounded-lg border p-3">
+                <p className="text-xs text-muted-foreground mb-1">
+                  Trading Fee
+                </p>
+                <p className="text-lg font-bold tabular-nums">2.0%</p>
+                <p className="text-xs text-muted-foreground">
+                  Applied to notional cost
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
         {/* Service Health */}
         {serviceStatus && (
           <Card>

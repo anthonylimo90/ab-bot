@@ -12,6 +12,8 @@ use hmac::{Hmac, Mac};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration as StdDuration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -234,6 +236,7 @@ impl ClobClient {
 
     /// Subscribe to real-time order book updates via WebSocket.
     /// Returns a channel receiver that yields order book updates.
+    /// Automatically reconnects with exponential backoff on disconnection.
     pub async fn subscribe_orderbook(
         &self,
         market_ids: Vec<String>,
@@ -242,24 +245,65 @@ impl ClobClient {
         let ws_url = self.ws_url.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = Self::ws_loop(ws_url, market_ids, tx).await {
-                warn!("WebSocket connection ended: {}", e);
-            }
+            Self::ws_loop_with_reconnect(ws_url, market_ids, tx).await;
         });
 
         Ok(rx)
     }
 
-    async fn ws_loop(
+    /// WebSocket loop with automatic reconnection and exponential backoff.
+    async fn ws_loop_with_reconnect(
         ws_url: String,
         market_ids: Vec<String>,
         tx: mpsc::Sender<OrderBookUpdate>,
+    ) {
+        let mut attempt = 0u32;
+        let max_backoff_secs = 60u64;
+        let base_delay_secs = 1u64;
+
+        loop {
+            match Self::ws_loop(&ws_url, &market_ids, &tx).await {
+                Ok(()) => {
+                    info!("WebSocket connection closed cleanly");
+                }
+                Err(e) => {
+                    warn!(attempt = attempt + 1, error = %e, "WebSocket connection failed");
+                }
+            }
+
+            // Check if the receiver has been dropped (no one listening)
+            if tx.is_closed() {
+                info!("WebSocket receiver dropped, stopping reconnection");
+                return;
+            }
+
+            // Exponential backoff: 1s, 2s, 4s, 8s, ... up to max_backoff_secs
+            let delay_secs = std::cmp::min(
+                base_delay_secs.saturating_mul(2u64.saturating_pow(attempt)),
+                max_backoff_secs,
+            );
+            warn!(
+                delay_secs = delay_secs,
+                attempt = attempt + 1,
+                "Reconnecting WebSocket in {}s",
+                delay_secs
+            );
+            tokio::time::sleep(StdDuration::from_secs(delay_secs)).await;
+
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    async fn ws_loop(
+        ws_url: &str,
+        market_ids: &[String],
+        tx: &mpsc::Sender<OrderBookUpdate>,
     ) -> Result<()> {
-        let (ws_stream, _) = connect_async(&ws_url).await?;
+        let (ws_stream, _) = connect_async(ws_url).await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Subscribe to markets
-        for market_id in &market_ids {
+        for market_id in market_ids {
             let subscribe_msg = serde_json::json!({
                 "type": "subscribe",
                 "market": market_id,
@@ -268,7 +312,7 @@ impl ClobClient {
             write.send(Message::Text(subscribe_msg.to_string())).await?;
             debug!("Subscribed to market: {}", market_id);
         }
-        info!("Subscribed to {} markets", market_ids.len());
+        info!("Subscribed to {} markets via WebSocket", market_ids.len());
 
         // Process incoming messages
         while let Some(msg) = read.next().await {
@@ -278,7 +322,7 @@ impl ClobClient {
                         if let Some(update) = ws_msg.into_update() {
                             if tx.send(update).await.is_err() {
                                 warn!("Receiver dropped, closing WebSocket");
-                                break;
+                                return Ok(());
                             }
                         }
                     }
@@ -291,11 +335,11 @@ impl ClobClient {
                 }
                 Ok(Message::Close(_)) => {
                     info!("WebSocket closed by server");
-                    break;
+                    return Ok(());
                 }
                 Err(e) => {
                     warn!("WebSocket receive error: {}", e);
-                    break;
+                    return Err(e.into());
                 }
                 _ => {}
             }
@@ -717,11 +761,26 @@ pub struct PostOrderResponse {
     /// Order ID assigned by the CLOB.
     #[serde(rename = "orderID")]
     pub order_id: String,
-    /// Status of the order.
+    /// Status of the order (e.g. "matched", "delayed", "unmatched").
     pub status: String,
     /// Transaction hash if applicable.
     #[serde(rename = "transactionHash")]
     pub transaction_hash: Option<String>,
+}
+
+impl PostOrderResponse {
+    /// Check if the order was successfully matched/filled.
+    /// FOK orders that fail return status "unmatched".
+    pub fn is_filled(&self) -> bool {
+        let s = self.status.to_lowercase();
+        s == "matched" || s == "live" || s == "delayed"
+    }
+
+    /// Check if the order was explicitly not filled (FOK rejection).
+    pub fn is_unfilled(&self) -> bool {
+        let s = self.status.to_lowercase();
+        s == "unmatched" || s == "rejected"
+    }
 }
 
 /// Open order information.
@@ -758,6 +817,10 @@ pub struct AuthenticatedClobClient {
     neg_risk_signer: OrderSigner,
     /// API credentials for L2 authentication (optional until derived).
     credentials: Option<ApiCredentials>,
+    /// Cache for is_neg_risk lookups (token_id -> bool). Rarely changes per token.
+    neg_risk_cache: Mutex<HashMap<String, bool>>,
+    /// Cache for fee_rate_bps lookups (token_id -> bps). Rarely changes per token.
+    fee_rate_cache: Mutex<HashMap<String, u64>>,
 }
 
 impl AuthenticatedClobClient {
@@ -769,6 +832,8 @@ impl AuthenticatedClobClient {
             signer,
             neg_risk_signer,
             credentials: None,
+            neg_risk_cache: Mutex::new(HashMap::new()),
+            fee_rate_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -784,6 +849,8 @@ impl AuthenticatedClobClient {
             signer,
             neg_risk_signer,
             credentials: Some(credentials),
+            neg_risk_cache: Mutex::new(HashMap::new()),
+            fee_rate_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -916,7 +983,13 @@ impl AuthenticatedClobClient {
     }
 
     /// Query the CLOB API for whether a token uses the neg-risk exchange.
+    /// Results are cached per token_id since neg-risk status rarely changes.
     async fn is_neg_risk(&self, token_id: &str) -> Result<bool> {
+        // Check cache first
+        if let Some(&cached) = self.neg_risk_cache.lock().unwrap().get(token_id) {
+            return Ok(cached);
+        }
+
         let url = format!("{}/neg-risk?token_id={}", self.client.base_url, token_id);
         let response = self.client.http_client.get(&url).send().await?;
 
@@ -940,16 +1013,28 @@ impl AuthenticatedClobClient {
             e
         })?;
 
+        // Store in cache
+        self.neg_risk_cache
+            .lock()
+            .unwrap()
+            .insert(token_id.to_string(), result.neg_risk);
+
         debug!(
             token_id = token_id,
             neg_risk = result.neg_risk,
-            "Queried neg-risk status"
+            "Queried and cached neg-risk status"
         );
         Ok(result.neg_risk)
     }
 
     /// Query the CLOB API for the taker fee rate for a token.
+    /// Results are cached per token_id since fee rates rarely change.
     async fn get_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
+        // Check cache first
+        if let Some(&cached) = self.fee_rate_cache.lock().unwrap().get(token_id) {
+            return Ok(cached);
+        }
+
         let url = format!("{}/fee-rate?token_id={}", self.client.base_url, token_id);
         let response = self.client.http_client.get(&url).send().await?;
 
@@ -981,7 +1066,17 @@ impl AuthenticatedClobClient {
             0
         };
 
-        debug!(token_id = token_id, fee_rate_bps = fee, "Fetched fee rate");
+        // Store in cache
+        self.fee_rate_cache
+            .lock()
+            .unwrap()
+            .insert(token_id.to_string(), fee);
+
+        debug!(
+            token_id = token_id,
+            fee_rate_bps = fee,
+            "Fetched and cached fee rate"
+        );
         Ok(fee)
     }
 

@@ -586,11 +586,11 @@ impl ProfitabilityAnalyzer {
             return 0.0;
         }
 
-        // Annualize: assume 252 trading days
-        let daily_rf = self.risk_free_rate / 252.0;
+        // Annualize: 365 days (Polymarket trades 24/7, not stock market hours)
+        let daily_rf = self.risk_free_rate / 365.0;
         let excess_return = mean_return - daily_rf;
 
-        (excess_return / std_dev) * (252.0_f64).sqrt()
+        (excess_return / std_dev) * (365.0_f64).sqrt()
     }
 
     fn calculate_sortino_ratio(&self, returns: &[DailyReturn]) -> f64 {
@@ -619,10 +619,10 @@ impl ProfitabilityAnalyzer {
             return f64::INFINITY;
         }
 
-        let daily_rf = self.risk_free_rate / 252.0;
+        let daily_rf = self.risk_free_rate / 365.0;
         let excess_return = mean_return - daily_rf;
 
-        (excess_return / downside_dev) * (252.0_f64).sqrt()
+        (excess_return / downside_dev) * (365.0_f64).sqrt()
     }
 
     fn calculate_max_drawdown(&self, returns: &[DailyReturn]) -> (f64, i64) {
@@ -664,7 +664,7 @@ impl ProfitabilityAnalyzer {
         let data = Data::new(return_values);
 
         // Annualized volatility
-        data.std_dev().unwrap_or(0.0) * (252.0_f64).sqrt()
+        data.std_dev().unwrap_or(0.0) * (365.0_f64).sqrt()
     }
 
     fn calculate_downside_deviation(&self, returns: &[DailyReturn]) -> f64 {
@@ -679,7 +679,7 @@ impl ProfitabilityAnalyzer {
         }
 
         (negative_returns.iter().sum::<f64>() / negative_returns.len() as f64).sqrt()
-            * (252.0_f64).sqrt()
+            * (365.0_f64).sqrt()
     }
 
     fn calculate_consistency_score(&self, pnls: &[f64]) -> f64 {
