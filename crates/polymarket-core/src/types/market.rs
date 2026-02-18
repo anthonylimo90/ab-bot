@@ -102,7 +102,8 @@ impl ArbOpportunity {
     pub fn calculate(book: &BinaryMarketBook, fee: Decimal) -> Option<Self> {
         let (yes_ask, no_ask, total_cost) = book.entry_cost()?;
         let gross_profit = Decimal::ONE - total_cost;
-        let net_profit = gross_profit - fee;
+        // Fee is a rate (e.g. 0.02 = 2%) applied to the notional cost of both legs
+        let net_profit = gross_profit - (total_cost * fee);
 
         Some(Self {
             market_id: book.market_id.clone(),
@@ -160,12 +161,13 @@ mod tests {
 
         // Total cost: 0.48 + 0.46 = 0.94
         // Gross profit: 1.00 - 0.94 = 0.06
-        // Net profit: 0.06 - 0.02 = 0.04
+        // Fees: 0.94 * 0.02 = 0.0188
+        // Net profit: 0.06 - 0.0188 = 0.0412
         let arb = ArbOpportunity::calculate(&book, ArbOpportunity::DEFAULT_FEE).unwrap();
 
         assert_eq!(arb.total_cost, Decimal::new(94, 2));
         assert_eq!(arb.gross_profit, Decimal::new(6, 2));
-        assert_eq!(arb.net_profit, Decimal::new(4, 2));
+        assert_eq!(arb.net_profit, Decimal::new(412, 4)); // 0.0412
         assert!(arb.is_profitable());
     }
 

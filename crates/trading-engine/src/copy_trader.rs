@@ -160,6 +160,7 @@ pub enum CopyTradeRejection {
     DailyCapitalLimitReached { deployed: Decimal, limit: Decimal },
     TooManyOpenPositions { current: usize, limit: usize },
     BelowMinTradeValue { value: Decimal, min: Decimal },
+    SlippageTooHigh { slippage_pct: Decimal, max: Decimal },
 }
 
 /// Copy trading engine that mirrors trades from successful wallets.
@@ -398,6 +399,42 @@ impl CopyTrader {
                 "Calculated copy quantity is zero, skipping"
             );
             return Ok(None);
+        }
+
+        // Pre-trade slippage check: compare current market price to source trade price
+        if trade.price > Decimal::ZERO && self.policy.max_slippage_pct > Decimal::ZERO {
+            let slippage_result = async {
+                let book = self
+                    .executor
+                    .clob_client()
+                    .get_order_book(&trade.outcome_id)
+                    .await?;
+                let market_price = match trade.side {
+                    OrderSide::Buy => book.asks.first().map(|l| l.price),
+                    OrderSide::Sell => book.bids.first().map(|l| l.price),
+                };
+                Ok::<Option<Decimal>, anyhow::Error>(market_price)
+            }
+            .await;
+
+            if let Ok(Some(market_price)) = slippage_result {
+                let slippage_pct = if trade.price > Decimal::ZERO {
+                    ((market_price - trade.price) / trade.price).abs()
+                } else {
+                    Decimal::ZERO
+                };
+                if slippage_pct > self.policy.max_slippage_pct {
+                    warn!(
+                        wallet = %trade.wallet_address,
+                        source_price = %trade.price,
+                        market_price = %market_price,
+                        slippage_pct = %slippage_pct,
+                        max = %self.policy.max_slippage_pct,
+                        "Slippage too high, skipping copy trade"
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
         info!(

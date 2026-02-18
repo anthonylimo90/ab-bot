@@ -245,7 +245,7 @@ impl CopyStopLossMonitor {
                     pnl_pct = %pnl_pct,
                     "Stop-loss triggered for copy trade"
                 );
-                self.close_position(pos, current_price, "stop_loss").await;
+                self.close_position(pos, "stop_loss").await;
                 continue;
             }
 
@@ -257,7 +257,7 @@ impl CopyStopLossMonitor {
                     pnl_pct = %pnl_pct,
                     "Take-profit triggered for copy trade"
                 );
-                self.close_position(pos, current_price, "take_profit").await;
+                self.close_position(pos, "take_profit").await;
                 continue;
             }
 
@@ -269,7 +269,7 @@ impl CopyStopLossMonitor {
                     hold_hours = hold_hours,
                     "Max hold time exceeded for copy trade"
                 );
-                self.close_position(pos, current_price, "time_exit").await;
+                self.close_position(pos, "time_exit").await;
             }
         }
 
@@ -316,16 +316,39 @@ impl CopyStopLossMonitor {
                 opened_at,
             };
 
-            let current_price = wallet_trade.price;
-            self.close_position(&pos, current_price, "mirror_exit")
-                .await;
+            self.close_position(&pos, "mirror_exit").await;
         }
 
         Ok(())
     }
 
     /// Close a copy trade position by placing a sell order.
-    async fn close_position(&self, pos: &CopyPosition, current_price: Decimal, reason: &str) {
+    ///
+    /// Uses an atomic claim pattern: sets `state = 3` (Closing) with a
+    /// `WHERE is_open = true` guard so only one concurrent caller wins.
+    async fn close_position(&self, pos: &CopyPosition, reason: &str) {
+        // Atomically claim the position — transition to Closing.
+        // If another task already claimed it, this returns 0 rows and we skip.
+        let claimed = match sqlx::query_scalar::<_, uuid::Uuid>(
+            "UPDATE positions SET state = 3, is_open = false WHERE id = $1 AND is_open = true RETURNING id",
+        )
+        .bind(pos.id)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                debug!(position_id = %pos.id, "Position already claimed by another task, skipping");
+                return;
+            }
+            Err(e) => {
+                error!(error = %e, position_id = %pos.id, "Failed to claim position for closing");
+                return;
+            }
+        };
+
+        debug_assert!(claimed);
+
         // Place sell order
         let order = MarketOrder::new(
             pos.market_id.clone(),
@@ -334,23 +357,21 @@ impl CopyStopLossMonitor {
             pos.quantity,
         );
 
-        let realized_pnl = (current_price - pos.entry_price) * pos.quantity;
-
         match self.order_executor.execute_market_order(order).await {
             Ok(report) if report.is_success() => {
                 let actual_pnl = (report.average_price - pos.entry_price) * report.filled_quantity
                     - report.fees_paid;
 
-                // Update position as closed in DB
+                // Finalize: mark as Closed (state = 4)
                 if let Err(e) = sqlx::query(
-                    "UPDATE positions SET is_open = false, realized_pnl = $1, exit_timestamp = NOW(), state = 4 WHERE id = $2",
+                    "UPDATE positions SET realized_pnl = $1, exit_timestamp = NOW(), state = 4 WHERE id = $2",
                 )
                 .bind(actual_pnl)
                 .bind(pos.id)
                 .execute(&self.pool)
                 .await
                 {
-                    error!(error = %e, position_id = %pos.id, "Failed to update closed position");
+                    error!(error = %e, position_id = %pos.id, "Failed to finalize closed position");
                 }
 
                 // Record with circuit breaker
@@ -392,19 +413,29 @@ impl CopyStopLossMonitor {
                 let _ = self.signal_tx.send(signal);
             }
             Ok(report) => {
+                // Sell failed — revert the claim so the position can be retried
                 warn!(
                     position_id = %pos.id,
                     status = ?report.status,
                     error = ?report.error_message,
-                    "Exit order failed for copy position"
+                    "Exit order failed for copy position, reverting claim"
                 );
+                let _ = sqlx::query("UPDATE positions SET state = 1, is_open = true WHERE id = $1")
+                    .bind(pos.id)
+                    .execute(&self.pool)
+                    .await;
             }
             Err(e) => {
+                // Execution error — revert the claim so the position can be retried
                 error!(
                     position_id = %pos.id,
                     error = %e,
-                    "Failed to execute exit order for copy position"
+                    "Failed to execute exit order for copy position, reverting claim"
                 );
+                let _ = sqlx::query("UPDATE positions SET state = 1, is_open = true WHERE id = $1")
+                    .bind(pos.id)
+                    .execute(&self.pool)
+                    .await;
             }
         }
     }

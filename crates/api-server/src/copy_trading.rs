@@ -232,6 +232,10 @@ impl CopyTradingMonitor {
                     CopyTradeRejection::CircuitBreakerTripped => {
                         ("circuit_breaker", "Circuit breaker tripped".to_string())
                     }
+                    CopyTradeRejection::SlippageTooHigh { slippage_pct, max } => (
+                        "slippage",
+                        format!("Slippage {slippage_pct} exceeds max {max}"),
+                    ),
                 };
                 warn!(
                     wallet = %trade.wallet_address,

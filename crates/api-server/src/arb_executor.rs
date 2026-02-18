@@ -354,14 +354,21 @@ impl ArbAutoExecutor {
 
         // 7. Dynamic position sizing based on spread width
         let position_size = if self.config.dynamic_sizing {
-            // Scale position size proportionally to net profit margin.
-            // Wider spreads (higher profit) → larger positions.
-            // net_profit is per-share profit (e.g. 0.04 = 4 cents per $1 payout).
-            // Scale factor: net_profit * 1000, clamped to [min, max].
-            let scale = arb.net_profit * Decimal::new(1000, 0);
-            let sized = scale
-                .max(self.config.min_position_size)
-                .min(self.config.max_position_size);
+            // Linear interpolation between min and max position size
+            // based on where net_profit falls in the [min_net_profit, 0.05] range.
+            // min_net_profit (e.g. 0.001) → min_position_size ($25)
+            // 0.05+ (5 cent spread) → max_position_size ($200)
+            let floor = self.config.min_net_profit;
+            let ceiling = Decimal::new(5, 2); // 0.05
+            let range = ceiling - floor;
+            let sized = if range.is_zero() {
+                self.config.min_position_size
+            } else {
+                let t = (arb.net_profit - floor) / range;
+                let t_clamped = t.max(Decimal::ZERO).min(Decimal::ONE);
+                let size_range = self.config.max_position_size - self.config.min_position_size;
+                self.config.min_position_size + size_range * t_clamped
+            };
             debug!(
                 market_id = %market_id,
                 net_profit = %arb.net_profit,
