@@ -79,6 +79,9 @@ interface TradingWallet {
   probationUntil?: string;
   isAutoSelected?: boolean;
   consecutiveLosses?: number;
+  strategyType?: string;
+  stalenessDays?: number;
+  compositeScore?: number;
 }
 
 /** Position lifecycle state badge configuration */
@@ -175,6 +178,11 @@ function toTradingWallet(
     probationUntil: allocation.probation_until,
     isAutoSelected: allocation.auto_assigned,
     consecutiveLosses: allocation.consecutive_losses,
+    strategyType: discovered?.strategy_type ?? undefined,
+    stalenessDays: discovered?.staleness_days ?? undefined,
+    compositeScore: discovered?.composite_score
+      ? Number(discovered.composite_score) * 100
+      : undefined,
   };
 }
 

@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/tooltip";
 import { differenceInDays } from "date-fns";
 import type { CopySettings, WalletPosition } from "@/types/api";
+import { StrategyBadge, StalenessIndicator, CompositeScoreGauge } from "@/components/discover";
 
 interface WalletCardProps {
   wallet: {
@@ -49,6 +50,9 @@ interface WalletCardProps {
     probationUntil?: string;
     isAutoSelected?: boolean;
     consecutiveLosses?: number;
+    strategyType?: string;
+    stalenessDays?: number;
+    compositeScore?: number;
   };
   positions: WalletPosition[];
   onDemote?: (address: string) => void;
@@ -166,10 +170,15 @@ export const WalletCard = memo(function WalletCard({
                     </Tooltip>
                   </TooltipProvider>
                 )}
+                <CompositeScoreGauge score={wallet.compositeScore} />
               </div>
-              <p className="text-xs text-muted-foreground font-mono">
-                {shortenAddress(wallet.address)}
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs text-muted-foreground font-mono">
+                  {shortenAddress(wallet.address)}
+                </p>
+                <StrategyBadge strategy={wallet.strategyType} />
+                <StalenessIndicator stalenessDays={wallet.stalenessDays ?? 0} />
+              </div>
             </div>
           </div>
           <div className="flex items-center gap-2">

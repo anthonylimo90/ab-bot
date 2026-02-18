@@ -17,6 +17,7 @@ use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
 use wallet_tracker::discovery::WalletDiscovery;
 use wallet_tracker::trade_monitor::TradeMonitor;
+use wallet_tracker::MarketRegime;
 
 use crate::auto_optimizer::AutomationEvent;
 use crate::email::{EmailClient, EmailConfig};
@@ -85,6 +86,8 @@ pub struct AppState {
     pub trade_monitor: Option<Arc<TradeMonitor>>,
     /// Copy trader (None if copy trading disabled).
     pub copy_trader: Option<Arc<RwLock<CopyTrader>>>,
+    /// Current detected market regime, updated hourly by MetricsCalculator.
+    pub current_regime: Arc<RwLock<MarketRegime>>,
 }
 
 impl AppState {
@@ -345,6 +348,7 @@ impl AppState {
             polygon_client,
             trade_monitor: None,
             copy_trader: None,
+            current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
         })
     }
 

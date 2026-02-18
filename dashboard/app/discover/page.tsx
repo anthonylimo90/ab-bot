@@ -31,6 +31,12 @@ import {
 } from "@/lib/utils";
 import { Star, Plus, Check, Loader2, Search } from "lucide-react";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import {
+  MarketRegimeBadge,
+  StrategyBadge,
+  StalenessIndicator,
+  CompositeScoreGauge,
+} from "@/components/discover";
 import type {
   CopyBehavior,
   DiscoveredWallet,
@@ -52,6 +58,9 @@ interface DisplayWallet {
   prediction: PredictionCategory;
   confidence: number;
   tracked: boolean;
+  compositeScore?: number;
+  strategyType?: string;
+  stalenessDays: number;
 }
 
 function toDisplayWallet(w: DiscoveredWallet, rank: number): DisplayWallet {
@@ -68,6 +77,9 @@ function toDisplayWallet(w: DiscoveredWallet, rank: number): DisplayWallet {
     prediction: w.prediction,
     confidence: Number(w.confidence) || 0,
     tracked: w.is_tracked,
+    compositeScore: w.composite_score != null ? Number(w.composite_score) : undefined,
+    strategyType: w.strategy_type ?? undefined,
+    stalenessDays: w.staleness_days ?? 0,
   };
 }
 
@@ -85,7 +97,7 @@ const predictionLabels = {
   INSUFFICIENT_DATA: "Insufficient Data",
 };
 
-type SortField = "roi" | "sharpe" | "winRate" | "trades";
+type SortField = "roi" | "sharpe" | "winRate" | "trades" | "composite";
 type TimePeriod = "7d" | "30d" | "90d";
 
 export default function DiscoverPage() {
@@ -106,8 +118,8 @@ export default function DiscoverPage() {
     currentWorkspace?.id,
   );
 
-  // Filter state
-  const [sortBy, setSortBy] = useState<SortField>("roi");
+  // Filter state — default to composite score sort
+  const [sortBy, setSortBy] = useState<SortField>("composite");
   const [timePeriod, setTimePeriod] = useState<TimePeriod>("30d");
   const [minTrades, setMinTrades] = useState<string>("10");
   const [hideBots, setHideBots] = useState(true);
@@ -173,7 +185,12 @@ export default function DiscoverPage() {
     // Sort (API already returns sorted, but we can re-sort client-side if needed)
     result.sort((a, b) => {
       switch (sortBy) {
-        case "roi":
+        case "composite": {
+          const sa = a.compositeScore ?? a.roi30d;
+          const sb = b.compositeScore ?? b.roi30d;
+          return sb - sa;
+        }
+        case "roi": {
           const roiA =
             timePeriod === "7d"
               ? a.roi7d
@@ -187,6 +204,7 @@ export default function DiscoverPage() {
                 ? b.roi90d
                 : b.roi30d;
           return roiB - roiA;
+        }
         case "sharpe":
           return b.sharpe - a.sharpe;
         case "winRate":
@@ -319,6 +337,7 @@ export default function DiscoverPage() {
               Find top-performing wallets to copy
             </p>
           </div>
+          <MarketRegimeBadge />
         </div>
 
         {/* Filters */}
@@ -331,10 +350,11 @@ export default function DiscoverPage() {
                   value={sortBy}
                   onValueChange={(v) => setSortBy(v as SortField)}
                 >
-                  <SelectTrigger className="w-[120px]">
+                  <SelectTrigger className="w-[140px]">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="composite">Score</SelectItem>
                     <SelectItem value="roi">ROI</SelectItem>
                     <SelectItem value="sharpe">Sharpe</SelectItem>
                     <SelectItem value="winRate">Win Rate</SelectItem>
@@ -497,17 +517,28 @@ export default function DiscoverPage() {
                             #{wallet.rank}
                           </div>
                           <div>
-                            <p className="font-medium font-mono">
-                              {shortenAddress(wallet.address)}
-                            </p>
-                            <span
-                              className={`text-xs px-2 py-0.5 rounded-full ${
-                                predictionColors[wallet.prediction]
-                              }`}
-                            >
-                              {predictionLabels[wallet.prediction]} (
-                              {wallet.confidence}%)
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <p className="font-medium font-mono">
+                                {shortenAddress(wallet.address)}
+                              </p>
+                              <CompositeScoreGauge
+                                score={wallet.compositeScore}
+                              />
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <span
+                                className={`text-xs px-2 py-0.5 rounded-full ${
+                                  predictionColors[wallet.prediction]
+                                }`}
+                              >
+                                {predictionLabels[wallet.prediction]} (
+                                {wallet.confidence}%)
+                              </span>
+                              <StrategyBadge strategy={wallet.strategyType} />
+                              <StalenessIndicator
+                                stalenessDays={wallet.stalenessDays}
+                              />
+                            </div>
                           </div>
                         </div>
 
