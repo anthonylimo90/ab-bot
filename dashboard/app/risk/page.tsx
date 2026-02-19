@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -41,7 +41,6 @@ import {
   Zap,
   Clock,
   AlertTriangle,
-  type LucideIcon,
 } from "lucide-react";
 import type { TripReason, ServiceStatusItem } from "@/types/api";
 
@@ -128,6 +127,13 @@ export default function RiskPage() {
     refetchInterval: 30000,
     staleTime: 15000,
   });
+  const { data: dynamicTunerStatus } = useQuery({
+    queryKey: ["dynamic-tuner-status", workspaceId],
+    queryFn: () => api.getDynamicTunerStatus(workspaceId!),
+    enabled: Boolean(workspaceId),
+    refetchInterval: 30000,
+    staleTime: 15000,
+  });
 
   const tripMutation = useManualTripMutation(workspaceId);
   const resetMutation = useResetCircuitBreakerMutation(workspaceId);
@@ -139,6 +145,13 @@ export default function RiskPage() {
     cb && cb.peak_value > 0
       ? ((cb.peak_value - cb.current_value) / cb.peak_value) * 100
       : 0;
+  const arbMonitorCap = useMemo(
+    () =>
+      dynamicTunerStatus?.dynamic_config.find(
+        (item) => item.key === "ARB_MONITOR_MAX_MARKETS",
+      )?.current_value,
+    [dynamicTunerStatus],
+  );
 
   return (
     <ErrorBoundary>
@@ -454,7 +467,9 @@ export default function RiskPage() {
                 <p className="text-xs text-muted-foreground mb-1">
                   Min Net Profit
                 </p>
-                <p className="text-lg font-bold tabular-nums">0.5%</p>
+                <p className="text-lg font-bold tabular-nums">
+                  {(dynamicTunerStatus?.signal_thresholds.min_net_profit_threshold_pct ?? 0.5).toFixed(2)}%
+                </p>
                 <p className="text-xs text-muted-foreground">
                   Must clear fees + slippage
                 </p>
@@ -463,7 +478,9 @@ export default function RiskPage() {
                 <p className="text-xs text-muted-foreground mb-1">
                   Signal Cooldown
                 </p>
-                <p className="text-lg font-bold tabular-nums">60s</p>
+                <p className="text-lg font-bold tabular-nums">
+                  {dynamicTunerStatus?.signal_thresholds.signal_cooldown_secs ?? 60}s
+                </p>
                 <p className="text-xs text-muted-foreground">
                   Per-market dedup window
                 </p>
@@ -472,7 +489,9 @@ export default function RiskPage() {
                 <p className="text-xs text-muted-foreground mb-1">
                   Min Depth
                 </p>
-                <p className="text-lg font-bold tabular-nums">$100</p>
+                <p className="text-lg font-bold tabular-nums">
+                  {formatCurrency(dynamicTunerStatus?.signal_thresholds.min_depth_usd ?? 100)}
+                </p>
                 <p className="text-xs text-muted-foreground">
                   Both sides at best ask
                 </p>
@@ -481,7 +500,9 @@ export default function RiskPage() {
                 <p className="text-xs text-muted-foreground mb-1">
                   Trading Fee
                 </p>
-                <p className="text-lg font-bold tabular-nums">2.0%</p>
+                <p className="text-lg font-bold tabular-nums">
+                  {((dynamicTunerStatus?.signal_thresholds.trading_fee_pct ?? 0.02) * 100).toFixed(2)}%
+                </p>
                 <p className="text-xs text-muted-foreground">
                   Applied to notional cost
                 </p>
@@ -489,6 +510,72 @@ export default function RiskPage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Dynamic Tuner */}
+        {dynamicTunerStatus && (
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Zap className="h-4 w-4" />
+                Dynamic Tuner
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex flex-wrap gap-2">
+                <Badge variant={dynamicTunerStatus.enabled ? "default" : "secondary"}>
+                  {dynamicTunerStatus.enabled ? "Enabled" : "Disabled"}
+                </Badge>
+                <Badge variant="outline">
+                  {dynamicTunerStatus.mode === "apply" ? "Apply mode" : "Shadow mode"}
+                </Badge>
+                <Badge variant="outline">
+                  Regime: {dynamicTunerStatus.current_regime}
+                </Badge>
+                <Badge variant={dynamicTunerStatus.frozen ? "destructive" : "secondary"}>
+                  {dynamicTunerStatus.frozen ? "Frozen" : "Active"}
+                </Badge>
+                {arbMonitorCap !== undefined && (
+                  <Badge variant="outline">
+                    Market cap: {Math.round(arbMonitorCap)}
+                  </Badge>
+                )}
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-lg border p-3">
+                  <p className="text-xs text-muted-foreground">Last run</p>
+                  <p className="text-sm font-medium">
+                    {dynamicTunerStatus.last_run_at
+                      ? `${new Date(dynamicTunerStatus.last_run_at).toLocaleString()} (${formatRelativeTime(dynamicTunerStatus.last_run_at)})`
+                      : "Not recorded"}
+                  </p>
+                  {dynamicTunerStatus.last_run_status && (
+                    <p className="text-xs text-muted-foreground">
+                      Status: {dynamicTunerStatus.last_run_status}
+                    </p>
+                  )}
+                </div>
+                <div className="rounded-lg border p-3">
+                  <p className="text-xs text-muted-foreground">Last change</p>
+                  <p className="text-sm font-medium">
+                    {dynamicTunerStatus.last_change_at
+                      ? `${new Date(dynamicTunerStatus.last_change_at).toLocaleString()} (${formatRelativeTime(dynamicTunerStatus.last_change_at)})`
+                      : "No dynamic change yet"}
+                  </p>
+                  {dynamicTunerStatus.last_change_key && (
+                    <p className="text-xs text-muted-foreground">
+                      {dynamicTunerStatus.last_change_action}: {dynamicTunerStatus.last_change_key}
+                    </p>
+                  )}
+                </div>
+              </div>
+              {dynamicTunerStatus.freeze_reason && (
+                <p className="text-xs text-loss">
+                  Freeze reason: {dynamicTunerStatus.freeze_reason}
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        )}
 
         {/* Service Health */}
         {serviceStatus && (

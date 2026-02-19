@@ -179,6 +179,8 @@ impl DynamicTuner {
     pub async fn start(self: Arc<Self>) {
         if !self.config.enabled {
             info!("Dynamic tuner is disabled");
+            self.persist_runtime_state("disabled", "dynamic tuner disabled", None)
+                .await;
             return;
         }
 
@@ -198,6 +200,8 @@ impl DynamicTuner {
             apply_changes = self.config.apply_changes,
             "Dynamic tuner started"
         );
+        self.persist_runtime_state("started", "dynamic tuner started", None)
+            .await;
 
         let mut ticker = interval(TokioDuration::from_secs(self.config.interval_secs));
 
@@ -210,6 +214,8 @@ impl DynamicTuner {
             .await
         {
             warn!(error = %e, "Initial dynamic tuning cycle failed");
+            self.persist_runtime_state("error", &format!("cycle failed: {e}"), None)
+                .await;
         }
 
         loop {
@@ -224,6 +230,8 @@ impl DynamicTuner {
                 .await
             {
                 warn!(error = %e, "Dynamic tuning cycle failed");
+                self.persist_runtime_state("error", &format!("cycle failed: {e}"), None)
+                    .await;
             }
         }
     }
@@ -276,12 +284,13 @@ impl DynamicTuner {
         self.evaluate_pending(rows.as_slice(), &metrics).await?;
 
         if metrics.cb_tripped || metrics.recent_drawdown >= self.config.max_drawdown_freeze {
+            let freeze_reason = "risk guard active: circuit breaker/drawdown";
             self.record_history(
                 None,
                 None,
                 None,
                 "frozen",
-                "risk guard active: circuit breaker/drawdown",
+                freeze_reason,
                 Some(&metrics),
                 None,
             )
@@ -291,6 +300,8 @@ impl DynamicTuner {
                 drawdown = metrics.recent_drawdown,
                 "Dynamic tuner frozen by risk guard"
             );
+            self.persist_runtime_state("frozen", freeze_reason, Some(&metrics))
+                .await;
             return Ok(());
         }
 
@@ -300,6 +311,8 @@ impl DynamicTuner {
         }
 
         let targets = self.compute_targets(&by_key, &metrics, resolved);
+        let mut applied_count = 0usize;
+        let mut recommended_count = 0usize;
 
         for (key, raw_target) in targets {
             let Some(row) = by_key.get(&key) else {
@@ -342,6 +355,7 @@ impl DynamicTuner {
 
             if self.config.apply_changes {
                 self.apply_change(row, new_value, &reason, &metrics).await?;
+                applied_count += 1;
                 self.publish_update(
                     redis_manager.as_mut(),
                     &DynamicConfigUpdate {
@@ -365,8 +379,17 @@ impl DynamicTuner {
                     None,
                 )
                 .await?;
+                recommended_count += 1;
             }
         }
+
+        let cycle_reason = if self.config.apply_changes {
+            format!("cycle complete: applied={applied_count}")
+        } else {
+            format!("cycle complete: shadow_recommended={recommended_count}")
+        };
+        self.persist_runtime_state("ok", &cycle_reason, Some(&metrics))
+            .await;
 
         Ok(())
     }
@@ -904,6 +927,37 @@ impl DynamicTuner {
         let result: redis::RedisResult<()> = redis.publish(channels::CONFIG_UPDATES, payload).await;
         if let Err(e) = result {
             warn!(error = %e, key = %update.key, "Failed publishing dynamic config update");
+        }
+    }
+
+    async fn persist_runtime_state(
+        &self,
+        status: &str,
+        reason: &str,
+        metrics: Option<&TuningMetrics>,
+    ) {
+        let metrics_json =
+            metrics.map(|m| serde_json::to_value(m).unwrap_or(serde_json::json!({})));
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO dynamic_tuner_state (
+                singleton, last_run_at, last_run_status, last_run_reason, last_metrics
+            )
+            VALUES (TRUE, NOW(), $1, $2, $3)
+            ON CONFLICT (singleton) DO UPDATE
+            SET last_run_at = EXCLUDED.last_run_at,
+                last_run_status = EXCLUDED.last_run_status,
+                last_run_reason = EXCLUDED.last_run_reason,
+                last_metrics = EXCLUDED.last_metrics
+            "#,
+        )
+        .bind(status)
+        .bind(reason)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await
+        {
+            warn!(error = %e, "Failed persisting dynamic tuner runtime state");
         }
     }
 }

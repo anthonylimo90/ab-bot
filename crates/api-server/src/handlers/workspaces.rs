@@ -1,16 +1,18 @@
 //! Workspace handlers for regular users.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use polymarket_core::types::ArbOpportunity;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
 use url::Url;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use auth::{AuditAction, Claims};
@@ -1048,6 +1050,126 @@ pub struct ServiceStatusResponse {
     pub live_trading: ServiceStatusItem,
 }
 
+const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicConfigStatusRow {
+    key: String,
+    current_value: Decimal,
+    default_value: Decimal,
+    min_value: Decimal,
+    max_value: Decimal,
+    max_step_pct: Decimal,
+    enabled: bool,
+    last_good_value: Decimal,
+    pending_eval: bool,
+    last_applied_at: Option<DateTime<Utc>>,
+    last_reason: Option<String>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicTunerStateRow {
+    last_run_at: Option<DateTime<Utc>>,
+    last_run_status: Option<String>,
+    last_run_reason: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicHistoryRow {
+    id: i64,
+    config_key: Option<String>,
+    old_value: Option<Decimal>,
+    new_value: Option<Decimal>,
+    action: String,
+    reason: String,
+    metrics_snapshot: Option<serde_json::Value>,
+    outcome_metrics: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicLastChangeRow {
+    config_key: Option<String>,
+    action: String,
+    reason: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DynamicConfigItemResponse {
+    pub key: String,
+    pub current_value: f64,
+    pub default_value: f64,
+    pub min_value: f64,
+    pub max_value: f64,
+    pub max_step_pct: f64,
+    pub enabled: bool,
+    pub last_good_value: f64,
+    pub pending_eval: bool,
+    pub last_applied_at: Option<DateTime<Utc>>,
+    pub last_reason: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DynamicSignalThresholdsResponse {
+    pub min_net_profit_threshold_pct: f64,
+    pub signal_cooldown_secs: i64,
+    pub min_depth_usd: f64,
+    pub trading_fee_pct: f64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DynamicTunerStatusResponse {
+    pub enabled: bool,
+    pub apply_changes: bool,
+    pub mode: String,
+    pub current_regime: String,
+    pub frozen: bool,
+    pub freeze_reason: Option<String>,
+    pub freeze_drawdown_threshold: f64,
+    pub current_drawdown: f64,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_run_status: Option<String>,
+    pub last_run_reason: Option<String>,
+    pub last_change_at: Option<DateTime<Utc>>,
+    pub last_change_action: Option<String>,
+    pub last_change_reason: Option<String>,
+    pub last_change_key: Option<String>,
+    pub signal_thresholds: DynamicSignalThresholdsResponse,
+    pub dynamic_config: Vec<DynamicConfigItemResponse>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct DynamicHistoryQuery {
+    /// Maximum results (default 50).
+    #[serde(default = "default_dynamic_history_limit")]
+    pub limit: i64,
+    /// Offset for pagination.
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_dynamic_history_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DynamicConfigHistoryEntryResponse {
+    pub id: i64,
+    pub config_key: Option<String>,
+    pub old_value: Option<f64>,
+    pub new_value: Option<f64>,
+    pub action: String,
+    pub reason: String,
+    #[schema(value_type = Object)]
+    pub metrics_snapshot: Option<serde_json::Value>,
+    #[schema(value_type = Object)]
+    pub outcome_metrics: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Get service status for a workspace.
 #[utoipa::path(
     get,
@@ -1153,6 +1275,268 @@ pub async fn get_service_status(
             },
         },
     }))
+}
+
+/// Get dynamic tuner status and active runtime thresholds.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/dynamic-tuning/status",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    responses(
+        (status = 200, description = "Dynamic tuner status", body = DynamicTunerStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member of this workspace"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn get_dynamic_tuner_status(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+) -> ApiResult<Json<DynamicTunerStatusResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
+    if role.is_none() {
+        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    }
+
+    let rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
+        r#"
+        SELECT
+            key, current_value, default_value, min_value, max_value,
+            max_step_pct, enabled, last_good_value, pending_eval,
+            last_applied_at, last_reason, updated_at
+        FROM dynamic_config
+        ORDER BY key
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let dynamic_config: Vec<DynamicConfigItemResponse> = rows
+        .iter()
+        .map(|row| DynamicConfigItemResponse {
+            key: row.key.clone(),
+            current_value: decimal_to_f64(row.current_value),
+            default_value: decimal_to_f64(row.default_value),
+            min_value: decimal_to_f64(row.min_value),
+            max_value: decimal_to_f64(row.max_value),
+            max_step_pct: decimal_to_f64(row.max_step_pct),
+            enabled: row.enabled,
+            last_good_value: decimal_to_f64(row.last_good_value),
+            pending_eval: row.pending_eval,
+            last_applied_at: row.last_applied_at,
+            last_reason: row.last_reason.clone(),
+            updated_at: row.updated_at,
+        })
+        .collect();
+
+    let min_profit_ratio = rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MIN_PROFIT_THRESHOLD)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(|| env_f64(KEY_ARB_MIN_PROFIT_THRESHOLD, 0.005));
+
+    let signal_thresholds = DynamicSignalThresholdsResponse {
+        min_net_profit_threshold_pct: min_profit_ratio * 100.0,
+        signal_cooldown_secs: env_i64("ARB_SIGNAL_COOLDOWN_SECS", 60),
+        min_depth_usd: env_f64("ARB_MIN_BOOK_DEPTH", 100.0),
+        trading_fee_pct: env_f64(
+            "ARB_TRADING_FEE_PCT",
+            decimal_to_f64(ArbOpportunity::DEFAULT_FEE),
+        ),
+    };
+
+    let runtime_state: Option<DynamicTunerStateRow> = sqlx::query_as(
+        r#"
+        SELECT last_run_at, last_run_status, last_run_reason
+        FROM dynamic_tuner_state
+        WHERE singleton = TRUE
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten();
+
+    let last_change: Option<DynamicLastChangeRow> = sqlx::query_as(
+        r#"
+        SELECT config_key, action, reason, created_at
+        FROM dynamic_config_history
+        WHERE action IN ('applied', 'rollback', 'recommended')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let cb_state = state.circuit_breaker.state().await;
+    let current_drawdown = if cb_state.peak_value > Decimal::ZERO {
+        decimal_to_f64((cb_state.peak_value - cb_state.current_value) / cb_state.peak_value)
+            .max(0.0)
+    } else {
+        0.0
+    };
+    let freeze_drawdown_threshold = env_f64("DYNAMIC_TUNER_FREEZE_DRAWDOWN", 0.20);
+    let (frozen, freeze_reason) = if cb_state.tripped {
+        (true, Some("circuit breaker is tripped".to_string()))
+    } else if current_drawdown >= freeze_drawdown_threshold {
+        (
+            true,
+            Some(format!(
+                "drawdown {:.2}% exceeds freeze threshold {:.2}%",
+                current_drawdown * 100.0,
+                freeze_drawdown_threshold * 100.0
+            )),
+        )
+    } else {
+        (false, None)
+    };
+
+    let current_regime = format!("{:?}", *state.current_regime.read().await);
+    let enabled = env_bool("DYNAMIC_TUNER_ENABLED", true);
+    let apply_changes = env_bool("DYNAMIC_TUNER_APPLY", true);
+    let (last_run_at, last_run_status, last_run_reason) = match runtime_state {
+        Some(row) => (row.last_run_at, row.last_run_status, row.last_run_reason),
+        None => (None, None, None),
+    };
+    let (last_change_at, last_change_action, last_change_reason, last_change_key) =
+        match last_change {
+            Some(row) => (
+                Some(row.created_at),
+                Some(row.action),
+                Some(row.reason),
+                row.config_key,
+            ),
+            None => (None, None, None, None),
+        };
+
+    Ok(Json(DynamicTunerStatusResponse {
+        enabled,
+        apply_changes,
+        mode: if apply_changes {
+            "apply".to_string()
+        } else {
+            "shadow".to_string()
+        },
+        current_regime,
+        frozen,
+        freeze_reason,
+        freeze_drawdown_threshold,
+        current_drawdown,
+        last_run_at,
+        last_run_status,
+        last_run_reason,
+        last_change_at,
+        last_change_action,
+        last_change_reason,
+        last_change_key,
+        signal_thresholds,
+        dynamic_config,
+    }))
+}
+
+/// List dynamic tuning history (changes, recommendations, rollbacks, evaluations).
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/dynamic-tuning/history",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        DynamicHistoryQuery
+    ),
+    responses(
+        (status = 200, description = "Dynamic tuning history", body = Vec<DynamicConfigHistoryEntryResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member of this workspace"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn get_dynamic_tuning_history(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+    Query(query): Query<DynamicHistoryQuery>,
+) -> ApiResult<Json<Vec<DynamicConfigHistoryEntryResponse>>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
+    if role.is_none() {
+        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
+    }
+
+    let limit = query.limit.clamp(1, 200);
+    let offset = query.offset.max(0);
+    let rows: Vec<DynamicHistoryRow> = sqlx::query_as(
+        r#"
+        SELECT
+            id, config_key, old_value, new_value, action, reason,
+            metrics_snapshot, outcome_metrics, created_at
+        FROM dynamic_config_history
+        ORDER BY created_at DESC
+        LIMIT $1 OFFSET $2
+        "#,
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let history = rows
+        .into_iter()
+        .map(|row| DynamicConfigHistoryEntryResponse {
+            id: row.id,
+            config_key: row.config_key,
+            old_value: row.old_value.map(decimal_to_f64),
+            new_value: row.new_value.map(decimal_to_f64),
+            action: row.action,
+            reason: row.reason,
+            metrics_snapshot: row.metrics_snapshot,
+            outcome_metrics: row.outcome_metrics,
+            created_at: row.created_at,
+        })
+        .collect();
+
+    Ok(Json(history))
+}
+
+fn env_bool(name: &str, fallback: bool) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes"
+        })
+        .unwrap_or(fallback)
+}
+
+fn env_f64(name: &str, fallback: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(fallback)
+}
+
+fn env_i64(name: &str, fallback: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(fallback)
+}
+
+fn decimal_to_f64(value: Decimal) -> f64 {
+    value.to_f64().unwrap_or(0.0)
 }
 
 /// Validate WalletConnect project ID format.

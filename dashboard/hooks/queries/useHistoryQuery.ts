@@ -3,7 +3,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
-import type { Activity } from "@/types/api";
+import type { Activity, DynamicConfigHistoryEntry } from "@/types/api";
 
 export interface HistoryFilters {
   outcome?: "yes" | "no";
@@ -50,6 +50,29 @@ export function useActivityHistoryQuery(filters?: ActivityHistoryFilters) {
         limit: filters?.limit ?? 50,
         offset: filters?.offset ?? 0,
       }),
+    staleTime: 30 * 1000,
+  });
+}
+
+export interface DynamicHistoryFilters {
+  workspaceId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export function useDynamicConfigHistoryQuery(filters?: DynamicHistoryFilters) {
+  const workspaceId = filters?.workspaceId;
+  return useQuery<DynamicConfigHistoryEntry[]>({
+    queryKey: queryKeys.dynamicTuning.history(workspaceId ?? "", {
+      limit: filters?.limit ?? 50,
+      offset: filters?.offset ?? 0,
+    }),
+    queryFn: () =>
+      api.getDynamicTuningHistory(workspaceId!, {
+        limit: filters?.limit ?? 50,
+        offset: filters?.offset ?? 0,
+      }),
+    enabled: Boolean(workspaceId),
     staleTime: 30 * 1000,
   });
 }

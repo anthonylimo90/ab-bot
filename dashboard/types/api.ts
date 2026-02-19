@@ -400,6 +400,8 @@ export interface Activity {
   id: string;
   type: ActivityType;
   message: string;
+  skip_reason?: string;
+  error_message?: string;
   details?: Record<string, unknown>;
   pnl?: number;
   created_at: string;
@@ -1009,6 +1011,60 @@ export interface ServiceStatus {
   copy_trading: ServiceStatusItem;
   arb_executor: ServiceStatusItem;
   live_trading: ServiceStatusItem;
+}
+
+export interface DynamicConfigItem {
+  key: string;
+  current_value: number;
+  default_value: number;
+  min_value: number;
+  max_value: number;
+  max_step_pct: number;
+  enabled: boolean;
+  last_good_value: number;
+  pending_eval: boolean;
+  last_applied_at: string | null;
+  last_reason: string | null;
+  updated_at: string;
+}
+
+export interface DynamicSignalThresholds {
+  min_net_profit_threshold_pct: number;
+  signal_cooldown_secs: number;
+  min_depth_usd: number;
+  trading_fee_pct: number;
+}
+
+export interface DynamicTunerStatus {
+  enabled: boolean;
+  apply_changes: boolean;
+  mode: "apply" | "shadow" | string;
+  current_regime: string;
+  frozen: boolean;
+  freeze_reason: string | null;
+  freeze_drawdown_threshold: number;
+  current_drawdown: number;
+  last_run_at: string | null;
+  last_run_status: string | null;
+  last_run_reason: string | null;
+  last_change_at: string | null;
+  last_change_action: string | null;
+  last_change_reason: string | null;
+  last_change_key: string | null;
+  signal_thresholds: DynamicSignalThresholds;
+  dynamic_config: DynamicConfigItem[];
+}
+
+export interface DynamicConfigHistoryEntry {
+  id: number;
+  config_key: string | null;
+  old_value: number | null;
+  new_value: number | null;
+  action: string;
+  reason: string;
+  metrics_snapshot?: Record<string, unknown> | null;
+  outcome_metrics?: Record<string, unknown> | null;
+  created_at: string;
 }
 
 // Risk monitoring types

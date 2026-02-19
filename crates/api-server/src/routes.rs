@@ -98,6 +98,8 @@ use crate::websocket;
         workspaces::remove_member,
         workspaces::get_optimizer_status,
         workspaces::get_service_status,
+        workspaces::get_dynamic_tuner_status,
+        workspaces::get_dynamic_tuning_history,
         // Invites
         invites::list_invites,
         invites::create_invite,
@@ -217,6 +219,10 @@ use crate::websocket;
             workspaces::PortfolioMetrics,
             workspaces::ServiceStatusResponse,
             workspaces::ServiceStatusItem,
+            workspaces::DynamicTunerStatusResponse,
+            workspaces::DynamicSignalThresholdsResponse,
+            workspaces::DynamicConfigItemResponse,
+            workspaces::DynamicConfigHistoryEntryResponse,
             // Invites
             invites::InviteResponse,
             invites::CreateInviteRequest,
@@ -452,6 +458,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/service-status",
             get(workspaces::get_service_status),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/status",
+            get(workspaces::get_dynamic_tuner_status),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/history",
+            get(workspaces::get_dynamic_tuning_history),
         )
         .route(
             "/api/v1/workspaces/:workspace_id/invites",
