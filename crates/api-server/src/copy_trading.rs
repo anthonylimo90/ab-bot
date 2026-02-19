@@ -373,7 +373,9 @@ impl CopyTradingMonitor {
         // Use a scoped read lock — drop it before any write lock to avoid deadlock
         let (result, allocation_pct) = {
             let copy_trader = self.copy_trader.read().await;
-            let result = copy_trader.process_detected_trade_with_reason(&detected).await;
+            let result = copy_trader
+                .process_detected_trade_with_reason(&detected)
+                .await;
             let alloc = copy_trader
                 .get_tracked_wallet(&trade.wallet_address)
                 .map(|w| w.allocation_pct)

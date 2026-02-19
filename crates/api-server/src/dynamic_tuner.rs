@@ -916,12 +916,9 @@ pub fn spawn_dynamic_config_subscriber(
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_dynamic_config_subscriber(
-                redis_url.as_str(),
-                copy_trader.clone(),
-                pool.clone(),
-            )
-            .await
+            if let Err(e) =
+                run_dynamic_config_subscriber(redis_url.as_str(), copy_trader.clone(), pool.clone())
+                    .await
             {
                 error!(error = %e, "Dynamic config subscriber failed, retrying");
                 tokio::time::sleep(TokioDuration::from_secs(5)).await;
@@ -1104,15 +1101,16 @@ async fn apply_startup_snapshot_to_copy_trader(
         }
     }
 
-    info!(applied, "Applied startup dynamic config snapshot to copy trader");
+    info!(
+        applied,
+        "Applied startup dynamic config snapshot to copy trader"
+    );
     Ok(())
 }
 
 fn load_allowed_update_sources() -> Vec<String> {
     std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
-        .unwrap_or_else(|_| {
-            "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync".to_string()
-        })
+        .unwrap_or_else(|_| "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync".to_string())
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())

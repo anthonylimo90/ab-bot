@@ -104,8 +104,8 @@ impl ArbMonitor {
             .and_then(decimal_to_cap)
             .or(max_markets_env);
 
-        let dynamic_redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
-            .unwrap_or_else(|_| config.redis.url.clone());
+        let dynamic_redis_url =
+            std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
         let dynamic_config_rx = spawn_dynamic_config_listener(dynamic_redis_url);
 
         Ok(Self {
@@ -304,7 +304,10 @@ impl ArbMonitor {
     }
 
     fn apply_dynamic_update(&mut self, update: DynamicConfigUpdate) -> bool {
-        if !self.allowed_dynamic_sources.contains(update.source.as_str()) {
+        if !self
+            .allowed_dynamic_sources
+            .contains(update.source.as_str())
+        {
             warn!(
                 source = %update.source,
                 key = %update.key,
@@ -313,7 +316,8 @@ impl ArbMonitor {
             return false;
         }
 
-        let Some(value) = clamp_dynamic_value(&update.key, update.value, &self.dynamic_bounds) else {
+        let Some(value) = clamp_dynamic_value(&update.key, update.value, &self.dynamic_bounds)
+        else {
             warn!(key = %update.key, "Ignoring unsupported dynamic config key");
             return false;
         };
@@ -526,7 +530,9 @@ async fn load_dynamic_values(pool: &sqlx::PgPool) -> HashMap<String, Decimal> {
         }
     };
 
-    rows.into_iter().map(|row| (row.key, row.current_value)).collect()
+    rows.into_iter()
+        .map(|row| (row.key, row.current_value))
+        .collect()
 }
 
 fn load_allowed_dynamic_sources() -> HashSet<String> {
