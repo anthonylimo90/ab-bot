@@ -29,8 +29,93 @@ const STALE_CHECK_INTERVAL: u64 = 500;
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
-const DEFAULT_EXPLORATION_SLOTS: usize = 5;
 const OPPORTUNITY_EWMA_ALPHA: f64 = 0.25;
+
+#[derive(Debug, Clone, Copy)]
+enum AggressivenessProfile {
+    Stable,
+    Balanced,
+    Discovery,
+}
+
+impl AggressivenessProfile {
+    fn from_env() -> Self {
+        match std::env::var("ARB_MONITOR_AGGRESSIVENESS")
+            .unwrap_or_else(|_| "balanced".to_string())
+            .to_lowercase()
+            .as_str()
+        {
+            "stable" | "conservative" => Self::Stable,
+            "discovery" | "aggressive" => Self::Discovery,
+            _ => Self::Balanced,
+        }
+    }
+
+    fn default_exploration_slots(self) -> usize {
+        match self {
+            Self::Stable => 2,
+            Self::Balanced => 5,
+            Self::Discovery => 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoringWeights {
+    selection_baseline_weight: f64,
+    selection_quality_weight: f64,
+    selection_hit_rate_weight: f64,
+    selection_freshness_weight: f64,
+    selection_sticky_bonus: f64,
+    exploration_baseline_weight: f64,
+    exploration_novelty_weight: f64,
+    exploration_rotation_weight: f64,
+    exploration_upside_weight: f64,
+    exploration_unseen_bonus: f64,
+}
+
+impl ScoringWeights {
+    fn for_profile(profile: AggressivenessProfile) -> Self {
+        match profile {
+            AggressivenessProfile::Stable => Self {
+                selection_baseline_weight: 1.20,
+                selection_quality_weight: 0.70,
+                selection_hit_rate_weight: 1.00,
+                selection_freshness_weight: 0.50,
+                selection_sticky_bonus: 0.35,
+                exploration_baseline_weight: 0.70,
+                exploration_novelty_weight: 0.55,
+                exploration_rotation_weight: 0.60,
+                exploration_upside_weight: 0.30,
+                exploration_unseen_bonus: 0.75,
+            },
+            AggressivenessProfile::Balanced => Self {
+                selection_baseline_weight: 1.00,
+                selection_quality_weight: 0.95,
+                selection_hit_rate_weight: 0.80,
+                selection_freshness_weight: 1.00,
+                selection_sticky_bonus: 0.20,
+                exploration_baseline_weight: 0.55,
+                exploration_novelty_weight: 1.10,
+                exploration_rotation_weight: 0.90,
+                exploration_upside_weight: 0.45,
+                exploration_unseen_bonus: 1.40,
+            },
+            AggressivenessProfile::Discovery => Self {
+                selection_baseline_weight: 0.80,
+                selection_quality_weight: 1.25,
+                selection_hit_rate_weight: 0.60,
+                selection_freshness_weight: 1.20,
+                selection_sticky_bonus: 0.10,
+                exploration_baseline_weight: 0.40,
+                exploration_novelty_weight: 1.45,
+                exploration_rotation_weight: 1.20,
+                exploration_upside_weight: 0.80,
+                exploration_unseen_bonus: 1.90,
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct DynamicConfigUpdate {
@@ -70,6 +155,10 @@ pub struct ArbMonitor {
     min_profit_threshold: Decimal,
     /// Last signal timestamp per market (for dedup/cooldown).
     last_signal_time: HashMap<String, DateTime<Utc>>,
+    /// Aggressiveness profile used for dynamic scoring.
+    aggressiveness_profile: AggressivenessProfile,
+    /// Scoring weights derived from aggressiveness profile.
+    scoring_weights: ScoringWeights,
     /// Optional cap for actively scanned markets.
     max_markets_cap: Option<usize>,
     /// Market ids sorted by baseline quality (liquidity + volume).
@@ -129,10 +218,12 @@ impl ArbMonitor {
             .and_then(|v| clamp_dynamic_value(KEY_ARB_MONITOR_MAX_MARKETS, v, &dynamic_bounds))
             .and_then(decimal_to_cap)
             .or(max_markets_env);
+        let aggressiveness_profile = AggressivenessProfile::from_env();
+        let scoring_weights = ScoringWeights::for_profile(aggressiveness_profile);
         let exploration_slots = std::env::var("ARB_MONITOR_EXPLORATION_SLOTS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_EXPLORATION_SLOTS);
+            .unwrap_or(aggressiveness_profile.default_exploration_slots());
 
         let dynamic_redis_url =
             std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
@@ -146,6 +237,8 @@ impl ArbMonitor {
             market_outcomes: HashMap::new(),
             min_profit_threshold,
             last_signal_time: HashMap::new(),
+            aggressiveness_profile,
+            scoring_weights,
             max_markets_cap,
             all_market_ids: Vec::new(),
             market_profiles: HashMap::new(),
@@ -192,6 +285,7 @@ impl ArbMonitor {
             total_markets = self.all_market_ids.len(),
             active_markets = self.eligible_markets.len(),
             max_cap = ?self.max_markets_cap,
+            aggressiveness = ?self.aggressiveness_profile,
             exploration_slots = self.exploration_slots,
             "Initialized arb market universe"
         );
@@ -421,6 +515,7 @@ impl ArbMonitor {
             &self.market_profiles,
             &self.market_stats,
             &self.eligible_markets,
+            self.scoring_weights,
             self.min_profit_threshold,
             active_count,
             self.exploration_slots,
@@ -717,19 +812,20 @@ fn market_selection_score(
     profiles: &HashMap<String, MarketProfile>,
     stats: &HashMap<String, MarketOpportunityStats>,
     currently_eligible: &HashSet<String>,
+    weights: ScoringWeights,
     min_profit_threshold: Decimal,
     now: DateTime<Utc>,
 ) -> f64 {
     let baseline = baseline_profile_score(profiles.get(market_id));
     let threshold = min_profit_threshold.to_f64().unwrap_or(0.005).max(0.0001);
     let sticky_bonus = if currently_eligible.contains(market_id) {
-        0.20
+        weights.selection_sticky_bonus
     } else {
         0.0
     };
 
     let Some(market_stats) = stats.get(market_id) else {
-        return baseline + sticky_bonus;
+        return baseline * weights.selection_baseline_weight + sticky_bonus;
     };
 
     let opportunity_quality = (market_stats.ewma_net_profit / threshold).clamp(0.0, 4.0);
@@ -741,10 +837,10 @@ fn market_selection_score(
     };
     let freshness = recency_bonus(market_stats.last_seen_at, now);
 
-    baseline
-        + opportunity_quality * 0.95
-        + (hit_rate * confidence) * 0.80
-        + freshness
+    baseline * weights.selection_baseline_weight
+        + opportunity_quality * weights.selection_quality_weight
+        + (hit_rate * confidence) * weights.selection_hit_rate_weight
+        + freshness * weights.selection_freshness_weight
         + sticky_bonus
 }
 
@@ -753,6 +849,7 @@ fn market_exploration_score(
     profiles: &HashMap<String, MarketProfile>,
     stats: &HashMap<String, MarketOpportunityStats>,
     currently_eligible: &HashSet<String>,
+    weights: ScoringWeights,
     min_profit_threshold: Decimal,
     now: DateTime<Utc>,
 ) -> f64 {
@@ -761,6 +858,7 @@ fn market_exploration_score(
         profiles,
         stats,
         currently_eligible,
+        weights,
         min_profit_threshold,
         now,
     );
@@ -768,7 +866,7 @@ fn market_exploration_score(
 
     let Some(market_stats) = stats.get(market_id) else {
         // Favor unseen markets for discovery.
-        return baseline * 0.55 + 1.4;
+        return baseline * weights.exploration_baseline_weight + weights.exploration_unseen_bonus;
     };
 
     let novelty = 1.0 / (1.0 + market_stats.evaluated_books as f64 / 70.0);
@@ -778,7 +876,10 @@ fn market_exploration_score(
         None => 1.0,
     };
 
-    baseline * 0.55 + novelty * 1.10 + rotation * 0.90 + upside
+    baseline * weights.exploration_baseline_weight
+        + novelty * weights.exploration_novelty_weight
+        + rotation * weights.exploration_rotation_weight
+        + upside * weights.exploration_upside_weight
 }
 
 fn select_market_ids(
@@ -786,6 +887,7 @@ fn select_market_ids(
     profiles: &HashMap<String, MarketProfile>,
     stats: &HashMap<String, MarketOpportunityStats>,
     currently_eligible: &HashSet<String>,
+    weights: ScoringWeights,
     min_profit_threshold: Decimal,
     active_count: usize,
     requested_exploration_slots: usize,
@@ -805,6 +907,7 @@ fn select_market_ids(
                     profiles,
                     stats,
                     currently_eligible,
+                    weights,
                     min_profit_threshold,
                     now,
                 ),
@@ -835,6 +938,7 @@ fn select_market_ids(
                         profiles,
                         stats,
                         currently_eligible,
+                        weights,
                         min_profit_threshold,
                         now,
                     ),
@@ -990,6 +1094,7 @@ mod tests {
             &profiles,
             &stats,
             &HashSet::new(),
+            ScoringWeights::for_profile(AggressivenessProfile::Balanced),
             Decimal::new(5, 3),
             2,
             0,
@@ -1049,6 +1154,7 @@ mod tests {
             &profiles,
             &stats,
             &HashSet::from(["core-a".to_string(), "core-b".to_string()]),
+            ScoringWeights::for_profile(AggressivenessProfile::Balanced),
             Decimal::new(5, 3),
             3,
             1,
@@ -1059,5 +1165,24 @@ mod tests {
         assert!(selected.contains(&"core-a".to_string()));
         assert!(selected.contains(&"core-b".to_string()));
         assert!(selected.contains(&"explore-c".to_string()));
+    }
+
+    #[test]
+    fn aggressiveness_profiles_adjust_discovery_bias() {
+        let stable = ScoringWeights::for_profile(AggressivenessProfile::Stable);
+        let discovery = ScoringWeights::for_profile(AggressivenessProfile::Discovery);
+
+        assert_eq!(AggressivenessProfile::Stable.default_exploration_slots(), 2);
+        assert_eq!(
+            AggressivenessProfile::Balanced.default_exploration_slots(),
+            5
+        );
+        assert_eq!(
+            AggressivenessProfile::Discovery.default_exploration_slots(),
+            8
+        );
+        assert!(discovery.selection_quality_weight > stable.selection_quality_weight);
+        assert!(discovery.exploration_novelty_weight > stable.exploration_novelty_weight);
+        assert!(discovery.exploration_unseen_bonus > stable.exploration_unseen_bonus);
     }
 }
