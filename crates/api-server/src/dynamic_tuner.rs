@@ -783,6 +783,18 @@ impl DynamicTuner {
         ];
 
         for seed in seeds {
+            let seeded_value = clamp_to_bounds(seed.default_value, seed.min_value, seed.max_value);
+            if seeded_value != seed.default_value {
+                warn!(
+                    key = seed.key,
+                    configured_default = %seed.default_value,
+                    seeded_default = %seeded_value,
+                    min = %seed.min_value,
+                    max = %seed.max_value,
+                    "Configured dynamic default is out of bounds; clamping to valid range"
+                );
+            }
+
             sqlx::query(
                 r#"
                 INSERT INTO dynamic_config (
@@ -793,7 +805,7 @@ impl DynamicTuner {
                 "#,
             )
             .bind(seed.key)
-            .bind(seed.default_value)
+            .bind(seeded_value)
             .bind(seed.min_value)
             .bind(seed.max_value)
             .bind(seed.max_step_pct)
@@ -1225,6 +1237,10 @@ struct ConfigSeed {
     max_step_pct: Decimal,
 }
 
+fn clamp_to_bounds(value: Decimal, min: Decimal, max: Decimal) -> Decimal {
+    value.max(min).min(max)
+}
+
 fn env_decimal(name: &str, fallback: Decimal) -> Decimal {
     std::env::var(name)
         .ok()
@@ -1281,5 +1297,21 @@ mod tests {
         assert_eq!(ratio(1.0, 0.0), 0.0);
         assert_eq!(ratio(0.0, 10.0), 0.0);
         assert_eq!(ratio(5.0, 10.0), 0.5);
+    }
+
+    #[test]
+    fn clamp_to_bounds_enforces_limits() {
+        assert_eq!(
+            clamp_to_bounds(Decimal::new(1, 0), Decimal::new(2, 0), Decimal::new(50, 0)),
+            Decimal::new(2, 0)
+        );
+        assert_eq!(
+            clamp_to_bounds(Decimal::new(60, 0), Decimal::new(2, 0), Decimal::new(50, 0)),
+            Decimal::new(50, 0)
+        );
+        assert_eq!(
+            clamp_to_bounds(Decimal::new(10, 0), Decimal::new(2, 0), Decimal::new(50, 0)),
+            Decimal::new(10, 0)
+        );
     }
 }
