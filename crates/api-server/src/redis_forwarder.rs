@@ -304,6 +304,7 @@ impl RedisForwarder {
 
     async fn handle_copy_signal(&self, payload: &str) -> anyhow::Result<()> {
         #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
         struct CopySignal {
             wallet_address: String,
             market_id: String,
@@ -448,6 +449,7 @@ mod tests {
         }"#;
 
         #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
         struct CopySignal {
             wallet_address: String,
             market_id: String,

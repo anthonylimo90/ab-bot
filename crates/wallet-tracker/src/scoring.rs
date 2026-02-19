@@ -43,6 +43,7 @@ impl WalletScore {
     /// - `consistency`: raw consistency score (0-1)
     /// - `max_drawdown`: raw max drawdown as a positive ratio (e.g., 0.20 for 20%)
     /// - `staleness_days`: days since last data update (0 = fresh)
+    #[allow(clippy::too_many_arguments)]
     pub fn from_raw(
         address: String,
         roi: f64,

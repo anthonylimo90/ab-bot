@@ -139,6 +139,7 @@ pub struct RiskScorer {
 struct WalletMetricsRow {
     address: String,
     roi_30d: Decimal,
+    #[allow(dead_code)]
     sharpe_30d: Decimal,
     sortino_30d: Decimal,
     max_drawdown_30d: Decimal,
@@ -318,7 +319,7 @@ impl RiskScorer {
                 "#,
             )
             .bind(decimal_pct)
-            .bind(&self.workspace_id)
+            .bind(self.workspace_id)
             .bind(tier)
             .bind(&allocation.address)
             .execute(&mut *tx)
@@ -365,7 +366,7 @@ impl RiskScorer {
                 ORDER BY wsm.roi_30d DESC
                 "#,
             )
-            .bind(&self.workspace_id)
+            .bind(self.workspace_id)
             .bind(t)
             .fetch_all(&self.pool)
             .await?
@@ -408,7 +409,7 @@ impl RiskScorer {
               AND tier = $2
             "#,
         )
-        .bind(&self.workspace_id)
+        .bind(self.workspace_id)
         .bind(tier)
         .fetch_all(&self.pool)
         .await?;
@@ -422,7 +423,7 @@ impl RiskScorer {
     fn calculate_wallet_score(&self, metrics: WalletMetricsRow) -> WalletRiskScore {
         // Normalize Sortino (typical range 0-3, good values > 1)
         let sortino_raw = metrics.sortino_30d.to_f64().unwrap_or(0.0);
-        let sortino_normalized = (sortino_raw / 3.0).min(1.0).max(0.0);
+        let sortino_normalized = (sortino_raw / 3.0).clamp(0.0, 1.0);
 
         // Consistency is already 0-1
         let consistency = metrics.consistency_score.to_f64().unwrap_or(0.0);
@@ -430,7 +431,7 @@ impl RiskScorer {
         // ROI/MaxDrawdown ratio (normalize typical range 0-2)
         let roi = metrics.roi_30d.to_f64().unwrap_or(0.0);
         let max_dd = metrics.max_drawdown_30d.to_f64().unwrap_or(0.01).max(0.01);
-        let roi_drawdown_ratio = ((roi / max_dd) / 2.0).min(1.0).max(0.0);
+        let roi_drawdown_ratio = ((roi / max_dd) / 2.0).clamp(0.0, 1.0);
 
         // Win rate is already 0-1
         let win_rate = metrics.win_rate_30d.to_f64().unwrap_or(0.0);

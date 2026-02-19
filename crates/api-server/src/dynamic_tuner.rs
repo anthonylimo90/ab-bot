@@ -25,6 +25,8 @@ const KEY_COPY_MIN_TRADE_VALUE: &str = "COPY_MIN_TRADE_VALUE";
 const KEY_COPY_MAX_SLIPPAGE_PCT: &str = "COPY_MAX_SLIPPAGE_PCT";
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
+const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
+const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
 
 const EPSILON: f64 = 1e-6;
 
@@ -806,6 +808,20 @@ impl DynamicTuner {
                 max_value: Decimal::new(1500, 0),
                 max_step_pct: Decimal::new(15, 2),
             },
+            ConfigSeed {
+                key: KEY_ARB_MONITOR_EXPLORATION_SLOTS,
+                default_value: env_decimal("ARB_MONITOR_EXPLORATION_SLOTS", Decimal::new(5, 0)),
+                min_value: Decimal::new(1, 0),
+                max_value: Decimal::new(500, 0),
+                max_step_pct: Decimal::new(25, 2),
+            },
+            ConfigSeed {
+                key: KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL,
+                default_value: env_aggressiveness_level(),
+                min_value: Decimal::ZERO,
+                max_value: Decimal::new(2, 0),
+                max_step_pct: Decimal::new(100, 2),
+            },
         ];
 
         for seed in seeds {
@@ -946,6 +962,7 @@ impl DynamicTuner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_history(
         &self,
         config_key: Option<&str>,
@@ -1063,6 +1080,19 @@ pub fn spawn_dynamic_config_subscriber(
     });
 
     info!("Dynamic config subscriber spawned");
+}
+
+/// Applies the current dynamic config snapshot to the local copy-trader policy.
+///
+/// This is used at startup to prefer DB-backed runtime configuration when
+/// available, while still allowing env defaults as fallback if dynamic config
+/// tables are missing or not yet seeded.
+pub async fn sync_dynamic_config_snapshot_to_copy_trader(
+    pool: &PgPool,
+    copy_trader: &Arc<RwLock<CopyTrader>>,
+) -> anyhow::Result<()> {
+    let bounds = load_dynamic_bounds(pool).await;
+    apply_startup_snapshot_to_copy_trader(pool, copy_trader, &bounds).await
 }
 
 async fn run_dynamic_config_subscriber(
@@ -1249,7 +1279,9 @@ async fn apply_startup_snapshot_to_copy_trader(
 
 fn load_allowed_update_sources() -> Vec<String> {
     std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
-        .unwrap_or_else(|_| "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync".to_string())
+        .unwrap_or_else(|_| {
+            "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync,workspace_manual".to_string()
+        })
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1283,6 +1315,8 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
         KEY_COPY_MAX_SLIPPAGE_PCT,
         KEY_ARB_MIN_PROFIT_THRESHOLD,
         KEY_ARB_MONITOR_MAX_MARKETS,
+        KEY_ARB_MONITOR_EXPLORATION_SLOTS,
+        KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL,
     ] {
         if let Some(bounds) = fallback_bounds_for_key(key) {
             map.insert(key.to_string(), bounds);
@@ -1297,6 +1331,8 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
         KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(5, 2))),
         KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
+        KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),
+        KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => Some((Decimal::ZERO, Decimal::new(2, 0))),
         _ => None,
     }
 }
@@ -1319,6 +1355,18 @@ fn env_decimal(name: &str, fallback: Decimal) -> Decimal {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(fallback)
+}
+
+fn env_aggressiveness_level() -> Decimal {
+    match std::env::var("ARB_MONITOR_AGGRESSIVENESS")
+        .unwrap_or_else(|_| "balanced".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "stable" | "conservative" => Decimal::ZERO,
+        "discovery" | "aggressive" => Decimal::new(2, 0),
+        _ => Decimal::new(1, 0),
+    }
 }
 
 fn ratio(numerator: f64, denominator: f64) -> f64 {

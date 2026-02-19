@@ -347,7 +347,7 @@ pub async fn discover_wallets(
                 let is_tracked = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
                 )
-                .bind(&dw.address.to_lowercase())
+                .bind(dw.address.to_lowercase())
                 .fetch_one(&state.pool)
                 .await
                 .unwrap_or(false);
@@ -404,7 +404,7 @@ async fn fetch_strategy_types(
         "#,
     )
     .bind(
-        &addresses
+        addresses
             .iter()
             .map(|a| a.to_lowercase())
             .collect::<Vec<_>>(),
@@ -536,7 +536,8 @@ pub async fn get_discovered_wallet(
             .await
             .unwrap_or(false);
 
-            let strategy_map = fetch_strategy_types(&state.pool, &[address.clone()]).await;
+            let strategy_map =
+                fetch_strategy_types(&state.pool, std::slice::from_ref(&address)).await;
             let strategy_type = strategy_map.get(&address).cloned();
 
             Ok(Json(map_to_api_wallet(&dw, 0, is_tracked, strategy_type)))
@@ -723,7 +724,7 @@ pub async fn get_copy_performance(
     };
 
     let divergence_pp = copy_win_rate.map(|cwr| (reported_win_rate - cwr).abs());
-    let has_significant_divergence = divergence_pp.map_or(false, |d| d > 15.0);
+    let has_significant_divergence = divergence_pp.is_some_and(|d| d > 15.0);
 
     Ok(Json(CopyPerformanceResponse {
         address,

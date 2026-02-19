@@ -153,7 +153,9 @@ pub struct SubmitOrderResponse {
 /// Database row for pending orders.
 #[derive(Debug, sqlx::FromRow)]
 struct PendingOrderRow {
+    #[allow(dead_code)]
     id: Uuid,
+    #[allow(dead_code)]
     user_id: Uuid,
     maker_address: String,
     token_id: String,
@@ -167,6 +169,7 @@ struct PendingOrderRow {
     signature_type: i16,
     neg_risk: bool,
     expires_at: DateTime<Utc>,
+    #[allow(dead_code)]
     created_at: DateTime<Utc>,
 }
 

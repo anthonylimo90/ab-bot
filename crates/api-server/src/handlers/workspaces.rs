@@ -6,6 +6,7 @@ use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use polymarket_core::types::ArbOpportunity;
+use redis::AsyncCommands;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -452,15 +453,13 @@ pub async fn update_workspace(
     // Build dynamic update
     let now = Utc::now();
     let mut set_parts = vec!["updated_at = $2".to_string()];
-    let mut param_idx = 3;
 
     // SAFETY: The $col arguments below MUST be hardcoded string literals (column names).
     // Never pass user-controlled input as $col — that would be SQL injection.
     macro_rules! add_param {
         ($field:ident, $col:literal) => {
             if req.$field.is_some() {
-                set_parts.push(format!("{} = ${}", $col, param_idx));
-                param_idx += 1;
+                set_parts.push(format!("{} = ${}", $col, set_parts.len() + 2));
             }
         };
     }
@@ -1051,6 +1050,10 @@ pub struct ServiceStatusResponse {
 }
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
+const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
+const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
+const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
+const ARB_RUNTIME_STATS_LATEST: &str = "arb:runtime:stats:latest";
 
 #[derive(Debug, sqlx::FromRow)]
 struct DynamicConfigStatusRow {
@@ -1096,6 +1099,36 @@ struct DynamicLastChangeRow {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ScannerMarketInsightSnapshot {
+    market_id: String,
+    tier: String,
+    total_score: f64,
+    baseline_score: f64,
+    opportunity_score: f64,
+    hit_rate_score: f64,
+    freshness_score: f64,
+    sticky_score: f64,
+    novelty_score: Option<f64>,
+    rotation_score: Option<f64>,
+    upside_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ArbRuntimeStatsSnapshot {
+    monitored_markets: f64,
+    #[serde(default)]
+    core_markets: f64,
+    #[serde(default)]
+    exploration_markets: f64,
+    #[serde(default)]
+    last_rerank_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_resubscribe_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    selected_markets: Vec<ScannerMarketInsightSnapshot>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DynamicConfigItemResponse {
     pub key: String,
@@ -1120,6 +1153,40 @@ pub struct DynamicSignalThresholdsResponse {
     pub trading_fee_pct: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ScannerMarketInsightResponse {
+    pub market_id: String,
+    pub tier: String,
+    pub total_score: f64,
+    pub baseline_score: f64,
+    pub opportunity_score: f64,
+    pub hit_rate_score: f64,
+    pub freshness_score: f64,
+    pub sticky_score: f64,
+    pub novelty_score: Option<f64>,
+    pub rotation_score: Option<f64>,
+    pub upside_score: Option<f64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScannerStatusResponse {
+    pub monitored_markets: i64,
+    pub core_markets: i64,
+    pub exploration_markets: i64,
+    pub last_rerank_at: Option<DateTime<Utc>>,
+    pub last_resubscribe_at: Option<DateTime<Utc>>,
+    pub selected_markets: Vec<ScannerMarketInsightResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OpportunitySelectionStatusResponse {
+    pub aggressiveness: String,
+    pub aggressiveness_level: f64,
+    pub exploration_slots: i64,
+    pub max_markets_cap: i64,
+    pub recommendation: String,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DynamicTunerStatusResponse {
     pub enabled: bool,
@@ -1138,6 +1205,8 @@ pub struct DynamicTunerStatusResponse {
     pub last_change_reason: Option<String>,
     pub last_change_key: Option<String>,
     pub signal_thresholds: DynamicSignalThresholdsResponse,
+    pub opportunity_selection: OpportunitySelectionStatusResponse,
+    pub scanner_status: ScannerStatusResponse,
     pub dynamic_config: Vec<DynamicConfigItemResponse>,
 }
 
@@ -1153,6 +1222,14 @@ pub struct DynamicHistoryQuery {
 
 fn default_dynamic_history_limit() -> i64 {
     50
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateOpportunitySelectionRequest {
+    /// Aggressiveness profile: stable, balanced, discovery.
+    pub aggressiveness: Option<String>,
+    /// Number of exploration slots reserved in market selection.
+    pub exploration_slots: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1343,6 +1420,27 @@ pub async fn get_dynamic_tuner_status(
         .find(|row| row.key == KEY_ARB_MIN_PROFIT_THRESHOLD)
         .map(|row| decimal_to_f64(row.current_value))
         .unwrap_or_else(|| env_f64(KEY_ARB_MIN_PROFIT_THRESHOLD, 0.005));
+    let max_markets_cap = rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MONITOR_MAX_MARKETS)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(|| env_f64(KEY_ARB_MONITOR_MAX_MARKETS, 300.0));
+    let exploration_slots = rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MONITOR_EXPLORATION_SLOTS)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(|| env_f64(KEY_ARB_MONITOR_EXPLORATION_SLOTS, 5.0));
+    let aggressiveness_level = rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(env_aggressiveness_level);
+    let aggressiveness = aggressiveness_label(aggressiveness_level).to_string();
+    let recommendation = match aggressiveness.as_str() {
+        "stable" => "Lower discovery, more stable execution.".to_string(),
+        "discovery" => "Higher discovery, more rotation and churn.".to_string(),
+        _ => "Balanced discovery and stability.".to_string(),
+    };
 
     let signal_thresholds = DynamicSignalThresholdsResponse {
         min_net_profit_threshold_pct: min_profit_ratio * 100.0,
@@ -1371,7 +1469,7 @@ pub async fn get_dynamic_tuner_status(
         r#"
         SELECT config_key, action, reason, created_at
         FROM dynamic_config_history
-        WHERE action IN ('applied', 'rollback', 'recommended')
+        WHERE action IN ('applied', 'rollback', 'recommended', 'manual_update')
         ORDER BY created_at DESC
         LIMIT 1
         "#,
@@ -1420,6 +1518,39 @@ pub async fn get_dynamic_tuner_status(
             None => (None, None, None, None),
         };
 
+    let runtime_stats = fetch_arb_runtime_stats().await.unwrap_or_default();
+    let scanner_status = ScannerStatusResponse {
+        monitored_markets: runtime_stats.monitored_markets.round() as i64,
+        core_markets: runtime_stats.core_markets.round() as i64,
+        exploration_markets: runtime_stats.exploration_markets.round() as i64,
+        last_rerank_at: runtime_stats.last_rerank_at,
+        last_resubscribe_at: runtime_stats.last_resubscribe_at,
+        selected_markets: runtime_stats
+            .selected_markets
+            .into_iter()
+            .map(|market| ScannerMarketInsightResponse {
+                market_id: market.market_id,
+                tier: market.tier,
+                total_score: market.total_score,
+                baseline_score: market.baseline_score,
+                opportunity_score: market.opportunity_score,
+                hit_rate_score: market.hit_rate_score,
+                freshness_score: market.freshness_score,
+                sticky_score: market.sticky_score,
+                novelty_score: market.novelty_score,
+                rotation_score: market.rotation_score,
+                upside_score: market.upside_score,
+            })
+            .collect(),
+    };
+    let opportunity_selection = OpportunitySelectionStatusResponse {
+        aggressiveness,
+        aggressiveness_level,
+        exploration_slots: exploration_slots.round() as i64,
+        max_markets_cap: max_markets_cap.round() as i64,
+        recommendation,
+    };
+
     Ok(Json(DynamicTunerStatusResponse {
         enabled,
         apply_changes,
@@ -1441,7 +1572,199 @@ pub async fn get_dynamic_tuner_status(
         last_change_reason,
         last_change_key,
         signal_thresholds,
+        opportunity_selection,
+        scanner_status,
         dynamic_config,
+    }))
+}
+
+/// Update opportunity-selection settings for arb market discovery.
+#[utoipa::path(
+    put,
+    path = "/api/v1/workspaces/{workspace_id}/dynamic-tuning/opportunity-selection",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = UpdateOpportunitySelectionRequest,
+    responses(
+        (status = 200, description = "Updated opportunity-selection settings", body = OpportunitySelectionStatusResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not allowed"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn update_opportunity_selection_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<UpdateOpportunitySelectionRequest>,
+) -> ApiResult<Json<OpportunitySelectionStatusResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+    if role != "owner" {
+        return Err(ApiError::Forbidden(
+            "Only workspace owner can update opportunity selection settings".into(),
+        ));
+    }
+
+    if req.aggressiveness.is_none() && req.exploration_slots.is_none() {
+        return Err(ApiError::BadRequest(
+            "Provide at least one field to update".into(),
+        ));
+    }
+
+    let mut updates: Vec<(String, Decimal, String)> = Vec::new();
+
+    if let Some(aggressiveness) = req.aggressiveness.as_deref() {
+        let level = aggressiveness_to_level(aggressiveness).ok_or_else(|| {
+            ApiError::BadRequest("Aggressiveness must be stable, balanced, or discovery".into())
+        })?;
+        updates.push((
+            KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL.to_string(),
+            Decimal::from_f64_retain(level).unwrap_or(Decimal::new(1, 0)),
+            format!("manual workspace update: aggressiveness={}", aggressiveness),
+        ));
+    }
+
+    if let Some(exploration_slots) = req.exploration_slots {
+        if !(1..=500).contains(&exploration_slots) {
+            return Err(ApiError::BadRequest(
+                "exploration_slots must be between 1 and 500".into(),
+            ));
+        }
+        updates.push((
+            KEY_ARB_MONITOR_EXPLORATION_SLOTS.to_string(),
+            Decimal::new(exploration_slots, 0),
+            format!(
+                "manual workspace update: exploration_slots={}",
+                exploration_slots
+            ),
+        ));
+    }
+
+    for (key, value, reason) in &updates {
+        let old_value: Option<Decimal> =
+            sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&state.pool)
+                .await?;
+
+        let (min_value, max_value, max_step_pct) =
+            opportunity_dynamic_bounds(key).ok_or_else(|| {
+                ApiError::Internal(format!("Unsupported dynamic config key: {}", key))
+            })?;
+        let clamped = (*value).max(min_value).min(max_value);
+
+        sqlx::query(
+            r#"
+            INSERT INTO dynamic_config (
+                key, current_value, default_value, min_value, max_value,
+                max_step_pct, enabled, last_good_value, pending_eval, pending_baseline,
+                last_applied_at, updated_by, last_reason
+            )
+            VALUES ($1, $2, $2, $3, $4, $5, TRUE, $2, FALSE, NULL, NULL, 'workspace_manual', $6)
+            ON CONFLICT (key) DO UPDATE SET
+                current_value = $2,
+                min_value = $3,
+                max_value = $4,
+                max_step_pct = $5,
+                last_good_value = $2,
+                pending_eval = FALSE,
+                pending_baseline = NULL,
+                last_applied_at = NULL,
+                updated_by = 'workspace_manual',
+                last_reason = $6
+            "#,
+        )
+        .bind(key)
+        .bind(clamped)
+        .bind(min_value)
+        .bind(max_value)
+        .bind(max_step_pct)
+        .bind(reason)
+        .execute(&state.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dynamic_config_history
+                (config_key, old_value, new_value, action, reason)
+            VALUES ($1, $2, $3, 'manual_update', $4)
+            "#,
+        )
+        .bind(key)
+        .bind(old_value)
+        .bind(clamped)
+        .bind(reason)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    publish_manual_dynamic_updates(&updates)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed publishing dynamic config updates to runtime subscribers: {}",
+                error
+            ))
+        })?;
+
+    // Return fresh status projection
+    let dynamic_rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
+        r#"
+        SELECT
+            key, current_value, default_value, min_value, max_value,
+            max_step_pct, enabled, last_good_value, pending_eval,
+            last_applied_at, last_reason, updated_at
+        FROM dynamic_config
+        WHERE key = ANY($1)
+        ORDER BY key
+        "#,
+    )
+    .bind(vec![
+        KEY_ARB_MONITOR_EXPLORATION_SLOTS,
+        KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL,
+        KEY_ARB_MONITOR_MAX_MARKETS,
+    ])
+    .fetch_all(&state.pool)
+    .await?;
+
+    let max_markets_cap = dynamic_rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MONITOR_MAX_MARKETS)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(|| env_f64(KEY_ARB_MONITOR_MAX_MARKETS, 300.0));
+    let exploration_slots = dynamic_rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MONITOR_EXPLORATION_SLOTS)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(|| env_f64(KEY_ARB_MONITOR_EXPLORATION_SLOTS, 5.0));
+    let aggressiveness_level = dynamic_rows
+        .iter()
+        .find(|row| row.key == KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL)
+        .map(|row| decimal_to_f64(row.current_value))
+        .unwrap_or_else(env_aggressiveness_level);
+    let aggressiveness = aggressiveness_label(aggressiveness_level).to_string();
+    let recommendation = match aggressiveness.as_str() {
+        "stable" => "Lower discovery, more stable execution.".to_string(),
+        "discovery" => "Higher discovery, more rotation and churn.".to_string(),
+        _ => "Balanced discovery and stability.".to_string(),
+    };
+
+    Ok(Json(OpportunitySelectionStatusResponse {
+        aggressiveness,
+        aggressiveness_level,
+        exploration_slots: exploration_slots.round() as i64,
+        max_markets_cap: max_markets_cap.round() as i64,
+        recommendation,
     }))
 }
 
@@ -1519,6 +1842,90 @@ fn env_bool(name: &str, fallback: bool) -> bool {
             normalized == "1" || normalized == "true" || normalized == "yes"
         })
         .unwrap_or(fallback)
+}
+
+fn env_aggressiveness_level() -> f64 {
+    match std::env::var("ARB_MONITOR_AGGRESSIVENESS")
+        .unwrap_or_else(|_| "balanced".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "stable" | "conservative" => 0.0,
+        "discovery" | "aggressive" => 2.0,
+        _ => 1.0,
+    }
+}
+
+fn aggressiveness_label(level: f64) -> &'static str {
+    if level <= 0.5 {
+        "stable"
+    } else if level >= 1.5 {
+        "discovery"
+    } else {
+        "balanced"
+    }
+}
+
+fn aggressiveness_to_level(value: &str) -> Option<f64> {
+    match value.trim().to_lowercase().as_str() {
+        "stable" | "conservative" => Some(0.0),
+        "balanced" => Some(1.0),
+        "discovery" | "aggressive" => Some(2.0),
+        _ => None,
+    }
+}
+
+fn opportunity_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> {
+    match key {
+        KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((
+            Decimal::new(1, 0),
+            Decimal::new(500, 0),
+            Decimal::new(25, 2),
+        )),
+        KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => {
+            Some((Decimal::ZERO, Decimal::new(2, 0), Decimal::new(100, 2)))
+        }
+        _ => None,
+    }
+}
+
+async fn publish_manual_dynamic_updates(
+    updates: &[(String, Decimal, String)],
+) -> Result<(), redis::RedisError> {
+    let redis_url = std::env::var("DYNAMIC_TUNER_REDIS_URL")
+        .or_else(|_| std::env::var("REDIS_URL"))
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = redis::Client::open(redis_url.as_str())?;
+    let mut redis = redis::aio::ConnectionManager::new(client).await?;
+
+    for (key, value, reason) in updates {
+        let payload = crate::dynamic_tuner::DynamicConfigUpdate {
+            key: key.clone(),
+            value: *value,
+            reason: reason.clone(),
+            source: "workspace_manual".to_string(),
+            timestamp: Utc::now(),
+            metrics: serde_json::json!({ "source": "workspace_settings" }),
+        };
+        let serialized = serde_json::to_string(&payload).map_err(|_| {
+            redis::RedisError::from((redis::ErrorKind::TypeError, "Failed serializing payload"))
+        })?;
+        let _: () = redis
+            .publish(crate::dynamic_tuner::channels::CONFIG_UPDATES, serialized)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn fetch_arb_runtime_stats() -> Option<ArbRuntimeStatsSnapshot> {
+    let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
+        .or_else(|_| std::env::var("REDIS_URL"))
+        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let client = redis::Client::open(redis_url.as_str()).ok()?;
+    let mut redis = redis::aio::ConnectionManager::new(client).await.ok()?;
+    let payload: Option<String> = redis.get(ARB_RUNTIME_STATS_LATEST).await.ok()?;
+    payload.and_then(|raw| serde_json::from_str::<ArbRuntimeStatsSnapshot>(&raw).ok())
 }
 
 fn env_f64(name: &str, fallback: f64) -> f64 {

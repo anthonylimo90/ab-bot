@@ -1,6 +1,7 @@
 //! Signal publishing for arbitrage alerts.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use polymarket_core::config::AlertsConfig;
 use polymarket_core::types::ArbOpportunity;
@@ -8,6 +9,7 @@ use redis::AsyncCommands;
 use tracing::{debug, warn};
 
 /// Redis channels for pub/sub.
+#[allow(dead_code)]
 pub mod channels {
     pub const ENTRY: &str = "arb:entry";
     pub const EXIT: &str = "arb:exit";
@@ -26,11 +28,36 @@ pub struct SignalPublisher {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RuntimeMarketInsight {
+    pub market_id: String,
+    pub tier: String,
+    pub total_score: f64,
+    pub baseline_score: f64,
+    pub opportunity_score: f64,
+    pub hit_rate_score: f64,
+    pub freshness_score: f64,
+    pub sticky_score: f64,
+    pub novelty_score: Option<f64>,
+    pub rotation_score: Option<f64>,
+    pub upside_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct RuntimeStats {
     pub updates_per_minute: f64,
     pub stalls_last_minute: f64,
     pub resets_last_minute: f64,
     pub monitored_markets: f64,
+    #[serde(default)]
+    pub core_markets: f64,
+    #[serde(default)]
+    pub exploration_markets: f64,
+    #[serde(default)]
+    pub last_rerank_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_resubscribe_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub selected_markets: Vec<RuntimeMarketInsight>,
 }
 
 impl SignalPublisher {
@@ -63,6 +90,7 @@ impl SignalPublisher {
     }
 
     /// Publish an exit signal.
+    #[allow(dead_code)]
     pub async fn publish_exit_signal(
         &mut self,
         market_id: &str,
@@ -152,10 +180,12 @@ impl SignalPublisher {
 }
 
 /// Subscribes to arbitrage signals from Redis.
+#[allow(dead_code)]
 pub struct SignalSubscriber {
     pubsub: redis::aio::PubSub,
 }
 
+#[allow(dead_code)]
 impl SignalSubscriber {
     /// Create a new signal subscriber.
     pub async fn new(redis_client: redis::Client) -> Result<Self> {

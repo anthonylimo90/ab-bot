@@ -111,6 +111,7 @@ struct PositionRow {
     realized_pnl: Option<Decimal>,
     opened_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[allow(dead_code)]
     is_open: bool,
 }
 

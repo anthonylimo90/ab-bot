@@ -689,7 +689,7 @@ impl AutoOptimizer {
         // Get current allocations
         let current = self.get_current_allocations(workspace.id).await?;
         let active_wallets: Vec<_> = current.iter().filter(|a| a.tier == "active").collect();
-        let active_count = active_wallets.len();
+        let _active_count = active_wallets.len();
 
         // Step 1: Check for wallets that need demotion (if auto_demote enabled)
         if auto_demote {
@@ -1456,9 +1456,9 @@ impl AutoOptimizer {
             let trade_count = candidate.trade_count_30d.unwrap_or(0) as f64;
 
             // Normalize scores (0-100 scale)
-            let roi_score = (roi / 0.20).min(1.0).max(0.0) * 100.0; // 20% monthly = max score
-            let sharpe_score = (sharpe / 3.0).min(1.0).max(0.0) * 100.0; // 3.0 = max score
-            let win_rate_score = (win_rate * 100.0).min(100.0).max(0.0);
+            let roi_score = (roi / 0.20).clamp(0.0, 1.0) * 100.0; // 20% monthly = max score
+            let sharpe_score = (sharpe / 3.0).clamp(0.0, 1.0) * 100.0; // 3.0 = max score
+            let win_rate_score = (win_rate * 100.0).clamp(0.0, 100.0);
 
             // Consistency score based on trade count and drawdown
             let drawdown = candidate
@@ -1785,6 +1785,7 @@ impl AutoOptimizer {
     }
 
     /// Rotate a wallet: demote old, promote new.
+    #[allow(dead_code)]
     async fn rotate_wallet(
         &self,
         workspace_id: Uuid,
@@ -1880,6 +1881,7 @@ impl AutoOptimizer {
     }
 
     /// Add a new wallet to the active roster.
+    #[allow(dead_code)]
     async fn add_to_active(&self, workspace_id: Uuid, address: &str) -> anyhow::Result<()> {
         let now = Utc::now();
 
@@ -2104,7 +2106,7 @@ impl AutoOptimizer {
         workspace_id: Uuid,
         wallet_address: &str,
         trigger: DemotionTrigger,
-        triggered_by: Option<Uuid>,
+        _triggered_by: Option<Uuid>,
     ) -> anyhow::Result<()> {
         let now = Utc::now();
         let action = if trigger.is_immediate() {
@@ -2333,6 +2335,7 @@ impl AutoOptimizer {
     }
 
     /// Log rotation action to history table.
+    #[allow(clippy::too_many_arguments)]
     async fn log_rotation_action(
         &self,
         workspace_id: Uuid,
@@ -2378,6 +2381,7 @@ impl AutoOptimizer {
         let now = Utc::now();
 
         // Find the rotation record
+        #[allow(clippy::type_complexity)]
         let rotation: Option<(
             String,
             Option<String>,

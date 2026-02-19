@@ -2,7 +2,6 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::{Duration, Utc};
@@ -100,6 +99,7 @@ pub struct LinkWalletResponse {
 struct UserRow {
     id: Uuid,
     email: Option<String>,
+    #[allow(dead_code)]
     wallet_address: Option<String>,
     role: i16,
     name: Option<String>,
@@ -402,7 +402,7 @@ pub async fn verify(
     let role = user.role_string();
     let user_role = user.user_role();
 
-    let claims = Claims::new(&user.id.to_string(), user_role, 24).with_wallet_address(&address);
+    let claims = Claims::new(user.id.to_string(), user_role, 24).with_wallet_address(&address);
     let claims = if let Some(ref email) = user.email {
         claims.with_email(email)
     } else {

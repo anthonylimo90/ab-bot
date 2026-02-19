@@ -138,7 +138,7 @@ impl SlippageModel {
                 off_hours_multiplier,
             } => {
                 // Prime time: 9am-5pm (hours 9-17)
-                let time_mult = if hour >= 9 && hour <= 17 {
+                let time_mult = if (9..=17).contains(&hour) {
                     *prime_time_multiplier
                 } else {
                     *off_hours_multiplier
@@ -196,7 +196,7 @@ impl FeeModel {
                     .iter()
                     .filter(|(threshold, _)| cumulative_volume >= *threshold)
                     .map(|(_, fee)| *fee)
-                    .last()
+                    .next_back()
                     .unwrap_or(*default_fee);
                 value * fee_pct
             }
@@ -207,8 +207,10 @@ impl FeeModel {
 /// Model for simulating partial fills based on market liquidity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PartialFillModel {
     /// Always fill the entire order (instant fill assumption).
+    #[default]
     FullFill,
     /// Fill based on orderbook depth.
     DepthBased {
@@ -228,12 +230,6 @@ pub enum PartialFillModel {
     Fixed(Decimal),
 }
 
-impl Default for PartialFillModel {
-    fn default() -> Self {
-        PartialFillModel::FullFill
-    }
-}
-
 impl PartialFillModel {
     /// Calculate fill quantity based on the model.
     /// Returns the quantity that will be filled.
@@ -241,7 +237,7 @@ impl PartialFillModel {
         &self,
         requested_quantity: Decimal,
         available_depth: Decimal,
-        spread: Decimal,
+        _spread: Decimal,
     ) -> Decimal {
         match self {
             PartialFillModel::FullFill => requested_quantity,

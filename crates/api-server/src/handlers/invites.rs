@@ -477,6 +477,7 @@ pub async fn get_invite_info(
 
     #[derive(sqlx::FromRow)]
     struct InviteInfoRow {
+        #[allow(dead_code)]
         workspace_id: Uuid,
         workspace_name: String,
         email: String,

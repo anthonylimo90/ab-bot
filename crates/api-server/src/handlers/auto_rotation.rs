@@ -358,6 +358,7 @@ pub async fn trigger_optimization(
     }
 
     // Check if auto-optimization is enabled and get thresholds
+    #[allow(clippy::type_complexity)]
     let settings: Option<(
         bool,
         bool,

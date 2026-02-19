@@ -11,19 +11,15 @@ use crate::profitability::{ProfitabilityAnalyzer, TimePeriod, WalletMetrics};
 /// Prediction model type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PredictionModel {
     /// Rule-based scoring using heuristics.
+    #[default]
     RuleBased,
     /// Simple linear model.
     Linear,
     /// Weighted average of multiple factors.
     WeightedAverage,
-}
-
-impl Default for PredictionModel {
-    fn default() -> Self {
-        Self::RuleBased
-    }
 }
 
 /// Prediction result for a wallet.
@@ -236,7 +232,7 @@ impl SuccessPredictor {
         .bind(prediction.success_probability)
         .bind(prediction.confidence)
         .bind(Self::category_to_db(prediction.category))
-        .bind(&prediction.predicted_at)
+        .bind(prediction.predicted_at)
         .bind(&prediction.address)
         .execute(&self.pool)
         .await?;
@@ -271,7 +267,7 @@ impl SuccessPredictor {
         total_weight += self.weights.win_rate;
 
         // Sharpe ratio factor (capped at 3.0)
-        let sharpe_score = (metrics.sharpe_ratio / 3.0).min(1.0).max(0.0);
+        let sharpe_score = (metrics.sharpe_ratio / 3.0).clamp(0.0, 1.0);
         factors.push(PredictionFactor::new(
             "sharpe_ratio",
             sharpe_score,
@@ -281,7 +277,7 @@ impl SuccessPredictor {
         total_weight += self.weights.sharpe_ratio;
 
         // Consistency factor
-        let consistency_score = metrics.consistency_score.min(1.0).max(0.0);
+        let consistency_score = metrics.consistency_score.clamp(0.0, 1.0);
         factors.push(PredictionFactor::new(
             "consistency",
             consistency_score,
@@ -291,7 +287,7 @@ impl SuccessPredictor {
         total_weight += self.weights.consistency;
 
         // ROI factor (capped at 50% monthly)
-        let roi_score = (metrics.roi_percentage / 0.5).min(1.0).max(0.0);
+        let roi_score = (metrics.roi_percentage / 0.5).clamp(0.0, 1.0);
         factors.push(PredictionFactor::new("roi", roi_score, self.weights.roi));
         total_score += roi_score * self.weights.roi;
         total_weight += self.weights.roi;
@@ -306,7 +302,7 @@ impl SuccessPredictor {
         total_score -= drawdown_penalty * self.weights.drawdown_penalty;
 
         // Trade count bonus (log scale, capped)
-        let trade_bonus = ((metrics.total_trades as f64).ln() / 5.0).min(1.0).max(0.0);
+        let trade_bonus = ((metrics.total_trades as f64).ln() / 5.0).clamp(0.0, 1.0);
         factors.push(PredictionFactor::new(
             "trade_count",
             trade_bonus,
@@ -316,7 +312,7 @@ impl SuccessPredictor {
         total_weight += self.weights.trade_count_bonus;
 
         // Normalize to 0-1 probability
-        let probability = (total_score / total_weight).max(0.0).min(1.0);
+        let probability = (total_score / total_weight).clamp(0.0, 1.0);
 
         // Calculate confidence based on data quality
         let confidence = self.calculate_confidence(metrics);
@@ -345,7 +341,7 @@ impl SuccessPredictor {
             - 0.1 * metrics.max_drawdown
             + 0.1 * ((metrics.total_trades as f64).ln() / 5.0).min(1.0);
 
-        let probability = probability.max(0.0).min(1.0);
+        let probability = probability.clamp(0.0, 1.0);
         let confidence = self.calculate_confidence(metrics);
         let category = PredictionCategory::from_probability(probability, confidence);
 
@@ -365,14 +361,14 @@ impl SuccessPredictor {
         // Weighted average of key metrics
         let scores = [
             (metrics.win_rate, 0.3),
-            ((metrics.sharpe_ratio / 3.0).min(1.0).max(0.0), 0.25),
+            ((metrics.sharpe_ratio / 3.0).clamp(0.0, 1.0), 0.25),
             (metrics.consistency_score, 0.2),
-            ((metrics.roi_percentage / 0.3).min(1.0).max(0.0), 0.15),
+            ((metrics.roi_percentage / 0.3).clamp(0.0, 1.0), 0.15),
             (1.0 - metrics.max_drawdown.min(1.0), 0.1),
         ];
 
         let probability: f64 = scores.iter().map(|(s, w)| s * w).sum();
-        let probability = probability.max(0.0).min(1.0);
+        let probability = probability.clamp(0.0, 1.0);
 
         let confidence = self.calculate_confidence(metrics);
         let category = PredictionCategory::from_probability(probability, confidence);
@@ -534,7 +530,7 @@ mod tests {
         let metrics = create_test_metrics(0.65, 2.0, 100);
 
         // Create a mock predictor for rule-based prediction test
-        let weights = PredictionWeights::default();
+        let _weights = PredictionWeights::default();
 
         // Win rate score: (0.65 - 0.5) * 2 = 0.30
         let win_rate_score = (metrics.win_rate - 0.5) * 2.0;

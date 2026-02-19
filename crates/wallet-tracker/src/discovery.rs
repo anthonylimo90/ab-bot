@@ -575,9 +575,9 @@ impl WalletDiscovery {
         .bind(&wallet.address)
         .bind(wallet.total_trades as i64)
         .bind(wallet.win_rate)
-        .bind(&wallet.total_volume)
-        .bind(&wallet.first_trade)
-        .bind(&wallet.last_trade)
+        .bind(wallet.total_volume)
+        .bind(wallet.first_trade)
+        .bind(wallet.last_trade)
         .execute(&self.pool)
         .await?;
 
@@ -754,7 +754,7 @@ mod tests {
             composite_score: Some(0.78), // High composite despite lower ROI
         };
 
-        let mut wallets = vec![wallet_a.clone(), wallet_b.clone()];
+        let mut wallets = [wallet_a.clone(), wallet_b.clone()];
         wallets.sort_by(|a, b| {
             let score_a = a.composite_score.unwrap_or(a.roi);
             let score_b = b.composite_score.unwrap_or(b.roi);

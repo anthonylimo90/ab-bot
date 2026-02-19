@@ -242,7 +242,7 @@ impl AppState {
                 if let Some(wallet) = approval_wallet {
                     let signer = wallet.signer();
                     match polymarket_core::api::approvals::ensure_polymarket_approvals(
-                        &signer, &rpc_url,
+                        signer, &rpc_url,
                     )
                     .await
                     {
@@ -384,6 +384,7 @@ impl AppState {
     }
 
     /// Publish a signal update.
+    #[allow(clippy::result_large_err)]
     pub fn publish_signal(
         &self,
         update: SignalUpdate,

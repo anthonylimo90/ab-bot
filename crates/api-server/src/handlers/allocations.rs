@@ -89,6 +89,7 @@ pub struct ListAllocationsQuery {
 #[derive(Debug, sqlx::FromRow)]
 struct AllocationRow {
     id: Uuid,
+    #[allow(dead_code)]
     workspace_id: Uuid,
     wallet_address: String,
     allocation_pct: Decimal,
@@ -1404,6 +1405,7 @@ pub async fn list_bans(
         return Err(ApiError::Forbidden("Not a member of this workspace".into()));
     }
 
+    #[allow(clippy::type_complexity)]
     let bans: Vec<(
         Uuid,
         String,

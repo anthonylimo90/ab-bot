@@ -259,10 +259,10 @@ impl TradeMonitor {
             match self.poll_all_wallets().await {
                 Ok(trades) => {
                     for trade in trades {
-                        if trade.is_significant(self.config.min_trade_value) {
-                            if self.trade_tx.send(trade).is_err() {
-                                debug!("No subscribers for trade notifications");
-                            }
+                        if trade.is_significant(self.config.min_trade_value)
+                            && self.trade_tx.send(trade).is_err()
+                        {
+                            debug!("No subscribers for trade notifications");
                         }
                     }
                 }

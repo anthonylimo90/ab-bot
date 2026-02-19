@@ -6,7 +6,7 @@ use axum::{
     extract::{Query, State},
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
@@ -93,6 +93,7 @@ struct WalletMetricsRow {
     win_rate_30d: Option<Decimal>,
     trades_30d: Option<i64>,
     max_drawdown_30d: Option<Decimal>,
+    #[allow(dead_code)]
     enabled: bool,
 }
 
@@ -259,7 +260,7 @@ pub async fn get_rotation_recommendations(
     // Check bench wallets for promotion candidates
     for wallet in &bench_wallets {
         let roi_30d = decimal_to_f64(wallet.roi_30d);
-        let sharpe = decimal_to_f64(wallet.sharpe_30d);
+        let _sharpe = decimal_to_f64(wallet.sharpe_30d);
         let win_rate = decimal_to_f64(wallet.win_rate_30d);
         let trades = wallet.trades_30d.unwrap_or(0);
 

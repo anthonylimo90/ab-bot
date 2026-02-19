@@ -453,8 +453,7 @@ impl Strategy for ArbitrageStrategy {
                         .to_string()
                         .parse::<f64>()
                         .unwrap_or(0.5)
-                        .min(1.0)
-                        .max(0.0);
+                        .clamp(0.0, 1.0);
 
                     let signal = Signal::buy(market_id, outcome, self.position_size)
                         .with_entry_price(price)

@@ -235,17 +235,19 @@ impl ClobClient {
     }
 
     /// Subscribe to real-time order book updates via WebSocket.
-    /// Returns a channel receiver that yields order book updates.
-    /// Automatically reconnects with exponential backoff on disconnection.
+    ///
+    /// Expects token IDs (`asset_id`) for the market channel subscription.
+    /// Returns a channel receiver that yields normalized order book updates and
+    /// automatically reconnects with exponential backoff on disconnection.
     pub async fn subscribe_orderbook(
         &self,
-        market_ids: Vec<String>,
+        asset_ids: Vec<String>,
     ) -> Result<mpsc::Receiver<OrderBookUpdate>> {
         let (tx, rx) = mpsc::channel(1000);
         let ws_url = self.ws_url.clone();
 
         tokio::spawn(async move {
-            Self::ws_loop_with_reconnect(ws_url, market_ids, tx).await;
+            Self::ws_loop_with_reconnect(ws_url, asset_ids, tx).await;
         });
 
         Ok(rx)
@@ -254,7 +256,7 @@ impl ClobClient {
     /// WebSocket loop with automatic reconnection and exponential backoff.
     async fn ws_loop_with_reconnect(
         ws_url: String,
-        market_ids: Vec<String>,
+        asset_ids: Vec<String>,
         tx: mpsc::Sender<OrderBookUpdate>,
     ) {
         let mut attempt = 0u32;
@@ -262,7 +264,7 @@ impl ClobClient {
         let base_delay_secs = 1u64;
 
         loop {
-            match Self::ws_loop(&ws_url, &market_ids, &tx).await {
+            match Self::ws_loop(&ws_url, &asset_ids, &tx).await {
                 Ok(()) => {
                     info!("WebSocket connection closed cleanly");
                 }
@@ -296,85 +298,93 @@ impl ClobClient {
 
     async fn ws_loop(
         ws_url: &str,
-        market_ids: &[String],
+        asset_ids: &[String],
         tx: &mpsc::Sender<OrderBookUpdate>,
     ) -> Result<()> {
+        if asset_ids.is_empty() {
+            return Err(Error::Config {
+                message: "Cannot subscribe to orderbook stream with empty asset list".to_string(),
+            });
+        }
+
         let (ws_stream, _) = connect_async(ws_url).await?;
         let (mut write, mut read) = ws_stream.split();
         let read_timeout_secs = std::env::var("CLOB_WS_READ_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(120_u64);
+        let ping_interval_secs = std::env::var("CLOB_WS_PING_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_u64);
+        let mut ping_tick = tokio::time::interval(StdDuration::from_secs(ping_interval_secs));
+        ping_tick.tick().await;
+        let mut order_books_by_asset: HashMap<String, OrderBook> = HashMap::new();
 
-        // Subscribe to markets
-        for (idx, market_id) in market_ids.iter().enumerate() {
-            let subscribe_msg = serde_json::json!({
-                "type": "subscribe",
-                "market": market_id,
-                "channel": "book"
-            });
-            write.send(Message::Text(subscribe_msg.to_string())).await?;
-            debug!("Subscribed to market: {}", market_id);
-
-            // Pace large subscription sets to reduce server-side reset risk.
-            if (idx + 1) % 200 == 0 {
-                tokio::time::sleep(StdDuration::from_millis(25)).await;
-            }
-        }
-        info!("Subscribed to {} markets via WebSocket", market_ids.len());
+        // Subscribe to market channel by token IDs.
+        let subscribe_msg = serde_json::json!({
+            "type": "market",
+            "assets_ids": asset_ids,
+            "custom_feature_enabled": false
+        });
+        write.send(Message::Text(subscribe_msg.to_string())).await?;
+        info!("Subscribed to {} assets via WebSocket", asset_ids.len());
 
         // Process incoming messages
         loop {
-            let msg =
-                match tokio::time::timeout(StdDuration::from_secs(read_timeout_secs), read.next())
-                    .await
-                {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => {
-                        warn!("WebSocket stream ended");
-                        return Ok(());
-                    }
-                    Err(_) => {
-                        warn!(
-                            timeout_secs = read_timeout_secs,
-                            "WebSocket read timed out without messages"
-                        );
-                        return Err(Error::Api {
-                            message: format!(
-                                "WebSocket read timed out after {}s without messages",
-                                read_timeout_secs
-                            ),
-                            status: None,
-                        });
-                    }
-                };
+            tokio::select! {
+                _ = ping_tick.tick() => {
+                    write.send(Message::Text("PING".to_string())).await?;
+                }
+                msg = tokio::time::timeout(StdDuration::from_secs(read_timeout_secs), read.next()) => {
+                    let msg = match msg {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => {
+                            warn!("WebSocket stream ended");
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            warn!(
+                                timeout_secs = read_timeout_secs,
+                                "WebSocket read timed out without messages"
+                            );
+                            return Err(Error::Api {
+                                message: format!(
+                                    "WebSocket read timed out after {}s without messages",
+                                    read_timeout_secs
+                                ),
+                                status: None,
+                            });
+                        }
+                    };
 
-            match msg {
-                Ok(Message::Text(text)) => match serde_json::from_str::<WsMessage>(&text) {
-                    Ok(ws_msg) => {
-                        if let Some(update) = ws_msg.into_update() {
-                            if tx.send(update).await.is_err() {
-                                warn!("Receiver dropped, closing WebSocket");
-                                return Ok(());
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            let updates = parse_ws_updates(&text, &mut order_books_by_asset);
+                            for update in updates {
+                                if tx.send(update).await.is_err() {
+                                    warn!("Receiver dropped, closing WebSocket");
+                                    return Ok(());
+                                }
                             }
                         }
+                        Ok(Message::Ping(data)) => {
+                            write.send(Message::Pong(data)).await?;
+                        }
+                        Ok(Message::Pong(_)) => {
+                            debug!("Received websocket pong");
+                        }
+                        Ok(Message::Close(_)) => {
+                            info!("WebSocket closed by server");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!("WebSocket receive error: {}", e);
+                            return Err(e.into());
+                        }
+                        _ => {}
                     }
-                    Err(e) => {
-                        debug!("Failed to parse WebSocket message: {} - {}", e, text);
-                    }
-                },
-                Ok(Message::Ping(data)) => {
-                    write.send(Message::Pong(data)).await?;
                 }
-                Ok(Message::Close(_)) => {
-                    info!("WebSocket closed by server");
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("WebSocket receive error: {}", e);
-                    return Err(e.into());
-                }
-                _ => {}
             }
         }
     }
@@ -647,49 +657,199 @@ impl From<ClobOrderBook> for OrderBook {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsMessage {
-    Book {
-        market: String,
-        asset_id: String,
-        bids: Vec<ClobPriceLevel>,
-        asks: Vec<ClobPriceLevel>,
-        timestamp: String,
-    },
-    #[serde(other)]
-    Other,
+struct WsBook {
+    market: String,
+    asset_id: String,
+    #[serde(default, alias = "buys")]
+    bids: Vec<ClobPriceLevel>,
+    #[serde(default, alias = "sells")]
+    asks: Vec<ClobPriceLevel>,
+    timestamp: String,
 }
 
-impl WsMessage {
-    fn into_update(self) -> Option<OrderBookUpdate> {
-        match self {
-            WsMessage::Book {
-                market,
-                asset_id,
-                bids,
-                asks,
-                timestamp,
-            } => Some(OrderBookUpdate {
-                market_id: market,
-                asset_id,
-                timestamp: timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                bids: bids
-                    .into_iter()
-                    .map(|l| PriceLevel {
-                        price: l.price.parse().unwrap_or_default(),
-                        size: l.size.parse().unwrap_or_default(),
-                    })
-                    .collect(),
-                asks: asks
-                    .into_iter()
-                    .map(|l| PriceLevel {
-                        price: l.price.parse().unwrap_or_default(),
-                        size: l.size.parse().unwrap_or_default(),
-                    })
-                    .collect(),
-            }),
-            WsMessage::Other => None,
+#[derive(Debug, Deserialize)]
+struct WsPriceChangeEvent {
+    market: String,
+    #[serde(default)]
+    price_changes: Vec<WsPriceChange>,
+    #[serde(default)]
+    timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WsPriceChange {
+    asset_id: String,
+    price: String,
+    size: String,
+    side: String,
+}
+
+fn parse_ws_updates(
+    text: &str,
+    book_state: &mut HashMap<String, OrderBook>,
+) -> Vec<OrderBookUpdate> {
+    let trimmed = text.trim();
+
+    if trimmed.eq_ignore_ascii_case("PONG") || trimmed.eq_ignore_ascii_case("PING") {
+        return Vec::new();
+    }
+    if trimmed.eq_ignore_ascii_case("INVALID OPERATION") {
+        warn!("Received INVALID OPERATION from CLOB websocket");
+        return Vec::new();
+    }
+
+    let value = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => value,
+        Err(e) => {
+            debug!(
+                "Failed to parse websocket JSON message: {} - {}",
+                e, trimmed
+            );
+            return Vec::new();
         }
+    };
+
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(parse_ws_book_from_value)
+            .inspect(|update| {
+                book_state.insert(update.asset_id.clone(), update_to_orderbook(update));
+            })
+            .collect(),
+        serde_json::Value::Object(_) => {
+            if let Some(update) = parse_ws_book_from_value(value.clone()) {
+                book_state.insert(update.asset_id.clone(), update_to_orderbook(&update));
+                return vec![update];
+            }
+
+            if let Ok(event) = serde_json::from_value::<WsPriceChangeEvent>(value) {
+                return apply_price_changes(event, book_state);
+            }
+
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_ws_book_from_value(value: serde_json::Value) -> Option<OrderBookUpdate> {
+    let ws_book = serde_json::from_value::<WsBook>(value).ok()?;
+
+    Some(OrderBookUpdate {
+        market_id: ws_book.market,
+        asset_id: ws_book.asset_id,
+        timestamp: parse_ws_timestamp(&ws_book.timestamp),
+        bids: ws_book
+            .bids
+            .into_iter()
+            .map(|l| PriceLevel {
+                price: l.price.parse().unwrap_or_default(),
+                size: l.size.parse().unwrap_or_default(),
+            })
+            .collect(),
+        asks: ws_book
+            .asks
+            .into_iter()
+            .map(|l| PriceLevel {
+                price: l.price.parse().unwrap_or_default(),
+                size: l.size.parse().unwrap_or_default(),
+            })
+            .collect(),
+    })
+}
+
+fn apply_price_changes(
+    event: WsPriceChangeEvent,
+    book_state: &mut HashMap<String, OrderBook>,
+) -> Vec<OrderBookUpdate> {
+    let timestamp = event
+        .timestamp
+        .as_deref()
+        .map(parse_ws_timestamp)
+        .unwrap_or_else(chrono::Utc::now);
+
+    let mut updates = Vec::new();
+    for change in event.price_changes {
+        let price = match change.price.parse::<Decimal>() {
+            Ok(price) => price,
+            Err(_) => continue,
+        };
+        let size = match change.size.parse::<Decimal>() {
+            Ok(size) => size,
+            Err(_) => continue,
+        };
+
+        let mut book = book_state
+            .remove(&change.asset_id)
+            .unwrap_or_else(|| OrderBook {
+                market_id: event.market.clone(),
+                outcome_id: change.asset_id.clone(),
+                timestamp,
+                bids: Vec::new(),
+                asks: Vec::new(),
+            });
+
+        book.market_id = event.market.clone();
+        book.timestamp = timestamp;
+
+        if change.side.eq_ignore_ascii_case("BUY") {
+            upsert_level(&mut book.bids, price, size, true);
+        } else if change.side.eq_ignore_ascii_case("SELL") {
+            upsert_level(&mut book.asks, price, size, false);
+        } else {
+            book_state.insert(change.asset_id, book);
+            continue;
+        }
+
+        let update = OrderBookUpdate {
+            market_id: book.market_id.clone(),
+            asset_id: book.outcome_id.clone(),
+            timestamp: book.timestamp,
+            bids: book.bids.clone(),
+            asks: book.asks.clone(),
+        };
+        book_state.insert(change.asset_id, book);
+        updates.push(update);
+    }
+
+    updates
+}
+
+fn parse_ws_timestamp(raw: &str) -> chrono::DateTime<chrono::Utc> {
+    if let Ok(ms) = raw.parse::<i64>() {
+        if let Some(ts) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms) {
+            return ts;
+        }
+    }
+    raw.parse().unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn update_to_orderbook(update: &OrderBookUpdate) -> OrderBook {
+    OrderBook {
+        market_id: update.market_id.clone(),
+        outcome_id: update.asset_id.clone(),
+        timestamp: update.timestamp,
+        bids: update.bids.clone(),
+        asks: update.asks.clone(),
+    }
+}
+
+fn upsert_level(levels: &mut Vec<PriceLevel>, price: Decimal, size: Decimal, descending: bool) {
+    if let Some(idx) = levels.iter().position(|l| l.price == price) {
+        if size <= Decimal::ZERO {
+            levels.remove(idx);
+        } else {
+            levels[idx].size = size;
+        }
+    } else if size > Decimal::ZERO {
+        levels.push(PriceLevel { price, size });
+    }
+
+    if descending {
+        levels.sort_by(|a, b| b.price.cmp(&a.price));
+    } else {
+        levels.sort_by(|a, b| a.price.cmp(&b.price));
     }
 }
 

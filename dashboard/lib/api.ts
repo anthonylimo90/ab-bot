@@ -32,6 +32,7 @@ import type {
   OnboardingStatus,
   CreateWorkspaceRequest,
   UpdateWorkspaceRequest,
+  UpdateOpportunitySelectionRequest,
   CreateInviteRequest,
   InviteInfo,
   AcceptInviteRequest,
@@ -722,6 +723,19 @@ class ApiClient {
   async getDynamicTunerStatus(workspaceId: string): Promise<DynamicTunerStatus> {
     return this.request<DynamicTunerStatus>(
       `/api/v1/workspaces/${workspaceId}/dynamic-tuning/status`,
+    );
+  }
+
+  async updateOpportunitySelection(
+    workspaceId: string,
+    params: UpdateOpportunitySelectionRequest,
+  ): Promise<DynamicTunerStatus["opportunity_selection"]> {
+    return this.request<DynamicTunerStatus["opportunity_selection"]>(
+      `/api/v1/workspaces/${workspaceId}/dynamic-tuning/opportunity-selection`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
     );
   }
 

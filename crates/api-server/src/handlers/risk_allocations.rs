@@ -96,10 +96,8 @@ pub async fn recalculate_allocations(
         }
 
         // Convert to previews
-        let previews: Vec<AllocationPreview> = allocations
-            .iter()
-            .map(|a| allocation_to_preview(a))
-            .collect();
+        let previews: Vec<AllocationPreview> =
+            allocations.iter().map(allocation_to_preview).collect();
 
         all_previews.extend(previews);
 

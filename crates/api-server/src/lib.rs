@@ -61,7 +61,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use trading_engine::copy_trader::{CopyTrader, TrackedWallet};
 use wallet_tracker::trade_monitor::{MonitorConfig, TradeMonitor};
 
@@ -246,6 +246,18 @@ impl ApiServer {
             }
 
             let copy_trader = Arc::new(RwLock::new(copy_trader));
+
+            if let Err(e) = crate::dynamic_tuner::sync_dynamic_config_snapshot_to_copy_trader(
+                &self.state.pool,
+                &copy_trader,
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "Failed to apply startup dynamic config snapshot; falling back to env policy"
+                );
+            }
 
             // Store in AppState so allocation handlers can sync at runtime
             self.state.trade_monitor = Some(trade_monitor.clone());

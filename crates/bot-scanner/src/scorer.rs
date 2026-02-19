@@ -3,12 +3,13 @@
 use polymarket_core::types::{BotScore, WalletClassification, WalletFeatures};
 
 /// Generate a detailed analysis report for a wallet.
+#[allow(dead_code)]
 pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
     let mut report = String::new();
 
-    report.push_str(&format!("=== Wallet Analysis Report ===\n"));
+    report.push_str("=== Wallet Analysis Report ===\n");
     report.push_str(&format!("Address: {}\n", features.address));
-    report.push_str(&format!("\n--- Trading Activity ---\n"));
+    report.push_str("\n--- Trading Activity ---\n");
     report.push_str(&format!("Total Trades: {}\n", features.total_trades));
     report.push_str(&format!("Markets Traded: {}\n", features.markets_traded));
     report.push_str(&format!("Total Volume: ${}\n", features.total_volume));
@@ -21,7 +22,7 @@ pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
         ));
     }
 
-    report.push_str(&format!("\n--- Behavioral Features ---\n"));
+    report.push_str("\n--- Behavioral Features ---\n");
 
     if let Some(cv) = features.interval_cv {
         let consistency = if cv < 0.1 {
@@ -78,7 +79,7 @@ pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
         ));
     }
 
-    report.push_str(&format!("\n--- Bot Score ---\n"));
+    report.push_str("\n--- Bot Score ---\n");
     report.push_str(&format!("Total Score: {} / 100\n", score.total_score));
     report.push_str(&format!(
         "Classification: {}\n",
@@ -90,18 +91,19 @@ pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
     ));
 
     if !score.signals.is_empty() {
-        report.push_str(&format!("\nTriggered Signals:\n"));
+        report.push_str("\nTriggered Signals:\n");
         for signal in &score.signals {
             report.push_str(&format!("  - {:?}\n", signal));
         }
     }
 
-    report.push_str(&format!("\n=============================\n"));
+    report.push_str("\n=============================\n");
 
     report
 }
 
 /// Batch analyze multiple wallets and rank by bot likelihood.
+#[allow(dead_code)]
 pub fn rank_wallets(wallets: &[(WalletFeatures, BotScore)]) -> Vec<&(WalletFeatures, BotScore)> {
     let mut ranked: Vec<_> = wallets.iter().collect();
     ranked.sort_by(|a, b| b.1.total_score.cmp(&a.1.total_score));
