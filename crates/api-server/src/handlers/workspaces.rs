@@ -1278,6 +1278,28 @@ pub async fn get_service_status(
         return Err(ApiError::Forbidden("Not a member of this workspace".into()));
     }
 
+    #[derive(sqlx::FromRow)]
+    struct WorkspaceServiceFlags {
+        copy_trading_enabled: bool,
+        arb_auto_execute: bool,
+        live_trading_enabled: bool,
+    }
+
+    let flags: WorkspaceServiceFlags = sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE(copy_trading_enabled, TRUE) as copy_trading_enabled,
+            COALESCE(arb_auto_execute, FALSE) as arb_auto_execute,
+            COALESCE(live_trading_enabled, FALSE) as live_trading_enabled
+        FROM workspaces
+        WHERE id = $1
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| ApiError::NotFound("Workspace not found".into()))?;
+
     // Check harvester: enabled by env
     let harvester_enabled = std::env::var("HARVESTER_ENABLED")
         .map(|v| v != "false")
@@ -1288,23 +1310,46 @@ pub async fn get_service_status(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
 
-    // Check copy trading: needs POLYGON_RPC_URL or ALCHEMY_API_KEY
-    let has_polygon =
-        std::env::var("POLYGON_RPC_URL").is_ok() || std::env::var("ALCHEMY_API_KEY").is_ok();
     let copy_trading_env = std::env::var("COPY_TRADING_ENABLED")
         .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+        .unwrap_or(true);
+    let copy_runtime_initialized = state.trade_monitor.is_some() && state.copy_trader.is_some();
+    let copy_monitor_active = if let Some(monitor) = &state.trade_monitor {
+        monitor.is_active().await
+    } else {
+        false
+    };
+    let workspace_copy_wallets: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT LOWER(tw.address))::bigint
+        FROM tracked_wallets tw
+        JOIN workspace_wallet_allocations wwa
+          ON LOWER(wwa.wallet_address) = LOWER(tw.address)
+        WHERE wwa.workspace_id = $1
+          AND wwa.tier = 'active'
+          AND tw.copy_enabled = TRUE
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    let copy_running = flags.copy_trading_enabled
+        && copy_trading_env
+        && copy_runtime_initialized
+        && copy_monitor_active
+        && workspace_copy_wallets > 0;
 
     // Check arb executor
-    let arb_enabled = std::env::var("ARB_AUTO_EXECUTE")
+    let arb_env_enabled = std::env::var("ARB_AUTO_EXECUTE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    let arb_effective_enabled = arb_env_enabled || flags.arb_auto_execute;
 
-    // Check live trading
-    let live_trading = std::env::var("LIVE_TRADING")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    let has_wallet_key = std::env::var("WALLET_PRIVATE_KEY").is_ok();
+    // Check live trading using actual executor mode/readiness.
+    let live_mode = state.order_executor.is_live();
+    let live_ready = state.order_executor.is_live_ready().await;
+    let live_running = flags.live_trading_enabled && live_mode && live_ready;
 
     Ok(Json(ServiceStatusResponse {
         harvester: ServiceStatusItem {
@@ -1324,29 +1369,40 @@ pub async fn get_service_status(
             },
         },
         copy_trading: ServiceStatusItem {
-            running: copy_trading_env && has_polygon,
-            reason: if !copy_trading_env {
-                Some("COPY_TRADING_ENABLED is not set".to_string())
-            } else if !has_polygon {
-                Some("POLYGON_RPC_URL or ALCHEMY_API_KEY not configured".to_string())
+            running: copy_running,
+            reason: if !flags.copy_trading_enabled {
+                Some("Workspace copy_trading_enabled=false".to_string())
+            } else if !copy_trading_env {
+                Some("Global COPY_TRADING_ENABLED=false".to_string())
+            } else if !copy_runtime_initialized {
+                Some("Copy runtime is not initialized".to_string())
+            } else if !copy_monitor_active {
+                Some("Trade monitor is not active".to_string())
+            } else if workspace_copy_wallets == 0 {
+                Some(
+                    "No active copy-enabled wallets for this workspace (run allocation reconciliation)"
+                        .to_string(),
+                )
             } else {
                 None
             },
         },
         arb_executor: ServiceStatusItem {
-            running: arb_enabled,
-            reason: if !arb_enabled {
-                Some("ARB_AUTO_EXECUTE is disabled".to_string())
+            running: arb_effective_enabled,
+            reason: if !arb_effective_enabled {
+                Some("ARB_AUTO_EXECUTE=false and workspace arb_auto_execute=false".to_string())
             } else {
                 None
             },
         },
         live_trading: ServiceStatusItem {
-            running: live_trading && has_wallet_key,
-            reason: if !live_trading {
-                Some("LIVE_TRADING is not enabled".to_string())
-            } else if !has_wallet_key {
-                Some("No wallet key configured".to_string())
+            running: live_running,
+            reason: if !flags.live_trading_enabled {
+                Some("Workspace live_trading_enabled=false (simulation expected)".to_string())
+            } else if !live_mode {
+                Some("Executor is running in simulation mode (set LIVE_TRADING=true)".to_string())
+            } else if !live_ready {
+                Some("Live mode enabled but wallet/API credentials are not ready".to_string())
             } else {
                 None
             },

@@ -61,6 +61,9 @@ struct TuningMetrics {
     slippage_skip_rate: f64,
     below_min_skip_rate: f64,
     successful_fill_rate: f64,
+    attempts_last_window: f64,
+    fills_last_window: f64,
+    top_skip_reason: Option<String>,
     realized_slippage_p90: f64,
     depth_proxy: f64,
     volatility_proxy: f64,
@@ -83,6 +86,10 @@ pub struct DynamicTunerConfig {
     pub evaluation_delay_minutes: i64,
     pub fill_rate_degrade_delta: f64,
     pub pnl_degrade_delta: f64,
+    pub bootstrap_enabled: bool,
+    pub bootstrap_max_attempts: i64,
+    pub no_trade_window_minutes: i64,
+    pub no_trade_min_attempts: i64,
     pub redis_url: String,
 }
 
@@ -97,6 +104,10 @@ impl Default for DynamicTunerConfig {
             evaluation_delay_minutes: 10,
             fill_rate_degrade_delta: 0.08,
             pnl_degrade_delta: 75.0,
+            bootstrap_enabled: true,
+            bootstrap_max_attempts: 100,
+            no_trade_window_minutes: 120,
+            no_trade_min_attempts: 20,
             redis_url: "redis://127.0.0.1:6379".to_string(),
         }
     }
@@ -135,6 +146,21 @@ impl DynamicTunerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(75.0),
+            bootstrap_enabled: std::env::var("DYNAMIC_TUNER_BOOTSTRAP_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(true),
+            bootstrap_max_attempts: std::env::var("DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            no_trade_window_minutes: std::env::var("DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            no_trade_min_attempts: std::env::var("DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
             redis_url: std::env::var("DYNAMIC_TUNER_REDIS_URL")
                 .or_else(|_| std::env::var("REDIS_URL"))
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
@@ -321,6 +347,24 @@ impl DynamicTuner {
         let targets = self.compute_targets(&by_key, &metrics, resolved);
         let mut applied_count = 0usize;
         let mut recommended_count = 0usize;
+        let bootstrap_active = self.config.bootstrap_enabled
+            && metrics.attempts_last_window < self.config.bootstrap_max_attempts as f64;
+        let no_trade_watchdog = metrics.attempts_last_window
+            >= self.config.no_trade_min_attempts as f64
+            && metrics.fills_last_window <= EPSILON;
+        let top_skip_reason = metrics
+            .top_skip_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
+
+        if no_trade_watchdog {
+            warn!(
+                attempts = metrics.attempts_last_window,
+                fills = metrics.fills_last_window,
+                top_skip_reason = %top_skip_reason,
+                "No-trade watchdog active: applying adaptive relaxation"
+            );
+        }
 
         for (key, raw_target) in targets {
             let Some(row) = by_key.get(&key) else {
@@ -353,12 +397,17 @@ impl DynamicTuner {
             };
 
             let reason = format!(
-                "auto tune: regime={} fill_rate={:.3} slip_p90={:.4} pnl={:.2} drawdown={:.3}",
+                "auto tune: regime={} fill_rate={:.3} slip_p90={:.4} pnl={:.2} drawdown={:.3} attempts={:.0} fills={:.0} top_skip={} bootstrap={} watchdog={}",
                 metrics.current_regime,
                 metrics.successful_fill_rate,
                 metrics.realized_slippage_p90,
                 metrics.recent_pnl,
-                metrics.recent_drawdown
+                metrics.recent_drawdown,
+                metrics.attempts_last_window,
+                metrics.fills_last_window,
+                top_skip_reason,
+                bootstrap_active,
+                no_trade_watchdog
             );
 
             if self.config.apply_changes {
@@ -402,6 +451,22 @@ impl DynamicTuner {
                 .await?;
                 recommended_count += 1;
             }
+        }
+
+        if no_trade_watchdog && applied_count == 0 && recommended_count == 0 {
+            self.record_history(
+                None,
+                None,
+                None,
+                "watchdog",
+                &format!(
+                    "no-trade watchdog active but no bounded changes available (top_skip={})",
+                    top_skip_reason
+                ),
+                Some(&metrics),
+                None,
+            )
+            .await?;
         }
 
         let cycle_reason = if self.config.apply_changes {
@@ -559,6 +624,17 @@ impl DynamicTuner {
             .map(|r| decimal_to_f64(r.current_value))
             .unwrap_or(300.0);
 
+        let bootstrap_active = self.config.bootstrap_enabled
+            && metrics.attempts_last_window < self.config.bootstrap_max_attempts as f64;
+        let no_trade_watchdog = metrics.attempts_last_window
+            >= self.config.no_trade_min_attempts as f64
+            && metrics.fills_last_window <= EPSILON;
+        let top_skip = metrics
+            .top_skip_reason
+            .as_deref()
+            .unwrap_or("none")
+            .to_string();
+
         let (regime_min_trade_mult, regime_buffer, regime_safety_margin) = match regime {
             MarketRegime::BullCalm => (0.95, 0.0012, 0.0010),
             MarketRegime::BullVolatile => (1.03, 0.0020, 0.0018),
@@ -573,9 +649,19 @@ impl DynamicTuner {
         let below_min_push_down = ((metrics.below_min_skip_rate - 0.20).max(0.0) * 0.35).min(0.20);
         let slippage_push_up = ((metrics.slippage_skip_rate - 0.15).max(0.0) * 0.45).min(0.25);
         let pnl_push_up = if metrics.recent_pnl < 0.0 { 0.05 } else { 0.0 };
-        let desired_min_trade = min_trade_current
+        let mut desired_min_trade = min_trade_current
             * (1.0 - below_min_push_down + slippage_push_up + pnl_push_up)
             * regime_min_trade_mult;
+        if bootstrap_active {
+            desired_min_trade = desired_min_trade.min(5.0);
+        }
+        if no_trade_watchdog {
+            desired_min_trade = match top_skip.as_str() {
+                "below_minimum" => desired_min_trade.min((min_trade_current * 0.70).max(2.0)),
+                "too_stale" => desired_min_trade.min((min_trade_current * 0.85).max(2.0)),
+                _ => desired_min_trade.min((min_trade_current * 0.80).max(2.0)),
+            };
+        }
         targets.insert(KEY_COPY_MIN_TRADE_VALUE.to_string(), desired_min_trade);
 
         // COPY_MAX_SLIPPAGE_PCT: set near recent p90 + buffer.
@@ -584,17 +670,30 @@ impl DynamicTuner {
         } else {
             0.0
         };
-        let desired_slippage = (metrics.realized_slippage_p90 + regime_buffer + fill_relax)
+        let mut desired_slippage = (metrics.realized_slippage_p90 + regime_buffer + fill_relax)
             .max(slippage_current * 0.7)
             .min(slippage_current * 1.4);
+        if bootstrap_active {
+            desired_slippage = desired_slippage.max(0.02);
+        }
+        if no_trade_watchdog {
+            desired_slippage = match top_skip.as_str() {
+                "slippage" => desired_slippage.max((slippage_current * 1.30).max(0.015)),
+                "too_stale" => desired_slippage.max((slippage_current * 1.10).max(0.012)),
+                _ => desired_slippage.max((slippage_current * 1.15).max(0.012)),
+            };
+        }
         targets.insert(KEY_COPY_MAX_SLIPPAGE_PCT.to_string(), desired_slippage);
 
         // ARB_MIN_PROFIT_THRESHOLD: expected slippage + safety margin.
         let expected_arb_slippage = (metrics.realized_slippage_p90 * 2.0).max(0.0015);
         let low_depth_penalty = (0.0010 - metrics.depth_proxy).max(0.0) * 0.3;
         let vol_penalty = metrics.volatility_proxy * 0.01;
-        let desired_arb_profit =
+        let mut desired_arb_profit =
             expected_arb_slippage + regime_safety_margin + low_depth_penalty + vol_penalty;
+        if no_trade_watchdog && top_skip != "slippage" {
+            desired_arb_profit *= 0.90;
+        }
         targets.insert(
             KEY_ARB_MIN_PROFIT_THRESHOLD.to_string(),
             desired_arb_profit.max(arb_profit_current * 0.7),
@@ -660,6 +759,7 @@ impl DynamicTuner {
         &self,
         redis_manager: Option<&mut redis::aio::ConnectionManager>,
     ) -> anyhow::Result<TuningMetrics> {
+        let window_minutes = self.config.no_trade_window_minutes.max(5);
         let row: (i64, i64, i64, i64, Decimal) = sqlx::query_as(
             r#"
             SELECT
@@ -673,11 +773,29 @@ impl DynamicTuner {
                     0
                 )::numeric AS slippage_p90
             FROM copy_trade_history
-            WHERE created_at >= NOW() - INTERVAL '2 hours'
+            WHERE created_at >= NOW() - make_interval(mins => $1::int)
             "#,
         )
+        .bind(window_minutes as i32)
         .fetch_one(&self.pool)
         .await?;
+
+        let top_skip_reason: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT skip_reason
+            FROM copy_trade_history
+            WHERE status = 3
+              AND skip_reason IS NOT NULL
+              AND created_at >= NOW() - make_interval(mins => $1::int)
+            GROUP BY skip_reason
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(window_minutes as i32)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
 
         let attempts = row.0.max(0) as f64;
         let fills = row.1.max(0) as f64;
@@ -744,6 +862,9 @@ impl DynamicTuner {
             slippage_skip_rate: ratio(slippage_skips, attempts),
             below_min_skip_rate: ratio(below_min_skips, attempts),
             successful_fill_rate: ratio(fills, attempts),
+            attempts_last_window: attempts,
+            fills_last_window: fills,
+            top_skip_reason,
             realized_slippage_p90: decimal_to_f64(row.4).abs(),
             depth_proxy,
             volatility_proxy,

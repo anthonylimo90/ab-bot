@@ -143,11 +143,33 @@ impl AppState {
         let clob_client = Arc::new(ClobClient::new(clob_url, None));
 
         // Create order executor
-        let live_trading = std::env::var("LIVE_TRADING")
+        let live_trading_env = std::env::var("LIVE_TRADING")
             .map(|v| v == "true")
             .unwrap_or(false);
+        let live_trading_workspace = match crate::runtime_sync::any_workspace_live_enabled(&pool)
+            .await
+        {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to read workspace live_trading_enabled flags; falling back to LIVE_TRADING env"
+                );
+                false
+            }
+        };
+        let live_trading = live_trading_env || live_trading_workspace;
+        if live_trading_workspace && !live_trading_env {
+            tracing::info!(
+                "Enabling live executor because at least one workspace has live_trading_enabled=true"
+            );
+        }
         let executor_config = ExecutorConfig {
             live_trading,
+            min_book_depth: std::env::var("EXECUTOR_MIN_BOOK_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(rust_decimal::Decimal::new(100, 0)),
             ..Default::default()
         };
         let order_executor = Arc::new(OrderExecutor::new(clob_client.clone(), executor_config));

@@ -33,6 +33,7 @@ pub mod metrics_calculator;
 pub mod middleware;
 pub mod redis_forwarder;
 pub mod routes;
+pub mod runtime_sync;
 pub mod schema;
 pub mod state;
 pub mod wallet_harvester;
@@ -48,12 +49,12 @@ pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
 pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
+pub use runtime_sync::reconcile_copy_runtime;
 pub use state::AppState;
 pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
-use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -62,7 +63,7 @@ use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
-use trading_engine::copy_trader::{CopyTrader, TrackedWallet};
+use trading_engine::copy_trader::CopyTrader;
 use wallet_tracker::trade_monitor::{MonitorConfig, TradeMonitor};
 
 /// Server configuration.
@@ -157,7 +158,24 @@ impl ApiServer {
     /// Run the server.
     pub async fn run(mut self) -> anyhow::Result<()> {
         // ── Copy trading setup (must happen before Arc-wrapping state) ──
-        let copy_config = CopyTradingConfig::from_env();
+        let mut copy_config = CopyTradingConfig::from_env();
+        if !copy_config.enabled {
+            match crate::runtime_sync::any_workspace_copy_enabled(&self.state.pool).await {
+                Ok(true) => {
+                    copy_config.enabled = true;
+                    info!(
+                        "Enabling copy trading runtime because at least one workspace has copy_trading_enabled=true"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed reading workspace copy_trading_enabled flags; falling back to env-only copy config"
+                    );
+                }
+            }
+        }
         let mut copy_monitor_args: Option<(
             CopyTradingConfig,
             Arc<TradeMonitor>,
@@ -165,61 +183,6 @@ impl ApiServer {
         )> = None;
 
         if copy_config.enabled {
-            // Sync active allocations → tracked_wallets.copy_enabled on startup
-            // First, upsert rows for active allocations that may not exist in tracked_wallets
-            sqlx::query(
-                r#"
-                INSERT INTO tracked_wallets (address, label, copy_enabled, allocation_pct, copy_delay_ms)
-                SELECT wwa.wallet_address, wwa.wallet_address, TRUE, wwa.allocation_pct, 500
-                FROM workspace_wallet_allocations wwa
-                WHERE wwa.tier = 'active'
-                ON CONFLICT (address) DO UPDATE SET copy_enabled = TRUE, allocation_pct = EXCLUDED.allocation_pct
-                "#,
-            )
-            .execute(&self.state.pool)
-            .await?;
-
-            sqlx::query(
-                r#"
-                UPDATE tracked_wallets
-                SET copy_enabled = FALSE
-                WHERE copy_enabled = TRUE
-                  AND LOWER(address) NOT IN (
-                    SELECT LOWER(wallet_address) FROM workspace_wallet_allocations WHERE tier = 'active'
-                  )
-                "#,
-            )
-            .execute(&self.state.pool)
-            .await?;
-
-            #[derive(sqlx::FromRow)]
-            struct TrackedWalletRow {
-                address: String,
-                label: Option<String>,
-                allocation_pct: Decimal,
-                copy_delay_ms: i32,
-                max_position_size: Option<Decimal>,
-            }
-
-            let tracked_wallets: Vec<TrackedWalletRow> = sqlx::query_as(
-                r#"
-                SELECT address, label, allocation_pct, copy_delay_ms, max_position_size
-                FROM tracked_wallets
-                WHERE copy_enabled = TRUE
-                ORDER BY success_score DESC NULLS LAST, added_at ASC
-                "#,
-            )
-            .fetch_all(&self.state.pool)
-            .await?;
-
-            if tracked_wallets.is_empty() {
-                tracing::warn!(
-                    "Copy trading is enabled but no tracked wallets have copy_enabled=true"
-                );
-            }
-
-            // Always create the monitor + trader so runtime promotions work,
-            // even if no wallets are currently active.
             let trade_monitor = Arc::new(TradeMonitor::new(
                 self.state.clob_client.clone(),
                 MonitorConfig::from_env(),
@@ -227,24 +190,9 @@ impl ApiServer {
             let total_capital = std::env::var("COPY_TOTAL_CAPITAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(10000, 0));
+                .unwrap_or(rust_decimal::Decimal::new(10000, 0));
             let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital)
                 .with_policy(trading_engine::CopyTradingPolicy::from_env());
-
-            for row in &tracked_wallets {
-                trade_monitor.add_wallet(&row.address).await;
-
-                let mut wallet = TrackedWallet::new(row.address.clone(), row.allocation_pct)
-                    .with_delay(row.copy_delay_ms.max(0) as u64);
-                if let Some(ref label) = row.label {
-                    wallet = wallet.with_alias(label.clone());
-                }
-                if let Some(max_size) = row.max_position_size {
-                    wallet = wallet.with_max_size(max_size);
-                }
-                copy_trader.add_tracked_wallet(wallet);
-            }
-
             let copy_trader = Arc::new(RwLock::new(copy_trader));
 
             if let Err(e) = crate::dynamic_tuner::sync_dynamic_config_snapshot_to_copy_trader(
@@ -262,6 +210,26 @@ impl ApiServer {
             // Store in AppState so allocation handlers can sync at runtime
             self.state.trade_monitor = Some(trade_monitor.clone());
             self.state.copy_trader = Some(copy_trader.clone());
+
+            match crate::runtime_sync::reconcile_copy_runtime(
+                &self.state.pool,
+                Some(&trade_monitor),
+                Some(&copy_trader),
+            )
+            .await
+            {
+                Ok(stats) => {
+                    if stats.desired_wallets == 0 {
+                        warn!("Copy trading runtime is enabled but no active wallets are eligible");
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to reconcile copy runtime on startup; copy monitor may start empty"
+                    );
+                }
+            }
 
             copy_monitor_args = Some((copy_config, trade_monitor, copy_trader));
         }
@@ -318,7 +286,24 @@ impl ApiServer {
         let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
 
         // Spawn arb auto-executor if enabled
-        let arb_config = ArbExecutorConfig::from_env();
+        let mut arb_config = ArbExecutorConfig::from_env();
+        if !arb_config.enabled {
+            match crate::runtime_sync::any_workspace_arb_enabled(&state.pool).await {
+                Ok(true) => {
+                    arb_config.enabled = true;
+                    info!(
+                        "Enabling arb auto-executor because at least one workspace has arb_auto_execute=true"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to read workspace arb_auto_execute flags; falling back to env-only arb config"
+                    );
+                }
+            }
+        }
         if arb_config.enabled {
             spawn_arb_auto_executor(
                 arb_config,
@@ -347,7 +332,10 @@ impl ApiServer {
         }
 
         // Spawn auto-optimizer background service
-        let optimizer = Arc::new(AutoOptimizer::new(state.pool.clone()));
+        let optimizer = Arc::new(
+            AutoOptimizer::new(state.pool.clone())
+                .with_runtime_handles(state.trade_monitor.clone(), state.copy_trader.clone()),
+        );
         tokio::spawn(optimizer.start(None));
 
         // Subscribe local runtime to dynamic updates (copy-trader knobs)
