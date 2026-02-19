@@ -12,6 +12,7 @@ use polymarket_core::db;
 use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, OrderBook};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
@@ -28,6 +29,8 @@ const STALE_CHECK_INTERVAL: u64 = 500;
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
+const DEFAULT_EXPLORATION_SLOTS: usize = 5;
+const OPPORTUNITY_EWMA_ALPHA: f64 = 0.25;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct DynamicConfigUpdate {
@@ -35,6 +38,23 @@ struct DynamicConfigUpdate {
     value: Decimal,
     #[serde(default)]
     source: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MarketProfile {
+    liquidity: f64,
+    volume: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MarketOpportunityStats {
+    evaluated_books: u64,
+    profitable_books: u64,
+    signaled_books: u64,
+    ewma_net_profit: f64,
+    last_seen_at: Option<DateTime<Utc>>,
+    last_signal_at: Option<DateTime<Utc>>,
+    last_selected_at: Option<DateTime<Utc>>,
 }
 
 /// Main arbitrage monitor service.
@@ -52,10 +72,16 @@ pub struct ArbMonitor {
     last_signal_time: HashMap<String, DateTime<Utc>>,
     /// Optional cap for actively scanned markets.
     max_markets_cap: Option<usize>,
-    /// Market ids sorted by liquidity (highest first).
+    /// Market ids sorted by baseline quality (liquidity + volume).
     all_market_ids: Vec<String>,
+    /// Static market metadata used in ranking.
+    market_profiles: HashMap<String, MarketProfile>,
+    /// Rolling market-level opportunity stats used for dynamic scoring.
+    market_stats: HashMap<String, MarketOpportunityStats>,
     /// Active market subset based on cap.
     eligible_markets: HashSet<String>,
+    /// Number of slots dedicated to exploration.
+    exploration_slots: usize,
     /// Dynamic config update stream from Redis.
     dynamic_config_rx: mpsc::UnboundedReceiver<DynamicConfigUpdate>,
     /// Bounds for dynamic keys loaded from DB (fallbacks if unavailable).
@@ -103,6 +129,10 @@ impl ArbMonitor {
             .and_then(|v| clamp_dynamic_value(KEY_ARB_MONITOR_MAX_MARKETS, v, &dynamic_bounds))
             .and_then(decimal_to_cap)
             .or(max_markets_env);
+        let exploration_slots = std::env::var("ARB_MONITOR_EXPLORATION_SLOTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EXPLORATION_SLOTS);
 
         let dynamic_redis_url =
             std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
@@ -118,7 +148,10 @@ impl ArbMonitor {
             last_signal_time: HashMap::new(),
             max_markets_cap,
             all_market_ids: Vec::new(),
+            market_profiles: HashMap::new(),
+            market_stats: HashMap::new(),
             eligible_markets: HashSet::new(),
+            exploration_slots,
             dynamic_config_rx,
             dynamic_bounds,
             allowed_dynamic_sources: load_allowed_dynamic_sources(),
@@ -131,22 +164,35 @@ impl ArbMonitor {
 
         // Fetch markets and identify binary markets
         let markets = self.clob_client.get_markets().await?;
-        let mut binary_markets: Vec<_> = markets
+        let binary_markets: Vec<_> = markets
             .iter()
             .filter(|m| m.outcomes.len() == 2 && !m.resolved)
             .collect();
 
-        // Keep sorted list so dynamic cap can widen/tighten without restart.
-        binary_markets.sort_by(|a, b| b.liquidity.cmp(&a.liquidity));
+        for market in &binary_markets {
+            self.market_profiles.insert(
+                market.id.clone(),
+                MarketProfile {
+                    liquidity: market.liquidity.to_f64().unwrap_or(0.0),
+                    volume: market.volume.to_f64().unwrap_or(0.0),
+                },
+            );
+        }
 
         self.all_market_ids = binary_markets.iter().map(|m| m.id.clone()).collect();
+        self.all_market_ids.sort_by(|a, b| {
+            let score_a = baseline_profile_score(self.market_profiles.get(a));
+            let score_b = baseline_profile_score(self.market_profiles.get(b));
+            compare_f64_desc(score_a, score_b)
+        });
         self.position_tracker.load_active_positions().await?;
-        self.rebuild_eligible_markets();
+        let _ = self.rebuild_eligible_markets();
 
         info!(
             total_markets = self.all_market_ids.len(),
             active_markets = self.eligible_markets.len(),
             max_cap = ?self.max_markets_cap,
+            exploration_slots = self.exploration_slots,
             "Initialized arb market universe"
         );
 
@@ -196,7 +242,7 @@ impl ArbMonitor {
                 let target_assets = self.active_subscription_asset_ids();
                 info!(
                     asset_count = target_assets.len(),
-                    "Resubscribing orderbook stream after dynamic market-cap update"
+                    "Resubscribing orderbook stream after dynamic market selection update"
                 );
                 loop {
                     match self
@@ -242,6 +288,13 @@ impl ArbMonitor {
                     updates_since_tick = 0;
                     stalls_since_tick = 0;
                     resets_since_tick = 0;
+                    if self.rebuild_eligible_markets() {
+                        info!(
+                            active_markets = self.eligible_markets.len(),
+                            "Refreshed monitored markets using dynamic opportunity scoring"
+                        );
+                        resubscribe_requested = true;
+                    }
                 }
                 maybe_update = tokio::time::timeout(StdDuration::from_secs(update_timeout_secs), updates.recv()) => {
                     let Some(update) = (match maybe_update {
@@ -341,36 +394,85 @@ impl ArbMonitor {
                 false
             }
             KEY_ARB_MONITOR_MAX_MARKETS => {
-                let previous_count = self.eligible_markets.len();
                 let cap = decimal_to_cap(value);
                 self.max_markets_cap = cap;
-                self.rebuild_eligible_markets();
+                let changed = self.rebuild_eligible_markets();
                 info!(
                     cap = ?self.max_markets_cap,
                     active_markets = self.eligible_markets.len(),
                     "Applied dynamic ARB_MONITOR_MAX_MARKETS"
                 );
-                self.eligible_markets.len() != previous_count
+                changed
             }
             _ => false,
         }
     }
 
-    fn rebuild_eligible_markets(&mut self) {
+    fn rebuild_eligible_markets(&mut self) -> bool {
+        let previous = self.eligible_markets.clone();
         let active_count = self
             .max_markets_cap
             .map(|cap| cap.min(self.all_market_ids.len()))
             .unwrap_or(self.all_market_ids.len());
 
-        self.eligible_markets.clear();
-        for market_id in self.all_market_ids.iter().take(active_count) {
-            self.eligible_markets.insert(market_id.clone());
+        let now = Utc::now();
+        let selected = select_market_ids(
+            &self.all_market_ids,
+            &self.market_profiles,
+            &self.market_stats,
+            &self.eligible_markets,
+            self.min_profit_threshold,
+            active_count,
+            self.exploration_slots,
+            now,
+        );
+
+        let mut next = HashSet::new();
+        for market_id in selected {
+            if let Some(stats) = self.market_stats.get_mut(&market_id) {
+                stats.last_selected_at = Some(now);
+            }
+            next.insert(market_id);
         }
 
         // Keep markets with open positions subscribed so exit tracking keeps working.
         for position in self.position_tracker.get_active_positions() {
-            self.eligible_markets.insert(position.market_id.clone());
+            next.insert(position.market_id.clone());
         }
+
+        let changed = next != previous;
+        self.eligible_markets = next;
+        changed
+    }
+
+    fn track_market_evaluation(&mut self, market_id: &str, at: DateTime<Utc>) {
+        let stats = self.market_stats.entry(market_id.to_string()).or_default();
+        stats.evaluated_books = stats.evaluated_books.saturating_add(1);
+        stats.last_seen_at = Some(at);
+    }
+
+    fn track_market_opportunity(
+        &mut self,
+        market_id: &str,
+        net_profit: Decimal,
+        at: DateTime<Utc>,
+    ) {
+        let stats = self.market_stats.entry(market_id.to_string()).or_default();
+        stats.profitable_books = stats.profitable_books.saturating_add(1);
+        stats.last_seen_at = Some(at);
+
+        let profit = net_profit.to_f64().unwrap_or(0.0).max(0.0);
+        stats.ewma_net_profit = if stats.profitable_books <= 1 {
+            profit
+        } else {
+            stats.ewma_net_profit * (1.0 - OPPORTUNITY_EWMA_ALPHA) + profit * OPPORTUNITY_EWMA_ALPHA
+        };
+    }
+
+    fn track_market_signal(&mut self, market_id: &str, at: DateTime<Utc>) {
+        let stats = self.market_stats.entry(market_id.to_string()).or_default();
+        stats.signaled_books = stats.signaled_books.saturating_add(1);
+        stats.last_signal_at = Some(at);
     }
 
     fn active_subscription_asset_ids(&self) -> Vec<String> {
@@ -404,9 +506,9 @@ impl ArbMonitor {
             .insert((update.market_id.clone(), update.asset_id.clone()), book);
 
         // Check if we have both sides for this market
-        if let Some((yes_id, no_id)) = self.market_outcomes.get(&update.market_id) {
-            let yes_key = (update.market_id.clone(), yes_id.clone());
-            let no_key = (update.market_id.clone(), no_id.clone());
+        if let Some((yes_id, no_id)) = self.market_outcomes.get(&update.market_id).cloned() {
+            let yes_key = (update.market_id.clone(), yes_id);
+            let no_key = (update.market_id.clone(), no_id);
 
             if let (Some(yes_book), Some(no_book)) = (
                 self.order_books.get(&yes_key),
@@ -421,27 +523,35 @@ impl ArbMonitor {
 
                 // Check liquidity depth on both sides before considering arb
                 let has_depth = binary_book.entry_cost_with_depth(MIN_DEPTH_USD).is_some();
+                let observed_at = Utc::now();
+                self.track_market_evaluation(&update.market_id, observed_at);
 
                 // Calculate arbitrage opportunity
-                if eligible_for_entries {
-                    if let Some(arb) =
-                        ArbOpportunity::calculate(&binary_book, ArbOpportunity::DEFAULT_FEE)
-                    {
-                        if arb.is_profitable()
-                            && arb.net_profit >= self.min_profit_threshold
-                            && has_depth
-                        {
-                            // Dedup/cooldown: skip if we signaled this market recently
-                            let now = Utc::now();
-                            let should_signal = match self.last_signal_time.get(&arb.market_id) {
-                                Some(last) => (now - *last).num_seconds() >= SIGNAL_COOLDOWN_SECS,
-                                None => true,
-                            };
+                if let Some(arb) =
+                    ArbOpportunity::calculate(&binary_book, ArbOpportunity::DEFAULT_FEE)
+                {
+                    if arb.is_profitable() && has_depth {
+                        self.track_market_opportunity(&arb.market_id, arb.net_profit, observed_at);
+                    }
 
-                            if should_signal {
-                                self.last_signal_time.insert(arb.market_id.clone(), now);
-                                self.handle_arb_opportunity(&arb, &binary_book).await?;
+                    if eligible_for_entries
+                        && arb.is_profitable()
+                        && arb.net_profit >= self.min_profit_threshold
+                        && has_depth
+                    {
+                        // Dedup/cooldown: skip if we signaled this market recently
+                        let should_signal = match self.last_signal_time.get(&arb.market_id) {
+                            Some(last) => {
+                                (observed_at - *last).num_seconds() >= SIGNAL_COOLDOWN_SECS
                             }
+                            None => true,
+                        };
+
+                        if should_signal {
+                            self.last_signal_time
+                                .insert(arb.market_id.clone(), observed_at);
+                            self.track_market_signal(&arb.market_id, observed_at);
+                            self.handle_arb_opportunity(&arb, &binary_book).await?;
                         }
                     }
                 }
@@ -571,6 +681,193 @@ fn decimal_to_cap(value: Decimal) -> Option<usize> {
         .filter(|v| *v > 0)
 }
 
+fn compare_f64_desc(left: f64, right: f64) -> Ordering {
+    right.partial_cmp(&left).unwrap_or(Ordering::Equal)
+}
+
+fn baseline_profile_score(profile: Option<&MarketProfile>) -> f64 {
+    let Some(profile) = profile else {
+        return 0.0;
+    };
+    let liquidity = profile.liquidity.max(0.0);
+    let volume = profile.volume.max(0.0);
+    let liquidity_score = (liquidity + 1.0).ln();
+    let volume_score = (volume + 1.0).ln();
+    liquidity_score * 0.65 + volume_score * 0.35
+}
+
+fn recency_bonus(last_seen_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> f64 {
+    let Some(last_seen_at) = last_seen_at else {
+        return 0.0;
+    };
+    let age_secs = (now - last_seen_at).num_seconds().max(0);
+    if age_secs <= 60 {
+        0.35
+    } else if age_secs <= 5 * 60 {
+        0.18
+    } else if age_secs <= 15 * 60 {
+        0.08
+    } else {
+        0.0
+    }
+}
+
+fn market_selection_score(
+    market_id: &str,
+    profiles: &HashMap<String, MarketProfile>,
+    stats: &HashMap<String, MarketOpportunityStats>,
+    currently_eligible: &HashSet<String>,
+    min_profit_threshold: Decimal,
+    now: DateTime<Utc>,
+) -> f64 {
+    let baseline = baseline_profile_score(profiles.get(market_id));
+    let threshold = min_profit_threshold.to_f64().unwrap_or(0.005).max(0.0001);
+    let sticky_bonus = if currently_eligible.contains(market_id) {
+        0.20
+    } else {
+        0.0
+    };
+
+    let Some(market_stats) = stats.get(market_id) else {
+        return baseline + sticky_bonus;
+    };
+
+    let opportunity_quality = (market_stats.ewma_net_profit / threshold).clamp(0.0, 4.0);
+    let confidence = (market_stats.evaluated_books as f64 / 220.0).min(1.0);
+    let hit_rate = if market_stats.profitable_books > 0 {
+        market_stats.signaled_books as f64 / market_stats.profitable_books as f64
+    } else {
+        0.0
+    };
+    let freshness = recency_bonus(market_stats.last_seen_at, now);
+
+    baseline
+        + opportunity_quality * 0.95
+        + (hit_rate * confidence) * 0.80
+        + freshness
+        + sticky_bonus
+}
+
+fn market_exploration_score(
+    market_id: &str,
+    profiles: &HashMap<String, MarketProfile>,
+    stats: &HashMap<String, MarketOpportunityStats>,
+    currently_eligible: &HashSet<String>,
+    min_profit_threshold: Decimal,
+    now: DateTime<Utc>,
+) -> f64 {
+    let baseline = market_selection_score(
+        market_id,
+        profiles,
+        stats,
+        currently_eligible,
+        min_profit_threshold,
+        now,
+    );
+    let threshold = min_profit_threshold.to_f64().unwrap_or(0.005).max(0.0001);
+
+    let Some(market_stats) = stats.get(market_id) else {
+        // Favor unseen markets for discovery.
+        return baseline * 0.55 + 1.4;
+    };
+
+    let novelty = 1.0 / (1.0 + market_stats.evaluated_books as f64 / 70.0);
+    let upside = (market_stats.ewma_net_profit / threshold).clamp(0.0, 3.0) * 0.45;
+    let rotation = match market_stats.last_selected_at {
+        Some(last) => ((now - last).num_seconds().max(0) as f64 / (30.0 * 60.0)).min(1.0),
+        None => 1.0,
+    };
+
+    baseline * 0.55 + novelty * 1.10 + rotation * 0.90 + upside
+}
+
+fn select_market_ids(
+    ordered_market_ids: &[String],
+    profiles: &HashMap<String, MarketProfile>,
+    stats: &HashMap<String, MarketOpportunityStats>,
+    currently_eligible: &HashSet<String>,
+    min_profit_threshold: Decimal,
+    active_count: usize,
+    requested_exploration_slots: usize,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    if active_count == 0 || ordered_market_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranked: Vec<(String, f64)> = ordered_market_ids
+        .iter()
+        .map(|market_id| {
+            (
+                market_id.clone(),
+                market_selection_score(
+                    market_id,
+                    profiles,
+                    stats,
+                    currently_eligible,
+                    min_profit_threshold,
+                    now,
+                ),
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| compare_f64_desc(a.1, b.1));
+
+    let exploration_slots = requested_exploration_slots.min(active_count.saturating_sub(1));
+    let core_slots = active_count.saturating_sub(exploration_slots);
+
+    let mut selected: Vec<String> = ranked
+        .iter()
+        .take(core_slots)
+        .map(|(market_id, _)| market_id.clone())
+        .collect();
+
+    if exploration_slots > 0 {
+        let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
+        let mut exploration_pool: Vec<(String, f64)> = ranked
+            .iter()
+            .filter(|(market_id, _)| !selected_set.contains(market_id.as_str()))
+            .map(|(market_id, _)| {
+                (
+                    market_id.clone(),
+                    market_exploration_score(
+                        market_id,
+                        profiles,
+                        stats,
+                        currently_eligible,
+                        min_profit_threshold,
+                        now,
+                    ),
+                )
+            })
+            .collect();
+        exploration_pool.sort_by(|a, b| compare_f64_desc(a.1, b.1));
+
+        selected.extend(
+            exploration_pool
+                .into_iter()
+                .take(exploration_slots)
+                .map(|(market_id, _)| market_id),
+        );
+    }
+
+    if selected.len() < active_count {
+        let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
+        let fill_candidates: Vec<String> = ranked
+            .iter()
+            .map(|(market_id, _)| market_id)
+            .filter(|market_id| !selected_set.contains(market_id.as_str()))
+            .take(active_count - selected.len())
+            .cloned()
+            .collect();
+        for market_id in fill_candidates {
+            selected.push(market_id.clone());
+        }
+    }
+
+    selected
+}
+
 fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
     let mut map = HashMap::new();
     for key in [KEY_ARB_MIN_PROFIT_THRESHOLD, KEY_ARB_MONITOR_MAX_MARKETS] {
@@ -641,4 +938,126 @@ async fn run_dynamic_config_listener_once(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn profile(liquidity: f64, volume: f64) -> MarketProfile {
+        MarketProfile { liquidity, volume }
+    }
+
+    #[test]
+    fn selection_score_prefers_stronger_opportunity_quality() {
+        let now = Utc::now();
+        let ordered = vec!["m1".to_string(), "m2".to_string(), "m3".to_string()];
+
+        let profiles = HashMap::from([
+            ("m1".to_string(), profile(1_000.0, 2_000.0)),
+            ("m2".to_string(), profile(1_000.0, 2_000.0)),
+            ("m3".to_string(), profile(900.0, 1_900.0)),
+        ]);
+
+        let stats = HashMap::from([
+            (
+                "m1".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 120,
+                    profitable_books: 20,
+                    signaled_books: 6,
+                    ewma_net_profit: 0.007,
+                    last_seen_at: Some(now - Duration::minutes(1)),
+                    ..Default::default()
+                },
+            ),
+            (
+                "m2".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 120,
+                    profitable_books: 20,
+                    signaled_books: 9,
+                    ewma_net_profit: 0.016,
+                    last_seen_at: Some(now - Duration::seconds(30)),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let selected = select_market_ids(
+            &ordered,
+            &profiles,
+            &stats,
+            &HashSet::new(),
+            Decimal::new(5, 3),
+            2,
+            0,
+            now,
+        );
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0], "m2");
+    }
+
+    #[test]
+    fn exploration_slot_surfaces_unseen_markets() {
+        let now = Utc::now();
+        let ordered = vec![
+            "core-a".to_string(),
+            "core-b".to_string(),
+            "explore-c".to_string(),
+            "tail-d".to_string(),
+        ];
+
+        let profiles = HashMap::from([
+            ("core-a".to_string(), profile(2_000.0, 5_000.0)),
+            ("core-b".to_string(), profile(1_900.0, 4_900.0)),
+            ("explore-c".to_string(), profile(1_800.0, 4_200.0)),
+            ("tail-d".to_string(), profile(200.0, 300.0)),
+        ]);
+
+        let stats = HashMap::from([
+            (
+                "core-a".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 400,
+                    profitable_books: 45,
+                    signaled_books: 20,
+                    ewma_net_profit: 0.011,
+                    last_seen_at: Some(now - Duration::minutes(1)),
+                    last_selected_at: Some(now - Duration::seconds(40)),
+                    ..Default::default()
+                },
+            ),
+            (
+                "core-b".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 350,
+                    profitable_books: 38,
+                    signaled_books: 16,
+                    ewma_net_profit: 0.010,
+                    last_seen_at: Some(now - Duration::minutes(2)),
+                    last_selected_at: Some(now - Duration::seconds(40)),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let selected = select_market_ids(
+            &ordered,
+            &profiles,
+            &stats,
+            &HashSet::from(["core-a".to_string(), "core-b".to_string()]),
+            Decimal::new(5, 3),
+            3,
+            1,
+            now,
+        );
+
+        assert_eq!(selected.len(), 3);
+        assert!(selected.contains(&"core-a".to_string()));
+        assert!(selected.contains(&"core-b".to_string()));
+        assert!(selected.contains(&"explore-c".to_string()));
+    }
 }
