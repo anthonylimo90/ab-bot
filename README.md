@@ -88,7 +88,7 @@ docker compose ps
 Services will be available at:
 - **API Server**: http://localhost:3000
 - **PostgreSQL**: localhost:5432
-- **Redis**: localhost:6379
+- **Redis**: internal Docker network only (not host-exposed by default)
 
 ### Running the Dashboard
 
@@ -112,6 +112,11 @@ POSTGRES_DB=ab_bot
 
 # API
 JWT_SECRET=your-secret-key-here
+
+# Redis ACL users (dynamic_tuner is sole writer for dynamic:config:update)
+REDIS_URL=redis://app:<app_password>@redis:6379
+DYNAMIC_TUNER_REDIS_URL=redis://dynamic_tuner:<tuner_password>@redis:6379
+DYNAMIC_CONFIG_REDIS_URL=redis://dynamic_subscriber:<subscriber_password>@redis:6379
 
 # External APIs
 POLYMARKET_API_URL=https://clob.polymarket.com

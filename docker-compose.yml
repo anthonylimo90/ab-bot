@@ -25,13 +25,16 @@ services:
   redis:
     image: redis:7-alpine
     container_name: ab-bot-redis
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    environment:
+      REDIS_APP_PASSWORD: ${REDIS_APP_PASSWORD:-app_secret_change_me}
+      REDIS_DYNAMIC_TUNER_PASSWORD: ${REDIS_DYNAMIC_TUNER_PASSWORD:-dynamic_tuner_secret_change_me}
+      REDIS_DYNAMIC_SUBSCRIBER_PASSWORD: ${REDIS_DYNAMIC_SUBSCRIBER_PASSWORD:-dynamic_subscriber_secret_change_me}
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+      - ./docker/redis/redis-entrypoint.sh:/usr/local/etc/redis/redis-entrypoint.sh:ro
+    command: sh /usr/local/etc/redis/redis-entrypoint.sh
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --user app --pass ${REDIS_APP_PASSWORD:-app_secret_change_me} ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,7 +51,9 @@ services:
     container_name: ab-bot-api
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://app:${REDIS_APP_PASSWORD:-app_secret_change_me}@redis:6379
+      DYNAMIC_TUNER_REDIS_URL: redis://dynamic_tuner:${REDIS_DYNAMIC_TUNER_PASSWORD:-dynamic_tuner_secret_change_me}@redis:6379
+      DYNAMIC_CONFIG_REDIS_URL: redis://dynamic_subscriber:${REDIS_DYNAMIC_SUBSCRIBER_PASSWORD:-dynamic_subscriber_secret_change_me}@redis:6379
       API_HOST: 0.0.0.0
       API_PORT: 3000
       # JWT_SECRET is required - generate with: openssl rand -base64 32
@@ -81,7 +86,8 @@ services:
     environment:
       SERVICE: arb-monitor
       DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://app:${REDIS_APP_PASSWORD:-app_secret_change_me}@redis:6379
+      DYNAMIC_CONFIG_REDIS_URL: redis://dynamic_subscriber:${REDIS_DYNAMIC_SUBSCRIBER_PASSWORD:-dynamic_subscriber_secret_change_me}@redis:6379
       RUST_LOG: ${RUST_LOG:-arb_monitor=info}
       POLYMARKET_API_URL: ${POLYMARKET_API_URL:-https://clob.polymarket.com}
       POLLING_INTERVAL_MS: ${POLLING_INTERVAL_MS:-1000}

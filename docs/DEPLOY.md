@@ -103,6 +103,8 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    ```
    DATABASE_URL=${{TimescaleDB.DATABASE_URL}}
    REDIS_URL=${{Redis.REDIS_URL}}
+   DYNAMIC_TUNER_REDIS_URL=${{Redis.REDIS_URL}}
+   DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
    JWT_SECRET=<generate-32-char-secret>
    RUST_LOG=info,api_server=debug
    CORS_PERMISSIVE=false
@@ -126,6 +128,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    ```
    DATABASE_URL=${{TimescaleDB.DATABASE_URL}}
    REDIS_URL=${{Redis.REDIS_URL}}
+   DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
    RUST_LOG=info,arb_monitor=debug
    POLYMARKET_CLOB_URL=https://clob.polymarket.com
    ```
@@ -178,6 +181,8 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 |----------|-------------|---------|
 | `DATABASE_URL` | TimescaleDB connection | `${{TimescaleDB.DATABASE_URL}}` |
 | `REDIS_URL` | Redis connection | `${{Redis.REDIS_URL}}` |
+| `DYNAMIC_TUNER_REDIS_URL` | Redis URL used by dynamic tuner publisher | `${{Redis.REDIS_URL}}` |
+| `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
 | `JWT_SECRET` | JWT signing key (32+ chars) | `your-secret-key` |
 | `RUST_LOG` | Log level | `info,api_server=debug` |
 | `CORS_PERMISSIVE` | Allow all CORS origins | `false` |
@@ -190,6 +195,7 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 |----------|-------------|---------|
 | `DATABASE_URL` | TimescaleDB connection | `${{TimescaleDB.DATABASE_URL}}` |
 | `REDIS_URL` | Redis connection | `${{Redis.REDIS_URL}}` |
+| `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
 | `RUST_LOG` | Log level | `info,arb_monitor=debug` |
 | `POLYMARKET_CLOB_URL` | Polymarket API | `https://clob.polymarket.com` |
 
@@ -199,6 +205,22 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 |----------|-------------|---------|
 | `NEXT_PUBLIC_API_URL` | API server URL | `https://api-server-xxx.railway.app` |
 | `NEXT_PUBLIC_WS_URL` | WebSocket URL | `wss://api-server-xxx.railway.app` |
+
+## Redis Hardening for Dynamic Config
+
+Recommended production posture is:
+
+1. `dynamic_tuner` is the sole writer to `dynamic:config:update`.
+2. Subscribers use read-only pub/sub credentials.
+3. Redis is private-network only (no public ingress).
+
+This repository supports split credentials by environment variable:
+
+- `REDIS_URL` for general app pub/sub traffic
+- `DYNAMIC_TUNER_REDIS_URL` for tuner publish/read
+- `DYNAMIC_CONFIG_REDIS_URL` for dynamic-config subscribers
+
+If your managed Redis tier does not support ACL users, keep all three URLs pointed at the same private Redis endpoint and enforce network isolation at the platform layer.
 
 ## railway.toml Configuration
 

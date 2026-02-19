@@ -163,6 +163,17 @@ pub enum CopyTradeRejection {
     SlippageTooHigh { slippage_pct: Decimal, max: Decimal },
 }
 
+/// Outcome from processing a detected trade.
+#[derive(Debug, Clone)]
+pub enum CopyTradeProcessOutcome {
+    /// Trade was successfully sent to the executor.
+    Executed(ExecutionReport),
+    /// Trade was ignored due to runtime conditions (not a policy rejection).
+    Skipped,
+    /// Trade was rejected by copy-trading policy constraints.
+    Rejected(CopyTradeRejection),
+}
+
 /// Copy trading engine that mirrors trades from successful wallets.
 pub struct CopyTrader {
     /// Wallets being tracked, keyed by address.
@@ -368,9 +379,20 @@ impl CopyTrader {
         &self,
         trade: &DetectedTrade,
     ) -> Result<Option<ExecutionReport>> {
+        match self.process_detected_trade_with_reason(trade).await? {
+            CopyTradeProcessOutcome::Executed(report) => Ok(Some(report)),
+            CopyTradeProcessOutcome::Skipped | CopyTradeProcessOutcome::Rejected(_) => Ok(None),
+        }
+    }
+
+    /// Process a detected trade and surface explicit rejection reason when available.
+    pub async fn process_detected_trade_with_reason(
+        &self,
+        trade: &DetectedTrade,
+    ) -> Result<CopyTradeProcessOutcome> {
         if !self.active {
             debug!("Copy trading is paused, skipping trade");
-            return Ok(None);
+            return Ok(CopyTradeProcessOutcome::Skipped);
         }
 
         let wallet = match self
@@ -383,14 +405,14 @@ impl CopyTrader {
                     wallet = %trade.wallet_address,
                     "Wallet is disabled, skipping trade"
                 );
-                return Ok(None);
+                return Ok(CopyTradeProcessOutcome::Skipped);
             }
             None => {
                 debug!(
                     wallet = %trade.wallet_address,
                     "Wallet not tracked, skipping trade"
                 );
-                return Ok(None);
+                return Ok(CopyTradeProcessOutcome::Skipped);
             }
         };
 
@@ -408,7 +430,7 @@ impl CopyTrader {
                 wallet = %trade.wallet_address,
                 "Calculated copy quantity is zero, skipping"
             );
-            return Ok(None);
+            return Ok(CopyTradeProcessOutcome::Skipped);
         }
 
         // Pre-trade slippage check: compare current market price to source trade price
@@ -442,7 +464,12 @@ impl CopyTrader {
                         max = %self.policy.max_slippage_pct,
                         "Slippage too high, skipping copy trade"
                     );
-                    return Ok(None);
+                    return Ok(CopyTradeProcessOutcome::Rejected(
+                        CopyTradeRejection::SlippageTooHigh {
+                            slippage_pct,
+                            max: self.policy.max_slippage_pct,
+                        },
+                    ));
                 }
             }
         }
@@ -486,7 +513,7 @@ impl CopyTrader {
             );
         }
 
-        Ok(Some(report))
+        Ok(CopyTradeProcessOutcome::Executed(report))
     }
 
     /// Calculate capital allocated to a specific wallet.

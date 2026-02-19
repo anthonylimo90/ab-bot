@@ -26,10 +26,15 @@ const SIGNAL_COOLDOWN_SECS: i64 = 60;
 /// How often to check for stale positions (every N order book updates).
 const STALE_CHECK_INTERVAL: u64 = 500;
 
+const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
+const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct DynamicConfigUpdate {
     key: String,
     value: Decimal,
+    #[serde(default)]
+    source: String,
 }
 
 /// Main arbitrage monitor service.
@@ -53,6 +58,10 @@ pub struct ArbMonitor {
     eligible_markets: HashSet<String>,
     /// Dynamic config update stream from Redis.
     dynamic_config_rx: mpsc::UnboundedReceiver<DynamicConfigUpdate>,
+    /// Bounds for dynamic keys loaded from DB (fallbacks if unavailable).
+    dynamic_bounds: HashMap<String, (Decimal, Decimal)>,
+    /// Allow-list for dynamic update publisher source field.
+    allowed_dynamic_sources: HashSet<String>,
 }
 
 impl ArbMonitor {
@@ -73,7 +82,31 @@ impl ArbMonitor {
         // Create signal publisher
         let signal_publisher = SignalPublisher::new(redis_client, config.alerts).await?;
 
-        let dynamic_config_rx = spawn_dynamic_config_listener(config.redis.url.clone());
+        let dynamic_bounds = load_dynamic_bounds(&pool).await;
+        let dynamic_values = load_dynamic_values(&pool).await;
+        let min_profit_env = std::env::var(KEY_ARB_MIN_PROFIT_THRESHOLD)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| Decimal::new(5, 3));
+        let max_markets_env = std::env::var(KEY_ARB_MONITOR_MAX_MARKETS)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok());
+        let min_profit_threshold = dynamic_values
+            .get(KEY_ARB_MIN_PROFIT_THRESHOLD)
+            .copied()
+            .or(Some(min_profit_env))
+            .and_then(|v| clamp_dynamic_value(KEY_ARB_MIN_PROFIT_THRESHOLD, v, &dynamic_bounds))
+            .unwrap_or(min_profit_env);
+        let max_markets_cap = dynamic_values
+            .get(KEY_ARB_MONITOR_MAX_MARKETS)
+            .copied()
+            .and_then(|v| clamp_dynamic_value(KEY_ARB_MONITOR_MAX_MARKETS, v, &dynamic_bounds))
+            .and_then(decimal_to_cap)
+            .or(max_markets_env);
+
+        let dynamic_redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
+            .unwrap_or_else(|_| config.redis.url.clone());
+        let dynamic_config_rx = spawn_dynamic_config_listener(dynamic_redis_url);
 
         Ok(Self {
             clob_client,
@@ -81,18 +114,14 @@ impl ArbMonitor {
             signal_publisher,
             order_books: HashMap::new(),
             market_outcomes: HashMap::new(),
-            // Raised from 0.1% to 0.5% — must clear fees + slippage to be worth trading
-            min_profit_threshold: std::env::var("ARB_MIN_PROFIT_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| Decimal::new(5, 3)), // default 0.005 = 0.5%
+            min_profit_threshold,
             last_signal_time: HashMap::new(),
-            max_markets_cap: std::env::var("ARB_MONITOR_MAX_MARKETS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok()),
+            max_markets_cap,
             all_market_ids: Vec::new(),
             eligible_markets: HashSet::new(),
             dynamic_config_rx,
+            dynamic_bounds,
+            allowed_dynamic_sources: load_allowed_dynamic_sources(),
         })
     }
 
@@ -111,6 +140,7 @@ impl ArbMonitor {
         binary_markets.sort_by(|a, b| b.liquidity.cmp(&a.liquidity));
 
         self.all_market_ids = binary_markets.iter().map(|m| m.id.clone()).collect();
+        self.position_tracker.load_active_positions().await?;
         self.rebuild_eligible_markets();
 
         info!(
@@ -274,22 +304,41 @@ impl ArbMonitor {
     }
 
     fn apply_dynamic_update(&mut self, update: DynamicConfigUpdate) -> bool {
+        if !self.allowed_dynamic_sources.contains(update.source.as_str()) {
+            warn!(
+                source = %update.source,
+                key = %update.key,
+                "Ignoring dynamic update from unauthorized source"
+            );
+            return false;
+        }
+
+        let Some(value) = clamp_dynamic_value(&update.key, update.value, &self.dynamic_bounds) else {
+            warn!(key = %update.key, "Ignoring unsupported dynamic config key");
+            return false;
+        };
+        if value != update.value {
+            warn!(
+                key = %update.key,
+                source = %update.source,
+                old = %update.value,
+                new = %value,
+                "Clamped dynamic update to configured bounds"
+            );
+        }
+
         match update.key.as_str() {
-            "ARB_MIN_PROFIT_THRESHOLD" => {
-                self.min_profit_threshold = update.value;
+            KEY_ARB_MIN_PROFIT_THRESHOLD => {
+                self.min_profit_threshold = value;
                 info!(
                     threshold = %self.min_profit_threshold,
                     "Applied dynamic ARB_MIN_PROFIT_THRESHOLD"
                 );
                 false
             }
-            "ARB_MONITOR_MAX_MARKETS" => {
+            KEY_ARB_MONITOR_MAX_MARKETS => {
                 let previous_count = self.eligible_markets.len();
-                let cap = update
-                    .value
-                    .to_u64()
-                    .and_then(|v| usize::try_from(v).ok())
-                    .filter(|v| *v > 0);
+                let cap = decimal_to_cap(value);
                 self.max_markets_cap = cap;
                 self.rebuild_eligible_markets();
                 info!(
@@ -416,6 +465,114 @@ impl ArbMonitor {
             .await?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicBoundsRow {
+    key: String,
+    min_value: Decimal,
+    max_value: Decimal,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicValueRow {
+    key: String,
+    current_value: Decimal,
+}
+
+async fn load_dynamic_bounds(pool: &sqlx::PgPool) -> HashMap<String, (Decimal, Decimal)> {
+    let rows: Vec<DynamicBoundsRow> = match sqlx::query_as(
+        r#"
+        SELECT key, min_value, max_value
+        FROM dynamic_config
+        WHERE enabled = TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "Failed loading dynamic bounds; using fallback bounds");
+            return fallback_dynamic_bounds();
+        }
+    };
+
+    if rows.is_empty() {
+        fallback_dynamic_bounds()
+    } else {
+        rows.into_iter()
+            .map(|row| (row.key, (row.min_value, row.max_value)))
+            .collect()
+    }
+}
+
+async fn load_dynamic_values(pool: &sqlx::PgPool) -> HashMap<String, Decimal> {
+    let rows: Vec<DynamicValueRow> = match sqlx::query_as(
+        r#"
+        SELECT key, current_value
+        FROM dynamic_config
+        WHERE enabled = TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "Failed loading dynamic values; using env defaults");
+            return HashMap::new();
+        }
+    };
+
+    rows.into_iter().map(|row| (row.key, row.current_value)).collect()
+}
+
+fn load_allowed_dynamic_sources() -> HashSet<String> {
+    std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
+        .unwrap_or_else(|_| "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn clamp_dynamic_value(
+    key: &str,
+    value: Decimal,
+    bounds: &HashMap<String, (Decimal, Decimal)>,
+) -> Option<Decimal> {
+    let (min, max) = bounds
+        .get(key)
+        .cloned()
+        .or_else(|| fallback_bounds_for_key(key))?;
+    Some(value.max(min).min(max))
+}
+
+fn decimal_to_cap(value: Decimal) -> Option<usize> {
+    value
+        .to_u64()
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+}
+
+fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
+    let mut map = HashMap::new();
+    for key in [KEY_ARB_MIN_PROFIT_THRESHOLD, KEY_ARB_MONITOR_MAX_MARKETS] {
+        if let Some(bounds) = fallback_bounds_for_key(key) {
+            map.insert(key.to_string(), bounds);
+        }
+    }
+    map
+}
+
+fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
+    match key {
+        KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
+        KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
+        _ => None,
     }
 }
 
