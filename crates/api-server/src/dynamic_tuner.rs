@@ -1065,6 +1065,19 @@ pub fn spawn_dynamic_config_subscriber(
     info!("Dynamic config subscriber spawned");
 }
 
+/// Applies the current dynamic config snapshot to the local copy-trader policy.
+///
+/// This is used at startup to prefer DB-backed runtime configuration when
+/// available, while still allowing env defaults as fallback if dynamic config
+/// tables are missing or not yet seeded.
+pub async fn sync_dynamic_config_snapshot_to_copy_trader(
+    pool: &PgPool,
+    copy_trader: &Arc<RwLock<CopyTrader>>,
+) -> anyhow::Result<()> {
+    let bounds = load_dynamic_bounds(pool).await;
+    apply_startup_snapshot_to_copy_trader(pool, copy_trader, &bounds).await
+}
+
 async fn run_dynamic_config_subscriber(
     redis_url: &str,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
