@@ -266,21 +266,22 @@ impl ArbAutoExecutor {
             .signed_duration_since(arb.timestamp)
             .num_seconds();
         if age_secs > self.config.max_signal_age_secs {
-            debug!(
+            info!(
                 market_id = %market_id,
                 age_secs = age_secs,
-                "Stale arb signal, skipping"
+                max = self.config.max_signal_age_secs,
+                "Arb signal too stale, skipping"
             );
             return Ok(());
         }
 
         // 2. Check minimum profit threshold
         if arb.net_profit < self.config.min_net_profit {
-            debug!(
+            info!(
                 market_id = %market_id,
                 net_profit = %arb.net_profit,
                 min = %self.config.min_net_profit,
-                "Below min profit threshold, skipping"
+                "Arb signal below min profit threshold, skipping"
             );
             return Ok(());
         }
@@ -341,12 +342,12 @@ impl ArbAutoExecutor {
                 let no_depth: Decimal = nb.asks.iter().map(|l| l.price * l.size).sum();
 
                 if yes_depth < self.config.min_book_depth || no_depth < self.config.min_book_depth {
-                    debug!(
+                    info!(
                         market_id = %market_id,
                         yes_depth = %yes_depth,
                         no_depth = %no_depth,
                         min_depth = %self.config.min_book_depth,
-                        "Insufficient orderbook depth, skipping"
+                        "Arb signal insufficient orderbook depth, skipping"
                     );
                     return Ok(());
                 }

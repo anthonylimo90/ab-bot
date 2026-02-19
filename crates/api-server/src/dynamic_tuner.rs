@@ -681,7 +681,7 @@ impl DynamicTuner {
         }
         if no_trade_watchdog {
             desired_slippage = match top_skip.as_str() {
-                "slippage" => desired_slippage.max((slippage_current * 1.30).max(0.015)),
+                "slippage" => desired_slippage.max((slippage_current * 1.50).max(0.015)),
                 "too_stale" => desired_slippage.max((slippage_current * 1.10).max(0.012)),
                 // Near-resolution markets cannot be fixed by relaxing slippage.
                 // Keep current slippage to avoid unsafe drift.
@@ -910,16 +910,16 @@ impl DynamicTuner {
             ConfigSeed {
                 key: KEY_COPY_MIN_TRADE_VALUE,
                 default_value: env_decimal("COPY_MIN_TRADE_VALUE", Decimal::new(10, 0)),
-                min_value: Decimal::new(2, 0),
+                min_value: Decimal::new(50, 2), // $0.50 floor (was $2)
                 max_value: Decimal::new(50, 0),
-                max_step_pct: Decimal::new(12, 2),
+                max_step_pct: Decimal::new(18, 2), // 18% per cycle (was 12%)
             },
             ConfigSeed {
                 key: KEY_COPY_MAX_SLIPPAGE_PCT,
                 default_value: env_decimal("COPY_MAX_SLIPPAGE_PCT", Decimal::new(1, 2)),
-                min_value: Decimal::new(25, 4),
-                max_value: Decimal::new(5, 2),
-                max_step_pct: Decimal::new(15, 2),
+                min_value: Decimal::new(25, 4),    // 0.25% floor
+                max_value: Decimal::new(15, 2),    // 15% ceiling (was 5%)
+                max_step_pct: Decimal::new(25, 2), // 25% per cycle (was 15%)
             },
             ConfigSeed {
                 key: KEY_ARB_MIN_PROFIT_THRESHOLD,
@@ -970,7 +970,12 @@ impl DynamicTuner {
                     key, current_value, default_value, min_value, max_value,
                     max_step_pct, enabled, last_good_value, updated_by, last_reason
                 ) VALUES ($1, $2, $2, $3, $4, $5, TRUE, $2, 'bootstrap', 'initial seed')
-                ON CONFLICT (key) DO NOTHING
+                ON CONFLICT (key) DO UPDATE SET
+                    min_value = EXCLUDED.min_value,
+                    max_value = EXCLUDED.max_value,
+                    max_step_pct = EXCLUDED.max_step_pct,
+                    default_value = EXCLUDED.default_value,
+                    current_value = LEAST(GREATEST(dynamic_config.current_value, EXCLUDED.min_value), EXCLUDED.max_value)
                 "#,
             )
             .bind(seed.key)
@@ -1454,8 +1459,8 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
 
 fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     match key {
-        KEY_COPY_MIN_TRADE_VALUE => Some((Decimal::new(2, 0), Decimal::new(50, 0))),
-        KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(5, 2))),
+        KEY_COPY_MIN_TRADE_VALUE => Some((Decimal::new(50, 2), Decimal::new(50, 0))),
+        KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(15, 2))),
         KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),

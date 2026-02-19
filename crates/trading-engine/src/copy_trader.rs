@@ -178,6 +178,11 @@ pub enum CopyTradeRejection {
     MarketNearResolution {
         market_price: Decimal,
     },
+    /// Copy quantity calculated to zero (no capital or zero allocation).
+    ZeroCalculatedQuantity {
+        total_capital: Decimal,
+        allocation_pct: Decimal,
+    },
 }
 
 /// Outcome from processing a detected trade.
@@ -445,9 +450,18 @@ impl CopyTrader {
         if copy_quantity <= Decimal::ZERO {
             warn!(
                 wallet = %trade.wallet_address,
-                "Calculated copy quantity is zero, skipping"
+                total_capital = %self.total_capital,
+                allocation_pct = %wallet.allocation_pct,
+                allocated_capital = %allocated_capital,
+                trade_price = %trade.price,
+                "Calculated copy quantity is zero — likely zero capital or allocation"
             );
-            return Ok(CopyTradeProcessOutcome::Skipped);
+            return Ok(CopyTradeProcessOutcome::Rejected(
+                CopyTradeRejection::ZeroCalculatedQuantity {
+                    total_capital: self.total_capital,
+                    allocation_pct: wallet.allocation_pct,
+                },
+            ));
         }
 
         // Pre-trade slippage check: compare current market price to source trade price

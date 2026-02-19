@@ -194,7 +194,13 @@ impl RedisForwarder {
         let arb: ArbOpportunity = serde_json::from_str(payload)?;
 
         // Forward to arb auto-executor before WebSocket processing
-        let _ = self.arb_entry_tx.send(arb.clone());
+        let receivers = self.arb_entry_tx.send(arb.clone()).unwrap_or(0);
+        info!(
+            market_id = %arb.market_id,
+            net_profit = %arb.net_profit,
+            receivers,
+            "Forwarded arb entry signal from Redis to executor"
+        );
 
         // Clone values needed for logging before moving
         let market_id_log = arb.market_id.clone();

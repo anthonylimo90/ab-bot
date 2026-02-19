@@ -322,6 +322,15 @@ impl CopyTradingMonitor {
                             "Market price {market_price} indicates resolved/near-resolution market"
                         ),
                     ),
+                    CopyTradeRejection::ZeroCalculatedQuantity {
+                        total_capital,
+                        allocation_pct,
+                    } => (
+                        "zero_capital",
+                        format!(
+                            "Zero copy quantity (capital={total_capital}, alloc={allocation_pct}%)"
+                        ),
+                    ),
                 };
                 warn!(
                     wallet = %trade.wallet_address,
@@ -628,6 +637,15 @@ impl CopyTradingMonitor {
                         "near_resolution",
                         format!(
                             "Market price {market_price} indicates resolved/near-resolution market"
+                        ),
+                    ),
+                    CopyTradeRejection::ZeroCalculatedQuantity {
+                        total_capital,
+                        allocation_pct,
+                    } => (
+                        "zero_capital",
+                        format!(
+                            "Zero copy quantity (capital={total_capital}, alloc={allocation_pct}%)"
                         ),
                     ),
                 };
