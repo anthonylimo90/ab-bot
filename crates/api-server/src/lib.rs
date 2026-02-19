@@ -58,6 +58,7 @@ use axum::http::Request;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
@@ -180,6 +181,7 @@ impl ApiServer {
             CopyTradingConfig,
             Arc<TradeMonitor>,
             Arc<RwLock<CopyTrader>>,
+            Arc<AtomicI64>,
         )> = None;
 
         if copy_config.enabled {
@@ -194,10 +196,12 @@ impl ApiServer {
             let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital)
                 .with_policy(trading_engine::CopyTradingPolicy::from_env());
             let copy_trader = Arc::new(RwLock::new(copy_trader));
+            let copy_latency_atomic = Arc::new(AtomicI64::new(copy_config.max_latency_secs));
 
             if let Err(e) = crate::dynamic_tuner::sync_dynamic_config_snapshot_to_copy_trader(
                 &self.state.pool,
                 &copy_trader,
+                Some(&copy_latency_atomic),
             )
             .await
             {
@@ -231,7 +235,8 @@ impl ApiServer {
                 }
             }
 
-            copy_monitor_args = Some((copy_config, trade_monitor, copy_trader));
+            copy_monitor_args =
+                Some((copy_config, trade_monitor, copy_trader, copy_latency_atomic));
         }
 
         // ── Wrap state in Arc and build router ──
@@ -338,11 +343,22 @@ impl ApiServer {
         );
         tokio::spawn(optimizer.start(None));
 
+        // Extract the latency atomic (if copy trading is active) so the
+        // dynamic config subscriber can write to it at runtime.
+        let copy_latency_atomic: Option<Arc<AtomicI64>> = copy_monitor_args
+            .as_ref()
+            .map(|(_, _, _, atomic)| atomic.clone());
+
         // Subscribe local runtime to dynamic updates (copy-trader knobs)
         let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
             .or_else(|_| std::env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        spawn_dynamic_config_subscriber(redis_url, state.copy_trader.clone(), state.pool.clone());
+        spawn_dynamic_config_subscriber(
+            redis_url,
+            state.copy_trader.clone(),
+            state.pool.clone(),
+            copy_latency_atomic,
+        );
 
         // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
         // so startup sync publications are not missed by local runtime.
@@ -378,7 +394,7 @@ impl ApiServer {
         }
 
         // Start copy trading monitor (objects were created above, before Arc wrap)
-        if let Some((copy_config, trade_monitor, copy_trader)) = copy_monitor_args {
+        if let Some((copy_config, trade_monitor, copy_trader, latency_atomic)) = copy_monitor_args {
             trade_monitor.start().await?;
             spawn_copy_trading_monitor(
                 copy_config,
@@ -387,6 +403,7 @@ impl ApiServer {
                 state.circuit_breaker.clone(),
                 state.signal_tx.clone(),
                 state.pool.clone(),
+                latency_atomic,
             );
 
             // Spawn copy-trade stop-loss / mirror-exit monitor

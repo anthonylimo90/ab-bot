@@ -12,6 +12,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration as TokioDuration};
@@ -27,6 +28,7 @@ const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
 const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
 const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
+const KEY_COPY_MAX_LATENCY_SECS: &str = "COPY_MAX_LATENCY_SECS";
 
 const EPSILON: f64 = 1e-6;
 
@@ -691,6 +693,21 @@ impl DynamicTuner {
         }
         targets.insert(KEY_COPY_MAX_SLIPPAGE_PCT.to_string(), desired_slippage);
 
+        // COPY_MAX_LATENCY_SECS: relax when trades are rejected as too_stale,
+        // tighten slightly otherwise to prefer fresher fills.
+        let latency_current = rows
+            .get(KEY_COPY_MAX_LATENCY_SECS)
+            .map(|r| decimal_to_f64(r.current_value))
+            .unwrap_or(600.0);
+        let desired_latency = if no_trade_watchdog && top_skip == "too_stale" {
+            // Most skips are stale trades — relax the threshold to let them through.
+            (latency_current * 1.30).min(900.0)
+        } else {
+            // Normal operation — tighten slightly toward fresher fills.
+            (latency_current * 0.95).max(60.0)
+        };
+        targets.insert(KEY_COPY_MAX_LATENCY_SECS.to_string(), desired_latency);
+
         // ARB_MIN_PROFIT_THRESHOLD: expected slippage + safety margin.
         let expected_arb_slippage = (metrics.realized_slippage_p90 * 2.0).max(0.0015);
         let low_depth_penalty = (0.0010 - metrics.depth_proxy).max(0.0) * 0.3;
@@ -949,6 +966,13 @@ impl DynamicTuner {
                 max_value: Decimal::new(2, 0),
                 max_step_pct: Decimal::new(100, 2),
             },
+            ConfigSeed {
+                key: KEY_COPY_MAX_LATENCY_SECS,
+                default_value: env_decimal("COPY_MAX_LATENCY_SECS", Decimal::new(600, 0)),
+                min_value: Decimal::new(60, 0),    // 1 minute floor
+                max_value: Decimal::new(900, 0),   // 15 minute ceiling
+                max_step_pct: Decimal::new(20, 2), // 20% per cycle
+            },
         ];
 
         for seed in seeds {
@@ -1198,12 +1222,17 @@ pub fn spawn_dynamic_config_subscriber(
     redis_url: String,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     pool: PgPool,
+    max_latency_secs: Option<Arc<AtomicI64>>,
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) =
-                run_dynamic_config_subscriber(redis_url.as_str(), copy_trader.clone(), pool.clone())
-                    .await
+            if let Err(e) = run_dynamic_config_subscriber(
+                redis_url.as_str(),
+                copy_trader.clone(),
+                pool.clone(),
+                max_latency_secs.clone(),
+            )
+            .await
             {
                 error!(error = %e, "Dynamic config subscriber failed, retrying");
                 tokio::time::sleep(TokioDuration::from_secs(5)).await;
@@ -1222,15 +1251,17 @@ pub fn spawn_dynamic_config_subscriber(
 pub async fn sync_dynamic_config_snapshot_to_copy_trader(
     pool: &PgPool,
     copy_trader: &Arc<RwLock<CopyTrader>>,
+    max_latency_secs: Option<&Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let bounds = load_dynamic_bounds(pool).await;
-    apply_startup_snapshot_to_copy_trader(pool, copy_trader, &bounds).await
+    apply_startup_snapshot_to_copy_trader(pool, copy_trader, &bounds, max_latency_secs).await
 }
 
 async fn run_dynamic_config_subscriber(
     redis_url: &str,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     pool: PgPool,
+    max_latency_secs: Option<Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let allowed_sources = load_allowed_update_sources();
     let bounds = load_dynamic_bounds(&pool).await;
@@ -1248,7 +1279,10 @@ async fn run_dynamic_config_subscriber(
     // Subscribe before snapshot application so updates published during startup
     // are queued and processed after snapshot reconciliation.
     if let Some(ref trader) = copy_trader {
-        if let Err(e) = apply_startup_snapshot_to_copy_trader(&pool, trader, &bounds).await {
+        if let Err(e) =
+            apply_startup_snapshot_to_copy_trader(&pool, trader, &bounds, max_latency_secs.as_ref())
+                .await
+        {
             warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
         }
     }
@@ -1303,6 +1337,21 @@ async fn run_dynamic_config_subscriber(
                     source = %update.source,
                     "Applied dynamic config in api-server"
                 );
+            }
+        }
+
+        // Apply latency threshold directly to the shared atomic
+        if update.key == KEY_COPY_MAX_LATENCY_SECS {
+            if let Some(ref atomic) = max_latency_secs {
+                if let Some(secs) = update.value.to_i64() {
+                    atomic.store(secs, Ordering::Relaxed);
+                    info!(
+                        key = %update.key,
+                        value = %update.value,
+                        source = %update.source,
+                        "Applied dynamic config in api-server"
+                    );
+                }
             }
         }
     }
@@ -1373,6 +1422,7 @@ async fn apply_startup_snapshot_to_copy_trader(
     pool: &PgPool,
     copy_trader: &Arc<RwLock<CopyTrader>>,
     bounds: &HashMap<String, (Decimal, Decimal)>,
+    max_latency_secs: Option<&Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let rows: Vec<DynamicValueRow> = sqlx::query_as(
         r#"
@@ -1390,15 +1440,26 @@ async fn apply_startup_snapshot_to_copy_trader(
             continue;
         };
         let update = DynamicConfigUpdate {
-            key: row.key,
+            key: row.key.clone(),
             value,
             reason: "startup snapshot".to_string(),
             source: "dynamic_tuner_sync".to_string(),
             timestamp: Utc::now(),
             metrics: serde_json::json!({ "sync": "subscriber_bootstrap" }),
         };
+
         if apply_to_copy_trader(copy_trader, &update).await {
             applied += 1;
+        }
+
+        // Apply latency threshold to the shared atomic
+        if row.key == KEY_COPY_MAX_LATENCY_SECS {
+            if let Some(atomic) = max_latency_secs {
+                if let Some(secs) = value.to_i64() {
+                    atomic.store(secs, Ordering::Relaxed);
+                    applied += 1;
+                }
+            }
         }
     }
 
@@ -1445,6 +1506,7 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
     for key in [
         KEY_COPY_MIN_TRADE_VALUE,
         KEY_COPY_MAX_SLIPPAGE_PCT,
+        KEY_COPY_MAX_LATENCY_SECS,
         KEY_ARB_MIN_PROFIT_THRESHOLD,
         KEY_ARB_MONITOR_MAX_MARKETS,
         KEY_ARB_MONITOR_EXPLORATION_SLOTS,
@@ -1461,6 +1523,7 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     match key {
         KEY_COPY_MIN_TRADE_VALUE => Some((Decimal::new(50, 2), Decimal::new(50, 0))),
         KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(15, 2))),
+        KEY_COPY_MAX_LATENCY_SECS => Some((Decimal::new(60, 0), Decimal::new(900, 0))),
         KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),

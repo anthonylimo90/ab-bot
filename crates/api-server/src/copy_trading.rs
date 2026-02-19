@@ -7,6 +7,7 @@ use chrono::Utc;
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{error, info, trace, warn};
@@ -34,7 +35,7 @@ impl Default for CopyTradingConfig {
     fn default() -> Self {
         Self {
             min_trade_value: Decimal::new(5, 0), // $5 minimum for cold-start coverage
-            max_latency_secs: 90,                // tolerate API lag and queueing
+            max_latency_secs: 600,               // 10 min: matches Data API inherent latency
             enabled: true,
         }
     }
@@ -51,7 +52,7 @@ impl CopyTradingConfig {
             max_latency_secs: std::env::var("COPY_MAX_LATENCY_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(90),
+                .unwrap_or(600),
             enabled: std::env::var("COPY_TRADING_ENABLED")
                 .map(|v| v == "true")
                 .unwrap_or(true),
@@ -67,6 +68,9 @@ pub struct CopyTradingMonitor {
     circuit_breaker: Arc<CircuitBreaker>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     pool: PgPool,
+    /// Runtime-tunable max latency threshold (seconds).  Written by the
+    /// dynamic config subscriber, read per-trade with `Relaxed` ordering.
+    max_latency_secs: Arc<AtomicI64>,
 }
 
 impl CopyTradingMonitor {
@@ -78,6 +82,7 @@ impl CopyTradingMonitor {
         circuit_breaker: Arc<CircuitBreaker>,
         signal_tx: broadcast::Sender<SignalUpdate>,
         pool: PgPool,
+        max_latency_secs: Arc<AtomicI64>,
     ) -> Self {
         Self {
             config,
@@ -86,6 +91,7 @@ impl CopyTradingMonitor {
             circuit_breaker,
             signal_tx,
             pool,
+            max_latency_secs,
         }
     }
 
@@ -243,23 +249,21 @@ impl CopyTradingMonitor {
             return Ok(());
         }
 
-        // Check latency
+        // Check latency (runtime-tunable via dynamic config)
         let now = Utc::now();
         let latency = now.signed_duration_since(trade.timestamp).num_seconds();
-        if latency > self.config.max_latency_secs {
-            warn!(
+        let max_latency = self.max_latency_secs.load(Ordering::Relaxed);
+        if latency > max_latency {
+            info!(
                 wallet = %trade.wallet_address,
                 latency = latency,
-                max = self.config.max_latency_secs,
+                max = max_latency,
                 "Trade too old, skipping"
             );
             self.publish_skip_signal(
                 &trade,
                 "too_stale",
-                &format!(
-                    "Trade is {}s old (max {}s)",
-                    latency, self.config.max_latency_secs
-                ),
+                &format!("Trade is {}s old (max {}s)", latency, max_latency),
             );
             self.record_trade_outcome(
                 &trade,
@@ -700,6 +704,7 @@ pub fn spawn_copy_trading_monitor(
     circuit_breaker: Arc<CircuitBreaker>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     pool: PgPool,
+    max_latency_secs: Arc<AtomicI64>,
 ) {
     let monitor = CopyTradingMonitor::new(
         config,
@@ -708,6 +713,7 @@ pub fn spawn_copy_trading_monitor(
         circuit_breaker,
         signal_tx,
         pool,
+        max_latency_secs,
     );
 
     tokio::spawn(async move {
@@ -727,7 +733,7 @@ mod tests {
     fn test_config_default() {
         let config = CopyTradingConfig::default();
         assert_eq!(config.min_trade_value, Decimal::new(5, 0));
-        assert_eq!(config.max_latency_secs, 90);
+        assert_eq!(config.max_latency_secs, 600);
         assert!(config.enabled);
     }
 
