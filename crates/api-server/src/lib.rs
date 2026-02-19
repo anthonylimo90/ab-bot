@@ -24,6 +24,7 @@ pub mod auto_optimizer;
 pub mod copy_trade_stop_loss;
 pub mod copy_trading;
 pub mod crypto;
+pub mod dynamic_tuner;
 pub mod email;
 pub mod error;
 pub mod exit_handler;
@@ -41,6 +42,7 @@ pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
 pub use auto_optimizer::AutoOptimizer;
 pub use copy_trade_stop_loss::{spawn_copy_stop_loss_monitor, CopyStopLossConfig};
 pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
+pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
 pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
 pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
@@ -335,6 +337,19 @@ impl ApiServer {
         // Spawn auto-optimizer background service
         let optimizer = Arc::new(AutoOptimizer::new(state.pool.clone()));
         tokio::spawn(optimizer.start(None));
+
+        // Spawn dynamic tuner (adaptive runtime configuration)
+        let tuner = Arc::new(DynamicTuner::new(
+            state.pool.clone(),
+            state.current_regime.clone(),
+            state.circuit_breaker.clone(),
+        ));
+        tokio::spawn(tuner.start());
+
+        // Subscribe local runtime to dynamic updates (copy-trader knobs)
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        spawn_dynamic_config_subscriber(redis_url, state.copy_trader.clone());
 
         // Spawn wallet harvester (discovers wallets from CLOB trades)
         let harvester_config = WalletHarvesterConfig::from_env();

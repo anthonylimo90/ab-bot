@@ -301,9 +301,13 @@ impl ClobClient {
     ) -> Result<()> {
         let (ws_stream, _) = connect_async(ws_url).await?;
         let (mut write, mut read) = ws_stream.split();
+        let read_timeout_secs = std::env::var("CLOB_WS_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(120_u64);
 
         // Subscribe to markets
-        for market_id in market_ids {
+        for (idx, market_id) in market_ids.iter().enumerate() {
             let subscribe_msg = serde_json::json!({
                 "type": "subscribe",
                 "market": market_id,
@@ -311,11 +315,40 @@ impl ClobClient {
             });
             write.send(Message::Text(subscribe_msg.to_string())).await?;
             debug!("Subscribed to market: {}", market_id);
+
+            // Pace large subscription sets to reduce server-side reset risk.
+            if (idx + 1) % 200 == 0 {
+                tokio::time::sleep(StdDuration::from_millis(25)).await;
+            }
         }
         info!("Subscribed to {} markets via WebSocket", market_ids.len());
 
         // Process incoming messages
-        while let Some(msg) = read.next().await {
+        loop {
+            let msg =
+                match tokio::time::timeout(StdDuration::from_secs(read_timeout_secs), read.next())
+                    .await
+                {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
+                        warn!("WebSocket stream ended");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        warn!(
+                            timeout_secs = read_timeout_secs,
+                            "WebSocket read timed out without messages"
+                        );
+                        return Err(Error::Api {
+                            message: format!(
+                                "WebSocket read timed out after {}s without messages",
+                                read_timeout_secs
+                            ),
+                            status: None,
+                        });
+                    }
+                };
+
             match msg {
                 Ok(Message::Text(text)) => match serde_json::from_str::<WsMessage>(&text) {
                     Ok(ws_msg) => {
@@ -344,8 +377,6 @@ impl ClobClient {
                 _ => {}
             }
         }
-
-        Ok(())
     }
 }
 
