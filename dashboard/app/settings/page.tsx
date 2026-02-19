@@ -223,16 +223,16 @@ export default function SettingsPage() {
   const shortAddress = (address: string) => `${address.slice(0, 6)}...${address.slice(-4)}`;
 
   return (
-    <div className="max-w-3xl mx-auto space-y-6">
+    <div className="mx-auto max-w-3xl space-y-5 sm:space-y-6">
       {/* Page Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
+          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Settings</h1>
           <p className="text-muted-foreground">
             Manage your account and preferences
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
           {isDirty && (
             <span className="text-sm text-yellow-500 flex items-center gap-1">
               <AlertTriangle className="h-4 w-4" />
@@ -283,14 +283,14 @@ export default function SettingsPage() {
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="rounded-lg border p-4">
-            <div className="flex items-center justify-between gap-2 mb-4">
+            <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="font-medium">Connected Wallets</p>
                 <p className="text-sm text-muted-foreground">
                   Primary wallet is used automatically for live trading
                 </p>
               </div>
-              <Button onClick={() => setConnectWalletOpen(true)}>Connect Wallet</Button>
+              <Button onClick={() => setConnectWalletOpen(true)} className="w-full sm:w-auto">Connect Wallet</Button>
             </div>
 
             {walletLoading && connectedWallets.length === 0 ? (
@@ -306,7 +306,7 @@ export default function SettingsPage() {
                   return (
                     <div
                       key={wallet.id}
-                      className="flex items-center justify-between gap-3 rounded-md border p-3"
+                      className="flex flex-col gap-3 rounded-md border p-3 sm:flex-row sm:items-center sm:justify-between"
                     >
                       <div className="min-w-0">
                         <p className="font-medium truncate">
@@ -316,7 +316,7 @@ export default function SettingsPage() {
                           {wallet.address}
                         </p>
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 self-start sm:self-auto">
                         {isPrimary ? (
                           <span className="inline-flex items-center gap-1 rounded-full border border-green-500/30 bg-green-500/10 px-2 py-1 text-xs text-green-600">
                             <Star className="h-3 w-3" />
@@ -337,6 +337,7 @@ export default function SettingsPage() {
                           size="sm"
                           onClick={() => handleDisconnectWallet(wallet.address)}
                           disabled={walletLoading}
+                          aria-label={`Disconnect wallet ${wallet.label || shortAddress(wallet.address)}`}
                         >
                           <Trash2 className="h-4 w-4" />
                         </Button>
@@ -367,7 +368,7 @@ export default function SettingsPage() {
               <label className="text-sm font-medium" htmlFor="walletconnect-project-id">
                 WalletConnect Project ID
               </label>
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   id="walletconnect-project-id"
                   type="text"
@@ -379,6 +380,7 @@ export default function SettingsPage() {
                 <Button
                   onClick={handleSaveWalletConnect}
                   disabled={isSavingWalletConnect || walletConnectProjectId === (currentWorkspace.walletconnect_project_id || '')}
+                  className="w-full sm:w-auto"
                 >
                   {isSavingWalletConnect ? (
                     <RefreshCw className="h-4 w-4 animate-spin" />
@@ -439,7 +441,7 @@ export default function SettingsPage() {
               <div className="rounded-lg border p-4 space-y-2">
                 <p className="text-sm font-medium mb-3">Service Status</p>
                 {Object.entries(serviceStatus).map(([key, status]) => (
-                  <div key={key} className="flex items-center justify-between text-sm">
+                  <div key={key} className="flex flex-col gap-1 text-sm sm:flex-row sm:items-center sm:justify-between">
                     <span className="capitalize">{key.replace(/_/g, ' ')}</span>
                     <div className="flex items-center gap-2">
                       <span
@@ -493,7 +495,7 @@ export default function SettingsPage() {
             </div>
 
             {/* Copy Trading Toggle */}
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="font-medium">Copy Trading</p>
                 <p className="text-sm text-muted-foreground">
@@ -507,7 +509,7 @@ export default function SettingsPage() {
             </div>
 
             {/* Arb Auto-Execute Toggle */}
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="font-medium">Arbitrage Auto-Execute</p>
                 <p className="text-sm text-muted-foreground">
@@ -521,7 +523,7 @@ export default function SettingsPage() {
             </div>
 
             {/* Live Trading Toggle */}
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <p className="font-medium">Live Trading</p>
                 <p className="text-sm text-muted-foreground">
@@ -567,7 +569,7 @@ export default function SettingsPage() {
       {currentWorkspace && (
         <Card>
           <CardHeader>
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <CardTitle className="flex items-center gap-2">
                   <Users className="h-5 w-5" />
@@ -606,7 +608,7 @@ export default function SettingsPage() {
                 <h3 className="text-sm font-medium mb-3">Pending Invitations</h3>
                 <div className="space-y-2">
                   {invites.filter(i => !i.accepted_at).map(invite => (
-                    <div key={invite.id} className="flex items-center justify-between p-3 rounded-lg border">
+                    <div key={invite.id} className="flex flex-col gap-2 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
                         <p className="font-medium">{invite.email}</p>
                         <p className="text-xs text-muted-foreground">
@@ -644,7 +646,7 @@ export default function SettingsPage() {
           </CardHeader>
           <CardContent>
             <Link href="/settings/users">
-              <div className="flex items-center justify-between p-4 rounded-lg border hover:bg-muted/50 transition-colors cursor-pointer">
+              <div className="flex items-center justify-between rounded-lg border p-4 transition-colors hover:bg-muted/50 cursor-pointer">
                 <div>
                   <p className="font-medium">Manage Users</p>
                   <p className="text-sm text-muted-foreground">
@@ -670,7 +672,7 @@ export default function SettingsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Default Stop-Loss</p>
               <p className="text-sm text-muted-foreground">
@@ -692,7 +694,7 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Max Position Size</p>
               <p className="text-sm text-muted-foreground">
@@ -714,7 +716,7 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Daily Loss Limit</p>
               <p className="text-sm text-muted-foreground">
@@ -736,7 +738,7 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Circuit Breaker</p>
               <p className="text-sm text-muted-foreground">
@@ -765,7 +767,7 @@ export default function SettingsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Telegram Alerts</p>
               <p className="text-sm text-muted-foreground">
@@ -787,7 +789,7 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Discord Webhook</p>
               <p className="text-sm text-muted-foreground">
@@ -809,7 +811,7 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Email Notifications</p>
               <p className="text-sm text-muted-foreground">
@@ -838,14 +840,14 @@ export default function SettingsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <p className="font-medium">Theme</p>
               <p className="text-sm text-muted-foreground">
                 Choose your preferred theme
               </p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               {themeButtons.map(({ value, label }) => (
                 <Button
                   key={value}

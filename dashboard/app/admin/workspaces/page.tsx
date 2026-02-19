@@ -20,20 +20,20 @@ export default function AdminWorkspacesPage() {
   });
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5 sm:space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">Workspaces</h1>
+          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Workspaces</h1>
           <p className="text-muted-foreground">
             Manage all workspaces in the platform
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="icon" onClick={() => refetch()}>
+        <div className="flex w-full items-center gap-2 sm:w-auto">
+          <Button variant="outline" size="icon" onClick={() => refetch()} aria-label="Refresh workspaces">
             <RefreshCw className="h-4 w-4" />
           </Button>
-          <Button onClick={() => setCreateDialogOpen(true)}>
+          <Button onClick={() => setCreateDialogOpen(true)} className="flex-1 sm:flex-none">
             <Plus className="mr-2 h-4 w-4" />
             Create Workspace
           </Button>

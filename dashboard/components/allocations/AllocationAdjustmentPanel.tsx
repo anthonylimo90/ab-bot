@@ -115,7 +115,7 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
     <>
       <Card className={className}>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle>Risk-Based Allocation</CardTitle>
               <CardDescription>
@@ -126,6 +126,7 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
               onClick={() => previewMutation.mutate()}
               disabled={previewMutation.isPending}
               variant="outline"
+              className="w-full sm:w-auto"
             >
               <RefreshCw className={`h-4 w-4 mr-2 ${previewMutation.isPending ? 'animate-spin' : ''}`} />
               Preview Changes
@@ -136,7 +137,8 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
         {previews.length > 0 && (
           <CardContent className="space-y-4">
             <div className="rounded-lg border">
-              <Table>
+              <div className="overflow-x-auto">
+              <Table className="min-w-[760px]">
                 <TableHeader>
                   <TableRow>
                     <TableHead>Wallet</TableHead>
@@ -185,23 +187,26 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
                   ))}
                 </TableBody>
               </Table>
+              </div>
             </div>
 
-            <div className="flex items-center justify-between pt-4 border-t">
+            <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
               <p className="text-sm text-muted-foreground">
                 {previews.length} wallet{previews.length !== 1 ? 's' : ''} will be updated
               </p>
-              <div className="flex gap-2">
+              <div className="flex w-full gap-2 sm:w-auto">
                 <Button
                   variant="outline"
                   onClick={() => setPreviews([])}
                   disabled={applyMutation.isPending}
+                  className="flex-1 sm:flex-none"
                 >
                   Cancel
                 </Button>
                 <Button
                   onClick={() => applyMutation.mutate()}
                   disabled={applyMutation.isPending}
+                  className="flex-1 sm:flex-none"
                 >
                   <CheckCircle className="h-4 w-4 mr-2" />
                   {applyMutation.isPending ? 'Applying...' : 'Apply Changes'}
@@ -229,7 +234,7 @@ export function AllocationAdjustmentPanel({ tier, className }: AllocationAdjustm
                 components={selectedWallet.components}
               />
 
-              <div className="grid grid-cols-2 gap-4 pt-4 border-t">
+              <div className="grid grid-cols-1 gap-4 border-t pt-4 sm:grid-cols-2">
                 <div>
                   <p className="text-sm text-muted-foreground mb-1">Current Allocation</p>
                   <p className="text-2xl font-bold">

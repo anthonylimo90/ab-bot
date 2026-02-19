@@ -193,16 +193,16 @@ export default function BacktestPage() {
     : 0;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5 sm:space-y-6">
       {/* Page Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">Backtest</h1>
+          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Backtest</h1>
           <p className="text-muted-foreground">
             Test strategies against historical data
           </p>
         </div>
-        <Button onClick={handleRunBacktest} disabled={isRunning}>
+        <Button onClick={handleRunBacktest} disabled={isRunning} className="w-full sm:w-auto">
           {isRunning ? (
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           ) : (
@@ -255,9 +255,9 @@ export default function BacktestPage() {
               </div>
             </div>
             <div className="space-y-2">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <label className="text-sm font-medium">Period</label>
-                <div className="flex gap-1">
+                <div className="flex flex-wrap gap-1">
                   {datePresets.map((preset) => (
                     <Button
                       key={preset.label}
@@ -271,7 +271,7 @@ export default function BacktestPage() {
                   ))}
                 </div>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   type="date"
                   value={startDate}
@@ -545,7 +545,7 @@ export default function BacktestPage() {
           <CardContent className="py-20">
             <div className="flex flex-col items-center gap-4">
               <Loader2 className="h-8 w-8 animate-spin text-primary" />
-              <p className="text-muted-foreground">Running backtest...</p>
+              <p className="text-muted-foreground">Running backtest…</p>
               <p className="text-xs text-muted-foreground">
                 Simulating{" "}
                 {Math.ceil(
@@ -838,7 +838,7 @@ export default function BacktestPage() {
                   </table>
                 </div>
                 {totalTradeLogPages > 1 && (
-                  <div className="flex items-center justify-between pt-4">
+                  <div className="flex flex-col gap-2 pt-4 sm:flex-row sm:items-center sm:justify-between">
                     <p className="text-xs text-muted-foreground">
                       Page {tradeLogPage + 1} of {totalTradeLogPages}
                     </p>
@@ -901,9 +901,10 @@ export default function BacktestPage() {
                 .filter((r) => r.status === "completed")
                 .slice(0, 10)
                 .map((result) => (
-                  <div
+                  <button
                     key={result.id}
-                    className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 cursor-pointer transition-colors"
+                    type="button"
+                    className="flex w-full flex-col gap-2 rounded-lg bg-muted/30 p-3 text-left transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between"
                     onClick={() => {
                       setTradeLogPage(0);
                       loadResult(result.id);
@@ -937,7 +938,7 @@ export default function BacktestPage() {
                         {result.total_trades} trades
                       </p>
                     </div>
-                  </div>
+                  </button>
                 ))}
             </div>
           </CardContent>

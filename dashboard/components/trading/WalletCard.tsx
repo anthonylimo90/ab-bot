@@ -105,7 +105,7 @@ export const WalletCard = memo(function WalletCard({
   return (
     <Card className="hover:border-primary/50 transition-colors">
       <CardHeader className="pb-2">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-start justify-between gap-2">
           <div className="flex items-center gap-3 min-w-0">
             <div
               className={cn(
@@ -172,7 +172,7 @@ export const WalletCard = memo(function WalletCard({
                 )}
                 <CompositeScoreGauge score={wallet.compositeScore} />
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <p className="text-xs text-muted-foreground font-mono">
                   {shortenAddress(wallet.address)}
                 </p>
@@ -194,7 +194,7 @@ export const WalletCard = memo(function WalletCard({
 
       <CardContent className="space-y-4">
         {/* Metrics Row */}
-        <div className="grid grid-cols-5 gap-3 text-sm">
+        <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3 lg:grid-cols-5">
           <div>
             <p className="text-xs text-muted-foreground">ROI (30d)</p>
             <p
@@ -266,8 +266,8 @@ export const WalletCard = memo(function WalletCard({
         )}
 
         {/* Actions Row */}
-        <div className="flex items-center justify-between pt-2 border-t">
-          <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2 border-t pt-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-wrap items-center gap-2">
             <Link href={`/wallet/${wallet.address}`}>
               <Button variant="outline" size="sm">
                 View Details
@@ -389,11 +389,11 @@ export const WalletCard = memo(function WalletCard({
             </p>
             <div className="space-y-2">
               {positions.map((position) => (
-                <div
+              <div
                   key={position.id}
-                  className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors"
+                  className="flex flex-col gap-2 rounded-lg bg-muted/30 p-3 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between"
                 >
-                  <div className="flex items-center gap-3">
+                  <div className="flex min-w-0 items-center gap-3">
                     <span
                       className={cn(
                         "px-2 py-0.5 rounded text-xs font-medium uppercase",
@@ -404,7 +404,7 @@ export const WalletCard = memo(function WalletCard({
                     >
                       {position.outcome}
                     </span>
-                    <div>
+                    <div className="min-w-0">
                       <p className="text-sm font-medium">
                         {position.marketQuestion ||
                           shortenAddress(position.marketId)}

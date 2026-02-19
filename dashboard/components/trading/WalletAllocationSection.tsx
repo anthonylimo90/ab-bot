@@ -132,22 +132,22 @@ export function WalletAllocationSection({
               {allocationPct}% of total balance
             </span>
           </div>
-          <div className="grid grid-cols-4 gap-4 text-center">
+          <div className="grid grid-cols-2 gap-3 text-center sm:grid-cols-4 sm:gap-4">
             <div>
               <p className="text-xs text-muted-foreground mb-1">Allocation</p>
-              <p className="text-lg font-bold">{allocationPct}%</p>
+                <p className="text-base font-bold sm:text-lg">{allocationPct}%</p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground mb-1">Max</p>
-              <p className="text-lg font-bold">
-                {formatCurrency(maxAllocation)}
-              </p>
+                <p className="text-base font-bold sm:text-lg">
+                  {formatCurrency(maxAllocation)}
+                </p>
             </div>
             <div>
               <p className="text-xs text-muted-foreground mb-1">In Use</p>
               <p
                 className={cn(
-                  "text-lg font-bold",
+                  "text-base font-bold sm:text-lg",
                   inUse > 0 ? "text-primary" : "text-muted-foreground",
                 )}
               >
@@ -158,7 +158,7 @@ export function WalletAllocationSection({
               <p className="text-xs text-muted-foreground mb-1">Available</p>
               <p
                 className={cn(
-                  "text-lg font-bold",
+                  "text-base font-bold sm:text-lg",
                   available > 0 ? "text-profit" : "text-loss",
                 )}
               >

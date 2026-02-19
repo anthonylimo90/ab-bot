@@ -155,9 +155,9 @@ export default function RiskPage() {
 
   return (
     <ErrorBoundary>
-      <div className="space-y-6">
+      <div className="space-y-5 sm:space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             <ShieldAlert className="h-6 w-6 text-muted-foreground" />
             <div>
@@ -196,7 +196,7 @@ export default function RiskPage() {
             )}
           >
             <CardContent className="p-6">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                 <div className="flex items-center gap-3">
                   {cb.tripped ? (
                     <ShieldOff className="h-8 w-8 text-loss" />
@@ -206,7 +206,7 @@ export default function RiskPage() {
                     <ShieldCheck className="h-8 w-8 text-profit" />
                   )}
                   <div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span
                         className={cn(
                           "text-lg font-bold",
@@ -245,7 +245,7 @@ export default function RiskPage() {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   {!cb.tripped && (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
@@ -428,13 +428,13 @@ export default function RiskPage() {
                     {sl.recent_executions.map((exec) => (
                       <div
                         key={exec.id}
-                        className="flex items-center justify-between rounded-lg border px-3 py-2"
+                        className="flex flex-col gap-2 rounded-lg border px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
                       >
-                        <div className="flex items-center gap-2">
+                        <div className="flex min-w-0 items-center gap-2">
                           <Badge variant="outline" className="text-xs">
                             {exec.stop_type}
                           </Badge>
-                          <span className="text-sm font-mono text-muted-foreground truncate max-w-[160px]">
+                          <span className="max-w-[160px] truncate text-sm font-mono text-muted-foreground">
                             {exec.market_id}
                           </span>
                         </div>
