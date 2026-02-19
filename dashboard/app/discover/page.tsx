@@ -326,11 +326,11 @@ export default function DiscoverPage() {
 
   return (
     <ErrorBoundary>
-      <div className="space-y-6">
+      <div className="space-y-5 sm:space-y-6">
         {/* Page Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">
+            <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
               Discover Strategies
             </h1>
             <p className="text-muted-foreground">
@@ -343,14 +343,14 @@ export default function DiscoverPage() {
         {/* Filters */}
         <Card>
           <CardContent className="p-4">
-            <div className="flex flex-wrap items-center gap-4">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-end gap-3 sm:gap-4">
+              <div className="flex w-full items-center gap-2 sm:w-auto">
                 <span className="text-sm text-muted-foreground">Sort by:</span>
                 <Select
                   value={sortBy}
                   onValueChange={(v) => setSortBy(v as SortField)}
                 >
-                  <SelectTrigger className="w-[140px]">
+                  <SelectTrigger className="w-full sm:w-[140px]">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -362,13 +362,13 @@ export default function DiscoverPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex w-full items-center gap-2 sm:w-auto">
                 <span className="text-sm text-muted-foreground">Time:</span>
                 <Select
                   value={timePeriod}
                   onValueChange={(v) => setTimePeriod(v as TimePeriod)}
                 >
-                  <SelectTrigger className="w-[110px]">
+                  <SelectTrigger className="w-full sm:w-[110px]">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -378,12 +378,12 @@ export default function DiscoverPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex w-full items-center gap-2 sm:w-auto">
                 <span className="text-sm text-muted-foreground">
                   Min Trades:
                 </span>
                 <Select value={minTrades} onValueChange={setMinTrades}>
-                  <SelectTrigger className="w-[80px]">
+                  <SelectTrigger className="w-full sm:w-[80px]">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -394,7 +394,7 @@ export default function DiscoverPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <div className="ml-auto flex items-center gap-4">
+              <div className="flex w-full flex-col gap-2 sm:ml-auto sm:w-auto sm:flex-row sm:items-center sm:gap-4">
                 <label className="flex items-center gap-2 text-sm cursor-pointer">
                   <Switch checked={hideBots} onCheckedChange={setHideBots} />
                   <span>Hide bots</span>
@@ -414,18 +414,19 @@ export default function DiscoverPage() {
         {/* What-If Calculator */}
         <Card className="bg-primary/5 border-primary/20">
           <CardContent className="p-4">
-            <div className="flex flex-wrap items-center gap-4">
+            <div className="flex flex-wrap items-center gap-3 sm:gap-4">
               <span className="font-medium">What-If Calculator:</span>
               <span className="text-sm text-muted-foreground">
                 If you invested
               </span>
-              <div className="flex items-center gap-1">
+              <div className="flex w-full items-center gap-1 sm:w-auto">
                 <span>$</span>
                 <input
                   type="number"
                   value={whatIfAmount}
                   onChange={(e) => setWhatIfAmount(Number(e.target.value))}
-                  className="w-24 rounded border bg-background px-2 py-1 text-sm"
+                  aria-label="What-if investment amount"
+                  className="w-full rounded border bg-background px-2 py-1 text-sm sm:w-24"
                 />
               </div>
               <span className="text-sm text-muted-foreground">
@@ -437,13 +438,13 @@ export default function DiscoverPage() {
 
         {/* Top Performers */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-2">
               <Star className="h-5 w-5 text-yellow-500" />
               <h2 className="text-xl font-semibold">Top Performers</h2>
             </div>
             <span className="text-sm text-muted-foreground">
-              {isLoading ? "Loading..." : `${filteredWallets.length} wallets`}
+              {isLoading ? "Loading…" : `${filteredWallets.length} wallets`}
             </span>
           </div>
 
@@ -462,7 +463,7 @@ export default function DiscoverPage() {
                             <Skeleton className="h-3 w-24" />
                           </div>
                         </div>
-                        <div className="grid grid-cols-5 gap-4 flex-1">
+                        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 flex-1">
                           {[1, 2, 3, 4, 5].map((j) => (
                             <div key={j} className="space-y-2">
                               <Skeleton className="h-3 w-12" />
@@ -516,7 +517,7 @@ export default function DiscoverPage() {
                           <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-primary-foreground font-bold">
                             #{wallet.rank}
                           </div>
-                          <div>
+                          <div className="min-w-0">
                             <div className="flex items-center gap-2">
                               <p className="font-medium font-mono">
                                 {shortenAddress(wallet.address)}
@@ -525,7 +526,7 @@ export default function DiscoverPage() {
                                 score={wallet.compositeScore}
                               />
                             </div>
-                            <div className="flex items-center gap-2 mt-0.5">
+                            <div className="mt-0.5 flex flex-wrap items-center gap-2">
                               <span
                                 className={`text-xs px-2 py-0.5 rounded-full ${
                                   predictionColors[wallet.prediction]
@@ -600,12 +601,13 @@ export default function DiscoverPage() {
                               {formatCurrency(hypotheticalTotal)}
                             </p>
                           </div>
-                          <div className="flex gap-2">
+                          <div className="flex w-full flex-wrap gap-2 sm:w-auto">
                             <Button
                               variant={wallet.tracked ? "outline" : "secondary"}
                               size="sm"
                               onClick={() => handleTrack(wallet.address)}
                               disabled={isTrackLoading}
+                              className="flex-1 sm:flex-none"
                             >
                               {isTrackLoading ? (
                                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -625,6 +627,7 @@ export default function DiscoverPage() {
                               variant="default"
                               size="sm"
                               onClick={() => handleCopyClick(wallet)}
+                              className="flex-1 sm:flex-none"
                             >
                               Copy
                             </Button>

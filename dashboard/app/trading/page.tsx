@@ -420,11 +420,11 @@ export default function TradingPage() {
 
   return (
     <ErrorBoundary>
-      <div className="space-y-6">
+      <div className="space-y-5 sm:space-y-6">
         {/* Page Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
+            <h1 className="flex items-center gap-2 text-2xl font-bold tracking-tight sm:text-3xl">
               <TrendingUp className="h-8 w-8" />
               Trading
             </h1>
@@ -432,8 +432,8 @@ export default function TradingPage() {
               Manage your copy trading wallets and positions
             </p>
           </div>
-          <Link href="/discover">
-            <Button>
+          <Link href="/discover" className="w-full sm:w-auto">
+            <Button className="w-full sm:w-auto">
               <Search className="mr-2 h-4 w-4" />
               Discover Wallets
             </Button>
@@ -465,7 +465,8 @@ export default function TradingPage() {
 
         {/* Tabs */}
         <Tabs value={currentTab} onValueChange={handleTabChange}>
-          <TabsList>
+          <div className="overflow-x-auto pb-1">
+            <TabsList className="w-max min-w-full sm:w-auto">
             <TabsTrigger value="active" className="flex items-center gap-2">
               <Star className="h-4 w-4" />
               Active ({allActiveWallets.length}/5)
@@ -482,7 +483,8 @@ export default function TradingPage() {
               <Bot className="h-4 w-4" />
               Automation
             </TabsTrigger>
-          </TabsList>
+            </TabsList>
+          </div>
 
           {/* Active Tab */}
           <TabsContent value="active" className="space-y-4">
@@ -514,7 +516,7 @@ export default function TradingPage() {
                     Promote wallets from Watching or discover new wallets to
                     start copying
                   </p>
-                  <div className="flex gap-2 justify-center">
+                  <div className="flex flex-col justify-center gap-2 sm:flex-row">
                     <Button
                       variant="outline"
                       onClick={() => handleTabChange("watching")}
@@ -650,12 +652,12 @@ export default function TradingPage() {
                 </CardContent>
               </Card>
             ) : (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center justify-between">
-                    <span>Closed Positions</span>
-                    <span
-                      className={cn(
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <span>Closed Positions</span>
+                      <span
+                        className={cn(
                         "text-lg font-bold",
                         realizedPnl >= 0 ? "text-profit" : "text-loss",
                       )}
@@ -666,7 +668,7 @@ export default function TradingPage() {
                 </CardHeader>
                 <CardContent>
                   <div className="overflow-x-auto">
-                    <table className="w-full">
+                    <table className="w-full min-w-[980px]">
                       <thead className="border-b bg-muted/50">
                         <tr>
                           <th className="text-left p-4 font-medium">Market</th>

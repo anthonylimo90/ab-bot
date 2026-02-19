@@ -123,20 +123,20 @@ export default function AdminUsersPage() {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5 sm:space-y-6">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">User Management</h1>
+          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">User Management</h1>
           <p className="text-muted-foreground">
             Manage user accounts and permissions
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="icon" onClick={() => refetch()}>
+        <div className="flex w-full items-center gap-2 sm:w-auto">
+          <Button variant="outline" size="icon" onClick={() => refetch()} aria-label="Refresh users">
             <RefreshCw className="h-4 w-4" />
           </Button>
-          <Button onClick={() => setCreateDialogOpen(true)}>
+          <Button onClick={() => setCreateDialogOpen(true)} className="flex-1 sm:flex-none">
             <Plus className="mr-2 h-4 w-4" />
             Add Admin
           </Button>
@@ -199,15 +199,15 @@ export default function AdminUsersPage() {
               {users?.map((user) => (
                 <div
                   key={user.id}
-                  className="flex items-center justify-between p-4 rounded-lg border hover:bg-muted/50 transition-colors"
+                  className="flex flex-col gap-3 rounded-lg border p-4 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between"
                 >
-                  <div className="flex items-center gap-4">
+                  <div className="flex min-w-0 items-center gap-4">
                     <div className="flex items-center justify-center h-10 w-10 rounded-full bg-muted">
                       {getRoleIcon(user.role)}
                     </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">{user.email}</span>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium break-all">{user.email}</span>
                         <Badge variant={getRoleBadgeVariant(user.role)}>
                           {user.role}
                         </Badge>
@@ -224,11 +224,12 @@ export default function AdminUsersPage() {
                       </div>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 self-end sm:self-auto">
                     <Button
                       variant="ghost"
                       size="sm"
                       onClick={() => openEditDialog(user)}
+                      aria-label={`Edit user ${user.email}`}
                     >
                       <Pencil className="h-4 w-4" />
                     </Button>
@@ -238,6 +239,7 @@ export default function AdminUsersPage() {
                       onClick={() => openDeleteDialog(user)}
                       disabled={user.id === currentUser?.id}
                       className="text-destructive hover:text-destructive"
+                      aria-label={`Delete user ${user.email}`}
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>

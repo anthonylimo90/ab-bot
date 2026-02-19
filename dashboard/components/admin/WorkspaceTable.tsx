@@ -62,8 +62,8 @@ export function WorkspaceTable({ workspaces }: WorkspaceTableProps) {
 
   return (
     <>
-      <div className="rounded-md border">
-        <table className="w-full">
+      <div className="overflow-x-auto rounded-md border">
+        <table className="w-full min-w-[760px]">
           <thead>
             <tr className="border-b bg-muted/50">
               <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">

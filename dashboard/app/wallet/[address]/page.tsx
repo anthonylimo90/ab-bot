@@ -312,7 +312,7 @@ export default function WalletDetailPage() {
   if (walletError && !storedWallet && !discoveredWallet) {
     return (
       <div className="space-y-6">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-3 sm:gap-4">
           <Button
             variant="ghost"
             size="icon"
@@ -321,7 +321,7 @@ export default function WalletDetailPage() {
           >
             <ArrowLeft className="h-5 w-5" />
           </Button>
-          <h1 className="text-3xl font-bold tracking-tight">Wallet Details</h1>
+          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Wallet Details</h1>
         </div>
         <ErrorDisplay
           error={walletError}
@@ -337,7 +337,7 @@ export default function WalletDetailPage() {
     <ErrorBoundary>
       <div className="space-y-6">
         {/* Breadcrumb & Header */}
-        <div className="flex items-center gap-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-4">
           <Button
             variant="ghost"
             size="icon"
@@ -347,9 +347,9 @@ export default function WalletDetailPage() {
             <ArrowLeft className="h-5 w-5" />
           </Button>
           <div className="flex-1">
-            <div className="flex items-center gap-3">
+            <div className="flex items-start gap-3">
               <Wallet className="h-8 w-8" />
-              <div>
+              <div className="min-w-0">
                 {isLoading ? (
                   <>
                     <Skeleton className="h-8 w-48 mb-2" />
@@ -357,10 +357,10 @@ export default function WalletDetailPage() {
                   </>
                 ) : (
                   <>
-                    <h1 className="text-3xl font-bold tracking-tight">
+                    <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
                       {wallet.label || shortenAddress(address)}
                     </h1>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       <p className="text-muted-foreground font-mono">
                         {shortenAddress(address)}
                       </p>
@@ -397,7 +397,7 @@ export default function WalletDetailPage() {
               </div>
             </div>
           </div>
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
             {/* Tier badge */}
             {isActive ? (
               <span className="px-3 py-1 rounded-full bg-primary text-primary-foreground text-sm font-medium">
@@ -455,6 +455,7 @@ export default function WalletDetailPage() {
                 onClick={handleDemote}
                 disabled={demoteMutation.isPending}
                 aria-label="Demote wallet"
+                className="w-full sm:w-auto"
               >
                 {demoteMutation.isPending ? (
                   <Loader2 className="mr-1 h-4 w-4 animate-spin" />
@@ -469,6 +470,7 @@ export default function WalletDetailPage() {
                 onClick={handlePromote}
                 disabled={isRosterFull || promoteMutation.isPending}
                 aria-label="Promote wallet"
+                className="w-full sm:w-auto"
               >
                 {promoteMutation.isPending ? (
                   <Loader2 className="mr-1 h-4 w-4 animate-spin" />
@@ -734,7 +736,7 @@ export default function WalletDetailPage() {
             ) : walletTrades && walletTrades.length > 0 ? (
               <div className="space-y-0">
                 <div className="overflow-x-auto">
-                  <table className="w-full">
+                  <table className="w-full min-w-[700px]">
                     <thead className="border-b bg-muted/50">
                       <tr>
                         <th className="text-left p-4 font-medium">Market</th>

@@ -87,19 +87,21 @@ export function DashboardHome() {
   const ModeIcon = isAutomatic ? Target : Settings2;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5 sm:space-y-6">
       {/* Page Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
           <div>
-            <h1 className="text-3xl font-bold tracking-tight">Dashboard</h1>
+            <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">
+              Dashboard
+            </h1>
             <p className="text-muted-foreground">
               Monitor your portfolio and trading activity
             </p>
           </div>
           <LiveIndicator />
         </div>
-        <Badge variant="secondary" className="flex items-center gap-1">
+        <Badge variant="secondary" className="w-fit items-center gap-1">
           <ModeIcon className="h-3 w-3" />
           {modeLabel} Mode
         </Badge>
@@ -138,11 +140,11 @@ export function DashboardHome() {
       </div>
 
       {/* Main Content */}
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-4 sm:gap-6 lg:grid-cols-2">
         {/* Recent Activity */}
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
-            <div className="flex items-center gap-2">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-wrap items-center gap-2">
               <CardTitle>Recent Activity</CardTitle>
               {unreadCount > 0 && (
                 <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-medium text-primary-foreground">
@@ -151,15 +153,15 @@ export function DashboardHome() {
               )}
               <ConnectionStatus status={activityStatus} />
             </div>
-            <Link href="/portfolio">
-              <Button variant="ghost" size="sm">
+            <Link href="/history" className="w-full sm:w-auto">
+              <Button variant="ghost" size="sm" className="w-full sm:w-auto">
                 View All
                 <ArrowRight className="ml-2 h-4 w-4" />
               </Button>
             </Link>
           </CardHeader>
           <CardContent>
-            <div className="space-y-4 max-h-[350px] overflow-y-auto">
+            <div className="max-h-[320px] space-y-4 overflow-y-auto sm:max-h-[350px]">
               {activities.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">
                   No recent activity yet. Activity will appear here when wallets
@@ -170,7 +172,7 @@ export function DashboardHome() {
                   <div
                     key={item.id}
                     className={cn(
-                      "flex items-start gap-3",
+                      "flex flex-wrap items-start gap-3 sm:flex-nowrap",
                       index === 0 && "animate-slide-in",
                     )}
                   >
@@ -179,8 +181,8 @@ export function DashboardHome() {
                         <Activity className="h-4 w-4" />
                       )}
                     </div>
-                    <div className="flex-1 space-y-1">
-                      <p className="text-sm">{item.message}</p>
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <p className="text-sm break-words">{item.message}</p>
                       <p className="text-xs text-muted-foreground">
                         {formatTimeAgo(item.created_at)}
                       </p>
@@ -188,7 +190,7 @@ export function DashboardHome() {
                     {item.pnl !== undefined && (
                       <span
                         className={cn(
-                          "text-sm font-medium tabular-nums",
+                          "ml-auto text-sm font-medium tabular-nums sm:ml-0",
                           item.pnl >= 0 ? "text-profit" : "text-loss",
                         )}
                       >
@@ -208,7 +210,7 @@ export function DashboardHome() {
           <CardHeader>
             <CardTitle>Quick Actions</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent className="space-y-3 sm:space-y-4">
             <p className="text-sm text-muted-foreground">
               Common actions to manage your portfolio
             </p>
@@ -217,7 +219,7 @@ export function DashboardHome() {
               <Link href="/discover">
                 <Button
                   variant="outline"
-                  className="w-full justify-start h-auto py-3"
+                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
                 >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-500/10">
@@ -236,7 +238,7 @@ export function DashboardHome() {
               <Link href="/portfolio">
                 <Button
                   variant="outline"
-                  className="w-full justify-start h-auto py-3"
+                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
                 >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-green-500/10">
@@ -256,7 +258,7 @@ export function DashboardHome() {
               <Link href="/backtest">
                 <Button
                   variant="outline"
-                  className="w-full justify-start h-auto py-3"
+                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
                 >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-purple-500/10">
@@ -275,7 +277,7 @@ export function DashboardHome() {
               <Link href="/roster">
                 <Button
                   variant="outline"
-                  className="w-full justify-start h-auto py-3"
+                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
                 >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-yellow-500/10">

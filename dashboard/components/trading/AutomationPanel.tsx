@@ -301,7 +301,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   return (
     <Card className="border-border/50 bg-card/50">
       <CardHeader className="pb-3">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <CardTitle className="flex items-center gap-2 text-lg">
             <Bot className="h-5 w-5 text-primary" />
             Automation
@@ -323,7 +323,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="settings">
-          <TabsList className="grid w-full grid-cols-4">
+          <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4">
             <TabsTrigger value="settings" className="text-xs">
               <Settings className="mr-1 h-3 w-3" />
               Settings
@@ -488,9 +488,10 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                   </div>
                 </div>
 
-                <div className="flex justify-end">
+                <div className="flex justify-stretch sm:justify-end">
                   <Button
                     size="sm"
+                    className="w-full sm:w-auto"
                     onClick={handleSaveSettings}
                     disabled={!hasUnsavedChanges || saveSettingsMutation.isPending}
                   >
@@ -555,9 +556,9 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                     {dynamicTunerStatus.dynamic_config.map((entry) => (
                       <div
                         key={entry.key}
-                        className="flex items-center justify-between rounded border border-border/50 px-3 py-2 text-sm"
+                        className="flex flex-col gap-1 rounded border border-border/50 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between"
                       >
-                        <span className="font-mono text-xs">{entry.key}</span>
+                        <span className="font-mono text-xs break-all">{entry.key}</span>
                         <span className="font-medium tabular-nums">{entry.current_value.toFixed(4)}</span>
                       </div>
                     ))}
@@ -628,11 +629,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                 bans.map((ban: WalletBan) => (
                   <div
                     key={ban.id}
-                    className="flex items-center justify-between rounded-lg border border-border/50 bg-background/50 p-3"
+                    className="flex flex-col gap-2 rounded-lg border border-border/50 bg-background/50 p-3 sm:flex-row sm:items-center sm:justify-between"
                   >
-                    <div className="flex items-center gap-3">
+                    <div className="flex min-w-0 items-center gap-3">
                       <Ban className="h-4 w-4 text-red-500" />
-                      <div>
+                      <div className="min-w-0">
                         <p className="text-sm font-mono">
                           {ban.wallet_address.slice(0, 10)}...{ban.wallet_address.slice(-8)}
                         </p>
@@ -647,6 +648,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                     <Button
                       variant="ghost"
                       size="sm"
+                      className="self-end sm:self-auto"
                       onClick={() => handleUnban(ban.wallet_address)}
                       disabled={unbanMutation.isPending}
                     >

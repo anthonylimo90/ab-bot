@@ -131,9 +131,9 @@ export default function HistoryPage() {
 
   return (
     <ErrorBoundary>
-      <div className="space-y-6">
+      <div className="space-y-5 sm:space-y-6">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight flex items-center gap-2">
+          <h1 className="flex items-center gap-2 text-2xl font-bold tracking-tight sm:text-3xl">
             <History className="h-8 w-8" />
             History
           </h1>
@@ -167,7 +167,7 @@ export default function HistoryPage() {
           </TabsList>
 
           <TabsContent value="activity" className="mt-4 space-y-4">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
               <Select
                 value={activityFilter}
                 onValueChange={(value) => {
@@ -175,7 +175,7 @@ export default function HistoryPage() {
                   setActivityPage(0);
                 }}
               >
-                <SelectTrigger className="w-[180px]">
+                <SelectTrigger className="w-full sm:w-[180px]">
                   <SelectValue placeholder="Activity Type" />
                 </SelectTrigger>
                 <SelectContent>
@@ -213,7 +213,7 @@ export default function HistoryPage() {
                   </CardHeader>
                   <CardContent>
                     <div className="overflow-x-auto">
-                      <table className="w-full">
+                      <table className="w-full min-w-[680px]">
                         <thead className="border-b bg-muted/50">
                           <tr>
                             <th className="text-left p-4 font-medium">Type</th>
@@ -243,7 +243,7 @@ export default function HistoryPage() {
                                   </span>
                                 </td>
                                 <td className="p-4 text-sm">
-                                  <p>{item.message}</p>
+                                  <p className="break-words">{item.message}</p>
                                   {(item.skip_reason || item.error_message) && (
                                     <div className="mt-1 flex flex-wrap gap-1">
                                       {item.skip_reason && (
@@ -286,7 +286,7 @@ export default function HistoryPage() {
                   </CardContent>
                 </Card>
 
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <p className="text-sm text-muted-foreground">
                     Page {activityPage + 1} &middot; {filteredActivity.length} records
                   </p>
@@ -347,7 +347,7 @@ export default function HistoryPage() {
                   </CardHeader>
                   <CardContent>
                     <div className="overflow-x-auto">
-                      <table className="w-full">
+                      <table className="w-full min-w-[920px]">
                         <thead className="border-b bg-muted/50">
                           <tr>
                             <th className="p-3 text-left text-xs font-medium">Key</th>
@@ -373,7 +373,7 @@ export default function HistoryPage() {
                               <td className="p-3 text-xs tabular-nums">
                                 {formatDynamicValue(entry.old_value)} → {formatDynamicValue(entry.new_value)}
                               </td>
-                              <td className="p-3 text-xs max-w-[280px]">{entry.reason}</td>
+                              <td className="max-w-[280px] p-3 text-xs break-words">{entry.reason}</td>
                               <td className="p-3 text-xs text-muted-foreground">
                                 fill={metricValue(entry.metrics_snapshot, "successful_fill_rate")}
                                 <br />
@@ -400,7 +400,7 @@ export default function HistoryPage() {
                   </CardContent>
                 </Card>
 
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <p className="text-sm text-muted-foreground">
                     Page {dynamicPage + 1} &middot; {dynamicHistory.length} records
                   </p>

@@ -3,52 +3,12 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  LayoutDashboard,
-  Search,
-  TrendingUp,
-  Settings,
-  LineChart,
-  History,
-  ShieldAlert,
   Star,
-  type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
-
-interface NavItem {
-  href: string;
-  label: string;
-  icon: LucideIcon;
-  badge?: "active" | "watching";
-}
-
-interface NavSection {
-  title: string;
-  items: NavItem[];
-}
-
-const navSections: NavSection[] = [
-  {
-    title: "Overview",
-    items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }],
-  },
-  {
-    title: "Trading",
-    items: [
-      { href: "/discover", label: "Discover", icon: Search },
-      { href: "/trading", label: "Trading", icon: TrendingUp, badge: "active" },
-      { href: "/backtest", label: "Backtest", icon: LineChart },
-      { href: "/history", label: "History", icon: History },
-      { href: "/risk", label: "Risk Monitor", icon: ShieldAlert },
-    ],
-  },
-  {
-    title: "Settings",
-    items: [{ href: "/settings", label: "Settings", icon: Settings }],
-  },
-];
+import { primaryNavSections } from "@/components/layout/navigation";
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -66,7 +26,7 @@ export function Sidebar() {
   return (
     <aside className="fixed left-0 top-16 z-30 hidden h-[calc(100vh-4rem)] w-64 border-r bg-background md:block">
       <nav className="flex flex-col gap-6 p-4">
-        {navSections.map((section) => (
+        {primaryNavSections.map((section) => (
           <div key={section.title} className="space-y-1">
             <h3 className="px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
               {section.title}

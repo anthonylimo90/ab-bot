@@ -131,7 +131,7 @@ export function CopyWalletModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="sm:max-w-[500px]">
+      <DialogContent className="w-[calc(100vw-2rem)] sm:max-w-[500px]">
         <form onSubmit={handleSubmit(onSubmit)}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -146,7 +146,7 @@ export function CopyWalletModal({
           <div className="space-y-6 py-4">
             {/* Wallet Info */}
             <div className="rounded-lg border p-4 space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="font-mono font-medium">
                   {shortenAddress(wallet.address)}
                 </span>
@@ -156,7 +156,7 @@ export function CopyWalletModal({
                   </span>
                 )}
               </div>
-              <div className="grid grid-cols-4 gap-2 text-sm">
+              <div className="grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
                 {wallet.roi30d !== undefined && (
                   <div>
                     <p className="text-xs text-muted-foreground">ROI</p>
@@ -379,11 +379,11 @@ export function CopyWalletModal({
             </div>
           </div>
 
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onClose}>
+          <DialogFooter className="flex-col gap-2 sm:flex-row">
+            <Button type="button" variant="outline" onClick={onClose} className="w-full sm:w-auto">
               Cancel
             </Button>
-            <Button type="submit">
+            <Button type="submit" className="w-full sm:w-auto">
               {tier === "active" ? "Add to Active" : "Add to Watching"}
             </Button>
           </DialogFooter>

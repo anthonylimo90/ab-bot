@@ -44,13 +44,15 @@ export const MetricCard = memo(function MetricCard({
 
   return (
     <Card className={cn('', className)}>
-      <CardContent className="p-6">
+      <CardContent className="p-4 sm:p-6">
         <div className="flex flex-col gap-1">
           <span className="text-sm font-medium text-muted-foreground">
             {title}
           </span>
-          <div className="flex items-baseline gap-2">
-            <span className="text-2xl font-bold tabular-nums">{value}</span>
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="break-words text-xl font-bold tabular-nums sm:text-2xl">
+              {value}
+            </span>
             {change !== undefined && (
               <div className="flex items-center gap-1">
                 {getTrendIcon()}

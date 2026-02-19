@@ -11,12 +11,6 @@ import {
   X,
   Target,
   Settings2,
-  LayoutDashboard,
-  Search,
-  Eye,
-  Star,
-  PieChart,
-  TrendingUp,
   Wallet,
   Plus,
   Pause,
@@ -39,6 +33,7 @@ import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
 import { useToastStore } from "@/stores/toast-store";
+import { primaryNavSections } from "@/components/layout/navigation";
 import api from "@/lib/api";
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
@@ -48,31 +43,13 @@ const usdFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
 
-const mobileNavSections = [
-  {
-    title: "Overview",
-    items: [{ href: "/", label: "Dashboard", icon: LayoutDashboard }],
-  },
-  {
-    title: "Copy Trading",
-    items: [
-      { href: "/discover", label: "Discover", icon: Search },
-      { href: "/bench", label: "Watching", icon: Eye },
-      { href: "/roster", label: "Active", icon: Star },
-    ],
-  },
-  {
-    title: "Portfolio",
-    items: [
-      { href: "/portfolio", label: "Positions", icon: PieChart },
-      { href: "/backtest", label: "Backtest", icon: TrendingUp },
-    ],
-  },
-  {
-    title: "Settings",
-    items: [{ href: "/settings", label: "Settings", icon: Settings }],
-  },
-];
+const usdCompactFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  notation: "compact",
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1,
+});
 
 export function Header() {
   const pathname = usePathname();
@@ -171,6 +148,25 @@ export function Header() {
     setIsMobileMenuOpen(false);
   }, [pathname]);
 
+  useEffect(() => {
+    if (!isMobileMenuOpen) return;
+
+    const originalOverflow = document.body.style.overflow;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsMobileMenuOpen(false);
+      }
+    };
+
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.body.style.overflow = originalOverflow;
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [isMobileMenuOpen]);
+
   const handleLogout = () => {
     logout();
     setIsUserMenuOpen(false);
@@ -189,9 +185,9 @@ export function Header() {
 
   return (
     <header className="sticky top-0 z-40 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="flex h-16 items-center justify-between px-4 md:px-6">
+      <div className="flex h-16 items-center justify-between gap-2 px-3 sm:px-4 md:px-6">
         {/* Logo & Brand */}
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 sm:gap-4">
           <Link href="/" className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground font-bold">
               AB
@@ -217,7 +213,10 @@ export function Header() {
             variant="ghost"
             size="icon"
             onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-            aria-label={isMobileMenuOpen ? "Close navigation menu" : "Open navigation menu"}
+            aria-label={
+              isMobileMenuOpen ? "Close navigation menu" : "Open navigation menu"
+            }
+            aria-expanded={isMobileMenuOpen}
           >
             {isMobileMenuOpen ? (
               <X className="h-5 w-5" />
@@ -228,60 +227,116 @@ export function Header() {
 
           {/* Mobile Menu Dropdown */}
           {isMobileMenuOpen && (
-            <div className="absolute left-0 right-0 top-16 bg-background border-b shadow-lg p-4 max-h-[calc(100vh-4rem)] overflow-y-auto">
-              {mobileNavSections.map((section) => (
-                <div key={section.title} className="mb-4">
-                  <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 px-3">
-                    {section.title}
-                  </h3>
-                  <div className="space-y-1">
-                    {section.items.map((item) => {
-                      const isActive =
-                        pathname === item.href ||
-                        (item.href !== "/" && pathname.startsWith(item.href));
-                      const Icon = item.icon;
-                      return (
-                        <Link
-                          key={item.href}
-                          href={item.href}
-                          className={cn(
-                            "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
-                            isActive
-                              ? "bg-primary text-primary-foreground"
-                              : "text-muted-foreground hover:bg-accent",
-                          )}
-                        >
-                          <Icon className="h-4 w-4" />
-                          {item.label}
-                        </Link>
-                      );
-                    })}
+            <div
+              className="fixed inset-x-0 bottom-0 top-16 z-50 border-t bg-background/95 p-4 backdrop-blur supports-[backdrop-filter]:bg-background/80"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Mobile navigation"
+            >
+              <div className="mx-auto h-full w-full max-w-screen-sm overflow-y-auto pb-8">
+                {primaryNavSections.map((section) => (
+                  <div key={section.title} className="mb-5">
+                    <h3 className="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      {section.title}
+                    </h3>
+                    <div className="space-y-1">
+                      {section.items.map((item) => {
+                        const isActive =
+                          pathname === item.href ||
+                          (item.href !== "/" && pathname.startsWith(item.href));
+                        const Icon = item.icon;
+                        return (
+                          <Link
+                            key={item.href}
+                            href={item.href}
+                            className={cn(
+                              "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
+                              isActive
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground hover:bg-accent",
+                            )}
+                          >
+                            <Icon className="h-4 w-4" />
+                            {item.label}
+                          </Link>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))}
 
-              {/* Mode Indicator in Mobile Menu */}
-              {currentWorkspace && (
-                <div className="pt-4 border-t">
-                  <div className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
-                    <ModeIcon className="h-4 w-4" />
-                    <span>{modeLabel} Mode</span>
-                  </div>
+                {/* Mobile quick actions */}
+                <div className="space-y-2 border-t pt-4">
+                  {currentWorkspace && (
+                    <Button
+                      variant="outline"
+                      className={cn(
+                        "h-10 w-full justify-start gap-2",
+                        isTradingActive
+                          ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
+                          : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
+                      )}
+                      disabled={toggleTradingMutation.isPending}
+                      onClick={() => toggleTradingMutation.mutate()}
+                    >
+                      {toggleTradingMutation.isPending ? (
+                        <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                      ) : isTradingActive ? (
+                        <Pause className="h-4 w-4" />
+                      ) : (
+                        <Play className="h-4 w-4" />
+                      )}
+                      {isTradingActive ? "Pause trading" : "Resume trading"}
+                    </Button>
+                  )}
+
+                  {currentWorkspace && (
+                    <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm text-muted-foreground">
+                      <ModeIcon className="h-4 w-4" />
+                      <span>{modeLabel} Mode</span>
+                    </div>
+                  )}
+
+                  <Link
+                    href="/settings"
+                    className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent"
+                    onClick={() => setIsMobileMenuOpen(false)}
+                  >
+                    <Settings className="h-4 w-4" />
+                    Settings
+                  </Link>
+                  <button
+                    onClick={handleLogout}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-destructive hover:bg-accent"
+                  >
+                    <LogOut className="h-4 w-4" />
+                    Sign out
+                  </button>
+                  {user?.email && (
+                    <p className="px-3 text-xs text-muted-foreground">
+                      Signed in as {user.email}
+                    </p>
+                  )}
+                  {hasWallet && primaryWallet && (
+                    <p className="px-3 text-xs text-muted-foreground">
+                      Wallet: {walletLabel}
+                    </p>
+                  )}
                 </div>
-              )}
+              </div>
             </div>
           )}
         </div>
 
         {/* Wallet Info & Actions */}
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
           {/* Trading Pause/Resume */}
           {currentWorkspace && (
             <Button
               variant="ghost"
               size="sm"
               className={cn(
-                "gap-1.5 text-xs font-medium",
+                "hidden gap-1.5 text-xs font-medium md:inline-flex",
                 isTradingActive
                   ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
                   : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
@@ -296,9 +351,7 @@ export function Header() {
               ) : (
                 <Play className="h-4 w-4" />
               )}
-              <span className="hidden sm:inline">
-                {isTradingActive ? "Pause" : "Resume"}
-              </span>
+              <span>{isTradingActive ? "Pause" : "Resume"}</span>
             </Button>
           )}
 
@@ -306,55 +359,80 @@ export function Header() {
 
           {/* Wallet Balance & Info */}
           {hasWallet && primaryWallet ? (
-            <div
-              className={cn(
-                "flex max-w-[20rem] items-center gap-2 rounded-full border px-3 py-1.5",
-                isWalletBalanceError
-                  ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
-                  : "border-border/60 bg-card/70",
-              )}
-              title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
-              aria-live="polite"
-            >
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted">
+            <>
+              <div
+                className={cn(
+                  "hidden max-w-[20rem] items-center gap-2 rounded-full border px-3 py-1.5 md:flex",
+                  isWalletBalanceError
+                    ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
+                    : "border-border/60 bg-card/70",
+                )}
+                title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
+                aria-live="polite"
+              >
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted">
+                  {isWalletBalancePending ? (
+                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                  ) : (
+                    <Wallet className="h-4 w-4 text-muted-foreground" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Available USDC.e
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {hasUsdcBalance ? (
+                      <span className="text-sm font-semibold tabular-nums">
+                        {usdFormatter.format(usdcBalance)}
+                      </span>
+                    ) : isWalletBalancePending ? (
+                      <span className="text-xs text-muted-foreground">
+                        Loading balance
+                      </span>
+                    ) : (
+                      <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                        Balance unavailable
+                      </span>
+                    )}
+                    {isWalletBalanceFetching && hasUsdcBalance && (
+                      <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                    )}
+                    <span className="hidden max-w-[8.5rem] truncate text-xs text-muted-foreground lg:inline">
+                      {walletLabel}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div
+                className={cn(
+                  "flex items-center gap-1.5 rounded-full border px-2 py-1.5 md:hidden",
+                  isWalletBalanceError
+                    ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
+                    : "border-border/60 bg-card/70",
+                )}
+                title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
+                aria-live="polite"
+              >
                 {isWalletBalancePending ? (
-                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
                 ) : (
-                  <Wallet className="h-4 w-4 text-muted-foreground" />
+                  <Wallet className="h-3.5 w-3.5 text-muted-foreground" />
+                )}
+                {hasUsdcBalance ? (
+                  <span className="text-xs font-semibold tabular-nums">
+                    {usdCompactFormatter.format(usdcBalance)}
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted-foreground">USDC.e</span>
                 )}
               </div>
-              <div className="min-w-0">
-                <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                  Available USDC.e
-                </div>
-                <div className="flex items-center gap-2">
-                  {hasUsdcBalance ? (
-                    <span className="text-sm font-semibold tabular-nums">
-                      {usdFormatter.format(usdcBalance)}
-                    </span>
-                  ) : isWalletBalancePending ? (
-                    <span className="text-xs text-muted-foreground">
-                      Loading balance
-                    </span>
-                  ) : (
-                    <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
-                      Balance unavailable
-                    </span>
-                  )}
-                  {isWalletBalanceFetching && hasUsdcBalance && (
-                    <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                  )}
-                  <span className="hidden max-w-[8.5rem] truncate text-xs text-muted-foreground lg:inline">
-                    {walletLabel}
-                  </span>
-                </div>
-              </div>
-            </div>
+            </>
           ) : (
             <button
               onClick={() => setShowConnectModal(true)}
               aria-label="Connect trading wallet"
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 text-sm font-medium transition-colors"
+              className="flex items-center gap-1.5 rounded-full border border-primary/20 bg-primary/10 px-2 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20 sm:px-3"
             >
               <Plus className="h-4 w-4" />
               <span className="hidden sm:inline">Connect</span>
@@ -370,7 +448,7 @@ export function Header() {
             <Button
               variant="ghost"
               size="icon"
-              className="hidden sm:flex"
+              className="hidden md:flex"
               aria-label="Open settings"
             >
               <Settings className="h-4 w-4" />
@@ -378,7 +456,7 @@ export function Header() {
           </Link>
 
           {/* User Menu */}
-          <div className="relative" ref={menuRef}>
+          <div className="relative hidden md:block" ref={menuRef}>
             <Button
               variant="ghost"
               size="sm"
@@ -388,7 +466,7 @@ export function Header() {
               aria-haspopup="menu"
               aria-label="Open user menu"
             >
-              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-primary-foreground text-xs font-medium">
+              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
                 {userInitials}
               </div>
               <ChevronDown
@@ -401,16 +479,16 @@ export function Header() {
 
             {isUserMenuOpen && (
               <div className="absolute right-0 mt-2 w-56 rounded-md border bg-popover p-1 shadow-lg">
-                <div className="px-3 py-2 border-b mb-1">
+                <div className="mb-1 border-b px-3 py-2">
                   <p className="text-sm font-medium">{user?.name || "User"}</p>
                   <p className="text-xs text-muted-foreground">{user?.email}</p>
-                  <p className="text-xs text-muted-foreground capitalize mt-1">
+                  <p className="mt-1 text-xs capitalize text-muted-foreground">
                     Role: {currentWorkspace?.my_role || user?.role}
                   </p>
                 </div>
                 <Link
                   href="/settings"
-                  className="flex items-center gap-2 px-3 py-2 text-sm rounded-sm hover:bg-accent cursor-pointer"
+                  className="flex cursor-pointer items-center gap-2 rounded-sm px-3 py-2 text-sm hover:bg-accent"
                   onClick={() => setIsUserMenuOpen(false)}
                 >
                   <Settings className="h-4 w-4" />
@@ -418,7 +496,7 @@ export function Header() {
                 </Link>
                 <button
                   onClick={handleLogout}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-sm rounded-sm hover:bg-accent text-destructive"
+                  className="flex w-full items-center gap-2 rounded-sm px-3 py-2 text-sm text-destructive hover:bg-accent"
                 >
                   <LogOut className="h-4 w-4" />
                   Sign out
