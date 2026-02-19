@@ -71,7 +71,7 @@ async fn get_nonce(http: &reqwest::Client, rpc_url: &str, address: &Address) -> 
     });
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
-    let hex = resp["result"].as_str().context("Missing nonce result")?;
+    let hex = rpc_result_hex(&resp, "eth_getTransactionCount")?;
     Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
 
@@ -85,8 +85,24 @@ async fn get_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
     });
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
-    let hex = resp["result"].as_str().context("Missing gasPrice result")?;
+    let hex = rpc_result_hex(&resp, "eth_gasPrice")?;
     Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16)?)
+}
+
+/// Extract hex string from JSON-RPC result, surfacing provider errors explicitly.
+fn rpc_result_hex<'a>(resp: &'a serde_json::Value, method: &str) -> Result<&'a str> {
+    if let Some(err) = resp.get("error") {
+        let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or_default();
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown RPC error");
+        anyhow::bail!("{method} RPC error ({code}): {message}");
+    }
+
+    resp.get("result")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("Missing result from {method}"))
 }
 
 /// Send a signed legacy transaction and return the tx hash.
@@ -195,8 +211,9 @@ async fn check_erc20_allowance(
     });
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
-    let hex_val = resp["result"].as_str().unwrap_or("0x0");
-    let val = U256::from_str_radix(hex_val.trim_start_matches("0x"), 16).unwrap_or_default();
+    let hex_val = rpc_result_hex(&resp, "eth_call allowance")?;
+    let val = U256::from_str_radix(hex_val.trim_start_matches("0x"), 16)
+        .context("Failed to parse allowance hex result")?;
     Ok(val)
 }
 
@@ -225,7 +242,7 @@ async fn check_erc1155_approval(
     });
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
-    let hex_val = resp["result"].as_str().unwrap_or("0x0");
+    let hex_val = rpc_result_hex(&resp, "eth_call isApprovedForAll")?;
     // Non-zero means approved
     let approved = !hex_val
         .trim_start_matches("0x")
@@ -248,8 +265,9 @@ async fn get_native_balance(
     });
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
-    let hex = resp["result"].as_str().unwrap_or("0x0");
-    Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0))
+    let hex = rpc_result_hex(&resp, "eth_getBalance")?;
+    u128::from_str_radix(hex.trim_start_matches("0x"), 16)
+        .context("Failed to parse eth_getBalance result")
 }
 
 /// Ensure all 6 Polymarket approvals are set for the given wallet.
@@ -291,7 +309,7 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
     // Check POL balance for gas before attempting any transactions
     let pol_balance = get_native_balance(&http, rpc_url, &address)
         .await
-        .unwrap_or(0);
+        .context("Failed fetching wallet POL balance for approval checks")?;
     info!(
         wallet = %address,
         pol_balance_wei = pol_balance,
