@@ -410,7 +410,8 @@ pub async fn trigger_optimization(
     );
 
     // Run the optimization synchronously
-    let optimizer = AutoOptimizer::new(state.pool.clone());
+    let optimizer = AutoOptimizer::new(state.pool.clone())
+        .with_runtime_handles(state.trade_monitor.clone(), state.copy_trader.clone());
     optimizer
         .optimize_workspace_by_id(workspace_id)
         .await

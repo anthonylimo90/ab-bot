@@ -13,6 +13,7 @@ use uuid::Uuid;
 use auth::{AuditAction, AuditEvent, Claims};
 
 use crate::error::{ApiError, ApiResult};
+use crate::runtime_sync::reconcile_copy_runtime;
 use crate::state::AppState;
 
 /// Onboarding status response.
@@ -572,6 +573,14 @@ pub async fn auto_setup(
             reason: format!("Top performer with {} trades", candidate.total_trades),
         });
     }
+
+    reconcile_copy_runtime(
+        &state.pool,
+        state.trade_monitor.as_ref(),
+        state.copy_trader.as_ref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to reconcile copy runtime: {e}")))?;
 
     // Log rotation history
     sqlx::query(

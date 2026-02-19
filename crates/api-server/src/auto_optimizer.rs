@@ -14,11 +14,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{debug, info, warn};
+use trading_engine::copy_trader::CopyTrader;
 use uuid::Uuid;
+use wallet_tracker::trade_monitor::TradeMonitor;
 
+use crate::runtime_sync::reconcile_copy_runtime;
 use crate::schema::wallet_features_has_strategy_type;
 
 /// Allocation strategy for workspace
@@ -250,6 +253,7 @@ pub enum AutomationEvent {
 pub struct WorkspaceOptimizationSettings {
     pub id: Uuid,
     pub name: String,
+    pub copy_trading_enabled: bool,
     // Legacy settings
     pub auto_optimize_enabled: bool,
     pub optimization_interval_hours: i32,
@@ -492,6 +496,8 @@ pub struct AutoOptimizer {
     pool: PgPool,
     config: AutoOptimizerConfig,
     event_sender: Option<mpsc::Sender<AutomationEvent>>,
+    trade_monitor: Option<Arc<TradeMonitor>>,
+    copy_trader: Option<Arc<RwLock<CopyTrader>>>,
 }
 
 impl Default for AutoOptimizer {
@@ -507,6 +513,8 @@ impl AutoOptimizer {
             pool,
             config: AutoOptimizerConfig::default(),
             event_sender: None,
+            trade_monitor: None,
+            copy_trader: None,
         }
     }
 
@@ -516,6 +524,8 @@ impl AutoOptimizer {
             pool,
             config,
             event_sender: None,
+            trade_monitor: None,
+            copy_trader: None,
         }
     }
 
@@ -527,14 +537,41 @@ impl AutoOptimizer {
                 pool,
                 config: AutoOptimizerConfig::default(),
                 event_sender: Some(tx),
+                trade_monitor: None,
+                copy_trader: None,
             },
             rx,
         )
     }
 
+    /// Attach live runtime handles so optimizer mutations can sync monitor/trader state.
+    pub fn with_runtime_handles(
+        mut self,
+        trade_monitor: Option<Arc<TradeMonitor>>,
+        copy_trader: Option<Arc<RwLock<CopyTrader>>>,
+    ) -> Self {
+        self.trade_monitor = trade_monitor;
+        self.copy_trader = copy_trader;
+        self
+    }
+
     /// Get event sender for external event emission.
     pub fn event_sender(&self) -> Option<mpsc::Sender<AutomationEvent>> {
         self.event_sender.clone()
+    }
+
+    async fn reconcile_runtime_if_attached(&self) -> anyhow::Result<()> {
+        if self.trade_monitor.is_none() && self.copy_trader.is_none() {
+            return Ok(());
+        }
+
+        reconcile_copy_runtime(
+            &self.pool,
+            self.trade_monitor.as_ref(),
+            self.copy_trader.as_ref(),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Start the background optimization loop with event handling.
@@ -599,6 +636,7 @@ impl AutoOptimizer {
                 self.handle_workspace_created(workspace_id).await?;
             }
         }
+        self.reconcile_runtime_if_attached().await?;
         Ok(())
     }
 
@@ -626,6 +664,8 @@ impl AutoOptimizer {
         // Process grace period expirations
         self.process_grace_period_expirations().await?;
 
+        self.reconcile_runtime_if_attached().await?;
+
         info!("Auto-optimization cycle complete");
         Ok(())
     }
@@ -634,7 +674,8 @@ impl AutoOptimizer {
     async fn get_eligible_workspaces(&self) -> anyhow::Result<Vec<WorkspaceOptimizationSettings>> {
         let workspaces: Vec<WorkspaceOptimizationSettings> = sqlx::query_as(
             r#"
-            SELECT id, name, auto_optimize_enabled, optimization_interval_hours,
+            SELECT id, name, COALESCE(copy_trading_enabled, TRUE) as copy_trading_enabled,
+                   auto_optimize_enabled, optimization_interval_hours,
                    min_roi_30d, min_sharpe, min_win_rate, min_trades_30d,
                    auto_select_enabled, auto_demote_enabled, probation_days,
                    max_pinned_wallets, allocation_strategy, max_drawdown_pct, inactivity_days
@@ -657,7 +698,8 @@ impl AutoOptimizer {
     ) -> anyhow::Result<WorkspaceOptimizationSettings> {
         let workspace: WorkspaceOptimizationSettings = sqlx::query_as(
             r#"
-            SELECT id, name, auto_optimize_enabled, optimization_interval_hours,
+            SELECT id, name, COALESCE(copy_trading_enabled, TRUE) as copy_trading_enabled,
+                   auto_optimize_enabled, optimization_interval_hours,
                    min_roi_30d, min_sharpe, min_win_rate, min_trades_30d,
                    auto_select_enabled, auto_demote_enabled, probation_days,
                    max_pinned_wallets, allocation_strategy, max_drawdown_pct, inactivity_days
@@ -677,6 +719,15 @@ impl AutoOptimizer {
         &self,
         workspace: &WorkspaceOptimizationSettings,
     ) -> anyhow::Result<()> {
+        if !workspace.copy_trading_enabled {
+            debug!(
+                workspace_id = %workspace.id,
+                workspace_name = %workspace.name,
+                "Skipping optimization because copy_trading_enabled=false"
+            );
+            return Ok(());
+        }
+
         debug!(
             workspace_id = %workspace.id,
             workspace_name = %workspace.name,
@@ -1953,7 +2004,9 @@ impl AutoOptimizer {
     /// Run optimization for a specific workspace (triggered manually).
     pub async fn optimize_workspace_by_id(&self, workspace_id: Uuid) -> anyhow::Result<()> {
         let workspace = self.get_workspace_settings(workspace_id).await?;
-        self.optimize_workspace(&workspace).await
+        self.optimize_workspace(&workspace).await?;
+        self.reconcile_runtime_if_attached().await?;
+        Ok(())
     }
 
     async fn get_wallet_metric_snapshot(

@@ -31,7 +31,7 @@ pub struct CopyTradingPolicy {
 impl Default for CopyTradingPolicy {
     fn default() -> Self {
         Self {
-            min_trade_value: Decimal::new(10, 0),       // $10 minimum
+            min_trade_value: Decimal::new(5, 0),        // $5 minimum
             max_slippage_pct: Decimal::new(1, 2),       // 1% max slippage
             daily_capital_limit: Decimal::new(5000, 0), // $5,000/day cap
             auto_stop_loss_pct: Decimal::new(15, 2),    // 15% stop-loss
@@ -47,7 +47,7 @@ impl CopyTradingPolicy {
             min_trade_value: std::env::var("COPY_MIN_TRADE_VALUE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(10, 0)),
+                .unwrap_or(Decimal::new(5, 0)),
             max_slippage_pct: std::env::var("COPY_MAX_SLIPPAGE_PCT")
                 .ok()
                 .and_then(|s| s.parse().ok())

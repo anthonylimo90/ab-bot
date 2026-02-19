@@ -1,6 +1,7 @@
 //! Trading and order execution handlers.
 
 use axum::extract::{Path, State};
+use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -10,6 +11,8 @@ use std::sync::Arc;
 use tracing::{info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+use auth::Claims;
 
 use polymarket_core::types::{
     LimitOrder as CoreLimitOrder, MarketOrder as CoreMarketOrder, OrderSide as CoreOrderSide,
@@ -161,8 +164,40 @@ struct OrderRow {
 )]
 pub async fn place_order(
     State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
     Json(request): Json<PlaceOrderRequest>,
 ) -> ApiResult<Json<OrderResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+
+    let workspace_live_enabled: bool = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(w.live_trading_enabled, FALSE)
+        FROM user_settings us
+        JOIN workspaces w ON w.id = us.default_workspace_id
+        WHERE us.user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or(false);
+
+    if workspace_live_enabled {
+        if !state.order_executor.is_live() {
+            return Err(ApiError::ServiceUnavailable(
+                "Workspace is configured for live trading but executor is running in simulation mode. Enable LIVE_TRADING and restart."
+                    .into(),
+            ));
+        }
+        if !state.order_executor.is_live_ready().await {
+            return Err(ApiError::ServiceUnavailable(
+                "Workspace is configured for live trading but wallet/API credentials are not ready."
+                    .into(),
+            ));
+        }
+    }
+
     // Check circuit breaker before processing any orders
     if !state.circuit_breaker.can_trade().await {
         let cb_state = state.circuit_breaker.state().await;
@@ -288,6 +323,7 @@ pub async fn place_order(
         status = ?status,
         filled = %filled_qty,
         live = %state.order_executor.is_live(),
+        workspace_live_enabled = %workspace_live_enabled,
         "Order executed"
     );
 

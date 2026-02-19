@@ -31,6 +31,8 @@ pub struct ExecutorConfig {
     pub default_slippage: Decimal,
     /// Maximum order size.
     pub max_order_size: Decimal,
+    /// Minimum notional depth at best price level required to execute.
+    pub min_book_depth: Decimal,
     /// Fee rate for trades.
     pub fee_rate: Decimal,
     /// Whether to actually execute orders (false = paper trading).
@@ -52,6 +54,7 @@ impl Default for ExecutorConfig {
         Self {
             default_slippage: Decimal::new(1, 2), // 1%
             max_order_size: Decimal::new(10000, 0),
+            min_book_depth: Decimal::new(100, 0),
             fee_rate: Decimal::new(2, 2), // 2%
             live_trading: false,
             api_key: None,
@@ -524,8 +527,14 @@ impl OrderExecutor {
         let client = match client_guard.as_ref() {
             Some(client) => client,
             None => {
-                warn!("No authenticated client for live trading - falling back to simulation");
-                return self.simulate_market_order(order).await;
+                warn!("No authenticated client for live trading");
+                return Ok(ExecutionReport::rejected(
+                    order.id,
+                    order.market_id.clone(),
+                    order.outcome_id.clone(),
+                    order.side,
+                    "Live trading wallet is not initialized".to_string(),
+                ));
             }
         };
 
@@ -562,7 +571,7 @@ impl OrderExecutor {
         };
 
         // Check liquidity depth: reject if best level has < $100 notional
-        let min_depth = Decimal::new(100, 0);
+        let min_depth = self.config.min_book_depth;
         let notional_at_best = available_size * price;
         if notional_at_best < min_depth {
             return Ok(ExecutionReport::rejected(
@@ -696,8 +705,14 @@ impl OrderExecutor {
         let client = match client_guard.as_ref() {
             Some(client) => client,
             None => {
-                warn!("No authenticated client for live trading - falling back to simulation");
-                return self.simulate_limit_order(order).await;
+                warn!("No authenticated client for live trading");
+                return Ok(ExecutionReport::rejected(
+                    order.id,
+                    order.market_id.clone(),
+                    order.outcome_id.clone(),
+                    order.side,
+                    "Live trading wallet is not initialized".to_string(),
+                ));
             }
         };
 

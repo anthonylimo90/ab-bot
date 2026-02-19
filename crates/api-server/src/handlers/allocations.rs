@@ -15,6 +15,7 @@ use auth::{AuditAction, AuditEvent, Claims};
 use trading_engine::copy_trader::TrackedWallet;
 
 use crate::error::{ApiError, ApiResult};
+use crate::runtime_sync::reconcile_copy_runtime;
 use crate::state::AppState;
 
 /// Wallet allocation response.
@@ -383,6 +384,14 @@ pub async fn add_allocation(
         }
     }
 
+    reconcile_copy_runtime(
+        &state.pool,
+        state.trade_monitor.as_ref(),
+        state.copy_trader.as_ref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to reconcile copy runtime: {e}")))?;
+
     // Audit log
     let event = AuditEvent::builder(
         AuditAction::Custom("roster_wallet_added".to_string()),
@@ -530,6 +539,14 @@ pub async fn update_allocation(
 
     q.execute(&state.pool).await?;
 
+    reconcile_copy_runtime(
+        &state.pool,
+        state.trade_monitor.as_ref(),
+        state.copy_trader.as_ref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to reconcile copy runtime: {e}")))?;
+
     // Audit log
     state.audit_logger.log_user_action(
         &claims.sub,
@@ -646,6 +663,14 @@ pub async fn remove_allocation(
         let trader = trader.read().await;
         trader.remove_tracked_wallet(&address);
     }
+
+    reconcile_copy_runtime(
+        &state.pool,
+        state.trade_monitor.as_ref(),
+        state.copy_trader.as_ref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to reconcile copy runtime: {e}")))?;
 
     // Audit log
     state.audit_logger.log_user_action(
@@ -774,6 +799,14 @@ pub async fn promote_allocation(
         let wallet = TrackedWallet::new(address.clone(), alloc_pct);
         trader.add_tracked_wallet(wallet);
     }
+
+    reconcile_copy_runtime(
+        &state.pool,
+        state.trade_monitor.as_ref(),
+        state.copy_trader.as_ref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to reconcile copy runtime: {e}")))?;
 
     // Log rotation history
     sqlx::query(
@@ -922,6 +955,14 @@ pub async fn demote_allocation(
         let trader = trader.read().await;
         trader.remove_tracked_wallet(&address);
     }
+
+    reconcile_copy_runtime(
+        &state.pool,
+        state.trade_monitor.as_ref(),
+        state.copy_trader.as_ref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Failed to reconcile copy runtime: {e}")))?;
 
     // Log rotation history
     sqlx::query(

@@ -33,8 +33,8 @@ pub struct CopyTradingConfig {
 impl Default for CopyTradingConfig {
     fn default() -> Self {
         Self {
-            min_trade_value: Decimal::new(10, 0), // $10 minimum (was $0.05)
-            max_latency_secs: 30,                 // 30 seconds max latency (was 60)
+            min_trade_value: Decimal::new(5, 0), // $5 minimum for cold-start coverage
+            max_latency_secs: 90,                // tolerate API lag and queueing
             enabled: true,
         }
     }
@@ -47,11 +47,11 @@ impl CopyTradingConfig {
             min_trade_value: std::env::var("COPY_MIN_TRADE_VALUE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(10, 0)),
+                .unwrap_or(Decimal::new(5, 0)),
             max_latency_secs: std::env::var("COPY_MAX_LATENCY_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(90),
             enabled: std::env::var("COPY_TRADING_ENABLED")
                 .map(|v| v == "true")
                 .unwrap_or(true),
@@ -696,8 +696,8 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = CopyTradingConfig::default();
-        assert_eq!(config.min_trade_value, Decimal::new(10, 0));
-        assert_eq!(config.max_latency_secs, 30);
+        assert_eq!(config.min_trade_value, Decimal::new(5, 0));
+        assert_eq!(config.max_latency_secs, 90);
         assert!(config.enabled);
     }
 

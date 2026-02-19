@@ -70,6 +70,8 @@ pub struct MonitorConfig {
     pub min_trade_value: Decimal,
     /// Maximum trade age to process (in seconds).
     pub max_trade_age_secs: u64,
+    /// Number of activity rows fetched per wallet poll.
+    pub wallet_activity_limit: u32,
     /// Maximum number of trades to keep in history.
     pub max_history_size: usize,
 }
@@ -79,7 +81,8 @@ impl Default for MonitorConfig {
         Self {
             poll_interval_secs: 15,
             min_trade_value: Decimal::new(5, 2), // $0.05
-            max_trade_age_secs: 300,
+            max_trade_age_secs: 900,             // 15 minutes to tolerate upstream lag
+            wallet_activity_limit: 100,
             max_history_size: 10000,
         }
     }
@@ -100,7 +103,11 @@ impl MonitorConfig {
             max_trade_age_secs: std::env::var("TRADE_MONITOR_MAX_AGE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(300),
+                .unwrap_or(900),
+            wallet_activity_limit: std::env::var("TRADE_MONITOR_WALLET_LIMIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100),
             max_history_size: 10000,
         }
     }
@@ -291,7 +298,10 @@ impl TradeMonitor {
         // Poll all wallets concurrently
         let futures: Vec<_> = wallet_list
             .iter()
-            .map(|addr| self.clob_client.get_wallet_activity(addr, 50))
+            .map(|addr| {
+                self.clob_client
+                    .get_wallet_activity(addr, self.config.wallet_activity_limit)
+            })
             .collect();
         let results = futures_util::future::join_all(futures).await;
 
@@ -322,8 +332,13 @@ impl TradeMonitor {
                     continue;
                 }
 
-                // Dedup by tx hash
-                if seen.contains(&ct.transaction_hash) {
+                // Dedup by a composite key to avoid dropping legitimate multi-fill trades
+                // that share one transaction hash.
+                let dedup_key = format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    ct.transaction_hash, ct.asset_id, ct.side, ct.timestamp, ct.price, ct.size
+                );
+                if seen.contains(&dedup_key) {
                     continue;
                 }
 
@@ -333,7 +348,7 @@ impl TradeMonitor {
                         continue;
                     }
 
-                    seen.insert(ct.transaction_hash.clone());
+                    seen.insert(dedup_key);
 
                     // Store in recent trades
                     self.recent_trades
@@ -498,7 +513,8 @@ mod tests {
         let config = MonitorConfig::default();
         assert_eq!(config.poll_interval_secs, 15);
         assert_eq!(config.min_trade_value, Decimal::new(5, 2));
-        assert_eq!(config.max_trade_age_secs, 300);
+        assert_eq!(config.max_trade_age_secs, 900);
+        assert_eq!(config.wallet_activity_limit, 100);
     }
 
     #[test]
@@ -507,7 +523,8 @@ mod tests {
         let config = MonitorConfig::from_env();
         assert_eq!(config.poll_interval_secs, 15);
         assert_eq!(config.min_trade_value, Decimal::new(5, 2));
-        assert_eq!(config.max_trade_age_secs, 300);
+        assert_eq!(config.max_trade_age_secs, 900);
+        assert_eq!(config.wallet_activity_limit, 100);
     }
 
     #[tokio::test]
