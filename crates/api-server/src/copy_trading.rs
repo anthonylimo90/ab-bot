@@ -12,7 +12,9 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use polymarket_core::types::OrderSide;
-use trading_engine::copy_trader::{CopyTradeRejection, CopyTrader, DetectedTrade};
+use trading_engine::copy_trader::{
+    CopyTradeProcessOutcome, CopyTradeRejection, CopyTrader, DetectedTrade,
+};
 use wallet_tracker::trade_monitor::{TradeDirection, TradeMonitor, WalletTrade};
 
 use crate::websocket::{SignalType, SignalUpdate};
@@ -371,7 +373,9 @@ impl CopyTradingMonitor {
         // Use a scoped read lock — drop it before any write lock to avoid deadlock
         let (result, allocation_pct) = {
             let copy_trader = self.copy_trader.read().await;
-            let result = copy_trader.process_detected_trade(&detected).await;
+            let result = copy_trader
+                .process_detected_trade_with_reason(&detected)
+                .await;
             let alloc = copy_trader
                 .get_tracked_wallet(&trade.wallet_address)
                 .map(|w| w.allocation_pct)
@@ -380,7 +384,7 @@ impl CopyTradingMonitor {
         }; // read lock dropped here
 
         match result {
-            Ok(Some(report)) => {
+            Ok(CopyTradeProcessOutcome::Executed(report)) => {
                 if !report.is_success() {
                     let err_msg = report
                         .error_message
@@ -593,7 +597,38 @@ impl CopyTradingMonitor {
                 };
                 let _ = self.signal_tx.send(success_signal);
             }
-            Ok(None) => {
+            Ok(CopyTradeProcessOutcome::Rejected(rejection)) => {
+                let (skip_type, reason) = match &rejection {
+                    CopyTradeRejection::BelowMinTradeValue { value, min } => (
+                        "below_minimum",
+                        format!("Trade value ${value} below policy minimum ${min}"),
+                    ),
+                    CopyTradeRejection::DailyCapitalLimitReached { deployed, limit } => (
+                        "daily_limit",
+                        format!("Daily capital limit reached (${deployed}/${limit})"),
+                    ),
+                    CopyTradeRejection::TooManyOpenPositions { current, limit } => (
+                        "position_limit",
+                        format!("Too many open copy positions ({current}/{limit})"),
+                    ),
+                    CopyTradeRejection::CircuitBreakerTripped => {
+                        ("circuit_breaker", "Circuit breaker is tripped".to_string())
+                    }
+                    CopyTradeRejection::SlippageTooHigh { slippage_pct, max } => (
+                        "slippage",
+                        format!("Slippage {slippage_pct} exceeds max {max}"),
+                    ),
+                };
+                debug!(
+                    wallet = %trade.wallet_address,
+                    rejection = ?rejection,
+                    "Trade rejected by copy-trader runtime policy"
+                );
+                self.publish_skip_signal(&trade, skip_type, &reason);
+                self.record_trade_outcome(&trade, 3, Some(skip_type), Some(&reason))
+                    .await;
+            }
+            Ok(CopyTradeProcessOutcome::Skipped) => {
                 debug!(
                     wallet = %trade.wallet_address,
                     "Trade not copied (wallet not tracked, disabled, or trade filtered)"

@@ -39,6 +39,7 @@ pub struct DynamicConfigUpdate {
     pub key: String,
     pub value: Decimal,
     pub reason: String,
+    #[serde(default)]
     pub source: String,
     pub timestamp: DateTime<Utc>,
     #[serde(default)]
@@ -132,7 +133,8 @@ impl DynamicTunerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(75.0),
-            redis_url: std::env::var("REDIS_URL")
+            redis_url: std::env::var("DYNAMIC_TUNER_REDIS_URL")
+                .or_else(|_| std::env::var("REDIS_URL"))
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
         }
     }
@@ -177,11 +179,16 @@ impl DynamicTuner {
     pub async fn start(self: Arc<Self>) {
         if !self.config.enabled {
             info!("Dynamic tuner is disabled");
+            self.persist_runtime_state("disabled", "dynamic tuner disabled", None)
+                .await;
             return;
         }
 
         if let Err(e) = self.seed_defaults().await {
             warn!(error = %e, "Failed seeding dynamic defaults");
+        }
+        if let Err(e) = self.publish_current_snapshot().await {
+            warn!(error = %e, "Failed publishing startup dynamic config snapshot");
         }
 
         let mut stable_regime = *self.current_regime.read().await;
@@ -193,6 +200,8 @@ impl DynamicTuner {
             apply_changes = self.config.apply_changes,
             "Dynamic tuner started"
         );
+        self.persist_runtime_state("started", "dynamic tuner started", None)
+            .await;
 
         let mut ticker = interval(TokioDuration::from_secs(self.config.interval_secs));
 
@@ -205,6 +214,8 @@ impl DynamicTuner {
             .await
         {
             warn!(error = %e, "Initial dynamic tuning cycle failed");
+            self.persist_runtime_state("error", &format!("cycle failed: {e}"), None)
+                .await;
         }
 
         loop {
@@ -219,8 +230,32 @@ impl DynamicTuner {
                 .await
             {
                 warn!(error = %e, "Dynamic tuning cycle failed");
+                self.persist_runtime_state("error", &format!("cycle failed: {e}"), None)
+                    .await;
             }
         }
+    }
+
+    async fn publish_current_snapshot(&self) -> anyhow::Result<()> {
+        let mut redis_manager = self.redis_connection_manager().await;
+        let rows = self.load_rows().await?;
+
+        for row in rows.into_iter().filter(|r| r.enabled) {
+            self.publish_update(
+                redis_manager.as_mut(),
+                &DynamicConfigUpdate {
+                    key: row.key,
+                    value: row.current_value,
+                    reason: "startup sync".to_string(),
+                    source: "dynamic_tuner_sync".to_string(),
+                    timestamp: Utc::now(),
+                    metrics: serde_json::json!({ "sync": "startup" }),
+                },
+            )
+            .await;
+        }
+
+        Ok(())
     }
 
     async fn run_cycle(
@@ -249,12 +284,13 @@ impl DynamicTuner {
         self.evaluate_pending(rows.as_slice(), &metrics).await?;
 
         if metrics.cb_tripped || metrics.recent_drawdown >= self.config.max_drawdown_freeze {
+            let freeze_reason = "risk guard active: circuit breaker/drawdown";
             self.record_history(
                 None,
                 None,
                 None,
                 "frozen",
-                "risk guard active: circuit breaker/drawdown",
+                freeze_reason,
                 Some(&metrics),
                 None,
             )
@@ -264,6 +300,8 @@ impl DynamicTuner {
                 drawdown = metrics.recent_drawdown,
                 "Dynamic tuner frozen by risk guard"
             );
+            self.persist_runtime_state("frozen", freeze_reason, Some(&metrics))
+                .await;
             return Ok(());
         }
 
@@ -273,6 +311,8 @@ impl DynamicTuner {
         }
 
         let targets = self.compute_targets(&by_key, &metrics, resolved);
+        let mut applied_count = 0usize;
+        let mut recommended_count = 0usize;
 
         for (key, raw_target) in targets {
             let Some(row) = by_key.get(&key) else {
@@ -315,6 +355,7 @@ impl DynamicTuner {
 
             if self.config.apply_changes {
                 self.apply_change(row, new_value, &reason, &metrics).await?;
+                applied_count += 1;
                 self.publish_update(
                     redis_manager.as_mut(),
                     &DynamicConfigUpdate {
@@ -338,8 +379,17 @@ impl DynamicTuner {
                     None,
                 )
                 .await?;
+                recommended_count += 1;
             }
         }
+
+        let cycle_reason = if self.config.apply_changes {
+            format!("cycle complete: applied={applied_count}")
+        } else {
+            format!("cycle complete: shadow_recommended={recommended_count}")
+        };
+        self.persist_runtime_state("ok", &cycle_reason, Some(&metrics))
+            .await;
 
         Ok(())
     }
@@ -879,17 +929,50 @@ impl DynamicTuner {
             warn!(error = %e, key = %update.key, "Failed publishing dynamic config update");
         }
     }
+
+    async fn persist_runtime_state(
+        &self,
+        status: &str,
+        reason: &str,
+        metrics: Option<&TuningMetrics>,
+    ) {
+        let metrics_json =
+            metrics.map(|m| serde_json::to_value(m).unwrap_or(serde_json::json!({})));
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO dynamic_tuner_state (
+                singleton, last_run_at, last_run_status, last_run_reason, last_metrics
+            )
+            VALUES (TRUE, NOW(), $1, $2, $3)
+            ON CONFLICT (singleton) DO UPDATE
+            SET last_run_at = EXCLUDED.last_run_at,
+                last_run_status = EXCLUDED.last_run_status,
+                last_run_reason = EXCLUDED.last_run_reason,
+                last_metrics = EXCLUDED.last_metrics
+            "#,
+        )
+        .bind(status)
+        .bind(reason)
+        .bind(metrics_json)
+        .execute(&self.pool)
+        .await
+        {
+            warn!(error = %e, "Failed persisting dynamic tuner runtime state");
+        }
+    }
 }
 
 /// Subscribes to dynamic config updates and applies them to local API runtime.
 pub fn spawn_dynamic_config_subscriber(
     redis_url: String,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
+    pool: PgPool,
 ) {
     tokio::spawn(async move {
         loop {
             if let Err(e) =
-                run_dynamic_config_subscriber(redis_url.as_str(), copy_trader.clone()).await
+                run_dynamic_config_subscriber(redis_url.as_str(), copy_trader.clone(), pool.clone())
+                    .await
             {
                 error!(error = %e, "Dynamic config subscriber failed, retrying");
                 tokio::time::sleep(TokioDuration::from_secs(5)).await;
@@ -903,7 +986,16 @@ pub fn spawn_dynamic_config_subscriber(
 async fn run_dynamic_config_subscriber(
     redis_url: &str,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
+    pool: PgPool,
 ) -> anyhow::Result<()> {
+    let allowed_sources = load_allowed_update_sources();
+    let bounds = load_dynamic_bounds(&pool).await;
+    if let Some(ref trader) = copy_trader {
+        if let Err(e) = apply_startup_snapshot_to_copy_trader(&pool, trader, &bounds).await {
+            warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
+        }
+    }
+
     let client = redis::Client::open(redis_url)?;
     let conn = client.get_async_connection().await?;
     let mut pubsub = conn.into_pubsub();
@@ -924,13 +1016,37 @@ async fn run_dynamic_config_subscriber(
             }
         };
 
-        let update: DynamicConfigUpdate = match serde_json::from_str(&payload) {
+        let mut update: DynamicConfigUpdate = match serde_json::from_str(&payload) {
             Ok(update) => update,
             Err(e) => {
                 warn!(error = %e, payload = %payload, "Failed parsing dynamic config update");
                 continue;
             }
         };
+
+        if !source_allowed(&update.source, &allowed_sources) {
+            warn!(
+                source = %update.source,
+                key = %update.key,
+                "Ignoring dynamic config update from unauthorized source"
+            );
+            continue;
+        }
+
+        let Some(validated) = clamp_dynamic_value(&update.key, update.value, &bounds) else {
+            warn!(key = %update.key, "Ignoring dynamic config update for unsupported key");
+            continue;
+        };
+        if validated != update.value {
+            warn!(
+                key = %update.key,
+                source = %update.source,
+                old = %update.value,
+                new = %validated,
+                "Clamped dynamic config update to allowed bounds"
+            );
+        }
+        update.value = validated;
 
         if let Some(ref trader) = copy_trader {
             if apply_to_copy_trader(trader, &update).await {
@@ -963,6 +1079,140 @@ async fn apply_to_copy_trader(
             true
         }
         _ => false,
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicBoundsRow {
+    key: String,
+    min_value: Decimal,
+    max_value: Decimal,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DynamicValueRow {
+    key: String,
+    current_value: Decimal,
+}
+
+async fn load_dynamic_bounds(pool: &PgPool) -> HashMap<String, (Decimal, Decimal)> {
+    let rows: Vec<DynamicBoundsRow> = match sqlx::query_as(
+        r#"
+        SELECT key, min_value, max_value
+        FROM dynamic_config
+        WHERE enabled = TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "Failed loading dynamic config bounds; using fallback bounds");
+            return fallback_dynamic_bounds();
+        }
+    };
+
+    if rows.is_empty() {
+        fallback_dynamic_bounds()
+    } else {
+        rows.into_iter()
+            .map(|row| (row.key, (row.min_value, row.max_value)))
+            .collect()
+    }
+}
+
+async fn apply_startup_snapshot_to_copy_trader(
+    pool: &PgPool,
+    copy_trader: &Arc<RwLock<CopyTrader>>,
+    bounds: &HashMap<String, (Decimal, Decimal)>,
+) -> anyhow::Result<()> {
+    let rows: Vec<DynamicValueRow> = sqlx::query_as(
+        r#"
+        SELECT key, current_value
+        FROM dynamic_config
+        WHERE enabled = TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut applied = 0usize;
+    for row in rows {
+        let Some(value) = clamp_dynamic_value(&row.key, row.current_value, bounds) else {
+            continue;
+        };
+        let update = DynamicConfigUpdate {
+            key: row.key,
+            value,
+            reason: "startup snapshot".to_string(),
+            source: "dynamic_tuner_sync".to_string(),
+            timestamp: Utc::now(),
+            metrics: serde_json::json!({ "sync": "subscriber_bootstrap" }),
+        };
+        if apply_to_copy_trader(copy_trader, &update).await {
+            applied += 1;
+        }
+    }
+
+    info!(
+        applied,
+        "Applied startup dynamic config snapshot to copy trader"
+    );
+    Ok(())
+}
+
+fn load_allowed_update_sources() -> Vec<String> {
+    std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
+        .unwrap_or_else(|_| "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn source_allowed(source: &str, allowed: &[String]) -> bool {
+    if source.is_empty() {
+        return false;
+    }
+    allowed.iter().any(|entry| entry == source)
+}
+
+fn clamp_dynamic_value(
+    key: &str,
+    value: Decimal,
+    bounds: &HashMap<String, (Decimal, Decimal)>,
+) -> Option<Decimal> {
+    let (min, max) = bounds
+        .get(key)
+        .cloned()
+        .or_else(|| fallback_bounds_for_key(key))?;
+    Some(value.max(min).min(max))
+}
+
+fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
+    let mut map = HashMap::new();
+    for key in [
+        KEY_COPY_MIN_TRADE_VALUE,
+        KEY_COPY_MAX_SLIPPAGE_PCT,
+        KEY_ARB_MIN_PROFIT_THRESHOLD,
+        KEY_ARB_MONITOR_MAX_MARKETS,
+    ] {
+        if let Some(bounds) = fallback_bounds_for_key(key) {
+            map.insert(key.to_string(), bounds);
+        }
+    }
+    map
+}
+
+fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
+    match key {
+        KEY_COPY_MIN_TRADE_VALUE => Some((Decimal::new(2, 0), Decimal::new(50, 0))),
+        KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(5, 2))),
+        KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
+        KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
+        _ => None,
     }
 }
 

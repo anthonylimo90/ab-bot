@@ -20,6 +20,12 @@ pub struct ActivityResponse {
     pub activity_type: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pnl: Option<Decimal>,
     pub created_at: DateTime<Utc>,
 }
@@ -49,6 +55,8 @@ struct ActivityRow {
     copy_price: Option<Decimal>,
     copy_quantity: Option<Decimal>,
     slippage: Option<Decimal>,
+    skip_reason: Option<String>,
+    error_message: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -72,7 +80,7 @@ pub async fn list_activity(
         SELECT
             id, status, source_wallet, source_market_id,
             source_direction, copy_price, copy_quantity,
-            slippage, created_at
+            slippage, skip_reason, error_message, created_at
         FROM copy_trade_history
         ORDER BY created_at DESC
         LIMIT $1 OFFSET $2
@@ -91,6 +99,8 @@ pub async fn list_activity(
             } else {
                 "sell"
             };
+            let skip_reason = row.skip_reason.clone();
+            let error_message = row.error_message.clone();
             let market_short = if row.source_market_id.len() > 20 {
                 format!("{}...", &row.source_market_id[..20])
             } else {
@@ -117,19 +127,27 @@ pub async fn list_activity(
                 3 => (
                     "TRADE_COPY_SKIPPED".to_string(),
                     format!(
-                        "Skipped {} {} from {}",
+                        "Skipped {} {} from {}{}",
                         direction,
                         market_short,
-                        &row.source_wallet[..8.min(row.source_wallet.len())]
+                        &row.source_wallet[..8.min(row.source_wallet.len())],
+                        skip_reason
+                            .as_ref()
+                            .map(|reason| format!(" ({reason})"))
+                            .unwrap_or_default()
                     ),
                 ),
                 4 => (
                     "TRADE_COPY_FAILED".to_string(),
                     format!(
-                        "Failed {} {} from {}",
+                        "Failed {} {} from {}{}",
                         direction,
                         market_short,
-                        &row.source_wallet[..8.min(row.source_wallet.len())]
+                        &row.source_wallet[..8.min(row.source_wallet.len())],
+                        error_message
+                            .as_ref()
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
                     ),
                 ),
                 _ => (
@@ -144,11 +162,21 @@ pub async fn list_activity(
             };
 
             let pnl = row.slippage.filter(|s| *s != Decimal::ZERO);
+            let details = Some(serde_json::json!({
+                "source_wallet": row.source_wallet,
+                "source_market_id": row.source_market_id,
+                "direction": direction,
+                "skip_reason": skip_reason.clone(),
+                "error_message": error_message.clone(),
+            }));
 
             ActivityResponse {
                 id: row.id.to_string(),
                 activity_type,
                 message,
+                skip_reason,
+                error_message,
+                details,
                 pnl,
                 created_at: row.created_at,
             }

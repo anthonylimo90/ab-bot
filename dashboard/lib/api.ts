@@ -46,6 +46,8 @@ import type {
   OptimizerStatus,
   OptimizationResult,
   ServiceStatus,
+  DynamicTunerStatus,
+  DynamicConfigHistoryEntry,
   Activity,
   RiskStatus,
   CircuitBreakerStatus,
@@ -714,6 +716,28 @@ class ApiClient {
   async getServiceStatus(workspaceId: string): Promise<ServiceStatus> {
     return this.request<ServiceStatus>(
       `/api/v1/workspaces/${workspaceId}/service-status`,
+    );
+  }
+
+  async getDynamicTunerStatus(workspaceId: string): Promise<DynamicTunerStatus> {
+    return this.request<DynamicTunerStatus>(
+      `/api/v1/workspaces/${workspaceId}/dynamic-tuning/status`,
+    );
+  }
+
+  async getDynamicTuningHistory(
+    workspaceId: string,
+    params?: {
+      limit?: number;
+      offset?: number;
+    },
+  ): Promise<DynamicConfigHistoryEntry[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.set("limit", String(params.limit));
+    if (params?.offset) searchParams.set("offset", String(params.offset));
+    const query = searchParams.toString();
+    return this.request<DynamicConfigHistoryEntry[]>(
+      `/api/v1/workspaces/${workspaceId}/dynamic-tuning/history${query ? `?${query}` : ""}`,
     );
   }
 

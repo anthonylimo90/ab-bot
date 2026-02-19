@@ -26,6 +26,7 @@ import {
   Ban,
   Bot,
   CheckCircle,
+  Gauge,
   History,
   Info,
   Play,
@@ -133,6 +134,13 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     queryFn: () => api.listBans(),
     enabled: hasWorkspace,
     staleTime: 30 * 1000,
+  });
+  const { data: dynamicTunerStatus, isLoading: isTunerLoading } = useQuery({
+    queryKey: ['dynamic-tuner-status', workspaceId],
+    queryFn: () => api.getDynamicTunerStatus(workspaceId),
+    enabled: hasWorkspace,
+    staleTime: 15 * 1000,
+    refetchInterval: 30 * 1000,
   });
   const bans = bansData?.bans ?? [];
 
@@ -315,10 +323,14 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="settings">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="settings" className="text-xs">
               <Settings className="mr-1 h-3 w-3" />
               Settings
+            </TabsTrigger>
+            <TabsTrigger value="tuner" className="text-xs">
+              <Gauge className="mr-1 h-3 w-3" />
+              Tuner
             </TabsTrigger>
             <TabsTrigger value="history" className="text-xs">
               <History className="mr-1 h-3 w-3" />
@@ -489,6 +501,67 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                     )}
                     Save Settings
                   </Button>
+                </div>
+              </>
+            )}
+          </TabsContent>
+
+          <TabsContent value="tuner" className="mt-4 space-y-3">
+            {!hasWorkspace || isTunerLoading || !dynamicTunerStatus ? (
+              <div className="rounded-lg border bg-background/50 p-4 text-sm text-muted-foreground">
+                Loading dynamic tuner status...
+              </div>
+            ) : (
+              <>
+                <div className="rounded-lg border bg-background/50 p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={dynamicTunerStatus.enabled ? 'default' : 'secondary'}>
+                      {dynamicTunerStatus.enabled ? 'Enabled' : 'Disabled'}
+                    </Badge>
+                    <Badge variant="outline">
+                      {dynamicTunerStatus.mode === 'apply' ? 'Apply mode' : 'Shadow mode'}
+                    </Badge>
+                    <Badge variant="outline">Regime: {dynamicTunerStatus.current_regime}</Badge>
+                    <Badge variant={dynamicTunerStatus.frozen ? 'destructive' : 'secondary'}>
+                      {dynamicTunerStatus.frozen ? 'Frozen' : 'Active'}
+                    </Badge>
+                  </div>
+                  <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                    <div>
+                      Last run:{' '}
+                      {dynamicTunerStatus.last_run_at
+                        ? formatDistanceToNow(new Date(dynamicTunerStatus.last_run_at), {
+                            addSuffix: true,
+                          })
+                        : 'not recorded'}
+                    </div>
+                    <div>
+                      Last change:{' '}
+                      {dynamicTunerStatus.last_change_at
+                        ? formatDistanceToNow(new Date(dynamicTunerStatus.last_change_at), {
+                            addSuffix: true,
+                          })
+                        : 'none'}
+                    </div>
+                  </div>
+                  {dynamicTunerStatus.freeze_reason && (
+                    <p className="mt-2 text-xs text-red-500">{dynamicTunerStatus.freeze_reason}</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border bg-background/50 p-4">
+                  <p className="mb-2 text-sm font-medium">Current Dynamic Config</p>
+                  <div className="space-y-2">
+                    {dynamicTunerStatus.dynamic_config.map((entry) => (
+                      <div
+                        key={entry.key}
+                        className="flex items-center justify-between rounded border border-border/50 px-3 py-2 text-sm"
+                      >
+                        <span className="font-mono text-xs">{entry.key}</span>
+                        <span className="font-medium tabular-nums">{entry.current_value.toFixed(4)}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </>
             )}

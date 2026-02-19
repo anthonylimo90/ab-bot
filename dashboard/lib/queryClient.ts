@@ -128,6 +128,14 @@ export const queryKeys = {
       [...queryKeys.risk.all(), "status", workspaceId] as const,
   },
 
+  dynamicTuning: {
+    all: () => ["dynamic-tuning"] as const,
+    status: (workspaceId: string) =>
+      [...queryKeys.dynamicTuning.all(), "status", workspaceId] as const,
+    history: (workspaceId: string, params?: { limit?: number; offset?: number }) =>
+      [...queryKeys.dynamicTuning.all(), "history", workspaceId, params] as const,
+  },
+
   // Rotation history
   rotationHistory: {
     all: () => ["rotation-history"] as const,

@@ -347,9 +347,10 @@ impl ApiServer {
         tokio::spawn(tuner.start());
 
         // Subscribe local runtime to dynamic updates (copy-trader knobs)
-        let redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        spawn_dynamic_config_subscriber(redis_url, state.copy_trader.clone());
+        let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        spawn_dynamic_config_subscriber(redis_url, state.copy_trader.clone(), state.pool.clone());
 
         // Spawn wallet harvester (discovers wallets from CLOB trades)
         let harvester_config = WalletHarvesterConfig::from_env();
