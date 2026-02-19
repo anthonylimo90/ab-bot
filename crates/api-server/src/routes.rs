@@ -99,6 +99,7 @@ use crate::websocket;
         workspaces::get_optimizer_status,
         workspaces::get_service_status,
         workspaces::get_dynamic_tuner_status,
+        workspaces::update_opportunity_selection_settings,
         workspaces::get_dynamic_tuning_history,
         // Invites
         invites::list_invites,
@@ -676,6 +677,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id",
             put(workspaces::update_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/opportunity-selection",
+            put(workspaces::update_opportunity_selection_settings),
         )
         .layer(GovernorLayer {
             config: Arc::new(config_rate_limit_config),

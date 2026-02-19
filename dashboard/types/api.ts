@@ -818,6 +818,11 @@ export interface UpdateWorkspaceRequest {
   live_trading_enabled?: boolean;
 }
 
+export interface UpdateOpportunitySelectionRequest {
+  aggressiveness?: "stable" | "balanced" | "discovery";
+  exploration_slots?: number;
+}
+
 export interface CreateInviteRequest {
   email: string;
   role: WorkspaceRole;
@@ -1035,6 +1040,37 @@ export interface DynamicSignalThresholds {
   trading_fee_pct: number;
 }
 
+export interface ScannerMarketInsight {
+  market_id: string;
+  tier: "core" | "exploration" | string;
+  total_score: number;
+  baseline_score: number;
+  opportunity_score: number;
+  hit_rate_score: number;
+  freshness_score: number;
+  sticky_score: number;
+  novelty_score: number | null;
+  rotation_score: number | null;
+  upside_score: number | null;
+}
+
+export interface ScannerStatus {
+  monitored_markets: number;
+  core_markets: number;
+  exploration_markets: number;
+  last_rerank_at: string | null;
+  last_resubscribe_at: string | null;
+  selected_markets: ScannerMarketInsight[];
+}
+
+export interface OpportunitySelectionStatus {
+  aggressiveness: "stable" | "balanced" | "discovery" | string;
+  aggressiveness_level: number;
+  exploration_slots: number;
+  max_markets_cap: number;
+  recommendation: string;
+}
+
 export interface DynamicTunerStatus {
   enabled: boolean;
   apply_changes: boolean;
@@ -1052,6 +1088,8 @@ export interface DynamicTunerStatus {
   last_change_reason: string | null;
   last_change_key: string | null;
   signal_thresholds: DynamicSignalThresholds;
+  opportunity_selection: OpportunitySelectionStatus;
+  scanner_status: ScannerStatus;
   dynamic_config: DynamicConfigItem[];
 }
 

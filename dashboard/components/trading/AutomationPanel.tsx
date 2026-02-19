@@ -55,6 +55,12 @@ interface AutomationPanelProps {
 }
 
 type RiskPreset = 'conservative' | 'balanced' | 'aggressive';
+type OpportunityAggressiveness = 'stable' | 'balanced' | 'discovery';
+
+interface OpportunitySelectionDraft {
+  aggressiveness: OpportunityAggressiveness;
+  exploration_slots: number;
+}
 
 const RISK_PRESETS: Record<
   RiskPreset,
@@ -99,6 +105,27 @@ const RISK_PRESETS: Record<
       min_win_rate: 45,
       min_trades_30d: 5,
     },
+  },
+};
+
+const OPPORTUNITY_PRESETS: Record<
+  OpportunityAggressiveness,
+  { label: string; description: string; defaultExplorationSlots: number }
+> = {
+  stable: {
+    label: 'Stable',
+    description: 'Prioritize consistency and lower rotation churn.',
+    defaultExplorationSlots: 2,
+  },
+  balanced: {
+    label: 'Balanced',
+    description: 'Mix steady execution with measured discovery.',
+    defaultExplorationSlots: 5,
+  },
+  discovery: {
+    label: 'Discovery',
+    description: 'Increase exploration to surface new opportunities faster.',
+    defaultExplorationSlots: 8,
   },
 };
 
@@ -165,6 +192,22 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       addToast({ type: 'error', title: 'Failed to save settings', description: error.message });
     },
   });
+  const saveOpportunitySelectionMutation = useMutation({
+    mutationFn: (selection: OpportunitySelectionDraft) =>
+      api.updateOpportunitySelection(workspaceId, selection),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dynamic-tuner-status', workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ['dynamic-tuning'] });
+      addToast({ type: 'success', title: 'Opportunity selection settings saved' });
+    },
+    onError: (error: Error) => {
+      addToast({
+        type: 'error',
+        title: 'Failed to save opportunity selection',
+        description: error.message,
+      });
+    },
+  });
   const unbanMutation = useMutation({
     mutationFn: (address: string) => api.unbanWallet(address),
     onSuccess: () => {
@@ -184,9 +227,13 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   }, [optimizerStatus]);
 
   const [settings, setSettings] = useState<OptimizationSettingsDraft | null>(null);
+  const [opportunitySettings, setOpportunitySettings] = useState<OpportunitySelectionDraft | null>(
+    null
+  );
 
   useEffect(() => {
     setSettings(null);
+    setOpportunitySettings(null);
   }, [workspaceId]);
 
   useEffect(() => {
@@ -196,6 +243,33 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     setSettings((current) => current ?? baselineSettings);
   }, [baselineSettings]);
 
+  const baselineOpportunitySettings = useMemo<OpportunitySelectionDraft | null>(() => {
+    if (!dynamicTunerStatus?.opportunity_selection) {
+      return null;
+    }
+
+    const rawAggressiveness = dynamicTunerStatus.opportunity_selection.aggressiveness;
+    const aggressiveness: OpportunityAggressiveness =
+      rawAggressiveness === 'stable' || rawAggressiveness === 'discovery'
+        ? rawAggressiveness
+        : 'balanced';
+
+    return {
+      aggressiveness,
+      exploration_slots: Math.max(
+        1,
+        Math.round(dynamicTunerStatus.opportunity_selection.exploration_slots || 1)
+      ),
+    };
+  }, [dynamicTunerStatus]);
+
+  useEffect(() => {
+    if (!baselineOpportunitySettings) {
+      return;
+    }
+    setOpportunitySettings((current) => current ?? baselineOpportunitySettings);
+  }, [baselineOpportunitySettings]);
+
   const hasUnsavedChanges = useMemo(() => {
     if (!settings || !baselineSettings) {
       return false;
@@ -203,8 +277,19 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     return JSON.stringify(settings) !== JSON.stringify(baselineSettings);
   }, [settings, baselineSettings]);
 
+  const hasOpportunityUnsavedChanges = useMemo(() => {
+    if (!opportunitySettings || !baselineOpportunitySettings) {
+      return false;
+    }
+    return JSON.stringify(opportunitySettings) !== JSON.stringify(baselineOpportunitySettings);
+  }, [opportunitySettings, baselineOpportunitySettings]);
+
   const updateSettings = (patch: Partial<OptimizationSettingsDraft>) => {
     setSettings((current) => (current ? { ...current, ...patch } : current));
+  };
+
+  const updateOpportunitySettings = (patch: Partial<OpportunitySelectionDraft>) => {
+    setOpportunitySettings((current) => (current ? { ...current, ...patch } : current));
   };
 
   const applyPreset = (preset: RiskPreset) => {
@@ -222,6 +307,26 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       return;
     }
     saveSettingsMutation.mutate(settings);
+  };
+
+  const applyOpportunityPresetDefaults = () => {
+    if (!opportunitySettings) {
+      return;
+    }
+    const preset = OPPORTUNITY_PRESETS[opportunitySettings.aggressiveness];
+    updateOpportunitySettings({ exploration_slots: preset.defaultExplorationSlots });
+    addToast({
+      type: 'info',
+      title: 'Applied recommended defaults',
+      description: `${preset.label}: ${preset.defaultExplorationSlots} exploration slots`,
+    });
+  };
+
+  const handleSaveOpportunitySettings = () => {
+    if (!hasWorkspace || !opportunitySettings) {
+      return;
+    }
+    saveOpportunitySelectionMutation.mutate(opportunitySettings);
   };
 
   const handleTriggerOptimization = async () => {
@@ -262,6 +367,14 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   const handleUnban = (address: string) => {
     unbanMutation.mutate(address);
   };
+
+  const maxMarketsCap = dynamicTunerStatus?.opportunity_selection?.max_markets_cap ?? 0;
+  const explorationRatio = useMemo(() => {
+    if (!opportunitySettings || maxMarketsCap <= 0) {
+      return 0;
+    }
+    return opportunitySettings.exploration_slots / maxMarketsCap;
+  }, [opportunitySettings, maxMarketsCap]);
 
   const getActionIcon = (action: string) => {
     switch (action) {
@@ -515,6 +628,155 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
             ) : (
               <>
                 <div className="rounded-lg border bg-background/50 p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-medium">Opportunity Selection</p>
+                    <Badge variant="outline">
+                      Profile: {dynamicTunerStatus.opportunity_selection.aggressiveness}
+                    </Badge>
+                  </div>
+                  {!opportunitySettings ? (
+                    <p className="text-sm text-muted-foreground">Loading opportunity settings...</p>
+                  ) : (
+                    <>
+                      <div className="grid gap-2 md:grid-cols-3">
+                        {(Object.keys(OPPORTUNITY_PRESETS) as OpportunityAggressiveness[]).map(
+                          (aggressiveness) => (
+                            <Button
+                              key={aggressiveness}
+                              type="button"
+                              size="sm"
+                              variant={
+                                opportunitySettings.aggressiveness === aggressiveness
+                                  ? 'default'
+                                  : 'outline'
+                              }
+                              className="h-auto justify-start py-2 text-left"
+                              onClick={() => updateOpportunitySettings({ aggressiveness })}
+                            >
+                              <span className="block text-sm font-medium">
+                                {OPPORTUNITY_PRESETS[aggressiveness].label}
+                              </span>
+                            </Button>
+                          )
+                        )}
+                      </div>
+
+                      <div className="mt-3 space-y-1.5">
+                        <Label htmlFor="exploration-slots">Exploration Slots</Label>
+                        <Input
+                          id="exploration-slots"
+                          type="number"
+                          min={1}
+                          max={500}
+                          value={opportunitySettings.exploration_slots}
+                          onChange={(event) => {
+                            const next = Number(event.target.value);
+                            if (!Number.isFinite(next)) {
+                              return;
+                            }
+                            updateOpportunitySettings({
+                              exploration_slots: clamp(Math.round(next), 1, 500),
+                            });
+                          }}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          {dynamicTunerStatus.opportunity_selection.recommendation}
+                        </p>
+                      </div>
+
+                      <div className="mt-3 grid gap-2 text-xs md:grid-cols-2">
+                        <Badge variant="outline" className="justify-start">
+                          Max monitored markets: {dynamicTunerStatus.opportunity_selection.max_markets_cap}
+                        </Badge>
+                        <Badge variant="outline" className="justify-start">
+                          Exploration ratio: {(explorationRatio * 100).toFixed(0)}%
+                        </Badge>
+                      </div>
+
+                      {maxMarketsCap > 0 &&
+                        opportunitySettings.exploration_slots >= maxMarketsCap && (
+                          <p className="mt-2 text-xs text-red-500">
+                            Exploration slots must stay below monitored market capacity ({maxMarketsCap}).
+                          </p>
+                        )}
+                      {maxMarketsCap > 0 && explorationRatio > 0.6 && explorationRatio < 1 && (
+                        <p className="mt-2 text-xs text-yellow-600">
+                          High discovery mode: this can increase opportunity churn and resubscribe frequency.
+                        </p>
+                      )}
+
+                      <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:justify-end">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={applyOpportunityPresetDefaults}
+                        >
+                          Use Recommended Defaults
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={handleSaveOpportunitySettings}
+                          disabled={
+                            !hasOpportunityUnsavedChanges ||
+                            saveOpportunitySelectionMutation.isPending ||
+                            (maxMarketsCap > 0 &&
+                              opportunitySettings.exploration_slots >= maxMarketsCap)
+                          }
+                        >
+                          {saveOpportunitySelectionMutation.isPending ? (
+                            <RotateCcw className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <Save className="mr-2 h-4 w-4" />
+                          )}
+                          Save Opportunity Settings
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <div className="rounded-lg border bg-background/50 p-4">
+                  <p className="mb-2 text-sm font-medium">Scanner Runtime</p>
+                  <div className="grid gap-2 text-sm md:grid-cols-3">
+                    <div className="rounded border border-border/50 px-3 py-2">
+                      <p className="text-xs text-muted-foreground">Monitored</p>
+                      <p className="font-semibold">{dynamicTunerStatus.scanner_status.monitored_markets}</p>
+                    </div>
+                    <div className="rounded border border-border/50 px-3 py-2">
+                      <p className="text-xs text-muted-foreground">Core</p>
+                      <p className="font-semibold">{dynamicTunerStatus.scanner_status.core_markets}</p>
+                    </div>
+                    <div className="rounded border border-border/50 px-3 py-2">
+                      <p className="text-xs text-muted-foreground">Exploration</p>
+                      <p className="font-semibold">{dynamicTunerStatus.scanner_status.exploration_markets}</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                    <div>
+                      Last re-rank:{' '}
+                      {dynamicTunerStatus.scanner_status.last_rerank_at
+                        ? formatDistanceToNow(new Date(dynamicTunerStatus.scanner_status.last_rerank_at), {
+                            addSuffix: true,
+                          })
+                        : 'not recorded'}
+                    </div>
+                    <div>
+                      Last resubscribe:{' '}
+                      {dynamicTunerStatus.scanner_status.last_resubscribe_at
+                        ? formatDistanceToNow(
+                            new Date(dynamicTunerStatus.scanner_status.last_resubscribe_at),
+                            {
+                              addSuffix: true,
+                            }
+                          )
+                        : 'not recorded'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border bg-background/50 p-4">
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge variant={dynamicTunerStatus.enabled ? 'default' : 'secondary'}>
                       {dynamicTunerStatus.enabled ? 'Enabled' : 'Disabled'}
@@ -547,6 +809,48 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                   </div>
                   {dynamicTunerStatus.freeze_reason && (
                     <p className="mt-2 text-xs text-red-500">{dynamicTunerStatus.freeze_reason}</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border bg-background/50 p-4">
+                  <p className="mb-2 text-sm font-medium">Why Markets Were Selected</p>
+                  {dynamicTunerStatus.scanner_status.selected_markets.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      No live selection snapshot available yet.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {dynamicTunerStatus.scanner_status.selected_markets.map((market) => (
+                        <div
+                          key={`${market.market_id}-${market.tier}`}
+                          className="rounded border border-border/50 px-3 py-2 text-xs"
+                        >
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <span className="font-mono break-all">{market.market_id}</span>
+                            <Badge variant={market.tier === 'exploration' ? 'secondary' : 'outline'}>
+                              {market.tier}
+                            </Badge>
+                          </div>
+                          <div className="grid gap-1 text-muted-foreground md:grid-cols-3">
+                            <span>Total: {market.total_score.toFixed(2)}</span>
+                            <span>Baseline: {market.baseline_score.toFixed(2)}</span>
+                            <span>Opportunity: {market.opportunity_score.toFixed(2)}</span>
+                            <span>Hit-rate: {market.hit_rate_score.toFixed(2)}</span>
+                            <span>Freshness: {market.freshness_score.toFixed(2)}</span>
+                            <span>Sticky: {market.sticky_score.toFixed(2)}</span>
+                            {market.novelty_score != null && (
+                              <span>Novelty: {market.novelty_score.toFixed(2)}</span>
+                            )}
+                            {market.rotation_score != null && (
+                              <span>Rotation: {market.rotation_score.toFixed(2)}</span>
+                            )}
+                            {market.upside_score != null && (
+                              <span>Upside: {market.upside_score.toFixed(2)}</span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
 

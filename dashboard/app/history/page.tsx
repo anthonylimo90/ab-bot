@@ -74,6 +74,33 @@ function metricValue(metrics: Record<string, unknown> | null | undefined, key: s
   return raw.toFixed(4);
 }
 
+function formatDynamicKey(key: string | null): string {
+  if (!key) return "(global)";
+  if (key === "ARB_MONITOR_AGGRESSIVENESS_LEVEL") return "Opportunity Aggressiveness";
+  if (key === "ARB_MONITOR_EXPLORATION_SLOTS") return "Exploration Slots";
+  if (key === "ARB_MONITOR_MAX_MARKETS") return "Max Monitored Markets";
+  if (key === "ARB_MIN_PROFIT_THRESHOLD") return "Min Net Profit Threshold";
+  return key;
+}
+
+function formatDynamicHistoryValue(key: string | null, value: number | null): string {
+  if (value === null) return "-";
+  if (key === "ARB_MONITOR_AGGRESSIVENESS_LEVEL") {
+    if (value <= 0.5) return "stable";
+    if (value >= 1.5) return "discovery";
+    return "balanced";
+  }
+  return formatDynamicValue(value);
+}
+
+function dynamicActionClass(action: string): string {
+  if (action === "manual_update") return "bg-blue-500/10 text-blue-600 border-blue-500/20";
+  if (action === "rollback") return "bg-yellow-500/10 text-yellow-700 border-yellow-500/20";
+  if (action === "applied") return "bg-green-500/10 text-green-700 border-green-500/20";
+  if (action === "recommended") return "bg-purple-500/10 text-purple-700 border-purple-500/20";
+  return "border-border";
+}
+
 export default function HistoryPage() {
   const { currentWorkspace } = useWorkspaceStore();
   const workspaceId = currentWorkspace?.id;
@@ -363,15 +390,21 @@ export default function HistoryPage() {
                           {dynamicHistory.map((entry) => (
                             <tr key={entry.id} className="border-b align-top hover:bg-muted/20">
                               <td className="p-3 font-mono text-xs">
-                                {entry.config_key ?? "(global)"}
+                                {formatDynamicKey(entry.config_key)}
                               </td>
                               <td className="p-3">
-                                <span className="rounded border px-2 py-0.5 text-xs">
+                                <span
+                                  className={cn(
+                                    "rounded border px-2 py-0.5 text-xs",
+                                    dynamicActionClass(entry.action),
+                                  )}
+                                >
                                   {entry.action}
                                 </span>
                               </td>
                               <td className="p-3 text-xs tabular-nums">
-                                {formatDynamicValue(entry.old_value)} → {formatDynamicValue(entry.new_value)}
+                                {formatDynamicHistoryValue(entry.config_key, entry.old_value)} →{" "}
+                                {formatDynamicHistoryValue(entry.config_key, entry.new_value)}
                               </td>
                               <td className="max-w-[280px] p-3 text-xs break-words">{entry.reason}</td>
                               <td className="p-3 text-xs text-muted-foreground">
