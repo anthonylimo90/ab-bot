@@ -169,10 +169,10 @@ impl ArbMonitor {
             }
         }
 
-        // Subscribe to the current active market subset.
+        // Subscribe to the current active market subset via token IDs.
         let mut updates = self
             .clob_client
-            .subscribe_orderbook(self.active_subscription_market_ids())
+            .subscribe_orderbook(self.active_subscription_asset_ids())
             .await?;
         let update_timeout_secs = std::env::var("ARB_UPDATE_TIMEOUT_SECS")
             .ok()
@@ -193,15 +193,15 @@ impl ArbMonitor {
 
         loop {
             if resubscribe_requested {
-                let target_markets = self.active_subscription_market_ids();
+                let target_assets = self.active_subscription_asset_ids();
                 info!(
-                    market_count = target_markets.len(),
+                    asset_count = target_assets.len(),
                     "Resubscribing orderbook stream after dynamic market-cap update"
                 );
                 loop {
                     match self
                         .clob_client
-                        .subscribe_orderbook(target_markets.clone())
+                        .subscribe_orderbook(target_assets.clone())
                         .await
                     {
                         Ok(new_updates) => {
@@ -250,7 +250,7 @@ impl ArbMonitor {
                             stalls_since_tick += 1;
                             warn!(timeout_secs = update_timeout_secs, "No orderbook updates received before timeout; reconnecting websocket subscription");
                             loop {
-                                match self.clob_client.subscribe_orderbook(self.active_subscription_market_ids()).await {
+                                match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
                                     Ok(new_updates) => {
                                         updates = new_updates;
                                         resets_since_tick += 1;
@@ -267,7 +267,7 @@ impl ArbMonitor {
                     }) else {
                         warn!("Orderbook update channel closed; reconnecting websocket subscription");
                         loop {
-                            match self.clob_client.subscribe_orderbook(self.active_subscription_market_ids()).await {
+                            match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
                                 Ok(new_updates) => {
                                     updates = new_updates;
                                     resets_since_tick += 1;
@@ -373,12 +373,19 @@ impl ArbMonitor {
         }
     }
 
-    fn active_subscription_market_ids(&self) -> Vec<String> {
-        self.all_market_ids
+    fn active_subscription_asset_ids(&self) -> Vec<String> {
+        let mut assets = HashSet::new();
+        for market_id in self
+            .all_market_ids
             .iter()
             .filter(|id| self.eligible_markets.contains(*id))
-            .cloned()
-            .collect()
+        {
+            if let Some((yes_id, no_id)) = self.market_outcomes.get(market_id) {
+                assets.insert(yes_id.clone());
+                assets.insert(no_id.clone());
+            }
+        }
+        assets.into_iter().collect()
     }
 
     /// Process an order book update.
