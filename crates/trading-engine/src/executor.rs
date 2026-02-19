@@ -777,6 +777,16 @@ impl OrderExecutor {
         };
 
         let fill_quantity = order.quantity.min(available);
+        if fill_quantity <= Decimal::ZERO {
+            return Ok(ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                "No available liquidity at best price".to_string(),
+            ));
+        }
+
         let fees = fill_quantity * price * self.config.fee_rate;
 
         info!(

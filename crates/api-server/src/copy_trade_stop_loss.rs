@@ -256,7 +256,7 @@ impl CopyStopLossMonitor {
                     outcome_prices.insert(key, PriceOutcome::Price(price));
                 }
                 Err(PriceFetchError::MarketNotFound) => {
-                    warn!(
+                    debug!(
                         market_id = %pos.market_id,
                         token_id = %token_id,
                         "Market/token not found on CLOB (404) — may be resolved or delisted"
@@ -290,7 +290,7 @@ impl CopyStopLossMonitor {
 
             // Time-based exit does not require a live price lookup.
             if hold_hours >= self.config.max_hold_hours {
-                warn!(
+                info!(
                     position_id = %pos.id,
                     market = %pos.market_id,
                     hold_hours = hold_hours,
@@ -342,7 +342,7 @@ impl CopyStopLossMonitor {
                     *strikes += 1;
 
                     if *strikes >= MAX_NOT_FOUND_STRIKES {
-                        warn!(
+                        info!(
                             position_id = %pos.id,
                             market = %pos.market_id,
                             strikes = *strikes,
@@ -472,6 +472,23 @@ impl CopyStopLossMonitor {
 
         debug_assert!(claimed);
 
+        // Terminal 404 path: market/token no longer exists on CLOB.
+        // Also guard against zero-sized positions, which cannot be sold.
+        if reason == "market_resolved" || pos.quantity <= Decimal::ZERO {
+            if pos.quantity <= Decimal::ZERO {
+                info!(
+                    position_id = %pos.id,
+                    quantity = %pos.quantity,
+                    reason = reason,
+                    "Closing copy position without exit order due to non-positive quantity"
+                );
+            }
+
+            self.finalize_position_without_order(pos, reason, Decimal::ZERO)
+                .await;
+            return;
+        }
+
         // Place sell order
         let order = MarketOrder::new(
             pos.market_id.clone(),
@@ -561,6 +578,62 @@ impl CopyStopLossMonitor {
                     .await;
             }
         }
+    }
+
+    /// Finalize a position closure when an on-chain exit order cannot be placed.
+    async fn finalize_position_without_order(
+        &self,
+        pos: &CopyPosition,
+        reason: &str,
+        realized_pnl: Decimal,
+    ) {
+        // Mark as closed in DB.
+        if let Err(e) = sqlx::query(
+            "UPDATE positions SET realized_pnl = $1, exit_timestamp = NOW(), state = 4 WHERE id = $2",
+        )
+        .bind(realized_pnl)
+        .bind(pos.id)
+        .execute(&self.pool)
+        .await
+        {
+            error!(
+                error = %e,
+                position_id = %pos.id,
+                "Failed to finalize position closure without order"
+            );
+            return;
+        }
+
+        // Keep CopyTrader open-position accounting accurate.
+        {
+            let mut ct = self.copy_trader.write().await;
+            ct.record_position_closed();
+        }
+
+        info!(
+            position_id = %pos.id,
+            reason = reason,
+            realized_pnl = %realized_pnl,
+            "Copy trade position closed without exit order"
+        );
+
+        let signal = SignalUpdate {
+            signal_id: uuid::Uuid::new_v4(),
+            signal_type: SignalType::CopyTrade,
+            market_id: pos.market_id.clone(),
+            outcome_id: pos.orderbook_token_id().to_string(),
+            action: "closed".to_string(),
+            confidence: 1.0,
+            timestamp: Utc::now(),
+            metadata: serde_json::json!({
+                "position_id": pos.id.to_string(),
+                "reason": reason,
+                "realized_pnl": realized_pnl.to_string(),
+                "entry_price": pos.entry_price.to_string(),
+                "exit_price": null,
+            }),
+        };
+        let _ = self.signal_tx.send(signal);
     }
 
     /// Load open copy trade positions from the database.

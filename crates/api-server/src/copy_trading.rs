@@ -157,13 +157,70 @@ impl CopyTradingMonitor {
         let _ = self.signal_tx.send(signal);
     }
 
+    /// Persist skipped/failed outcomes for observability and tuning metrics.
+    async fn record_trade_outcome(
+        &self,
+        trade: &WalletTrade,
+        status: i16,
+        skip_reason: Option<&str>,
+        error_message: Option<&str>,
+    ) {
+        let direction_i16: i16 = match trade.direction {
+            TradeDirection::Buy => 0,
+            TradeDirection::Sell => 1,
+        };
+
+        let allocation_pct = {
+            let ct = self.copy_trader.read().await;
+            ct.get_tracked_wallet(&trade.wallet_address)
+                .map(|w| w.allocation_pct)
+                .unwrap_or(Decimal::ZERO)
+        };
+
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO copy_trade_history (
+                source_wallet, source_tx_hash,
+                source_market_id, source_token_id, source_direction,
+                source_price, source_quantity, source_timestamp,
+                allocation_pct, status, skip_reason, error_message
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12
+            )
+            "#,
+        )
+        .bind(&trade.wallet_address)
+        .bind(&trade.tx_hash)
+        .bind(&trade.market_id)
+        .bind(&trade.token_id)
+        .bind(direction_i16)
+        .bind(trade.price)
+        .bind(trade.quantity)
+        .bind(trade.timestamp)
+        .bind(allocation_pct)
+        .bind(status)
+        .bind(skip_reason)
+        .bind(error_message)
+        .execute(&self.pool)
+        .await
+        {
+            warn!(error = %e, "Failed to persist copy trade outcome");
+        }
+    }
+
     async fn process_trade(&self, trade: WalletTrade) -> anyhow::Result<()> {
+        let policy_min_trade_value = {
+            let copy_trader = self.copy_trader.read().await;
+            copy_trader.policy().min_trade_value
+        };
+
         // Check minimum trade value
-        if trade.value < self.config.min_trade_value {
+        if trade.value < policy_min_trade_value {
             debug!(
                 wallet = %trade.wallet_address,
                 value = %trade.value,
-                min = %self.config.min_trade_value,
+                min = %policy_min_trade_value,
                 "Trade below minimum value, skipping"
             );
             self.publish_skip_signal(
@@ -171,9 +228,16 @@ impl CopyTradingMonitor {
                 "below_minimum",
                 &format!(
                     "Trade value ${} below minimum ${}",
-                    trade.value, self.config.min_trade_value
+                    trade.value, policy_min_trade_value
                 ),
             );
+            self.record_trade_outcome(
+                &trade,
+                3,
+                Some("below_minimum"),
+                Some("Trade value below minimum"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -195,6 +259,13 @@ impl CopyTradingMonitor {
                     latency, self.config.max_latency_secs
                 ),
             );
+            self.record_trade_outcome(
+                &trade,
+                3,
+                Some("too_stale"),
+                Some("Trade exceeded max latency"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -209,6 +280,13 @@ impl CopyTradingMonitor {
                 "circuit_breaker",
                 "Circuit breaker is tripped — all trading halted",
             );
+            self.record_trade_outcome(
+                &trade,
+                3,
+                Some("circuit_breaker"),
+                Some("Circuit breaker is tripped"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -243,6 +321,8 @@ impl CopyTradingMonitor {
                     "Copy trade rejected by policy"
                 );
                 self.publish_skip_signal(&trade, skip_type, &reason);
+                self.record_trade_outcome(&trade, 3, Some(skip_type), Some(&reason))
+                    .await;
                 return Ok(());
             }
         }
@@ -301,7 +381,30 @@ impl CopyTradingMonitor {
 
         match result {
             Ok(Some(report)) => {
+                if !report.is_success() {
+                    let err_msg = report
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "order rejected".to_string());
+                    warn!(
+                        wallet = %trade.wallet_address,
+                        market = %trade.market_id,
+                        order_id = %report.order_id,
+                        status = ?report.status,
+                        error = %err_msg,
+                        "Copy trade execution was rejected"
+                    );
+                    self.publish_failure_signal(
+                        &trade,
+                        &format!("Copy order rejected: {}", err_msg),
+                    );
+                    self.record_trade_outcome(&trade, 4, Some("order_rejected"), Some(&err_msg))
+                        .await;
+                    return Ok(());
+                }
+
                 let trade_value = report.filled_quantity * report.average_price;
+                let has_open_fill = report.filled_quantity > Decimal::ZERO;
 
                 info!(
                     wallet = %trade.wallet_address,
@@ -312,10 +415,30 @@ impl CopyTradingMonitor {
                     "Successfully copied trade"
                 );
 
-                // Record position opening with the copy trader for daily/position tracking
-                {
+                if has_open_fill {
+                    // Record position opening with the copy trader for daily/position tracking.
                     let mut ct = self.copy_trader.write().await;
                     ct.record_position_opened(trade_value);
+                } else {
+                    warn!(
+                        wallet = %trade.wallet_address,
+                        market = %trade.market_id,
+                        order_id = %report.order_id,
+                        filled_quantity = %report.filled_quantity,
+                        "Copy trade execution reported success with non-positive fill; treating as failed copy"
+                    );
+                    self.publish_failure_signal(
+                        &trade,
+                        "Copy order had non-positive fill quantity",
+                    );
+                    self.record_trade_outcome(
+                        &trade,
+                        4,
+                        Some("invalid_fill"),
+                        Some("Copy order had non-positive fill quantity"),
+                    )
+                    .await;
+                    return Ok(());
                 }
 
                 // Record in copy_trade_history
@@ -366,58 +489,60 @@ impl CopyTradingMonitor {
                     warn!(error = %e, "Failed to record copy trade history");
                 }
 
-                // Insert position for dashboard visibility
-                let position_id = uuid::Uuid::new_v4();
-                let side_str = match trade.direction {
-                    TradeDirection::Buy => "long",
-                    TradeDirection::Sell => "short",
-                };
-                let outcome_str = match trade.direction {
-                    TradeDirection::Buy => "yes",
-                    TradeDirection::Sell => "no",
-                };
+                // Insert position for dashboard visibility only when we actually hold size.
+                if has_open_fill {
+                    let position_id = uuid::Uuid::new_v4();
+                    let side_str = match trade.direction {
+                        TradeDirection::Buy => "long",
+                        TradeDirection::Sell => "short",
+                    };
+                    let outcome_str = match trade.direction {
+                        TradeDirection::Buy => "yes",
+                        TradeDirection::Sell => "no",
+                    };
 
-                if let Err(e) = sqlx::query(
-                    r#"
-                    INSERT INTO positions (
-                        id, market_id, outcome, side, quantity,
-                        entry_price, current_price, unrealized_pnl,
-                        is_copy_trade, source_wallet, is_open, opened_at,
-                        source_token_id,
-                        yes_entry_price, no_entry_price, entry_timestamp,
-                        exit_strategy, state, source
-                    ) VALUES (
-                        $1, $2, $3, $4, $5,
-                        $6, $6, 0,
-                        true, $7, true, NOW(),
-                        $8,
-                        $9, $10, NOW(),
-                        1, 1, 2
+                    if let Err(e) = sqlx::query(
+                        r#"
+                        INSERT INTO positions (
+                            id, market_id, outcome, side, quantity,
+                            entry_price, current_price, unrealized_pnl,
+                            is_copy_trade, source_wallet, is_open, opened_at,
+                            source_token_id,
+                            yes_entry_price, no_entry_price, entry_timestamp,
+                            exit_strategy, state, source
+                        ) VALUES (
+                            $1, $2, $3, $4, $5,
+                            $6, $6, 0,
+                            true, $7, true, NOW(),
+                            $8,
+                            $9, $10, NOW(),
+                            1, 1, 2
+                        )
+                        "#,
                     )
-                    "#,
-                )
-                .bind(position_id)
-                .bind(&trade.market_id)
-                .bind(outcome_str)
-                .bind(side_str)
-                .bind(report.filled_quantity)
-                .bind(report.average_price)
-                .bind(&trade.wallet_address)
-                .bind(&trade.token_id)
-                .bind(if side_str == "long" {
-                    report.average_price
-                } else {
-                    Decimal::ZERO
-                })
-                .bind(if side_str == "short" {
-                    report.average_price
-                } else {
-                    Decimal::ZERO
-                })
-                .execute(&self.pool)
-                .await
-                {
-                    warn!(error = %e, "Failed to insert copy trade position");
+                    .bind(position_id)
+                    .bind(&trade.market_id)
+                    .bind(outcome_str)
+                    .bind(side_str)
+                    .bind(report.filled_quantity)
+                    .bind(report.average_price)
+                    .bind(&trade.wallet_address)
+                    .bind(&trade.token_id)
+                    .bind(if side_str == "long" {
+                        report.average_price
+                    } else {
+                        Decimal::ZERO
+                    })
+                    .bind(if side_str == "short" {
+                        report.average_price
+                    } else {
+                        Decimal::ZERO
+                    })
+                    .execute(&self.pool)
+                    .await
+                    {
+                        warn!(error = %e, "Failed to insert copy trade position");
+                    }
                 }
 
                 // Insert execution report
@@ -478,6 +603,13 @@ impl CopyTradingMonitor {
                     "not_copied",
                     "Wallet not tracked, disabled, or trade filtered",
                 );
+                self.record_trade_outcome(
+                    &trade,
+                    3,
+                    Some("not_copied"),
+                    Some("Wallet not tracked, disabled, or trade filtered"),
+                )
+                .await;
             }
             Err(e) => {
                 error!(
@@ -486,6 +618,8 @@ impl CopyTradingMonitor {
                     "Failed to copy trade"
                 );
                 self.publish_failure_signal(&trade, &e.to_string());
+                self.record_trade_outcome(&trade, 4, Some("execution_error"), Some(&e.to_string()))
+                    .await;
             }
         }
 

@@ -225,6 +225,16 @@ impl CopyTrader {
         &self.policy
     }
 
+    /// Update the minimum trade value policy at runtime.
+    pub fn set_min_trade_value(&mut self, value: Decimal) {
+        self.policy.min_trade_value = value.max(Decimal::ZERO);
+    }
+
+    /// Update maximum slippage tolerance at runtime.
+    pub fn set_max_slippage_pct(&mut self, value: Decimal) {
+        self.policy.max_slippage_pct = value.max(Decimal::ZERO);
+    }
+
     /// Record that a copy position was opened (for position count tracking).
     pub fn record_position_opened(&mut self, capital_deployed: Decimal) {
         self.maybe_reset_daily();
@@ -465,6 +475,15 @@ impl CopyTrader {
                 wallet.last_copied_trade = Some(Utc::now());
                 wallet.total_copied_value += report.total_value();
             }
+        } else {
+            warn!(
+                wallet = %trade.wallet_address,
+                market = %trade.market_id,
+                order_id = %report.order_id,
+                status = ?report.status,
+                error = ?report.error_message,
+                "Copy order rejected by executor"
+            );
         }
 
         Ok(Some(report))

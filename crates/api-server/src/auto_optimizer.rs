@@ -1381,7 +1381,10 @@ impl AutoOptimizer {
                         0
                     )) AS recency_adjusted_roi,
                     -- Staleness: days since last data update
-                    EXTRACT(EPOCH FROM (NOW() - COALESCE(wsm.last_computed, wf.last_trade, NOW()))) / 86400.0 AS staleness_days
+                    (
+                        EXTRACT(EPOCH FROM (NOW() - COALESCE(wsm.last_computed, wf.last_trade, NOW())))
+                        / 86400.0
+                    )::FLOAT8 AS staleness_days
                 FROM wallet_success_metrics wsm
                 FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
                 WHERE COALESCE(wsm.address, wf.address) IS NOT NULL

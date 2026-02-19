@@ -13,6 +13,9 @@ pub mod channels {
     pub const EXIT: &str = "arb:exit";
     pub const PRICES: &str = "arb:prices";
     pub const ALERTS: &str = "arb:alerts";
+    pub const RUNTIME_STATS: &str = "arb:runtime:stats";
+    pub const RUNTIME_STATS_LATEST: &str = "arb:runtime:stats:latest";
+    pub const DYNAMIC_CONFIG_UPDATES: &str = "dynamic:config:update";
 }
 
 /// Publishes arbitrage signals to Redis and external alerting services.
@@ -20,6 +23,14 @@ pub struct SignalPublisher {
     redis: redis::aio::ConnectionManager,
     alerts_config: AlertsConfig,
     http_client: reqwest::Client,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RuntimeStats {
+    pub updates_per_minute: f64,
+    pub stalls_last_minute: f64,
+    pub resets_last_minute: f64,
+    pub monitored_markets: f64,
 }
 
 impl SignalPublisher {
@@ -73,6 +84,17 @@ impl SignalPublisher {
         self.send_alerts(&format!("ARB EXIT: {} | Profit: {:.4}", market_id, profit))
             .await?;
 
+        Ok(())
+    }
+
+    /// Publish runtime health stats so the tuner can react to stream quality.
+    pub async fn publish_runtime_stats(&mut self, stats: &RuntimeStats) -> Result<()> {
+        let payload = serde_json::to_string(stats)?;
+        let _: () = self
+            .redis
+            .set(channels::RUNTIME_STATS_LATEST, &payload)
+            .await?;
+        let _: () = self.redis.publish(channels::RUNTIME_STATS, payload).await?;
         Ok(())
     }
 

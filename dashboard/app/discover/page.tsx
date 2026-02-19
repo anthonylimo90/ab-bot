@@ -121,9 +121,9 @@ export default function DiscoverPage() {
   // Filter state — default to composite score sort
   const [sortBy, setSortBy] = useState<SortField>("composite");
   const [timePeriod, setTimePeriod] = useState<TimePeriod>("30d");
-  const [minTrades, setMinTrades] = useState<string>("10");
+  const [minTrades, setMinTrades] = useState<string>("0");
   const [hideBots, setHideBots] = useState(true);
-  const [minWinRate, setMinWinRate] = useState(true);
+  const [minWinRate, setMinWinRate] = useState(false);
 
   // What-if calculator
   const [whatIfAmount, setWhatIfAmount] = useState(100);
