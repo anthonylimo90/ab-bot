@@ -141,6 +141,7 @@ pub struct CopyStopLossMonitor {
 }
 
 impl CopyStopLossMonitor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: CopyStopLossConfig,
         pool: PgPool,
@@ -727,6 +728,7 @@ impl CopyStopLossMonitor {
 }
 
 /// Spawn the copy-trade stop-loss monitor as a background task.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_copy_stop_loss_monitor(
     config: CopyStopLossConfig,
     pool: PgPool,

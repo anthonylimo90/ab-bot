@@ -270,7 +270,7 @@ pub async fn create_workspace(
     .bind(workspace_id)
     .bind(&req.name)
     .bind(&req.description)
-    .bind(&req.setup_mode.to_lowercase())
+    .bind(req.setup_mode.to_lowercase())
     .bind(admin_id)
     .bind(now)
     .execute(&mut *tx)

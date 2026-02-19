@@ -962,6 +962,7 @@ impl DynamicTuner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_history(
         &self,
         config_key: Option<&str>,

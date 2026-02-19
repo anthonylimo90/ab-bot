@@ -507,14 +507,14 @@ impl ArbMonitor {
                     self.process_update(update).await?;
                     health_tick += 1;
 
-                    if health_tick % 100 == 0 {
+                    if health_tick.is_multiple_of(100) {
                         crate::touch_health_file();
                     }
-                    if health_tick % 5000 == 0 {
+                    if health_tick.is_multiple_of(5000) {
                         info!(updates = health_tick, "Arb monitor processed orderbook updates");
                     }
                     // Periodically check for stale positions and publish exit signals
-                    if health_tick % STALE_CHECK_INTERVAL == 0 {
+                    if health_tick.is_multiple_of(STALE_CHECK_INTERVAL) {
                         if let Err(e) = self.position_tracker.check_stale_positions().await {
                             warn!(error = %e, "Failed to check stale positions");
                         }
@@ -1046,6 +1046,7 @@ struct MarketSelectionResult {
     exploration_count: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_market_ids(
     ordered_market_ids: &[String],
     profiles: &HashMap<String, MarketProfile>,

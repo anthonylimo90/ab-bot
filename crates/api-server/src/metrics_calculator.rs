@@ -266,6 +266,7 @@ impl MetricsCalculator {
         }
 
         // Fetch wallets missing a strategy classification (limit per batch)
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             String,
             i64,

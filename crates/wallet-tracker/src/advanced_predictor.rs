@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use crate::profitability::{ProfitabilityAnalyzer, TimePeriod, WalletMetrics};
-use crate::success_predictor::{PredictionCategory, PredictionFactor, SuccessPrediction};
+use crate::success_predictor::{PredictionCategory, PredictionFactor};
 
 /// Ensemble prediction model combining multiple predictors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +239,7 @@ impl AdvancedPredictor {
     fn calculate_timing_score(&self, metrics: &WalletMetrics) -> f64 {
         // Timing score based on win rate and profit factor
         let base = metrics.win_rate * 0.5;
-        let profit_bonus = (metrics.profit_factor - 1.0).max(0.0).min(2.0) * 0.25;
+        let profit_bonus = (metrics.profit_factor - 1.0).clamp(0.0, 2.0) * 0.25;
         (base + profit_bonus).min(1.0)
     }
 
@@ -247,9 +247,7 @@ impl AdvancedPredictor {
         // Position sizing score based on drawdown and consistency
         let drawdown_penalty = metrics.max_drawdown.min(0.5);
         let consistency_bonus = metrics.consistency_score * 0.5;
-        (0.5 + consistency_bonus - drawdown_penalty)
-            .max(0.0)
-            .min(1.0)
+        (0.5 + consistency_bonus - drawdown_penalty).clamp(0.0, 1.0)
     }
 
     fn ensemble_predict(
@@ -333,7 +331,7 @@ impl AdvancedPredictor {
             .regime_adjustments
             .get(&self.market_regime)
             .unwrap_or(&1.0);
-        probability = (probability * regime_adj).max(0.0).min(1.0);
+        probability = (probability * regime_adj).clamp(0.0, 1.0);
 
         // Calculate confidence from model agreement
         let probs: Vec<f64> = predictions.iter().map(|p| p.probability).collect();
@@ -342,7 +340,7 @@ impl AdvancedPredictor {
         let std_dev = variance.sqrt();
 
         // Lower std_dev = higher confidence (models agree)
-        let confidence = (1.0 - std_dev * 2.0).max(0.0).min(1.0);
+        let confidence = (1.0 - std_dev * 2.0).clamp(0.0, 1.0);
 
         // Data quality adjustment
         let data_confidence = self.data_quality_confidence(features);
@@ -363,8 +361,8 @@ impl AdvancedPredictor {
 
     fn statistical_model(&self, features: &PredictionFeatures) -> f64 {
         // Weighted combination of statistical measures
-        let sharpe_score = (features.sharpe_ratio / 3.0).max(0.0).min(1.0);
-        let sortino_score = (features.sortino_ratio / 4.0).max(0.0).min(1.0);
+        let sharpe_score = (features.sharpe_ratio / 3.0).clamp(0.0, 1.0);
+        let sortino_score = (features.sortino_ratio / 4.0).clamp(0.0, 1.0);
         let win_rate_score = features.win_rate;
         let consistency_score = features.consistency;
 
@@ -379,7 +377,7 @@ impl AdvancedPredictor {
             (features.recent_performance_30d / 0.1).max(-1.0) * 0.5 + 0.5 // Penalize losses
         };
 
-        let trend_score = (features.performance_trend * 0.5 + 0.5).max(0.0).min(1.0);
+        let trend_score = (features.performance_trend * 0.5 + 0.5).clamp(0.0, 1.0);
         let acceleration = if features.recent_performance_7d > features.recent_performance_30d / 4.0
         {
             0.6 // Accelerating
@@ -392,10 +390,10 @@ impl AdvancedPredictor {
 
     fn risk_adjusted_model(&self, features: &PredictionFeatures) -> f64 {
         // Focus on risk-adjusted returns
-        let calmar_score = (features.calmar_ratio / 5.0).max(0.0).min(1.0);
+        let calmar_score = (features.calmar_ratio / 5.0).clamp(0.0, 1.0);
         let drawdown_score = (1.0 - features.max_drawdown * 2.0).max(0.0);
-        let var_score = (1.0 - features.var_95 / 0.3).max(0.0).min(1.0);
-        let vol_score = (1.0 - features.volatility / 0.5).max(0.0).min(1.0);
+        let var_score = (1.0 - features.var_95 / 0.3).clamp(0.0, 1.0);
+        let vol_score = (1.0 - features.volatility / 0.5).clamp(0.0, 1.0);
 
         0.3 * calmar_score + 0.3 * drawdown_score + 0.2 * var_score + 0.2 * vol_score
     }
@@ -413,12 +411,10 @@ impl AdvancedPredictor {
         } else {
             1.0 // Good frequency
         };
-        let frequency_score = frequency_score.max(0.0).min(1.0);
+        let frequency_score = frequency_score.clamp(0.0, 1.0);
 
         // Experience score
-        let experience_score = ((features.total_trades as f64).ln() / 5.0)
-            .min(1.0)
-            .max(0.0);
+        let experience_score = ((features.total_trades as f64).ln() / 5.0).clamp(0.0, 1.0);
 
         0.3 * timing + 0.3 * sizing + 0.2 * frequency_score + 0.2 * experience_score
     }
@@ -488,7 +484,7 @@ impl AdvancedPredictor {
         let mut factors = Vec::new();
 
         for model in &prediction.model_predictions {
-            let impact = model.probability * model.weight;
+            let _impact = model.probability * model.weight;
             factors.push(PredictionFactor::new(
                 &model.model_name,
                 model.probability,

@@ -143,7 +143,7 @@ pub async fn get_status(
     .fetch_optional(&state.pool)
     .await?;
 
-    let settings = settings.unwrap_or_else(|| UserSettingsRow {
+    let settings = settings.unwrap_or(UserSettingsRow {
         onboarding_completed: false,
         onboarding_step: 0,
         default_workspace_id: None,

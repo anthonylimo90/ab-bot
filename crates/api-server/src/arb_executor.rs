@@ -170,6 +170,7 @@ pub struct ArbAutoExecutor {
 
 impl ArbAutoExecutor {
     /// Create a new arb auto-executor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ArbExecutorConfig,
         arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
@@ -548,6 +549,7 @@ impl ArbAutoExecutor {
 }
 
 /// Spawn the arb auto-executor as a background task.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_arb_auto_executor(
     config: ArbExecutorConfig,
     arb_entry_rx: broadcast::Receiver<ArbOpportunity>,

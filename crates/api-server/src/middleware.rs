@@ -137,20 +137,7 @@ fn forbidden_response(message: &str) -> Response {
 mod tests {
     use super::*;
     use auth::jwt::{JwtAuth, JwtConfig, UserRole};
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-        middleware,
-        routing::get,
-        Router,
-    };
-    use sqlx::PgPool;
-    use tokio::sync::broadcast;
-    use tower::ServiceExt;
-
-    async fn test_handler() -> &'static str {
-        "OK"
-    }
+    use axum::http::StatusCode;
 
     fn create_test_jwt_auth() -> JwtAuth {
         JwtAuth::new(JwtConfig {

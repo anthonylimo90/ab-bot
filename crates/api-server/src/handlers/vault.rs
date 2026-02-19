@@ -171,8 +171,8 @@ pub async fn store_wallet(
 
     // Validate private key format
     let private_key = req.private_key.trim();
-    let key_bytes = if private_key.starts_with("0x") {
-        hex::decode(&private_key[2..])
+    let key_bytes = if let Some(stripped) = private_key.strip_prefix("0x") {
+        hex::decode(stripped)
             .map_err(|_| ApiError::BadRequest("Invalid private key format".into()))?
     } else {
         hex::decode(private_key)

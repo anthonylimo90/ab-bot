@@ -512,6 +512,7 @@ pub async fn run_backtest(
 }
 
 /// Background task to run the backtest.
+#[allow(clippy::too_many_arguments)]
 async fn run_backtest_task(
     pool: PgPool,
     result_id: Uuid,

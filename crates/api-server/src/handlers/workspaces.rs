@@ -453,15 +453,13 @@ pub async fn update_workspace(
     // Build dynamic update
     let now = Utc::now();
     let mut set_parts = vec!["updated_at = $2".to_string()];
-    let mut param_idx = 3;
 
     // SAFETY: The $col arguments below MUST be hardcoded string literals (column names).
     // Never pass user-controlled input as $col — that would be SQL injection.
     macro_rules! add_param {
         ($field:ident, $col:literal) => {
             if req.$field.is_some() {
-                set_parts.push(format!("{} = ${}", $col, param_idx));
-                param_idx += 1;
+                set_parts.push(format!("{} = ${}", $col, set_parts.len() + 2));
             }
         };
     }

@@ -275,20 +275,20 @@ impl HistoricalDataStore {
             "#,
         )
         .bind(&snapshot.market_id)
-        .bind(&snapshot.timestamp)
-        .bind(&snapshot.yes_bid)
-        .bind(&snapshot.yes_ask)
-        .bind(&snapshot.no_bid)
-        .bind(&snapshot.no_ask)
-        .bind(&snapshot.yes_bid_depth)
-        .bind(&snapshot.yes_ask_depth)
-        .bind(&snapshot.no_bid_depth)
-        .bind(&snapshot.no_ask_depth)
-        .bind(&snapshot.yes_mid)
-        .bind(&snapshot.no_mid)
-        .bind(&snapshot.yes_spread)
-        .bind(&snapshot.no_spread)
-        .bind(&snapshot.volume_24h)
+        .bind(snapshot.timestamp)
+        .bind(snapshot.yes_bid)
+        .bind(snapshot.yes_ask)
+        .bind(snapshot.no_bid)
+        .bind(snapshot.no_ask)
+        .bind(snapshot.yes_bid_depth)
+        .bind(snapshot.yes_ask_depth)
+        .bind(snapshot.no_bid_depth)
+        .bind(snapshot.no_ask_depth)
+        .bind(snapshot.yes_mid)
+        .bind(snapshot.no_mid)
+        .bind(snapshot.yes_spread)
+        .bind(snapshot.no_spread)
+        .bind(snapshot.volume_24h)
         .execute(&self.pool)
         .await?;
 
@@ -322,17 +322,17 @@ impl HistoricalDataStore {
             ON CONFLICT (id) DO NOTHING
             "#,
         )
-        .bind(&trade.id)
+        .bind(trade.id)
         .bind(&trade.market_id)
         .bind(&trade.outcome_id)
-        .bind(&trade.timestamp)
-        .bind(&trade.price)
-        .bind(&trade.quantity)
+        .bind(trade.timestamp)
+        .bind(trade.price)
+        .bind(trade.quantity)
         .bind(match trade.side {
             TradeSide::Buy => 0i16,
             TradeSide::Sell => 1i16,
         })
-        .bind(&trade.fee)
+        .bind(trade.fee)
         .execute(&self.pool)
         .await?;
 
@@ -408,14 +408,14 @@ impl HistoricalDataStore {
 
         let rows = if query.market_ids.is_empty() {
             sqlx::query(&sql)
-                .bind(&query.start_time)
-                .bind(&query.end_time)
+                .bind(query.start_time)
+                .bind(query.end_time)
                 .fetch_all(&self.pool)
                 .await?
         } else {
             sqlx::query(&sql)
-                .bind(&query.start_time)
-                .bind(&query.end_time)
+                .bind(query.start_time)
+                .bind(query.end_time)
                 .bind(&query.market_ids)
                 .fetch_all(&self.pool)
                 .await?
@@ -465,8 +465,8 @@ impl HistoricalDataStore {
             "#,
         )
         .bind(market_id)
-        .bind(&start_time)
-        .bind(&end_time)
+        .bind(start_time)
+        .bind(end_time)
         .fetch_all(&self.pool)
         .await?;
 
@@ -566,7 +566,7 @@ impl HistoricalDataStore {
             WHERE timestamp < $1
             "#,
         )
-        .bind(&older_than)
+        .bind(older_than)
         .execute(&self.pool)
         .await?;
 
@@ -823,10 +823,10 @@ impl DataQualityChecker {
         report.data_end = timestamps.iter().max().copied();
 
         // Check gaps for each market
-        for (market_id, market_snapshots) in &grouped {
+        for market_snapshots in grouped.values() {
             let gaps = self.detect_gaps(market_snapshots);
             for gap in gaps {
-                report.total_gap_duration = report.total_gap_duration + gap.duration;
+                report.total_gap_duration += gap.duration;
                 report.gaps.push(gap);
             }
         }

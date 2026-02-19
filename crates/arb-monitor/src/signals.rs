@@ -9,6 +9,7 @@ use redis::AsyncCommands;
 use tracing::{debug, warn};
 
 /// Redis channels for pub/sub.
+#[allow(dead_code)]
 pub mod channels {
     pub const ENTRY: &str = "arb:entry";
     pub const EXIT: &str = "arb:exit";
@@ -89,6 +90,7 @@ impl SignalPublisher {
     }
 
     /// Publish an exit signal.
+    #[allow(dead_code)]
     pub async fn publish_exit_signal(
         &mut self,
         market_id: &str,
@@ -178,10 +180,12 @@ impl SignalPublisher {
 }
 
 /// Subscribes to arbitrage signals from Redis.
+#[allow(dead_code)]
 pub struct SignalSubscriber {
     pubsub: redis::aio::PubSub,
 }
 
+#[allow(dead_code)]
 impl SignalSubscriber {
     /// Create a new signal subscriber.
     pub async fn new(redis_client: redis::Client) -> Result<Self> {

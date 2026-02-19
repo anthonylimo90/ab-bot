@@ -237,8 +237,8 @@ mod tests {
             hourly_distribution: {
                 let mut dist = [0u64; 24];
                 // Active only during typical waking hours
-                for i in 9..22 {
-                    dist[i] = 5;
+                for hour in dist.iter_mut().take(22).skip(9) {
+                    *hour = 5;
                 }
                 dist
             },

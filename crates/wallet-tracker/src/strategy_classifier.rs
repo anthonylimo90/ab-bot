@@ -3,12 +3,9 @@
 //! Analyzes wallet trading behavior to identify which trading strategy
 //! (or strategies) the wallet is likely using.
 
-use chrono::{DateTime, Duration, Utc};
 use polymarket_core::types::{
     DetectedStrategy, StrategyClassification, StrategyEvidence, StrategySignal, WalletFeatures,
 };
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -559,6 +556,7 @@ impl Default for StrategyClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
 
     fn mock_arb_features() -> ExtendedFeatures {
         ExtendedFeatures {

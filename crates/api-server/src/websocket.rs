@@ -189,15 +189,10 @@ async fn handle_orderbook_socket(socket: WebSocket, state: Arc<AppState>) {
             Some(msg) = receiver.next() => {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        if let Ok(request) = serde_json::from_str::<WsRequest>(&text) {
-                            match request {
-                                WsRequest::Ping => {
-                                    let pong = WsMessage::Pong;
-                                    if let Ok(json) = serde_json::to_string(&pong) {
-                                        let _ = sender.send(Message::Text(json)).await;
-                                    }
-                                }
-                                _ => {}
+                        if let Ok(WsRequest::Ping) = serde_json::from_str::<WsRequest>(&text) {
+                            let pong = WsMessage::Pong;
+                            if let Ok(json) = serde_json::to_string(&pong) {
+                                let _ = sender.send(Message::Text(json)).await;
                             }
                         }
                     }

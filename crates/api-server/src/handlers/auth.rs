@@ -286,7 +286,7 @@ pub async fn login(
             let hash_str = u.password_hash.clone();
             let password = req.password.clone();
             let valid = tokio::task::spawn_blocking(move || {
-                PasswordHash::new(&hash_str).ok().map_or(false, |parsed| {
+                PasswordHash::new(&hash_str).ok().is_some_and(|parsed| {
                     Argon2::default()
                         .verify_password(password.as_bytes(), &parsed)
                         .is_ok()

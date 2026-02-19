@@ -20,7 +20,7 @@ pub mod contracts {
 /// Continuous trade indexer that monitors Polymarket for new trades.
 pub struct TradeIndexer {
     polygon: PolygonClient,
-    pool: PgPool,
+    _pool: PgPool,
     wallet_repo: WalletRepository,
     /// Last processed block.
     last_block: u64,
@@ -48,7 +48,7 @@ impl TradeIndexer {
 
         Ok(Self {
             polygon,
-            pool,
+            _pool: pool,
             wallet_repo,
             last_block: current_block,
             analyzed_wallets: HashSet::new(),

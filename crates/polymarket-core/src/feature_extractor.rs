@@ -182,8 +182,8 @@ mod tests {
 
         // Active only 12 hours
         let mut half_hours = [0u64; 24];
-        for i in 0..12 {
-            half_hours[i] = 5;
+        for hour in half_hours.iter_mut().take(12) {
+            *hour = 5;
         }
         assert_eq!(calculate_activity_spread(&half_hours), 0.5);
     }

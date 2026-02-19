@@ -785,13 +785,13 @@ fn apply_price_changes(
             .unwrap_or_else(|| OrderBook {
                 market_id: event.market.clone(),
                 outcome_id: change.asset_id.clone(),
-                timestamp: timestamp.clone(),
+                timestamp,
                 bids: Vec::new(),
                 asks: Vec::new(),
             });
 
         book.market_id = event.market.clone();
-        book.timestamp = timestamp.clone();
+        book.timestamp = timestamp;
 
         if change.side.eq_ignore_ascii_case("BUY") {
             upsert_level(&mut book.bids, price, size, true);

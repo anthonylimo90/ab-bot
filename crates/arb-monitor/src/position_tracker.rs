@@ -20,6 +20,7 @@ pub struct PositionTracker {
     exit_threshold: Decimal,
 }
 
+#[allow(dead_code)]
 impl PositionTracker {
     /// Create a new position tracker.
     pub fn new(pool: PgPool) -> Self {
@@ -568,6 +569,7 @@ impl PositionTracker {
 
 /// Result of position reconciliation on startup.
 #[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
 pub struct ReconciliationResult {
     /// Total positions found in database.
     pub total_positions: usize,
@@ -591,6 +593,7 @@ pub struct ReconciliationResult {
     pub auto_recovered: usize,
 }
 
+#[allow(dead_code)]
 impl ReconciliationResult {
     /// Check if any issues were found that need attention.
     pub fn has_issues(&self) -> bool {
@@ -609,6 +612,7 @@ impl ReconciliationResult {
 
 /// Summary of current position states.
 #[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
 pub struct PositionSummary {
     pub total: usize,
     pub pending: usize,
@@ -740,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_position_active_filtering() {
-        let positions = vec![
+        let positions = [
             make_position(PositionState::Open, Decimal::ZERO, None),
             make_position(PositionState::Closed, Decimal::ZERO, Some(Decimal::ONE)),
             make_position(PositionState::EntryFailed, Decimal::ZERO, None),
