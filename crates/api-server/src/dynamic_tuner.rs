@@ -204,6 +204,9 @@ impl DynamicTuner {
             .await;
 
         let mut ticker = interval(TokioDuration::from_secs(self.config.interval_secs));
+        // tokio::time::interval ticks immediately once; consume it so the next
+        // tick aligns with the configured interval after the initial cycle.
+        ticker.tick().await;
 
         if let Err(e) = self
             .run_cycle(
@@ -252,7 +255,7 @@ impl DynamicTuner {
                     metrics: serde_json::json!({ "sync": "startup" }),
                 },
             )
-            .await;
+            .await?;
         }
 
         Ok(())
@@ -282,6 +285,9 @@ impl DynamicTuner {
         metrics.current_regime = format!("{:?}", resolved);
 
         self.evaluate_pending(rows.as_slice(), &metrics).await?;
+        // evaluate_pending can mutate pending_eval/current_value; refresh rows
+        // so this cycle doesn't operate on stale pre-evaluation state.
+        rows = self.load_rows().await?;
 
         if metrics.cb_tripped || metrics.recent_drawdown >= self.config.max_drawdown_freeze {
             let freeze_reason = "risk guard active: circuit breaker/drawdown";
@@ -355,19 +361,32 @@ impl DynamicTuner {
 
             if self.config.apply_changes {
                 self.apply_change(row, new_value, &reason, &metrics).await?;
+                let publish_result = self
+                    .publish_update(
+                        redis_manager.as_mut(),
+                        &DynamicConfigUpdate {
+                            key: key.clone(),
+                            value: new_value,
+                            reason: reason.clone(),
+                            source: "dynamic_tuner".to_string(),
+                            timestamp: Utc::now(),
+                            metrics: serde_json::to_value(&metrics)
+                                .unwrap_or(serde_json::json!({})),
+                        },
+                    )
+                    .await;
+                if let Err(e) = publish_result {
+                    warn!(
+                        key = %key,
+                        attempted_value = %new_value,
+                        error = %e,
+                        "Dynamic config publish failed; reverting DB change to preserve runtime/DB consistency"
+                    );
+                    self.rollback_unpublished_change(row, new_value, &reason, &e)
+                        .await?;
+                    continue;
+                }
                 applied_count += 1;
-                self.publish_update(
-                    redis_manager.as_mut(),
-                    &DynamicConfigUpdate {
-                        key: key.clone(),
-                        value: new_value,
-                        reason: reason.clone(),
-                        source: "dynamic_tuner".to_string(),
-                        timestamp: Utc::now(),
-                        metrics: serde_json::to_value(&metrics).unwrap_or(serde_json::json!({})),
-                    },
-                )
-                .await;
             } else {
                 self.record_history(
                     Some(&key),
@@ -474,7 +493,14 @@ impl DynamicTuner {
                         metrics: serde_json::to_value(metrics).unwrap_or(serde_json::json!({})),
                     },
                 )
-                .await;
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        key = %row.key,
+                        error = %e,
+                        "Failed publishing rollback dynamic config update"
+                    );
+                });
             } else {
                 sqlx::query(
                     r#"
@@ -878,6 +904,48 @@ impl DynamicTuner {
         Ok(())
     }
 
+    async fn rollback_unpublished_change(
+        &self,
+        row: &DynamicConfigRow,
+        attempted_value: Decimal,
+        reason: &str,
+        publish_error: &anyhow::Error,
+    ) -> anyhow::Result<()> {
+        let revert_reason = format!(
+            "reverted unapplied change after publish failure: {publish_error}; original_reason={reason}"
+        );
+        sqlx::query(
+            r#"
+            UPDATE dynamic_config
+            SET current_value = $2,
+                pending_eval = FALSE,
+                pending_baseline = NULL,
+                last_applied_at = NULL,
+                last_reason = $3,
+                updated_by = 'dynamic_tuner'
+            WHERE key = $1
+            "#,
+        )
+        .bind(&row.key)
+        .bind(row.current_value)
+        .bind(&revert_reason)
+        .execute(&self.pool)
+        .await?;
+
+        self.record_history(
+            Some(&row.key),
+            Some(attempted_value),
+            Some(row.current_value),
+            "skipped",
+            "reverted dynamic update because publish to subscribers failed",
+            None,
+            None,
+        )
+        .await?;
+
+        Ok(())
+    }
+
     async fn record_history(
         &self,
         config_key: Option<&str>,
@@ -922,24 +990,26 @@ impl DynamicTuner {
         &self,
         redis_manager: Option<&mut redis::aio::ConnectionManager>,
         update: &DynamicConfigUpdate,
-    ) {
+    ) -> anyhow::Result<()> {
         let Some(redis) = redis_manager else {
-            warn!(key = %update.key, "No Redis connection, skipping dynamic config publish");
-            return;
+            anyhow::bail!("No Redis connection for dynamic config publish");
         };
 
         let payload = match serde_json::to_string(update) {
             Ok(payload) => payload,
             Err(e) => {
-                warn!(error = %e, "Failed serializing dynamic config update");
-                return;
+                anyhow::bail!("Failed serializing dynamic config update: {e}");
             }
         };
 
         let result: redis::RedisResult<()> = redis.publish(channels::CONFIG_UPDATES, payload).await;
         if let Err(e) = result {
-            warn!(error = %e, key = %update.key, "Failed publishing dynamic config update");
+            anyhow::bail!(
+                "Failed publishing dynamic config update for {}: {e}",
+                update.key
+            );
         }
+        Ok(())
     }
 
     async fn persist_runtime_state(
@@ -1002,11 +1072,6 @@ async fn run_dynamic_config_subscriber(
 ) -> anyhow::Result<()> {
     let allowed_sources = load_allowed_update_sources();
     let bounds = load_dynamic_bounds(&pool).await;
-    if let Some(ref trader) = copy_trader {
-        if let Err(e) = apply_startup_snapshot_to_copy_trader(&pool, trader, &bounds).await {
-            warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
-        }
-    }
 
     let client = redis::Client::open(redis_url)?;
     let conn = client.get_async_connection().await?;
@@ -1017,6 +1082,14 @@ async fn run_dynamic_config_subscriber(
         channel = channels::CONFIG_UPDATES,
         "Subscribed to dynamic config updates"
     );
+
+    // Subscribe before snapshot application so updates published during startup
+    // are queued and processed after snapshot reconciliation.
+    if let Some(ref trader) = copy_trader {
+        if let Err(e) = apply_startup_snapshot_to_copy_trader(&pool, trader, &bounds).await {
+            warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
+        }
+    }
 
     let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {
