@@ -397,6 +397,10 @@ impl ArbMonitor {
         let mut resets_since_tick = 0u64;
         let mut resubscribe_requested = false;
 
+        const MAX_RESUBSCRIBE_RETRIES: u32 = 10;
+        const RESUBSCRIBE_BASE_DELAY_SECS: u64 = 3;
+        const RESUBSCRIBE_MAX_DELAY_SECS: u64 = 60;
+
         loop {
             if resubscribe_requested {
                 let target_assets = self.active_subscription_asset_ids();
@@ -404,7 +408,9 @@ impl ArbMonitor {
                     asset_count = target_assets.len(),
                     "Resubscribing orderbook stream after dynamic market selection update"
                 );
+                let mut attempt = 0u32;
                 loop {
+                    attempt += 1;
                     match self
                         .clob_client
                         .subscribe_orderbook(target_assets.clone())
@@ -418,11 +424,28 @@ impl ArbMonitor {
                             break;
                         }
                         Err(e) => {
+                            let delay = RESUBSCRIBE_BASE_DELAY_SECS
+                                .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
+                                .min(RESUBSCRIBE_MAX_DELAY_SECS);
+                            if attempt >= MAX_RESUBSCRIBE_RETRIES {
+                                warn!(
+                                    error = %e,
+                                    attempts = attempt,
+                                    "Resubscribe failed after max retries, deferring to next select! cycle"
+                                );
+                                // Leave resubscribe_requested=true so the next
+                                // select! iteration will retry, keeping the
+                                // dynamic_config_rx channel responsive.
+                                break;
+                            }
                             warn!(
                                 error = %e,
-                                "Failed resubscribing orderbook stream, retrying in 3s"
+                                attempt,
+                                max_retries = MAX_RESUBSCRIBE_RETRIES,
+                                retry_delay_secs = delay,
+                                "Failed resubscribing orderbook stream, retrying"
                             );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
                         }
                     }
                 }

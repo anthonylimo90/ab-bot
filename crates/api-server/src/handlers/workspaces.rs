@@ -309,7 +309,7 @@ pub async fn get_workspace(
             w.trading_wallet_address, w.walletconnect_project_id,
             w.polygon_rpc_url, w.alchemy_api_key,
             COALESCE(w.arb_auto_execute, false) as arb_auto_execute,
-            COALESCE(w.copy_trading_enabled, true) as copy_trading_enabled,
+            COALESCE(w.copy_trading_enabled, false) as copy_trading_enabled,
             COALESCE(w.live_trading_enabled, false) as live_trading_enabled,
             wm.role, w.created_at, w.updated_at
         FROM workspaces w
@@ -435,8 +435,13 @@ pub async fn update_workspace(
                 ));
             }
 
-            // Block private/internal network addresses
+            // Validate against allowlisted RPC providers (SSRF protection)
             if let Some(host) = parsed.host_str() {
+                if !is_allowed_rpc_host(host) {
+                    return Err(ApiError::BadRequest(
+                        "Polygon RPC URL host is not in the approved provider list. Allowed: Alchemy, Infura, Ankr, etc.".into(),
+                    ));
+                }
                 if is_private_host(host) {
                     return Err(ApiError::BadRequest(
                         "Polygon RPC URL must not point to a private/internal address".into(),
@@ -1288,7 +1293,7 @@ pub async fn get_service_status(
     let flags: WorkspaceServiceFlags = sqlx::query_as(
         r#"
         SELECT
-            COALESCE(copy_trading_enabled, TRUE) as copy_trading_enabled,
+            COALESCE(copy_trading_enabled, FALSE) as copy_trading_enabled,
             COALESCE(arb_auto_execute, FALSE) as arb_auto_execute,
             COALESCE(live_trading_enabled, FALSE) as live_trading_enabled
         FROM workspaces
@@ -1574,7 +1579,9 @@ pub async fn get_dynamic_tuner_status(
             None => (None, None, None, None),
         };
 
-    let runtime_stats = fetch_arb_runtime_stats().await.unwrap_or_default();
+    let runtime_stats = fetch_arb_runtime_stats(state.redis_conn.as_ref())
+        .await
+        .unwrap_or_default();
     let scanner_status = ScannerStatusResponse {
         monitored_markets: runtime_stats.monitored_markets.round() as i64,
         core_markets: runtime_stats.core_markets.round() as i64,
@@ -1671,6 +1678,13 @@ pub async fn update_opportunity_selection_settings(
         ));
     }
 
+    // Dynamic config is global (not workspace-scoped), so restrict to platform admins
+    if claims.role != auth::UserRole::PlatformAdmin && role != "owner" {
+        return Err(ApiError::Forbidden(
+            "Only platform admins or workspace owners can update global opportunity selection settings".into(),
+        ));
+    }
+
     if req.aggressiveness.is_none() && req.exploration_slots.is_none() {
         return Err(ApiError::BadRequest(
             "Provide at least one field to update".into(),
@@ -1764,7 +1778,7 @@ pub async fn update_opportunity_selection_settings(
         .await?;
     }
 
-    publish_manual_dynamic_updates(&updates)
+    publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref())
         .await
         .map_err(|error| {
             ApiError::Internal(format!(
@@ -1947,12 +1961,20 @@ fn opportunity_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> 
 
 async fn publish_manual_dynamic_updates(
     updates: &[(String, Decimal, String)],
+    shared_conn: Option<&redis::aio::ConnectionManager>,
 ) -> Result<(), redis::RedisError> {
-    let redis_url = std::env::var("DYNAMIC_TUNER_REDIS_URL")
-        .or_else(|_| std::env::var("REDIS_URL"))
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let client = redis::Client::open(redis_url.as_str())?;
-    let mut redis = redis::aio::ConnectionManager::new(client).await?;
+    let mut owned_conn;
+    let redis = if let Some(conn) = shared_conn {
+        owned_conn = conn.clone();
+        &mut owned_conn
+    } else {
+        let redis_url = std::env::var("DYNAMIC_TUNER_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let client = redis::Client::open(redis_url.as_str())?;
+        owned_conn = redis::aio::ConnectionManager::new(client).await?;
+        &mut owned_conn
+    };
 
     for (key, value, reason) in updates {
         let payload = crate::dynamic_tuner::DynamicConfigUpdate {
@@ -1974,12 +1996,21 @@ async fn publish_manual_dynamic_updates(
     Ok(())
 }
 
-async fn fetch_arb_runtime_stats() -> Option<ArbRuntimeStatsSnapshot> {
-    let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
-        .or_else(|_| std::env::var("REDIS_URL"))
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let client = redis::Client::open(redis_url.as_str()).ok()?;
-    let mut redis = redis::aio::ConnectionManager::new(client).await.ok()?;
+async fn fetch_arb_runtime_stats(
+    shared_conn: Option<&redis::aio::ConnectionManager>,
+) -> Option<ArbRuntimeStatsSnapshot> {
+    let mut owned_conn;
+    let redis = if let Some(conn) = shared_conn {
+        owned_conn = conn.clone();
+        &mut owned_conn
+    } else {
+        let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
+            .or_else(|_| std::env::var("REDIS_URL"))
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let client = redis::Client::open(redis_url.as_str()).ok()?;
+        owned_conn = redis::aio::ConnectionManager::new(client).await.ok()?;
+        &mut owned_conn
+    };
     let payload: Option<String> = redis.get(ARB_RUNTIME_STATS_LATEST).await.ok()?;
     payload.and_then(|raw| serde_json::from_str::<ArbRuntimeStatsSnapshot>(&raw).ok())
 }
@@ -2009,10 +2040,35 @@ fn is_valid_walletconnect_project_id(project_id: &str) -> bool {
     project_id.len() == 32 && project_id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Allowlisted RPC provider hostnames.
+/// Only these providers are permitted for user-supplied Polygon RPC URLs.
+const ALLOWED_RPC_HOSTS: &[&str] = &[
+    "polygon-mainnet.g.alchemy.com",
+    "polygon-mainnet.infura.io",
+    "rpc.ankr.com",
+    "polygon-rpc.com",
+    "polygon.llamarpc.com",
+    "polygon.drpc.org",
+    "polygon-bor-rpc.publicnode.com",
+    "1rpc.io",
+    "gateway.tenderly.co",
+    "polygon.gateway.tenderly.co",
+    "rpc.particle.network",
+];
+
+/// Validate that an RPC URL host is in the allowlist.
+/// This prevents SSRF by restricting to known RPC providers rather than
+/// trying to blocklist private addresses (which can be bypassed via DNS).
+fn is_allowed_rpc_host(host: &str) -> bool {
+    let lower = host.to_lowercase();
+    ALLOWED_RPC_HOSTS
+        .iter()
+        .any(|allowed| lower == *allowed || lower.ends_with(&format!(".{}", allowed)))
+}
+
 /// Check if a hostname resolves to a private/internal network address.
-/// Used to prevent SSRF attacks via user-supplied URLs.
+/// Used as a secondary check alongside the RPC host allowlist.
 fn is_private_host(host: &str) -> bool {
-    // Check common private hostnames
     let lower = host.to_lowercase();
     if lower == "localhost"
         || lower == "0.0.0.0"
@@ -2022,19 +2078,12 @@ fn is_private_host(host: &str) -> bool {
         return true;
     }
 
-    // Check if the host is a private IP address
     if let Ok(ip) = host.parse::<IpAddr>() {
         return match ip {
             IpAddr::V4(v4) => {
-                v4.is_loopback()          // 127.0.0.0/8
-                    || v4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                    || v4.is_link_local()  // 169.254.0.0/16
-                    || v4.is_unspecified() // 0.0.0.0
+                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
             }
-            IpAddr::V6(v6) => {
-                v6.is_loopback()          // ::1
-                    || v6.is_unspecified() // ::
-            }
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
         };
     }
 

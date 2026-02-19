@@ -88,6 +88,8 @@ pub struct AppState {
     pub copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     /// Current detected market regime, updated hourly by MetricsCalculator.
     pub current_regime: Arc<RwLock<MarketRegime>>,
+    /// Shared Redis connection for dynamic config pub/sub (None if Redis unavailable).
+    pub redis_conn: Option<redis::aio::ConnectionManager>,
 }
 
 impl AppState {
@@ -349,6 +351,29 @@ impl AppState {
             }
         });
 
+        // Create shared Redis connection for dynamic config pub/sub
+        let redis_conn = {
+            let redis_url = std::env::var("DYNAMIC_TUNER_REDIS_URL")
+                .or_else(|_| std::env::var("REDIS_URL"))
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            match redis::Client::open(redis_url.as_str()) {
+                Ok(client) => match redis::aio::ConnectionManager::new(client).await {
+                    Ok(conn) => {
+                        tracing::info!("Shared Redis connection established for dynamic config");
+                        Some(conn)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to connect to Redis; dynamic config updates via Redis will be unavailable");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to open Redis client; dynamic config updates via Redis will be unavailable");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             pool,
             jwt_secret,
@@ -371,6 +396,7 @@ impl AppState {
             trade_monitor: None,
             copy_trader: None,
             current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
+            redis_conn,
         })
     }
 

@@ -67,6 +67,7 @@ export function Header() {
   const isTradingActive =
     currentWorkspace?.copy_trading_enabled ||
     currentWorkspace?.live_trading_enabled ||
+    currentWorkspace?.arb_auto_execute ||
     false;
 
   const toggleTradingMutation = useMutation({
@@ -76,13 +77,15 @@ export function Header() {
       return api.updateWorkspace(currentWorkspace.id, {
         copy_trading_enabled: !pausing,
         live_trading_enabled: !pausing,
+        arb_auto_execute: !pausing,
       });
     },
     onSuccess: (updatedWorkspace) => {
       setCurrentWorkspace(updatedWorkspace);
       const paused =
         !updatedWorkspace.copy_trading_enabled &&
-        !updatedWorkspace.live_trading_enabled;
+        !updatedWorkspace.live_trading_enabled &&
+        !updatedWorkspace.arb_auto_execute;
       if (paused) {
         toast.warning(
           "Trading paused",

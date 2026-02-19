@@ -157,10 +157,27 @@ pub struct DetectedTrade {
 #[serde(rename_all = "snake_case")]
 pub enum CopyTradeRejection {
     CircuitBreakerTripped,
-    DailyCapitalLimitReached { deployed: Decimal, limit: Decimal },
-    TooManyOpenPositions { current: usize, limit: usize },
-    BelowMinTradeValue { value: Decimal, min: Decimal },
-    SlippageTooHigh { slippage_pct: Decimal, max: Decimal },
+    DailyCapitalLimitReached {
+        deployed: Decimal,
+        limit: Decimal,
+    },
+    TooManyOpenPositions {
+        current: usize,
+        limit: usize,
+    },
+    BelowMinTradeValue {
+        value: Decimal,
+        min: Decimal,
+    },
+    SlippageTooHigh {
+        slippage_pct: Decimal,
+        max: Decimal,
+    },
+    /// Market price is near 0 or 1, indicating a resolved or near-resolution market
+    /// where there is no meaningful liquidity to copy into.
+    MarketNearResolution {
+        market_price: Decimal,
+    },
 }
 
 /// Outcome from processing a detected trade.
@@ -450,13 +467,28 @@ impl CopyTrader {
             .await;
 
             if let Ok(Some(market_price)) = slippage_result {
+                // Reject markets near resolution (price < 0.03 or > 0.97).
+                // These have no meaningful liquidity and slippage will always be extreme.
+                let near_resolution_floor = Decimal::new(3, 2); // 0.03
+                let near_resolution_ceil = Decimal::new(97, 2); // 0.97
+                if market_price < near_resolution_floor || market_price > near_resolution_ceil {
+                    debug!(
+                        wallet = %trade.wallet_address,
+                        market_price = %market_price,
+                        "Market near resolution, skipping copy trade"
+                    );
+                    return Ok(CopyTradeProcessOutcome::Rejected(
+                        CopyTradeRejection::MarketNearResolution { market_price },
+                    ));
+                }
+
                 let slippage_pct = if trade.price > Decimal::ZERO {
                     ((market_price - trade.price) / trade.price).abs()
                 } else {
                     Decimal::ZERO
                 };
                 if slippage_pct > self.policy.max_slippage_pct {
-                    warn!(
+                    debug!(
                         wallet = %trade.wallet_address,
                         source_price = %trade.price,
                         market_price = %market_price,

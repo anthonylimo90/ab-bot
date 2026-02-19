@@ -43,7 +43,7 @@ pub async fn any_workspace_copy_enabled(pool: &PgPool) -> Result<bool, sqlx::Err
         SELECT EXISTS(
             SELECT 1
             FROM workspaces
-            WHERE COALESCE(copy_trading_enabled, TRUE) = TRUE
+            WHERE COALESCE(copy_trading_enabled, FALSE) = TRUE
         )
         "#,
     )
@@ -109,7 +109,7 @@ pub async fn reconcile_copy_runtime(
         FROM workspace_wallet_allocations wwa
         JOIN workspaces w ON w.id = wwa.workspace_id
         WHERE wwa.tier = 'active'
-          AND COALESCE(w.copy_trading_enabled, TRUE) = TRUE
+          AND COALESCE(w.copy_trading_enabled, FALSE) = TRUE
         GROUP BY LOWER(wwa.wallet_address)
         HAVING COUNT(*) > 1
         "#,
@@ -125,17 +125,19 @@ pub async fn reconcile_copy_runtime(
     }
 
     // Upsert desired active copy wallets from workspace allocations.
+    // Use MIN for allocation to fail-safe to the smaller allocation when
+    // a wallet appears in multiple workspaces.
     sqlx::query(
         r#"
         WITH desired AS (
             SELECT
                 LOWER(wwa.wallet_address) AS address,
-                MAX(wwa.allocation_pct) AS allocation_pct,
-                MAX(wwa.max_position_size) AS max_position_size
+                MIN(wwa.allocation_pct) AS allocation_pct,
+                MIN(wwa.max_position_size) AS max_position_size
             FROM workspace_wallet_allocations wwa
             JOIN workspaces w ON w.id = wwa.workspace_id
             WHERE wwa.tier = 'active'
-              AND COALESCE(w.copy_trading_enabled, TRUE) = TRUE
+              AND COALESCE(w.copy_trading_enabled, FALSE) = TRUE
             GROUP BY LOWER(wwa.wallet_address)
         )
         INSERT INTO tracked_wallets
@@ -171,7 +173,7 @@ pub async fn reconcile_copy_runtime(
               FROM workspace_wallet_allocations wwa
               JOIN workspaces w ON w.id = wwa.workspace_id
               WHERE wwa.tier = 'active'
-                AND COALESCE(w.copy_trading_enabled, TRUE) = TRUE
+                AND COALESCE(w.copy_trading_enabled, FALSE) = TRUE
                 AND LOWER(wwa.wallet_address) = LOWER(tw.address)
           )
         "#,

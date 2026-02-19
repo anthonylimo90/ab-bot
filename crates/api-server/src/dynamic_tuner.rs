@@ -659,6 +659,9 @@ impl DynamicTuner {
             desired_min_trade = match top_skip.as_str() {
                 "below_minimum" => desired_min_trade.min((min_trade_current * 0.70).max(2.0)),
                 "too_stale" => desired_min_trade.min((min_trade_current * 0.85).max(2.0)),
+                // Near-resolution markets are a wallet curation problem, not a parameter problem.
+                // Do not relax min trade value when most skips are from dead/resolved markets.
+                "near_resolution" => desired_min_trade,
                 _ => desired_min_trade.min((min_trade_current * 0.80).max(2.0)),
             };
         }
@@ -680,6 +683,9 @@ impl DynamicTuner {
             desired_slippage = match top_skip.as_str() {
                 "slippage" => desired_slippage.max((slippage_current * 1.30).max(0.015)),
                 "too_stale" => desired_slippage.max((slippage_current * 1.10).max(0.012)),
+                // Near-resolution markets cannot be fixed by relaxing slippage.
+                // Keep current slippage to avoid unsafe drift.
+                "near_resolution" => desired_slippage,
                 _ => desired_slippage.max((slippage_current * 1.15).max(0.012)),
             };
         }

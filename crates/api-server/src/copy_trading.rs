@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use polymarket_core::types::OrderSide;
 use trading_engine::copy_trader::{
@@ -219,7 +219,7 @@ impl CopyTradingMonitor {
 
         // Check minimum trade value
         if trade.value < policy_min_trade_value {
-            debug!(
+            trace!(
                 wallet = %trade.wallet_address,
                 value = %trade.value,
                 min = %policy_min_trade_value,
@@ -315,6 +315,12 @@ impl CopyTradingMonitor {
                     CopyTradeRejection::SlippageTooHigh { slippage_pct, max } => (
                         "slippage",
                         format!("Slippage {slippage_pct} exceeds max {max}"),
+                    ),
+                    CopyTradeRejection::MarketNearResolution { market_price } => (
+                        "near_resolution",
+                        format!(
+                            "Market price {market_price} indicates resolved/near-resolution market"
+                        ),
                     ),
                 };
                 warn!(
@@ -618,8 +624,14 @@ impl CopyTradingMonitor {
                         "slippage",
                         format!("Slippage {slippage_pct} exceeds max {max}"),
                     ),
+                    CopyTradeRejection::MarketNearResolution { market_price } => (
+                        "near_resolution",
+                        format!(
+                            "Market price {market_price} indicates resolved/near-resolution market"
+                        ),
+                    ),
                 };
-                debug!(
+                trace!(
                     wallet = %trade.wallet_address,
                     rejection = ?rejection,
                     "Trade rejected by copy-trader runtime policy"
@@ -629,7 +641,7 @@ impl CopyTradingMonitor {
                     .await;
             }
             Ok(CopyTradeProcessOutcome::Skipped) => {
-                debug!(
+                trace!(
                     wallet = %trade.wallet_address,
                     "Trade not copied (wallet not tracked, disabled, or trade filtered)"
                 );
