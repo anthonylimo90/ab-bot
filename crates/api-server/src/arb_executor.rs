@@ -15,6 +15,7 @@ use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
@@ -184,6 +185,8 @@ pub struct ArbAutoExecutor {
     /// Set of market IDs with active positions (for deduplication).
     /// Shared with ExitHandler so closed positions unblock their markets.
     active_markets: Arc<RwLock<HashSet<String>>>,
+    /// Heartbeat timestamp (epoch secs) — updated every loop iteration to prove liveness.
+    heartbeat: Arc<AtomicI64>,
 }
 
 impl ArbAutoExecutor {
@@ -199,6 +202,7 @@ impl ArbAutoExecutor {
         pool: PgPool,
         active_markets: Arc<RwLock<HashSet<String>>>,
         active_clob_markets: Arc<RwLock<HashSet<String>>>,
+        heartbeat: Arc<AtomicI64>,
     ) -> Self {
         Self {
             config,
@@ -209,6 +213,7 @@ impl ArbAutoExecutor {
             position_repo: PositionRepository::new(pool),
             token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets),
             active_markets,
+            heartbeat,
         }
     }
 
@@ -221,16 +226,12 @@ impl ArbAutoExecutor {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let startup_cfg = self.snapshot_config().await;
 
-        if !startup_cfg.enabled {
-            info!("Arb auto-executor is disabled (set ARB_AUTO_EXECUTE=true to enable)");
-            return Ok(());
-        }
-
         info!(
+            enabled = startup_cfg.enabled,
             position_size = %startup_cfg.position_size,
             min_net_profit = %startup_cfg.min_net_profit,
             max_signal_age_secs = startup_cfg.max_signal_age_secs,
-            "Starting arb auto-executor"
+            "Starting arb auto-executor (always-on, per-signal guard)"
         );
 
         // Initial token cache load
@@ -254,6 +255,10 @@ impl ArbAutoExecutor {
         cache_ticker.tick().await;
 
         loop {
+            // Update heartbeat to prove liveness
+            self.heartbeat
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+
             tokio::select! {
                 result = self.arb_entry_rx.recv() => {
                     match result {
@@ -286,6 +291,12 @@ impl ArbAutoExecutor {
     /// Process a single arb signal through validation → execution → tracking.
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
         let cfg = self.snapshot_config().await;
+
+        // Per-signal guard: skip processing when disabled at runtime
+        if !cfg.enabled {
+            return Ok(());
+        }
+
         let market_id = &arb.market_id;
 
         // 1. Validate signal freshness
@@ -588,6 +599,7 @@ pub fn spawn_arb_auto_executor(
     pool: PgPool,
     active_markets: Arc<RwLock<HashSet<String>>>,
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
+    heartbeat: Arc<AtomicI64>,
 ) {
     let executor = ArbAutoExecutor::new(
         config,
@@ -599,6 +611,7 @@ pub fn spawn_arb_auto_executor(
         pool,
         active_markets,
         active_clob_markets,
+        heartbeat,
     );
 
     tokio::spawn(async move {

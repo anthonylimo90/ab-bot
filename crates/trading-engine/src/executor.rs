@@ -8,6 +8,7 @@ use polymarket_core::api::ClobClient;
 use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
 use polymarket_core::types::{ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus};
 use rust_decimal::Decimal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
@@ -110,12 +111,15 @@ pub struct OrderExecutor {
     metrics: std::sync::RwLock<ExecutionMetrics>,
     /// Authenticated client for live trading (swappable at runtime).
     auth_client: Arc<RwLock<Option<AuthenticatedClobClient>>>,
+    /// Runtime-toggleable live mode flag (overrides config.live_trading).
+    live_override: AtomicBool,
 }
 
 impl OrderExecutor {
     /// Create a new order executor (paper trading mode).
     pub fn new(clob_client: Arc<ClobClient>, config: ExecutorConfig) -> Self {
         let (report_tx, report_rx) = mpsc::channel(1000);
+        let live = config.live_trading;
         Self {
             clob_client,
             config,
@@ -124,6 +128,7 @@ impl OrderExecutor {
             report_rx: Some(report_rx),
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
             auth_client: Arc::new(RwLock::new(None)),
+            live_override: AtomicBool::new(live),
         }
     }
 
@@ -162,6 +167,7 @@ impl OrderExecutor {
             "Created order executor with wallet authentication"
         );
 
+        let live = config.live_trading;
         Self {
             clob_client,
             config,
@@ -170,6 +176,7 @@ impl OrderExecutor {
             report_rx: Some(report_rx),
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
             auth_client: Arc::new(RwLock::new(Some(auth_client))),
+            live_override: AtomicBool::new(live),
         }
     }
 
@@ -200,7 +207,7 @@ impl OrderExecutor {
 
     /// Check if live trading is initialized and ready.
     pub async fn is_live_ready(&self) -> bool {
-        if !self.config.live_trading {
+        if !self.is_live() {
             return false;
         }
         let slot = self.auth_client.read().await;
@@ -215,7 +222,7 @@ impl OrderExecutor {
 
     /// Hot-reload the live trading wallet signer and API credentials.
     pub async fn reload_wallet(&self, wallet: TradingWallet) -> Result<String> {
-        if !self.config.live_trading {
+        if !self.is_live() {
             return Err(anyhow::anyhow!(
                 "Executor is not in live mode; set LIVE_TRADING=true"
             ));
@@ -286,7 +293,7 @@ impl OrderExecutor {
         let report = self
             .execute_with_retry(
                 || async {
-                    if self.config.live_trading {
+                    if self.is_live() {
                         self.execute_live_market_order(&order).await
                     } else {
                         self.simulate_market_order(&order).await
@@ -475,7 +482,7 @@ impl OrderExecutor {
         let report = self
             .execute_with_retry(
                 || async {
-                    if self.config.live_trading {
+                    if self.is_live() {
                         self.execute_live_limit_order(&order).await
                     } else {
                         self.simulate_limit_order(&order).await
@@ -509,9 +516,14 @@ impl OrderExecutor {
         self.metrics.read().unwrap().clone()
     }
 
-    /// Check if executor is in live trading mode.
+    /// Check if executor is in live trading mode (reads runtime override).
     pub fn is_live(&self) -> bool {
-        self.config.live_trading
+        self.live_override.load(Ordering::Relaxed)
+    }
+
+    /// Toggle live trading mode at runtime.
+    pub fn set_live_mode(&self, enabled: bool) {
+        self.live_override.store(enabled, Ordering::Relaxed);
     }
 
     /// Get a reference to the underlying CLOB client.

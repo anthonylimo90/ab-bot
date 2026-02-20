@@ -16,6 +16,7 @@ use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
@@ -110,7 +111,7 @@ impl OutcomeTokenCache {
 
 /// Exit handler service — closes positions via sell orders or resolution detection.
 pub struct ExitHandler {
-    config: ExitHandlerConfig,
+    config: Arc<RwLock<ExitHandlerConfig>>,
     position_repo: PositionRepository,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
@@ -119,17 +120,20 @@ pub struct ExitHandler {
     token_cache: OutcomeTokenCache,
     /// Shared dedup set with ArbAutoExecutor.
     arb_dedup: Arc<RwLock<HashSet<String>>>,
+    /// Heartbeat timestamp (epoch secs) — updated every tick to prove liveness.
+    heartbeat: Arc<AtomicI64>,
 }
 
 impl ExitHandler {
     pub fn new(
-        config: ExitHandlerConfig,
+        config: Arc<RwLock<ExitHandlerConfig>>,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
         clob_client: Arc<ClobClient>,
         signal_tx: broadcast::Sender<SignalUpdate>,
         pool: PgPool,
         arb_dedup: Arc<RwLock<HashSet<String>>>,
+        heartbeat: Arc<AtomicI64>,
     ) -> Self {
         Self {
             config,
@@ -140,20 +144,24 @@ impl ExitHandler {
             signal_tx,
             token_cache: OutcomeTokenCache::new(clob_client),
             arb_dedup,
+            heartbeat,
         }
+    }
+
+    /// Snapshot the current config for use during a single tick.
+    async fn snapshot_config(&self) -> ExitHandlerConfig {
+        self.config.read().await.clone()
     }
 
     /// Main run loop with two tickers.
     pub async fn run(self) -> anyhow::Result<()> {
-        if !self.config.enabled {
-            info!("Exit handler is disabled (set EXIT_HANDLER_ENABLED=true to enable)");
-            return Ok(());
-        }
+        let startup_cfg = self.snapshot_config().await;
 
         info!(
-            exit_poll_secs = self.config.exit_poll_interval_secs,
-            resolution_check_secs = self.config.resolution_check_secs,
-            "Starting exit handler"
+            enabled = startup_cfg.enabled,
+            exit_poll_secs = startup_cfg.exit_poll_interval_secs,
+            resolution_check_secs = startup_cfg.resolution_check_secs,
+            "Starting exit handler (always-on, per-tick guard)"
         );
 
         // Initial token cache load
@@ -163,10 +171,10 @@ impl ExitHandler {
         }
 
         let mut exit_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
-            self.config.exit_poll_interval_secs,
+            startup_cfg.exit_poll_interval_secs,
         ));
         let mut resolution_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
-            self.config.resolution_check_secs,
+            startup_cfg.resolution_check_secs,
         ));
 
         // Skip the first immediate ticks
@@ -174,16 +182,31 @@ impl ExitHandler {
         resolution_ticker.tick().await;
 
         loop {
+            // Update heartbeat to prove liveness
+            self.heartbeat
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+
             tokio::select! {
                 _ = exit_ticker.tick() => {
+                    // Per-tick guard: skip when disabled at runtime
+                    if !self.snapshot_config().await.enabled {
+                        continue;
+                    }
                     if let Err(e) = self.process_exit_ready().await {
                         error!(error = %e, "Failed to process exit-ready positions");
                     }
                     if let Err(e) = self.process_failed_exits().await {
                         error!(error = %e, "Failed to process failed exits");
                     }
+                    if let Err(e) = self.process_one_legged_recovery().await {
+                        error!(error = %e, "Failed to process one-legged recovery");
+                    }
                 }
                 _ = resolution_ticker.tick() => {
+                    // Per-tick guard: skip when disabled at runtime
+                    if !self.snapshot_config().await.enabled {
+                        continue;
+                    }
                     if let Err(e) = self.check_market_resolutions().await {
                         error!(error = %e, "Failed to check market resolutions");
                     }
@@ -467,6 +490,113 @@ impl ExitHandler {
         Ok(())
     }
 
+    /// Process one-legged entry failures: attempt to buy the missing NO leg.
+    async fn process_one_legged_recovery(&self) -> anyhow::Result<()> {
+        let positions = self.position_repo.get_one_legged_entry_failed().await?;
+        if positions.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            count = positions.len(),
+            "Processing one-legged entry failures for recovery"
+        );
+
+        for mut position in positions {
+            let market_id = position.market_id.clone();
+
+            // Resolve NO token ID
+            let (_yes_token_id, no_token_id) = match self.token_cache.get(&market_id).await {
+                Some(ids) => ids,
+                None => {
+                    let _ = self.token_cache.refresh().await;
+                    match self.token_cache.get(&market_id).await {
+                        Some(ids) => ids,
+                        None => {
+                            warn!(
+                                market_id = %market_id,
+                                position_id = %position.id,
+                                "Cannot recover one-legged: no token IDs for market"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Attempt to buy the NO leg
+            let no_order = MarketOrder::new(
+                market_id.clone(),
+                no_token_id,
+                OrderSide::Buy,
+                position.quantity,
+            );
+
+            let no_report = match self.order_executor.execute_market_order(no_order).await {
+                Ok(report) => report,
+                Err(e) => {
+                    warn!(
+                        market_id = %market_id,
+                        position_id = %position.id,
+                        error = %e,
+                        "One-legged recovery: NO order execution error"
+                    );
+                    // Increment retry count to avoid infinite loops
+                    position.retry_count += 1;
+                    position.last_updated = Utc::now();
+                    let _ = self.position_repo.update(&position).await;
+                    continue;
+                }
+            };
+
+            if !no_report.is_success() {
+                let msg = no_report
+                    .error_message
+                    .unwrap_or_else(|| "NO order not filled".to_string());
+                warn!(
+                    market_id = %market_id,
+                    position_id = %position.id,
+                    reason = %msg,
+                    "One-legged recovery: NO order failed"
+                );
+                position.retry_count += 1;
+                position.last_updated = Utc::now();
+                let _ = self.position_repo.update(&position).await;
+                continue;
+            }
+
+            // NO leg filled — transition to Open
+            match position.recover_one_legged_to_open() {
+                Ok(()) => {
+                    let _ = self.position_repo.update(&position).await;
+                    // Add to dedup set since position is now active
+                    self.arb_dedup.write().await.insert(market_id.clone());
+
+                    self.publish_alert(
+                        &market_id,
+                        "one_legged_recovered",
+                        "NO leg placed, position now Open",
+                    );
+                    info!(
+                        market_id = %market_id,
+                        position_id = %position.id,
+                        "One-legged position recovered to Open"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        market_id = %market_id,
+                        position_id = %position.id,
+                        error = %e,
+                        "One-legged recovery: state transition failed"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process ExitFailed positions eligible for retry.
     async fn process_failed_exits(&self) -> anyhow::Result<()> {
         let positions = self.position_repo.get_failed_exits().await?;
@@ -517,13 +647,14 @@ impl ExitHandler {
 
 /// Spawn the exit handler as a background task.
 pub fn spawn_exit_handler(
-    config: ExitHandlerConfig,
+    config: Arc<RwLock<ExitHandlerConfig>>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
     clob_client: Arc<ClobClient>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     pool: PgPool,
     arb_dedup: Arc<RwLock<HashSet<String>>>,
+    heartbeat: Arc<AtomicI64>,
 ) {
     let handler = ExitHandler::new(
         config,
@@ -533,6 +664,7 @@ pub fn spawn_exit_handler(
         signal_tx,
         pool,
         arb_dedup,
+        heartbeat,
     );
 
     tokio::spawn(async move {

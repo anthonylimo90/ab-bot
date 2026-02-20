@@ -261,6 +261,28 @@ impl ApiServer {
         let arb_config_arc = Arc::new(RwLock::new(arb_config_pre));
         self.state.arb_executor_config = Some(arb_config_arc.clone());
 
+        // Pre-create exit handler config Arc (must happen before Arc-wrapping state)
+        let mut exit_config_pre = ExitHandlerConfig::from_env();
+        if !exit_config_pre.enabled {
+            match crate::runtime_sync::any_workspace_exit_handler_enabled(&self.state.pool).await {
+                Ok(true) => {
+                    exit_config_pre.enabled = true;
+                    info!(
+                        "Enabling exit handler because at least one workspace has exit_handler_enabled=true"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to read workspace exit_handler_enabled flags; falling back to env-only exit config"
+                    );
+                }
+            }
+        }
+        let exit_config_arc = Arc::new(RwLock::new(exit_config_pre));
+        self.state.exit_handler_config = Some(exit_config_arc.clone());
+
         // Pre-create stop-loss config Arc (must happen before Arc-wrapping state)
         let stop_loss_config_arc: Option<Arc<tokio::sync::RwLock<CopyStopLossConfig>>> =
             if copy_monitor_args.is_some() {
@@ -322,34 +344,34 @@ impl ApiServer {
         // Shared dedup set for arb executor + exit handler
         let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
 
-        // Spawn arb auto-executor if enabled (config Arc created before wrap)
-        if arb_config_arc.read().await.enabled {
-            spawn_arb_auto_executor(
-                arb_config_arc.clone(),
-                state.subscribe_arb_entry(),
-                state.signal_tx.clone(),
-                state.order_executor.clone(),
-                state.circuit_breaker.clone(),
-                state.clob_client.clone(),
-                state.pool.clone(),
-                arb_dedup.clone(),
-                state.active_clob_markets.clone(),
-            );
-        }
+        // Spawn arb auto-executor unconditionally (per-signal guard checks enabled)
+        spawn_arb_auto_executor(
+            arb_config_arc.clone(),
+            state.subscribe_arb_entry(),
+            state.signal_tx.clone(),
+            state.order_executor.clone(),
+            state.circuit_breaker.clone(),
+            state.clob_client.clone(),
+            state.pool.clone(),
+            arb_dedup.clone(),
+            state.active_clob_markets.clone(),
+            state.arb_executor_heartbeat.clone(),
+        );
 
-        // Spawn exit handler if enabled
-        let exit_config = ExitHandlerConfig::from_env();
-        if exit_config.enabled {
-            spawn_exit_handler(
-                exit_config,
-                state.order_executor.clone(),
-                state.circuit_breaker.clone(),
-                state.clob_client.clone(),
-                state.signal_tx.clone(),
-                state.pool.clone(),
-                arb_dedup.clone(),
-            );
-        }
+        // Spawn exit handler unconditionally (per-tick guard checks enabled)
+        spawn_exit_handler(
+            state
+                .exit_handler_config
+                .clone()
+                .unwrap_or_else(|| Arc::new(RwLock::new(ExitHandlerConfig::from_env()))),
+            state.order_executor.clone(),
+            state.circuit_breaker.clone(),
+            state.clob_client.clone(),
+            state.signal_tx.clone(),
+            state.pool.clone(),
+            arb_dedup.clone(),
+            state.exit_handler_heartbeat.clone(),
+        );
 
         // Spawn auto-optimizer background service
         let optimizer = Arc::new(

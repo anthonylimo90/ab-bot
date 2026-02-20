@@ -57,6 +57,7 @@ pub struct WorkspaceResponse {
     pub arb_auto_execute: bool,
     pub copy_trading_enabled: bool,
     pub live_trading_enabled: bool,
+    pub exit_handler_enabled: bool,
     pub my_role: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -113,6 +114,7 @@ pub struct UpdateWorkspaceRequest {
     pub arb_auto_execute: Option<bool>,
     pub copy_trading_enabled: Option<bool>,
     pub live_trading_enabled: Option<bool>,
+    pub exit_handler_enabled: Option<bool>,
 }
 
 /// Workspace member response.
@@ -165,6 +167,7 @@ struct WorkspaceDetailRow {
     arb_auto_execute: bool,
     copy_trading_enabled: bool,
     live_trading_enabled: bool,
+    exit_handler_enabled: bool,
     role: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -311,6 +314,7 @@ pub async fn get_workspace(
             COALESCE(w.arb_auto_execute, false) as arb_auto_execute,
             COALESCE(w.copy_trading_enabled, false) as copy_trading_enabled,
             COALESCE(w.live_trading_enabled, false) as live_trading_enabled,
+            COALESCE(w.exit_handler_enabled, false) as exit_handler_enabled,
             wm.role, w.created_at, w.updated_at
         FROM workspaces w
         INNER JOIN workspace_members wm ON w.id = wm.workspace_id
@@ -359,6 +363,7 @@ pub async fn get_workspace(
         arb_auto_execute: workspace.arb_auto_execute,
         copy_trading_enabled: workspace.copy_trading_enabled,
         live_trading_enabled: workspace.live_trading_enabled,
+        exit_handler_enabled: workspace.exit_handler_enabled,
         my_role: workspace.role,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
@@ -486,6 +491,7 @@ pub async fn update_workspace(
     add_param!(arb_auto_execute, "arb_auto_execute");
     add_param!(copy_trading_enabled, "copy_trading_enabled");
     add_param!(live_trading_enabled, "live_trading_enabled");
+    add_param!(exit_handler_enabled, "exit_handler_enabled");
 
     let query = format!(
         "UPDATE workspaces SET {} WHERE id = $1",
@@ -547,8 +553,46 @@ pub async fn update_workspace(
     if let Some(live_trading_enabled) = req.live_trading_enabled {
         q = q.bind(live_trading_enabled);
     }
+    if let Some(exit_handler_enabled) = req.exit_handler_enabled {
+        q = q.bind(exit_handler_enabled);
+    }
 
     q.execute(&state.pool).await?;
+
+    // ── Propagate toggle changes to running services ──
+
+    // Arb executor toggle propagation
+    if let Some(arb_val) = req.arb_auto_execute {
+        if let Some(ref arb_config) = state.arb_executor_config {
+            arb_config.write().await.enabled = arb_val;
+            tracing::info!(
+                arb_auto_execute = arb_val,
+                "Propagated arb toggle to runtime"
+            );
+        }
+    }
+
+    // Exit handler toggle propagation
+    if let Some(eh_val) = req.exit_handler_enabled {
+        if let Some(ref eh_config) = state.exit_handler_config {
+            eh_config.write().await.enabled = eh_val;
+            tracing::info!(
+                exit_handler_enabled = eh_val,
+                "Propagated exit handler toggle to runtime"
+            );
+        }
+    }
+
+    // Live trading toggle propagation
+    if let Some(live_val) = req.live_trading_enabled {
+        if live_val && state.order_executor.is_live_ready().await {
+            state.order_executor.set_live_mode(true);
+            tracing::info!("Propagated live trading ON to runtime");
+        } else if !live_val {
+            state.order_executor.set_live_mode(false);
+            tracing::info!("Propagated live trading OFF to runtime");
+        }
+    }
 
     // Audit log
     state.audit_logger.log_user_action(
@@ -1051,6 +1095,7 @@ pub struct ServiceStatusResponse {
     pub metrics_calculator: ServiceStatusItem,
     pub copy_trading: ServiceStatusItem,
     pub arb_executor: ServiceStatusItem,
+    pub exit_handler: ServiceStatusItem,
     pub live_trading: ServiceStatusItem,
 }
 
@@ -1352,6 +1397,7 @@ pub async fn get_service_status(
         copy_trading_enabled: bool,
         arb_auto_execute: bool,
         live_trading_enabled: bool,
+        exit_handler_enabled: bool,
     }
 
     let flags: WorkspaceServiceFlags = sqlx::query_as(
@@ -1359,7 +1405,8 @@ pub async fn get_service_status(
         SELECT
             COALESCE(copy_trading_enabled, FALSE) as copy_trading_enabled,
             COALESCE(arb_auto_execute, FALSE) as arb_auto_execute,
-            COALESCE(live_trading_enabled, FALSE) as live_trading_enabled
+            COALESCE(live_trading_enabled, FALSE) as live_trading_enabled,
+            COALESCE(exit_handler_enabled, FALSE) as exit_handler_enabled
         FROM workspaces
         WHERE id = $1
         "#,
@@ -1409,11 +1456,38 @@ pub async fn get_service_status(
         && copy_monitor_active
         && workspace_copy_wallets > 0;
 
-    // Check arb executor
-    let arb_env_enabled = std::env::var("ARB_AUTO_EXECUTE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    let arb_effective_enabled = arb_env_enabled || flags.arb_auto_execute;
+    // Check arb executor — read runtime config for actual enabled state
+    let arb_runtime_enabled = if let Some(ref arb_config) = state.arb_executor_config {
+        arb_config.read().await.enabled
+    } else {
+        let arb_env_enabled = std::env::var("ARB_AUTO_EXECUTE")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        arb_env_enabled || flags.arb_auto_execute
+    };
+
+    // Check exit handler — read runtime config for actual enabled state
+    let exit_handler_runtime_enabled = if let Some(ref eh_config) = state.exit_handler_config {
+        eh_config.read().await.enabled
+    } else {
+        flags.exit_handler_enabled
+    };
+
+    // Heartbeat staleness check (>120s since last heartbeat = task dead)
+    let now_epoch = chrono::Utc::now().timestamp();
+    let heartbeat_max_age_secs: i64 = 120;
+
+    let arb_heartbeat_ts = state
+        .arb_executor_heartbeat
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let arb_task_alive =
+        arb_heartbeat_ts > 0 && (now_epoch - arb_heartbeat_ts) < heartbeat_max_age_secs;
+
+    let exit_heartbeat_ts = state
+        .exit_handler_heartbeat
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let exit_task_alive =
+        exit_heartbeat_ts > 0 && (now_epoch - exit_heartbeat_ts) < heartbeat_max_age_secs;
 
     // Check live trading using actual executor mode/readiness.
     let live_mode = state.order_executor.is_live();
@@ -1457,9 +1531,21 @@ pub async fn get_service_status(
             },
         },
         arb_executor: ServiceStatusItem {
-            running: arb_effective_enabled,
-            reason: if !arb_effective_enabled {
-                Some("ARB_AUTO_EXECUTE=false and workspace arb_auto_execute=false".to_string())
+            running: arb_runtime_enabled && arb_task_alive,
+            reason: if !arb_runtime_enabled {
+                Some("Arb auto-executor is disabled (workspace and env)".to_string())
+            } else if !arb_task_alive {
+                Some("Arb auto-executor task is not responding (heartbeat stale)".to_string())
+            } else {
+                None
+            },
+        },
+        exit_handler: ServiceStatusItem {
+            running: exit_handler_runtime_enabled && exit_task_alive,
+            reason: if !exit_handler_runtime_enabled {
+                Some("Exit handler is disabled (workspace and env)".to_string())
+            } else if !exit_task_alive {
+                Some("Exit handler task is not responding (heartbeat stale)".to_string())
             } else {
                 None
             },

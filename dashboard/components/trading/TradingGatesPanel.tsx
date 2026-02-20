@@ -68,10 +68,21 @@ function GateSection({ title, gates }: { title: string; gates: GateRow[] }) {
 function buildCoreGates(workspace: Workspace, serviceStatus: ServiceStatus | null): GateRow[] {
   const gates: GateRow[] = [];
 
+  // Cross-reference workspace flag with service status for honest reporting
+  const liveConfigured = workspace.live_trading_enabled;
+  const liveRunning = serviceStatus?.live_trading?.running ?? false;
   gates.push({
     label: 'Live Trading',
-    status: workspace.live_trading_enabled ? 'green' : 'red',
-    value: workspace.live_trading_enabled ? 'Enabled' : 'Disabled',
+    status: liveConfigured && liveRunning
+      ? 'green'
+      : liveConfigured && !liveRunning
+        ? 'red'
+        : 'red',
+    value: liveConfigured && liveRunning
+      ? 'Running'
+      : liveConfigured && !liveRunning
+        ? serviceStatus?.live_trading?.reason || 'Offline'
+        : 'Disabled',
   });
 
   // Wallet readiness: prefer the DB field, but fall back to the live_trading
@@ -95,10 +106,38 @@ function buildCoreGates(workspace: Workspace, serviceStatus: ServiceStatus | nul
     value: workspace.copy_trading_enabled ? 'Enabled' : 'Disabled',
   });
 
+  // Cross-reference arb flag with service status for honest reporting
+  const arbConfigured = workspace.arb_auto_execute;
+  const arbRunning = serviceStatus?.arb_executor?.running ?? false;
   gates.push({
     label: 'Arb Auto-Execute',
-    status: workspace.arb_auto_execute ? 'green' : 'amber',
-    value: workspace.arb_auto_execute ? 'Enabled' : 'Manual',
+    status: arbConfigured && arbRunning
+      ? 'green'
+      : arbConfigured && !arbRunning
+        ? 'red'
+        : 'amber',
+    value: arbConfigured && arbRunning
+      ? 'Running'
+      : arbConfigured && !arbRunning
+        ? serviceStatus?.arb_executor?.reason || 'Offline'
+        : 'Manual',
+  });
+
+  // Exit handler gate
+  const ehConfigured = workspace.exit_handler_enabled;
+  const ehRunning = serviceStatus?.exit_handler?.running ?? false;
+  gates.push({
+    label: 'Exit Handler',
+    status: ehConfigured && ehRunning
+      ? 'green'
+      : ehConfigured && !ehRunning
+        ? 'red'
+        : 'amber',
+    value: ehConfigured && ehRunning
+      ? 'Running'
+      : ehConfigured && !ehRunning
+        ? serviceStatus?.exit_handler?.reason || 'Offline'
+        : 'Disabled',
   });
 
   const hasRpc = !!(workspace.polygon_rpc_url || workspace.alchemy_api_key);
@@ -198,6 +237,7 @@ function buildServiceGates(serviceStatus: ServiceStatus | null): GateRow[] {
   const entries: [string, { running: boolean; reason?: string }][] = [
     ['Copy Trading Monitor', serviceStatus.copy_trading],
     ['Arb Executor', serviceStatus.arb_executor],
+    ['Exit Handler', serviceStatus.exit_handler],
     ['Live Trading', serviceStatus.live_trading],
     ['Harvester', serviceStatus.harvester],
     ['Metrics Calculator', serviceStatus.metrics_calculator],

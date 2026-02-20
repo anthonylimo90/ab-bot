@@ -380,6 +380,46 @@ impl Position {
         Some(recovered_state)
     }
 
+    /// Check if this is a one-legged entry failure (YES filled but NO failed).
+    pub fn is_one_legged_entry_fail(&self) -> bool {
+        if self.state != PositionState::EntryFailed {
+            return false;
+        }
+        match &self.failure_reason {
+            Some(FailureReason::OrderRejected { message })
+            | Some(FailureReason::ConnectivityError { message }) => {
+                let lower = message.to_lowercase();
+                lower.contains("one-legged") || lower.contains("one_legged")
+            }
+            _ => false,
+        }
+    }
+
+    /// Recover a one-legged entry-failed position back to Open state.
+    /// Should only be called after the missing NO leg has been successfully placed.
+    pub fn recover_one_legged_to_open(&mut self) -> std::result::Result<(), String> {
+        if self.state != PositionState::EntryFailed {
+            return Err(format!(
+                "Cannot recover one-legged from {:?} (expected EntryFailed)",
+                self.state
+            ));
+        }
+        if !self.is_one_legged_entry_fail() {
+            return Err("Position is not a one-legged entry failure".to_string());
+        }
+        if self.retry_count >= MAX_RETRY_ATTEMPTS {
+            return Err(format!(
+                "Max retries exceeded ({}/{})",
+                self.retry_count, MAX_RETRY_ATTEMPTS
+            ));
+        }
+        self.state = PositionState::Open;
+        self.failure_reason = None;
+        self.retry_count += 1;
+        self.last_updated = Utc::now();
+        Ok(())
+    }
+
     /// Touch the position to update last_updated timestamp.
     pub fn touch(&mut self) {
         self.last_updated = Utc::now();

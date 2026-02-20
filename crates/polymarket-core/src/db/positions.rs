@@ -255,6 +255,30 @@ impl PositionRepository {
         Ok(rows.iter().map(Self::row_to_position).collect())
     }
 
+    /// Get one-legged entry failures eligible for recovery (retry_count < 3).
+    /// These are positions where YES filled but NO failed, identifiable by
+    /// failure_reason containing "one-legged" or "one_legged".
+    pub async fn get_one_legged_entry_failed(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated
+            FROM positions
+            WHERE state = 5
+              AND retry_count < 3
+              AND (failure_reason ILIKE '%one-legged%' OR failure_reason ILIKE '%one_legged%')
+            ORDER BY last_updated ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
     /// Get position statistics.
     pub async fn get_stats(&self) -> Result<PositionStats> {
         let row = sqlx::query(

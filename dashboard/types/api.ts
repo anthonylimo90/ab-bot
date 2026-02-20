@@ -668,6 +668,7 @@ export interface Workspace {
   arb_auto_execute: boolean;
   copy_trading_enabled: boolean;
   live_trading_enabled: boolean;
+  exit_handler_enabled: boolean;
   my_role: WorkspaceRole;
   onboarding_completed?: boolean;
   created_by?: string;
@@ -816,6 +817,7 @@ export interface UpdateWorkspaceRequest {
   arb_auto_execute?: boolean;
   copy_trading_enabled?: boolean;
   live_trading_enabled?: boolean;
+  exit_handler_enabled?: boolean;
 }
 
 export interface UpdateOpportunitySelectionRequest {
@@ -1015,6 +1017,7 @@ export interface ServiceStatus {
   metrics_calculator: ServiceStatusItem;
   copy_trading: ServiceStatusItem;
   arb_executor: ServiceStatusItem;
+  exit_handler: ServiceStatusItem;
   live_trading: ServiceStatusItem;
 }
 

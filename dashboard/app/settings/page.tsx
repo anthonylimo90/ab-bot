@@ -52,6 +52,7 @@ export default function SettingsPage() {
   const [copyTradingEnabled, setCopyTradingEnabled] = useState(false);
   const [arbAutoExecute, setArbAutoExecute] = useState(false);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
+  const [exitHandlerEnabled, setExitHandlerEnabled] = useState(false);
 
   // Risk management form state (backed by API, not localStorage)
   const [isSavingRisk, setIsSavingRisk] = useState(false);
@@ -141,6 +142,7 @@ export default function SettingsPage() {
       setCopyTradingEnabled(currentWorkspace.copy_trading_enabled ?? false);
       setArbAutoExecute(currentWorkspace.arb_auto_execute ?? false);
       setLiveTradingEnabled(currentWorkspace.live_trading_enabled ?? false);
+      setExitHandlerEnabled(currentWorkspace.exit_handler_enabled ?? false);
     }
   }, [currentWorkspace]);
 
@@ -187,6 +189,7 @@ export default function SettingsPage() {
         copy_trading_enabled: copyTradingEnabled,
         arb_auto_execute: arbAutoExecute,
         live_trading_enabled: liveTradingEnabled,
+        exit_handler_enabled: exitHandlerEnabled,
       };
       if (polygonRpcUrl) updates.polygon_rpc_url = polygonRpcUrl;
       if (alchemyApiKey) updates.alchemy_api_key = alchemyApiKey;
@@ -535,6 +538,20 @@ export default function SettingsPage() {
               <Switch
                 checked={arbAutoExecute}
                 onCheckedChange={setArbAutoExecute}
+              />
+            </div>
+
+            {/* Exit Handler Toggle */}
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="font-medium">Exit Handler</p>
+                <p className="text-sm text-muted-foreground">
+                  Automatically close positions via market exit or resolution
+                </p>
+              </div>
+              <Switch
+                checked={exitHandlerEnabled}
+                onCheckedChange={setExitHandlerEnabled}
               />
             </div>
 
