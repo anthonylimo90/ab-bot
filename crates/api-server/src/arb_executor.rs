@@ -254,6 +254,11 @@ impl ArbAutoExecutor {
         // Skip the first immediate tick (we already loaded above)
         cache_ticker.tick().await;
 
+        // Heartbeat ticker keeps the liveness stamp fresh even when no signals arrive.
+        // Must be well under the 120s staleness threshold checked by the status endpoint.
+        let mut heartbeat_ticker = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        heartbeat_ticker.tick().await;
+
         loop {
             // Update heartbeat to prove liveness
             self.heartbeat
@@ -281,6 +286,10 @@ impl ArbAutoExecutor {
                         Ok(count) => debug!(markets = count, "Token cache refreshed"),
                         Err(e) => warn!(error = %e, "Token cache refresh failed"),
                     }
+                }
+                _ = heartbeat_ticker.tick() => {
+                    // No-op: the heartbeat stamp at the top of the loop is sufficient.
+                    // This arm just ensures the loop wakes up during quiet periods.
                 }
             }
         }
