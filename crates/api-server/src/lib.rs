@@ -193,8 +193,12 @@ impl ApiServer {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(rust_decimal::Decimal::new(10000, 0));
-            let copy_trader = CopyTrader::new(self.state.order_executor.clone(), total_capital)
-                .with_policy(trading_engine::CopyTradingPolicy::from_env());
+            let copy_trader = CopyTrader::new(
+                self.state.order_executor.clone(),
+                total_capital,
+                self.state.copy_near_resolution_margin.clone(),
+            )
+            .with_policy(trading_engine::CopyTradingPolicy::from_env());
             let copy_trader = Arc::new(RwLock::new(copy_trader));
             let copy_latency_atomic = Arc::new(AtomicI64::new(copy_config.max_latency_secs));
 
@@ -202,6 +206,8 @@ impl ApiServer {
                 &self.state.pool,
                 &copy_trader,
                 Some(&copy_latency_atomic),
+                Some(&self.state.copy_total_capital),
+                Some(&self.state.copy_near_resolution_margin),
             )
             .await
             {
@@ -397,6 +403,8 @@ impl ApiServer {
             copy_latency_atomic,
             state.copy_stop_loss_config.clone(),
             state.arb_executor_config.clone(),
+            Some(state.copy_total_capital.clone()),
+            Some(state.copy_near_resolution_margin.clone()),
         );
 
         // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
@@ -444,6 +452,7 @@ impl ApiServer {
                 state.pool.clone(),
                 latency_atomic,
                 state.active_clob_markets.clone(),
+                state.copy_total_capital.clone(),
             );
 
             // Spawn copy-trade stop-loss / mirror-exit monitor

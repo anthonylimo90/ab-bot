@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 
 use polymarket_core::types::OrderSide;
 use trading_engine::copy_trader::{
@@ -75,6 +75,8 @@ pub struct CopyTradingMonitor {
     /// Set of active (non-resolved) CLOB market IDs, populated by OutcomeTokenCache.
     /// When non-empty, trades for markets not in this set are skipped.
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
+    /// Total copy-trading capital in cents. Read per-trade, written by dynamic config subscriber.
+    copy_total_capital: Arc<AtomicI64>,
 }
 
 impl CopyTradingMonitor {
@@ -88,6 +90,7 @@ impl CopyTradingMonitor {
         pool: PgPool,
         max_latency_secs: Arc<AtomicI64>,
         active_clob_markets: Arc<RwLock<HashSet<String>>>,
+        copy_total_capital: Arc<AtomicI64>,
     ) -> Self {
         Self {
             config,
@@ -98,6 +101,7 @@ impl CopyTradingMonitor {
             pool,
             max_latency_secs,
             active_clob_markets,
+            copy_total_capital,
         }
     }
 
@@ -224,6 +228,14 @@ impl CopyTradingMonitor {
     }
 
     async fn process_trade(&self, trade: WalletTrade) -> anyhow::Result<()> {
+        // Read runtime-tunable total capital (stored as cents) and push to copy trader.
+        let capital_cents = self.copy_total_capital.load(Ordering::Relaxed);
+        if capital_cents > 0 {
+            let capital = Decimal::new(capital_cents, 2); // cents → dollars
+            let mut ct = self.copy_trader.write().await;
+            ct.update_capital(capital);
+        }
+
         let policy_min_trade_value = {
             let copy_trader = self.copy_trader.read().await;
             copy_trader.policy().min_trade_value
@@ -231,7 +243,7 @@ impl CopyTradingMonitor {
 
         // Check minimum trade value
         if trade.value < policy_min_trade_value {
-            trace!(
+            info!(
                 wallet = %trade.wallet_address,
                 value = %trade.value,
                 min = %policy_min_trade_value,
@@ -697,7 +709,7 @@ impl CopyTradingMonitor {
                         format!("Outcome {outcome_id} not found on CLOB (resolved or delisted)"),
                     ),
                 };
-                trace!(
+                info!(
                     wallet = %trade.wallet_address,
                     rejection = ?rejection,
                     "Trade rejected by copy-trader runtime policy"
@@ -707,7 +719,7 @@ impl CopyTradingMonitor {
                     .await;
             }
             Ok(CopyTradeProcessOutcome::Skipped) => {
-                trace!(
+                info!(
                     wallet = %trade.wallet_address,
                     "Trade not copied (wallet not tracked, disabled, or trade filtered)"
                 );
@@ -750,6 +762,7 @@ pub fn spawn_copy_trading_monitor(
     pool: PgPool,
     max_latency_secs: Arc<AtomicI64>,
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
+    copy_total_capital: Arc<AtomicI64>,
 ) {
     let monitor = CopyTradingMonitor::new(
         config,
@@ -760,6 +773,7 @@ pub fn spawn_copy_trading_monitor(
         pool,
         max_latency_secs,
         active_clob_markets,
+        copy_total_capital,
     );
 
     tokio::spawn(async move {

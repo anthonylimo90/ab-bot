@@ -71,12 +71,15 @@ const COPY_TRADING_KEYS = new Set([
   'COPY_STOP_LOSS_PCT',
   'COPY_TAKE_PROFIT_PCT',
   'COPY_MAX_HOLD_HOURS',
+  'COPY_TOTAL_CAPITAL',
+  'COPY_NEAR_RESOLUTION_MARGIN',
 ]);
 
 const ARB_EXECUTOR_KEYS = new Set([
   'ARB_POSITION_SIZE',
   'ARB_MIN_NET_PROFIT',
   'ARB_MIN_BOOK_DEPTH',
+  'ARB_MAX_SIGNAL_AGE_SECS',
 ]);
 
 interface CopyTradingDraft {
@@ -88,12 +91,15 @@ interface CopyTradingDraft {
   stop_loss_pct: number;
   take_profit_pct: number;
   max_hold_hours: number;
+  total_capital: number;
+  near_resolution_margin: number;
 }
 
 interface ArbExecutorDraft {
   position_size: number;
   min_net_profit: number;
   min_book_depth: number;
+  max_signal_age_secs: number;
 }
 
 interface OpportunitySelectionDraft {
@@ -302,6 +308,8 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       stop_loss_pct: findVal('COPY_STOP_LOSS_PCT') ?? 0.15,
       take_profit_pct: findVal('COPY_TAKE_PROFIT_PCT') ?? 0.25,
       max_hold_hours: findVal('COPY_MAX_HOLD_HOURS') ?? 72,
+      total_capital: findVal('COPY_TOTAL_CAPITAL') ?? 10000,
+      near_resolution_margin: findVal('COPY_NEAR_RESOLUTION_MARGIN') ?? 0.03,
     };
   }, [dynamicTunerStatus]);
 
@@ -332,6 +340,8 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
         stop_loss_pct: copyTradingDraft.stop_loss_pct,
         take_profit_pct: copyTradingDraft.take_profit_pct,
         max_hold_hours: Math.round(copyTradingDraft.max_hold_hours),
+        total_capital: copyTradingDraft.total_capital,
+        near_resolution_margin: copyTradingDraft.near_resolution_margin,
       });
     },
     onSuccess: () => {
@@ -358,6 +368,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       position_size: findVal('ARB_POSITION_SIZE') ?? 50,
       min_net_profit: findVal('ARB_MIN_NET_PROFIT') ?? 0.001,
       min_book_depth: findVal('ARB_MIN_BOOK_DEPTH') ?? 100,
+      max_signal_age_secs: findVal('ARB_MAX_SIGNAL_AGE_SECS') ?? 30,
     };
   }, [dynamicTunerStatus]);
 
@@ -382,6 +393,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
         position_size: arbExecutorDraft.position_size,
         min_net_profit: arbExecutorDraft.min_net_profit,
         min_book_depth: arbExecutorDraft.min_book_depth,
+        max_signal_age_secs: arbExecutorDraft.max_signal_age_secs,
       });
     },
     onSuccess: () => {
@@ -1188,6 +1200,55 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                           <span className="text-sm text-muted-foreground">hrs</span>
                         </div>
                       </div>
+
+                      {/* Total Copy Capital */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Total Copy Capital</p>
+                          <p className="text-xs text-muted-foreground">Overall budget for copy trading positions</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-sm text-muted-foreground">$</span>
+                          <Input
+                            type="number"
+                            min={100}
+                            max={500000}
+                            step={100}
+                            value={copyTradingDraft.total_capital}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, total_capital: clamp(v, 100, 500000) } : d
+                              );
+                            }}
+                            className="w-28 text-right"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Near-Resolution Margin */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Near-Resolution Margin</p>
+                          <p className="text-xs text-muted-foreground">Skip markets within this margin of 0 or 1. Set 0 to disable.</p>
+                        </div>
+                        <Input
+                          type="number"
+                          min={0}
+                          max={0.25}
+                          step={0.01}
+                          value={copyTradingDraft.near_resolution_margin}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isFinite(v)) return;
+                            setCopyTradingDraft((d) =>
+                              d ? { ...d, near_resolution_margin: clamp(v, 0, 0.25) } : d
+                            );
+                          }}
+                          className="w-24 text-right"
+                        />
+                      </div>
                     </div>
 
                     <Button
@@ -1292,6 +1353,32 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                             }}
                             className="w-24 text-right"
                           />
+                        </div>
+                      </div>
+
+                      {/* Max Signal Age */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Max Signal Age</p>
+                          <p className="text-xs text-muted-foreground">Discard arb signals older than this</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={5}
+                            max={300}
+                            step={5}
+                            value={arbExecutorDraft.max_signal_age_secs}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setArbExecutorDraft((d) =>
+                                d ? { ...d, max_signal_age_secs: clamp(v, 5, 300) } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">s</span>
                         </div>
                       </div>
                     </div>

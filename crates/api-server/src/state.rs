@@ -105,6 +105,10 @@ pub struct AppState {
     pub arb_executor_heartbeat: Arc<AtomicI64>,
     /// Heartbeat timestamp (epoch secs) from exit handler loop — 0 means never updated.
     pub exit_handler_heartbeat: Arc<AtomicI64>,
+    /// Total copy-trading capital in cents (e.g. 1_000_000 = $10,000).
+    pub copy_total_capital: Arc<AtomicI64>,
+    /// Near-resolution margin stored as margin * 10,000 (e.g. 300 = 0.03). 0 = filter disabled.
+    pub copy_near_resolution_margin: Arc<AtomicI64>,
 }
 
 impl AppState {
@@ -495,6 +499,20 @@ impl AppState {
             exit_handler_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
+            copy_total_capital: Arc::new(AtomicI64::new(
+                std::env::var("COPY_TOTAL_CAPITAL")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|dollars| (dollars * 100.0) as i64)
+                    .unwrap_or(1_000_000), // $10,000 default
+            )),
+            copy_near_resolution_margin: Arc::new(AtomicI64::new(
+                std::env::var("COPY_NEAR_RESOLUTION_MARGIN")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .map(|m| (m * 10_000.0) as i64)
+                    .unwrap_or(300), // 0.03 default
+            )),
         })
     }
 

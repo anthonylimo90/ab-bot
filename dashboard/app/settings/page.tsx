@@ -61,6 +61,8 @@ export default function SettingsPage() {
   const [riskMaxConsecutiveLosses, setRiskMaxConsecutiveLosses] = useState<number | ''>('');
   const [riskCooldownMinutes, setRiskCooldownMinutes] = useState<number | ''>('');
   const [riskEnabled, setRiskEnabled] = useState(true);
+  const [isTrippingCb, setIsTrippingCb] = useState(false);
+  const [isResettingCb, setIsResettingCb] = useState(false);
 
   const {
     connectedWallets,
@@ -223,6 +225,34 @@ export default function SettingsPage() {
       toast.error('Failed to save risk settings', err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsSavingRisk(false);
+    }
+  };
+
+  const handleTripCircuitBreaker = async () => {
+    if (!currentWorkspace) return;
+    setIsTrippingCb(true);
+    try {
+      await api.manualTripCircuitBreaker(currentWorkspace.id);
+      toast.success('Circuit breaker tripped', 'All automated trading has been paused');
+      queryClient.invalidateQueries({ queryKey: ['risk-status', currentWorkspace.id] });
+    } catch (err) {
+      toast.error('Failed to trip circuit breaker', err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setIsTrippingCb(false);
+    }
+  };
+
+  const handleResetCircuitBreaker = async () => {
+    if (!currentWorkspace) return;
+    setIsResettingCb(true);
+    try {
+      await api.resetCircuitBreaker(currentWorkspace.id);
+      toast.success('Circuit breaker reset', 'Automated trading has been resumed');
+      queryClient.invalidateQueries({ queryKey: ['risk-status', currentWorkspace.id] });
+    } catch (err) {
+      toast.error('Failed to reset circuit breaker', err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setIsResettingCb(false);
     }
   };
 
@@ -822,6 +852,44 @@ export default function SettingsPage() {
                     disabled={!canManageRisk}
                   />
                 </div>
+
+                {/* Manual Trip / Reset Buttons */}
+                {canManageRisk && (
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="font-medium">Manual Override</p>
+                      <p className="text-sm text-muted-foreground">
+                        Immediately trip or reset the circuit breaker
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={handleTripCircuitBreaker}
+                        disabled={isTrippingCb || riskStatus?.circuit_breaker?.tripped}
+                      >
+                        {isTrippingCb ? (
+                          <><RefreshCw className="mr-1 h-3 w-3 animate-spin" />Tripping...</>
+                        ) : (
+                          <><AlertTriangle className="mr-1 h-3 w-3" />Trip</>
+                        )}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleResetCircuitBreaker}
+                        disabled={isResettingCb || !riskStatus?.circuit_breaker?.tripped}
+                      >
+                        {isResettingCb ? (
+                          <><RefreshCw className="mr-1 h-3 w-3 animate-spin" />Resetting...</>
+                        ) : (
+                          <><Shield className="mr-1 h-3 w-3" />Reset</>
+                        )}
+                      </Button>
+                    </div>
+                  </div>
+                )}
 
                 {/* Current Runtime Stats */}
                 <div className="rounded-lg border p-4 space-y-1">

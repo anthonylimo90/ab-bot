@@ -37,6 +37,9 @@ const KEY_COPY_MAX_HOLD_HOURS: &str = "COPY_MAX_HOLD_HOURS";
 const KEY_ARB_POSITION_SIZE: &str = "ARB_POSITION_SIZE";
 const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
 const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
+const KEY_ARB_MAX_SIGNAL_AGE_SECS: &str = "ARB_MAX_SIGNAL_AGE_SECS";
+const KEY_COPY_TOTAL_CAPITAL: &str = "COPY_TOTAL_CAPITAL";
+const KEY_COPY_NEAR_RESOLUTION_MARGIN: &str = "COPY_NEAR_RESOLUTION_MARGIN";
 
 const EPSILON: f64 = 1e-6;
 
@@ -1042,6 +1045,27 @@ impl DynamicTuner {
                 max_value: Decimal::new(1000, 0), // $1,000 ceiling
                 max_step_pct: Decimal::new(20, 2),
             },
+            ConfigSeed {
+                key: KEY_ARB_MAX_SIGNAL_AGE_SECS,
+                default_value: env_decimal("ARB_MAX_SIGNAL_AGE_SECS", Decimal::new(30, 0)),
+                min_value: Decimal::new(5, 0),   // 5s floor
+                max_value: Decimal::new(300, 0), // 300s ceiling
+                max_step_pct: Decimal::new(25, 2),
+            },
+            ConfigSeed {
+                key: KEY_COPY_TOTAL_CAPITAL,
+                default_value: env_decimal("COPY_TOTAL_CAPITAL", Decimal::new(10000, 0)),
+                min_value: Decimal::new(100, 0),    // $100 floor
+                max_value: Decimal::new(500000, 0), // $500,000 ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
+            ConfigSeed {
+                key: KEY_COPY_NEAR_RESOLUTION_MARGIN,
+                default_value: env_decimal("COPY_NEAR_RESOLUTION_MARGIN", Decimal::new(3, 2)),
+                min_value: Decimal::ZERO,       // 0 = disabled
+                max_value: Decimal::new(25, 2), // 0.25 ceiling
+                max_step_pct: Decimal::new(50, 2),
+            },
         ];
 
         for seed in seeds {
@@ -1294,6 +1318,8 @@ pub fn spawn_dynamic_config_subscriber(
     max_latency_secs: Option<Arc<AtomicI64>>,
     copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
     arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
+    copy_total_capital: Option<Arc<AtomicI64>>,
+    copy_near_resolution_margin: Option<Arc<AtomicI64>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1304,6 +1330,8 @@ pub fn spawn_dynamic_config_subscriber(
                 max_latency_secs.clone(),
                 copy_stop_loss_config.clone(),
                 arb_executor_config.clone(),
+                copy_total_capital.clone(),
+                copy_near_resolution_margin.clone(),
             )
             .await
             {
@@ -1325,9 +1353,19 @@ pub async fn sync_dynamic_config_snapshot_to_copy_trader(
     pool: &PgPool,
     copy_trader: &Arc<RwLock<CopyTrader>>,
     max_latency_secs: Option<&Arc<AtomicI64>>,
+    copy_total_capital: Option<&Arc<AtomicI64>>,
+    copy_near_resolution_margin: Option<&Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let bounds = load_dynamic_bounds(pool).await;
-    apply_startup_snapshot_to_copy_trader(pool, copy_trader, &bounds, max_latency_secs).await
+    apply_startup_snapshot_to_copy_trader(
+        pool,
+        copy_trader,
+        &bounds,
+        max_latency_secs,
+        copy_total_capital,
+        copy_near_resolution_margin,
+    )
+    .await
 }
 
 async fn run_dynamic_config_subscriber(
@@ -1337,6 +1375,8 @@ async fn run_dynamic_config_subscriber(
     max_latency_secs: Option<Arc<AtomicI64>>,
     copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
     arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
+    copy_total_capital: Option<Arc<AtomicI64>>,
+    copy_near_resolution_margin: Option<Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let allowed_sources = load_allowed_update_sources();
     let bounds = load_dynamic_bounds(&pool).await;
@@ -1354,9 +1394,15 @@ async fn run_dynamic_config_subscriber(
     // Subscribe before snapshot application so updates published during startup
     // are queued and processed after snapshot reconciliation.
     if let Some(ref trader) = copy_trader {
-        if let Err(e) =
-            apply_startup_snapshot_to_copy_trader(&pool, trader, &bounds, max_latency_secs.as_ref())
-                .await
+        if let Err(e) = apply_startup_snapshot_to_copy_trader(
+            &pool,
+            trader,
+            &bounds,
+            max_latency_secs.as_ref(),
+            copy_total_capital.as_ref(),
+            copy_near_resolution_margin.as_ref(),
+        )
+        .await
         {
             warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
         }
@@ -1468,6 +1514,39 @@ async fn run_dynamic_config_subscriber(
             }
         }
 
+        // Apply copy total capital to shared atomic (stored as cents)
+        if update.key == KEY_COPY_TOTAL_CAPITAL {
+            if let Some(ref atomic) = copy_total_capital {
+                if let Some(dollars) = update.value.to_i64() {
+                    atomic.store(dollars * 100, Ordering::Relaxed);
+                    info!(
+                        key = %update.key,
+                        value = %update.value,
+                        source = %update.source,
+                        "Applied copy total capital update at runtime"
+                    );
+                }
+            }
+        }
+
+        // Apply near-resolution margin to shared atomic (stored as margin * 10,000)
+        if update.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
+            if let Some(ref atomic) = copy_near_resolution_margin {
+                // value is e.g. 0.03 → store as 300
+                let margin_raw = (update.value * Decimal::new(10_000, 0))
+                    .to_i64()
+                    .unwrap_or(0);
+                atomic.store(margin_raw, Ordering::Relaxed);
+                info!(
+                    key = %update.key,
+                    value = %update.value,
+                    margin_raw,
+                    source = %update.source,
+                    "Applied near-resolution margin update at runtime"
+                );
+            }
+        }
+
         // Apply arb executor config updates
         if let Some(ref arb_config) = arb_executor_config {
             let applied = match update.key.as_str() {
@@ -1482,6 +1561,14 @@ async fn run_dynamic_config_subscriber(
                 KEY_ARB_MIN_BOOK_DEPTH => {
                     arb_config.write().await.min_book_depth = update.value;
                     true
+                }
+                KEY_ARB_MAX_SIGNAL_AGE_SECS => {
+                    if let Some(secs) = update.value.to_i64() {
+                        arb_config.write().await.max_signal_age_secs = secs;
+                        true
+                    } else {
+                        false
+                    }
                 }
                 _ => false,
             };
@@ -1575,6 +1662,8 @@ async fn apply_startup_snapshot_to_copy_trader(
     copy_trader: &Arc<RwLock<CopyTrader>>,
     bounds: &HashMap<String, (Decimal, Decimal)>,
     max_latency_secs: Option<&Arc<AtomicI64>>,
+    copy_total_capital: Option<&Arc<AtomicI64>>,
+    copy_near_resolution_margin: Option<&Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let rows: Vec<DynamicValueRow> = sqlx::query_as(
         r#"
@@ -1611,6 +1700,25 @@ async fn apply_startup_snapshot_to_copy_trader(
                     atomic.store(secs, Ordering::Relaxed);
                     applied += 1;
                 }
+            }
+        }
+
+        // Apply total capital to the shared atomic (stored as cents)
+        if row.key == KEY_COPY_TOTAL_CAPITAL {
+            if let Some(atomic) = copy_total_capital {
+                if let Some(dollars) = value.to_i64() {
+                    atomic.store(dollars * 100, Ordering::Relaxed);
+                    applied += 1;
+                }
+            }
+        }
+
+        // Apply near-resolution margin to the shared atomic (stored as margin * 10,000)
+        if row.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
+            if let Some(atomic) = copy_near_resolution_margin {
+                let margin_raw = (value * Decimal::new(10_000, 0)).to_i64().unwrap_or(0);
+                atomic.store(margin_raw, Ordering::Relaxed);
+                applied += 1;
             }
         }
     }
@@ -1658,6 +1766,14 @@ async fn apply_startup_snapshot_to_arb_executor(
             KEY_ARB_MIN_BOOK_DEPTH => {
                 arb_config.write().await.min_book_depth = value;
                 true
+            }
+            KEY_ARB_MAX_SIGNAL_AGE_SECS => {
+                if let Some(secs) = value.to_i64() {
+                    arb_config.write().await.max_signal_age_secs = secs;
+                    true
+                } else {
+                    false
+                }
             }
             _ => false,
         };
@@ -1717,6 +1833,9 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
         KEY_ARB_POSITION_SIZE,
         KEY_ARB_MIN_NET_PROFIT,
         KEY_ARB_MIN_BOOK_DEPTH,
+        KEY_ARB_MAX_SIGNAL_AGE_SECS,
+        KEY_COPY_TOTAL_CAPITAL,
+        KEY_COPY_NEAR_RESOLUTION_MARGIN,
     ] {
         if let Some(bounds) = fallback_bounds_for_key(key) {
             map.insert(key.to_string(), bounds);
@@ -1737,6 +1856,9 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
         KEY_ARB_POSITION_SIZE => Some((Decimal::new(10, 0), Decimal::new(500, 0))),
         KEY_ARB_MIN_NET_PROFIT => Some((Decimal::new(5, 4), Decimal::new(5, 2))),
         KEY_ARB_MIN_BOOK_DEPTH => Some((Decimal::new(25, 0), Decimal::new(1000, 0))),
+        KEY_ARB_MAX_SIGNAL_AGE_SECS => Some((Decimal::new(5, 0), Decimal::new(300, 0))),
+        KEY_COPY_TOTAL_CAPITAL => Some((Decimal::new(100, 0), Decimal::new(500000, 0))),
+        KEY_COPY_NEAR_RESOLUTION_MARGIN => Some((Decimal::ZERO, Decimal::new(25, 2))),
         _ => None,
     }
 }
