@@ -111,13 +111,20 @@ impl ArbExecutorConfig {
 struct OutcomeTokenCache {
     clob_client: Arc<ClobClient>,
     tokens: RwLock<HashMap<String, (String, String)>>,
+    /// Shared set of active (non-resolved) market IDs, populated on each refresh.
+    /// Copy trading monitor reads this to skip resolved markets before hitting CLOB.
+    active_clob_markets: Arc<RwLock<HashSet<String>>>,
 }
 
 impl OutcomeTokenCache {
-    fn new(clob_client: Arc<ClobClient>) -> Self {
+    fn new(
+        clob_client: Arc<ClobClient>,
+        active_clob_markets: Arc<RwLock<HashSet<String>>>,
+    ) -> Self {
         Self {
             clob_client,
             tokens: RwLock::new(HashMap::new()),
+            active_clob_markets,
         }
     }
 
@@ -125,8 +132,18 @@ impl OutcomeTokenCache {
     async fn refresh(&self) -> anyhow::Result<usize> {
         let markets = self.clob_client.get_markets().await?;
         let mut map = HashMap::new();
+        let mut active_set = HashSet::new();
 
         for market in &markets {
+            if !market.resolved {
+                active_set.insert(market.id.clone());
+                // Also insert outcome token IDs so trades whose market_id
+                // fell back to asset_id (when condition_id is absent) still
+                // match the active set.
+                for outcome in &market.outcomes {
+                    active_set.insert(outcome.token_id.clone());
+                }
+            }
             if market.outcomes.len() == 2 {
                 let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
                     (
@@ -145,6 +162,7 @@ impl OutcomeTokenCache {
 
         let count = map.len();
         *self.tokens.write().await = map;
+        *self.active_clob_markets.write().await = active_set;
         Ok(count)
     }
 
@@ -180,6 +198,7 @@ impl ArbAutoExecutor {
         clob_client: Arc<ClobClient>,
         pool: PgPool,
         active_markets: Arc<RwLock<HashSet<String>>>,
+        active_clob_markets: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
         Self {
             config,
@@ -188,7 +207,7 @@ impl ArbAutoExecutor {
             order_executor,
             circuit_breaker,
             position_repo: PositionRepository::new(pool),
-            token_cache: OutcomeTokenCache::new(clob_client),
+            token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets),
             active_markets,
         }
     }
@@ -560,6 +579,7 @@ pub fn spawn_arb_auto_executor(
     clob_client: Arc<ClobClient>,
     pool: PgPool,
     active_markets: Arc<RwLock<HashSet<String>>>,
+    active_clob_markets: Arc<RwLock<HashSet<String>>>,
 ) {
     let executor = ArbAutoExecutor::new(
         config,
@@ -570,6 +590,7 @@ pub fn spawn_arb_auto_executor(
         clob_client,
         pool,
         active_markets,
+        active_clob_markets,
     );
 
     tokio::spawn(async move {

@@ -319,6 +319,7 @@ impl ApiServer {
                 state.clob_client.clone(),
                 state.pool.clone(),
                 arb_dedup.clone(),
+                state.active_clob_markets.clone(),
             );
         }
 
@@ -404,6 +405,7 @@ impl ApiServer {
                 state.signal_tx.clone(),
                 state.pool.clone(),
                 latency_atomic,
+                state.active_clob_markets.clone(),
             );
 
             // Spawn copy-trade stop-loss / mirror-exit monitor

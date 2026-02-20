@@ -183,6 +183,10 @@ pub enum CopyTradeRejection {
         total_capital: Decimal,
         allocation_pct: Decimal,
     },
+    /// Outcome token not found on CLOB (market resolved, delisted, or invalid).
+    MarketNotFound {
+        outcome_id: String,
+    },
 }
 
 /// Outcome from processing a detected trade.
@@ -480,42 +484,81 @@ impl CopyTrader {
             }
             .await;
 
-            if let Ok(Some(market_price)) = slippage_result {
-                // Reject markets near resolution (price < 0.03 or > 0.97).
-                // These have no meaningful liquidity and slippage will always be extreme.
-                let near_resolution_floor = Decimal::new(3, 2); // 0.03
-                let near_resolution_ceil = Decimal::new(97, 2); // 0.97
-                if market_price < near_resolution_floor || market_price > near_resolution_ceil {
-                    debug!(
-                        wallet = %trade.wallet_address,
-                        market_price = %market_price,
-                        "Market near resolution, skipping copy trade"
-                    );
-                    return Ok(CopyTradeProcessOutcome::Rejected(
-                        CopyTradeRejection::MarketNearResolution { market_price },
-                    ));
-                }
+            match slippage_result {
+                Err(e) => {
+                    // Check if the underlying error is a 4xx API error (resolved/delisted market).
+                    let is_client_error = e
+                        .downcast_ref::<polymarket_core::Error>()
+                        .and_then(|pe| match pe {
+                            polymarket_core::Error::Api {
+                                status: Some(s), ..
+                            } => Some(*s),
+                            _ => None,
+                        })
+                        .map(|s| (400..500).contains(&s))
+                        .unwrap_or(false);
 
-                let slippage_pct = if trade.price > Decimal::ZERO {
-                    ((market_price - trade.price) / trade.price).abs()
-                } else {
-                    Decimal::ZERO
-                };
-                if slippage_pct > self.policy.max_slippage_pct {
-                    debug!(
+                    if is_client_error {
+                        debug!(
+                            wallet = %trade.wallet_address,
+                            outcome_id = %trade.outcome_id,
+                            error = %e,
+                            "Outcome not found on CLOB (resolved or delisted), skipping"
+                        );
+                        return Ok(CopyTradeProcessOutcome::Rejected(
+                            CopyTradeRejection::MarketNotFound {
+                                outcome_id: trade.outcome_id.clone(),
+                            },
+                        ));
+                    }
+                    // Non-4xx errors: warn and fall through — let the executor handle it.
+                    warn!(
                         wallet = %trade.wallet_address,
-                        source_price = %trade.price,
-                        market_price = %market_price,
-                        slippage_pct = %slippage_pct,
-                        max = %self.policy.max_slippage_pct,
-                        "Slippage too high, skipping copy trade"
+                        outcome_id = %trade.outcome_id,
+                        error = %e,
+                        "Slippage pre-check failed with non-client error, proceeding"
                     );
-                    return Ok(CopyTradeProcessOutcome::Rejected(
-                        CopyTradeRejection::SlippageTooHigh {
-                            slippage_pct,
-                            max: self.policy.max_slippage_pct,
-                        },
-                    ));
+                }
+                Ok(Some(market_price)) => {
+                    // Reject markets near resolution (price < 0.03 or > 0.97).
+                    // These have no meaningful liquidity and slippage will always be extreme.
+                    let near_resolution_floor = Decimal::new(3, 2); // 0.03
+                    let near_resolution_ceil = Decimal::new(97, 2); // 0.97
+                    if market_price < near_resolution_floor || market_price > near_resolution_ceil {
+                        debug!(
+                            wallet = %trade.wallet_address,
+                            market_price = %market_price,
+                            "Market near resolution, skipping copy trade"
+                        );
+                        return Ok(CopyTradeProcessOutcome::Rejected(
+                            CopyTradeRejection::MarketNearResolution { market_price },
+                        ));
+                    }
+
+                    let slippage_pct = if trade.price > Decimal::ZERO {
+                        ((market_price - trade.price) / trade.price).abs()
+                    } else {
+                        Decimal::ZERO
+                    };
+                    if slippage_pct > self.policy.max_slippage_pct {
+                        debug!(
+                            wallet = %trade.wallet_address,
+                            source_price = %trade.price,
+                            market_price = %market_price,
+                            slippage_pct = %slippage_pct,
+                            max = %self.policy.max_slippage_pct,
+                            "Slippage too high, skipping copy trade"
+                        );
+                        return Ok(CopyTradeProcessOutcome::Rejected(
+                            CopyTradeRejection::SlippageTooHigh {
+                                slippage_pct,
+                                max: self.policy.max_slippage_pct,
+                            },
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    // Empty book — fall through, the executor will handle gracefully.
                 }
             }
         }

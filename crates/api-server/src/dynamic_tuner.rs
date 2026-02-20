@@ -612,7 +612,7 @@ impl DynamicTuner {
         let min_trade_current = rows
             .get(KEY_COPY_MIN_TRADE_VALUE)
             .map(|r| decimal_to_f64(r.current_value))
-            .unwrap_or(10.0);
+            .unwrap_or(2.0);
         let slippage_current = rows
             .get(KEY_COPY_MAX_SLIPPAGE_PCT)
             .map(|r| decimal_to_f64(r.current_value))
@@ -702,6 +702,10 @@ impl DynamicTuner {
         let desired_latency = if no_trade_watchdog && top_skip == "too_stale" {
             // Most skips are stale trades — relax the threshold to let them through.
             (latency_current * 1.30).min(900.0)
+        } else if no_trade_watchdog || bootstrap_active {
+            // No fills yet (watchdog or bootstrap) but staleness isn't the top issue.
+            // Hold latency steady — tightening during 0-fill phases is counter-productive.
+            latency_current
         } else {
             // Normal operation — tighten slightly toward fresher fills.
             (latency_current * 0.95).max(60.0)
@@ -926,7 +930,7 @@ impl DynamicTuner {
         let seeds = vec![
             ConfigSeed {
                 key: KEY_COPY_MIN_TRADE_VALUE,
-                default_value: env_decimal("COPY_MIN_TRADE_VALUE", Decimal::new(10, 0)),
+                default_value: env_decimal("COPY_MIN_TRADE_VALUE", Decimal::new(2, 0)),
                 min_value: Decimal::new(50, 2), // $0.50 floor (was $2)
                 max_value: Decimal::new(50, 0),
                 max_step_pct: Decimal::new(18, 2), // 18% per cycle (was 12%)

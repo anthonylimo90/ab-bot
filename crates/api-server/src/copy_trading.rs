@@ -7,6 +7,7 @@ use chrono::Utc;
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -71,6 +72,9 @@ pub struct CopyTradingMonitor {
     /// Runtime-tunable max latency threshold (seconds).  Written by the
     /// dynamic config subscriber, read per-trade with `Relaxed` ordering.
     max_latency_secs: Arc<AtomicI64>,
+    /// Set of active (non-resolved) CLOB market IDs, populated by OutcomeTokenCache.
+    /// When non-empty, trades for markets not in this set are skipped.
+    active_clob_markets: Arc<RwLock<HashSet<String>>>,
 }
 
 impl CopyTradingMonitor {
@@ -83,6 +87,7 @@ impl CopyTradingMonitor {
         signal_tx: broadcast::Sender<SignalUpdate>,
         pool: PgPool,
         max_latency_secs: Arc<AtomicI64>,
+        active_clob_markets: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
         Self {
             config,
@@ -92,6 +97,7 @@ impl CopyTradingMonitor {
             signal_tx,
             pool,
             max_latency_secs,
+            active_clob_markets,
         }
     }
 
@@ -275,6 +281,36 @@ impl CopyTradingMonitor {
             return Ok(());
         }
 
+        // Resolved-market filter: skip trades for markets no longer active on CLOB.
+        // When the set is empty (before the first OutcomeTokenCache refresh), allow
+        // through — Fix 2's 404 detection in the slippage pre-check is the backup.
+        {
+            let active_markets = self.active_clob_markets.read().await;
+            if !active_markets.is_empty() && !active_markets.contains(&trade.market_id) {
+                info!(
+                    wallet = %trade.wallet_address,
+                    market_id = %trade.market_id,
+                    "Market not in active CLOB set, skipping (resolved or delisted)"
+                );
+                self.publish_skip_signal(
+                    &trade,
+                    "market_not_active",
+                    &format!(
+                        "Market {} not in active CLOB set (resolved or delisted)",
+                        trade.market_id
+                    ),
+                );
+                self.record_trade_outcome(
+                    &trade,
+                    3,
+                    Some("market_not_active"),
+                    Some("Market not in active CLOB set"),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Circuit breaker check — copy trades must respect it
         if !self.circuit_breaker.can_trade().await {
             warn!(
@@ -334,6 +370,10 @@ impl CopyTradingMonitor {
                         format!(
                             "Zero copy quantity (capital={total_capital}, alloc={allocation_pct}%)"
                         ),
+                    ),
+                    CopyTradeRejection::MarketNotFound { outcome_id } => (
+                        "market_not_found",
+                        format!("Outcome {outcome_id} not found on CLOB (resolved or delisted)"),
                     ),
                 };
                 warn!(
@@ -652,6 +692,10 @@ impl CopyTradingMonitor {
                             "Zero copy quantity (capital={total_capital}, alloc={allocation_pct}%)"
                         ),
                     ),
+                    CopyTradeRejection::MarketNotFound { outcome_id } => (
+                        "market_not_found",
+                        format!("Outcome {outcome_id} not found on CLOB (resolved or delisted)"),
+                    ),
                 };
                 trace!(
                     wallet = %trade.wallet_address,
@@ -705,6 +749,7 @@ pub fn spawn_copy_trading_monitor(
     signal_tx: broadcast::Sender<SignalUpdate>,
     pool: PgPool,
     max_latency_secs: Arc<AtomicI64>,
+    active_clob_markets: Arc<RwLock<HashSet<String>>>,
 ) {
     let monitor = CopyTradingMonitor::new(
         config,
@@ -714,6 +759,7 @@ pub fn spawn_copy_trading_monitor(
         signal_tx,
         pool,
         max_latency_secs,
+        active_clob_markets,
     );
 
     tokio::spawn(async move {

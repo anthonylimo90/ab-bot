@@ -2,6 +2,7 @@
 
 use anyhow::Context;
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
@@ -90,6 +91,9 @@ pub struct AppState {
     pub current_regime: Arc<RwLock<MarketRegime>>,
     /// Shared Redis connection for dynamic config pub/sub (None if Redis unavailable).
     pub redis_conn: Option<redis::aio::ConnectionManager>,
+    /// Set of active (non-resolved) CLOB market IDs, refreshed by OutcomeTokenCache.
+    /// Used by CopyTradingMonitor to skip resolved markets before hitting the CLOB.
+    pub active_clob_markets: Arc<RwLock<HashSet<String>>>,
 }
 
 impl AppState {
@@ -397,6 +401,7 @@ impl AppState {
             copy_trader: None,
             current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
             redis_conn,
+            active_clob_markets: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
