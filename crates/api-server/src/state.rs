@@ -310,6 +310,31 @@ impl AppState {
                     }
                 }
             }
+
+            // Persist the loaded wallet address to all live-trading workspaces so
+            // the dashboard TradingGates panel can display it without querying the executor.
+            if let Some(addr) = order_executor.wallet_address().await {
+                match sqlx::query(
+                    "UPDATE workspaces SET trading_wallet_address = $1 WHERE live_trading_enabled = true AND (trading_wallet_address IS NULL OR trading_wallet_address != $1)",
+                )
+                .bind(&addr)
+                .execute(&pool)
+                .await
+                {
+                    Ok(result) => {
+                        if result.rows_affected() > 0 {
+                            tracing::info!(
+                                wallet = %addr,
+                                workspaces_updated = result.rows_affected(),
+                                "Persisted trading wallet address to workspace(s)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to persist trading wallet address to workspaces (non-fatal)");
+                    }
+                }
+            }
         }
 
         // Create circuit breaker for risk management

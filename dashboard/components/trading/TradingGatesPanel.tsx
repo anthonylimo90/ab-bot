@@ -65,7 +65,7 @@ function GateSection({ title, gates }: { title: string; gates: GateRow[] }) {
   );
 }
 
-function buildCoreGates(workspace: Workspace): GateRow[] {
+function buildCoreGates(workspace: Workspace, serviceStatus: ServiceStatus | null): GateRow[] {
   const gates: GateRow[] = [];
 
   gates.push({
@@ -74,12 +74,19 @@ function buildCoreGates(workspace: Workspace): GateRow[] {
     value: workspace.live_trading_enabled ? 'Enabled' : 'Disabled',
   });
 
+  // Wallet readiness: prefer the DB field, but fall back to the live_trading
+  // service status which checks order_executor.is_live_ready() — this covers
+  // wallets loaded from WALLET_PRIVATE_KEY/vault that never wrote back to DB.
+  const walletFromDb = workspace.trading_wallet_address;
+  const walletReady = walletFromDb || (serviceStatus?.live_trading?.running ?? false);
   gates.push({
     label: 'Wallet Loaded',
-    status: workspace.trading_wallet_address ? 'green' : 'red',
-    value: workspace.trading_wallet_address
-      ? `${workspace.trading_wallet_address.slice(0, 6)}...`
-      : 'None',
+    status: walletReady ? 'green' : 'red',
+    value: walletFromDb
+      ? `${walletFromDb.slice(0, 6)}...`
+      : walletReady
+        ? 'Active'
+        : 'None',
   });
 
   gates.push({
@@ -213,7 +220,7 @@ export const TradingGatesPanel = memo(function TradingGatesPanel({
   riskStatus,
   dynamicTunerStatus,
 }: TradingGatesPanelProps) {
-  const coreGates = buildCoreGates(workspace);
+  const coreGates = buildCoreGates(workspace, serviceStatus);
   const cbGates = buildCircuitBreakerGates(riskStatus);
   const copyGates = buildCopyTradingGates(dynamicTunerStatus);
   const svcGates = buildServiceGates(serviceStatus);
