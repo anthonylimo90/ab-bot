@@ -16,6 +16,9 @@ import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { PortfolioChart } from "@/components/charts/PortfolioChart";
+import { AllocationPie } from "@/components/charts/AllocationPie";
+import { LiveActivityFeed } from "@/components/discover/LiveActivityFeed";
 import {
   Activity,
   ArrowRight,
@@ -33,6 +36,7 @@ import {
   Target,
   Settings2,
   Star,
+  LineChart,
 } from "lucide-react";
 import { formatCurrency, formatTimeAgo } from "@/lib/utils";
 import { cn } from "@/lib/utils";
@@ -81,6 +85,41 @@ export function DashboardHome() {
     };
   }, [openPositions, totalUnrealizedPnl, closedPositions, riskStatus]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
+
+  // Derive equity curve from closed positions (accumulated realized P&L)
+  const equityCurve = useMemo(() => {
+    if (closedPositions.length === 0) return [];
+    const sorted = [...closedPositions]
+      .filter((p) => p.updated_at)
+      .sort(
+        (a, b) =>
+          new Date(a.updated_at!).getTime() - new Date(b.updated_at!).getTime(),
+      );
+    let cumulative = 0;
+    return sorted.map((p) => {
+      cumulative += p.realized_pnl ?? 0;
+      return {
+        time: new Date(p.updated_at!).toISOString().slice(0, 10),
+        value: cumulative,
+      };
+    });
+  }, [closedPositions]);
+
+  // Derive allocation pie data from active wallets
+  const allocationData = useMemo(() => {
+    const colors = [
+      "#3b82f6",
+      "#10b981",
+      "#f59e0b",
+      "#ef4444",
+      "#8b5cf6",
+    ];
+    return activeWallets.map((w, i) => ({
+      name: w.wallet_label || `${w.wallet_address.slice(0, 6)}...${w.wallet_address.slice(-4)}`,
+      value: w.allocation_pct,
+      color: colors[i % colors.length],
+    }));
+  }, [activeWallets]);
 
   const isAutomatic = currentWorkspace?.setup_mode === "automatic";
   const modeLabel = isAutomatic ? "Guided" : "Custom";
@@ -137,6 +176,34 @@ export function DashboardHome() {
           changeLabel={`Win rate: ${(stats.win_rate || 0).toFixed(0)}%`}
           trend="neutral"
         />
+      </div>
+
+      {/* Quick Actions Row */}
+      <div className="flex flex-wrap gap-2">
+        <Link href="/discover">
+          <Button variant="outline" size="sm" className="gap-2">
+            <Search className="h-4 w-4 text-blue-500" />
+            Discover
+          </Button>
+        </Link>
+        <Link href="/trading">
+          <Button variant="outline" size="sm" className="gap-2">
+            <PieChart className="h-4 w-4 text-green-500" />
+            Positions ({stats.active_positions})
+          </Button>
+        </Link>
+        <Link href="/backtest">
+          <Button variant="outline" size="sm" className="gap-2">
+            <LineChart className="h-4 w-4 text-purple-500" />
+            Backtest
+          </Button>
+        </Link>
+        <Link href="/roster">
+          <Button variant="outline" size="sm" className="gap-2">
+            <Star className="h-4 w-4 text-yellow-500" />
+            Wallets ({activeWallets.length}/5)
+          </Button>
+        </Link>
       </div>
 
       {/* Main Content */}
@@ -205,94 +272,38 @@ export function DashboardHome() {
           </CardContent>
         </Card>
 
-        {/* Quick Actions */}
+        {/* Live Activity Feed */}
+        <LiveActivityFeed className="lg:col-span-1" />
+      </div>
+
+      {/* Charts */}
+      <div className="grid gap-4 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Quick Actions</CardTitle>
+            <CardTitle>Equity Curve</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-3 sm:space-y-4">
-            <p className="text-sm text-muted-foreground">
-              Common actions to manage your portfolio
-            </p>
-
-            <div className="grid gap-3">
-              <Link href="/discover">
-                <Button
-                  variant="outline"
-                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-500/10">
-                      <Search className="h-5 w-5 text-blue-500" />
-                    </div>
-                    <div className="text-left">
-                      <p className="font-medium">Discover Wallets</p>
-                      <p className="text-xs text-muted-foreground">
-                        Find top performers to copy
-                      </p>
-                    </div>
-                  </div>
-                </Button>
-              </Link>
-
-              <Link href="/portfolio">
-                <Button
-                  variant="outline"
-                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-green-500/10">
-                      <PieChart className="h-5 w-5 text-green-500" />
-                    </div>
-                    <div className="text-left">
-                      <p className="font-medium">View Positions</p>
-                      <p className="text-xs text-muted-foreground">
-                        {stats.active_positions} open position
-                        {stats.active_positions !== 1 ? "s" : ""}
-                      </p>
-                    </div>
-                  </div>
-                </Button>
-              </Link>
-
-              <Link href="/backtest">
-                <Button
-                  variant="outline"
-                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-purple-500/10">
-                      <TrendingUp className="h-5 w-5 text-purple-500" />
-                    </div>
-                    <div className="text-left">
-                      <p className="font-medium">Run Backtest</p>
-                      <p className="text-xs text-muted-foreground">
-                        Test strategies on historical data
-                      </p>
-                    </div>
-                  </div>
-                </Button>
-              </Link>
-
-              <Link href="/roster">
-                <Button
-                  variant="outline"
-                  className="h-auto w-full justify-start py-3 text-left whitespace-normal"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-yellow-500/10">
-                      <Star className="h-5 w-5 text-yellow-500" />
-                    </div>
-                    <div className="text-left">
-                      <p className="font-medium">Manage Active Wallets</p>
-                      <p className="text-xs text-muted-foreground">
-                        {activeWallets.length}/5 slots filled
-                      </p>
-                    </div>
-                  </div>
-                </Button>
-              </Link>
-            </div>
+          <CardContent>
+            {equityCurve.length > 1 ? (
+              <PortfolioChart data={equityCurve} height={250} />
+            ) : (
+              <div className="flex items-center justify-center h-[250px] text-sm text-muted-foreground">
+                Close positions to see your equity curve
+              </div>
+            )}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardTitle>Wallet Allocation</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {allocationData.length > 0 ? (
+              <AllocationPie data={allocationData} showLegend />
+            ) : (
+              <div className="flex items-center justify-center h-[250px] text-sm text-muted-foreground">
+                Add active wallets to see allocation
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

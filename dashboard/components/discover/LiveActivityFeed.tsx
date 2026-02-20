@@ -1,44 +1,23 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { LiveIndicator } from '@/components/shared/LiveIndicator';
 import { cn, formatCurrency, formatTimeAgo, shortenAddress } from '@/lib/utils';
 import type { LiveTrade } from '@/types/api';
-import api from '@/lib/api';
+import { useLiveTradesQuery } from '@/hooks/queries/useDiscoverQuery';
 
 interface LiveActivityFeedProps {
   className?: string;
   maxItems?: number;
-  refreshInterval?: number;
 }
 
 export function LiveActivityFeed({
   className,
   maxItems = 10,
-  refreshInterval = 10000,
 }: LiveActivityFeedProps) {
-  const [trades, setTrades] = useState<LiveTrade[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchTrades = useCallback(async () => {
-    try {
-      const data = await api.getLiveTrades({ limit: maxItems });
-      setTrades(data);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to fetch trades');
-    } finally {
-      setIsLoading(false);
-    }
-  }, [maxItems]);
-
-  useEffect(() => {
-    fetchTrades();
-    const interval = setInterval(fetchTrades, refreshInterval);
-    return () => clearInterval(interval);
-  }, [fetchTrades, refreshInterval]);
+  const { data: trades = [], isLoading, error } = useLiveTradesQuery({
+    limit: maxItems,
+  });
 
   return (
     <Card className={cn('overflow-hidden', className)}>
@@ -55,7 +34,7 @@ export function LiveActivityFeed({
           </div>
         ) : error ? (
           <div className="px-6 py-4 text-center text-sm text-muted-foreground">
-            {error}
+            {error instanceof Error ? error.message : 'Failed to fetch trades'}
           </div>
         ) : trades.length === 0 ? (
           <div className="px-6 py-4 text-center text-sm text-muted-foreground">

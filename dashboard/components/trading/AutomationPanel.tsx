@@ -12,6 +12,10 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { queryKeys } from '@/lib/queryClient';
 import { ratioOrPercentToPercent, formatDynamicKey, formatDynamicConfigValue } from '@/lib/utils';
+import { RISK_PRESETS } from '@/lib/riskPresets';
+import type { RiskPreset } from '@/lib/riskPresets';
+import { TunerTimeline } from '@/components/analytics/TunerTimeline';
+import { useDynamicConfigHistoryQuery } from '@/hooks/queries/useHistoryQuery';
 import { useNotificationStore } from '@/stores/notification-store';
 import { useToastStore } from '@/stores/toast-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -27,6 +31,7 @@ import {
   Ban,
   Bot,
   CheckCircle,
+  Clock,
   Gauge,
   History,
   Info,
@@ -55,7 +60,6 @@ interface AutomationPanelProps {
   onRefresh?: () => void;
 }
 
-type RiskPreset = 'conservative' | 'balanced' | 'aggressive';
 type OpportunityAggressiveness = 'stable' | 'balanced' | 'discovery';
 
 const COPY_TRADING_KEYS = new Set([
@@ -96,52 +100,6 @@ interface OpportunitySelectionDraft {
   aggressiveness: OpportunityAggressiveness;
   exploration_slots: number;
 }
-
-const RISK_PRESETS: Record<
-  RiskPreset,
-  {
-    label: string;
-    description: string;
-    settings: Pick<
-      OptimizationSettingsDraft,
-      'optimization_interval_hours' | 'min_roi_30d' | 'min_sharpe' | 'min_win_rate' | 'min_trades_30d'
-    >;
-  }
-> = {
-  conservative: {
-    label: 'Conservative',
-    description: 'Higher quality bar, fewer rotations.',
-    settings: {
-      optimization_interval_hours: 24,
-      min_roi_30d: 8,
-      min_sharpe: 1.3,
-      min_win_rate: 58,
-      min_trades_30d: 20,
-    },
-  },
-  balanced: {
-    label: 'Balanced',
-    description: 'Moderate quality bar for steady discovery.',
-    settings: {
-      optimization_interval_hours: 12,
-      min_roi_30d: 5,
-      min_sharpe: 1,
-      min_win_rate: 50,
-      min_trades_30d: 10,
-    },
-  },
-  aggressive: {
-    label: 'Aggressive',
-    description: 'Lower thresholds for broader candidate exploration.',
-    settings: {
-      optimization_interval_hours: 6,
-      min_roi_30d: 2,
-      min_sharpe: 0.6,
-      min_win_rate: 45,
-      min_trades_30d: 5,
-    },
-  },
-};
 
 const OPPORTUNITY_PRESETS: Record<
   OpportunityAggressiveness,
@@ -205,6 +163,10 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     enabled: hasWorkspace,
     staleTime: 15 * 1000,
     refetchInterval: 30 * 1000,
+  });
+  const { data: dynamicConfigHistory = [] } = useDynamicConfigHistoryQuery({
+    workspaceId: hasWorkspace ? workspaceId : undefined,
+    limit: 50,
   });
   const bans = bansData?.bans ?? [];
 
@@ -584,7 +546,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       </CardHeader>
       <CardContent>
         <Tabs defaultValue="settings">
-          <TabsList className="grid w-full grid-cols-2 sm:grid-cols-4">
+          <TabsList className="grid w-full grid-cols-3 sm:grid-cols-5">
             <TabsTrigger value="settings" className="text-xs">
               <Settings className="mr-1 h-3 w-3" />
               Settings
@@ -600,6 +562,10 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
             <TabsTrigger value="bans" className="text-xs">
               <Ban className="mr-1 h-3 w-3" />
               Bans ({bans.length})
+            </TabsTrigger>
+            <TabsTrigger value="tuner-log" className="text-xs">
+              <Clock className="mr-1 h-3 w-3" />
+              Tuner Log
             </TabsTrigger>
           </TabsList>
 
@@ -1468,6 +1434,10 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                 ))
               )}
             </div>
+          </TabsContent>
+
+          <TabsContent value="tuner-log" className="mt-4">
+            <TunerTimeline history={dynamicConfigHistory} />
           </TabsContent>
         </Tabs>
       </CardContent>

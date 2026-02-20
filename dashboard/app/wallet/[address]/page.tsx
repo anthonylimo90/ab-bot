@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToastStore } from "@/stores/toast-store";
 import {
@@ -63,6 +64,11 @@ import {
   CalibrationChart,
   CopyPerformance,
 } from "@/components/discover";
+import { EquityCurve } from "@/components/charts/EquityCurve";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/queryClient";
+import type { WebSocketMessage } from "@/types/api";
 
 type RoiPeriod = "7d" | "30d" | "90d";
 
@@ -81,6 +87,24 @@ export default function WalletDetailPage() {
   const { data: livePositions = [] } = usePositionsQuery({ status: "open" });
 
   const [roiPeriod, setRoiPeriod] = useState<RoiPeriod>("30d");
+  const qc = useQueryClient();
+
+  // Live position updates via WebSocket (Phase 2.3)
+  const handlePositionWs = useCallback(
+    (msg: WebSocketMessage) => {
+      if (msg.type !== "Position") return;
+      // Invalidate positions when any update arrives for this wallet
+      const data = msg.data as unknown as { source_wallet?: string };
+      if (
+        data.source_wallet &&
+        data.source_wallet.toLowerCase() === address?.toLowerCase()
+      ) {
+        qc.invalidateQueries({ queryKey: queryKeys.positions.all() });
+      }
+    },
+    [address, qc],
+  );
+  useWebSocket({ channel: "positions", onMessage: handlePositionWs });
 
   const storedWallet = useMemo(() => {
     return allocations.find(
@@ -264,6 +288,24 @@ export default function WalletDetailPage() {
     "90d": wallet.roi90d ?? 0,
   };
   const selectedRoi = roiByPeriod[roiPeriod];
+
+  // Derive equity curve from wallet trades (Phase 2.3)
+  const equityCurveData = useMemo(() => {
+    if (!walletTrades || walletTrades.length === 0) return [];
+    const sorted = [...walletTrades].sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    );
+    let cumulative = 0;
+    return sorted.map((t) => {
+      const pnl = t.side === "BUY" ? -t.value : t.value;
+      cumulative += pnl;
+      return {
+        time: new Date(t.timestamp).toISOString().slice(0, 10),
+        value: cumulative,
+      };
+    });
+  }, [walletTrades]);
 
   const tradeSummary = useMemo(() => {
     if (!walletTrades || walletTrades.length === 0) return null;
@@ -666,6 +708,75 @@ export default function WalletDetailPage() {
             readOnly={isBench}
           />
         )}
+
+        {/* Bot Score + Equity Curve (Phase 2.3) */}
+        <div className="grid gap-4 md:grid-cols-2">
+          {/* Bot Score */}
+          {discoveredWallet && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  Bot Score
+                  {discoveredWallet.prediction != null && (
+                    <Badge
+                      variant={
+                        discoveredWallet.prediction === "HIGH_POTENTIAL" ||
+                        discoveredWallet.prediction === "MODERATE"
+                          ? "secondary"
+                          : "destructive"
+                      }
+                    >
+                      {discoveredWallet.prediction.replace(/_/g, " ")}
+                    </Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="flex items-center gap-4">
+                  <CompositeScoreGauge
+                    score={
+                      discoveredWallet.composite_score != null
+                        ? Number(discoveredWallet.composite_score)
+                        : undefined
+                    }
+                  />
+                  <div className="space-y-1 text-sm">
+                    <p>
+                      <span className="text-muted-foreground">Confidence:</span>{" "}
+                      <span className="font-medium">
+                        {(discoveredWallet.confidence * 100).toFixed(0)}%
+                      </span>
+                    </p>
+                    {discoveredWallet.prediction != null && (
+                      <p>
+                        <span className="text-muted-foreground">Prediction:</span>{" "}
+                        <span className="font-medium">
+                          {discoveredWallet.prediction.replace(/_/g, " ")}
+                        </span>
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Equity Curve */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Equity Curve</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {equityCurveData.length > 1 ? (
+                <EquityCurve data={equityCurveData} height={200} />
+              ) : (
+                <div className="flex items-center justify-center h-[200px] text-sm text-muted-foreground">
+                  Not enough trade data for equity curve
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
 
         {/* Calibration + Copy Performance */}
         <div className="grid gap-4 md:grid-cols-2">

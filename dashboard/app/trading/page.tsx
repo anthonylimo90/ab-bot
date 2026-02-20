@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, useEffect } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -18,6 +18,14 @@ import { AllocationAdjustmentPanel } from "@/components/allocations/AllocationAd
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { useToastStore } from "@/stores/toast-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
+import { useQueryClient } from "@tanstack/react-query";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { queryKeys } from "@/lib/queryClient";
+import { useMarketsQuery, useOrderbookQuery } from "@/hooks/queries/useMarketsQuery";
+import { OrderForm } from "@/components/trading/OrderForm";
+import { OrderbookDepthTable } from "@/components/markets/OrderbookDepthTable";
+import { OrderManagementPanel } from "@/components/trading/OrderManagementPanel";
+import type { WebSocketMessage } from "@/types/api";
 import {
   usePositionsQuery,
   useClosePositionMutation,
@@ -53,6 +61,7 @@ import {
   Plus,
   History,
   Bot,
+  PenLine,
 } from "lucide-react";
 import { useDiscoverWalletsQuery } from "@/hooks/queries/useDiscoverQuery";
 import type { WorkspaceAllocation, DiscoveredWallet } from "@/types/api";
@@ -192,6 +201,32 @@ export default function TradingPage() {
   const toast = useToastStore();
   const [walletSearch, setWalletSearch] = useState("");
   const { currentWorkspace } = useWorkspaceStore();
+  const queryClient = useQueryClient();
+
+  // Manual trade state (Phase 3.5)
+  const [selectedMarketId, setSelectedMarketId] = useState<string | null>(null);
+  const [recentOrderIds, setRecentOrderIds] = useState<string[]>([]);
+  const [marketSearch, setMarketSearch] = useState("");
+  const { data: markets = [] } = useMarketsQuery();
+  const { data: orderbook } = useOrderbookQuery(selectedMarketId);
+
+  // WebSocket: auto-refresh positions on updates (Phase 1.2)
+  const handlePositionWsMessage = useCallback(
+    (msg: WebSocketMessage) => {
+      if (msg.type === "Position") {
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.positions.all(),
+        });
+      }
+    },
+    [queryClient],
+  );
+  useWebSocket({
+    channel: "positions",
+    onMessage: handlePositionWsMessage,
+    batchMessages: true,
+    batchInterval: 500,
+  });
 
   // Get tab from URL, default to 'active'
   const currentTab = searchParams.get("tab") || "active";
@@ -482,6 +517,10 @@ export default function TradingPage() {
             <TabsTrigger value="automation" className="flex items-center gap-2">
               <Bot className="h-4 w-4" />
               Automation
+            </TabsTrigger>
+            <TabsTrigger value="manual" className="flex items-center gap-2">
+              <PenLine className="h-4 w-4" />
+              Manual Trade
             </TabsTrigger>
             </TabsList>
           </div>
@@ -799,6 +838,96 @@ export default function TradingPage() {
           {/* Automation Tab */}
           <TabsContent value="automation" className="space-y-4">
             <AutomationPanel workspaceId={currentWorkspace?.id ?? ""} />
+          </TabsContent>
+
+          {/* Manual Trade Tab */}
+          <TabsContent value="manual" className="space-y-4">
+            <div className="grid gap-4 lg:grid-cols-2">
+              {/* Left: Market selector + Orderbook */}
+              <div className="space-y-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Select Market</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <Input
+                      type="text"
+                      placeholder="Search markets..."
+                      value={marketSearch}
+                      onChange={(e) => setMarketSearch(e.target.value)}
+                    />
+                    <div className="mt-3 max-h-[200px] overflow-y-auto space-y-1">
+                      {markets.filter((m) =>
+                        m.question.toLowerCase().includes(marketSearch.toLowerCase()),
+                      ).slice(0, 20).map((m) => (
+                        <button
+                          key={m.id}
+                          onClick={() => setSelectedMarketId(m.id)}
+                          className={cn(
+                            "w-full text-left px-3 py-2 text-sm rounded-md hover:bg-muted transition-colors",
+                            selectedMarketId === m.id && "bg-muted font-medium",
+                          )}
+                        >
+                          <p className="truncate">{m.question}</p>
+                          <p className="text-xs text-muted-foreground">
+                            Yes: {(m.yes_price * 100).toFixed(0)}¢ | No:{" "}
+                            {(m.no_price * 100).toFixed(0)}¢
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {orderbook && selectedMarketId && (
+                  <OrderbookDepthTable
+                    orderbook={orderbook}
+                    outcome="yes"
+                  />
+                )}
+              </div>
+
+              {/* Right: Order form */}
+              <div className="space-y-4">
+                {selectedMarketId ? (
+                  <>
+                    <OrderForm
+                      marketId={selectedMarketId}
+                      tokenId={selectedMarketId}
+                      outcome="yes"
+                      currentPrice={
+                        markets.find((m) => m.id === selectedMarketId)
+                          ?.yes_price ?? 0.5
+                      }
+                      onSuccess={(orderId) => {
+                        if (orderId) {
+                          setRecentOrderIds((prev) => [orderId, ...prev]);
+                        }
+                        toast.success(
+                          "Order Placed",
+                          "Your order has been submitted",
+                        );
+                      }}
+                    />
+                    {recentOrderIds.length > 0 && (
+                      <OrderManagementPanel recentOrderIds={recentOrderIds} />
+                    )}
+                  </>
+                ) : (
+                  <Card>
+                    <CardContent className="p-12 text-center">
+                      <PenLine className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                      <h3 className="text-lg font-medium mb-2">
+                        Select a market
+                      </h3>
+                      <p className="text-muted-foreground">
+                        Choose a market from the left to place a manual trade
+                      </p>
+                    </CardContent>
+                  </Card>
+                )}
+              </div>
+            </div>
           </TabsContent>
         </Tabs>
       </div>

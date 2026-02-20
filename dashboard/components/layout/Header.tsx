@@ -16,6 +16,7 @@ import {
   Pause,
   Play,
   Loader2,
+  Bell,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -29,6 +30,7 @@ import {
 } from "@/stores/wallet-store";
 import { useMutation } from "@tanstack/react-query";
 import { useActivity } from "@/hooks/useActivity";
+import { useActivityStore } from "@/stores/activity-store";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
@@ -62,7 +64,11 @@ export function Header() {
   const { user, logout } = useAuthStore();
   const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
   const toast = useToastStore();
-  const { status: wsStatus } = useActivity();
+  const { status: wsStatus, activities } = useActivity();
+  const globalUnread = useActivityStore((s) => s.unreadCount);
+  const resetGlobalUnread = useActivityStore((s) => s.reset);
+  const [isSignalDropdownOpen, setIsSignalDropdownOpen] = useState(false);
+  const signalDropdownRef = useRef<HTMLDivElement>(null);
 
   const isTradingActive =
     currentWorkspace?.copy_trading_enabled ||
@@ -141,6 +147,12 @@ export function Header() {
         !mobileMenuRef.current.contains(event.target as Node)
       ) {
         setIsMobileMenuOpen(false);
+      }
+      if (
+        signalDropdownRef.current &&
+        !signalDropdownRef.current.contains(event.target as Node)
+      ) {
+        setIsSignalDropdownOpen(false);
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
@@ -357,6 +369,62 @@ export function Header() {
               <span>{isTradingActive ? "Pause" : "Resume"}</span>
             </Button>
           )}
+
+          {/* Signal Bell */}
+          <div className="relative" ref={signalDropdownRef}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="relative"
+              onClick={() => {
+                setIsSignalDropdownOpen(!isSignalDropdownOpen);
+                if (!isSignalDropdownOpen) resetGlobalUnread();
+              }}
+              aria-label="View signals"
+            >
+              <Bell className="h-4 w-4" />
+              {globalUnread > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-bold text-destructive-foreground">
+                  {globalUnread > 99 ? "99+" : globalUnread}
+                </span>
+              )}
+            </Button>
+
+            {isSignalDropdownOpen && (
+              <div className="absolute right-0 mt-2 w-80 rounded-md border bg-popover p-1 shadow-lg z-50">
+                <div className="px-3 py-2 border-b">
+                  <p className="text-sm font-medium">Recent Signals</p>
+                </div>
+                <div className="max-h-[300px] overflow-y-auto">
+                  {activities.slice(0, 5).map((item) => (
+                    <div
+                      key={item.id}
+                      className="px-3 py-2 hover:bg-accent rounded-sm text-sm"
+                    >
+                      <p className="truncate">{item.message}</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {new Date(item.created_at).toLocaleTimeString()}
+                      </p>
+                    </div>
+                  ))}
+                  {activities.length === 0 && (
+                    <p className="px-3 py-4 text-sm text-muted-foreground text-center">
+                      No signals yet
+                    </p>
+                  )}
+                </div>
+                <div className="border-t px-3 py-2">
+                  <Link
+                    href="/signals"
+                    className="text-xs text-primary hover:underline"
+                    onClick={() => setIsSignalDropdownOpen(false)}
+                  >
+                    View All Signals
+                  </Link>
+                </div>
+              </div>
+            )}
+          </div>
 
           <ConnectionStatus status={wsStatus} />
 

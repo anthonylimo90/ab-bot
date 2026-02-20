@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useWebSocket, ConnectionStatus } from "./useWebSocket";
 import { useToastStore } from "@/stores/toast-store";
+import { useActivityStore } from "@/stores/activity-store";
 import { api } from "@/lib/api";
 import type {
   Activity,
@@ -166,6 +167,7 @@ export function useActivity(): UseActivityReturn {
 
     setActivities((prev) => [activity, ...prev].slice(0, 50));
     setUnreadCount((prev) => prev + 1);
+    useActivityStore.getState().increment();
 
     // Fire toast notification
     const toast = useToastStore.getState();

@@ -136,6 +136,12 @@ export const queryKeys = {
       [...queryKeys.dynamicTuning.all(), "history", workspaceId, params] as const,
   },
 
+  // Orders
+  orders: {
+    all: () => ["orders"] as const,
+    detail: (id: string) => [...queryKeys.orders.all(), "detail", id] as const,
+  },
+
   // Rotation history
   rotationHistory: {
     all: () => ["rotation-history"] as const,

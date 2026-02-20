@@ -10,11 +10,15 @@ import { CheckCircle, ArrowRight, ArrowLeft, Wand2, Settings2, Target, Clock, Ey
 import { BudgetStep } from './BudgetStep';
 import { WalletSelectionStep } from './WalletSelectionStep';
 import { AutoSetupStep } from './AutoSetupStep';
+import { RiskToleranceStep } from './RiskToleranceStep';
+import { AllocationPie } from '@/components/charts/AllocationPie';
+import { useAllocationsQuery } from '@/hooks/queries/useAllocationsQuery';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useToastStore } from '@/stores/toast-store';
 import api from '@/lib/api';
 import type { SetupMode, OnboardingStatus } from '@/types/api';
 
-type WizardStep = 'mode' | 'budget' | 'wallets' | 'auto' | 'complete';
+type WizardStep = 'mode' | 'budget' | 'risk' | 'wallets' | 'auto' | 'complete';
 
 interface SetupWizardProps {
   initialStatus: OnboardingStatus;
@@ -24,11 +28,14 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const { currentWorkspace } = useWorkspaceStore();
   const [step, setStep] = useState<WizardStep>('mode');
   const [mode, setMode] = useState<SetupMode>(initialStatus.setup_mode || 'automatic');
   const [budget, setBudget] = useState<number>(initialStatus.total_budget || 0);
   const [reservedPct, setReservedPct] = useState(20);
   const [activeWalletCount, setActiveWalletCount] = useState(0);
+
+  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
 
   const setModeMutation = useMutation({
     mutationFn: (newMode: SetupMode) => api.setOnboardingMode(newMode),
@@ -77,10 +84,14 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
   const handleBudgetNext = async () => {
     try {
       await setBudgetMutation.mutateAsync();
-      setStep(mode === 'automatic' ? 'auto' : 'wallets');
+      setStep('risk');
     } catch {
       // Error handled by mutation
     }
+  };
+
+  const handleRiskNext = (_preset: import('@/lib/riskPresets').RiskPreset) => {
+    setStep(mode === 'automatic' ? 'auto' : 'wallets');
   };
 
   const handleWalletsComplete = (walletCount: number) => {
@@ -103,15 +114,12 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
 
   const getProgress = () => {
     switch (step) {
-      case 'mode':
-        return 20;
-      case 'budget':
-        return 40;
+      case 'mode': return 20;
+      case 'budget': return 40;
+      case 'risk': return 55;
       case 'wallets':
-      case 'auto':
-        return 70;
-      case 'complete':
-        return 100;
+      case 'auto': return 75;
+      case 'complete': return 100;
     }
   };
 
@@ -213,11 +221,19 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
           />
         );
 
+      case 'risk':
+        return (
+          <RiskToleranceStep
+            onNext={handleRiskNext}
+            onBack={() => setStep('budget')}
+          />
+        );
+
       case 'wallets':
         return (
           <WalletSelectionStep
             onComplete={handleWalletsComplete}
-            onBack={() => setStep('budget')}
+            onBack={() => setStep('risk')}
           />
         );
 
@@ -225,7 +241,7 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
         return (
           <AutoSetupStep
             onComplete={handleAutoComplete}
-            onBack={() => setStep('budget')}
+            onBack={() => setStep('risk')}
           />
         );
 
@@ -311,6 +327,27 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
                 </li>
               </ul>
             </div>
+
+            {/* Wallet Allocation Preview */}
+            {allocations.length > 0 && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Wallet Allocation</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <AllocationPie
+                    data={allocations
+                      .filter((a) => a.tier === 'active')
+                      .map((a, i) => ({
+                        name: a.wallet_label || `${a.wallet_address.slice(0, 6)}...${a.wallet_address.slice(-4)}`,
+                        value: a.allocation_pct,
+                        color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'][i % 5],
+                      }))}
+                    showLegend
+                  />
+                </CardContent>
+              </Card>
+            )}
 
             {/* Actions */}
             <div className="flex flex-col sm:flex-row gap-3 pt-2">

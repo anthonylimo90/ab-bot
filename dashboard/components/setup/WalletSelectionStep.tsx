@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
+import { Input } from '@/components/ui/input';
 import {
   ArrowLeft,
   ArrowRight,
@@ -33,6 +34,9 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const { currentWorkspace } = useWorkspaceStore();
+
+  const [manualAddress, setManualAddress] = useState('');
+  const [addressError, setAddressError] = useState<string | null>(null);
 
   // Fetch discovered wallets
   const { data: discoveredWallets, isLoading: isLoadingWallets } = useQuery({
@@ -110,6 +114,18 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
 
   const formatAddress = (address: string) => {
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  };
+
+  const isValidAddress = (addr: string) => /^0x[a-fA-F0-9]{40}$/.test(addr);
+
+  const handleAddManualAddress = () => {
+    if (!isValidAddress(manualAddress)) {
+      setAddressError('Invalid Ethereum address (0x + 40 hex chars)');
+      return;
+    }
+    setAddressError(null);
+    addMutation.mutate(manualAddress);
+    setManualAddress('');
   };
 
   const isLoading = isLoadingWallets || isLoadingAllocations;
@@ -235,6 +251,37 @@ export function WalletSelectionStep({ onComplete, onBack }: WalletSelectionStepP
               </div>
             </div>
           )}
+
+          {/* Manual Address Entry */}
+          <div className="space-y-2">
+            <h3 className="font-medium flex items-center gap-2">
+              <Plus className="h-4 w-4 text-muted-foreground" />
+              Add by Address
+            </h3>
+            <div className="flex gap-2">
+              <Input
+                placeholder="Enter wallet address (0x...)"
+                value={manualAddress}
+                onChange={(e) => {
+                  setManualAddress(e.target.value);
+                  if (addressError) setAddressError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleAddManualAddress();
+                }}
+              />
+              <Button
+                variant="outline"
+                onClick={handleAddManualAddress}
+                disabled={addMutation.isPending || !manualAddress}
+              >
+                Add by Address
+              </Button>
+            </div>
+            {addressError && (
+              <p className="text-sm text-destructive">{addressError}</p>
+            )}
+          </div>
 
           {/* Discovered Wallets */}
           <div className="space-y-3">

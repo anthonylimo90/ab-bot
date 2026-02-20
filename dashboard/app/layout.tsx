@@ -8,6 +8,7 @@ import { WalletProvider } from '@/providers/WalletProvider';
 import { WorkspaceProvider } from '@/providers/WorkspaceProvider';
 import { AuthGuard } from '@/components/auth/AuthGuard';
 import { AppShell } from '@/components/layout/AppShell';
+import { WebSocketProvider } from '@/providers/WebSocketProvider';
 import './globals.css';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -30,7 +31,9 @@ export default function RootLayout({
             <TooltipProvider>
               <AuthGuard>
                 <WorkspaceProvider>
-                  <AppShell>{children}</AppShell>
+                  <WebSocketProvider>
+                    <AppShell>{children}</AppShell>
+                  </WebSocketProvider>
                 </WorkspaceProvider>
               </AuthGuard>
               <ToastProvider />
