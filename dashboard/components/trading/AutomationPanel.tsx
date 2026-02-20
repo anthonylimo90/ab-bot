@@ -11,9 +11,10 @@ import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { queryKeys } from '@/lib/queryClient';
-import { ratioOrPercentToPercent } from '@/lib/utils';
+import { ratioOrPercentToPercent, formatDynamicKey, formatDynamicConfigValue } from '@/lib/utils';
 import { useNotificationStore } from '@/stores/notification-store';
 import { useToastStore } from '@/stores/toast-store';
+import { useWorkspaceStore } from '@/stores/workspace-store';
 import {
   useAcknowledgeRotationMutation,
   useOptimizerStatusQuery,
@@ -147,6 +148,8 @@ function toSettingsDraft(status: OptimizerStatus): OptimizationSettingsDraft {
 export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps) {
   const queryClient = useQueryClient();
   const { addToast } = useToastStore();
+  const { currentWorkspace } = useWorkspaceStore();
+  const isOwner = currentWorkspace?.my_role === 'owner';
   const hasWorkspace = Boolean(workspaceId);
 
   const { data: optimizerStatus, isLoading: isStatusLoading } = useOptimizerStatusQuery(
@@ -634,7 +637,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                       Profile: {dynamicTunerStatus.opportunity_selection.aggressiveness}
                     </Badge>
                   </div>
-                  {!opportunitySettings ? (
+                  {!isOwner ? (
+                    <p className="text-sm text-muted-foreground">
+                      Opportunity selection can only be changed by the workspace owner.
+                    </p>
+                  ) : !opportunitySettings ? (
                     <p className="text-sm text-muted-foreground">Loading opportunity settings...</p>
                   ) : (
                     <>
@@ -862,8 +869,8 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                         key={entry.key}
                         className="flex flex-col gap-1 rounded border border-border/50 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between"
                       >
-                        <span className="font-mono text-xs break-all">{entry.key}</span>
-                        <span className="font-medium tabular-nums">{entry.current_value.toFixed(4)}</span>
+                        <span className="font-medium text-xs">{formatDynamicKey(entry.key)}</span>
+                        <span className="font-medium tabular-nums">{formatDynamicConfigValue(entry.key, entry.current_value)}</span>
                       </div>
                     ))}
                   </div>

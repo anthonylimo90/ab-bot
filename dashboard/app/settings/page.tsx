@@ -59,7 +59,7 @@ export default function SettingsPage() {
   const [isSavingTradingConfig, setIsSavingTradingConfig] = useState(false);
   const [polygonRpcUrl, setPolygonRpcUrl] = useState('');
   const [alchemyApiKey, setAlchemyApiKey] = useState('');
-  const [copyTradingEnabled, setCopyTradingEnabled] = useState(true);
+  const [copyTradingEnabled, setCopyTradingEnabled] = useState(false);
   const [arbAutoExecute, setArbAutoExecute] = useState(false);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
   const {
@@ -110,7 +110,7 @@ export default function SettingsPage() {
     if (currentWorkspace) {
       setPolygonRpcUrl(currentWorkspace.polygon_rpc_url || '');
       setAlchemyApiKey(''); // Never pre-fill masked key
-      setCopyTradingEnabled(currentWorkspace.copy_trading_enabled ?? true);
+      setCopyTradingEnabled(currentWorkspace.copy_trading_enabled ?? false);
       setArbAutoExecute(currentWorkspace.arb_auto_execute ?? false);
       setLiveTradingEnabled(currentWorkspace.live_trading_enabled ?? false);
     }
@@ -472,7 +472,9 @@ export default function SettingsPage() {
                 className="w-full rounded border bg-background px-3 py-2 text-sm"
               />
               <p className="text-xs text-muted-foreground">
-                Required for copy trading and wallet monitoring
+                Required for copy trading and wallet monitoring. Accepted providers:
+                Alchemy, Infura, Ankr, Polygon, LlamaRPC, DRPC, PublicNode, 1RPC,
+                Tenderly, Particle Network.
               </p>
             </div>
 
