@@ -340,7 +340,7 @@ export function SetupWizard({ initialStatus }: SetupWizardProps) {
                       .filter((a) => a.tier === 'active')
                       .map((a, i) => ({
                         name: a.wallet_label || `${a.wallet_address.slice(0, 6)}...${a.wallet_address.slice(-4)}`,
-                        value: a.allocation_pct,
+                        value: Number(a.allocation_pct) || 0,
                         color: ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'][i % 5],
                       }))}
                     showLegend

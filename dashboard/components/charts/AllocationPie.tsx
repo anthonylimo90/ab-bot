@@ -25,7 +25,7 @@ const CustomTooltip = ({ active, payload, totalBalance = 0 }: any) => {
       <div className="bg-popover/90 backdrop-blur border rounded-lg px-3 py-2 text-sm shadow-lg">
         <div className="font-medium">{data.name}</div>
         <div className="text-muted-foreground">
-          {data.value.toFixed(1)}% (${((data.value / 100) * totalBalance).toLocaleString()})
+          {Number(data.value).toFixed(1)}% (${((Number(data.value) / 100) * totalBalance).toLocaleString()})
         </div>
       </div>
     );
@@ -77,7 +77,7 @@ export function AllocationPie({
                 />
                 <span>{entry.name}</span>
               </div>
-              <span className="font-medium tabular-nums">{entry.value.toFixed(0)}%</span>
+              <span className="font-medium tabular-nums">{Number(entry.value).toFixed(0)}%</span>
             </div>
           ))}
         </div>

@@ -116,7 +116,7 @@ export function DashboardHome() {
     ];
     return activeWallets.map((w, i) => ({
       name: w.wallet_label || `${w.wallet_address.slice(0, 6)}...${w.wallet_address.slice(-4)}`,
-      value: w.allocation_pct,
+      value: Number(w.allocation_pct) || 0,
       color: colors[i % colors.length],
     }));
   }, [activeWallets]);
