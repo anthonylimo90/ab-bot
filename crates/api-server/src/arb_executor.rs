@@ -174,7 +174,7 @@ impl OutcomeTokenCache {
 
 /// Arb auto-executor service.
 pub struct ArbAutoExecutor {
-    config: ArbExecutorConfig,
+    config: Arc<RwLock<ArbExecutorConfig>>,
     arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     order_executor: Arc<OrderExecutor>,
@@ -190,7 +190,7 @@ impl ArbAutoExecutor {
     /// Create a new arb auto-executor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: ArbExecutorConfig,
+        config: Arc<RwLock<ArbExecutorConfig>>,
         arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
         signal_tx: broadcast::Sender<SignalUpdate>,
         order_executor: Arc<OrderExecutor>,
@@ -212,17 +212,24 @@ impl ArbAutoExecutor {
         }
     }
 
+    /// Snapshot the current config for use during a single tick/signal.
+    async fn snapshot_config(&self) -> ArbExecutorConfig {
+        self.config.read().await.clone()
+    }
+
     /// Main run loop.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        if !self.config.enabled {
+        let startup_cfg = self.snapshot_config().await;
+
+        if !startup_cfg.enabled {
             info!("Arb auto-executor is disabled (set ARB_AUTO_EXECUTE=true to enable)");
             return Ok(());
         }
 
         info!(
-            position_size = %self.config.position_size,
-            min_net_profit = %self.config.min_net_profit,
-            max_signal_age_secs = self.config.max_signal_age_secs,
+            position_size = %startup_cfg.position_size,
+            min_net_profit = %startup_cfg.min_net_profit,
+            max_signal_age_secs = startup_cfg.max_signal_age_secs,
             "Starting arb auto-executor"
         );
 
@@ -241,7 +248,7 @@ impl ArbAutoExecutor {
             info!(active_positions = %active.len(), "Loaded active positions for dedup");
         }
 
-        let cache_interval = tokio::time::Duration::from_secs(self.config.cache_refresh_secs);
+        let cache_interval = tokio::time::Duration::from_secs(startup_cfg.cache_refresh_secs);
         let mut cache_ticker = tokio::time::interval(cache_interval);
         // Skip the first immediate tick (we already loaded above)
         cache_ticker.tick().await;
@@ -278,28 +285,29 @@ impl ArbAutoExecutor {
 
     /// Process a single arb signal through validation → execution → tracking.
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
+        let cfg = self.snapshot_config().await;
         let market_id = &arb.market_id;
 
         // 1. Validate signal freshness
         let age_secs = Utc::now()
             .signed_duration_since(arb.timestamp)
             .num_seconds();
-        if age_secs > self.config.max_signal_age_secs {
+        if age_secs > cfg.max_signal_age_secs {
             info!(
                 market_id = %market_id,
                 age_secs = age_secs,
-                max = self.config.max_signal_age_secs,
+                max = cfg.max_signal_age_secs,
                 "Arb signal too stale, skipping"
             );
             return Ok(());
         }
 
         // 2. Check minimum profit threshold
-        if arb.net_profit < self.config.min_net_profit {
+        if arb.net_profit < cfg.min_net_profit {
             info!(
                 market_id = %market_id,
                 net_profit = %arb.net_profit,
-                min = %self.config.min_net_profit,
+                min = %cfg.min_net_profit,
                 "Arb signal below min profit threshold, skipping"
             );
             return Ok(());
@@ -360,12 +368,12 @@ impl ArbAutoExecutor {
                 let yes_depth: Decimal = yb.asks.iter().map(|l| l.price * l.size).sum();
                 let no_depth: Decimal = nb.asks.iter().map(|l| l.price * l.size).sum();
 
-                if yes_depth < self.config.min_book_depth || no_depth < self.config.min_book_depth {
+                if yes_depth < cfg.min_book_depth || no_depth < cfg.min_book_depth {
                     info!(
                         market_id = %market_id,
                         yes_depth = %yes_depth,
                         no_depth = %no_depth,
-                        min_depth = %self.config.min_book_depth,
+                        min_depth = %cfg.min_book_depth,
                         "Arb signal insufficient orderbook depth, skipping"
                     );
                     return Ok(());
@@ -374,21 +382,21 @@ impl ArbAutoExecutor {
         }
 
         // 7. Dynamic position sizing based on spread width
-        let position_size = if self.config.dynamic_sizing {
+        let position_size = if cfg.dynamic_sizing {
             // Linear interpolation between min and max position size
             // based on where net_profit falls in the [min_net_profit, 0.05] range.
             // min_net_profit (e.g. 0.001) → min_position_size ($25)
             // 0.05+ (5 cent spread) → max_position_size ($200)
-            let floor = self.config.min_net_profit;
+            let floor = cfg.min_net_profit;
             let ceiling = Decimal::new(5, 2); // 0.05
             let range = ceiling - floor;
             let sized = if range.is_zero() {
-                self.config.min_position_size
+                cfg.min_position_size
             } else {
                 let t = (arb.net_profit - floor) / range;
                 let t_clamped = t.max(Decimal::ZERO).min(Decimal::ONE);
-                let size_range = self.config.max_position_size - self.config.min_position_size;
-                self.config.min_position_size + size_range * t_clamped
+                let size_range = cfg.max_position_size - cfg.min_position_size;
+                cfg.min_position_size + size_range * t_clamped
             };
             debug!(
                 market_id = %market_id,
@@ -398,7 +406,7 @@ impl ArbAutoExecutor {
             );
             sized
         } else {
-            self.config.position_size
+            cfg.position_size
         };
 
         if arb.total_cost.is_zero() {
@@ -408,7 +416,7 @@ impl ArbAutoExecutor {
         let quantity = position_size / arb.total_cost;
 
         // Fee drag tracking: log the expected fees vs expected profit
-        let expected_fees = quantity * arb.total_cost * self.config.fee_rate;
+        let expected_fees = quantity * arb.total_cost * cfg.fee_rate;
         let expected_gross = arb.gross_profit * quantity;
         let expected_net = arb.net_profit * quantity;
 
@@ -571,7 +579,7 @@ impl ArbAutoExecutor {
 /// Spawn the arb auto-executor as a background task.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_arb_auto_executor(
-    config: ArbExecutorConfig,
+    config: Arc<RwLock<ArbExecutorConfig>>,
     arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     order_executor: Arc<OrderExecutor>,

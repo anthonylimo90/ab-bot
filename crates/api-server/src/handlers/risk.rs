@@ -5,7 +5,7 @@ use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -364,6 +364,133 @@ pub async fn manual_trip_circuit_breaker(
             cooldown_minutes: cb_config.cooldown_minutes,
             enabled: cb_config.enabled,
         },
+    }))
+}
+
+/// Request to update circuit breaker configuration.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateCircuitBreakerConfigRequest {
+    pub max_daily_loss: Option<f64>,
+    pub max_drawdown_pct: Option<f64>,
+    pub max_consecutive_losses: Option<u32>,
+    pub cooldown_minutes: Option<i64>,
+    pub enabled: Option<bool>,
+}
+
+/// Update circuit breaker configuration.
+#[utoipa::path(
+    put,
+    path = "/api/v1/workspaces/{workspace_id}/risk/circuit-breaker/config",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = UpdateCircuitBreakerConfigRequest,
+    responses(
+        (status = 200, description = "Updated config", body = CircuitBreakerConfigResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member / insufficient role"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "risk"
+)]
+pub async fn update_circuit_breaker_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<UpdateCircuitBreakerConfigRequest>,
+) -> ApiResult<Json<CircuitBreakerConfigResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    // Verify membership + role
+    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
+    let role = match role {
+        Some(r) => r,
+        None => return Err(ApiError::Forbidden("Not a member of this workspace".into())),
+    };
+    if !can_manage_risk(&role) {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners/admins can update circuit breaker config".into(),
+        ));
+    }
+
+    // Read current config and merge partial updates
+    let mut config = state.circuit_breaker.config().await;
+
+    if let Some(v) = req.max_daily_loss {
+        if v < 0.0 {
+            return Err(ApiError::BadRequest("max_daily_loss must be >= 0".into()));
+        }
+        config.max_daily_loss =
+            Decimal::from_f64_retain(v).unwrap_or_else(|| Decimal::new(v as i64, 0));
+    }
+    if let Some(v) = req.max_drawdown_pct {
+        if !(0.0..=1.0).contains(&v) {
+            return Err(ApiError::BadRequest(
+                "max_drawdown_pct must be between 0 and 1 (e.g., 0.20 for 20%)".into(),
+            ));
+        }
+        config.max_drawdown_pct =
+            Decimal::from_f64_retain(v).unwrap_or_else(|| Decimal::new((v * 100.0) as i64, 2));
+    }
+    if let Some(v) = req.max_consecutive_losses {
+        if v < 1 {
+            return Err(ApiError::BadRequest(
+                "max_consecutive_losses must be >= 1".into(),
+            ));
+        }
+        config.max_consecutive_losses = v;
+    }
+    if let Some(v) = req.cooldown_minutes {
+        if v < 0 {
+            return Err(ApiError::BadRequest("cooldown_minutes must be >= 0".into()));
+        }
+        config.cooldown_minutes = v;
+    }
+    if let Some(v) = req.enabled {
+        config.enabled = v;
+    }
+
+    // Hot-swap the in-memory config
+    state.circuit_breaker.update_config(config.clone()).await;
+
+    // Persist to workspace DB columns so config survives restarts
+    sqlx::query(
+        r#"
+        UPDATE workspaces
+        SET cb_max_daily_loss = $1,
+            cb_max_drawdown_pct = $2,
+            cb_max_consecutive_losses = $3,
+            cb_cooldown_minutes = $4,
+            cb_enabled = $5,
+            updated_at = NOW()
+        WHERE id = $6
+        "#,
+    )
+    .bind(config.max_daily_loss)
+    .bind(config.max_drawdown_pct)
+    .bind(config.max_consecutive_losses as i32)
+    .bind(config.cooldown_minutes as i32)
+    .bind(config.enabled)
+    .bind(workspace_id)
+    .execute(&state.pool)
+    .await?;
+
+    tracing::info!(
+        workspace_id = %workspace_id,
+        user_id = %user_id,
+        "Circuit breaker config updated via dashboard"
+    );
+
+    Ok(Json(CircuitBreakerConfigResponse {
+        max_daily_loss: config.max_daily_loss,
+        max_drawdown_pct: config.max_drawdown_pct,
+        max_consecutive_losses: config.max_consecutive_losses,
+        cooldown_minutes: config.cooldown_minutes,
+        enabled: config.enabled,
     }))
 }
 

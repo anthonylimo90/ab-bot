@@ -94,6 +94,10 @@ pub struct AppState {
     /// Set of active (non-resolved) CLOB market IDs, refreshed by OutcomeTokenCache.
     /// Used by CopyTradingMonitor to skip resolved markets before hitting the CLOB.
     pub active_clob_markets: Arc<RwLock<HashSet<String>>>,
+    /// Shared copy-trade stop-loss config for runtime hot-swap (None if copy trading disabled).
+    pub copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
+    /// Shared arb executor config for runtime hot-swap (None if arb executor disabled).
+    pub arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
 }
 
 impl AppState {
@@ -330,6 +334,58 @@ impl AppState {
                 circuit_breaker_config.cooldown_minutes = n;
             }
         }
+
+        // Apply DB overrides (workspace-level CB config takes priority over env vars)
+        #[derive(sqlx::FromRow)]
+        struct CbOverrideRow {
+            cb_max_daily_loss: Option<rust_decimal::Decimal>,
+            cb_max_drawdown_pct: Option<rust_decimal::Decimal>,
+            cb_max_consecutive_losses: Option<i32>,
+            cb_cooldown_minutes: Option<i32>,
+            cb_enabled: Option<bool>,
+        }
+        match sqlx::query_as::<_, CbOverrideRow>(
+            r#"
+            SELECT cb_max_daily_loss, cb_max_drawdown_pct, cb_max_consecutive_losses,
+                   cb_cooldown_minutes, cb_enabled
+            FROM workspaces
+            WHERE cb_max_daily_loss IS NOT NULL
+               OR cb_max_drawdown_pct IS NOT NULL
+               OR cb_max_consecutive_losses IS NOT NULL
+               OR cb_cooldown_minutes IS NOT NULL
+               OR cb_enabled IS NOT NULL
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&pool)
+        .await
+        {
+            Ok(Some(row)) => {
+                if let Some(v) = row.cb_max_daily_loss {
+                    circuit_breaker_config.max_daily_loss = v;
+                }
+                if let Some(v) = row.cb_max_drawdown_pct {
+                    circuit_breaker_config.max_drawdown_pct = v;
+                }
+                if let Some(v) = row.cb_max_consecutive_losses {
+                    circuit_breaker_config.max_consecutive_losses = v as u32;
+                }
+                if let Some(v) = row.cb_cooldown_minutes {
+                    circuit_breaker_config.cooldown_minutes = v as i64;
+                }
+                if let Some(v) = row.cb_enabled {
+                    circuit_breaker_config.enabled = v;
+                }
+                tracing::info!("Loaded circuit breaker config overrides from workspace DB");
+            }
+            Ok(None) => {
+                tracing::debug!("No workspace CB overrides found, using env/default values");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load CB overrides from DB, using env/defaults: {e}");
+            }
+        }
+
         let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
 
         // Create Polygon client for on-chain queries (balance, etc.)
@@ -402,6 +458,8 @@ impl AppState {
             current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
             redis_conn,
             active_clob_markets: Arc::new(RwLock::new(HashSet::new())),
+            copy_stop_loss_config: None,
+            arb_executor_config: None,
         })
     }
 

@@ -239,6 +239,38 @@ impl ApiServer {
                 Some((copy_config, trade_monitor, copy_trader, copy_latency_atomic));
         }
 
+        // ── Pre-create arb executor config Arc (must happen before Arc-wrapping state) ──
+        let mut arb_config_pre = ArbExecutorConfig::from_env();
+        if !arb_config_pre.enabled {
+            match crate::runtime_sync::any_workspace_arb_enabled(&self.state.pool).await {
+                Ok(true) => {
+                    arb_config_pre.enabled = true;
+                    info!(
+                        "Enabling arb auto-executor because at least one workspace has arb_auto_execute=true"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to read workspace arb_auto_execute flags; falling back to env-only arb config"
+                    );
+                }
+            }
+        }
+        let arb_config_arc = Arc::new(RwLock::new(arb_config_pre));
+        self.state.arb_executor_config = Some(arb_config_arc.clone());
+
+        // Pre-create stop-loss config Arc (must happen before Arc-wrapping state)
+        let stop_loss_config_arc: Option<Arc<tokio::sync::RwLock<CopyStopLossConfig>>> =
+            if copy_monitor_args.is_some() {
+                let arc = Arc::new(tokio::sync::RwLock::new(CopyStopLossConfig::from_env()));
+                self.state.copy_stop_loss_config = Some(arc.clone());
+                Some(arc)
+            } else {
+                None
+            };
+
         // ── Wrap state in Arc and build router ──
         let state = Arc::new(self.state);
 
@@ -290,28 +322,10 @@ impl ApiServer {
         // Shared dedup set for arb executor + exit handler
         let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
 
-        // Spawn arb auto-executor if enabled
-        let mut arb_config = ArbExecutorConfig::from_env();
-        if !arb_config.enabled {
-            match crate::runtime_sync::any_workspace_arb_enabled(&state.pool).await {
-                Ok(true) => {
-                    arb_config.enabled = true;
-                    info!(
-                        "Enabling arb auto-executor because at least one workspace has arb_auto_execute=true"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to read workspace arb_auto_execute flags; falling back to env-only arb config"
-                    );
-                }
-            }
-        }
-        if arb_config.enabled {
+        // Spawn arb auto-executor if enabled (config Arc created before wrap)
+        if arb_config_arc.read().await.enabled {
             spawn_arb_auto_executor(
-                arb_config,
+                arb_config_arc.clone(),
                 state.subscribe_arb_entry(),
                 state.signal_tx.clone(),
                 state.order_executor.clone(),
@@ -350,7 +364,7 @@ impl ApiServer {
             .as_ref()
             .map(|(_, _, _, atomic)| atomic.clone());
 
-        // Subscribe local runtime to dynamic updates (copy-trader knobs)
+        // Subscribe local runtime to dynamic updates (copy-trader knobs + arb executor)
         let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
             .or_else(|_| std::env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -359,6 +373,8 @@ impl ApiServer {
             state.copy_trader.clone(),
             state.pool.clone(),
             copy_latency_atomic,
+            state.copy_stop_loss_config.clone(),
+            state.arb_executor_config.clone(),
         );
 
         // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
@@ -409,17 +425,19 @@ impl ApiServer {
             );
 
             // Spawn copy-trade stop-loss / mirror-exit monitor
-            let stop_loss_config = CopyStopLossConfig::from_env();
-            spawn_copy_stop_loss_monitor(
-                stop_loss_config,
-                state.pool.clone(),
-                state.order_executor.clone(),
-                state.circuit_breaker.clone(),
-                state.clob_client.clone(),
-                copy_trader,
-                Some(trade_monitor),
-                state.signal_tx.clone(),
-            );
+            // (Arc was pre-created above so the subscriber can reference it)
+            if let Some(sl_config) = stop_loss_config_arc {
+                spawn_copy_stop_loss_monitor(
+                    sl_config,
+                    state.pool.clone(),
+                    state.order_executor.clone(),
+                    state.circuit_breaker.clone(),
+                    state.clob_client.clone(),
+                    copy_trader,
+                    Some(trade_monitor),
+                    state.signal_tx.clone(),
+                );
+            }
 
             tracing::info!(
                 "Copy trading monitor stack initialized (with stop-loss + mirror exits)"

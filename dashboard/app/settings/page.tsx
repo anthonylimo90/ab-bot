@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -10,7 +10,6 @@ import { useToastStore } from '@/stores/toast-store';
 import {
   RefreshCw,
   Wallet,
-  Bell,
   Shield,
   Palette,
   Save,
@@ -33,27 +32,18 @@ import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
 import { useWalletStore } from '@/stores/wallet-store';
 import api from '@/lib/api';
 import Link from 'next/link';
+import { TradingGatesPanel } from '@/components/trading/TradingGatesPanel';
+import { formatCurrency } from '@/lib/utils';
 
 export default function SettingsPage() {
   const toast = useToastStore();
   const queryClient = useQueryClient();
   const { user } = useAuthStore();
   const { currentWorkspace } = useWorkspaceStore();
-  const {
-    risk,
-    notifications,
-    appearance,
-    isDirty,
-    updateRisk,
-    updateNotifications,
-    updateAppearance,
-    markClean,
-    resetToDefaults,
-  } = useSettingsStore();
+  const { appearance, updateAppearance } = useSettingsStore();
 
   const [connectWalletOpen, setConnectWalletOpen] = useState(false);
   const [inviteDialogOpen, setInviteDialogOpen] = useState(false);
-  const [isSaving, setIsSaving] = useState(false);
   const [walletConnectProjectId, setWalletConnectProjectId] = useState('');
   const [isSavingWalletConnect, setIsSavingWalletConnect] = useState(false);
   const [isSavingTradingConfig, setIsSavingTradingConfig] = useState(false);
@@ -62,6 +52,15 @@ export default function SettingsPage() {
   const [copyTradingEnabled, setCopyTradingEnabled] = useState(false);
   const [arbAutoExecute, setArbAutoExecute] = useState(false);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
+
+  // Risk management form state (backed by API, not localStorage)
+  const [isSavingRisk, setIsSavingRisk] = useState(false);
+  const [riskMaxDailyLoss, setRiskMaxDailyLoss] = useState<number | ''>('');
+  const [riskMaxDrawdownPct, setRiskMaxDrawdownPct] = useState<number | ''>('');
+  const [riskMaxConsecutiveLosses, setRiskMaxConsecutiveLosses] = useState<number | ''>('');
+  const [riskCooldownMinutes, setRiskCooldownMinutes] = useState<number | ''>('');
+  const [riskEnabled, setRiskEnabled] = useState(true);
+
   const {
     connectedWallets,
     primaryWallet,
@@ -71,6 +70,12 @@ export default function SettingsPage() {
     disconnectWallet,
   } = useWalletStore();
 
+  // Get current user's role in workspace
+  const currentUserRole = currentWorkspace?.my_role;
+  const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
+  const canManageRisk = currentUserRole === 'owner' || currentUserRole === 'admin';
+  const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
+
   // Fetch workspace members
   const { data: members = [], isLoading: membersLoading } = useQuery({
     queryKey: ['workspace', currentWorkspace?.id, 'members'],
@@ -79,24 +84,47 @@ export default function SettingsPage() {
   });
 
   // Fetch pending invites
-  const { data: invites = [], isLoading: invitesLoading } = useQuery({
+  const { data: invites = [] } = useQuery({
     queryKey: ['workspace', currentWorkspace?.id, 'invites'],
     queryFn: () => api.listWorkspaceInvites(currentWorkspace!.id),
     enabled: !!currentWorkspace?.id,
   });
-
-  // Get current user's role in workspace
-  const currentUserRole = currentWorkspace?.my_role;
-  const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
-  const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
 
   // Fetch service status
   const { data: serviceStatus } = useQuery({
     queryKey: ['workspace', currentWorkspace?.id, 'service-status'],
     queryFn: () => api.getServiceStatus(currentWorkspace!.id),
     enabled: !!currentWorkspace?.id && canConfigureWalletConnect,
-    refetchInterval: 30000, // refresh every 30s
+    refetchInterval: 30000,
   });
+
+  // Fetch risk status (real CB config from backend)
+  const { data: riskStatus } = useQuery({
+    queryKey: ['risk-status', currentWorkspace?.id],
+    queryFn: () => api.getRiskStatus(currentWorkspace!.id),
+    enabled: !!currentWorkspace?.id,
+    refetchInterval: 30000,
+  });
+
+  // Fetch dynamic tuner status (for gates panel)
+  const { data: dynamicTunerStatus } = useQuery({
+    queryKey: ['dynamic-tuner-status', currentWorkspace?.id],
+    queryFn: () => api.getDynamicTunerStatus(currentWorkspace!.id),
+    enabled: !!currentWorkspace?.id,
+    refetchInterval: 30000,
+  });
+
+  // Initialize risk form from API data
+  useEffect(() => {
+    if (riskStatus?.circuit_breaker?.config) {
+      const cfg = riskStatus.circuit_breaker.config;
+      setRiskMaxDailyLoss(cfg.max_daily_loss);
+      setRiskMaxDrawdownPct(Math.round(cfg.max_drawdown_pct * 10000) / 100); // ratio -> percent display
+      setRiskMaxConsecutiveLosses(cfg.max_consecutive_losses);
+      setRiskCooldownMinutes(cfg.cooldown_minutes);
+      setRiskEnabled(cfg.enabled);
+    }
+  }, [riskStatus]);
 
   // Initialize walletConnectProjectId from workspace
   useEffect(() => {
@@ -123,16 +151,15 @@ export default function SettingsPage() {
   }, [fetchWallets]);
 
   // Revoke invite mutation
-  const revokeInviteMutation = useMutation({
-    mutationFn: (inviteId: string) => api.revokeInvite(currentWorkspace!.id, inviteId),
-    onSuccess: () => {
+  const handleRevokeInvite = async (inviteId: string) => {
+    try {
+      await api.revokeInvite(currentWorkspace!.id, inviteId);
       queryClient.invalidateQueries({ queryKey: ['workspace', currentWorkspace?.id, 'invites'] });
       toast.success('Invite revoked', 'The invitation has been cancelled');
-    },
-    onError: (err: Error) => {
-      toast.error('Failed to revoke invite', err.message);
-    },
-  });
+    } catch (err) {
+      toast.error('Failed to revoke invite', err instanceof Error ? err.message : 'Unknown error');
+    }
+  };
 
   // Save WalletConnect project ID
   const handleSaveWalletConnect = async () => {
@@ -143,7 +170,6 @@ export default function SettingsPage() {
         walletconnect_project_id: walletConnectProjectId || undefined,
       });
       toast.success('WalletConnect settings saved', 'Your wallet connection is now configured');
-      // Refresh workspace to get updated config
       queryClient.invalidateQueries({ queryKey: ['workspace'] });
     } catch (err) {
       toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
@@ -176,19 +202,35 @@ export default function SettingsPage() {
     }
   };
 
-  const handleSave = async () => {
-    setIsSaving(true);
-    // Simulate API call
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    markClean();
-    toast.success('Settings saved', 'Your preferences have been updated');
-    setIsSaving(false);
+  // Save risk management config (real API call)
+  const handleSaveRisk = async () => {
+    if (!currentWorkspace) return;
+    setIsSavingRisk(true);
+    try {
+      await api.updateCircuitBreakerConfig(currentWorkspace.id, {
+        max_daily_loss: riskMaxDailyLoss === '' ? undefined : Number(riskMaxDailyLoss),
+        max_drawdown_pct: riskMaxDrawdownPct === '' ? undefined : Number(riskMaxDrawdownPct) / 100, // percent -> ratio
+        max_consecutive_losses: riskMaxConsecutiveLosses === '' ? undefined : Number(riskMaxConsecutiveLosses),
+        cooldown_minutes: riskCooldownMinutes === '' ? undefined : Number(riskCooldownMinutes),
+        enabled: riskEnabled,
+      });
+      toast.success('Risk settings saved', 'Circuit breaker configuration has been updated');
+      queryClient.invalidateQueries({ queryKey: ['risk-status', currentWorkspace.id] });
+    } catch (err) {
+      toast.error('Failed to save risk settings', err instanceof Error ? err.message : 'Unknown error');
+    } finally {
+      setIsSavingRisk(false);
+    }
   };
 
-  const handleReset = () => {
-    resetToDefaults();
-    toast.info('Settings reset', 'All settings have been restored to defaults');
-  };
+  // Check if risk form has changed from API baseline
+  const riskDirty = riskStatus?.circuit_breaker?.config
+    ? (riskMaxDailyLoss !== riskStatus.circuit_breaker.config.max_daily_loss ||
+       riskMaxDrawdownPct !== Math.round(riskStatus.circuit_breaker.config.max_drawdown_pct * 10000) / 100 ||
+       riskMaxConsecutiveLosses !== riskStatus.circuit_breaker.config.max_consecutive_losses ||
+       riskCooldownMinutes !== riskStatus.circuit_breaker.config.cooldown_minutes ||
+       riskEnabled !== riskStatus.circuit_breaker.config.enabled)
+    : false;
 
   const themeButtons: { value: Theme; label: string }[] = [
     { value: 'light', label: 'Light' },
@@ -225,50 +267,22 @@ export default function SettingsPage() {
   return (
     <div className="mx-auto max-w-3xl space-y-5 sm:space-y-6">
       {/* Page Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Settings</h1>
-          <p className="text-muted-foreground">
-            Manage your account and preferences
-          </p>
-        </div>
-        <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:justify-end">
-          {isDirty && (
-            <span className="text-sm text-yellow-500 flex items-center gap-1">
-              <AlertTriangle className="h-4 w-4" />
-              Unsaved changes
-            </span>
-          )}
-          <Button
-            variant="outline"
-            onClick={handleReset}
-            disabled={isSaving}
-          >
-            Reset to Defaults
-          </Button>
-          <Button
-            onClick={handleSave}
-            disabled={!isDirty || isSaving}
-          >
-            {isSaving ? (
-              <>
-                <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                Saving...
-              </>
-            ) : isDirty ? (
-              <>
-                <Save className="mr-2 h-4 w-4" />
-                Save Changes
-              </>
-            ) : (
-              <>
-                <Check className="mr-2 h-4 w-4" />
-                Saved
-              </>
-            )}
-          </Button>
-        </div>
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Settings</h1>
+        <p className="text-muted-foreground">
+          Manage your account, trading configuration, and risk parameters
+        </p>
       </div>
+
+      {/* Trading Gates Panel */}
+      {currentWorkspace && (
+        <TradingGatesPanel
+          workspace={currentWorkspace}
+          serviceStatus={serviceStatus ?? null}
+          riskStatus={riskStatus ?? null}
+          dynamicTunerStatus={dynamicTunerStatus ?? null}
+        />
+      )}
 
       {/* Account */}
       <Card>
@@ -620,10 +634,9 @@ export default function SettingsPage() {
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => revokeInviteMutation.mutate(invite.id)}
-                        disabled={revokeInviteMutation.isPending}
+                        onClick={() => handleRevokeInvite(invite.id)}
                       >
-                        {revokeInviteMutation.isPending ? 'Revoking...' : 'Revoke'}
+                        Revoke
                       </Button>
                     </div>
                   ))}
@@ -662,173 +675,186 @@ export default function SettingsPage() {
         </Card>
       )}
 
-      {/* Risk Management */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Shield className="h-5 w-5" />
-            Risk Management
-          </CardTitle>
-          <CardDescription>
-            Configure risk parameters for your trades
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Default Stop-Loss</p>
-              <p className="text-sm text-muted-foreground">
-                Automatically set stop-loss on new positions
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                value={risk.defaultStopLoss}
-                onChange={(e) =>
-                  updateRisk({ defaultStopLoss: Number(e.target.value) })
-                }
-                className="w-20 rounded border bg-background px-3 py-1 text-right"
-                min={1}
-                max={50}
-              />
-              <span className="text-muted-foreground">%</span>
-            </div>
-          </div>
+      {/* Risk Management — backed by real API */}
+      {currentWorkspace && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Shield className="h-5 w-5" />
+              Risk Management
+            </CardTitle>
+            <CardDescription>
+              Circuit breaker configuration — protects against cascading losses
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            {!riskStatus ? (
+              <div className="text-center py-4 text-muted-foreground">Loading risk configuration...</div>
+            ) : (
+              <>
+                {/* Circuit Breaker Status Banner */}
+                {riskStatus.circuit_breaker.tripped && (
+                  <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3">
+                    <p className="text-sm text-red-500 flex items-center gap-2">
+                      <AlertTriangle className="h-4 w-4" />
+                      Circuit breaker is tripped — trading is paused
+                      {riskStatus.circuit_breaker.trip_reason && (
+                        <> (reason: {riskStatus.circuit_breaker.trip_reason})</>
+                      )}
+                    </p>
+                  </div>
+                )}
 
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Max Position Size</p>
-              <p className="text-sm text-muted-foreground">
-                Maximum amount per single position
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-muted-foreground">$</span>
-              <input
-                type="number"
-                value={risk.maxPositionSize}
-                onChange={(e) =>
-                  updateRisk({ maxPositionSize: Number(e.target.value) })
-                }
-                className="w-24 rounded border bg-background px-3 py-1 text-right"
-                min={10}
-                max={10000}
-              />
-            </div>
-          </div>
+                {/* Max Daily Loss */}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-medium">Max Daily Loss</p>
+                    <p className="text-sm text-muted-foreground">
+                      Trips circuit breaker when daily P&L exceeds this loss
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground">$</span>
+                    <input
+                      type="number"
+                      value={riskMaxDailyLoss}
+                      onChange={(e) => setRiskMaxDailyLoss(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-28 rounded border bg-background px-3 py-1 text-right"
+                      min={0}
+                      step={100}
+                      disabled={!canManageRisk}
+                    />
+                  </div>
+                </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Daily Loss Limit</p>
-              <p className="text-sm text-muted-foreground">
-                Maximum daily loss before circuit breaker triggers
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-muted-foreground">$</span>
-              <input
-                type="number"
-                value={risk.dailyLossLimit}
-                onChange={(e) =>
-                  updateRisk({ dailyLossLimit: Number(e.target.value) })
-                }
-                className="w-24 rounded border bg-background px-3 py-1 text-right"
-                min={100}
-                max={50000}
-              />
-            </div>
-          </div>
+                {/* Max Drawdown */}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-medium">Max Drawdown</p>
+                    <p className="text-sm text-muted-foreground">
+                      Trips when portfolio drops this % from peak value
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      value={riskMaxDrawdownPct}
+                      onChange={(e) => setRiskMaxDrawdownPct(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-20 rounded border bg-background px-3 py-1 text-right"
+                      min={1}
+                      max={100}
+                      step={1}
+                      disabled={!canManageRisk}
+                    />
+                    <span className="text-muted-foreground">%</span>
+                  </div>
+                </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Circuit Breaker</p>
-              <p className="text-sm text-muted-foreground">
-                Pause trading after daily loss exceeds threshold
-              </p>
-            </div>
-            <Switch
-              checked={risk.circuitBreakerEnabled}
-              onCheckedChange={(checked) =>
-                updateRisk({ circuitBreakerEnabled: checked })
-              }
-            />
-          </div>
-        </CardContent>
-      </Card>
+                {/* Max Consecutive Losses */}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-medium">Max Consecutive Losses</p>
+                    <p className="text-sm text-muted-foreground">
+                      Trips after this many consecutive losing trades
+                    </p>
+                  </div>
+                  <input
+                    type="number"
+                    value={riskMaxConsecutiveLosses}
+                    onChange={(e) => setRiskMaxConsecutiveLosses(e.target.value === '' ? '' : Number(e.target.value))}
+                    className="w-20 rounded border bg-background px-3 py-1 text-right"
+                    min={1}
+                    max={100}
+                    disabled={!canManageRisk}
+                  />
+                </div>
 
-      {/* Notifications */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bell className="h-5 w-5" />
-            Notifications
-          </CardTitle>
-          <CardDescription>
-            Configure alerts and notifications
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Telegram Alerts</p>
-              <p className="text-sm text-muted-foreground">
-                Receive trade notifications via Telegram
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={notifications.telegramEnabled}
-                onCheckedChange={(checked) =>
-                  updateNotifications({ telegramEnabled: checked })
-                }
-              />
-              {notifications.telegramEnabled && (
-                <Button variant="outline" size="sm">
-                  Configure
-                </Button>
-              )}
-            </div>
-          </div>
+                {/* Cooldown Minutes */}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-medium">Cooldown Period</p>
+                    <p className="text-sm text-muted-foreground">
+                      Minutes to wait before auto-resuming after a trip
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      value={riskCooldownMinutes}
+                      onChange={(e) => setRiskCooldownMinutes(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-20 rounded border bg-background px-3 py-1 text-right"
+                      min={0}
+                      max={1440}
+                      disabled={!canManageRisk}
+                    />
+                    <span className="text-muted-foreground">min</span>
+                  </div>
+                </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Discord Webhook</p>
-              <p className="text-sm text-muted-foreground">
-                Post updates to a Discord channel
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={notifications.discordEnabled}
-                onCheckedChange={(checked) =>
-                  updateNotifications({ discordEnabled: checked })
-                }
-              />
-              {notifications.discordEnabled && (
-                <Button variant="outline" size="sm">
-                  Configure
-                </Button>
-              )}
-            </div>
-          </div>
+                {/* Circuit Breaker Enabled */}
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="font-medium">Circuit Breaker</p>
+                    <p className="text-sm text-muted-foreground">
+                      Pause trading when loss thresholds are exceeded
+                    </p>
+                  </div>
+                  <Switch
+                    checked={riskEnabled}
+                    onCheckedChange={setRiskEnabled}
+                    disabled={!canManageRisk}
+                  />
+                </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <p className="font-medium">Email Notifications</p>
-              <p className="text-sm text-muted-foreground">
-                Daily summary and important alerts
-              </p>
-            </div>
-            <Switch
-              checked={notifications.emailEnabled}
-              onCheckedChange={(checked) =>
-                updateNotifications({ emailEnabled: checked })
-              }
-            />
-          </div>
-        </CardContent>
-      </Card>
+                {/* Current Runtime Stats */}
+                <div className="rounded-lg border p-4 space-y-1">
+                  <p className="text-sm font-medium mb-2">Current Status</p>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Daily P&L</span>
+                    <span className={riskStatus.circuit_breaker.daily_pnl < 0 ? 'text-red-500' : 'text-green-500'}>
+                      {formatCurrency(riskStatus.circuit_breaker.daily_pnl, { showSign: true })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Consecutive Losses</span>
+                    <span>{riskStatus.circuit_breaker.consecutive_losses}</span>
+                  </div>
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Trips Today</span>
+                    <span>{riskStatus.circuit_breaker.trips_today}</span>
+                  </div>
+                </div>
+
+                {/* Save Button */}
+                {canManageRisk && (
+                  <Button
+                    onClick={handleSaveRisk}
+                    disabled={isSavingRisk || !riskDirty}
+                    className="w-full"
+                  >
+                    {isSavingRisk ? (
+                      <>
+                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        Saving...
+                      </>
+                    ) : riskDirty ? (
+                      <>
+                        <Save className="mr-2 h-4 w-4" />
+                        Save Risk Configuration
+                      </>
+                    ) : (
+                      <>
+                        <Check className="mr-2 h-4 w-4" />
+                        Saved
+                      </>
+                    )}
+                  </Button>
+                )}
+              </>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Appearance */}
       <Card>

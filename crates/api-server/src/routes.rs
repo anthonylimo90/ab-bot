@@ -139,6 +139,11 @@ use crate::websocket;
         risk::get_risk_status,
         risk::manual_trip_circuit_breaker,
         risk::reset_circuit_breaker,
+        risk::update_circuit_breaker_config,
+        // Copy trading config
+        workspaces::update_copy_trading_config,
+        // Arb executor config
+        workspaces::update_arb_executor_config,
     ),
     components(
         schemas(
@@ -268,6 +273,11 @@ use crate::websocket;
             risk::RecoveryStateResponse,
             risk::StopLossStatsResponse,
             risk::RecentStopExecution,
+            risk::UpdateCircuitBreakerConfigRequest,
+            workspaces::UpdateCopyTradingConfigRequest,
+            workspaces::CopyTradingConfigResponse,
+            workspaces::UpdateArbExecutorConfigRequest,
+            workspaces::ArbExecutorConfigResponse,
         )
     ),
     tags(
@@ -681,6 +691,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/opportunity-selection",
             put(workspaces::update_opportunity_selection_settings),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/config",
+            put(risk::update_circuit_breaker_config),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/copy-trading",
+            put(workspaces::update_copy_trading_config),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/arb-executor",
+            put(workspaces::update_arb_executor_config),
         )
         .layer(GovernorLayer {
             config: Arc::new(config_rate_limit_config),

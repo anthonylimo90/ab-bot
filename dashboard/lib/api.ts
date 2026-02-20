@@ -52,6 +52,7 @@ import type {
   Activity,
   RiskStatus,
   CircuitBreakerStatus,
+  CircuitBreakerConfig,
   MarketRegimeResponse,
   CalibrationReport,
   CopyPerformanceResponse,
@@ -739,6 +740,52 @@ class ApiClient {
     );
   }
 
+  async updateCopyTradingConfig(
+    workspaceId: string,
+    params: {
+      min_trade_value?: number;
+      max_slippage_pct?: number;
+      max_latency_secs?: number;
+      daily_capital_limit?: number;
+      max_open_positions?: number;
+      stop_loss_pct?: number;
+      take_profit_pct?: number;
+      max_hold_hours?: number;
+    },
+  ): Promise<{
+    min_trade_value: number | null;
+    max_slippage_pct: number | null;
+    max_latency_secs: number | null;
+    daily_capital_limit: number | null;
+    max_open_positions: number | null;
+    stop_loss_pct: number | null;
+    take_profit_pct: number | null;
+    max_hold_hours: number | null;
+  }> {
+    return this.request(
+      `/api/v1/workspaces/${workspaceId}/dynamic-tuning/copy-trading`,
+      { method: "PUT", body: JSON.stringify(params) },
+    );
+  }
+
+  async updateArbExecutorConfig(
+    workspaceId: string,
+    params: {
+      position_size?: number;
+      min_net_profit?: number;
+      min_book_depth?: number;
+    },
+  ): Promise<{
+    position_size: number | null;
+    min_net_profit: number | null;
+    min_book_depth: number | null;
+  }> {
+    return this.request(
+      `/api/v1/workspaces/${workspaceId}/dynamic-tuning/arb-executor`,
+      { method: "PUT", body: JSON.stringify(params) },
+    );
+  }
+
   async getDynamicTuningHistory(
     workspaceId: string,
     params?: {
@@ -1015,6 +1062,22 @@ class ApiClient {
     return this.request<CircuitBreakerStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/reset`,
       { method: "POST" },
+    );
+  }
+
+  async updateCircuitBreakerConfig(
+    workspaceId: string,
+    params: {
+      max_daily_loss?: number;
+      max_drawdown_pct?: number;
+      max_consecutive_losses?: number;
+      cooldown_minutes?: number;
+      enabled?: boolean;
+    },
+  ): Promise<CircuitBreakerConfig> {
+    return this.request<CircuitBreakerConfig>(
+      `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/config`,
+      { method: "PUT", body: JSON.stringify(params) },
     );
   }
 

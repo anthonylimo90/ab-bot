@@ -1058,6 +1058,17 @@ const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
 const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
 const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
+const KEY_COPY_MIN_TRADE_VALUE: &str = "COPY_MIN_TRADE_VALUE";
+const KEY_COPY_MAX_SLIPPAGE_PCT: &str = "COPY_MAX_SLIPPAGE_PCT";
+const KEY_COPY_MAX_LATENCY_SECS: &str = "COPY_MAX_LATENCY_SECS";
+const KEY_COPY_DAILY_CAPITAL_LIMIT: &str = "COPY_DAILY_CAPITAL_LIMIT";
+const KEY_COPY_MAX_OPEN_POSITIONS: &str = "COPY_MAX_OPEN_POSITIONS";
+const KEY_COPY_STOP_LOSS_PCT: &str = "COPY_STOP_LOSS_PCT";
+const KEY_COPY_TAKE_PROFIT_PCT: &str = "COPY_TAKE_PROFIT_PCT";
+const KEY_COPY_MAX_HOLD_HOURS: &str = "COPY_MAX_HOLD_HOURS";
+const KEY_ARB_POSITION_SIZE: &str = "ARB_POSITION_SIZE";
+const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
+const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
 const ARB_RUNTIME_STATS_LATEST: &str = "arb:runtime:stats:latest";
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1235,6 +1246,59 @@ pub struct UpdateOpportunitySelectionRequest {
     pub aggressiveness: Option<String>,
     /// Number of exploration slots reserved in market selection.
     pub exploration_slots: Option<i64>,
+}
+
+/// Request to update copy trading dynamic config thresholds.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateCopyTradingConfigRequest {
+    /// Minimum USD value for a trade to be copied.
+    pub min_trade_value: Option<f64>,
+    /// Maximum acceptable slippage as a ratio (e.g. 0.01 = 1%).
+    pub max_slippage_pct: Option<f64>,
+    /// Maximum trade age in seconds before a trade is considered too stale.
+    pub max_latency_secs: Option<i64>,
+    /// Daily capital deployment limit (USD).
+    pub daily_capital_limit: Option<f64>,
+    /// Maximum number of open copy positions.
+    pub max_open_positions: Option<i64>,
+    /// Stop-loss percentage as ratio (e.g. 0.15 = 15%).
+    pub stop_loss_pct: Option<f64>,
+    /// Take-profit percentage as ratio (e.g. 0.25 = 25%).
+    pub take_profit_pct: Option<f64>,
+    /// Maximum hold time in hours before force-closing.
+    pub max_hold_hours: Option<i64>,
+}
+
+/// Response after updating copy trading config.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CopyTradingConfigResponse {
+    pub min_trade_value: Option<f64>,
+    pub max_slippage_pct: Option<f64>,
+    pub max_latency_secs: Option<i64>,
+    pub daily_capital_limit: Option<f64>,
+    pub max_open_positions: Option<i64>,
+    pub stop_loss_pct: Option<f64>,
+    pub take_profit_pct: Option<f64>,
+    pub max_hold_hours: Option<i64>,
+}
+
+/// Request to update arb executor dynamic config thresholds.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateArbExecutorConfigRequest {
+    /// Base dollar amount per position (used when dynamic sizing is off).
+    pub position_size: Option<f64>,
+    /// Minimum net profit to consider a signal worth executing.
+    pub min_net_profit: Option<f64>,
+    /// Minimum orderbook depth (in $) on each side to enter.
+    pub min_book_depth: Option<f64>,
+}
+
+/// Response after updating arb executor config.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArbExecutorConfigResponse {
+    pub position_size: Option<f64>,
+    pub min_net_profit: Option<f64>,
+    pub min_book_depth: Option<f64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1838,6 +1902,276 @@ pub async fn update_opportunity_selection_settings(
     }))
 }
 
+/// Update copy trading dynamic config thresholds.
+#[utoipa::path(
+    put,
+    path = "/api/v1/workspaces/{workspace_id}/dynamic-tuning/copy-trading",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = UpdateCopyTradingConfigRequest,
+    responses(
+        (status = 200, description = "Updated copy trading config", body = CopyTradingConfigResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member / insufficient role"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn update_copy_trading_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<UpdateCopyTradingConfigRequest>,
+) -> ApiResult<Json<CopyTradingConfigResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+    if role != "owner" && role != "admin" {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners/admins can update copy trading config".into(),
+        ));
+    }
+
+    if req.min_trade_value.is_none()
+        && req.max_slippage_pct.is_none()
+        && req.max_latency_secs.is_none()
+        && req.daily_capital_limit.is_none()
+        && req.max_open_positions.is_none()
+        && req.stop_loss_pct.is_none()
+        && req.take_profit_pct.is_none()
+        && req.max_hold_hours.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "Provide at least one field to update".into(),
+        ));
+    }
+
+    let mut updates: Vec<(String, Decimal, String)> = Vec::new();
+
+    if let Some(v) = req.min_trade_value {
+        let (min, max, max_step) = copy_trading_dynamic_bounds(KEY_COPY_MIN_TRADE_VALUE)
+            .expect("bounds defined for COPY_MIN_TRADE_VALUE");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid min_trade_value".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_MIN_TRADE_VALUE.to_string(),
+            clamped,
+            format!("manual workspace update: min_trade_value={}", clamped),
+        ));
+        let _ = (min, max, max_step); // suppress unused
+    }
+
+    if let Some(v) = req.max_slippage_pct {
+        let (min, max, max_step) = copy_trading_dynamic_bounds(KEY_COPY_MAX_SLIPPAGE_PCT)
+            .expect("bounds defined for COPY_MAX_SLIPPAGE_PCT");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid max_slippage_pct".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_MAX_SLIPPAGE_PCT.to_string(),
+            clamped,
+            format!("manual workspace update: max_slippage_pct={}", clamped),
+        ));
+        let _ = max_step;
+    }
+
+    if let Some(v) = req.max_latency_secs {
+        let (min, max, max_step) = copy_trading_dynamic_bounds(KEY_COPY_MAX_LATENCY_SECS)
+            .expect("bounds defined for COPY_MAX_LATENCY_SECS");
+        let dec = Decimal::new(v, 0);
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_MAX_LATENCY_SECS.to_string(),
+            clamped,
+            format!("manual workspace update: max_latency_secs={}", clamped),
+        ));
+        let _ = max_step;
+    }
+
+    if let Some(v) = req.daily_capital_limit {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_DAILY_CAPITAL_LIMIT).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid daily_capital_limit".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_DAILY_CAPITAL_LIMIT.to_string(),
+            clamped,
+            format!("manual workspace update: daily_capital_limit={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.max_open_positions {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_MAX_OPEN_POSITIONS).expect("bounds defined");
+        let dec = Decimal::new(v, 0);
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_MAX_OPEN_POSITIONS.to_string(),
+            clamped,
+            format!("manual workspace update: max_open_positions={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.stop_loss_pct {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_STOP_LOSS_PCT).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid stop_loss_pct".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_STOP_LOSS_PCT.to_string(),
+            clamped,
+            format!("manual workspace update: stop_loss_pct={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.take_profit_pct {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_TAKE_PROFIT_PCT).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid take_profit_pct".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_TAKE_PROFIT_PCT.to_string(),
+            clamped,
+            format!("manual workspace update: take_profit_pct={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.max_hold_hours {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_MAX_HOLD_HOURS).expect("bounds defined");
+        let dec = Decimal::new(v, 0);
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_MAX_HOLD_HOURS.to_string(),
+            clamped,
+            format!("manual workspace update: max_hold_hours={}", clamped),
+        ));
+    }
+
+    // Write each update to DB + history
+    for (key, value, reason) in &updates {
+        let old_value: Option<Decimal> =
+            sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&state.pool)
+                .await?;
+
+        let (min_value, max_value, max_step_pct) =
+            copy_trading_dynamic_bounds(key).ok_or_else(|| {
+                ApiError::Internal(format!("Unsupported dynamic config key: {}", key))
+            })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dynamic_config (
+                key, current_value, default_value, min_value, max_value,
+                max_step_pct, enabled, last_good_value, pending_eval, pending_baseline,
+                last_applied_at, updated_by, last_reason
+            )
+            VALUES ($1, $2, $2, $3, $4, $5, TRUE, $2, FALSE, NULL, NULL, 'workspace_manual', $6)
+            ON CONFLICT (key) DO UPDATE SET
+                current_value = $2,
+                last_good_value = $2,
+                pending_eval = FALSE,
+                pending_baseline = NULL,
+                last_applied_at = NULL,
+                updated_by = 'workspace_manual',
+                last_reason = $6
+            "#,
+        )
+        .bind(key)
+        .bind(*value)
+        .bind(min_value)
+        .bind(max_value)
+        .bind(max_step_pct)
+        .bind(reason)
+        .execute(&state.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dynamic_config_history
+                (config_key, old_value, new_value, action, reason)
+            VALUES ($1, $2, $3, 'manual_update', $4)
+            "#,
+        )
+        .bind(key)
+        .bind(old_value)
+        .bind(*value)
+        .bind(reason)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    // Publish to Redis for live hot-swap
+    publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref())
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed publishing dynamic config updates to runtime subscribers: {}",
+                error
+            ))
+        })?;
+
+    // Read back fresh values
+    let rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
+        r#"
+        SELECT
+            key, current_value, default_value, min_value, max_value,
+            max_step_pct, enabled, last_good_value, pending_eval,
+            last_applied_at, last_reason, updated_at
+        FROM dynamic_config
+        WHERE key = ANY($1)
+        ORDER BY key
+        "#,
+    )
+    .bind(vec![
+        KEY_COPY_MIN_TRADE_VALUE,
+        KEY_COPY_MAX_SLIPPAGE_PCT,
+        KEY_COPY_MAX_LATENCY_SECS,
+        KEY_COPY_DAILY_CAPITAL_LIMIT,
+        KEY_COPY_MAX_OPEN_POSITIONS,
+        KEY_COPY_STOP_LOSS_PCT,
+        KEY_COPY_TAKE_PROFIT_PCT,
+        KEY_COPY_MAX_HOLD_HOURS,
+    ])
+    .fetch_all(&state.pool)
+    .await?;
+
+    let find_f64 = |key: &str| -> Option<f64> {
+        rows.iter()
+            .find(|r| r.key == key)
+            .map(|r| decimal_to_f64(r.current_value))
+    };
+    let find_i64 = |key: &str| -> Option<i64> {
+        rows.iter()
+            .find(|r| r.key == key)
+            .map(|r| decimal_to_f64(r.current_value) as i64)
+    };
+
+    Ok(Json(CopyTradingConfigResponse {
+        min_trade_value: find_f64(KEY_COPY_MIN_TRADE_VALUE),
+        max_slippage_pct: find_f64(KEY_COPY_MAX_SLIPPAGE_PCT),
+        max_latency_secs: find_i64(KEY_COPY_MAX_LATENCY_SECS),
+        daily_capital_limit: find_f64(KEY_COPY_DAILY_CAPITAL_LIMIT),
+        max_open_positions: find_i64(KEY_COPY_MAX_OPEN_POSITIONS),
+        stop_loss_pct: find_f64(KEY_COPY_STOP_LOSS_PCT),
+        take_profit_pct: find_f64(KEY_COPY_TAKE_PROFIT_PCT),
+        max_hold_hours: find_i64(KEY_COPY_MAX_HOLD_HOURS),
+    }))
+}
+
 /// List dynamic tuning history (changes, recommendations, rollbacks, evaluations).
 #[utoipa::path(
     get,
@@ -1957,6 +2291,262 @@ fn opportunity_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> 
         }
         _ => None,
     }
+}
+
+/// Returns (min, max, max_step_pct) bounds for copy trading dynamic config keys.
+fn copy_trading_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> {
+    match key {
+        // $0.50 – $50.00, 18% step
+        KEY_COPY_MIN_TRADE_VALUE => Some((
+            Decimal::new(50, 2),
+            Decimal::new(50, 0),
+            Decimal::new(18, 2),
+        )),
+        // 0.25% – 15%, 25% step
+        KEY_COPY_MAX_SLIPPAGE_PCT => Some((
+            Decimal::new(25, 4),
+            Decimal::new(15, 2),
+            Decimal::new(25, 2),
+        )),
+        // 60s – 900s, 20% step
+        KEY_COPY_MAX_LATENCY_SECS => Some((
+            Decimal::new(60, 0),
+            Decimal::new(900, 0),
+            Decimal::new(20, 2),
+        )),
+        // $100 – $50,000, 20% step
+        KEY_COPY_DAILY_CAPITAL_LIMIT => Some((
+            Decimal::new(100, 0),
+            Decimal::new(50000, 0),
+            Decimal::new(20, 2),
+        )),
+        // 1 – 50, 25% step
+        KEY_COPY_MAX_OPEN_POSITIONS => {
+            Some((Decimal::new(1, 0), Decimal::new(50, 0), Decimal::new(25, 2)))
+        }
+        // 5% – 50%, 20% step (stored as ratio: 0.05 – 0.50)
+        KEY_COPY_STOP_LOSS_PCT => {
+            Some((Decimal::new(5, 2), Decimal::new(50, 2), Decimal::new(20, 2)))
+        }
+        // 5% – 100%, 20% step (stored as ratio: 0.05 – 1.00)
+        KEY_COPY_TAKE_PROFIT_PCT => Some((
+            Decimal::new(5, 2),
+            Decimal::new(100, 2),
+            Decimal::new(20, 2),
+        )),
+        // 1h – 720h, 20% step
+        KEY_COPY_MAX_HOLD_HOURS => Some((
+            Decimal::new(1, 0),
+            Decimal::new(720, 0),
+            Decimal::new(20, 2),
+        )),
+        _ => None,
+    }
+}
+
+/// Returns (min, max, max_step_pct) bounds for arb executor dynamic config keys.
+fn arb_executor_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> {
+    match key {
+        // $10 – $500, 20% step
+        KEY_ARB_POSITION_SIZE => Some((
+            Decimal::new(10, 0),
+            Decimal::new(500, 0),
+            Decimal::new(20, 2),
+        )),
+        // 0.0005 – 0.05, 15% step
+        KEY_ARB_MIN_NET_PROFIT => {
+            Some((Decimal::new(5, 4), Decimal::new(5, 2), Decimal::new(15, 2)))
+        }
+        // $25 – $1,000, 20% step
+        KEY_ARB_MIN_BOOK_DEPTH => Some((
+            Decimal::new(25, 0),
+            Decimal::new(1000, 0),
+            Decimal::new(20, 2),
+        )),
+        _ => None,
+    }
+}
+
+/// Update arb executor dynamic config thresholds.
+#[utoipa::path(
+    put,
+    path = "/api/v1/workspaces/{workspace_id}/dynamic-tuning/arb-executor",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = UpdateArbExecutorConfigRequest,
+    responses(
+        (status = 200, description = "Updated arb executor config", body = ArbExecutorConfigResponse),
+        (status = 400, description = "Invalid parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member / insufficient role"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn update_arb_executor_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+    Json(req): Json<UpdateArbExecutorConfigRequest>,
+) -> ApiResult<Json<ArbExecutorConfigResponse>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+    if role != "owner" && role != "admin" {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners/admins can update arb executor config".into(),
+        ));
+    }
+
+    if req.position_size.is_none() && req.min_net_profit.is_none() && req.min_book_depth.is_none() {
+        return Err(ApiError::BadRequest(
+            "Provide at least one field to update".into(),
+        ));
+    }
+
+    let mut updates: Vec<(String, Decimal, String)> = Vec::new();
+
+    if let Some(v) = req.position_size {
+        let (min, max, _) =
+            arb_executor_dynamic_bounds(KEY_ARB_POSITION_SIZE).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid position_size".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_ARB_POSITION_SIZE.to_string(),
+            clamped,
+            format!("manual workspace update: position_size={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.min_net_profit {
+        let (min, max, _) =
+            arb_executor_dynamic_bounds(KEY_ARB_MIN_NET_PROFIT).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid min_net_profit".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_ARB_MIN_NET_PROFIT.to_string(),
+            clamped,
+            format!("manual workspace update: min_net_profit={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.min_book_depth {
+        let (min, max, _) =
+            arb_executor_dynamic_bounds(KEY_ARB_MIN_BOOK_DEPTH).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid min_book_depth".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_ARB_MIN_BOOK_DEPTH.to_string(),
+            clamped,
+            format!("manual workspace update: min_book_depth={}", clamped),
+        ));
+    }
+
+    // Write each update to DB + history
+    for (key, value, reason) in &updates {
+        let old_value: Option<Decimal> =
+            sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&state.pool)
+                .await?;
+
+        let (min_value, max_value, max_step_pct) =
+            arb_executor_dynamic_bounds(key).ok_or_else(|| {
+                ApiError::Internal(format!("Unsupported dynamic config key: {}", key))
+            })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dynamic_config (
+                key, current_value, default_value, min_value, max_value,
+                max_step_pct, enabled, last_good_value, pending_eval, pending_baseline,
+                last_applied_at, updated_by, last_reason
+            )
+            VALUES ($1, $2, $2, $3, $4, $5, TRUE, $2, FALSE, NULL, NULL, 'workspace_manual', $6)
+            ON CONFLICT (key) DO UPDATE SET
+                current_value = $2,
+                last_good_value = $2,
+                pending_eval = FALSE,
+                pending_baseline = NULL,
+                last_applied_at = NULL,
+                updated_by = 'workspace_manual',
+                last_reason = $6
+            "#,
+        )
+        .bind(key)
+        .bind(*value)
+        .bind(min_value)
+        .bind(max_value)
+        .bind(max_step_pct)
+        .bind(reason)
+        .execute(&state.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dynamic_config_history
+                (config_key, old_value, new_value, action, reason)
+            VALUES ($1, $2, $3, 'manual_update', $4)
+            "#,
+        )
+        .bind(key)
+        .bind(old_value)
+        .bind(*value)
+        .bind(reason)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    // Publish to Redis for live hot-swap
+    publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref())
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed publishing dynamic config updates to runtime subscribers: {}",
+                error
+            ))
+        })?;
+
+    // Read back fresh values
+    let rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
+        r#"
+        SELECT
+            key, current_value, default_value, min_value, max_value,
+            max_step_pct, enabled, last_good_value, pending_eval,
+            last_applied_at, last_reason, updated_at
+        FROM dynamic_config
+        WHERE key = ANY($1)
+        ORDER BY key
+        "#,
+    )
+    .bind(vec![
+        KEY_ARB_POSITION_SIZE,
+        KEY_ARB_MIN_NET_PROFIT,
+        KEY_ARB_MIN_BOOK_DEPTH,
+    ])
+    .fetch_all(&state.pool)
+    .await?;
+
+    let find_f64 = |key: &str| -> Option<f64> {
+        rows.iter()
+            .find(|r| r.key == key)
+            .map(|r| decimal_to_f64(r.current_value))
+    };
+
+    Ok(Json(ArbExecutorConfigResponse {
+        position_size: find_f64(KEY_ARB_POSITION_SIZE),
+        min_net_profit: find_f64(KEY_ARB_MIN_NET_PROFIT),
+        min_book_depth: find_f64(KEY_ARB_MIN_BOOK_DEPTH),
+    }))
 }
 
 async fn publish_manual_dynamic_updates(

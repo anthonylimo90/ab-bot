@@ -58,6 +58,40 @@ interface AutomationPanelProps {
 type RiskPreset = 'conservative' | 'balanced' | 'aggressive';
 type OpportunityAggressiveness = 'stable' | 'balanced' | 'discovery';
 
+const COPY_TRADING_KEYS = new Set([
+  'COPY_MIN_TRADE_VALUE',
+  'COPY_MAX_SLIPPAGE_PCT',
+  'COPY_MAX_LATENCY_SECS',
+  'COPY_DAILY_CAPITAL_LIMIT',
+  'COPY_MAX_OPEN_POSITIONS',
+  'COPY_STOP_LOSS_PCT',
+  'COPY_TAKE_PROFIT_PCT',
+  'COPY_MAX_HOLD_HOURS',
+]);
+
+const ARB_EXECUTOR_KEYS = new Set([
+  'ARB_POSITION_SIZE',
+  'ARB_MIN_NET_PROFIT',
+  'ARB_MIN_BOOK_DEPTH',
+]);
+
+interface CopyTradingDraft {
+  min_trade_value: number;
+  max_slippage_pct: number;
+  max_latency_secs: number;
+  daily_capital_limit: number;
+  max_open_positions: number;
+  stop_loss_pct: number;
+  take_profit_pct: number;
+  max_hold_hours: number;
+}
+
+interface ArbExecutorDraft {
+  position_size: number;
+  min_net_profit: number;
+  min_book_depth: number;
+}
+
 interface OpportunitySelectionDraft {
   aggressiveness: OpportunityAggressiveness;
   exploration_slots: number;
@@ -286,6 +320,117 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     }
     return JSON.stringify(opportunitySettings) !== JSON.stringify(baselineOpportunitySettings);
   }, [opportunitySettings, baselineOpportunitySettings]);
+
+  // Copy trading config - baseline/draft pattern
+  const [copyTradingDraft, setCopyTradingDraft] = useState<CopyTradingDraft | null>(null);
+
+  const baselineCopyTrading = useMemo<CopyTradingDraft | null>(() => {
+    if (!dynamicTunerStatus?.dynamic_config) return null;
+    const configs = dynamicTunerStatus.dynamic_config;
+    const findVal = (key: string) => configs.find((c) => c.key === key)?.current_value;
+    // Need at least one copy trading key present to show the section
+    const hasCopyKeys = configs.some((c) => COPY_TRADING_KEYS.has(c.key));
+    if (!hasCopyKeys) return null;
+    return {
+      min_trade_value: findVal('COPY_MIN_TRADE_VALUE') ?? 2,
+      max_slippage_pct: findVal('COPY_MAX_SLIPPAGE_PCT') ?? 0.01,
+      max_latency_secs: findVal('COPY_MAX_LATENCY_SECS') ?? 600,
+      daily_capital_limit: findVal('COPY_DAILY_CAPITAL_LIMIT') ?? 5000,
+      max_open_positions: findVal('COPY_MAX_OPEN_POSITIONS') ?? 15,
+      stop_loss_pct: findVal('COPY_STOP_LOSS_PCT') ?? 0.15,
+      take_profit_pct: findVal('COPY_TAKE_PROFIT_PCT') ?? 0.25,
+      max_hold_hours: findVal('COPY_MAX_HOLD_HOURS') ?? 72,
+    };
+  }, [dynamicTunerStatus]);
+
+  useEffect(() => {
+    if (!baselineCopyTrading) return;
+    setCopyTradingDraft((current) => current ?? baselineCopyTrading);
+  }, [baselineCopyTrading]);
+
+  // Reset copy trading draft on workspace change
+  useEffect(() => {
+    setCopyTradingDraft(null);
+  }, [workspaceId]);
+
+  const hasCopyTradingChanges = useMemo(() => {
+    if (!copyTradingDraft || !baselineCopyTrading) return false;
+    return JSON.stringify(copyTradingDraft) !== JSON.stringify(baselineCopyTrading);
+  }, [copyTradingDraft, baselineCopyTrading]);
+
+  const saveCopyTradingMutation = useMutation({
+    mutationFn: () => {
+      if (!copyTradingDraft) throw new Error('No draft');
+      return api.updateCopyTradingConfig(workspaceId, {
+        min_trade_value: copyTradingDraft.min_trade_value,
+        max_slippage_pct: copyTradingDraft.max_slippage_pct,
+        max_latency_secs: Math.round(copyTradingDraft.max_latency_secs),
+        daily_capital_limit: copyTradingDraft.daily_capital_limit,
+        max_open_positions: Math.round(copyTradingDraft.max_open_positions),
+        stop_loss_pct: copyTradingDraft.stop_loss_pct,
+        take_profit_pct: copyTradingDraft.take_profit_pct,
+        max_hold_hours: Math.round(copyTradingDraft.max_hold_hours),
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dynamic-tuner-status'] });
+      addToast({ type: 'success', title: 'Copy trading config saved' });
+      // Reset baseline so draft re-syncs on next fetch
+      setCopyTradingDraft(null);
+    },
+    onError: () => {
+      addToast({ type: 'error', title: 'Failed to save copy trading config' });
+    },
+  });
+
+  // Arb executor config - baseline/draft pattern
+  const [arbExecutorDraft, setArbExecutorDraft] = useState<ArbExecutorDraft | null>(null);
+
+  const baselineArbExecutor = useMemo<ArbExecutorDraft | null>(() => {
+    if (!dynamicTunerStatus?.dynamic_config) return null;
+    const configs = dynamicTunerStatus.dynamic_config;
+    const findVal = (key: string) => configs.find((c) => c.key === key)?.current_value;
+    const hasArbKeys = configs.some((c) => ARB_EXECUTOR_KEYS.has(c.key));
+    if (!hasArbKeys) return null;
+    return {
+      position_size: findVal('ARB_POSITION_SIZE') ?? 50,
+      min_net_profit: findVal('ARB_MIN_NET_PROFIT') ?? 0.001,
+      min_book_depth: findVal('ARB_MIN_BOOK_DEPTH') ?? 100,
+    };
+  }, [dynamicTunerStatus]);
+
+  useEffect(() => {
+    if (!baselineArbExecutor) return;
+    setArbExecutorDraft((current) => current ?? baselineArbExecutor);
+  }, [baselineArbExecutor]);
+
+  useEffect(() => {
+    setArbExecutorDraft(null);
+  }, [workspaceId]);
+
+  const hasArbExecutorChanges = useMemo(() => {
+    if (!arbExecutorDraft || !baselineArbExecutor) return false;
+    return JSON.stringify(arbExecutorDraft) !== JSON.stringify(baselineArbExecutor);
+  }, [arbExecutorDraft, baselineArbExecutor]);
+
+  const saveArbExecutorMutation = useMutation({
+    mutationFn: () => {
+      if (!arbExecutorDraft) throw new Error('No draft');
+      return api.updateArbExecutorConfig(workspaceId, {
+        position_size: arbExecutorDraft.position_size,
+        min_net_profit: arbExecutorDraft.min_net_profit,
+        min_book_depth: arbExecutorDraft.min_book_depth,
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dynamic-tuner-status'] });
+      addToast({ type: 'success', title: 'Arb executor config saved' });
+      setArbExecutorDraft(null);
+    },
+    onError: () => {
+      addToast({ type: 'error', title: 'Failed to save arb executor config' });
+    },
+  });
 
   const updateSettings = (patch: Partial<OptimizationSettingsDraft>) => {
     setSettings((current) => (current ? { ...current, ...patch } : current));
@@ -861,20 +1006,374 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                   )}
                 </div>
 
-                <div className="rounded-lg border bg-background/50 p-4">
-                  <p className="mb-2 text-sm font-medium">Current Dynamic Config</p>
-                  <div className="space-y-2">
-                    {dynamicTunerStatus.dynamic_config.map((entry) => (
-                      <div
-                        key={entry.key}
-                        className="flex flex-col gap-1 rounded border border-border/50 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between"
-                      >
-                        <span className="font-medium text-xs">{formatDynamicKey(entry.key)}</span>
-                        <span className="font-medium tabular-nums">{formatDynamicConfigValue(entry.key, entry.current_value)}</span>
+                {/* Editable Copy Trading Thresholds */}
+                {copyTradingDraft && (
+                  <div className="rounded-lg border bg-background/50 p-4">
+                    <p className="mb-3 text-sm font-medium">Copy Trading Thresholds</p>
+                    <div className="space-y-4">
+                      {/* Min Trade Value */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Min Copy Trade Value</p>
+                          <p className="text-xs text-muted-foreground">Trades below this USD amount are skipped</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-sm text-muted-foreground">$</span>
+                          <Input
+                            type="number"
+                            min={0.5}
+                            max={50}
+                            step={0.5}
+                            value={copyTradingDraft.min_trade_value}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, min_trade_value: Math.max(0.5, Math.min(50, v)) } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                        </div>
                       </div>
-                    ))}
+
+                      {/* Max Slippage */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Max Copy Slippage</p>
+                          <p className="text-xs text-muted-foreground">Maximum acceptable price slippage</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={0.025}
+                            max={15}
+                            step={0.1}
+                            value={Math.round(copyTradingDraft.max_slippage_pct * 10000) / 100}
+                            onChange={(e) => {
+                              const pctVal = Number(e.target.value);
+                              if (!Number.isFinite(pctVal)) return;
+                              const ratio = Math.max(0.0025, Math.min(0.15, pctVal / 100));
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, max_slippage_pct: ratio } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">%</span>
+                        </div>
+                      </div>
+
+                      {/* Max Trade Age (latency) */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Max Copy Trade Age</p>
+                          <p className="text-xs text-muted-foreground">Trades older than this are considered stale</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={1}
+                            max={15}
+                            step={0.5}
+                            value={Math.round((copyTradingDraft.max_latency_secs / 60) * 10) / 10}
+                            onChange={(e) => {
+                              const mins = Number(e.target.value);
+                              if (!Number.isFinite(mins)) return;
+                              const secs = Math.max(60, Math.min(900, mins * 60));
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, max_latency_secs: secs } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">min</span>
+                        </div>
+                      </div>
+
+                      <div className="my-3 border-t border-border/50" />
+                      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Risk & Position Limits</p>
+
+                      {/* Daily Capital Limit */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Daily Capital Limit</p>
+                          <p className="text-xs text-muted-foreground">Max USD deployed per day across all copy trades</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-sm text-muted-foreground">$</span>
+                          <Input
+                            type="number"
+                            min={100}
+                            max={50000}
+                            step={100}
+                            value={copyTradingDraft.daily_capital_limit}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, daily_capital_limit: clamp(v, 100, 50000) } : d
+                              );
+                            }}
+                            className="w-28 text-right"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Max Open Positions */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Max Open Positions</p>
+                          <p className="text-xs text-muted-foreground">Maximum concurrent copy-traded positions</p>
+                        </div>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={50}
+                          step={1}
+                          value={Math.round(copyTradingDraft.max_open_positions)}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isFinite(v)) return;
+                            setCopyTradingDraft((d) =>
+                              d ? { ...d, max_open_positions: clamp(Math.round(v), 1, 50) } : d
+                            );
+                          }}
+                          className="w-24 text-right"
+                        />
+                      </div>
+
+                      {/* Stop-Loss % */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Stop-Loss</p>
+                          <p className="text-xs text-muted-foreground">Auto-exit when loss reaches this percentage</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={5}
+                            max={50}
+                            step={1}
+                            value={Math.round(copyTradingDraft.stop_loss_pct * 1000) / 10}
+                            onChange={(e) => {
+                              const pctVal = Number(e.target.value);
+                              if (!Number.isFinite(pctVal)) return;
+                              const ratio = clamp(pctVal / 100, 0.05, 0.50);
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, stop_loss_pct: ratio } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">%</span>
+                        </div>
+                      </div>
+
+                      {/* Take-Profit % */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Take-Profit</p>
+                          <p className="text-xs text-muted-foreground">Auto-exit when profit reaches this percentage</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={5}
+                            max={100}
+                            step={1}
+                            value={Math.round(copyTradingDraft.take_profit_pct * 1000) / 10}
+                            onChange={(e) => {
+                              const pctVal = Number(e.target.value);
+                              if (!Number.isFinite(pctVal)) return;
+                              const ratio = clamp(pctVal / 100, 0.05, 1.00);
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, take_profit_pct: ratio } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">%</span>
+                        </div>
+                      </div>
+
+                      {/* Max Hold Hours */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Max Hold Duration</p>
+                          <p className="text-xs text-muted-foreground">Force-exit positions held longer than this</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={1}
+                            max={720}
+                            step={1}
+                            value={Math.round(copyTradingDraft.max_hold_hours)}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, max_hold_hours: clamp(Math.round(v), 1, 720) } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">hrs</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <Button
+                      className="mt-4 w-full"
+                      disabled={!hasCopyTradingChanges || saveCopyTradingMutation.isPending}
+                      onClick={() => saveCopyTradingMutation.mutate()}
+                    >
+                      {saveCopyTradingMutation.isPending ? (
+                        <>
+                          <RotateCcw className="mr-2 h-4 w-4 animate-spin" />
+                          Saving...
+                        </>
+                      ) : hasCopyTradingChanges ? (
+                        <>
+                          <Save className="mr-2 h-4 w-4" />
+                          Save Copy Trading Config
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle className="mr-2 h-4 w-4" />
+                          Saved
+                        </>
+                      )}
+                    </Button>
                   </div>
-                </div>
+                )}
+
+                {/* Editable Arb Executor Thresholds */}
+                {arbExecutorDraft && (
+                  <div className="rounded-lg border bg-background/50 p-4">
+                    <p className="mb-3 text-sm font-medium">Arb Executor Thresholds</p>
+                    <div className="space-y-4">
+                      {/* Position Size */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Position Size</p>
+                          <p className="text-xs text-muted-foreground">Default dollar amount per arb trade</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-sm text-muted-foreground">$</span>
+                          <Input
+                            type="number"
+                            min={10}
+                            max={500}
+                            step={5}
+                            value={arbExecutorDraft.position_size}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setArbExecutorDraft((d) =>
+                                d ? { ...d, position_size: clamp(v, 10, 500) } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Min Net Profit */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Min Net Profit</p>
+                          <p className="text-xs text-muted-foreground">Skip signals with net profit below this threshold</p>
+                        </div>
+                        <Input
+                          type="number"
+                          min={0.0005}
+                          max={0.05}
+                          step={0.0005}
+                          value={arbExecutorDraft.min_net_profit}
+                          onChange={(e) => {
+                            const v = Number(e.target.value);
+                            if (!Number.isFinite(v)) return;
+                            setArbExecutorDraft((d) =>
+                              d ? { ...d, min_net_profit: clamp(v, 0.0005, 0.05) } : d
+                            );
+                          }}
+                          className="w-24 text-right"
+                        />
+                      </div>
+
+                      {/* Min Book Depth */}
+                      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">Min Book Depth</p>
+                          <p className="text-xs text-muted-foreground">Require this much liquidity in the order book</p>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <span className="text-sm text-muted-foreground">$</span>
+                          <Input
+                            type="number"
+                            min={25}
+                            max={1000}
+                            step={25}
+                            value={arbExecutorDraft.min_book_depth}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setArbExecutorDraft((d) =>
+                                d ? { ...d, min_book_depth: clamp(v, 25, 1000) } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <Button
+                      className="mt-4 w-full"
+                      disabled={!hasArbExecutorChanges || saveArbExecutorMutation.isPending}
+                      onClick={() => saveArbExecutorMutation.mutate()}
+                    >
+                      {saveArbExecutorMutation.isPending ? (
+                        <>
+                          <RotateCcw className="mr-2 h-4 w-4 animate-spin" />
+                          Saving...
+                        </>
+                      ) : hasArbExecutorChanges ? (
+                        <>
+                          <Save className="mr-2 h-4 w-4" />
+                          Save Arb Executor Config
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle className="mr-2 h-4 w-4" />
+                          Saved
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                )}
+
+                {/* Other Dynamic Config (read-only) */}
+                {dynamicTunerStatus.dynamic_config.filter((e) => !COPY_TRADING_KEYS.has(e.key) && !ARB_EXECUTOR_KEYS.has(e.key)).length > 0 && (
+                  <div className="rounded-lg border bg-background/50 p-4">
+                    <p className="mb-2 text-sm font-medium">Other Dynamic Config</p>
+                    <div className="space-y-2">
+                      {dynamicTunerStatus.dynamic_config
+                        .filter((entry) => !COPY_TRADING_KEYS.has(entry.key) && !ARB_EXECUTOR_KEYS.has(entry.key))
+                        .map((entry) => (
+                          <div
+                            key={entry.key}
+                            className="flex flex-col gap-1 rounded border border-border/50 px-3 py-2 text-sm sm:flex-row sm:items-center sm:justify-between"
+                          >
+                            <span className="font-medium text-xs">{formatDynamicKey(entry.key)}</span>
+                            <span className="font-medium tabular-nums">{formatDynamicConfigValue(entry.key, entry.current_value)}</span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </TabsContent>

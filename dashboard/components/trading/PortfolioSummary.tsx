@@ -177,7 +177,7 @@ export const PortfolioSummary = memo(function PortfolioSummary({
         </CardContent>
       </Card>
 
-      {/* Available Balance (Demo only) */}
+      {/* Available Balance */}
       {availableBalance != null && (
         <Card>
           <CardContent className="p-4">

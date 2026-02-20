@@ -29,6 +29,14 @@ const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
 const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
 const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
 const KEY_COPY_MAX_LATENCY_SECS: &str = "COPY_MAX_LATENCY_SECS";
+const KEY_COPY_DAILY_CAPITAL_LIMIT: &str = "COPY_DAILY_CAPITAL_LIMIT";
+const KEY_COPY_MAX_OPEN_POSITIONS: &str = "COPY_MAX_OPEN_POSITIONS";
+const KEY_COPY_STOP_LOSS_PCT: &str = "COPY_STOP_LOSS_PCT";
+const KEY_COPY_TAKE_PROFIT_PCT: &str = "COPY_TAKE_PROFIT_PCT";
+const KEY_COPY_MAX_HOLD_HOURS: &str = "COPY_MAX_HOLD_HOURS";
+const KEY_ARB_POSITION_SIZE: &str = "ARB_POSITION_SIZE";
+const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
+const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
 
 const EPSILON: f64 = 1e-6;
 
@@ -977,6 +985,63 @@ impl DynamicTuner {
                 max_value: Decimal::new(900, 0),   // 15 minute ceiling
                 max_step_pct: Decimal::new(20, 2), // 20% per cycle
             },
+            ConfigSeed {
+                key: KEY_COPY_DAILY_CAPITAL_LIMIT,
+                default_value: env_decimal("COPY_DAILY_CAPITAL_LIMIT", Decimal::new(5000, 0)),
+                min_value: Decimal::new(100, 0),   // $100 floor
+                max_value: Decimal::new(50000, 0), // $50,000 ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
+            ConfigSeed {
+                key: KEY_COPY_MAX_OPEN_POSITIONS,
+                default_value: env_decimal("COPY_MAX_OPEN_POSITIONS", Decimal::new(15, 0)),
+                min_value: Decimal::new(1, 0),
+                max_value: Decimal::new(50, 0),
+                max_step_pct: Decimal::new(25, 2),
+            },
+            ConfigSeed {
+                key: KEY_COPY_STOP_LOSS_PCT,
+                default_value: env_decimal("COPY_STOP_LOSS_PCT", Decimal::new(15, 2)),
+                min_value: Decimal::new(5, 2),  // 5% floor
+                max_value: Decimal::new(50, 2), // 50% ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
+            ConfigSeed {
+                key: KEY_COPY_TAKE_PROFIT_PCT,
+                default_value: env_decimal("COPY_TAKE_PROFIT_PCT", Decimal::new(25, 2)),
+                min_value: Decimal::new(5, 2),   // 5% floor
+                max_value: Decimal::new(100, 2), // 100% ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
+            ConfigSeed {
+                key: KEY_COPY_MAX_HOLD_HOURS,
+                default_value: env_decimal("COPY_MAX_HOLD_HOURS", Decimal::new(72, 0)),
+                min_value: Decimal::new(1, 0),   // 1 hour floor
+                max_value: Decimal::new(720, 0), // 30 days ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
+            // ── Arb executor tuning knobs ──
+            ConfigSeed {
+                key: KEY_ARB_POSITION_SIZE,
+                default_value: env_decimal("ARB_POSITION_SIZE", Decimal::new(50, 0)),
+                min_value: Decimal::new(10, 0),  // $10 floor
+                max_value: Decimal::new(500, 0), // $500 ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
+            ConfigSeed {
+                key: KEY_ARB_MIN_NET_PROFIT,
+                default_value: env_decimal("ARB_MIN_NET_PROFIT", Decimal::new(1, 3)),
+                min_value: Decimal::new(5, 4), // 0.0005 floor
+                max_value: Decimal::new(5, 2), // 0.05 ceiling
+                max_step_pct: Decimal::new(15, 2),
+            },
+            ConfigSeed {
+                key: KEY_ARB_MIN_BOOK_DEPTH,
+                default_value: env_decimal("ARB_MIN_BOOK_DEPTH", Decimal::new(100, 0)),
+                min_value: Decimal::new(25, 0),   // $25 floor
+                max_value: Decimal::new(1000, 0), // $1,000 ceiling
+                max_step_pct: Decimal::new(20, 2),
+            },
         ];
 
         for seed in seeds {
@@ -1227,6 +1292,8 @@ pub fn spawn_dynamic_config_subscriber(
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     pool: PgPool,
     max_latency_secs: Option<Arc<AtomicI64>>,
+    copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
+    arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1235,6 +1302,8 @@ pub fn spawn_dynamic_config_subscriber(
                 copy_trader.clone(),
                 pool.clone(),
                 max_latency_secs.clone(),
+                copy_stop_loss_config.clone(),
+                arb_executor_config.clone(),
             )
             .await
             {
@@ -1266,6 +1335,8 @@ async fn run_dynamic_config_subscriber(
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     pool: PgPool,
     max_latency_secs: Option<Arc<AtomicI64>>,
+    copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
+    arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
 ) -> anyhow::Result<()> {
     let allowed_sources = load_allowed_update_sources();
     let bounds = load_dynamic_bounds(&pool).await;
@@ -1288,6 +1359,13 @@ async fn run_dynamic_config_subscriber(
                 .await
         {
             warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
+        }
+    }
+
+    // Apply startup snapshot to arb executor config
+    if let Some(ref arb_config) = arb_executor_config {
+        if let Err(e) = apply_startup_snapshot_to_arb_executor(&pool, arb_config, &bounds).await {
+            warn!(error = %e, "Failed applying startup dynamic config snapshot to arb executor");
         }
     }
 
@@ -1358,6 +1436,64 @@ async fn run_dynamic_config_subscriber(
                 }
             }
         }
+
+        // Apply stop-loss/take-profit/hold-hours to shared config
+        if let Some(ref sl_config) = copy_stop_loss_config {
+            let applied = match update.key.as_str() {
+                KEY_COPY_STOP_LOSS_PCT => {
+                    sl_config.write().await.stop_loss_pct = update.value;
+                    true
+                }
+                KEY_COPY_TAKE_PROFIT_PCT => {
+                    sl_config.write().await.take_profit_pct = update.value;
+                    true
+                }
+                KEY_COPY_MAX_HOLD_HOURS => {
+                    if let Some(h) = update.value.to_i64() {
+                        sl_config.write().await.max_hold_hours = h;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if applied {
+                info!(
+                    key = %update.key,
+                    value = %update.value,
+                    source = %update.source,
+                    "Applied stop-loss config update at runtime"
+                );
+            }
+        }
+
+        // Apply arb executor config updates
+        if let Some(ref arb_config) = arb_executor_config {
+            let applied = match update.key.as_str() {
+                KEY_ARB_POSITION_SIZE => {
+                    arb_config.write().await.position_size = update.value;
+                    true
+                }
+                KEY_ARB_MIN_NET_PROFIT => {
+                    arb_config.write().await.min_net_profit = update.value;
+                    true
+                }
+                KEY_ARB_MIN_BOOK_DEPTH => {
+                    arb_config.write().await.min_book_depth = update.value;
+                    true
+                }
+                _ => false,
+            };
+            if applied {
+                info!(
+                    key = %update.key,
+                    value = %update.value,
+                    source = %update.source,
+                    "Applied arb executor config update at runtime"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -1377,6 +1513,18 @@ async fn apply_to_copy_trader(
         KEY_COPY_MAX_SLIPPAGE_PCT => {
             trader.set_max_slippage_pct(update.value);
             true
+        }
+        KEY_COPY_DAILY_CAPITAL_LIMIT => {
+            trader.set_daily_capital_limit(update.value);
+            true
+        }
+        KEY_COPY_MAX_OPEN_POSITIONS => {
+            if let Some(n) = update.value.to_u64() {
+                trader.set_max_open_positions(n as usize);
+                true
+            } else {
+                false
+            }
         }
         _ => false,
     }
@@ -1474,6 +1622,57 @@ async fn apply_startup_snapshot_to_copy_trader(
     Ok(())
 }
 
+/// Applies the current dynamic config snapshot to the arb executor config.
+///
+/// Used at startup to prefer DB-backed runtime configuration when available,
+/// while still allowing env defaults as fallback.
+async fn apply_startup_snapshot_to_arb_executor(
+    pool: &PgPool,
+    arb_config: &Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>,
+    bounds: &HashMap<String, (Decimal, Decimal)>,
+) -> anyhow::Result<()> {
+    let rows: Vec<DynamicValueRow> = sqlx::query_as(
+        r#"
+        SELECT key, current_value
+        FROM dynamic_config
+        WHERE enabled = TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut applied = 0usize;
+    for row in rows {
+        let Some(value) = clamp_dynamic_value(&row.key, row.current_value, bounds) else {
+            continue;
+        };
+        let did_apply = match row.key.as_str() {
+            KEY_ARB_POSITION_SIZE => {
+                arb_config.write().await.position_size = value;
+                true
+            }
+            KEY_ARB_MIN_NET_PROFIT => {
+                arb_config.write().await.min_net_profit = value;
+                true
+            }
+            KEY_ARB_MIN_BOOK_DEPTH => {
+                arb_config.write().await.min_book_depth = value;
+                true
+            }
+            _ => false,
+        };
+        if did_apply {
+            applied += 1;
+        }
+    }
+
+    info!(
+        applied,
+        "Applied startup dynamic config snapshot to arb executor"
+    );
+    Ok(())
+}
+
 fn load_allowed_update_sources() -> Vec<String> {
     std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
         .unwrap_or_else(|_| {
@@ -1515,6 +1714,9 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
         KEY_ARB_MONITOR_MAX_MARKETS,
         KEY_ARB_MONITOR_EXPLORATION_SLOTS,
         KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL,
+        KEY_ARB_POSITION_SIZE,
+        KEY_ARB_MIN_NET_PROFIT,
+        KEY_ARB_MIN_BOOK_DEPTH,
     ] {
         if let Some(bounds) = fallback_bounds_for_key(key) {
             map.insert(key.to_string(), bounds);
@@ -1532,6 +1734,9 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),
         KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => Some((Decimal::ZERO, Decimal::new(2, 0))),
+        KEY_ARB_POSITION_SIZE => Some((Decimal::new(10, 0), Decimal::new(500, 0))),
+        KEY_ARB_MIN_NET_PROFIT => Some((Decimal::new(5, 4), Decimal::new(5, 2))),
+        KEY_ARB_MIN_BOOK_DEPTH => Some((Decimal::new(25, 0), Decimal::new(1000, 0))),
         _ => None,
     }
 }

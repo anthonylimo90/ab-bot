@@ -272,6 +272,16 @@ impl CopyTrader {
         self.policy.max_slippage_pct = value.max(Decimal::ZERO);
     }
 
+    /// Update daily capital deployment limit at runtime.
+    pub fn set_daily_capital_limit(&mut self, value: Decimal) {
+        self.policy.daily_capital_limit = value.max(Decimal::ZERO);
+    }
+
+    /// Update maximum open positions at runtime.
+    pub fn set_max_open_positions(&mut self, value: usize) {
+        self.policy.max_open_positions = value.max(1);
+    }
+
     /// Record that a copy position was opened (for position count tracking).
     pub fn record_position_opened(&mut self, capital_deployed: Decimal) {
         self.maybe_reset_daily();

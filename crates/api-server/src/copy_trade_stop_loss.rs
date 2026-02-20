@@ -127,7 +127,7 @@ impl CopyPosition {
 
 /// Background service that monitors copy trade positions.
 pub struct CopyStopLossMonitor {
-    config: CopyStopLossConfig,
+    config: Arc<RwLock<CopyStopLossConfig>>,
     pool: PgPool,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
@@ -143,7 +143,7 @@ pub struct CopyStopLossMonitor {
 impl CopyStopLossMonitor {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        config: CopyStopLossConfig,
+        config: Arc<RwLock<CopyStopLossConfig>>,
         pool: PgPool,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
@@ -165,25 +165,31 @@ impl CopyStopLossMonitor {
         }
     }
 
+    /// Snapshot the current config from the shared Arc.
+    async fn snapshot_config(&self) -> CopyStopLossConfig {
+        self.config.read().await.clone()
+    }
+
     /// Main run loop.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        if !self.config.enabled {
+        let initial_config = self.snapshot_config().await;
+        if !initial_config.enabled {
             info!("Copy trade stop-loss monitor is disabled");
             return Ok(());
         }
 
         info!(
-            stop_loss_pct = %self.config.stop_loss_pct,
-            take_profit_pct = %self.config.take_profit_pct,
-            max_hold_hours = self.config.max_hold_hours,
-            mirror_exits = self.config.mirror_exits,
+            stop_loss_pct = %initial_config.stop_loss_pct,
+            take_profit_pct = %initial_config.take_profit_pct,
+            max_hold_hours = initial_config.max_hold_hours,
+            mirror_exits = initial_config.mirror_exits,
             "Starting copy trade stop-loss monitor"
         );
 
         // Subscribe to wallet trade feed for mirror exits
         let mut mirror_rx = self.trade_monitor.as_ref().map(|tm| tm.subscribe());
 
-        let check_interval = tokio::time::Duration::from_secs(self.config.check_interval_secs);
+        let check_interval = tokio::time::Duration::from_secs(initial_config.check_interval_secs);
         let mut check_ticker = tokio::time::interval(check_interval);
 
         loop {
@@ -202,7 +208,8 @@ impl CopyStopLossMonitor {
                 } => {
                     match result {
                         Ok(wallet_trade) => {
-                            if self.config.mirror_exits
+                            let cfg = self.snapshot_config().await;
+                            if cfg.mirror_exits
                                 && wallet_trade.direction == wallet_tracker::trade_monitor::TradeDirection::Sell
                             {
                                 if let Err(e) = self.handle_mirror_exit(&wallet_trade).await {
@@ -225,6 +232,7 @@ impl CopyStopLossMonitor {
 
     /// Check all open copy-trade positions for stop-loss, take-profit, and time exits.
     async fn check_positions(&mut self) -> anyhow::Result<()> {
+        let cfg = self.snapshot_config().await;
         let positions = self.load_open_copy_positions().await?;
         if positions.is_empty() {
             return Ok(());
@@ -290,7 +298,7 @@ impl CopyStopLossMonitor {
             let hold_hours = now.signed_duration_since(pos.opened_at).num_hours();
 
             // Time-based exit does not require a live price lookup.
-            if hold_hours >= self.config.max_hold_hours {
+            if hold_hours >= cfg.max_hold_hours {
                 info!(
                     position_id = %pos.id,
                     market = %pos.market_id,
@@ -313,7 +321,7 @@ impl CopyStopLossMonitor {
                     };
 
                     // Stop-loss: close if loss exceeds threshold
-                    if pnl_pct < Decimal::ZERO && pnl_pct.abs() >= self.config.stop_loss_pct {
+                    if pnl_pct < Decimal::ZERO && pnl_pct.abs() >= cfg.stop_loss_pct {
                         info!(
                             position_id = %pos.id,
                             market = %pos.market_id,
@@ -325,7 +333,7 @@ impl CopyStopLossMonitor {
                     }
 
                     // Take-profit: close if profit exceeds threshold
-                    if pnl_pct > Decimal::ZERO && pnl_pct >= self.config.take_profit_pct {
+                    if pnl_pct > Decimal::ZERO && pnl_pct >= cfg.take_profit_pct {
                         info!(
                             position_id = %pos.id,
                             market = %pos.market_id,
@@ -730,7 +738,7 @@ impl CopyStopLossMonitor {
 /// Spawn the copy-trade stop-loss monitor as a background task.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_copy_stop_loss_monitor(
-    config: CopyStopLossConfig,
+    config: Arc<RwLock<CopyStopLossConfig>>,
     pool: PgPool,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
