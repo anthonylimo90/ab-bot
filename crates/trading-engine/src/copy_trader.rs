@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use polymarket_core::types::{ExecutionReport, MarketOrder, OrderSide};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -224,11 +225,17 @@ pub struct CopyTrader {
     daily_reset_date: chrono::NaiveDate,
     /// Current count of open copy positions.
     open_position_count: usize,
+    /// Near-resolution margin stored as margin * 10,000 (e.g. 300 = 0.03). 0 = filter disabled.
+    near_resolution_margin: Arc<AtomicI64>,
 }
 
 impl CopyTrader {
     /// Create a new copy trader.
-    pub fn new(executor: Arc<OrderExecutor>, total_capital: Decimal) -> Self {
+    pub fn new(
+        executor: Arc<OrderExecutor>,
+        total_capital: Decimal,
+        near_resolution_margin: Arc<AtomicI64>,
+    ) -> Self {
         let (trade_tx, trade_rx) = mpsc::channel(1000);
         Self {
             tracked_wallets: DashMap::new(),
@@ -242,6 +249,7 @@ impl CopyTrader {
             daily_deployed: Decimal::ZERO,
             daily_reset_date: Utc::now().date_naive(),
             open_position_count: 0,
+            near_resolution_margin,
         }
     }
 
@@ -427,7 +435,7 @@ impl CopyTrader {
         trade: &DetectedTrade,
     ) -> Result<CopyTradeProcessOutcome> {
         if !self.active {
-            debug!("Copy trading is paused, skipping trade");
+            info!("Copy trading is paused, skipping trade");
             return Ok(CopyTradeProcessOutcome::Skipped);
         }
 
@@ -437,14 +445,14 @@ impl CopyTrader {
         {
             Some(w) if w.enabled => w.clone(),
             Some(_) => {
-                debug!(
+                info!(
                     wallet = %trade.wallet_address,
                     "Wallet is disabled, skipping trade"
                 );
                 return Ok(CopyTradeProcessOutcome::Skipped);
             }
             None => {
-                debug!(
+                info!(
                     wallet = %trade.wallet_address,
                     "Wallet not tracked, skipping trade"
                 );
@@ -509,7 +517,7 @@ impl CopyTrader {
                         .unwrap_or(false);
 
                     if is_client_error {
-                        debug!(
+                        info!(
                             wallet = %trade.wallet_address,
                             outcome_id = %trade.outcome_id,
                             error = %e,
@@ -530,12 +538,18 @@ impl CopyTrader {
                     );
                 }
                 Ok(Some(market_price)) => {
-                    // Reject markets near resolution (price < 0.03 or > 0.97).
-                    // These have no meaningful liquidity and slippage will always be extreme.
-                    let near_resolution_floor = Decimal::new(3, 2); // 0.03
-                    let near_resolution_ceil = Decimal::new(97, 2); // 0.97
-                    if market_price < near_resolution_floor || market_price > near_resolution_ceil {
-                        debug!(
+                    // Reject markets near resolution (dynamically tunable margin).
+                    // When margin_raw > 0, reject prices within [0, margin) or (1-margin, 1].
+                    // When margin_raw == 0, the filter is disabled entirely.
+                    let margin_raw = self.near_resolution_margin.load(Ordering::Relaxed);
+                    let near_resolution_active = margin_raw > 0;
+                    let near_resolution_floor = Decimal::new(margin_raw, 4);
+                    let near_resolution_ceil = Decimal::ONE - near_resolution_floor;
+                    if near_resolution_active
+                        && (market_price < near_resolution_floor
+                            || market_price > near_resolution_ceil)
+                    {
+                        info!(
                             wallet = %trade.wallet_address,
                             market_price = %market_price,
                             "Market near resolution, skipping copy trade"
@@ -551,7 +565,7 @@ impl CopyTrader {
                         Decimal::ZERO
                     };
                     if slippage_pct > self.policy.max_slippage_pct {
-                        debug!(
+                        info!(
                             wallet = %trade.wallet_address,
                             source_price = %trade.price,
                             market_price = %market_price,
@@ -773,7 +787,11 @@ mod tests {
     #[test]
     fn test_add_and_list_wallets() {
         let executor = create_test_executor();
-        let copy_trader = CopyTrader::new(executor, Decimal::new(10000, 0));
+        let copy_trader = CopyTrader::new(
+            executor,
+            Decimal::new(10000, 0),
+            Arc::new(AtomicI64::new(300)),
+        );
 
         copy_trader
             .add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(50, 0)));
@@ -787,8 +805,12 @@ mod tests {
     #[test]
     fn test_allocation_equal_weight() {
         let executor = create_test_executor();
-        let copy_trader = CopyTrader::new(executor, Decimal::new(10000, 0))
-            .with_strategy(AllocationStrategy::EqualWeight);
+        let copy_trader = CopyTrader::new(
+            executor,
+            Decimal::new(10000, 0),
+            Arc::new(AtomicI64::new(300)),
+        )
+        .with_strategy(AllocationStrategy::EqualWeight);
 
         copy_trader.add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(0, 0)));
         copy_trader.add_tracked_wallet(TrackedWallet::new("0xBBB".to_string(), Decimal::new(0, 0)));
@@ -801,7 +823,11 @@ mod tests {
     #[test]
     fn test_enable_disable_wallet() {
         let executor = create_test_executor();
-        let copy_trader = CopyTrader::new(executor, Decimal::new(10000, 0));
+        let copy_trader = CopyTrader::new(
+            executor,
+            Decimal::new(10000, 0),
+            Arc::new(AtomicI64::new(300)),
+        );
 
         copy_trader
             .add_tracked_wallet(TrackedWallet::new("0xAAA".to_string(), Decimal::new(50, 0)));

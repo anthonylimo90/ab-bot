@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, Duration};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// A trade detected from a monitored wallet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,7 +269,7 @@ impl TradeMonitor {
                         if trade.is_significant(self.config.min_trade_value)
                             && self.trade_tx.send(trade).is_err()
                         {
-                            debug!("No subscribers for trade notifications");
+                            warn!("No subscribers for trade notifications");
                         }
                     }
                 }

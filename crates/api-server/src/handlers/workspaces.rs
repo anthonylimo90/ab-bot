@@ -1114,6 +1114,9 @@ const KEY_COPY_MAX_HOLD_HOURS: &str = "COPY_MAX_HOLD_HOURS";
 const KEY_ARB_POSITION_SIZE: &str = "ARB_POSITION_SIZE";
 const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
 const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
+const KEY_ARB_MAX_SIGNAL_AGE_SECS: &str = "ARB_MAX_SIGNAL_AGE_SECS";
+const KEY_COPY_TOTAL_CAPITAL: &str = "COPY_TOTAL_CAPITAL";
+const KEY_COPY_NEAR_RESOLUTION_MARGIN: &str = "COPY_NEAR_RESOLUTION_MARGIN";
 const ARB_RUNTIME_STATS_LATEST: &str = "arb:runtime:stats:latest";
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1312,6 +1315,10 @@ pub struct UpdateCopyTradingConfigRequest {
     pub take_profit_pct: Option<f64>,
     /// Maximum hold time in hours before force-closing.
     pub max_hold_hours: Option<i64>,
+    /// Total copy-trading capital budget (USD).
+    pub total_capital: Option<f64>,
+    /// Near-resolution filter margin (e.g. 0.03). 0 = disabled.
+    pub near_resolution_margin: Option<f64>,
 }
 
 /// Response after updating copy trading config.
@@ -1325,6 +1332,8 @@ pub struct CopyTradingConfigResponse {
     pub stop_loss_pct: Option<f64>,
     pub take_profit_pct: Option<f64>,
     pub max_hold_hours: Option<i64>,
+    pub total_capital: Option<f64>,
+    pub near_resolution_margin: Option<f64>,
 }
 
 /// Request to update arb executor dynamic config thresholds.
@@ -1336,6 +1345,8 @@ pub struct UpdateArbExecutorConfigRequest {
     pub min_net_profit: Option<f64>,
     /// Minimum orderbook depth (in $) on each side to enter.
     pub min_book_depth: Option<f64>,
+    /// Maximum age (in seconds) of an arb signal before it is discarded.
+    pub max_signal_age_secs: Option<i64>,
 }
 
 /// Response after updating arb executor config.
@@ -1344,6 +1355,7 @@ pub struct ArbExecutorConfigResponse {
     pub position_size: Option<f64>,
     pub min_net_profit: Option<f64>,
     pub min_book_depth: Option<f64>,
+    pub max_signal_age_secs: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2033,6 +2045,8 @@ pub async fn update_copy_trading_config(
         && req.stop_loss_pct.is_none()
         && req.take_profit_pct.is_none()
         && req.max_hold_hours.is_none()
+        && req.total_capital.is_none()
+        && req.near_resolution_margin.is_none()
     {
         return Err(ApiError::BadRequest(
             "Provide at least one field to update".into(),
@@ -2145,6 +2159,35 @@ pub async fn update_copy_trading_config(
         ));
     }
 
+    if let Some(v) = req.total_capital {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_TOTAL_CAPITAL).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid total_capital".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_TOTAL_CAPITAL.to_string(),
+            clamped,
+            format!("manual workspace update: total_capital={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.near_resolution_margin {
+        let (min, max, _) =
+            copy_trading_dynamic_bounds(KEY_COPY_NEAR_RESOLUTION_MARGIN).expect("bounds defined");
+        let dec = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("Invalid near_resolution_margin".into()))?;
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_COPY_NEAR_RESOLUTION_MARGIN.to_string(),
+            clamped,
+            format!(
+                "manual workspace update: near_resolution_margin={}",
+                clamped
+            ),
+        ));
+    }
+
     // Write each update to DB + history
     for (key, value, reason) in &updates {
         let old_value: Option<Decimal> =
@@ -2231,6 +2274,8 @@ pub async fn update_copy_trading_config(
         KEY_COPY_STOP_LOSS_PCT,
         KEY_COPY_TAKE_PROFIT_PCT,
         KEY_COPY_MAX_HOLD_HOURS,
+        KEY_COPY_TOTAL_CAPITAL,
+        KEY_COPY_NEAR_RESOLUTION_MARGIN,
     ])
     .fetch_all(&state.pool)
     .await?;
@@ -2255,6 +2300,8 @@ pub async fn update_copy_trading_config(
         stop_loss_pct: find_f64(KEY_COPY_STOP_LOSS_PCT),
         take_profit_pct: find_f64(KEY_COPY_TAKE_PROFIT_PCT),
         max_hold_hours: find_i64(KEY_COPY_MAX_HOLD_HOURS),
+        total_capital: find_f64(KEY_COPY_TOTAL_CAPITAL),
+        near_resolution_margin: find_f64(KEY_COPY_NEAR_RESOLUTION_MARGIN),
     }))
 }
 
@@ -2426,6 +2473,16 @@ fn copy_trading_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)>
             Decimal::new(720, 0),
             Decimal::new(20, 2),
         )),
+        // $100 – $500,000, 20% step
+        KEY_COPY_TOTAL_CAPITAL => Some((
+            Decimal::new(100, 0),
+            Decimal::new(500000, 0),
+            Decimal::new(20, 2),
+        )),
+        // 0.0 – 0.25, 50% step
+        KEY_COPY_NEAR_RESOLUTION_MARGIN => {
+            Some((Decimal::ZERO, Decimal::new(25, 2), Decimal::new(50, 2)))
+        }
         _ => None,
     }
 }
@@ -2448,6 +2505,12 @@ fn arb_executor_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)>
             Decimal::new(25, 0),
             Decimal::new(1000, 0),
             Decimal::new(20, 2),
+        )),
+        // 5s – 300s, 25% step
+        KEY_ARB_MAX_SIGNAL_AGE_SECS => Some((
+            Decimal::new(5, 0),
+            Decimal::new(300, 0),
+            Decimal::new(25, 2),
         )),
         _ => None,
     }
@@ -2490,7 +2553,11 @@ pub async fn update_arb_executor_config(
         ));
     }
 
-    if req.position_size.is_none() && req.min_net_profit.is_none() && req.min_book_depth.is_none() {
+    if req.position_size.is_none()
+        && req.min_net_profit.is_none()
+        && req.min_book_depth.is_none()
+        && req.max_signal_age_secs.is_none()
+    {
         return Err(ApiError::BadRequest(
             "Provide at least one field to update".into(),
         ));
@@ -2534,6 +2601,18 @@ pub async fn update_arb_executor_config(
             KEY_ARB_MIN_BOOK_DEPTH.to_string(),
             clamped,
             format!("manual workspace update: min_book_depth={}", clamped),
+        ));
+    }
+
+    if let Some(v) = req.max_signal_age_secs {
+        let (min, max, _) =
+            arb_executor_dynamic_bounds(KEY_ARB_MAX_SIGNAL_AGE_SECS).expect("bounds defined");
+        let dec = Decimal::new(v, 0);
+        let clamped = dec.max(min).min(max);
+        updates.push((
+            KEY_ARB_MAX_SIGNAL_AGE_SECS.to_string(),
+            clamped,
+            format!("manual workspace update: max_signal_age_secs={}", clamped),
         ));
     }
 
@@ -2618,6 +2697,7 @@ pub async fn update_arb_executor_config(
         KEY_ARB_POSITION_SIZE,
         KEY_ARB_MIN_NET_PROFIT,
         KEY_ARB_MIN_BOOK_DEPTH,
+        KEY_ARB_MAX_SIGNAL_AGE_SECS,
     ])
     .fetch_all(&state.pool)
     .await?;
@@ -2632,6 +2712,10 @@ pub async fn update_arb_executor_config(
         position_size: find_f64(KEY_ARB_POSITION_SIZE),
         min_net_profit: find_f64(KEY_ARB_MIN_NET_PROFIT),
         min_book_depth: find_f64(KEY_ARB_MIN_BOOK_DEPTH),
+        max_signal_age_secs: rows
+            .iter()
+            .find(|r| r.key == KEY_ARB_MAX_SIGNAL_AGE_SECS)
+            .and_then(|r| r.current_value.to_string().parse::<i64>().ok()),
     }))
 }
 

@@ -135,6 +135,9 @@ export function formatDynamicKey(key: string | null): string {
     ARB_POSITION_SIZE: "Arb Position Size",
     ARB_MIN_NET_PROFIT: "Arb Min Net Profit",
     ARB_MIN_BOOK_DEPTH: "Arb Min Book Depth",
+    ARB_MAX_SIGNAL_AGE_SECS: "Arb Max Signal Age",
+    COPY_TOTAL_CAPITAL: "Total Copy Capital",
+    COPY_NEAR_RESOLUTION_MARGIN: "Near-Resolution Margin",
   };
   return labels[key] ?? key;
 }
@@ -158,6 +161,12 @@ export function formatDynamicConfigValue(
   if (key === "ARB_POSITION_SIZE") return formatCurrency(value);
   if (key === "ARB_MIN_NET_PROFIT") return value.toFixed(4);
   if (key === "ARB_MIN_BOOK_DEPTH") return formatCurrency(value);
+  if (key === "ARB_MAX_SIGNAL_AGE_SECS") {
+    const secs = Math.round(value);
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
   if (key === "COPY_MIN_TRADE_VALUE") return formatCurrency(value);
   // Backend stores slippage as ratio (0.01 = 1%), so multiply by 100
   if (key === "COPY_MAX_SLIPPAGE_PCT") return `${(value * 100).toFixed(2)}%`;
@@ -169,6 +178,10 @@ export function formatDynamicConfigValue(
   if (key === "COPY_MAX_HOLD_HOURS") {
     const h = Math.round(value);
     return h >= 24 ? `${(h / 24).toFixed(1)}d` : `${h}h`;
+  }
+  if (key === "COPY_TOTAL_CAPITAL") return formatCurrency(value);
+  if (key === "COPY_NEAR_RESOLUTION_MARGIN") {
+    return value === 0 ? "disabled" : `\u00b1${(value * 100).toFixed(1)}%`;
   }
   return Number.isInteger(value) ? String(value) : value.toFixed(4);
 }

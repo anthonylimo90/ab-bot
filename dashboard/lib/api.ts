@@ -751,6 +751,8 @@ class ApiClient {
       stop_loss_pct?: number;
       take_profit_pct?: number;
       max_hold_hours?: number;
+      total_capital?: number;
+      near_resolution_margin?: number;
     },
   ): Promise<{
     min_trade_value: number | null;
@@ -761,6 +763,8 @@ class ApiClient {
     stop_loss_pct: number | null;
     take_profit_pct: number | null;
     max_hold_hours: number | null;
+    total_capital: number | null;
+    near_resolution_margin: number | null;
   }> {
     return this.request(
       `/api/v1/workspaces/${workspaceId}/dynamic-tuning/copy-trading`,
@@ -774,11 +778,13 @@ class ApiClient {
       position_size?: number;
       min_net_profit?: number;
       min_book_depth?: number;
+      max_signal_age_secs?: number;
     },
   ): Promise<{
     position_size: number | null;
     min_net_profit: number | null;
     min_book_depth: number | null;
+    max_signal_age_secs: number | null;
   }> {
     return this.request(
       `/api/v1/workspaces/${workspaceId}/dynamic-tuning/arb-executor`,

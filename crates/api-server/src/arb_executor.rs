@@ -328,7 +328,7 @@ impl ArbAutoExecutor {
         {
             let active = self.active_markets.read().await;
             if active.contains(market_id) {
-                debug!(market_id = %market_id, "Active position exists, skipping");
+                info!(market_id = %market_id, "Active position exists, skipping");
                 return Ok(());
             }
         }
