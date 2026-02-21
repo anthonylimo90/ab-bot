@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 
 use auth::jwt::{JwtAuth, JwtConfig};
 use auth::key_vault::KeyVault;
@@ -109,6 +109,8 @@ pub struct AppState {
     pub copy_total_capital: Arc<AtomicI64>,
     /// Near-resolution margin stored as margin * 10,000 (e.g. 300 = 0.03). 0 = filter disabled.
     pub copy_near_resolution_margin: Arc<AtomicI64>,
+    /// Sender for pushing events to the auto-optimizer (position closes, CB trips, etc.).
+    pub optimizer_event_tx: Option<mpsc::Sender<AutomationEvent>>,
 }
 
 impl AppState {
@@ -513,6 +515,7 @@ impl AppState {
                     .map(|m| (m * 10_000.0) as i64)
                     .unwrap_or(300), // 0.03 default
             )),
+            optimizer_event_tx: None,
         })
     }
 

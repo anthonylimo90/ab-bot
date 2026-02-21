@@ -14,10 +14,12 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::copy_trader::CopyTrader;
 use trading_engine::OrderExecutor;
+
+use crate::auto_optimizer::AutomationEvent;
 
 use polymarket_core::types::{MarketOrder, OrderSide};
 use wallet_tracker::trade_monitor::TradeMonitor;
@@ -114,6 +116,7 @@ struct CopyPosition {
     market_id: String,
     outcome: String,
     source_token_id: Option<String>,
+    source_wallet: Option<String>,
     quantity: Decimal,
     entry_price: Decimal,
     opened_at: chrono::DateTime<Utc>,
@@ -135,6 +138,8 @@ pub struct CopyStopLossMonitor {
     copy_trader: Arc<RwLock<CopyTrader>>,
     trade_monitor: Option<Arc<TradeMonitor>>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    /// Sender for pushing position-close events to the auto-optimizer.
+    event_tx: Option<mpsc::Sender<AutomationEvent>>,
     /// Tracks consecutive 404s per (market_id, token_id) so we can auto-close
     /// positions whose markets have been resolved or delisted.
     not_found_strikes: HashMap<(String, String), u32>,
@@ -151,6 +156,7 @@ impl CopyStopLossMonitor {
         copy_trader: Arc<RwLock<CopyTrader>>,
         trade_monitor: Option<Arc<TradeMonitor>>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        event_tx: Option<mpsc::Sender<AutomationEvent>>,
     ) -> Self {
         Self {
             config,
@@ -161,6 +167,7 @@ impl CopyStopLossMonitor {
             copy_trader,
             trade_monitor,
             signal_tx,
+            event_tx,
             not_found_strikes: HashMap::new(),
         }
     }
@@ -386,7 +393,18 @@ impl CopyStopLossMonitor {
         wallet_trade: &wallet_tracker::trade_monitor::WalletTrade,
     ) -> anyhow::Result<()> {
         // Find open copy positions from this wallet in this market/token.
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Decimal, Decimal, chrono::DateTime<Utc>)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                Option<String>,
+                Decimal,
+                Decimal,
+                Option<chrono::DateTime<Utc>>,
+                chrono::DateTime<Utc>,
+            ),
+        >(
             r#"
             SELECT
               p.id,
@@ -404,7 +422,8 @@ impl CopyStopLossMonitor {
               ) AS resolved_token_id,
               p.quantity,
               p.entry_price,
-              p.opened_at
+              p.opened_at,
+              p.entry_timestamp
             FROM positions p
             WHERE p.is_copy_trade = true
               AND p.source_wallet = $1
@@ -429,7 +448,9 @@ impl CopyStopLossMonitor {
         .fetch_all(&self.pool)
         .await?;
 
-        for (id, outcome, source_token_id, quantity, entry_price, opened_at) in rows {
+        for (id, outcome, source_token_id, quantity, entry_price, opened_at, entry_timestamp) in
+            rows
+        {
             info!(
                 position_id = %id,
                 source_wallet = %wallet_trade.wallet_address,
@@ -442,10 +463,11 @@ impl CopyStopLossMonitor {
                 id,
                 market_id: wallet_trade.market_id.clone(),
                 outcome,
-                source_token_id: Some(source_token_id),
+                source_token_id,
+                source_wallet: Some(wallet_trade.wallet_address.clone()),
                 quantity,
                 entry_price,
-                opened_at,
+                opened_at: opened_at.unwrap_or(entry_timestamp),
             };
 
             self.close_position(&pos, "mirror_exit").await;
@@ -542,6 +564,9 @@ impl CopyStopLossMonitor {
                     "Copy trade position closed"
                 );
 
+                // Notify auto-optimizer of position close
+                self.emit_position_closed(pos, actual_pnl).await;
+
                 // Publish signal
                 let signal = SignalUpdate {
                     signal_id: uuid::Uuid::new_v4(),
@@ -626,6 +651,9 @@ impl CopyStopLossMonitor {
             "Copy trade position closed without exit order"
         );
 
+        // Notify auto-optimizer of position close
+        self.emit_position_closed(pos, realized_pnl).await;
+
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
             signal_type: SignalType::CopyTrade,
@@ -645,6 +673,54 @@ impl CopyStopLossMonitor {
         let _ = self.signal_tx.send(signal);
     }
 
+    /// Emit a `PositionClosed` event to the auto-optimizer so it can track
+    /// consecutive losses and trigger wallet demotions in real time.
+    async fn emit_position_closed(&self, pos: &CopyPosition, pnl: Decimal) {
+        let Some(ref tx) = self.event_tx else { return };
+        let Some(ref wallet) = pos.source_wallet else {
+            return;
+        };
+
+        // Look up workspace_id from active wallet allocation
+        let ws_id = sqlx::query_as::<_, (uuid::Uuid,)>(
+            "SELECT workspace_id FROM workspace_wallet_allocations WHERE LOWER(wallet_address) = LOWER($1) AND tier = 'active' LIMIT 1",
+        )
+        .bind(wallet)
+        .fetch_optional(&self.pool)
+        .await;
+
+        match ws_id {
+            Ok(Some((workspace_id,))) => {
+                if let Err(e) = tx.try_send(AutomationEvent::PositionClosed {
+                    workspace_id,
+                    wallet_address: wallet.clone(),
+                    pnl,
+                    is_win: pnl >= Decimal::ZERO,
+                }) {
+                    warn!(
+                        error = %e,
+                        wallet = %wallet,
+                        "Failed to send position-close event to optimizer"
+                    );
+                }
+            }
+            Ok(None) => {
+                debug!(
+                    wallet = %wallet,
+                    position_id = %pos.id,
+                    "No active-tier allocation found for wallet; skipping optimizer event"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    wallet = %wallet,
+                    "DB error looking up workspace for optimizer event"
+                );
+            }
+        }
+    }
+
     /// Load open copy trade positions from the database.
     async fn load_open_copy_positions(&self) -> anyhow::Result<Vec<CopyPosition>> {
         let rows = sqlx::query_as::<
@@ -653,6 +729,7 @@ impl CopyStopLossMonitor {
                 uuid::Uuid,
                 String,
                 String,
+                Option<String>,
                 Option<String>,
                 Decimal,
                 Decimal,
@@ -676,6 +753,7 @@ impl CopyStopLossMonitor {
                   LIMIT 1
                 )
               ) AS resolved_token_id,
+              p.source_wallet,
               p.quantity,
               p.entry_price,
               p.opened_at,
@@ -696,6 +774,7 @@ impl CopyStopLossMonitor {
                     market_id,
                     outcome,
                     source_token_id,
+                    source_wallet,
                     quantity,
                     entry_price,
                     opened_at,
@@ -706,6 +785,7 @@ impl CopyStopLossMonitor {
                         market_id,
                         outcome,
                         source_token_id,
+                        source_wallet,
                         quantity,
                         entry_price,
                         opened_at: opened_at.unwrap_or(entry_timestamp),
@@ -746,6 +826,7 @@ pub fn spawn_copy_stop_loss_monitor(
     copy_trader: Arc<RwLock<CopyTrader>>,
     trade_monitor: Option<Arc<TradeMonitor>>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    event_tx: Option<mpsc::Sender<AutomationEvent>>,
 ) {
     let monitor = CopyStopLossMonitor::new(
         config,
@@ -756,6 +837,7 @@ pub fn spawn_copy_stop_loss_monitor(
         copy_trader,
         trade_monitor,
         signal_tx,
+        event_tx,
     );
 
     tokio::spawn(async move {
