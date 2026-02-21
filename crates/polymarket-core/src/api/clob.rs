@@ -108,6 +108,12 @@ impl ClobClient {
     pub async fn get_markets(&self) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
         let mut cursor: Option<String> = None;
+        // Safety valve: configurable via CLOB_MARKET_LIMIT env var (default 200,000).
+        let limit: usize = std::env::var("CLOB_MARKET_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200_000);
+        let mut pages = 0u32;
 
         loop {
             let url = match &cursor {
@@ -119,21 +125,26 @@ impl ClobClient {
 
             let page: MarketsResponse = response.json().await?;
             all_markets.extend(page.data.into_iter().map(Into::into));
+            pages += 1;
 
             match page.next_cursor {
                 Some(c) if !c.is_empty() => cursor = Some(c),
                 _ => break,
             }
 
-            // Safety valve to avoid infinite pagination loops
-            if all_markets.len() > 50_000 {
+            if all_markets.len() > limit {
                 warn!(
                     count = all_markets.len(),
-                    "Market pagination safety limit reached"
+                    limit, pages, "Market pagination safety limit reached"
                 );
                 break;
             }
         }
+
+        info!(
+            total = all_markets.len(),
+            pages, "Fetched all active markets from CLOB"
+        );
 
         Ok(all_markets)
     }
