@@ -673,8 +673,9 @@ impl DynamicTuner {
                 "below_minimum" => desired_min_trade.min((min_trade_current * 0.70).max(0.50)),
                 "too_stale" => desired_min_trade.min((min_trade_current * 0.85).max(0.50)),
                 // Near-resolution and market_not_active are infrastructure/cache problems,
-                // not parameter problems. Do not relax min trade value for these.
-                "near_resolution" | "market_not_active" => desired_min_trade,
+                // not parameter problems. Pin to current value to prevent drift —
+                // the base formula already moved desired_min_trade away from current.
+                "near_resolution" | "market_not_active" => min_trade_current,
                 _ => desired_min_trade.min((min_trade_current * 0.80).max(0.50)),
             };
         }
@@ -697,8 +698,9 @@ impl DynamicTuner {
                 "slippage" => desired_slippage.max((slippage_current * 1.50).max(0.015)),
                 "too_stale" => desired_slippage.max((slippage_current * 1.10).max(0.012)),
                 // Near-resolution and market_not_active are infrastructure/cache problems.
-                // Cannot be fixed by relaxing slippage — keep current to avoid unsafe drift.
-                "near_resolution" | "market_not_active" => desired_slippage,
+                // Cannot be fixed by relaxing slippage — pin to current to prevent drift.
+                // The base formula drives desired_slippage toward 0 when p90 = 0 (no fills).
+                "near_resolution" | "market_not_active" => slippage_current,
                 _ => desired_slippage.max((slippage_current * 1.15).max(0.012)),
             };
         }
