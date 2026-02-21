@@ -2,7 +2,8 @@
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { LiveIndicator } from '@/components/shared/LiveIndicator';
-import { cn, formatCurrency, formatTimeAgo, shortenAddress } from '@/lib/utils';
+import { cn, formatCurrency, shortenAddress } from '@/lib/utils';
+import { TimeAgo } from '@/components/shared/TimeAgo';
 import type { LiveTrade } from '@/types/api';
 import { useLiveTradesQuery } from '@/hooks/queries/useDiscoverQuery';
 
@@ -75,9 +76,10 @@ function TradeRow({ trade }: { trade: LiveTrade }) {
           <span className="font-medium truncate">
             {trade.wallet_label || shortenAddress(trade.wallet_address)}
           </span>
-          <span className="text-muted-foreground text-xs">
-            {formatTimeAgo(trade.timestamp)}
-          </span>
+          <TimeAgo
+            date={trade.timestamp}
+            className="text-muted-foreground text-xs"
+          />
         </div>
         <div className="text-sm text-muted-foreground truncate">
           {trade.market_question || shortenAddress(trade.market_id)}

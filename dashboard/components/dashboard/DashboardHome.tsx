@@ -38,8 +38,9 @@ import {
   Star,
   LineChart,
 } from "lucide-react";
-import { formatCurrency, formatTimeAgo } from "@/lib/utils";
+import { formatCurrency } from "@/lib/utils";
 import { cn } from "@/lib/utils";
+import { TimeAgo } from "@/components/shared/TimeAgo";
 
 const activityIcons: Record<string, React.ReactNode> = {
   TRADE_COPIED: <Copy className="h-4 w-4 text-blue-500" />,
@@ -250,9 +251,10 @@ export function DashboardHome() {
                     </div>
                     <div className="min-w-0 flex-1 space-y-1">
                       <p className="text-sm break-words">{item.message}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {formatTimeAgo(item.created_at)}
-                      </p>
+                      <TimeAgo
+                        date={item.created_at}
+                        className="text-xs text-muted-foreground"
+                      />
                     </div>
                     {item.pnl !== undefined && (
                       <span
