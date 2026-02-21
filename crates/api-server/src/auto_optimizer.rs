@@ -576,8 +576,12 @@ impl AutoOptimizer {
 
     /// Start the background optimization loop with event handling.
     pub async fn start(self: Arc<Self>, mut event_rx: Option<mpsc::Receiver<AutomationEvent>>) {
-        // Run scheduled optimization every hour
-        let mut ticker = interval(TokioDuration::from_secs(3600));
+        // Run scheduled optimization on a configurable interval (default 15 min)
+        let interval_secs = std::env::var("AUTO_ROTATION_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(900u64);
+        let mut ticker = interval(TokioDuration::from_secs(interval_secs));
 
         info!("Auto-optimizer started");
 

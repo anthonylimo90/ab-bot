@@ -299,6 +299,16 @@ impl ApiServer {
                 None
             };
 
+        // ── Create auto-optimizer event channel (before Arc wrap so we can set field) ──
+        let (optimizer_base, optimizer_rx) =
+            AutoOptimizer::with_event_channel(self.state.pool.clone());
+        // Extract sender before builder chain to avoid future refactor divergence
+        self.state.optimizer_event_tx = optimizer_base.event_sender();
+        let optimizer_base = optimizer_base.with_runtime_handles(
+            self.state.trade_monitor.clone(),
+            self.state.copy_trader.clone(),
+        );
+
         // ── Wrap state in Arc and build router ──
         let state = Arc::new(self.state);
 
@@ -379,12 +389,9 @@ impl ApiServer {
             state.exit_handler_heartbeat.clone(),
         );
 
-        // Spawn auto-optimizer background service
-        let optimizer = Arc::new(
-            AutoOptimizer::new(state.pool.clone())
-                .with_runtime_handles(state.trade_monitor.clone(), state.copy_trader.clone()),
-        );
-        tokio::spawn(optimizer.start(None));
+        // Spawn auto-optimizer background service (channel created before Arc wrap)
+        let optimizer = Arc::new(optimizer_base);
+        tokio::spawn(optimizer.start(Some(optimizer_rx)));
 
         // Extract the latency atomic (if copy trading is active) so the
         // dynamic config subscriber can write to it at runtime.
@@ -467,6 +474,7 @@ impl ApiServer {
                     copy_trader,
                     Some(trade_monitor),
                     state.signal_tx.clone(),
+                    state.optimizer_event_tx.clone(),
                 );
             }
 
