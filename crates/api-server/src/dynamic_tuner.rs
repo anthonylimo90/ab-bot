@@ -670,12 +670,12 @@ impl DynamicTuner {
         }
         if no_trade_watchdog {
             desired_min_trade = match top_skip.as_str() {
-                "below_minimum" => desired_min_trade.min((min_trade_current * 0.70).max(2.0)),
-                "too_stale" => desired_min_trade.min((min_trade_current * 0.85).max(2.0)),
-                // Near-resolution markets are a wallet curation problem, not a parameter problem.
-                // Do not relax min trade value when most skips are from dead/resolved markets.
-                "near_resolution" => desired_min_trade,
-                _ => desired_min_trade.min((min_trade_current * 0.80).max(2.0)),
+                "below_minimum" => desired_min_trade.min((min_trade_current * 0.70).max(0.50)),
+                "too_stale" => desired_min_trade.min((min_trade_current * 0.85).max(0.50)),
+                // Near-resolution and market_not_active are infrastructure/cache problems,
+                // not parameter problems. Do not relax min trade value for these.
+                "near_resolution" | "market_not_active" => desired_min_trade,
+                _ => desired_min_trade.min((min_trade_current * 0.80).max(0.50)),
             };
         }
         targets.insert(KEY_COPY_MIN_TRADE_VALUE.to_string(), desired_min_trade);
@@ -696,9 +696,9 @@ impl DynamicTuner {
             desired_slippage = match top_skip.as_str() {
                 "slippage" => desired_slippage.max((slippage_current * 1.50).max(0.015)),
                 "too_stale" => desired_slippage.max((slippage_current * 1.10).max(0.012)),
-                // Near-resolution markets cannot be fixed by relaxing slippage.
-                // Keep current slippage to avoid unsafe drift.
-                "near_resolution" => desired_slippage,
+                // Near-resolution and market_not_active are infrastructure/cache problems.
+                // Cannot be fixed by relaxing slippage — keep current to avoid unsafe drift.
+                "near_resolution" | "market_not_active" => desired_slippage,
                 _ => desired_slippage.max((slippage_current * 1.15).max(0.012)),
             };
         }

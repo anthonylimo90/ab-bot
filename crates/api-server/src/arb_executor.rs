@@ -130,7 +130,7 @@ impl OutcomeTokenCache {
     }
 
     /// Refresh the cache by fetching all markets from the CLOB API.
-    async fn refresh(&self) -> anyhow::Result<usize> {
+    async fn refresh(&self) -> anyhow::Result<(usize, usize)> {
         let markets = self.clob_client.get_markets().await?;
         let mut map = HashMap::new();
         let mut active_set = HashSet::new();
@@ -162,9 +162,10 @@ impl OutcomeTokenCache {
         }
 
         let count = map.len();
+        let active_set_size = active_set.len();
         *self.tokens.write().await = map;
         *self.active_clob_markets.write().await = active_set;
-        Ok(count)
+        Ok((count, active_set_size))
     }
 
     /// Look up token IDs for a given market.
@@ -236,7 +237,10 @@ impl ArbAutoExecutor {
 
         // Initial token cache load
         match self.token_cache.refresh().await {
-            Ok(count) => info!(markets = count, "Outcome token cache loaded"),
+            Ok((count, active_set_size)) => info!(
+                markets = count,
+                active_set_size, "Outcome token cache loaded"
+            ),
             Err(e) => warn!(error = %e, "Failed to load token cache, will retry"),
         }
 
@@ -283,7 +287,7 @@ impl ArbAutoExecutor {
                 }
                 _ = cache_ticker.tick() => {
                     match self.token_cache.refresh().await {
-                        Ok(count) => debug!(markets = count, "Token cache refreshed"),
+                        Ok((count, active_set_size)) => debug!(markets = count, active_set_size, "Token cache refreshed"),
                         Err(e) => warn!(error = %e, "Token cache refresh failed"),
                     }
                 }

@@ -101,14 +101,18 @@ impl ClobClient {
     }
 
     /// Fetch list of active markets.
+    ///
+    /// Requests only active (non-closed) markets from the CLOB API to reduce
+    /// page count and ensure all active markets are included regardless of
+    /// total market count.
     pub async fn get_markets(&self) -> Result<Vec<Market>> {
         let mut all_markets = Vec::new();
         let mut cursor: Option<String> = None;
 
         loop {
             let url = match &cursor {
-                Some(c) => format!("{}/markets?next_cursor={}", self.base_url, c),
-                None => format!("{}/markets", self.base_url),
+                Some(c) => format!("{}/markets?active=true&next_cursor={}", self.base_url, c),
+                None => format!("{}/markets?active=true", self.base_url),
             };
 
             let response = self.get_with_retry(&url).await?;
@@ -121,13 +125,28 @@ impl ClobClient {
                 _ => break,
             }
 
-            // Limit to avoid infinite loops (max ~5000 markets)
-            if all_markets.len() > 5000 {
+            // Safety valve to avoid infinite pagination loops
+            if all_markets.len() > 50_000 {
+                warn!(
+                    count = all_markets.len(),
+                    "Market pagination safety limit reached"
+                );
                 break;
             }
         }
 
         Ok(all_markets)
+    }
+
+    /// Fetch a single market by condition ID.
+    ///
+    /// Uses `GET /markets/{condition_id}` which returns a single `ClobMarket`
+    /// instead of paginating through the full market list.
+    pub async fn get_market_by_id(&self, condition_id: &str) -> Result<Market> {
+        let url = format!("{}/markets/{}", self.base_url, condition_id);
+        let response = self.get_with_retry(&url).await?;
+        let clob_market: ClobMarket = response.json().await?;
+        Ok(clob_market.into())
     }
 
     /// Fetch order book for a specific token.
@@ -330,31 +349,42 @@ impl ClobClient {
         write.send(Message::Text(subscribe_msg.to_string())).await?;
         info!("Subscribed to {} assets via WebSocket", asset_ids.len());
 
+        // Use a persistent deadline that only resets when data is actually received.
+        // This prevents the ping ticker from inadvertently resetting the read timeout
+        // every 10s (which made the 120s timeout effectively infinite when the server
+        // stopped sending data).
+        let read_deadline = tokio::time::sleep(StdDuration::from_secs(read_timeout_secs));
+        tokio::pin!(read_deadline);
+
         // Process incoming messages
         loop {
             tokio::select! {
                 _ = ping_tick.tick() => {
                     write.send(Message::Text("PING".to_string())).await?;
                 }
-                msg = tokio::time::timeout(StdDuration::from_secs(read_timeout_secs), read.next()) => {
+                _ = &mut read_deadline => {
+                    // Read timeout actually fired — no data for read_timeout_secs
+                    warn!(
+                        timeout_secs = read_timeout_secs,
+                        "WebSocket read timed out without messages"
+                    );
+                    return Err(Error::Api {
+                        message: format!(
+                            "WebSocket read timed out after {}s without messages",
+                            read_timeout_secs
+                        ),
+                        status: None,
+                    });
+                }
+                msg = read.next() => {
+                    // Reset deadline on any received frame
+                    read_deadline.as_mut().reset(tokio::time::Instant::now() + StdDuration::from_secs(read_timeout_secs));
+
                     let msg = match msg {
-                        Ok(Some(msg)) => msg,
-                        Ok(None) => {
+                        Some(msg) => msg,
+                        None => {
                             warn!("WebSocket stream ended");
                             return Ok(());
-                        }
-                        Err(_) => {
-                            warn!(
-                                timeout_secs = read_timeout_secs,
-                                "WebSocket read timed out without messages"
-                            );
-                            return Err(Error::Api {
-                                message: format!(
-                                    "WebSocket read timed out after {}s without messages",
-                                    read_timeout_secs
-                                ),
-                                status: None,
-                            });
                         }
                     };
 
@@ -604,6 +634,7 @@ impl From<ClobMarket> for Market {
                     id: t.token_id.clone(),
                     name: t.outcome,
                     token_id: t.token_id,
+                    price: t.price.and_then(Decimal::from_f64_retain),
                 })
                 .collect(),
             volume: m.volume.and_then(|v| v.parse().ok()).unwrap_or_default(),
