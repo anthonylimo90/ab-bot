@@ -391,6 +391,11 @@ impl ArbMonitor {
         let mut health_tick = 0u64;
         let mut stats_tick = tokio::time::interval(tokio::time::Duration::from_secs(60));
         stats_tick.tick().await;
+        // Heartbeat ticker keeps the health file fresh even when no orderbook
+        // updates are flowing (e.g. WebSocket hung). Without this, liveness
+        // depends entirely on update volume.
+        let mut heartbeat_tick = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        heartbeat_tick.tick().await;
 
         let mut updates_since_tick = 0u64;
         let mut stalls_since_tick = 0u64;
@@ -458,6 +463,9 @@ impl ArbMonitor {
                             resubscribe_requested = true;
                         }
                     }
+                }
+                _ = heartbeat_tick.tick() => {
+                    crate::touch_health_file();
                 }
                 _ = stats_tick.tick() => {
                     let stats = RuntimeStats {
