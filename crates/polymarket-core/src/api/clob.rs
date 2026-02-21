@@ -130,6 +130,17 @@ impl ClobClient {
         Ok(all_markets)
     }
 
+    /// Fetch a single market by condition ID.
+    ///
+    /// Uses `GET /markets/{condition_id}` which returns a single `ClobMarket`
+    /// instead of paginating through the full market list.
+    pub async fn get_market_by_id(&self, condition_id: &str) -> Result<Market> {
+        let url = format!("{}/markets/{}", self.base_url, condition_id);
+        let response = self.get_with_retry(&url).await?;
+        let clob_market: ClobMarket = response.json().await?;
+        Ok(clob_market.into())
+    }
+
     /// Fetch order book for a specific token.
     pub async fn get_order_book(&self, token_id: &str) -> Result<OrderBook> {
         let url = format!("{}/book?token_id={}", self.base_url, token_id);
@@ -604,6 +615,7 @@ impl From<ClobMarket> for Market {
                     id: t.token_id.clone(),
                     name: t.outcome,
                     token_id: t.token_id,
+                    price: t.price.and_then(Decimal::from_f64_retain),
                 })
                 .collect(),
             volume: m.volume.and_then(|v| v.parse().ok()).unwrap_or_default(),

@@ -65,8 +65,8 @@ pub struct OrderbookResponse {
 pub struct PriceLevel {
     /// Price.
     pub price: Decimal,
-    /// Size at this price.
-    pub size: Decimal,
+    /// Quantity at this price level.
+    pub quantity: Decimal,
 }
 
 /// Spread information.
@@ -161,15 +161,7 @@ pub async fn list_markets(
             true
         })
         .map(|m| {
-            // Calculate yes/no prices from outcomes if available
-            let (yes_price, no_price) = if m.outcomes.len() >= 2 {
-                // Best estimate: complement each other to ~1.0
-                (Decimal::new(50, 2), Decimal::new(50, 2))
-            } else {
-                (Decimal::ZERO, Decimal::ZERO)
-            };
-
-            // Determine category from question content
+            let (yes_price, no_price) = extract_prices(&m.outcomes);
             let category = infer_category(&m.question);
 
             MarketResponse {
@@ -240,6 +232,26 @@ fn infer_category(question: &str) -> String {
     }
 }
 
+/// Extract yes/no prices from market outcomes.
+///
+/// Looks for outcomes named "Yes" and "No" and returns their CLOB prices.
+/// Falls back to 0.50/0.50 if prices are unavailable.
+fn extract_prices(outcomes: &[polymarket_core::types::Outcome]) -> (Decimal, Decimal) {
+    let yes = outcomes
+        .iter()
+        .find(|o| o.name.to_lowercase().contains("yes"))
+        .and_then(|o| o.price)
+        .unwrap_or(Decimal::new(50, 2));
+
+    let no = outcomes
+        .iter()
+        .find(|o| o.name.to_lowercase().contains("no"))
+        .and_then(|o| o.price)
+        .unwrap_or(Decimal::new(50, 2));
+
+    (yes, no)
+}
+
 /// Get a specific market.
 #[utoipa::path(
     get,
@@ -285,10 +297,35 @@ pub async fn get_market(
             liquidity: row.liquidity,
             created_at: row.created_at,
         })),
-        None => Err(ApiError::NotFound(format!(
-            "Market {} not found",
-            market_id
-        ))),
+        None => {
+            // Fallback: fetch from CLOB API by condition_id
+            let m = state
+                .clob_client
+                .get_market_by_id(&market_id)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, market_id = %market_id, "CLOB fallback failed");
+                    ApiError::NotFound(format!("Market {} not found", market_id))
+                })?;
+
+            let now = Utc::now();
+            let (yes_price, no_price) = extract_prices(&m.outcomes);
+            let category = infer_category(&m.question);
+
+            Ok(Json(MarketResponse {
+                id: m.id,
+                question: m.question,
+                description: m.description,
+                category,
+                end_date: m.end_date.unwrap_or(now + chrono::Duration::days(365)),
+                active: !m.resolved,
+                yes_price,
+                no_price,
+                volume_24h: m.volume,
+                liquidity: m.liquidity,
+                created_at: now,
+            }))
+        }
     }
 }
 
@@ -309,17 +346,15 @@ pub async fn get_market_orderbook(
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<OrderbookResponse>> {
-    // First, get the market to find outcome token IDs
-    let markets = state
+    // Fetch the specific market by condition ID (avoids loading all 5000+ markets)
+    let market = state
         .clob_client
-        .get_markets()
+        .get_market_by_id(&market_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to fetch markets: {}", e)))?;
-
-    let market = markets
-        .iter()
-        .find(|m| m.id == market_id)
-        .ok_or_else(|| ApiError::NotFound(format!("Market {} not found", market_id)))?;
+        .map_err(|e| {
+            warn!(error = %e, market_id = %market_id, "Failed to fetch market from CLOB");
+            ApiError::NotFound(format!("Market {} not found", market_id))
+        })?;
 
     // Get token IDs for yes/no outcomes
     let (yes_token, no_token) = if market.outcomes.len() >= 2 {
@@ -349,14 +384,14 @@ pub async fn get_market_orderbook(
                     .into_iter()
                     .map(|p| PriceLevel {
                         price: p.price,
-                        size: p.size,
+                        quantity: p.size,
                     })
                     .collect(),
                 book.asks
                     .into_iter()
                     .map(|p| PriceLevel {
                         price: p.price,
-                        size: p.size,
+                        quantity: p.size,
                     })
                     .collect(),
             ),
@@ -376,14 +411,14 @@ pub async fn get_market_orderbook(
                     .into_iter()
                     .map(|p| PriceLevel {
                         price: p.price,
-                        size: p.size,
+                        quantity: p.size,
                     })
                     .collect(),
                 book.asks
                     .into_iter()
                     .map(|p| PriceLevel {
                         price: p.price,
-                        size: p.size,
+                        quantity: p.size,
                     })
                     .collect(),
             ),
@@ -477,11 +512,11 @@ mod tests {
             timestamp: Utc::now(),
             yes_bids: vec![PriceLevel {
                 price: Decimal::new(50, 2),
-                size: Decimal::new(100, 0),
+                quantity: Decimal::new(100, 0),
             }],
             yes_asks: vec![PriceLevel {
                 price: Decimal::new(51, 2),
-                size: Decimal::new(100, 0),
+                quantity: Decimal::new(100, 0),
             }],
             no_bids: vec![],
             no_asks: vec![],
