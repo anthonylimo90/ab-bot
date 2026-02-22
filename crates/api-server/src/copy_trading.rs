@@ -319,6 +319,7 @@ impl CopyTradingMonitor {
                 info!(
                     wallet = %trade.wallet_address,
                     market_id = %trade.market_id,
+                    active_set_size = active_markets.len(),
                     "Market not in active CLOB set, skipping (resolved or delisted)"
                 );
                 self.publish_skip_signal(
