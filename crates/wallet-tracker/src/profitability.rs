@@ -460,9 +460,12 @@ impl ProfitabilityAnalyzer {
             })
             .collect();
 
-        // If no copy trades found, fall back to wallet_trades (for discovery/evaluation)
-        // Using sqlx::query (not query!) to avoid offline mode requirement for wallet_trades
+        // If no copy trades found, fall back to wallet_trades (for discovery/evaluation).
+        // Using sqlx::query (not query!) to avoid offline mode requirement for wallet_trades.
+        // Cap at 2000 most recent trades — sufficient for accurate metrics (ROI, Sharpe,
+        // win rate) while avoiding 11K+ row fetches that trigger slow query warnings.
         if trades.is_empty() {
+            const WALLET_TRADES_LIMIT: i64 = 2000;
             let wallet_query = if let Some(cutoff_date) = cutoff {
                 sqlx::query(
                     r#"
@@ -476,10 +479,12 @@ impl ProfitabilityAnalyzer {
                     WHERE LOWER(wallet_address) = LOWER($1)
                       AND timestamp >= $2
                     ORDER BY timestamp
+                    LIMIT $3
                     "#,
                 )
                 .bind(address)
                 .bind(cutoff_date)
+                .bind(WALLET_TRADES_LIMIT)
                 .fetch_all(&self.pool)
                 .await?
             } else {
@@ -493,10 +498,12 @@ impl ProfitabilityAnalyzer {
                            timestamp
                     FROM wallet_trades
                     WHERE LOWER(wallet_address) = LOWER($1)
-                    ORDER BY timestamp
+                    ORDER BY timestamp DESC
+                    LIMIT $2
                     "#,
                 )
                 .bind(address)
+                .bind(WALLET_TRADES_LIMIT)
                 .fetch_all(&self.pool)
                 .await?
             };
