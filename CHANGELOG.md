@@ -1,5 +1,145 @@
 # Changelog
 
+## 2026-02-22: Phase 16 - Fill Rate Visibility & Skip Diagnostics
+
+**API Expansion:**
+
+- **`AllocationResponse` expanded** with 13 new fields: `fill_rate_24h`, `fill_attempts_24h`, `fill_count_24h`, `grace_period_started_at`, `grace_period_reason`, `pinned`, `pinned_at`, `probation_until`, `probation_allocation_pct`, `consecutive_losses`, `last_loss_at`, `confidence_score`
+- **`ALLOCATION_SELECT` constant** — shared SQL with `LEFT JOIN LATERAL` on `copy_trade_history` for inline 24h fill rate computation; replaces 4 duplicated query blocks
+- **`row_to_response()` helper** — centralizes `AllocationRow` → `AllocationResponse` conversion
+- New activity types: `WALLET_DEMOTED`, `WALLET_PROMOTED`
+
+**Dashboard Fixes:**
+
+- **Fill rate metric** on `WalletCard` (6th column, color-coded: ≥50% green, ≥20% yellow, <20% red) and wallet detail page stat card
+- **Grace period badge** (amber) shown when wallet is in grace period with reason
+- **Human-readable skip reasons** via `formatSkipReason()` utility — maps raw codes (`market_not_active`, `below_minimum`, `too_stale`, etc.) to labels
+- **Skip reason breakdown analytics** — aggregated pills on history page showing skip counts per reason
+- **Watchdog alert banner** on dashboard home — detects zero fills with skip activity, shows top skip reason
+- **Rotation history pagination** — "Load more" button with offset-based loading (starts at 20)
+- **Inactivity demotion icon** — `emergency_demote` events with `evidence.trigger = 'Inactivity'` get amber Clock icon
+- **Hardcoded defaults fixed** — latency 600→120s, ceiling 900→300s, near-resolution min 0→3%, max trade age 15→5
+
+**Backend Fixes:**
+
+- **Workspace API bounds aligned** — `COPY_NEAR_RESOLUTION_MARGIN` min changed from 0.0 to 0.03, matching all other enforcement layers
+- **Skip diagnostic logging** — `active_set_size` added to `market_not_active` skip log for cache health visibility
+
+---
+
+## 2026-02-19: Phase 15 - Zero-Trade Pipeline Fix & Dynamic Config
+
+**Copy Trading Pipeline Fixes:**
+
+- **429 retry logic** — CLOB API rate limits (429) now retried with 2s/4s/8s exponential backoff (previously treated as non-retryable 4xx)
+- **Trade staleness windows reduced** — `TRADE_MONITOR_MAX_AGE_SECS`: 900→120s; `COPY_MAX_LATENCY_SECS` default: 600→120s
+- **Near-resolution margin 3% hard floor** — new `MarketNearResolution` rejection; hardcoded `MIN_MARGIN_RAW=300` (0.03) in `copy_trader.rs`; catches stub quotes at 0.001 from resolved markets
+- **Resolved-market filter** — shared `active_clob_markets` `HashSet` populated from `/markets?active=true`; trades for missing markets skipped as `market_not_active`
+- **Block when cache empty** — trades blocked with `market_cache_empty` until first cache refresh completes
+- **404 fail-fast** — new `MarketNotFound` rejection for CLOB 404 responses on slippage pre-check
+- **`ZeroCalculatedQuantity` rejection** — replaces silent `Skipped` outcome; includes `total_capital` and `allocation_pct`
+
+**Auto-Optimizer Improvements:**
+
+- **Inactivity demotion** — wallets with ≥10 copy attempts and 0 fills in 24h get `DemotionTrigger::Inactivity` (immediate, no grace period)
+- **Tightened thresholds** — consecutive losses: 8→5, drawdown: 40%→25%, grace ROI: -5%→-3%, grace Sharpe: 0.3→0.5, negative ROI grace: 72→48h, low Sharpe grace: 48→24h
+- **Event-driven rotation** — `AutomationEvent` mpsc channel; position closes and circuit breaker trips reach optimizer immediately
+- **Rotation interval reduced** — 1 hour → 15 minutes (configurable via `AUTO_ROTATION_INTERVAL_SECS`)
+- **`source_wallet` on `CopyPosition`** — enables stop-loss events to include source wallet in optimizer events
+
+**Dynamic Tuner:**
+
+- **Tuner drift fix** — `market_not_active` and `near_resolution` skip reasons now pin slippage/min_trade to current values instead of adjusting (prevented self-reinforcing drift toward 0 fills)
+- **New ConfigSeed keys** — `COPY_NEAR_RESOLUTION_MARGIN`, `COPY_TOTAL_CAPITAL`, `ARB_MAX_SIGNAL_AGE_SECS` with `ON CONFLICT DO UPDATE` for bounds columns
+- **Watchdog relaxation rate** — 1.30x→1.50x per cycle; step sizes: 15%→25% and 12%→18%
+- **`COPY_MAX_SLIPPAGE_PCT` ceiling** — 5%→15% so tuner can converge
+- **`COPY_MIN_TRADE_VALUE` floor** — $2.00→$0.50 to stop filtering small trades
+- **Margin fallback fix** — `.unwrap_or(0)` → `.unwrap_or(300)` for near-resolution margin raw value
+
+**CLOB Client:**
+
+- **Market cache raised** — 5,000→50,000→200,000; configurable via `CLOB_MARKET_LIMIT`
+- **`?active=true` filter** — all market fetches filtered to active-only
+- **WebSocket read timeout fix** — persistent deadline that only resets on actual data received
+- **Single-market fallback** — new `get_market_by_id()` for point lookups; `get_market` handler falls back to CLOB API on DB miss
+- **`Outcome.price` field** — replaces hardcoded 50/50; propagated from `ClobToken`
+- **`PriceLevel.size` → `PriceLevel.quantity`** — matches TypeScript types, fixes NaN in dashboard orderbook
+
+**Performance:**
+
+- **wallet_trades query capped** — `LIMIT 2000` on fallback query (was unbounded; 11K+ rows in 1.87s)
+
+**New API Endpoints:**
+
+- `PUT /api/v1/workspaces/:id/risk/circuit-breaker/config`
+- `PUT /api/v1/workspaces/:id/dynamic-tuning/copy-trading`
+- `PUT /api/v1/workspaces/:id/dynamic-tuning/arb-executor`
+
+**Database Migrations:**
+
+- **032** — `workspace_cb_config`: per-workspace circuit breaker overrides (`cb_max_daily_loss`, `cb_max_drawdown_pct`, `cb_max_consecutive_losses`, `cb_cooldown_minutes`, `cb_enabled`)
+- **033** — `workspace_exit_handler`: `exit_handler_enabled` column on workspaces
+
+---
+
+## 2026-02-08: Phase 14 - Dashboard Overhaul & Service Liveness
+
+**New Dashboard Pages:**
+
+- **Markets** (`/markets`) — Browse active markets with live orderbook via WebSocket, search/filter bar, `activeOnly` toggle
+- **Signals** (`/signals`) — Real-time trading signals browser with filter tabs and activity feed
+- **History** (`/history`) — Trade copy history with skip reason tracking
+
+**New Dashboard Components:**
+
+- `MarketCard` — Individual market display card
+- `MarketDetailSheet` — Side sheet with full market detail and live orderbook WebSocket
+- `OrderbookDepthTable` — Bid/ask depth visualization
+- `OrderForm` — Manual trade form with MetaMask signing
+- `OrderManagementPanel` — Open orders management
+- `DrawdownChart` — Peak-to-trough drawdown visualization with 20% threshold line
+- `TunerTimeline` — Dynamic config history timeline with action color coding
+- `RiskToleranceStep` — Risk preset selector in onboarding wizard
+- `WebSocketProvider` — Global WS provider feeding header bell notifications
+- `TimeAgo` — Self-refreshing relative timestamp with adaptive tick rate (5s/10s/30s granularity)
+
+**New Libraries/Stores:**
+
+- `riskPresets.ts` — three presets: Conservative, Balanced, Aggressive (with ROI, Sharpe, win rate, trade count thresholds)
+- `activity-store.ts` — Zustand store for header bell notifications
+- `useMarketsQuery.ts`, `useOrdersQuery.ts` — TanStack Query hooks
+
+**Service Liveness & Heartbeat:**
+
+- Services report alive via `Arc<AtomicI64>` heartbeat stamps (epoch seconds)
+- Dashboard reports service as "dead" when heartbeat >120s stale (replaces DB flag)
+- Arb executor and exit handler spawn unconditionally; per-signal/per-tick runtime guards check enabled state
+- Arb executor 30s heartbeat ticker prevents liveness timeout during quiet periods
+- Arb-monitor 60s heartbeat ticker for same reason
+
+**Exit Handler:**
+
+- One-legged position auto-recovery — finds positions in `ENTRY_FAILED` state with "one-legged" failure, resolves NO token ID, attempts to buy missing leg (max 3 retries)
+- Dashboard visibility via workspace `exit_handler_enabled` toggle
+
+**Security Hardening:**
+
+- RPC host allowlist (SSRF protection) — hardcoded allowlist of known-good RPC providers
+- Global opportunity selection restricted to `PlatformAdmin` or workspace owner
+- Shared Redis `ConnectionManager` eliminates per-request connections
+- Arb-monitor reconnect bounded to 10 retries with exponential backoff
+- Allocation merge: `MIN` instead of `MAX` when wallet appears in multiple workspaces (fail-safe)
+- `arb_auto_execute` added to Pause Trading toggle
+- `COPY_TRADING_ENABLED` default changed from `TRUE` to `FALSE` (opt-in)
+
+**Log Visibility:**
+
+- 11 silent rejection logs promoted from `debug`/`trace` to `info`/`warn`
+- Arb executor rejections (signal age, profit, book depth) promoted to `info`
+- Copy trading skip logs downgraded to `trace`/`debug` to reduce Railway log volume
+
+---
+
 ## 2026-01-18: Phase 13 - Automated Wallet Management & Multi-Tenant Workspaces
 
 **Multi-Tenant Workspace System:**

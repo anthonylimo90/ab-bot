@@ -81,6 +81,7 @@ pub struct CopyTradingMonitor {
 
 impl CopyTradingMonitor {
     /// Create a new copy trading monitor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: CopyTradingConfig,
         trade_monitor: Arc<TradeMonitor>,
@@ -771,6 +772,7 @@ impl CopyTradingMonitor {
 }
 
 /// Spawn the copy trading monitor as a background task.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_copy_trading_monitor(
     config: CopyTradingConfig,
     trade_monitor: Arc<TradeMonitor>,

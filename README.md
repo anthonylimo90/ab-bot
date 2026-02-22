@@ -14,8 +14,10 @@ A high-performance Polymarket trading platform built in Rust, featuring automate
 
 ### Automated Wallet Management
 - **Auto-Select** - Automatically fills Active roster with best-performing wallets
-- **Auto-Drop** - Demotes wallets that fail performance thresholds
+- **Auto-Drop** - Demotes wallets that fail performance thresholds (immediate or grace period)
 - **Auto-Swap** - Replaces underperformers with better candidates from the pool
+- **Inactivity Demotion** - Wallets with 0% copy fill rate (≥10 attempts, 0 fills in 24h) are immediately demoted
+- **Event-Driven Rotation** - Position closes and circuit breaker trips trigger immediate optimizer runs (15-min cycle + events)
 - **Confidence-Weighted Allocation** - Higher allocation to wallets with higher prediction confidence
 - **Probation System** - New wallets start at 50% allocation for 7 days
 - **Pin/Ban Support** - User overrides for automation behavior
@@ -162,8 +164,8 @@ The platform includes a fully automated wallet selection system that runs hands-
 
 2. **Auto-Drop (Demotion)**
    - Wallets demoted to Bench when they fail thresholds
-   - **Immediate triggers**: 5+ consecutive losses, drawdown > 30%, circuit breaker trip
-   - **Grace period triggers**: ROI < 0% for 48h, Sharpe < 0.5 for 24h, no trades in 14 days
+   - **Immediate triggers**: 5+ consecutive losses, drawdown > 25%, circuit breaker trip, 0% copy fill rate (24h)
+   - **Grace period triggers**: ROI < -3% for 48h, Sharpe < 0.5 for 24h
 
 3. **Confidence-Weighted Allocation**
    - Uses ensemble of 4 rule-based models (Statistical, Momentum, Risk-Adjusted, Behavioral)
@@ -190,10 +192,66 @@ The platform includes a fully automated wallet selection system that runs hands-
 | Condition | Action |
 |-----------|--------|
 | 5+ consecutive losses | Immediate demote |
-| Drawdown > 30% | Immediate demote |
-| ROI < 0% for 48h | Demote after grace period |
+| Drawdown > 25% | Immediate demote |
+| Circuit breaker trip | Immediate demote |
+| 0% copy fill rate (24h, ≥10 attempts) | Immediate demote |
+| ROI < -3% for 48h | Demote after grace period |
 | Sharpe < 0.5 for 24h | Demote after grace period |
-| No activity 14 days | Demote |
+
+## Copy Trading Pipeline
+
+The copy trading system evaluates each incoming wallet trade through a multi-stage filter pipeline:
+
+1. **Minimum value check** — skip trades below `COPY_MIN_TRADE_VALUE` ($0.50 default)
+2. **Latency check** — skip trades older than `COPY_MAX_LATENCY_SECS` (120s default, watchdog-driven)
+3. **Active market filter** — skip trades for resolved/delisted markets via shared `active_clob_markets` set (refreshed every 5 min from CLOB API); blocks all trades when cache is not yet populated
+4. **Circuit breaker** — respect trading halts
+5. **Near-resolution filter** — skip trades where price < 0.03 or > 0.97 (3% hard floor, catches stub quotes from resolved markets)
+6. **Policy checks** — daily capital limit, max positions, slippage tolerance
+7. **Order execution** — place order via CLOB API
+
+All skip reasons are tracked and visible in the dashboard:
+
+| Skip Reason | Description |
+|-------------|-------------|
+| `market_not_active` | Market resolved or delisted |
+| `too_stale` | Trade exceeded max latency |
+| `below_minimum` | Below minimum trade value |
+| `near_resolution` | Price too close to 0 or 1 |
+| `SlippageTooHigh` | Slippage exceeds tolerance |
+| `market_cache_empty` | Market cache not yet loaded |
+| `circuit_breaker` | Circuit breaker tripped |
+| `insufficient_capital` | Not enough capital |
+| `max_positions_reached` | Position limit reached |
+
+**Resilience features:**
+- **429 retry** — CLOB API rate limits retried with 2s/4s/8s exponential backoff
+- **Watchdog** — when 0 fills detected over the tuner window, adaptively relaxes latency, slippage, and min value thresholds
+
+## Dynamic Configuration
+
+All key trading parameters are dynamically tunable at runtime via the API or the auto-tuner. Changes propagate in real-time via Redis pub/sub.
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `COPY_MAX_LATENCY_SECS` | 120 | watchdog-driven | Max trade staleness |
+| `COPY_NEAR_RESOLUTION_MARGIN` | 0.03 | 0.03–0.25 | Near-resolution price filter |
+| `COPY_MIN_TRADE_VALUE` | $0.50 | $0.50–$50 | Minimum copy trade value |
+| `COPY_MAX_SLIPPAGE_PCT` | 5% | 1%–15% | Max slippage tolerance |
+| `COPY_TOTAL_CAPITAL` | $10,000 | $100–$500K | Total capital for allocation |
+| `COPY_DAILY_CAPITAL_LIMIT` | $5,000 | — | Daily capital limit |
+| `COPY_MAX_OPEN_POSITIONS` | 15 | — | Max simultaneous positions |
+| `COPY_STOP_LOSS_PCT` | 15% | 5%–100% | Stop-loss threshold |
+| `COPY_TAKE_PROFIT_PCT` | 25% | 5%–100% | Take-profit threshold |
+| `COPY_MAX_HOLD_HOURS` | 72h | 1–720 | Max position hold time |
+| `ARB_POSITION_SIZE` | $50 | $10–$500 | Arb position size |
+| `ARB_MIN_NET_PROFIT` | 0.001 | 0.0005–0.05 | Min arb profit threshold |
+| `ARB_MIN_BOOK_DEPTH` | $100 | $25–$1,000 | Min orderbook depth |
+| `ARB_MAX_SIGNAL_AGE_SECS` | 30s | 5–300 | Max arb signal age |
+
+**Dynamic Tuning API:**
+- `PUT /api/v1/workspaces/:id/dynamic-tuning/copy-trading` — Update copy trading parameters
+- `PUT /api/v1/workspaces/:id/dynamic-tuning/arb-executor` — Update arb executor parameters
 
 ## API Endpoints
 
@@ -242,6 +300,11 @@ The platform includes a fully automated wallet selection system that runs hands-
 - `GET /api/v1/auto-rotation/history` - Get rotation history
 - `POST /api/v1/auto-rotation/history/:id/acknowledge` - Acknowledge entry
 - `POST /api/v1/auto-rotation/trigger` - Trigger optimization manually
+
+### Dynamic Tuning & Risk
+- `PUT /api/v1/workspaces/:id/dynamic-tuning/copy-trading` - Update copy trading config
+- `PUT /api/v1/workspaces/:id/dynamic-tuning/arb-executor` - Update arb executor config
+- `PUT /api/v1/workspaces/:id/risk/circuit-breaker/config` - Per-workspace circuit breaker overrides
 
 ### Onboarding
 - `GET /api/v1/onboarding/status` - Get onboarding status
@@ -311,16 +374,20 @@ API documentation available at `/swagger-ui` when running.
 
 ### Pages
 
-- **Dashboard** - Portfolio overview and metrics
+- **Dashboard** - Portfolio overview, watchdog alert banner (zero-fill detection), and live activity feed
 - **Trading** - Unified copy trading and portfolio management
-  - Active tab: Active roster wallets with positions
+  - Active tab: Active roster wallets with fill rate metrics (color-coded), grace period badges
   - Bench tab: Bench wallets ready for promotion
-  - Positions tab: Manual position management
+  - Positions tab: Manual position management with order form
   - History tab: Closed positions
-  - Automation tab: Auto-optimizer controls and history
+  - Automation tab: Auto-optimizer controls, rotation history with pagination, inactivity demotion icons
+- **Markets** - Browse active markets with live orderbook via WebSocket, search/filter
+- **Signals** - Real-time trading signals with skip reason labels and breakdown analytics
+- **History** - Trade copy history with human-readable skip reasons and breakdown pills
 - **Discover** - Find top-performing wallets
 - **Backtest** - Historical simulations
 - **Settings** - Configuration, wallet management, and WalletConnect setup
+- **Wallet Detail** (`/wallet/[address]`) - Per-wallet metrics with fill rate stat card, grace period badge, equity curve
 
 ### Demo Mode
 - Paper trading with simulated capital ($10,000 default)
@@ -337,8 +404,18 @@ API documentation available at `/swagger-ui` when running.
 - Risk appetite presets: Conservative, Balanced, Aggressive
 - Adjustable thresholds (ROI, Sharpe, Win Rate, Trades, Drawdown)
 - Allocation strategies: Equal, Confidence-Weighted, Performance-Weighted
-- Live rotation history with reasons
+- Dynamic config sliders: latency, slippage, min trade value, near-resolution margin
+- Live rotation history with pagination ("Load more"), inactivity demotion icons
 - Manual trigger button for immediate optimization
+
+### Allocation API Response
+The `/api/v1/allocations` endpoint returns expanded wallet data including:
+- `fill_rate_24h`, `fill_attempts_24h`, `fill_count_24h` — 24h copy trade fill rate
+- `grace_period_started_at`, `grace_period_reason` — grace period status
+- `pinned`, `pinned_at` — pin status
+- `probation_until`, `probation_allocation_pct` — probation details
+- `consecutive_losses`, `last_loss_at` — loss tracking
+- `confidence_score` — prediction confidence
 
 ## Development
 

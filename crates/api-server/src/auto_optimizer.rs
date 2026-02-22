@@ -471,6 +471,8 @@ pub struct AutoOptimizerConfig {
     pub exploration_slots: usize,
     /// Minimum confidence required for exploration picks.
     pub min_exploration_confidence: f64,
+    /// Maximum active wallets in the roster (was hardcoded to 5).
+    pub max_active_wallets: usize,
 }
 
 impl Default for AutoOptimizerConfig {
@@ -488,6 +490,10 @@ impl Default for AutoOptimizerConfig {
             max_relaxation_rounds: 3,
             exploration_slots: 1,
             min_exploration_confidence: 0.15,
+            max_active_wallets: std::env::var("MAX_ACTIVE_WALLETS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
         }
     }
 }
@@ -797,12 +803,14 @@ impl AutoOptimizer {
     ) -> anyhow::Result<()> {
         let current = self.get_current_allocations(workspace.id).await?;
         let active_count = current.iter().filter(|a| a.tier == "active").count();
-        let empty_slots = 5_usize.saturating_sub(active_count);
+        let max_active = self.config.max_active_wallets;
+        let empty_slots = max_active.saturating_sub(active_count);
 
         info!(
             workspace_id = %workspace.id,
             active_count = active_count,
             empty_slots = empty_slots,
+            max_active = max_active,
             "Checking for empty slots to fill"
         );
 
@@ -988,9 +996,9 @@ impl AutoOptimizer {
 
         // Copy fill rate check: demote wallets whose trades consistently fail to
         // copy (resolved markets, extreme slippage, etc.). A wallet with many
-        // attempts but zero fills over the last 24h is trading in markets we
-        // can't follow.
-        let min_attempts_for_fill_check: i64 = 10;
+        // attempts but zero fills over the last 6h is trading in markets we
+        // can't follow. Shortened from 24h to detect bad wallets faster.
+        let min_attempts_for_fill_check: i64 = 5;
         let fill_rate_row: Option<(i64, i64)> = sqlx::query_as(
             r#"
             SELECT
@@ -998,7 +1006,7 @@ impl AutoOptimizer {
                 COALESCE(SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END), 0)::bigint AS fills
             FROM copy_trade_history
             WHERE LOWER(source_wallet) = LOWER($1)
-              AND created_at >= NOW() - INTERVAL '24 hours'
+              AND created_at >= NOW() - INTERVAL '6 hours'
             "#,
         )
         .bind(&allocation.wallet_address)
@@ -1012,7 +1020,7 @@ impl AutoOptimizer {
                     wallet = %allocation.wallet_address,
                     attempts,
                     fills,
-                    "Wallet has 0% copy fill rate over 24h, triggering demotion"
+                    "Wallet has 0% copy fill rate over 6h, triggering demotion"
                 );
                 return Ok(Some(DemotionTrigger::Inactivity));
             }
@@ -2804,7 +2812,7 @@ impl AutoOptimizer {
 
         // Check for potential promotions
         let active_count = active_wallets.len();
-        let empty_slots = 5_usize.saturating_sub(active_count);
+        let empty_slots = self.config.max_active_wallets.saturating_sub(active_count);
 
         if empty_slots > 0 {
             let banned = self.get_banned_wallets(workspace_id).await?;
