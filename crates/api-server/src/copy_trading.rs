@@ -36,7 +36,7 @@ impl Default for CopyTradingConfig {
     fn default() -> Self {
         Self {
             min_trade_value: Decimal::new(5, 0), // $5 minimum for cold-start coverage
-            max_latency_secs: 600,               // 10 min: matches Data API inherent latency
+            max_latency_secs: 120,               // 2 min: binary markets resolve fast
             enabled: true,
         }
     }
@@ -53,7 +53,7 @@ impl CopyTradingConfig {
             max_latency_secs: std::env::var("COPY_MAX_LATENCY_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(600),
+                .unwrap_or(120),
             enabled: std::env::var("COPY_TRADING_ENABLED")
                 .map(|v| v == "true")
                 .unwrap_or(true),
@@ -294,11 +294,28 @@ impl CopyTradingMonitor {
         }
 
         // Resolved-market filter: skip trades for markets no longer active on CLOB.
-        // When the set is empty (before the first OutcomeTokenCache refresh), allow
-        // through — Fix 2's 404 detection in the slippage pre-check is the backup.
+        // When the set is empty (token cache not yet populated), also block trades
+        // rather than letting resolved-market trades slip through. The slippage
+        // pre-check is a fallback but wastes API calls on markets we already know
+        // are dead once the cache is populated.
         {
             let active_markets = self.active_clob_markets.read().await;
-            if !active_markets.is_empty() && !active_markets.contains(&trade.market_id) {
+            if active_markets.is_empty() {
+                warn!(
+                    wallet = %trade.wallet_address,
+                    market_id = %trade.market_id,
+                    "Active market set not yet populated, skipping trade until cache is ready"
+                );
+                self.record_trade_outcome(
+                    &trade,
+                    3,
+                    Some("market_cache_empty"),
+                    Some("Active market cache not yet populated"),
+                )
+                .await;
+                return Ok(());
+            }
+            if !active_markets.contains(&trade.market_id) {
                 info!(
                     wallet = %trade.wallet_address,
                     market_id = %trade.market_id,
@@ -793,7 +810,7 @@ mod tests {
     fn test_config_default() {
         let config = CopyTradingConfig::default();
         assert_eq!(config.min_trade_value, Decimal::new(5, 0));
-        assert_eq!(config.max_latency_secs, 600);
+        assert_eq!(config.max_latency_secs, 120);
         assert!(config.enabled);
     }
 

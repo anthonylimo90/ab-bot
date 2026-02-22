@@ -81,7 +81,7 @@ impl Default for MonitorConfig {
         Self {
             poll_interval_secs: 15,
             min_trade_value: Decimal::new(5, 2), // $0.05
-            max_trade_age_secs: 900,             // 15 minutes to tolerate upstream lag
+            max_trade_age_secs: 120,             // 2 minutes — binary markets resolve fast
             wallet_activity_limit: 100,
             max_history_size: 10000,
         }
@@ -103,7 +103,7 @@ impl MonitorConfig {
             max_trade_age_secs: std::env::var("TRADE_MONITOR_MAX_AGE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(900),
+                .unwrap_or(120),
             wallet_activity_limit: std::env::var("TRADE_MONITOR_WALLET_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -513,7 +513,7 @@ mod tests {
         let config = MonitorConfig::default();
         assert_eq!(config.poll_interval_secs, 15);
         assert_eq!(config.min_trade_value, Decimal::new(5, 2));
-        assert_eq!(config.max_trade_age_secs, 900);
+        assert_eq!(config.max_trade_age_secs, 120);
         assert_eq!(config.wallet_activity_limit, 100);
     }
 
@@ -523,7 +523,7 @@ mod tests {
         let config = MonitorConfig::from_env();
         assert_eq!(config.poll_interval_secs, 15);
         assert_eq!(config.min_trade_value, Decimal::new(5, 2));
-        assert_eq!(config.max_trade_age_secs, 900);
+        assert_eq!(config.max_trade_age_secs, 120);
         assert_eq!(config.wallet_activity_limit, 100);
     }
 

@@ -539,16 +539,19 @@ impl CopyTrader {
                 }
                 Ok(Some(market_price)) => {
                     // Reject markets near resolution (dynamically tunable margin).
-                    // When margin_raw > 0, reject prices within [0, margin) or (1-margin, 1].
-                    // When margin_raw == 0, the filter is disabled entirely.
-                    let margin_raw = self.near_resolution_margin.load(Ordering::Relaxed);
-                    let near_resolution_active = margin_raw > 0;
+                    // Rejects prices within [0, margin) or (1-margin, 1].
+                    // Enforce a minimum floor of 0.03 (3%) so this filter is never
+                    // fully disabled — resolved markets with stub quotes at 0.001
+                    // must always be caught here rather than falling through to the
+                    // slippage check with 98%+ values.
+                    const MIN_MARGIN_RAW: i64 = 300; // 0.03 = 3%
+                    let margin_raw = self
+                        .near_resolution_margin
+                        .load(Ordering::Relaxed)
+                        .max(MIN_MARGIN_RAW);
                     let near_resolution_floor = Decimal::new(margin_raw, 4);
                     let near_resolution_ceil = Decimal::ONE - near_resolution_floor;
-                    if near_resolution_active
-                        && (market_price < near_resolution_floor
-                            || market_price > near_resolution_ceil)
-                    {
+                    if market_price < near_resolution_floor || market_price > near_resolution_ceil {
                         info!(
                             wallet = %trade.wallet_address,
                             market_price = %market_price,

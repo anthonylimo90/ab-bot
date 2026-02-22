@@ -51,27 +51,55 @@ impl ClobClient {
     const MAX_RETRIES: u32 = 3;
 
     /// Execute an HTTP GET with retry and exponential backoff.
+    ///
+    /// Retries on 5xx server errors and 429 rate-limit responses (with a longer
+    /// backoff for 429). All other 4xx errors fail immediately.
     async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response> {
         let mut last_error = None;
 
         for attempt in 0..Self::MAX_RETRIES {
             match self.http_client.get(url).send().await {
                 Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) if response.status().is_server_error() => {
+                Ok(response)
+                    if response.status().as_u16() == 429 || response.status().is_server_error() =>
+                {
                     let status = response.status();
+                    let is_rate_limited = status.as_u16() == 429;
                     warn!(
                         attempt = attempt + 1,
                         status = %status,
                         url = url,
+                        rate_limited = is_rate_limited,
                         "Retryable API error, backing off"
                     );
                     last_error = Some(Error::Api {
-                        message: format!("Server error: {}", status),
+                        message: format!(
+                            "{}: {}",
+                            if is_rate_limited {
+                                "Rate limited"
+                            } else {
+                                "Server error"
+                            },
+                            status
+                        ),
                         status: Some(status.as_u16()),
                     });
+
+                    // Use longer backoff for 429 to respect rate limits
+                    if attempt + 1 < Self::MAX_RETRIES {
+                        let backoff = if is_rate_limited {
+                            // 2s, 4s, 8s for rate limits
+                            StdDuration::from_millis(2000 * 2u64.pow(attempt))
+                        } else {
+                            // 500ms, 1s, 2s for server errors
+                            StdDuration::from_millis(500 * 2u64.pow(attempt))
+                        };
+                        tokio::time::sleep(backoff).await;
+                    }
+                    continue;
                 }
                 Ok(response) => {
-                    // Client error (4xx) — don't retry
+                    // Client error (4xx except 429) — don't retry
                     return Err(Error::Api {
                         message: format!("API error: {}", response.status()),
                         status: Some(response.status().as_u16()),
