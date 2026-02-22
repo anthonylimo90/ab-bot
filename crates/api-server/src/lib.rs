@@ -177,6 +177,7 @@ impl ApiServer {
                 }
             }
         }
+        #[allow(clippy::type_complexity)]
         let mut copy_monitor_args: Option<(
             CopyTradingConfig,
             Arc<TradeMonitor>,
