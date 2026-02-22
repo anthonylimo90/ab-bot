@@ -2479,9 +2479,9 @@ fn copy_trading_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)>
             Decimal::new(500000, 0),
             Decimal::new(20, 2),
         )),
-        // 0.0 – 0.25, 50% step
+        // 0.03 – 0.25, 50% step (3% floor matches copy_trader MIN_MARGIN_RAW)
         KEY_COPY_NEAR_RESOLUTION_MARGIN => {
-            Some((Decimal::ZERO, Decimal::new(25, 2), Decimal::new(50, 2)))
+            Some((Decimal::new(3, 2), Decimal::new(25, 2), Decimal::new(50, 2)))
         }
         _ => None,
     }
