@@ -1534,10 +1534,10 @@ async fn run_dynamic_config_subscriber(
         // Apply near-resolution margin to shared atomic (stored as margin * 10,000)
         if update.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
             if let Some(ref atomic) = copy_near_resolution_margin {
-                // value is e.g. 0.03 → store as 300
+                // value is e.g. 0.03 → store as 300; floor at 300 (3%) to match MIN_MARGIN_RAW
                 let margin_raw = (update.value * Decimal::new(10_000, 0))
                     .to_i64()
-                    .unwrap_or(0);
+                    .unwrap_or(300);
                 atomic.store(margin_raw, Ordering::Relaxed);
                 info!(
                     key = %update.key,
@@ -1718,7 +1718,7 @@ async fn apply_startup_snapshot_to_copy_trader(
         // Apply near-resolution margin to the shared atomic (stored as margin * 10,000)
         if row.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
             if let Some(atomic) = copy_near_resolution_margin {
-                let margin_raw = (value * Decimal::new(10_000, 0)).to_i64().unwrap_or(0);
+                let margin_raw = (value * Decimal::new(10_000, 0)).to_i64().unwrap_or(300);
                 atomic.store(margin_raw, Ordering::Relaxed);
                 applied += 1;
             }
