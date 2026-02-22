@@ -394,7 +394,9 @@ export type ActivityType =
   | "ARB_EXECUTION_FAILED"
   | "ARB_EXIT_FAILED"
   | "RECOMMENDATION_NEW"
-  | "ALLOCATION_ACTIVATED";
+  | "ALLOCATION_ACTIVATED"
+  | "WALLET_DEMOTED"
+  | "WALLET_PROMOTED";
 
 export interface Activity {
   id: string;
@@ -744,6 +746,10 @@ export interface WorkspaceAllocation {
   // Wallet metadata
   wallet_label?: string;
   wallet_success_score?: number;
+  // Fill rate (computed from copy_trade_history over 24h)
+  fill_rate_24h?: number;
+  fill_attempts_24h?: number;
+  fill_count_24h?: number;
 }
 
 // Wallet ban (prevents auto-promotion)

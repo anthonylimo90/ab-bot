@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { useActivity } from "@/hooks/useActivity";
-import { formatTimeAgo, cn } from "@/lib/utils";
+import { formatTimeAgo, cn, formatSkipReason } from "@/lib/utils";
 import {
   Zap,
   Copy,
@@ -128,6 +128,14 @@ export default function SignalsPage() {
                       </span>
                     </div>
                     <p className="text-sm break-words">{item.message}</p>
+                    {item.type === "TRADE_COPY_SKIPPED" && item.skip_reason && (
+                      <Badge
+                        variant="outline"
+                        className="text-xs bg-yellow-500/10 text-yellow-600 border-yellow-500/20 w-fit"
+                      >
+                        {formatSkipReason(item.skip_reason)}
+                      </Badge>
+                    )}
                   </div>
                   {item.pnl !== undefined && (
                     <span

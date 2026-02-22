@@ -478,6 +478,12 @@ export default function WalletDetailPage() {
                 {storedWallet!.consecutive_losses} losses
               </span>
             )}
+            {storedWallet?.grace_period_started_at && (
+              <span className="px-2 py-1 rounded-full bg-orange-500/10 text-orange-600 text-xs font-medium flex items-center gap-1">
+                <Clock className="h-3 w-3" />
+                Grace: {storedWallet.grace_period_reason ?? 'pending'}
+              </span>
+            )}
             {discoveredWallet && (
               <>
                 <StrategyBadge strategy={discoveredWallet.strategy_type} size="md" />
@@ -526,7 +532,7 @@ export default function WalletDetailPage() {
         </div>
 
         {/* Stats Row */}
-        <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-7">
+        <div className="grid gap-4 grid-cols-2 sm:grid-cols-4 lg:grid-cols-8">
           {/* ROI Card with period toggle */}
           <Card>
             <CardContent className="p-4">
@@ -687,6 +693,35 @@ export default function WalletDetailPage() {
                     <p className="text-xl font-bold tabular-nums">
                       {(wallet.volatility * 100).toFixed(1)}%
                     </p>
+                  ) : (
+                    <p className="text-xl font-bold text-muted-foreground">
+                      &mdash;
+                    </p>
+                  )}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-3">
+                <Activity className="h-5 w-5 text-cyan-500" />
+                <div>
+                  <p className="text-xs text-muted-foreground">Fill Rate (24h)</p>
+                  {isLoading ? (
+                    <Skeleton className="h-6 w-16" />
+                  ) : storedWallet?.fill_rate_24h != null ? (
+                    <>
+                      <p className={`text-xl font-bold tabular-nums ${
+                        storedWallet.fill_rate_24h >= 0.5 ? 'text-profit' :
+                        storedWallet.fill_rate_24h >= 0.2 ? 'text-yellow-500' : 'text-loss'
+                      }`}>
+                        {(storedWallet.fill_rate_24h * 100).toFixed(0)}%
+                      </p>
+                      <p className="text-xs text-muted-foreground tabular-nums">
+                        {storedWallet.fill_count_24h ?? 0}/{storedWallet.fill_attempts_24h ?? 0}
+                      </p>
+                    </>
                   ) : (
                     <p className="text-xl font-bold text-muted-foreground">
                       &mdash;

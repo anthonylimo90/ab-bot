@@ -19,7 +19,8 @@ import {
   useDynamicConfigHistoryQuery,
 } from "@/hooks/queries/useHistoryQuery";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { formatCurrency, formatTimeAgo, cn, formatDynamicKey, formatDynamicConfigValue } from "@/lib/utils";
+import { formatCurrency, formatTimeAgo, cn, formatDynamicKey, formatDynamicConfigValue, formatSkipReason } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import {
   History,
   ChevronLeft,
@@ -135,6 +136,16 @@ export default function HistoryPage() {
     [filteredActivity],
   );
 
+  const skipBreakdown = useMemo(() => {
+    const counts: Record<string, number> = {};
+    filteredActivity
+      .filter((a) => a.type === "TRADE_COPY_SKIPPED" && a.skip_reason)
+      .forEach((a) => {
+        counts[a.skip_reason!] = (counts[a.skip_reason!] || 0) + 1;
+      });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  }, [filteredActivity]);
+
   return (
     <ErrorBoundary>
       <div className="space-y-5 sm:space-y-6">
@@ -162,6 +173,21 @@ export default function HistoryPage() {
             trend={failedCount > 0 ? "down" : "neutral"}
           />
         </div>
+
+        {skipBreakdown.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Skip reasons:</span>
+            {skipBreakdown.map(([reason, count]) => (
+              <Badge
+                key={reason}
+                variant="outline"
+                className="text-xs bg-yellow-500/5 text-yellow-700 border-yellow-500/20"
+              >
+                {formatSkipReason(reason)} ({count})
+              </Badge>
+            ))}
+          </div>
+        )}
 
         <Tabs
           value={historyTab}
@@ -254,7 +280,7 @@ export default function HistoryPage() {
                                     <div className="mt-1 flex flex-wrap gap-1">
                                       {item.skip_reason && (
                                         <span className="rounded bg-yellow-500/10 px-1.5 py-0.5 text-xs text-yellow-700">
-                                          skip: {item.skip_reason}
+                                          {formatSkipReason(item.skip_reason)}
                                         </span>
                                       )}
                                       {item.error_message && (

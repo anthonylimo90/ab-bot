@@ -38,7 +38,7 @@ import {
   Star,
   LineChart,
 } from "lucide-react";
-import { formatCurrency } from "@/lib/utils";
+import { formatCurrency, formatSkipReason } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { TimeAgo } from "@/components/shared/TimeAgo";
 
@@ -55,6 +55,8 @@ const activityIcons: Record<string, React.ReactNode> = {
   ARB_EXIT_FAILED: <ShieldAlert className="h-4 w-4 text-red-400" />,
   POSITION_OPENED: <AlertCircle className="h-4 w-4 text-profit" />,
   POSITION_CLOSED: <AlertCircle className="h-4 w-4 text-muted-foreground" />,
+  WALLET_DEMOTED: <TrendingDown className="h-4 w-4 text-orange-500" />,
+  WALLET_PROMOTED: <TrendingUp className="h-4 w-4 text-profit" />,
 };
 
 export function DashboardHome() {
@@ -86,6 +88,26 @@ export function DashboardHome() {
     };
   }, [openPositions, totalUnrealizedPnl, closedPositions, riskStatus]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
+
+  // Watchdog: detect zero fills with skips
+  const watchdog = useMemo(() => {
+    const copiedCount = activities.filter((a) => a.type === "TRADE_COPIED").length;
+    const skippedItems = activities.filter((a) => a.type === "TRADE_COPY_SKIPPED");
+    if (copiedCount === 0 && skippedItems.length > 0) {
+      // Find top skip reason
+      const counts: Record<string, number> = {};
+      skippedItems.forEach((a) => {
+        if (a.skip_reason) counts[a.skip_reason] = (counts[a.skip_reason] || 0) + 1;
+      });
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      return {
+        show: true,
+        skippedCount: skippedItems.length,
+        topReason: sorted[0] ? formatSkipReason(sorted[0][0]) : undefined,
+      };
+    }
+    return { show: false, skippedCount: 0 };
+  }, [activities]);
 
   // Derive equity curve from closed positions (accumulated realized P&L)
   const equityCurve = useMemo(() => {
@@ -146,6 +168,25 @@ export function DashboardHome() {
           {modeLabel} Mode
         </Badge>
       </div>
+
+      {/* Watchdog alert */}
+      {watchdog.show && (
+        <div className="flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3">
+          <AlertCircle className="h-5 w-5 text-amber-500 shrink-0" />
+          <div className="flex-1 text-sm">
+            <span className="font-medium text-amber-600">No trades executing</span>
+            {" \u2014 "}
+            <span className="text-muted-foreground">
+              {watchdog.skippedCount} skipped{watchdog.topReason ? `. Top reason: ${watchdog.topReason}` : ""}
+            </span>
+          </div>
+          <Link href="/history">
+            <Button variant="ghost" size="sm" className="text-amber-600 hover:text-amber-700">
+              View Details <ArrowRight className="ml-1 h-3 w-3" />
+            </Button>
+          </Link>
+        </div>
+      )}
 
       {/* Stats Grid */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">

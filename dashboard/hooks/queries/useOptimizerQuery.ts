@@ -21,9 +21,9 @@ export function useRotationHistoryQuery(params?: {
 }) {
   return useQuery({
     queryKey: params?.workspaceId
-      ? queryKeys.rotationHistory.list(params.workspaceId, {
+      ? [...queryKeys.rotationHistory.list(params.workspaceId, {
           unacknowledgedOnly: params?.unacknowledgedOnly,
-        })
+        }), { limit: params?.limit }]
       : ["rotation-history", "disabled"],
     queryFn: () =>
       api.listRotationHistory({

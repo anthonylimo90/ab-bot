@@ -41,6 +41,36 @@ pub struct AllocationResponse {
     pub wallet_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_success_score: Option<Decimal>,
+    // Pin status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+    // Probation status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probation_until: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probation_allocation_pct: Option<Decimal>,
+    // Loss tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consecutive_losses: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_loss_at: Option<DateTime<Utc>>,
+    // Confidence score
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence_score: Option<Decimal>,
+    // Grace period
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grace_period_started_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grace_period_reason: Option<String>,
+    // Fill rate (computed from copy_trade_history over 24h)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_rate_24h: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_attempts_24h: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_count_24h: Option<i64>,
 }
 
 /// Add wallet to roster request.
@@ -109,6 +139,86 @@ struct AllocationRow {
     // Joined from tracked_wallets
     wallet_label: Option<String>,
     wallet_success_score: Option<Decimal>,
+    // Extended fields
+    pinned: Option<bool>,
+    pinned_at: Option<DateTime<Utc>>,
+    probation_until: Option<DateTime<Utc>>,
+    probation_allocation_pct: Option<Decimal>,
+    consecutive_losses: Option<i32>,
+    last_loss_at: Option<DateTime<Utc>>,
+    confidence_score: Option<Decimal>,
+    grace_period_started_at: Option<DateTime<Utc>>,
+    grace_period_reason: Option<String>,
+    // Computed from copy_trade_history
+    fill_attempts_24h: Option<i64>,
+    fill_count_24h: Option<i64>,
+}
+
+/// Full SELECT query fragment for AllocationRow with fill-rate JOIN.
+const ALLOCATION_SELECT: &str = r#"
+    SELECT
+        wwa.id, wwa.workspace_id, wwa.wallet_address, wwa.allocation_pct,
+        wwa.max_position_size, wwa.tier, wwa.auto_assigned, wwa.auto_assigned_reason,
+        wwa.backtest_roi, wwa.backtest_sharpe, wwa.backtest_win_rate,
+        wwa.copy_behavior, wwa.arb_threshold_pct, wwa.added_by,
+        wwa.added_at, wwa.updated_at,
+        tw.label as wallet_label, tw.success_score as wallet_success_score,
+        wwa.pinned, wwa.pinned_at,
+        wwa.probation_until, wwa.probation_allocation_pct,
+        wwa.consecutive_losses, wwa.last_loss_at,
+        wwa.confidence_score,
+        wwa.grace_period_started_at, wwa.grace_period_reason,
+        fill.attempts AS fill_attempts_24h,
+        fill.fills AS fill_count_24h
+    FROM workspace_wallet_allocations wwa
+    LEFT JOIN tracked_wallets tw ON wwa.wallet_address = tw.address
+    LEFT JOIN LATERAL (
+        SELECT
+            COUNT(*)::bigint AS attempts,
+            COALESCE(SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END), 0)::bigint AS fills
+        FROM copy_trade_history
+        WHERE LOWER(source_wallet) = LOWER(wwa.wallet_address)
+          AND created_at >= NOW() - INTERVAL '24 hours'
+    ) fill ON true
+"#;
+
+/// Convert an AllocationRow into an AllocationResponse.
+fn row_to_response(a: AllocationRow) -> AllocationResponse {
+    let fill_rate = match (a.fill_attempts_24h, a.fill_count_24h) {
+        (Some(attempts), Some(fills)) if attempts > 0 => Some(fills as f64 / attempts as f64),
+        _ => None,
+    };
+    AllocationResponse {
+        id: a.id.to_string(),
+        wallet_address: a.wallet_address,
+        allocation_pct: a.allocation_pct,
+        max_position_size: a.max_position_size,
+        tier: a.tier,
+        auto_assigned: a.auto_assigned,
+        auto_assigned_reason: a.auto_assigned_reason,
+        backtest_roi: a.backtest_roi,
+        backtest_sharpe: a.backtest_sharpe,
+        backtest_win_rate: a.backtest_win_rate,
+        copy_behavior: a.copy_behavior,
+        arb_threshold_pct: a.arb_threshold_pct,
+        added_by: a.added_by.map(|id| id.to_string()),
+        added_at: a.added_at,
+        updated_at: a.updated_at,
+        wallet_label: a.wallet_label,
+        wallet_success_score: a.wallet_success_score,
+        pinned: a.pinned,
+        pinned_at: a.pinned_at,
+        probation_until: a.probation_until,
+        probation_allocation_pct: a.probation_allocation_pct,
+        consecutive_losses: a.consecutive_losses,
+        last_loss_at: a.last_loss_at,
+        confidence_score: a.confidence_score,
+        grace_period_started_at: a.grace_period_started_at,
+        grace_period_reason: a.grace_period_reason,
+        fill_rate_24h: fill_rate,
+        fill_attempts_24h: a.fill_attempts_24h,
+        fill_count_24h: a.fill_count_24h,
+    }
 }
 
 /// Get user's current workspace ID.
@@ -178,71 +288,27 @@ pub async fn list_allocations(
     let tier_filter = query.tier.as_deref();
 
     let allocations: Vec<AllocationRow> = if let Some(tier) = tier_filter {
-        sqlx::query_as(
-            r#"
-            SELECT
-                wwa.id, wwa.workspace_id, wwa.wallet_address, wwa.allocation_pct,
-                wwa.max_position_size, wwa.tier, wwa.auto_assigned, wwa.auto_assigned_reason,
-                wwa.backtest_roi, wwa.backtest_sharpe, wwa.backtest_win_rate,
-                wwa.copy_behavior, wwa.arb_threshold_pct, wwa.added_by,
-                wwa.added_at, wwa.updated_at,
-                tw.label as wallet_label, tw.success_score as wallet_success_score
-            FROM workspace_wallet_allocations wwa
-            LEFT JOIN tracked_wallets tw ON wwa.wallet_address = tw.address
-            WHERE wwa.workspace_id = $1 AND wwa.tier = $2
-            ORDER BY wwa.allocation_pct DESC, wwa.added_at
-            "#,
-        )
-        .bind(workspace_id)
-        .bind(tier)
-        .fetch_all(&state.pool)
-        .await?
+        let q = format!(
+            "{} WHERE wwa.workspace_id = $1 AND wwa.tier = $2 ORDER BY wwa.allocation_pct DESC, wwa.added_at",
+            ALLOCATION_SELECT
+        );
+        sqlx::query_as(&q)
+            .bind(workspace_id)
+            .bind(tier)
+            .fetch_all(&state.pool)
+            .await?
     } else {
-        sqlx::query_as(
-            r#"
-            SELECT
-                wwa.id, wwa.workspace_id, wwa.wallet_address, wwa.allocation_pct,
-                wwa.max_position_size, wwa.tier, wwa.auto_assigned, wwa.auto_assigned_reason,
-                wwa.backtest_roi, wwa.backtest_sharpe, wwa.backtest_win_rate,
-                wwa.copy_behavior, wwa.arb_threshold_pct, wwa.added_by,
-                wwa.added_at, wwa.updated_at,
-                tw.label as wallet_label, tw.success_score as wallet_success_score
-            FROM workspace_wallet_allocations wwa
-            LEFT JOIN tracked_wallets tw ON wwa.wallet_address = tw.address
-            WHERE wwa.workspace_id = $1
-            ORDER BY
-                CASE wwa.tier WHEN 'active' THEN 0 ELSE 1 END,
-                wwa.allocation_pct DESC,
-                wwa.added_at
-            "#,
-        )
-        .bind(workspace_id)
-        .fetch_all(&state.pool)
-        .await?
+        let q = format!(
+            "{} WHERE wwa.workspace_id = $1 ORDER BY CASE wwa.tier WHEN 'active' THEN 0 ELSE 1 END, wwa.allocation_pct DESC, wwa.added_at",
+            ALLOCATION_SELECT
+        );
+        sqlx::query_as(&q)
+            .bind(workspace_id)
+            .fetch_all(&state.pool)
+            .await?
     };
 
-    let response: Vec<AllocationResponse> = allocations
-        .into_iter()
-        .map(|a| AllocationResponse {
-            id: a.id.to_string(),
-            wallet_address: a.wallet_address,
-            allocation_pct: a.allocation_pct,
-            max_position_size: a.max_position_size,
-            tier: a.tier,
-            auto_assigned: a.auto_assigned,
-            auto_assigned_reason: a.auto_assigned_reason,
-            backtest_roi: a.backtest_roi,
-            backtest_sharpe: a.backtest_sharpe,
-            backtest_win_rate: a.backtest_win_rate,
-            copy_behavior: a.copy_behavior,
-            arb_threshold_pct: a.arb_threshold_pct,
-            added_by: a.added_by.map(|id| id.to_string()),
-            added_at: a.added_at,
-            updated_at: a.updated_at,
-            wallet_label: a.wallet_label,
-            wallet_success_score: a.wallet_success_score,
-        })
-        .collect();
+    let response: Vec<AllocationResponse> = allocations.into_iter().map(row_to_response).collect();
 
     Ok(Json(response))
 }
@@ -435,6 +501,18 @@ pub async fn add_allocation(
             updated_at: now,
             wallet_label,
             wallet_success_score,
+            pinned: None,
+            pinned_at: None,
+            probation_until: None,
+            probation_allocation_pct: None,
+            consecutive_losses: None,
+            last_loss_at: None,
+            confidence_score: None,
+            grace_period_started_at: None,
+            grace_period_reason: None,
+            fill_rate_24h: None,
+            fill_attempts_24h: None,
+            fill_count_24h: None,
         }),
     ))
 }
@@ -558,44 +636,17 @@ pub async fn update_allocation(
     );
 
     // Fetch updated allocation
-    let allocation: AllocationRow = sqlx::query_as(
-        r#"
-        SELECT
-            wwa.id, wwa.workspace_id, wwa.wallet_address, wwa.allocation_pct,
-            wwa.max_position_size, wwa.tier, wwa.auto_assigned, wwa.auto_assigned_reason,
-            wwa.backtest_roi, wwa.backtest_sharpe, wwa.backtest_win_rate,
-            wwa.copy_behavior, wwa.arb_threshold_pct, wwa.added_by,
-            wwa.added_at, wwa.updated_at,
-            tw.label as wallet_label, tw.success_score as wallet_success_score
-        FROM workspace_wallet_allocations wwa
-        LEFT JOIN tracked_wallets tw ON wwa.wallet_address = tw.address
-        WHERE wwa.workspace_id = $1 AND wwa.wallet_address = $2
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(&address)
-    .fetch_one(&state.pool)
-    .await?;
+    let q = format!(
+        "{} WHERE wwa.workspace_id = $1 AND wwa.wallet_address = $2",
+        ALLOCATION_SELECT
+    );
+    let allocation: AllocationRow = sqlx::query_as(&q)
+        .bind(workspace_id)
+        .bind(&address)
+        .fetch_one(&state.pool)
+        .await?;
 
-    Ok(Json(AllocationResponse {
-        id: allocation.id.to_string(),
-        wallet_address: allocation.wallet_address,
-        allocation_pct: allocation.allocation_pct,
-        max_position_size: allocation.max_position_size,
-        tier: allocation.tier,
-        auto_assigned: allocation.auto_assigned,
-        auto_assigned_reason: allocation.auto_assigned_reason,
-        backtest_roi: allocation.backtest_roi,
-        backtest_sharpe: allocation.backtest_sharpe,
-        backtest_win_rate: allocation.backtest_win_rate,
-        copy_behavior: allocation.copy_behavior,
-        arb_threshold_pct: allocation.arb_threshold_pct,
-        added_by: allocation.added_by.map(|id| id.to_string()),
-        added_at: allocation.added_at,
-        updated_at: allocation.updated_at,
-        wallet_label: allocation.wallet_label,
-        wallet_success_score: allocation.wallet_success_score,
-    }))
+    Ok(Json(row_to_response(allocation)))
 }
 
 /// Remove a wallet from the roster.
@@ -833,44 +884,17 @@ pub async fn promote_allocation(
     );
 
     // Fetch updated allocation
-    let allocation: AllocationRow = sqlx::query_as(
-        r#"
-        SELECT
-            wwa.id, wwa.workspace_id, wwa.wallet_address, wwa.allocation_pct,
-            wwa.max_position_size, wwa.tier, wwa.auto_assigned, wwa.auto_assigned_reason,
-            wwa.backtest_roi, wwa.backtest_sharpe, wwa.backtest_win_rate,
-            wwa.copy_behavior, wwa.arb_threshold_pct, wwa.added_by,
-            wwa.added_at, wwa.updated_at,
-            tw.label as wallet_label, tw.success_score as wallet_success_score
-        FROM workspace_wallet_allocations wwa
-        LEFT JOIN tracked_wallets tw ON wwa.wallet_address = tw.address
-        WHERE wwa.workspace_id = $1 AND wwa.wallet_address = $2
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(&address)
-    .fetch_one(&state.pool)
-    .await?;
+    let q = format!(
+        "{} WHERE wwa.workspace_id = $1 AND wwa.wallet_address = $2",
+        ALLOCATION_SELECT
+    );
+    let allocation: AllocationRow = sqlx::query_as(&q)
+        .bind(workspace_id)
+        .bind(&address)
+        .fetch_one(&state.pool)
+        .await?;
 
-    Ok(Json(AllocationResponse {
-        id: allocation.id.to_string(),
-        wallet_address: allocation.wallet_address,
-        allocation_pct: allocation.allocation_pct,
-        max_position_size: allocation.max_position_size,
-        tier: allocation.tier,
-        auto_assigned: allocation.auto_assigned,
-        auto_assigned_reason: allocation.auto_assigned_reason,
-        backtest_roi: allocation.backtest_roi,
-        backtest_sharpe: allocation.backtest_sharpe,
-        backtest_win_rate: allocation.backtest_win_rate,
-        copy_behavior: allocation.copy_behavior,
-        arb_threshold_pct: allocation.arb_threshold_pct,
-        added_by: allocation.added_by.map(|id| id.to_string()),
-        added_at: allocation.added_at,
-        updated_at: allocation.updated_at,
-        wallet_label: allocation.wallet_label,
-        wallet_success_score: allocation.wallet_success_score,
-    }))
+    Ok(Json(row_to_response(allocation)))
 }
 
 /// Demote a wallet from active to bench.
@@ -989,44 +1013,17 @@ pub async fn demote_allocation(
     );
 
     // Fetch updated allocation
-    let allocation: AllocationRow = sqlx::query_as(
-        r#"
-        SELECT
-            wwa.id, wwa.workspace_id, wwa.wallet_address, wwa.allocation_pct,
-            wwa.max_position_size, wwa.tier, wwa.auto_assigned, wwa.auto_assigned_reason,
-            wwa.backtest_roi, wwa.backtest_sharpe, wwa.backtest_win_rate,
-            wwa.copy_behavior, wwa.arb_threshold_pct, wwa.added_by,
-            wwa.added_at, wwa.updated_at,
-            tw.label as wallet_label, tw.success_score as wallet_success_score
-        FROM workspace_wallet_allocations wwa
-        LEFT JOIN tracked_wallets tw ON wwa.wallet_address = tw.address
-        WHERE wwa.workspace_id = $1 AND wwa.wallet_address = $2
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(&address)
-    .fetch_one(&state.pool)
-    .await?;
+    let q = format!(
+        "{} WHERE wwa.workspace_id = $1 AND wwa.wallet_address = $2",
+        ALLOCATION_SELECT
+    );
+    let allocation: AllocationRow = sqlx::query_as(&q)
+        .bind(workspace_id)
+        .bind(&address)
+        .fetch_one(&state.pool)
+        .await?;
 
-    Ok(Json(AllocationResponse {
-        id: allocation.id.to_string(),
-        wallet_address: allocation.wallet_address,
-        allocation_pct: allocation.allocation_pct,
-        max_position_size: allocation.max_position_size,
-        tier: allocation.tier,
-        auto_assigned: allocation.auto_assigned,
-        auto_assigned_reason: allocation.auto_assigned_reason,
-        backtest_roi: allocation.backtest_roi,
-        backtest_sharpe: allocation.backtest_sharpe,
-        backtest_win_rate: allocation.backtest_win_rate,
-        copy_behavior: allocation.copy_behavior,
-        arb_threshold_pct: allocation.arb_threshold_pct,
-        added_by: allocation.added_by.map(|id| id.to_string()),
-        added_at: allocation.added_at,
-        updated_at: allocation.updated_at,
-        wallet_label: allocation.wallet_label,
-        wallet_success_score: allocation.wallet_success_score,
-    }))
+    Ok(Json(row_to_response(allocation)))
 }
 
 /// Pin response.
