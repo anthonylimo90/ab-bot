@@ -181,6 +181,7 @@ pub struct ArbAutoExecutor {
     signal_tx: broadcast::Sender<SignalUpdate>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
+    pool: PgPool,
     position_repo: PositionRepository,
     token_cache: OutcomeTokenCache,
     /// Set of market IDs with active positions (for deduplication).
@@ -211,6 +212,7 @@ impl ArbAutoExecutor {
             signal_tx,
             order_executor,
             circuit_breaker,
+            pool: pool.clone(),
             position_repo: PositionRepository::new(pool),
             token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets),
             active_markets,
@@ -304,6 +306,29 @@ impl ArbAutoExecutor {
     /// Process a single arb signal through validation → execution → tracking.
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
         let cfg = self.snapshot_config().await;
+
+        // Persist every arb signal to arb_opportunities for the DynamicTuner's
+        // depth_proxy and events_per_min calculations. Fire-and-forget to avoid
+        // blocking the execution path.
+        let pool_ref = self.pool.clone();
+        let arb_clone = arb.clone();
+        tokio::spawn(async move {
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO arb_opportunities (market_id, timestamp, yes_ask, no_ask, total_cost, gross_profit, net_profit)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "#,
+            )
+            .bind(&arb_clone.market_id)
+            .bind(arb_clone.timestamp)
+            .bind(arb_clone.yes_ask)
+            .bind(arb_clone.no_ask)
+            .bind(arb_clone.total_cost)
+            .bind(arb_clone.gross_profit)
+            .bind(arb_clone.net_profit)
+            .execute(&pool_ref)
+            .await;
+        });
 
         // Per-signal guard: skip processing when disabled at runtime
         if !cfg.enabled {

@@ -1313,6 +1313,7 @@ impl DynamicTuner {
 }
 
 /// Subscribes to dynamic config updates and applies them to local API runtime.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_dynamic_config_subscriber(
     redis_url: String,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
@@ -1370,6 +1371,7 @@ pub async fn sync_dynamic_config_snapshot_to_copy_trader(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_dynamic_config_subscriber(
     redis_url: &str,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
@@ -1537,7 +1539,8 @@ async fn run_dynamic_config_subscriber(
                 // value is e.g. 0.03 → store as 300; floor at 300 (3%) to match MIN_MARGIN_RAW
                 let margin_raw = (update.value * Decimal::new(10_000, 0))
                     .to_i64()
-                    .unwrap_or(300);
+                    .unwrap_or(300)
+                    .max(300); // Floor at 3% (MIN_MARGIN_RAW) — never allow 0
                 atomic.store(margin_raw, Ordering::Relaxed);
                 info!(
                     key = %update.key,
@@ -1718,7 +1721,10 @@ async fn apply_startup_snapshot_to_copy_trader(
         // Apply near-resolution margin to the shared atomic (stored as margin * 10,000)
         if row.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
             if let Some(atomic) = copy_near_resolution_margin {
-                let margin_raw = (value * Decimal::new(10_000, 0)).to_i64().unwrap_or(300);
+                let margin_raw = (value * Decimal::new(10_000, 0))
+                    .to_i64()
+                    .unwrap_or(300)
+                    .max(300); // Floor at 3% — match MIN_MARGIN_RAW
                 atomic.store(margin_raw, Ordering::Relaxed);
                 applied += 1;
             }

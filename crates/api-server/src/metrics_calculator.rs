@@ -33,9 +33,9 @@ impl Default for MetricsCalculatorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 3600, // 1 hour
+            interval_secs: 900, // 15 minutes — was 1 hour, too slow for rotation
             batch_size: 50,
-            recalc_after_hours: 24,
+            recalc_after_hours: 6, // was 24 — stale metrics block good candidates
         }
     }
 }
@@ -50,7 +50,7 @@ impl MetricsCalculatorConfig {
             interval_secs: std::env::var("METRICS_CALCULATOR_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(3600),
+                .unwrap_or(900),
             batch_size: std::env::var("METRICS_CALCULATOR_BATCH_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -58,7 +58,7 @@ impl MetricsCalculatorConfig {
             recalc_after_hours: std::env::var("METRICS_RECALC_AFTER_HOURS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(24),
+                .unwrap_or(6),
         }
     }
 }
@@ -130,16 +130,33 @@ impl MetricsCalculator {
             error!(error = %e, "Failed to calculate initial metrics batch");
         }
 
-        // Then resume the normal hourly interval
+        // Then resume the normal interval
         let mut interval = time::interval(time::Duration::from_secs(self.config.interval_secs));
         // Consume the first immediate tick so we don't double-run
         interval.tick().await;
 
+        let mut cycle_count: u64 = 0;
+        // Run cleanup every 16 cycles (~4 hours at 15-min intervals)
+        let cleanup_every: u64 = 16;
+
         loop {
             interval.tick().await;
+            cycle_count += 1;
 
             if let Err(e) = self.calculate_batch().await {
                 error!(error = %e, "Failed to calculate metrics batch");
+            }
+
+            // Periodic data hygiene — purge stale rows to keep tables lean
+            if cycle_count.is_multiple_of(cleanup_every) {
+                info!("Running periodic data hygiene cleanup");
+                match sqlx::query("SELECT cleanup_stale_data()")
+                    .execute(&self.pool)
+                    .await
+                {
+                    Ok(_) => info!("Data hygiene cleanup completed successfully"),
+                    Err(e) => warn!(error = %e, "Data hygiene cleanup failed (non-fatal)"),
+                }
             }
         }
     }
@@ -375,9 +392,9 @@ mod tests {
     fn test_config_default() {
         let config = MetricsCalculatorConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.interval_secs, 3600);
+        assert_eq!(config.interval_secs, 900);
         assert_eq!(config.batch_size, 50);
-        assert_eq!(config.recalc_after_hours, 24);
+        assert_eq!(config.recalc_after_hours, 6);
     }
 
     #[test]

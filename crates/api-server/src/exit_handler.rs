@@ -125,6 +125,7 @@ pub struct ExitHandler {
 }
 
 impl ExitHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<RwLock<ExitHandlerConfig>>,
         order_executor: Arc<OrderExecutor>,
@@ -646,6 +647,7 @@ impl ExitHandler {
 }
 
 /// Spawn the exit handler as a background task.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_exit_handler(
     config: Arc<RwLock<ExitHandlerConfig>>,
     order_executor: Arc<OrderExecutor>,
