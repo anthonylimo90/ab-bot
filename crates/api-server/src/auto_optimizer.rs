@@ -391,9 +391,9 @@ impl DemotionTrigger {
     /// Returns defaults; use AutoOptimizerConfig for configurable values.
     pub fn grace_period_hours(&self) -> Option<i64> {
         match self {
-            DemotionTrigger::NegativeRoi => Some(72),
-            DemotionTrigger::LowSharpe => Some(48),
-            DemotionTrigger::Inactivity => None, // No grace period, but not immediate
+            DemotionTrigger::NegativeRoi => Some(48), // Was 72 — shorter patience
+            DemotionTrigger::LowSharpe => Some(24),   // Was 48 — shorter patience
+            DemotionTrigger::Inactivity => None,      // No grace period, but not immediate
             _ => None,
         }
     }
@@ -475,12 +475,12 @@ pub struct AutoOptimizerConfig {
 impl Default for AutoOptimizerConfig {
     fn default() -> Self {
         Self {
-            demotion_max_consecutive_losses: 8,
-            demotion_max_drawdown_pct: 0.40,
-            demotion_grace_roi_threshold: -0.05,
-            demotion_grace_sharpe_threshold: 0.3,
-            grace_period_negative_roi_hours: 72,
-            grace_period_low_sharpe_hours: 48,
+            demotion_max_consecutive_losses: 5,   // Was 8 — demote faster
+            demotion_max_drawdown_pct: 0.25,      // Was 0.40 — tighter risk control
+            demotion_grace_roi_threshold: -0.03,  // Was -0.05 — catch underperformers sooner
+            demotion_grace_sharpe_threshold: 0.5, // Was 0.3 — higher quality bar
+            grace_period_negative_roi_hours: 48,  // Was 72 — shorter patience
+            grace_period_low_sharpe_hours: 24,    // Was 48 — shorter patience
             min_allocation_pct: 5.0,
             max_allocation_pct: 50.0,
             auto_relax_thresholds: true,
@@ -982,6 +982,38 @@ impl AutoOptimizer {
             let sharpe_f64: f64 = sharpe.to_string().parse().unwrap_or(0.0);
             if sharpe_f64 < self.config.demotion_grace_sharpe_threshold {
                 return Ok(Some(DemotionTrigger::LowSharpe));
+            }
+        }
+
+        // Copy fill rate check: demote wallets whose trades consistently fail to
+        // copy (resolved markets, extreme slippage, etc.). A wallet with many
+        // attempts but zero fills over the last 24h is trading in markets we
+        // can't follow.
+        let min_attempts_for_fill_check: i64 = 10;
+        let fill_rate_row: Option<(i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*)::bigint AS attempts,
+                COALESCE(SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END), 0)::bigint AS fills
+            FROM copy_trade_history
+            WHERE LOWER(source_wallet) = LOWER($1)
+              AND created_at >= NOW() - INTERVAL '24 hours'
+            "#,
+        )
+        .bind(&allocation.wallet_address)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        if let Some((attempts, fills)) = fill_rate_row {
+            if attempts >= min_attempts_for_fill_check && fills == 0 {
+                info!(
+                    wallet = %allocation.wallet_address,
+                    attempts,
+                    fills,
+                    "Wallet has 0% copy fill rate over 24h, triggering demotion"
+                );
+                return Ok(Some(DemotionTrigger::Inactivity));
             }
         }
 

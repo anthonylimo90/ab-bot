@@ -711,10 +711,10 @@ impl DynamicTuner {
         let latency_current = rows
             .get(KEY_COPY_MAX_LATENCY_SECS)
             .map(|r| decimal_to_f64(r.current_value))
-            .unwrap_or(600.0);
+            .unwrap_or(120.0);
         let desired_latency = if no_trade_watchdog && top_skip == "too_stale" {
             // Most skips are stale trades — relax the threshold to let them through.
-            (latency_current * 1.30).min(900.0)
+            (latency_current * 1.30).min(300.0)
         } else if no_trade_watchdog || bootstrap_active {
             // No fills yet (watchdog or bootstrap) but staleness isn't the top issue.
             // Hold latency steady — tightening during 0-fill phases is counter-productive.
@@ -985,9 +985,9 @@ impl DynamicTuner {
             },
             ConfigSeed {
                 key: KEY_COPY_MAX_LATENCY_SECS,
-                default_value: env_decimal("COPY_MAX_LATENCY_SECS", Decimal::new(600, 0)),
-                min_value: Decimal::new(60, 0),    // 1 minute floor
-                max_value: Decimal::new(900, 0),   // 15 minute ceiling
+                default_value: env_decimal("COPY_MAX_LATENCY_SECS", Decimal::new(120, 0)),
+                min_value: Decimal::new(30, 0),    // 30 second floor
+                max_value: Decimal::new(300, 0),   // 5 minute ceiling (was 15 min)
                 max_step_pct: Decimal::new(20, 2), // 20% per cycle
             },
             ConfigSeed {
@@ -1064,7 +1064,7 @@ impl DynamicTuner {
             ConfigSeed {
                 key: KEY_COPY_NEAR_RESOLUTION_MARGIN,
                 default_value: env_decimal("COPY_NEAR_RESOLUTION_MARGIN", Decimal::new(3, 2)),
-                min_value: Decimal::ZERO,       // 0 = disabled
+                min_value: Decimal::new(3, 2), // 0.03 (3%) floor — never fully disabled
                 max_value: Decimal::new(25, 2), // 0.25 ceiling
                 max_step_pct: Decimal::new(50, 2),
             },
@@ -1850,7 +1850,7 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     match key {
         KEY_COPY_MIN_TRADE_VALUE => Some((Decimal::new(50, 2), Decimal::new(50, 0))),
         KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(15, 2))),
-        KEY_COPY_MAX_LATENCY_SECS => Some((Decimal::new(60, 0), Decimal::new(900, 0))),
+        KEY_COPY_MAX_LATENCY_SECS => Some((Decimal::new(30, 0), Decimal::new(300, 0))),
         KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),
@@ -1860,7 +1860,7 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
         KEY_ARB_MIN_BOOK_DEPTH => Some((Decimal::new(25, 0), Decimal::new(1000, 0))),
         KEY_ARB_MAX_SIGNAL_AGE_SECS => Some((Decimal::new(5, 0), Decimal::new(300, 0))),
         KEY_COPY_TOTAL_CAPITAL => Some((Decimal::new(100, 0), Decimal::new(500000, 0))),
-        KEY_COPY_NEAR_RESOLUTION_MARGIN => Some((Decimal::ZERO, Decimal::new(25, 2))),
+        KEY_COPY_NEAR_RESOLUTION_MARGIN => Some((Decimal::new(3, 2), Decimal::new(25, 2))),
         _ => None,
     }
 }
