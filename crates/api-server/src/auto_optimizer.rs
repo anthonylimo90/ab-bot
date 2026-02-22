@@ -384,6 +384,7 @@ impl DemotionTrigger {
                 | DemotionTrigger::MaxDrawdown
                 | DemotionTrigger::CircuitBreaker
                 | DemotionTrigger::ManualDemote
+                | DemotionTrigger::Inactivity
         )
     }
 
@@ -1125,6 +1126,35 @@ impl AutoOptimizer {
                 workspace_id,
                 &wallet_address,
                 DemotionTrigger::LowSharpe,
+                None,
+            )
+            .await?;
+        }
+
+        // Inactivity grace period cleanup — catch any wallets stuck in Inactivity
+        // grace periods from before `Inactivity` was made immediate.
+        let inactivity_expiry = now - Duration::hours(1);
+
+        let expired_inactivity: Vec<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT workspace_id, wallet_address
+            FROM workspace_wallet_allocations
+            WHERE tier = 'active'
+              AND grace_period_started_at IS NOT NULL
+              AND grace_period_reason = 'Inactivity'
+              AND grace_period_started_at <= $1
+              AND COALESCE(pinned, false) = false
+            "#,
+        )
+        .bind(inactivity_expiry)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (workspace_id, wallet_address) in expired_inactivity {
+            self.demote_wallet(
+                workspace_id,
+                &wallet_address,
+                DemotionTrigger::Inactivity,
                 None,
             )
             .await?;
