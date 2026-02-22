@@ -139,6 +139,23 @@ export function calculatePnL(
   return { amount, percent };
 }
 
+/** Map raw skip-reason strings to human-readable labels. */
+export function formatSkipReason(reason: string): string {
+  const SKIP_LABELS: Record<string, string> = {
+    market_not_active: "Resolved Market",
+    below_minimum: "Below Min Value",
+    trade_too_old: "Stale Trade",
+    SlippageTooHigh: "High Slippage",
+    market_cache_empty: "Cache Loading",
+    near_resolution: "Near Resolution",
+    duplicate: "Duplicate",
+    insufficient_capital: "Insufficient Capital",
+    max_positions_reached: "Max Positions",
+    wallet_not_active: "Wallet Not Active",
+  };
+  return SKIP_LABELS[reason] ?? reason.replace(/_/g, " ");
+}
+
 export function formatDynamicKey(key: string | null): string {
   if (!key) return "(global)";
   const labels: Record<string, string> = {

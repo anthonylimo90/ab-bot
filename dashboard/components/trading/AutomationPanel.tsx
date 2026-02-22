@@ -28,6 +28,7 @@ import {
 import { api } from '@/lib/api';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Ban,
   Bot,
   CheckCircle,
@@ -153,9 +154,10 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   const { data: optimizerStatus, isLoading: isStatusLoading } = useOptimizerStatusQuery(
     hasWorkspace ? workspaceId : undefined
   );
+  const [historyLimit, setHistoryLimit] = useState(20);
   const { data: history = [] } = useRotationHistoryQuery({
     workspaceId: hasWorkspace ? workspaceId : undefined,
-    limit: 20,
+    limit: historyLimit,
   });
   const { data: bansData } = useQuery({
     queryKey: ['wallet-bans', workspaceId],
@@ -302,7 +304,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     return {
       min_trade_value: findVal('COPY_MIN_TRADE_VALUE') ?? 2,
       max_slippage_pct: findVal('COPY_MAX_SLIPPAGE_PCT') ?? 0.01,
-      max_latency_secs: findVal('COPY_MAX_LATENCY_SECS') ?? 600,
+      max_latency_secs: findVal('COPY_MAX_LATENCY_SECS') ?? 120,
       daily_capital_limit: findVal('COPY_DAILY_CAPITAL_LIMIT') ?? 5000,
       max_open_positions: findVal('COPY_MAX_OPEN_POSITIONS') ?? 15,
       stop_loss_pct: findVal('COPY_STOP_LOSS_PCT') ?? 0.15,
@@ -498,7 +500,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     return opportunitySettings.exploration_slots / maxMarketsCap;
   }, [opportunitySettings, maxMarketsCap]);
 
-  const getActionIcon = (action: string) => {
+  const getActionIcon = (action: string, evidence?: Record<string, unknown>) => {
+    // Inactivity demotions are logged as emergency_demote with evidence.trigger = 'Inactivity'
+    if (action === 'emergency_demote' && evidence?.trigger === 'Inactivity') {
+      return <Clock className="h-4 w-4 text-amber-500" />;
+    }
     switch (action) {
       case 'probation_start':
         return <TrendingUp className="h-4 w-4 text-blue-500" />;
@@ -512,12 +518,20 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
         return <Shield className="h-4 w-4 text-purple-500" />;
       case 'ban':
         return <Ban className="h-4 w-4 text-red-500" />;
+      case 'auto_swap':
+        return <ArrowLeftRight className="h-4 w-4 text-blue-500" />;
+      case 'undo':
+        return <RotateCcw className="h-4 w-4 text-gray-500" />;
       default:
         return <Info className="h-4 w-4 text-gray-500" />;
     }
   };
 
-  const getActionBadge = (action: string) => {
+  const getActionBadge = (action: string, evidence?: Record<string, unknown>) => {
+    // Inactivity demotions get amber styling
+    if (action === 'emergency_demote' && evidence?.trigger === 'Inactivity') {
+      return 'bg-amber-500/10 text-amber-500';
+    }
     const colors: Record<string, string> = {
       probation_start: 'bg-blue-500/10 text-blue-500',
       probation_graduate: 'bg-green-500/10 text-green-500',
@@ -525,10 +539,12 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
       emergency_demote: 'bg-red-500/10 text-red-500',
       grace_period_start: 'bg-yellow-500/10 text-yellow-500',
       grace_period_demote: 'bg-orange-500/10 text-orange-500',
+      auto_swap: 'bg-blue-500/10 text-blue-500',
       pin: 'bg-purple-500/10 text-purple-500',
       unpin: 'bg-gray-500/10 text-gray-500',
       ban: 'bg-red-500/10 text-red-500',
       unban: 'bg-green-500/10 text-green-500',
+      undo: 'bg-gray-500/10 text-gray-500',
     };
     return colors[action] || 'bg-gray-500/10 text-gray-500';
   };
@@ -1052,13 +1068,13 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                           <Input
                             type="number"
                             min={1}
-                            max={15}
+                            max={5}
                             step={0.5}
                             value={Math.round((copyTradingDraft.max_latency_secs / 60) * 10) / 10}
                             onChange={(e) => {
                               const mins = Number(e.target.value);
                               if (!Number.isFinite(mins)) return;
-                              const secs = Math.max(60, Math.min(900, mins * 60));
+                              const secs = Math.max(60, Math.min(300, mins * 60));
                               setCopyTradingDraft((d) =>
                                 d ? { ...d, max_latency_secs: secs } : d
                               );
@@ -1231,11 +1247,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                         <div>
                           <p className="text-sm font-medium">Near-Resolution Margin</p>
-                          <p className="text-xs text-muted-foreground">Skip markets within this margin of 0 or 1. Set 0 to disable.</p>
+                          <p className="text-xs text-muted-foreground">Skip markets within this margin of 0 or 1. Min 3% enforced by backend.</p>
                         </div>
                         <Input
                           type="number"
-                          min={0}
+                          min={0.03}
                           max={0.25}
                           step={0.01}
                           value={copyTradingDraft.near_resolution_margin}
@@ -1243,7 +1259,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                             const v = Number(e.target.value);
                             if (!Number.isFinite(v)) return;
                             setCopyTradingDraft((d) =>
-                              d ? { ...d, near_resolution_margin: clamp(v, 0, 0.25) } : d
+                              d ? { ...d, near_resolution_margin: clamp(v, 0.03, 0.25) } : d
                             );
                           }}
                           className="w-24 text-right"
@@ -1432,54 +1448,68 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
           </TabsContent>
 
           <TabsContent value="history" className="mt-4">
-            <div className="max-h-64 space-y-2 overflow-y-auto">
+            <div className="max-h-80 space-y-2 overflow-y-auto">
               {history.length === 0 ? (
                 <div className="py-8 text-center text-sm text-muted-foreground">
                   No automation history yet
                 </div>
               ) : (
-                history.map((entry) => (
-                  <div
-                    key={entry.id}
-                    className={`flex items-start gap-3 rounded-lg border bg-background/50 p-3 ${
-                      !entry.acknowledged ? 'border-primary/20' : 'border-border/50'
-                    }`}
-                  >
-                    <div className="mt-0.5">{getActionIcon(entry.action)}</div>
-                    <div className="min-w-0 flex-1">
-                      <div className="mb-1 flex items-center gap-2">
-                        <Badge className={`text-xs ${getActionBadge(entry.action)}`}>
-                          {entry.action.replace(/_/g, ' ')}
-                        </Badge>
-                        <span className="text-xs text-muted-foreground">
-                          {formatDistanceToNow(new Date(entry.created_at), { addSuffix: true })}
-                        </span>
-                      </div>
-                      <p className="truncate text-sm">{entry.reason}</p>
-                      {(entry.wallet_in || entry.wallet_out) && (
-                        <div className="mt-1 font-mono text-xs text-muted-foreground">
-                          {entry.wallet_in && (
-                            <span className="text-green-500">+{entry.wallet_in.slice(0, 8)}...</span>
-                          )}
-                          {entry.wallet_in && entry.wallet_out && ' / '}
-                          {entry.wallet_out && (
-                            <span className="text-red-500">-{entry.wallet_out.slice(0, 8)}...</span>
-                          )}
+                <>
+                  {history.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className={`flex items-start gap-3 rounded-lg border bg-background/50 p-3 ${
+                        !entry.acknowledged ? 'border-primary/20' : 'border-border/50'
+                      }`}
+                    >
+                      <div className="mt-0.5">{getActionIcon(entry.action, entry.evidence)}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className="mb-1 flex items-center gap-2">
+                          <Badge className={`text-xs ${getActionBadge(entry.action, entry.evidence)}`}>
+                            {entry.action === 'emergency_demote' && entry.evidence?.trigger === 'Inactivity'
+                              ? 'inactivity demote'
+                              : entry.action.replace(/_/g, ' ')}
+                          </Badge>
+                          <span className="text-xs text-muted-foreground">
+                            {formatDistanceToNow(new Date(entry.created_at), { addSuffix: true })}
+                          </span>
                         </div>
+                        <p className="truncate text-sm">{entry.reason}</p>
+                        {(entry.wallet_in || entry.wallet_out) && (
+                          <div className="mt-1 font-mono text-xs text-muted-foreground">
+                            {entry.wallet_in && (
+                              <span className="text-green-500">+{entry.wallet_in.slice(0, 8)}...</span>
+                            )}
+                            {entry.wallet_in && entry.wallet_out && ' / '}
+                            {entry.wallet_out && (
+                              <span className="text-red-500">-{entry.wallet_out.slice(0, 8)}...</span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      {!entry.acknowledged && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleAcknowledge(entry.id)}
+                          disabled={acknowledgeMutation.isPending}
+                        >
+                          <CheckCircle className="h-4 w-4" />
+                        </Button>
                       )}
                     </div>
-                    {!entry.acknowledged && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleAcknowledge(entry.id)}
-                        disabled={acknowledgeMutation.isPending}
-                      >
-                        <CheckCircle className="h-4 w-4" />
-                      </Button>
-                    )}
-                  </div>
-                ))
+                  ))}
+                  {history.length >= historyLimit && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="w-full text-muted-foreground"
+                      onClick={() => setHistoryLimit((prev) => prev + 20)}
+                    >
+                      Load more
+                    </Button>
+                  )}
+                </>
               )}
             </div>
           </TabsContent>

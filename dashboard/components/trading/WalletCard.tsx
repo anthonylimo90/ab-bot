@@ -53,6 +53,11 @@ interface WalletCardProps {
     strategyType?: string;
     stalenessDays?: number;
     compositeScore?: number;
+    fillRate24h?: number;
+    fillAttempts24h?: number;
+    fillCount24h?: number;
+    gracePeriodStartedAt?: string;
+    gracePeriodReason?: string;
   };
   positions: WalletPosition[];
   onDemote?: (address: string) => void;
@@ -170,6 +175,16 @@ export const WalletCard = memo(function WalletCard({
                     </Tooltip>
                   </TooltipProvider>
                 )}
+                {/* Grace period badge */}
+                {wallet.gracePeriodStartedAt && (
+                  <Badge
+                    variant="outline"
+                    className="text-xs bg-orange-500/10 text-orange-500 border-orange-500/20"
+                  >
+                    <Clock className="h-3 w-3 mr-1" />
+                    Grace: {wallet.gracePeriodReason ?? 'pending'}
+                  </Badge>
+                )}
                 <CompositeScoreGauge score={wallet.compositeScore} />
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -194,7 +209,7 @@ export const WalletCard = memo(function WalletCard({
 
       <CardContent className="space-y-4">
         {/* Metrics Row */}
-        <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3 lg:grid-cols-5">
+        <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-3 lg:grid-cols-6">
           <div>
             <p className="text-xs text-muted-foreground">ROI (30d)</p>
             <p
@@ -232,6 +247,30 @@ export const WalletCard = memo(function WalletCard({
             >
               {Number(wallet.confidence).toFixed(0)}%
             </p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground">Fill Rate</p>
+            <p
+              className={cn(
+                "font-medium tabular-nums",
+                wallet.fillRate24h != null && wallet.fillRate24h >= 0.5
+                  ? "text-profit"
+                  : wallet.fillRate24h != null && wallet.fillRate24h >= 0.2
+                    ? "text-yellow-500"
+                    : wallet.fillRate24h != null
+                      ? "text-loss"
+                      : "text-muted-foreground",
+              )}
+            >
+              {wallet.fillRate24h != null
+                ? `${(wallet.fillRate24h * 100).toFixed(0)}%`
+                : "—"}
+            </p>
+            {wallet.fillAttempts24h != null && wallet.fillAttempts24h > 0 && (
+              <p className="text-xs text-muted-foreground tabular-nums">
+                {wallet.fillCount24h ?? 0}/{wallet.fillAttempts24h}
+              </p>
+            )}
           </div>
           <div>
             <p className="text-xs text-muted-foreground">
