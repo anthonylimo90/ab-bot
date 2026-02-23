@@ -201,51 +201,57 @@ async fn harvest_cycle(
         }
     }
 
-    // 4. Store individual trades for profitability analysis
+    // 4. Store trades in bulk batches (50 per INSERT) to reduce pool pressure
     let mut trades_inserted = 0u32;
-    for trade in &trades {
-        let wallet_addr = trade.wallet_address.to_lowercase();
-        if wallet_addr.is_empty() || !wallet_addr.starts_with("0x") {
-            continue;
-        }
+    let valid_trades: Vec<_> = trades
+        .iter()
+        .filter_map(|trade| {
+            let wallet_addr = trade.wallet_address.to_lowercase();
+            if wallet_addr.is_empty() || !wallet_addr.starts_with("0x") {
+                return None;
+            }
+            let price = Decimal::from_f64_retain(trade.price).unwrap_or(Decimal::ZERO);
+            let size = Decimal::from_f64_retain(trade.size).unwrap_or(Decimal::ZERO);
+            let value = price * size;
+            let timestamp = chrono::DateTime::from_timestamp(trade.timestamp, 0).unwrap_or(now);
+            Some((trade, wallet_addr, price, size, value, timestamp))
+        })
+        .collect();
 
-        let price = Decimal::from_f64_retain(trade.price).unwrap_or(Decimal::ZERO);
-        let size = Decimal::from_f64_retain(trade.size).unwrap_or(Decimal::ZERO);
-        let value = price * size;
-        let timestamp = chrono::DateTime::from_timestamp(trade.timestamp, 0).unwrap_or(now);
-
-        // Insert trade with ON CONFLICT DO NOTHING for deduplication
-        // Using sqlx::query (not query!) to avoid offline mode requirement
-        let result = sqlx::query(
-            r#"
-            INSERT INTO wallet_trades (
+    // Batch inserts — 50 rows per query keeps parameter count under PostgreSQL's limit
+    const BATCH_SIZE: usize = 50;
+    for chunk in valid_trades.chunks(BATCH_SIZE) {
+        let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "INSERT INTO wallet_trades (
                 transaction_hash, wallet_address, asset_id, condition_id,
                 side, price, quantity, value, timestamp,
                 title, slug, outcome
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (transaction_hash) DO NOTHING
-            "#,
-        )
-        .bind(&trade.transaction_hash)
-        .bind(&wallet_addr)
-        .bind(&trade.asset_id)
-        .bind(&trade.condition_id)
-        .bind(&trade.side)
-        .bind(price)
-        .bind(size)
-        .bind(value)
-        .bind(timestamp)
-        .bind(&trade.title)
-        .bind(&trade.slug)
-        .bind(&trade.outcome)
-        .execute(wallet_repo.pool())
-        .await;
+            ) ",
+        );
 
-        match result {
-            Ok(_) => trades_inserted += 1,
+        query_builder.push_values(
+            chunk,
+            |mut b, (trade, wallet_addr, price, size, value, timestamp)| {
+                b.push_bind(&trade.transaction_hash)
+                    .push_bind(wallet_addr)
+                    .push_bind(&trade.asset_id)
+                    .push_bind(&trade.condition_id)
+                    .push_bind(&trade.side)
+                    .push_bind(price)
+                    .push_bind(size)
+                    .push_bind(value)
+                    .push_bind(timestamp)
+                    .push_bind(&trade.title)
+                    .push_bind(&trade.slug)
+                    .push_bind(&trade.outcome);
+            },
+        );
+        query_builder.push(" ON CONFLICT (transaction_hash) DO NOTHING");
+
+        match query_builder.build().execute(wallet_repo.pool()).await {
+            Ok(result) => trades_inserted += result.rows_affected() as u32,
             Err(e) => {
-                warn!(tx_hash = %trade.transaction_hash, error = %e, "Failed to insert trade");
+                warn!(batch_size = chunk.len(), error = %e, "Failed to insert trade batch");
             }
         }
     }

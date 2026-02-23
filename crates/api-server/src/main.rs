@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(20),
+            .unwrap_or(40),
         max_retries: std::env::var("DB_RETRY_MAX_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
