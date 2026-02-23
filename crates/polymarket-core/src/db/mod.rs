@@ -15,11 +15,23 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool> {
     let mut last_error = None;
 
     for attempt in 0..=config.max_retries {
-        let mut opts = PgPoolOptions::new().max_connections(config.max_connections);
+        let min_connections = config.max_connections / 4; // Keep 25% warm
+        let mut opts = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(min_connections)
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(1800));
 
         if let Some(timeout_secs) = config.acquire_timeout_secs {
             opts = opts.acquire_timeout(Duration::from_secs(timeout_secs));
         }
+
+        info!(
+            max_connections = config.max_connections,
+            min_connections = min_connections,
+            acquire_timeout_secs = config.acquire_timeout_secs,
+            "Creating database pool"
+        );
 
         match opts.connect(&config.url).await {
             Ok(pool) => {
