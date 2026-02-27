@@ -22,11 +22,11 @@ wallet-tracker.workspace = true
 backtester.workspace = true
 
 # Web framework
-axum = { version = "0.7", features = ["ws", "macros"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = { version = "0.4", features = ["util", "timeout"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"] }
-tower_governor = "0.4"
+axum = { version = "0.8", features = ["ws", "macros"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tower = { version = "0.5", features = ["util", "timeout"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+tower_governor = "0.8"
 
 # Async
 tokio.workspace = true
@@ -43,7 +43,7 @@ rust_decimal.workspace = true
 hex.workspace = true
 
 # Random (for demo data generation)
-rand = "0.8"
+rand = "0.9"
 
 # Password hashing
 argon2 = "0.5"
@@ -82,8 +82,8 @@ sqlx.workspace = true
 redis.workspace = true
 
 # OpenAPI documentation
-utoipa = { version = "4", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-swagger-ui = { version = "6", features = ["axum"] }
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # CLI
 clap.workspace = true

@@ -23,7 +23,7 @@ uuid.workspace = true
 rust_decimal.workspace = true
 
 # Concurrent data structures
-dashmap = "5.5"
+dashmap = "6.1"
 
 # Error handling
 thiserror.workspace = true
