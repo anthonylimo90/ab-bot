@@ -11,7 +11,8 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 /// Configuration for the wallet harvester.
 #[derive(Debug, Clone)]
@@ -73,6 +74,7 @@ pub fn spawn_wallet_harvester(
     config: WalletHarvesterConfig,
     clob_client: Arc<ClobClient>,
     pool: PgPool,
+    db_semaphore: Arc<Semaphore>,
 ) {
     if !config.enabled {
         info!("Wallet harvester is disabled");
@@ -87,11 +89,16 @@ pub fn spawn_wallet_harvester(
     );
 
     tokio::spawn(async move {
-        harvester_loop(config, clob_client, pool).await;
+        harvester_loop(config, clob_client, pool, db_semaphore).await;
     });
 }
 
-async fn harvester_loop(config: WalletHarvesterConfig, clob_client: Arc<ClobClient>, pool: PgPool) {
+async fn harvester_loop(
+    config: WalletHarvesterConfig,
+    clob_client: Arc<ClobClient>,
+    pool: PgPool,
+    db_semaphore: Arc<Semaphore>,
+) {
     let wallet_repo = WalletRepository::new(pool.clone());
     let interval = Duration::from_secs(config.interval_secs);
 
@@ -100,7 +107,7 @@ async fn harvester_loop(config: WalletHarvesterConfig, clob_client: Arc<ClobClie
 
     let mut first_cycle = true;
     loop {
-        match harvest_cycle(&config, &clob_client, &wallet_repo).await {
+        match harvest_cycle(&config, &clob_client, &wallet_repo, &db_semaphore).await {
             Ok(trade_count) => {
                 if first_cycle {
                     if trade_count > 0 {
@@ -132,8 +139,9 @@ async fn harvest_cycle(
     config: &WalletHarvesterConfig,
     clob_client: &ClobClient,
     wallet_repo: &WalletRepository,
+    db_semaphore: &Semaphore,
 ) -> anyhow::Result<usize> {
-    // 1. Fetch recent trades from CLOB
+    // 1. Fetch recent trades from CLOB (no semaphore — this is network I/O, not DB work)
     let trades = clob_client
         .get_recent_trades(config.trades_per_fetch, None)
         .await
@@ -146,7 +154,7 @@ async fn harvest_cycle(
 
     let trade_count = trades.len();
 
-    // 2. Aggregate per-wallet stats from the trade batch
+    // 2. Aggregate per-wallet stats from the trade batch (in-memory, no DB)
     let mut stats_map: HashMap<String, WalletTradeStats> = HashMap::new();
     let now = chrono::Utc::now();
 
@@ -181,25 +189,32 @@ async fn harvest_cycle(
         }
     }
 
-    // 3. Accumulate stats into the database (cap at max_new_per_cycle)
-    let mut harvested = 0u32;
-    for (addr, stats) in stats_map.iter().take(config.max_new_per_cycle) {
-        match wallet_repo
-            .accumulate_features(
-                addr,
+    // 3. Acquire semaphore before DB writes (steps 3 + 4)
+    let _permit = db_semaphore.acquire().await.expect("semaphore closed");
+    debug!("Wallet harvester acquired DB semaphore permit");
+
+    // Accumulate stats into the database in a single batch UPSERT (cap at max_new_per_cycle)
+    let batch_rows: Vec<_> = stats_map
+        .iter()
+        .take(config.max_new_per_cycle)
+        .map(|(addr, stats)| {
+            (
+                addr.clone(),
                 stats.trade_count,
                 stats.total_volume,
                 stats.first_seen,
                 stats.last_seen,
             )
-            .await
-        {
-            Ok(()) => harvested += 1,
-            Err(e) => {
-                warn!(address = %addr, error = %e, "Failed to accumulate wallet features");
-            }
+        })
+        .collect();
+
+    let harvested = match wallet_repo.accumulate_features_batch(&batch_rows).await {
+        Ok(rows) => rows as u32,
+        Err(e) => {
+            warn!(error = %e, "Failed to batch-accumulate wallet features");
+            0
         }
-    }
+    };
 
     // 4. Store trades in bulk batches (50 per INSERT) to reduce pool pressure
     let mut trades_inserted = 0u32;
@@ -255,6 +270,10 @@ async fn harvest_cycle(
             }
         }
     }
+
+    // Release semaphore — all DB writes done
+    drop(_permit);
+    debug!("Wallet harvester released DB semaphore permit");
 
     info!(
         harvested = harvested,

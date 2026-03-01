@@ -2,7 +2,7 @@
 
 use crate::types::{BotScore, WalletClassification, WalletFeatures};
 use crate::Result;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, QueryBuilder, Row};
 
 /// Repository for wallet analysis data.
 pub struct WalletRepository {
@@ -105,6 +105,53 @@ impl WalletRepository {
         .await?;
 
         Ok(())
+    }
+
+    /// Accumulate wallet features for multiple wallets in a single multi-row UPSERT.
+    ///
+    /// This replaces N sequential `accumulate_features` calls with a single query,
+    /// dramatically reducing pool pressure during harvest cycles.
+    #[allow(clippy::type_complexity)]
+    pub async fn accumulate_features_batch(
+        &self,
+        rows: &[(
+            String,
+            i64,
+            rust_decimal::Decimal,
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        )],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let mut query_builder: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO wallet_features (address, total_trades, total_volume, first_trade, last_trade) ",
+        );
+
+        query_builder.push_values(
+            rows,
+            |mut b, (address, trade_count, total_volume, first_trade, last_trade)| {
+                b.push_bind(address)
+                    .push_bind(trade_count)
+                    .push_bind(total_volume)
+                    .push_bind(first_trade)
+                    .push_bind(last_trade);
+            },
+        );
+
+        query_builder.push(
+            " ON CONFLICT (address) DO UPDATE SET \
+                total_trades = wallet_features.total_trades + EXCLUDED.total_trades, \
+                total_volume = wallet_features.total_volume + EXCLUDED.total_volume, \
+                first_trade = LEAST(wallet_features.first_trade, EXCLUDED.first_trade), \
+                last_trade = GREATEST(wallet_features.last_trade, EXCLUDED.last_trade), \
+                updated_at = NOW()",
+        );
+
+        let result = query_builder.build().execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 
     /// Insert a bot score.

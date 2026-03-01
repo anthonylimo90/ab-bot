@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::time;
 use tracing::{debug, error, info, warn};
 use wallet_tracker::profitability::{ProfitabilityAnalyzer, TimePeriod};
@@ -70,6 +70,8 @@ pub struct MetricsCalculator {
     analyzer: Arc<ProfitabilityAnalyzer>,
     /// Shared market regime state, updated each cycle.
     regime_state: Option<Arc<RwLock<MarketRegime>>>,
+    /// Shared semaphore to coordinate heavy DB tasks.
+    db_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl MetricsCalculator {
@@ -81,6 +83,7 @@ impl MetricsCalculator {
             config,
             analyzer,
             regime_state: None,
+            db_semaphore: None,
         }
     }
 
@@ -96,7 +99,14 @@ impl MetricsCalculator {
             config,
             analyzer,
             regime_state: Some(regime_state),
+            db_semaphore: None,
         }
+    }
+
+    /// Attach a shared DB semaphore for backpressure coordination.
+    pub fn with_db_semaphore(mut self, semaphore: Arc<Semaphore>) -> Self {
+        self.db_semaphore = Some(semaphore);
+        self
     }
 
     /// Compute metrics for a single wallet address (for on-demand recomputation).
@@ -163,6 +173,15 @@ impl MetricsCalculator {
 
     /// Calculate metrics for a batch of wallets.
     async fn calculate_batch(&self) -> Result<()> {
+        // Acquire semaphore permit before heavy DB work (if configured)
+        let _permit = if let Some(ref sem) = self.db_semaphore {
+            let permit = sem.acquire().await.expect("semaphore closed");
+            debug!("Metrics calculator acquired DB semaphore permit");
+            Some(permit)
+        } else {
+            None
+        };
+
         let start_time = Utc::now();
         debug!("Starting metrics calculation cycle");
 
@@ -182,8 +201,8 @@ impl MetricsCalculator {
         let mut success_count = 0;
         let mut error_count = 0;
 
-        for address in wallets {
-            match self.calculate_wallet_metrics(&address).await {
+        for (i, address) in wallets.iter().enumerate() {
+            match self.calculate_wallet_metrics(address).await {
                 Ok(_) => {
                     success_count += 1;
                     debug!(address = %address, "Successfully calculated metrics");
@@ -193,7 +212,16 @@ impl MetricsCalculator {
                     warn!(address = %address, error = %e, "Failed to calculate metrics");
                 }
             }
+
+            // Yield every 5 wallets to let other tasks acquire pool connections
+            if (i + 1) % 5 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
+
+        // Release permit before the lighter classification + regime work
+        drop(_permit);
+        debug!("Metrics calculator released DB semaphore permit");
 
         let duration = (Utc::now() - start_time).num_seconds();
         info!(

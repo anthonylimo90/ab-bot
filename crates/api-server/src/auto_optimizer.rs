@@ -505,6 +505,10 @@ pub struct AutoOptimizer {
     event_sender: Option<mpsc::Sender<AutomationEvent>>,
     trade_monitor: Option<Arc<TradeMonitor>>,
     copy_trader: Option<Arc<RwLock<CopyTrader>>>,
+    /// Shared semaphore to coordinate heavy DB tasks.
+    db_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Semaphore to bound concurrent per-wallet metric recompute spawns.
+    recompute_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for AutoOptimizer {
@@ -522,6 +526,8 @@ impl AutoOptimizer {
             event_sender: None,
             trade_monitor: None,
             copy_trader: None,
+            db_semaphore: None,
+            recompute_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 
@@ -533,6 +539,8 @@ impl AutoOptimizer {
             event_sender: None,
             trade_monitor: None,
             copy_trader: None,
+            db_semaphore: None,
+            recompute_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 
@@ -546,9 +554,17 @@ impl AutoOptimizer {
                 event_sender: Some(tx),
                 trade_monitor: None,
                 copy_trader: None,
+                db_semaphore: None,
+                recompute_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             },
             rx,
         )
+    }
+
+    /// Attach a shared DB semaphore for backpressure coordination.
+    pub fn with_db_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.db_semaphore = Some(semaphore);
+        self
     }
 
     /// Attach live runtime handles so optimizer mutations can sync monitor/trader state.
@@ -653,6 +669,15 @@ impl AutoOptimizer {
 
     /// Run optimization for all eligible workspaces.
     pub async fn run_scheduled_optimizations(&self) -> anyhow::Result<()> {
+        // Acquire semaphore permit before heavy DB work (if configured)
+        let _permit = if let Some(ref sem) = self.db_semaphore {
+            let permit = sem.acquire().await.expect("semaphore closed");
+            debug!("Auto-optimizer acquired DB semaphore permit");
+            Some(permit)
+        } else {
+            None
+        };
+
         info!("Starting auto-optimization cycle");
 
         let workspaces = self.get_eligible_workspaces().await?;
@@ -676,6 +701,9 @@ impl AutoOptimizer {
         self.process_grace_period_expirations().await?;
 
         self.reconcile_runtime_if_attached().await?;
+
+        drop(_permit);
+        debug!("Auto-optimizer released DB semaphore permit");
 
         info!("Auto-optimization cycle complete");
         Ok(())
@@ -2373,9 +2401,18 @@ impl AutoOptimizer {
         // Trigger immediate single-wallet metric recompute for faster feedback.
         // This updates wallet_success_metrics so the next optimization cycle
         // has fresh data instead of waiting up to 1 hour for the batch job.
+        // Bounded by a semaphore (max 2 concurrent) to avoid pool exhaustion.
         let pool = self.pool.clone();
         let address = wallet_address.to_string();
+        let recompute_sem = self.recompute_semaphore.clone();
         tokio::spawn(async move {
+            let Ok(_permit) = recompute_sem.try_acquire() else {
+                info!(
+                    address = %address,
+                    "Skipping metric recompute — max concurrent recomputes reached"
+                );
+                return;
+            };
             let config = crate::metrics_calculator::MetricsCalculatorConfig {
                 enabled: true,
                 ..Default::default()
