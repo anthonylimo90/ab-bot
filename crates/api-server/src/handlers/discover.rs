@@ -233,7 +233,7 @@ pub async fn get_live_trades(
         .get_recent_trades(query.limit as u32, None)
         .await
     {
-        Ok(clob_trades) => {
+        Ok((clob_trades, _next_offset)) => {
             let min_val = query.min_value.unwrap_or(Decimal::ZERO);
             let trades: Vec<LiveTrade> = clob_trades
                 .into_iter()

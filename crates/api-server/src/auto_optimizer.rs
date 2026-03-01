@@ -730,6 +730,47 @@ impl AutoOptimizer {
         Ok(workspaces)
     }
 
+    /// Refresh backtest metrics for active wallets from the latest wallet_success_metrics.
+    ///
+    /// Without this, `backtest_roi` / `backtest_sharpe` / `backtest_win_rate` are frozen
+    /// at promotion time, making demotion checks stale. This syncs them each optimizer cycle.
+    async fn refresh_active_wallet_metrics(&self, workspace_id: Uuid) -> anyhow::Result<()> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE workspace_wallet_allocations wwa
+            SET
+                backtest_roi = CASE
+                    WHEN ABS(COALESCE(wsm.roi_30d, 0)) > 1 THEN wsm.roi_30d / 100
+                    ELSE wsm.roi_30d
+                END,
+                backtest_sharpe = wsm.sharpe_30d,
+                backtest_win_rate = CASE
+                    WHEN ABS(COALESCE(wsm.win_rate_30d, 0)) > 1 THEN wsm.win_rate_30d / 100
+                    ELSE wsm.win_rate_30d
+                END,
+                updated_at = NOW()
+            FROM wallet_success_metrics wsm
+            WHERE LOWER(wwa.wallet_address) = LOWER(wsm.address)
+              AND wwa.workspace_id = $1
+              AND wwa.tier = 'active'
+              AND wsm.roi_30d IS NOT NULL
+            "#,
+        )
+        .bind(workspace_id)
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() > 0 {
+            debug!(
+                workspace_id = %workspace_id,
+                updated = updated.rows_affected(),
+                "Refreshed backtest metrics for active wallets"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Get settings for a specific workspace.
     async fn get_workspace_settings(
         &self,
@@ -776,7 +817,12 @@ impl AutoOptimizer {
         let auto_select = workspace.auto_select_enabled.unwrap_or(true);
         let auto_demote = workspace.auto_demote_enabled.unwrap_or(true);
 
-        // Get current allocations
+        // Step 0: Refresh backtest metrics for active wallets from wallet_success_metrics.
+        // These are frozen at promotion time and never updated otherwise, so demotion
+        // checks operate on stale data.
+        self.refresh_active_wallet_metrics(workspace.id).await?;
+
+        // Get current allocations (with freshly updated metrics)
         let current = self.get_current_allocations(workspace.id).await?;
         let active_wallets: Vec<_> = current.iter().filter(|a| a.tier == "active").collect();
         let _active_count = active_wallets.len();
@@ -1054,8 +1100,39 @@ impl AutoOptimizer {
             }
         }
 
-        // Inactivity check - would need last_trade_at from wallet metrics
-        // This would typically be checked via a join with wallet_success_metrics
+        // Inactivity check: query wallet_features.last_trade for actual on-chain recency.
+        // If the wallet hasn't traded in `inactivity_days`, demote immediately.
+        let inactivity_days = workspace.inactivity_days.unwrap_or(14) as i64;
+        let last_trade_row: Option<(Option<chrono::DateTime<Utc>>,)> = sqlx::query_as(
+            r#"
+            SELECT last_trade
+            FROM wallet_features
+            WHERE LOWER(address) = LOWER($1)
+            "#,
+        )
+        .bind(&allocation.wallet_address)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        if let Some((Some(last_trade),)) = last_trade_row {
+            let days_since = (Utc::now() - last_trade).num_days();
+            if days_since >= inactivity_days {
+                info!(
+                    wallet = %allocation.wallet_address,
+                    days_since_last_trade = days_since,
+                    inactivity_threshold = inactivity_days,
+                    "Wallet dormant — no on-chain trades, triggering inactivity demotion"
+                );
+                return Ok(Some(DemotionTrigger::Inactivity));
+            }
+        } else {
+            // No wallet_features record at all — treat as inactive if we have no data
+            warn!(
+                wallet = %allocation.wallet_address,
+                "No wallet_features record found — cannot verify trade recency"
+            );
+        }
 
         Ok(None)
     }
@@ -1475,9 +1552,11 @@ impl AutoOptimizer {
                 min_trades: (base.min_trades / 3).max(3),
                 max_drawdown: (base.max_drawdown + 0.20).min(0.70),
             },
+            // Catch-all: maximum relaxation — allow zero-sharpe wallets when nothing
+            // else qualifies. The ranking system penalizes low sharpe via sharpe_score.
             _ => CandidateThresholds {
                 min_roi: (base.min_roi - 0.10).max(-0.25),
-                min_sharpe: (base.min_sharpe - 0.50).max(0.0),
+                min_sharpe: 0.0, // was (base - 0.50).max(0.0) — now allows zero-sharpe
                 min_win_rate: (base.min_win_rate - 0.15).max(0.40),
                 min_trades: 1,
                 max_drawdown: (base.max_drawdown + 0.30).min(0.80),
@@ -1524,7 +1603,7 @@ impl AutoOptimizer {
                             THEN COALESCE(wsm.max_drawdown_30d, 0.2) / 100
                         ELSE COALESCE(wsm.max_drawdown_30d, 0.2)
                     END AS max_drawdown_30d,
-                    COALESCE(wsm.last_computed, wf.last_trade, NOW()) AS last_trade_at,
+                    COALESCE(wf.last_trade, wsm.last_computed, NOW()) AS last_trade_at,
                     -- Recency-adjusted ROI: blend 30d (70%) and 90d (30%) metrics
                     (0.70 * COALESCE(
                         CASE WHEN ABS(COALESCE(wsm.roi_30d, 0)) > 1 THEN wsm.roi_30d / 100 ELSE COALESCE(wsm.roi_30d, 0) END,
@@ -1533,14 +1612,16 @@ impl AutoOptimizer {
                         CASE WHEN ABS(COALESCE(wsm.roi_90d, wsm.roi_30d, 0)) > 1 THEN COALESCE(wsm.roi_90d, wsm.roi_30d, 0) / 100 ELSE COALESCE(wsm.roi_90d, wsm.roi_30d, 0) END,
                         0
                     )) AS recency_adjusted_roi,
-                    -- Staleness: days since last data update
+                    -- Staleness: days since last actual trade (not metrics computation)
                     (
-                        EXTRACT(EPOCH FROM (NOW() - COALESCE(wsm.last_computed, wf.last_trade, NOW())))
+                        EXTRACT(EPOCH FROM (NOW() - COALESCE(wf.last_trade, wsm.last_computed, NOW())))
                         / 86400.0
                     )::FLOAT8 AS staleness_days
                 FROM wallet_success_metrics wsm
                 FULL OUTER JOIN wallet_features wf ON wf.address = wsm.address
                 WHERE COALESCE(wsm.address, wf.address) IS NOT NULL
+                  -- Exclude wallets with no trade activity in 30 days
+                  AND COALESCE(wf.last_trade, wsm.last_computed) >= NOW() - INTERVAL '30 days'
             ),
             copy_performance AS (
                 SELECT

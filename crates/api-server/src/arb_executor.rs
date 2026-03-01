@@ -115,6 +115,8 @@ struct OutcomeTokenCache {
     /// Shared set of active (non-resolved) market IDs, populated on each refresh.
     /// Copy trading monitor reads this to skip resolved markets before hitting CLOB.
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
+    /// Database pool for persisting token→condition_id mappings.
+    pool: Option<PgPool>,
 }
 
 impl OutcomeTokenCache {
@@ -126,7 +128,13 @@ impl OutcomeTokenCache {
             clob_client,
             tokens: RwLock::new(HashMap::new()),
             active_clob_markets,
+            pool: None,
         }
+    }
+
+    fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Refresh the cache by fetching all markets from the CLOB API.
@@ -134,6 +142,8 @@ impl OutcomeTokenCache {
         let markets = self.clob_client.get_markets().await?;
         let mut map = HashMap::new();
         let mut active_set = HashSet::new();
+        // Collect token_id → condition_id mappings for DB cache
+        let mut token_condition_pairs: Vec<(String, String)> = Vec::new();
 
         for market in &markets {
             if !market.resolved {
@@ -143,6 +153,8 @@ impl OutcomeTokenCache {
                 // match the active set.
                 for outcome in &market.outcomes {
                     active_set.insert(outcome.token_id.clone());
+                    // Map token_id → condition_id (market.id) for the DB cache
+                    token_condition_pairs.push((outcome.token_id.clone(), market.id.clone()));
                 }
             }
             if market.outcomes.len() == 2 {
@@ -165,7 +177,49 @@ impl OutcomeTokenCache {
         let active_set_size = active_set.len();
         *self.tokens.write().await = map;
         *self.active_clob_markets.write().await = active_set;
+
+        // Batch UPSERT token→condition_id mappings to DB for copy trading resolution
+        if let Some(ref pool) = self.pool {
+            if let Err(e) = Self::upsert_token_condition_cache(pool, &token_condition_pairs).await {
+                warn!(error = %e, "Failed to update token_condition_cache");
+            } else {
+                debug!(
+                    pairs = token_condition_pairs.len(),
+                    "Updated token_condition_cache"
+                );
+            }
+        }
+
         Ok((count, active_set_size))
+    }
+
+    /// Batch UPSERT token→condition_id mappings into the database cache.
+    async fn upsert_token_condition_cache(
+        pool: &PgPool,
+        pairs: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        // Batch in chunks of 500 to stay under PostgreSQL parameter limits
+        const BATCH_SIZE: usize = 500;
+        for chunk in pairs.chunks(BATCH_SIZE) {
+            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+                "INSERT INTO token_condition_cache (token_id, condition_id, updated_at) ",
+            );
+            qb.push_values(chunk, |mut b, (token_id, condition_id)| {
+                b.push_bind(token_id)
+                    .push_bind(condition_id)
+                    .push_bind(chrono::Utc::now());
+            });
+            qb.push(
+                " ON CONFLICT (token_id) DO UPDATE SET condition_id = EXCLUDED.condition_id, updated_at = EXCLUDED.updated_at",
+            );
+            qb.build().execute(pool).await?;
+        }
+
+        Ok(())
     }
 
     /// Look up token IDs for a given market.
@@ -213,8 +267,8 @@ impl ArbAutoExecutor {
             order_executor,
             circuit_breaker,
             pool: pool.clone(),
-            position_repo: PositionRepository::new(pool),
-            token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets),
+            position_repo: PositionRepository::new(pool.clone()),
+            token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool),
             active_markets,
             heartbeat,
         }

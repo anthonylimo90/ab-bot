@@ -172,8 +172,17 @@ impl ProfitabilityAnalyzer {
             0.0
         };
 
-        // Calculate risk metrics
-        let sharpe = self.calculate_sharpe_ratio(&daily_returns);
+        // Calculate risk metrics — prefer daily returns for Sharpe when enough data points
+        // exist (>= 2 unique trading days), otherwise fall back to per-trade returns which
+        // work even when trades are concentrated in 1-2 days.
+        let daily_sharpe = self.calculate_sharpe_ratio(&daily_returns);
+        let sharpe = if daily_sharpe == 0.0 {
+            // Daily returns had < 2 data points — use per-trade calculation
+            let trade_returns = self.calculate_trade_returns(&trades);
+            self.calculate_trade_sharpe(&trade_returns)
+        } else {
+            daily_sharpe
+        };
         let sortino = self.calculate_sortino_ratio(&daily_returns);
         let (max_dd, dd_duration) = self.calculate_max_drawdown(&daily_returns);
         let volatility = self.calculate_volatility(&daily_returns);
@@ -600,6 +609,57 @@ impl ProfitabilityAnalyzer {
         (excess_return / std_dev) * (365.0_f64).sqrt()
     }
 
+    /// Calculate per-trade returns using a rolling capital model.
+    ///
+    /// Unlike `calculate_daily_returns` which groups by calendar day (yielding too few
+    /// data points for wallets that concentrate trades in 1-2 days), this computes the
+    /// return percentage for each individual trade against a rolling capital base.
+    fn calculate_trade_returns(&self, trades: &[TradeRecord]) -> Vec<f64> {
+        if trades.is_empty() {
+            return vec![];
+        }
+
+        let initial_capital = self.estimate_initial_capital(trades);
+        let capital_f64 = initial_capital.to_f64().unwrap_or(1000.0).max(1.0);
+        let mut running_capital = capital_f64;
+
+        trades
+            .iter()
+            .filter_map(|t| {
+                let pnl = t.pnl?.to_f64()?;
+                let ret = pnl / running_capital.max(1.0);
+                running_capital += pnl;
+                Some(ret)
+            })
+            .collect()
+    }
+
+    /// Calculate Sharpe ratio from per-trade returns.
+    ///
+    /// Uses individual trade returns instead of daily aggregation, making it meaningful
+    /// even when all trades happen on 1-2 calendar days. Requires at least 5 trades
+    /// for statistical significance.
+    fn calculate_trade_sharpe(&self, trade_returns: &[f64]) -> f64 {
+        if trade_returns.len() < 5 {
+            return 0.0;
+        }
+
+        let data = Data::new(trade_returns.to_vec());
+        let mean_return = data.mean().unwrap_or(0.0);
+        let std_dev = data.std_dev().unwrap_or(1.0);
+
+        if std_dev == 0.0 {
+            return 0.0;
+        }
+
+        // Scale to annualized assuming ~2 trades/day average
+        let trades_per_year = 365.0 * 2.0;
+        let rf_per_trade = self.risk_free_rate / trades_per_year;
+        let excess = mean_return - rf_per_trade;
+
+        (excess / std_dev) * trades_per_year.sqrt()
+    }
+
     fn calculate_sortino_ratio(&self, returns: &[DailyReturn]) -> f64 {
         if returns.len() < 2 {
             return 0.0;
@@ -741,13 +801,26 @@ impl ProfitabilityAnalyzer {
     }
 
     fn estimate_initial_capital(&self, trades: &[TradeRecord]) -> Decimal {
-        // Estimate based on first few trades
-        trades
+        // Use total buy value as denominator (actual capital deployed).
+        // This is more accurate than max(first 5 trades) since it reflects
+        // the wallet's true capital commitment.
+        let total_buy_value: Decimal = trades
             .iter()
-            .take(5)
+            .filter(|t| t.side == TradeSide::Buy)
             .map(|t| t.quantity * t.entry_price)
-            .max()
-            .unwrap_or(Decimal::new(1000, 0))
+            .sum();
+
+        if total_buy_value > Decimal::ZERO {
+            total_buy_value
+        } else {
+            // Fallback: max single position size from first few trades
+            trades
+                .iter()
+                .take(5)
+                .map(|t| t.quantity * t.entry_price)
+                .max()
+                .unwrap_or(Decimal::new(1000, 0))
+        }
     }
 
     fn empty_metrics(&self, address: &str, period: TimePeriod) -> WalletMetrics {
@@ -1145,8 +1218,8 @@ mod tests {
         ];
 
         let capital = analyzer.estimate_initial_capital(&trades);
-        // max(200*0.50, 500*0.80) = max(100, 400) = 400
-        assert_eq!(capital, Decimal::new(400, 0));
+        // total buy value = (200*0.50) + (500*0.80) = 100 + 400 = 500
+        assert_eq!(capital, Decimal::new(500, 0));
     }
 
     #[tokio::test]

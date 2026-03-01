@@ -204,16 +204,20 @@ impl ClobClient {
     ///
     /// Note: Switched from CLOB API to Data API because CLOB /trades endpoint
     /// now requires authentication.
+    /// Fetch recent trades from the Data API with offset-based pagination.
+    ///
+    /// Returns the trades and the next offset for pagination (current offset + trade count).
+    /// Pass `None` for the first page, then feed the returned offset back for subsequent pages.
     pub async fn get_recent_trades(
         &self,
         limit: u32,
-        cursor: Option<&str>,
-    ) -> Result<Vec<ClobTrade>> {
+        cursor: Option<u64>,
+    ) -> Result<(Vec<ClobTrade>, Option<u64>)> {
         // Use Data API instead of CLOB API - it's public and doesn't require auth
         let data_api_url = "https://data-api.polymarket.com";
         let mut url = format!("{}/trades?limit={}", data_api_url, limit);
-        if let Some(c) = cursor {
-            url.push_str(&format!("&offset={}", c));
+        if let Some(offset) = cursor {
+            url.push_str(&format!("&offset={}", offset));
         }
 
         let response = self.get_with_retry(&url).await?;
@@ -221,7 +225,17 @@ impl ClobClient {
 
         // Data API returns trades as a top-level array
         match serde_json::from_str::<Vec<ClobTrade>>(&text) {
-            Ok(trades) => Ok(trades),
+            Ok(trades) => {
+                let count = trades.len() as u64;
+                let next_offset = if count >= limit as u64 {
+                    // More pages likely available
+                    Some(cursor.unwrap_or(0) + count)
+                } else {
+                    // Last page — fewer results than requested
+                    None
+                };
+                Ok((trades, next_offset))
+            }
             Err(e) => {
                 let preview = if text.len() > 500 {
                     &text[..500]
@@ -252,7 +266,7 @@ impl ClobClient {
     ) -> Result<Vec<ClobTrade>> {
         let data_api_url = "https://data-api.polymarket.com";
         let url = format!(
-            "{}/activity?user={}&limit={}",
+            "{}/activity?user={}&limit={}&type=TRADE",
             data_api_url, wallet_address, limit
         );
 
@@ -290,6 +304,64 @@ impl ClobClient {
                 })
             }
         }
+    }
+
+    /// Fetch full trade history for a wallet using offset-based pagination.
+    ///
+    /// Used by the discovery/enrichment path (not the real-time monitor, which only
+    /// needs recent trades). Fetches up to `max_pages` pages of `limit` trades each.
+    pub async fn get_wallet_activity_paginated(
+        &self,
+        wallet_address: &str,
+        limit: u32,
+        max_pages: usize,
+    ) -> Result<Vec<ClobTrade>> {
+        let data_api_url = "https://data-api.polymarket.com";
+        let mut all_trades = Vec::new();
+        let mut offset: u64 = 0;
+
+        for page in 0..max_pages {
+            let url = format!(
+                "{}/activity?user={}&limit={}&type=TRADE&offset={}",
+                data_api_url, wallet_address, limit, offset
+            );
+
+            let response = self.get_with_retry(&url).await?;
+            let text = response.text().await?;
+
+            match serde_json::from_str::<Vec<ActivityEntry>>(&text) {
+                Ok(entries) => {
+                    let trades: Vec<ClobTrade> = entries
+                        .into_iter()
+                        .filter_map(|e| e.into_clob_trade())
+                        .collect();
+                    let count = trades.len();
+                    all_trades.extend(trades);
+
+                    if count < limit as usize {
+                        // Last page
+                        break;
+                    }
+                    offset += limit as u64;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        wallet = %wallet_address,
+                        page,
+                        "Could not parse wallet activity page"
+                    );
+                    break;
+                }
+            }
+        }
+
+        debug!(
+            wallet = %wallet_address,
+            total_trades = all_trades.len(),
+            "Fetched paginated wallet activity"
+        );
+        Ok(all_trades)
     }
 
     /// Subscribe to real-time order book updates via WebSocket.

@@ -21,19 +21,22 @@ pub struct WalletHarvesterConfig {
     pub enabled: bool,
     /// Interval between harvest cycles in seconds.
     pub interval_secs: u64,
-    /// Number of trades to fetch per cycle.
+    /// Number of trades to fetch per page.
     pub trades_per_fetch: u32,
     /// Maximum new wallets to analyze per cycle.
     pub max_new_per_cycle: usize,
+    /// Number of pages to fetch per cycle (pagination depth).
+    pub pages_per_cycle: usize,
 }
 
 impl Default for WalletHarvesterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 300,
-            trades_per_fetch: 1000, // was 500 — more data per cycle for faster discovery
-            max_new_per_cycle: 50,
+            interval_secs: 120,     // was 300 — faster discovery cycles
+            trades_per_fetch: 1000, // per page
+            max_new_per_cycle: 200, // was 50 — process more wallets per cycle
+            pages_per_cycle: 3,     // fetch up to 3 pages (3000 trades)
         }
     }
 }
@@ -48,7 +51,7 @@ impl WalletHarvesterConfig {
             interval_secs: std::env::var("HARVESTER_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+                .unwrap_or(120),
             trades_per_fetch: std::env::var("HARVESTER_TRADES_PER_FETCH")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -56,7 +59,11 @@ impl WalletHarvesterConfig {
             max_new_per_cycle: std::env::var("HARVESTER_MAX_NEW_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(50),
+                .unwrap_or(200),
+            pages_per_cycle: std::env::var("HARVESTER_PAGES_PER_CYCLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
         }
     }
 }
@@ -85,6 +92,7 @@ pub fn spawn_wallet_harvester(
         interval_secs = config.interval_secs,
         trades_per_fetch = config.trades_per_fetch,
         max_new = config.max_new_per_cycle,
+        pages_per_cycle = config.pages_per_cycle,
         "Spawning wallet harvester"
     );
 
@@ -102,12 +110,23 @@ async fn harvester_loop(
     let wallet_repo = WalletRepository::new(pool.clone());
     let interval = Duration::from_secs(config.interval_secs);
 
+    // Persist cursor across cycles so each cycle fetches a NEW page of trades
+    let mut last_offset: Option<u64> = None;
+
     // Initial delay to let the server finish starting up
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let mut first_cycle = true;
     loop {
-        match harvest_cycle(&config, &clob_client, &wallet_repo, &db_semaphore).await {
+        match harvest_cycle(
+            &config,
+            &clob_client,
+            &wallet_repo,
+            &db_semaphore,
+            &mut last_offset,
+        )
+        .await
+        {
             Ok(trade_count) => {
                 if first_cycle {
                     if trade_count > 0 {
@@ -128,6 +147,8 @@ async fn harvester_loop(
                     warn!("First harvest cycle failed — Data API may be unreachable");
                     first_cycle = false;
                 }
+                // Reset cursor on error to avoid getting stuck on a bad offset
+                last_offset = None;
             }
         }
 
@@ -140,25 +161,53 @@ async fn harvest_cycle(
     clob_client: &ClobClient,
     wallet_repo: &WalletRepository,
     db_semaphore: &Semaphore,
+    last_offset: &mut Option<u64>,
 ) -> anyhow::Result<usize> {
-    // 1. Fetch recent trades from CLOB (no semaphore — this is network I/O, not DB work)
-    let trades = clob_client
-        .get_recent_trades(config.trades_per_fetch, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("CLOB trade fetch failed: {}", e))?;
+    // 1. Fetch recent trades from Data API with pagination (no semaphore — this is network I/O)
+    let mut all_trades = Vec::new();
+    let mut current_offset = *last_offset;
 
-    if trades.is_empty() {
+    for page in 0..config.pages_per_cycle {
+        let (trades, next_offset) = clob_client
+            .get_recent_trades(config.trades_per_fetch, current_offset)
+            .await
+            .map_err(|e| anyhow::anyhow!("CLOB trade fetch failed (page {}): {}", page, e))?;
+
+        let page_count = trades.len();
+        all_trades.extend(trades);
+
+        if let Some(next) = next_offset {
+            current_offset = Some(next);
+        } else {
+            // No more pages — reset cursor for next cycle
+            current_offset = None;
+            break;
+        }
+
+        if page_count < config.trades_per_fetch as usize {
+            // Partial page — no more data available
+            current_offset = None;
+            break;
+        }
+    }
+
+    // Advance cursor for next cycle
+    *last_offset = current_offset;
+
+    if all_trades.is_empty() {
         info!("No trades returned from Data API this cycle");
+        // Reset offset when API returns nothing — likely wrapped around
+        *last_offset = None;
         return Ok(0);
     }
 
-    let trade_count = trades.len();
+    let trade_count = all_trades.len();
 
     // 2. Aggregate per-wallet stats from the trade batch (in-memory, no DB)
     let mut stats_map: HashMap<String, WalletTradeStats> = HashMap::new();
     let now = chrono::Utc::now();
 
-    for trade in &trades {
+    for trade in &all_trades {
         // Data API returns f64 for price and size
         let price = Decimal::from_f64_retain(trade.price).unwrap_or(Decimal::ZERO);
         let size = Decimal::from_f64_retain(trade.size).unwrap_or(Decimal::ZERO);
@@ -193,13 +242,16 @@ async fn harvest_cycle(
     let _permit = db_semaphore.acquire().await.expect("semaphore closed");
     debug!("Wallet harvester acquired DB semaphore permit");
 
-    // Accumulate stats into the database in a single batch UPSERT (cap at max_new_per_cycle)
-    let batch_rows: Vec<_> = stats_map
+    // Sort by last_seen DESC (most recently active wallets first) before truncating
+    let mut sorted_wallets: Vec<_> = stats_map.iter().collect();
+    sorted_wallets.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+
+    let batch_rows: Vec<_> = sorted_wallets
         .iter()
         .take(config.max_new_per_cycle)
         .map(|(addr, stats)| {
             (
-                addr.clone(),
+                (*addr).clone(),
                 stats.trade_count,
                 stats.total_volume,
                 stats.first_seen,
@@ -207,6 +259,17 @@ async fn harvest_cycle(
             )
         })
         .collect();
+
+    // Warn when batch cap is hit — indicates we're truncating useful data
+    if stats_map.len() > config.max_new_per_cycle {
+        warn!(
+            unique_wallets = stats_map.len(),
+            batch_cap = config.max_new_per_cycle,
+            dropped = stats_map.len() - config.max_new_per_cycle,
+            "Batch cap reached — {} wallets dropped (consider raising HARVESTER_MAX_NEW_PER_CYCLE)",
+            stats_map.len() - config.max_new_per_cycle
+        );
+    }
 
     let harvested = match wallet_repo.accumulate_features_batch(&batch_rows).await {
         Ok(rows) => rows as u32,
@@ -218,7 +281,7 @@ async fn harvest_cycle(
 
     // 4. Store trades in bulk batches (50 per INSERT) to reduce pool pressure
     let mut trades_inserted = 0u32;
-    let valid_trades: Vec<_> = trades
+    let valid_trades: Vec<_> = all_trades
         .iter()
         .filter_map(|trade| {
             let wallet_addr = trade.wallet_address.to_lowercase();
@@ -280,6 +343,8 @@ async fn harvest_cycle(
         total_clob_trades = trade_count,
         unique_addresses = stats_map.len(),
         trades_inserted = trades_inserted,
+        pages_fetched = config.pages_per_cycle,
+        cursor_offset = ?last_offset,
         "Harvested {} new wallets from {} trades ({} trades stored)",
         harvested,
         trade_count,
