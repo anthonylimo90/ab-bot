@@ -255,6 +255,9 @@ impl TradeMonitor {
 
     async fn monitoring_loop(&self) {
         let mut poll_interval = interval(Duration::from_secs(self.config.poll_interval_secs));
+        let mut cycle_count: u64 = 0;
+        // Log every 4 cycles (~1 minute at 15s intervals)
+        let health_log_interval: u64 = 4;
 
         loop {
             poll_interval.tick().await;
@@ -263,13 +266,28 @@ impl TradeMonitor {
                 break;
             }
 
+            cycle_count += 1;
+
             match self.poll_all_wallets().await {
                 Ok(trades) => {
-                    for trade in trades {
-                        if trade.is_significant(self.config.min_trade_value)
-                            && self.trade_tx.send(trade).is_err()
-                        {
-                            warn!("No subscribers for trade notifications");
+                    if trades.is_empty() {
+                        // Log health summary periodically when no trades are found,
+                        // making pipeline starvation visible in production logs.
+                        if cycle_count % health_log_interval == 0 {
+                            let wallet_count = self.monitored_wallets.read().await.len();
+                            info!(
+                                wallets = wallet_count,
+                                cycle = cycle_count,
+                                "Trade monitor poll: no new trades"
+                            );
+                        }
+                    } else {
+                        for trade in trades {
+                            if trade.is_significant(self.config.min_trade_value)
+                                && self.trade_tx.send(trade).is_err()
+                            {
+                                warn!("No subscribers for trade notifications");
+                            }
                         }
                     }
                 }
@@ -295,12 +313,20 @@ impl TradeMonitor {
         let wallet_list: Vec<String> = wallets.iter().cloned().collect();
         drop(wallets);
 
-        // Poll all wallets concurrently
+        // Poll wallets with bounded concurrency to avoid 429 rate limits at scale.
+        // Semaphore limits to 5 concurrent API calls.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
         let futures: Vec<_> = wallet_list
             .iter()
             .map(|addr| {
-                self.clob_client
-                    .get_wallet_activity(addr, self.config.wallet_activity_limit)
+                let sem = semaphore.clone();
+                let client = self.clob_client.clone();
+                let address = addr.clone();
+                let limit = self.config.wallet_activity_limit;
+                async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
+                    client.get_wallet_activity(&address, limit).await
+                }
             })
             .collect();
         let results = futures_util::future::join_all(futures).await;

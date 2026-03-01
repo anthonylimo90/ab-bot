@@ -6,7 +6,8 @@ use polymarket_core::api::PolygonClient;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use tracing::info;
+use std::collections::HashMap;
+use tracing::{info, warn};
 
 /// Criteria for discovering wallets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,13 +34,13 @@ impl Default for DiscoveryCriteria {
     fn default() -> Self {
         Self {
             min_trades: 30,                    // 30+ trades for statistical significance (was 10)
-            min_win_rate: 0.60,                // 60%+ net-positive after fees (was 0.52)
+            min_win_rate: 0.52, // 52%+ — lower bar to find more candidates (was 0.60)
             min_volume: Decimal::new(5000, 0), // $5,000+ volume (was $500)
-            time_window_days: 90,              // 90-day window for longer track record (was 30)
-            exclude_bots: true,                // Exclude bots by default (was false)
-            min_roi: Some(0.10),               // 10%+ ROI (was 2%)
-            limit: 50,                         // Focus on top 50 (was 100)
-            max_staleness_days: 60,            // Reject wallets inactive > 60 days
+            time_window_days: 90, // 90-day window for longer track record (was 30)
+            exclude_bots: true, // Exclude bots by default (was false)
+            min_roi: Some(0.10), // 10%+ ROI (was 2%)
+            limit: 50,          // Focus on top 50 (was 100)
+            max_staleness_days: 14, // Reject wallets inactive > 14 days (was 60)
         }
     }
 }
@@ -220,11 +221,41 @@ impl WalletDiscovery {
         // Query wallet features from database
         let wallets = self.query_wallet_candidates(&cutoff_date, criteria).await?;
 
-        // Filter by criteria
-        let mut discovered: Vec<DiscoveredWallet> = wallets
-            .into_iter()
-            .filter(|w| self.meets_criteria(w, criteria))
-            .collect();
+        // Filter by criteria, tracking rejection reasons for observability
+        let total_candidates = wallets.len();
+        let mut discovered: Vec<DiscoveredWallet> = Vec::new();
+        let mut rejection_reasons: HashMap<&str, usize> = HashMap::new();
+
+        for wallet in wallets {
+            if wallet.total_trades < criteria.min_trades {
+                *rejection_reasons.entry("low_trades").or_insert(0) += 1;
+            } else if wallet.win_rate < criteria.min_win_rate {
+                *rejection_reasons.entry("low_win_rate").or_insert(0) += 1;
+            } else if wallet.total_volume < criteria.min_volume {
+                *rejection_reasons.entry("low_volume").or_insert(0) += 1;
+            } else if criteria.exclude_bots && wallet.bot_score.map_or(false, |s| s >= 50) {
+                *rejection_reasons.entry("bot_detected").or_insert(0) += 1;
+            } else if criteria.min_roi.map_or(false, |min| wallet.roi < min) {
+                *rejection_reasons.entry("low_roi").or_insert(0) += 1;
+            } else if criteria.max_staleness_days > 0 {
+                let cutoff = Utc::now() - Duration::days(criteria.max_staleness_days as i64);
+                if wallet.last_trade < cutoff {
+                    *rejection_reasons.entry("stale").or_insert(0) += 1;
+                } else {
+                    discovered.push(wallet);
+                }
+            } else {
+                discovered.push(wallet);
+            }
+        }
+
+        if discovered.is_empty() && total_candidates > 0 {
+            warn!(
+                total_candidates,
+                rejections = ?rejection_reasons,
+                "Discovery found 0 wallets passing criteria"
+            );
+        }
 
         // Sort by composite score (falls back to ROI when composite unavailable)
         discovered.sort_by(|a, b| {
@@ -584,6 +615,7 @@ impl WalletDiscovery {
         Ok(())
     }
 
+    #[cfg(test)]
     fn meets_criteria(&self, wallet: &DiscoveredWallet, criteria: &DiscoveryCriteria) -> bool {
         if wallet.total_trades < criteria.min_trades {
             return false;
@@ -701,14 +733,14 @@ mod tests {
 
         let criteria = DiscoveryCriteria::default();
 
-        // Verify the tightened thresholds
+        // Verify the thresholds
         assert_eq!(criteria.min_trades, 30);
-        assert_eq!(criteria.min_win_rate, 0.60);
+        assert_eq!(criteria.min_win_rate, 0.52);
         assert_eq!(criteria.min_volume, Decimal::new(5000, 0));
         assert_eq!(criteria.time_window_days, 90);
         assert!(criteria.exclude_bots);
         assert_eq!(criteria.min_roi, Some(0.10));
-        assert_eq!(criteria.max_staleness_days, 60);
+        assert_eq!(criteria.max_staleness_days, 14);
 
         // Wallet should pass the tightened criteria
         assert!(wallet.total_trades >= criteria.min_trades);

@@ -317,10 +317,46 @@ impl CopyTradingMonitor {
                 return Ok(());
             }
             if !active_markets.contains(&trade.market_id) {
+                // Distinguish missing condition_id (token_id used as fallback) from
+                // genuinely resolved markets. This helps quantify the token_id issue.
+                let is_condition_id_fallback = trade.market_id == trade.token_id;
+                if is_condition_id_fallback {
+                    warn!(
+                        wallet = %trade.wallet_address,
+                        market_id = %trade.market_id,
+                        token_id = %trade.token_id,
+                        "condition_id was None — market_id is token_id fallback, attempting DB cache lookup"
+                    );
+
+                    // Try to resolve the real condition_id from token_condition_cache
+                    if let Ok(Some((resolved_condition_id,))) = sqlx::query_as::<_, (String,)>(
+                        "SELECT condition_id FROM token_condition_cache WHERE token_id = $1",
+                    )
+                    .bind(&trade.token_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    {
+                        if active_markets.contains(&resolved_condition_id) {
+                            info!(
+                                wallet = %trade.wallet_address,
+                                token_id = %trade.token_id,
+                                resolved_condition_id = %resolved_condition_id,
+                                "Resolved token_id to active condition_id via DB cache"
+                            );
+                            // Drop the read lock and re-process with corrected market_id.
+                            // The corrected trade will pass the active market check on re-entry.
+                            drop(active_markets);
+                            let mut corrected_trade = trade.clone();
+                            corrected_trade.market_id = resolved_condition_id;
+                            return Box::pin(self.process_trade(corrected_trade)).await;
+                        }
+                    }
+                }
                 info!(
                     wallet = %trade.wallet_address,
                     market_id = %trade.market_id,
                     active_set_size = active_markets.len(),
+                    condition_id_fallback = is_condition_id_fallback,
                     "Market not in active CLOB set, skipping (resolved or delisted)"
                 );
                 self.publish_skip_signal(

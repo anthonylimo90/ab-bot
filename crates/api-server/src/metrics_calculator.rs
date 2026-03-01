@@ -34,7 +34,7 @@ impl Default for MetricsCalculatorConfig {
         Self {
             enabled: true,
             interval_secs: 900, // 15 minutes — was 1 hour, too slow for rotation
-            batch_size: 50,
+            batch_size: 200,    // was 50 — process more wallets per cycle
             recalc_after_hours: 6, // was 24 — stale metrics block good candidates
         }
     }
@@ -265,6 +265,7 @@ impl MetricsCalculator {
     async fn get_wallets_to_process(&self) -> Result<Vec<String>> {
         let cutoff = Utc::now() - Duration::hours(self.config.recalc_after_hours);
 
+        // Priority 0: Wallets currently in workspace_wallet_allocations (actively tracked)
         // Priority 1: Wallets that have never been calculated
         // Priority 2: Wallets with stale metrics (older than recalc_after_hours)
         // Priority 3: Active wallets (have traded recently)
@@ -281,6 +282,11 @@ impl MetricsCalculator {
                 -- Active in the last 90 days
                 AND wf.last_trade >= NOW() - INTERVAL '90 days'
             ORDER BY
+                -- Tier 0: actively tracked wallets get absolute priority
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM workspace_wallet_allocations wwa
+                    WHERE LOWER(wwa.wallet_address) = LOWER(wf.address)
+                ) THEN 0 ELSE 1 END,
                 -- Prioritize never-calculated
                 CASE WHEN wsm.last_computed IS NULL THEN 0 ELSE 1 END,
                 -- Then by staleness
@@ -421,7 +427,7 @@ mod tests {
         let config = MetricsCalculatorConfig::default();
         assert!(config.enabled);
         assert_eq!(config.interval_secs, 900);
-        assert_eq!(config.batch_size, 50);
+        assert_eq!(config.batch_size, 200);
         assert_eq!(config.recalc_after_hours, 6);
     }
 
