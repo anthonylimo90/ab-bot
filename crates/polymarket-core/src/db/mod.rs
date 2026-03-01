@@ -26,7 +26,8 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool> {
         let mut opts = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .idle_timeout(Duration::from_secs(300))
-            .max_lifetime(Duration::from_secs(1800));
+            .max_lifetime(Duration::from_secs(1800))
+            .test_before_acquire(true);
 
         if let Some(timeout_secs) = config.acquire_timeout_secs {
             opts = opts.acquire_timeout(Duration::from_secs(timeout_secs));

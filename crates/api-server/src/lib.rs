@@ -60,7 +60,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{info, warn, Level};
@@ -349,6 +349,12 @@ impl ApiServer {
 
         // ── Spawn background tasks ──
 
+        // Shared semaphore to coordinate heavy background DB tasks.
+        // 3 permits ensures at most 3 heavy batch operations run simultaneously,
+        // leaving ~17 connections available for HTTP handlers + lighter tasks.
+        let db_semaphore = Arc::new(Semaphore::new(3));
+        info!("DB backpressure semaphore created (3 permits)");
+
         // Spawn Redis forwarder for signal bridging
         let redis_config = RedisForwarderConfig::from_env();
         spawn_redis_forwarder(
@@ -391,7 +397,7 @@ impl ApiServer {
         );
 
         // Spawn auto-optimizer background service (channel created before Arc wrap)
-        let optimizer = Arc::new(optimizer_base);
+        let optimizer = Arc::new(optimizer_base.with_db_semaphore(db_semaphore.clone()));
         tokio::spawn(optimizer.start(Some(optimizer_rx)));
 
         // Extract the latency atomic (if copy trading is active) so the
@@ -430,16 +436,20 @@ impl ApiServer {
             harvester_config,
             state.clob_client.clone(),
             state.pool.clone(),
+            db_semaphore.clone(),
         );
 
         // Spawn metrics calculator (populates wallet_success_metrics + market regime)
         let metrics_config = MetricsCalculatorConfig::from_env();
         if metrics_config.enabled {
-            let calculator = Arc::new(MetricsCalculator::with_regime(
-                state.pool.clone(),
-                metrics_config.clone(),
-                state.current_regime.clone(),
-            ));
+            let calculator = Arc::new(
+                MetricsCalculator::with_regime(
+                    state.pool.clone(),
+                    metrics_config.clone(),
+                    state.current_regime.clone(),
+                )
+                .with_db_semaphore(db_semaphore.clone()),
+            );
             tokio::spawn(calculator.run());
             info!(
                 interval_secs = metrics_config.interval_secs,
