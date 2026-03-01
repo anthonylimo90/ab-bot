@@ -1094,7 +1094,8 @@ impl DynamicTuner {
                     max_value = EXCLUDED.max_value,
                     max_step_pct = EXCLUDED.max_step_pct,
                     default_value = EXCLUDED.default_value,
-                    current_value = LEAST(GREATEST(dynamic_config.current_value, EXCLUDED.min_value), EXCLUDED.max_value)
+                    current_value = LEAST(GREATEST(dynamic_config.current_value, EXCLUDED.min_value), EXCLUDED.max_value),
+                    last_good_value = LEAST(GREATEST(dynamic_config.last_good_value, EXCLUDED.min_value), EXCLUDED.max_value)
                 "#,
             )
             .bind(seed.key)

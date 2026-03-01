@@ -45,15 +45,12 @@ SELECT add_compression_policy('orderbook_snapshots', INTERVAL '3 days', if_not_e
 SELECT add_compression_policy('historical_trades', INTERVAL '3 days', if_not_exists => TRUE);
 
 -- ===================
--- 4. Refresh continuous aggregates to drop stale materialized data
+-- 4. Continuous aggregate refresh (skipped)
 -- ===================
--- The continuous aggregates still reference old data ranges. Refresh them
--- to discard materialized rows whose source chunks no longer exist.
--- Using invalidation window matching the chunk drop (30 days ago to now).
-
-CALL refresh_continuous_aggregate('orderbook_5min', NULL, NOW() - INTERVAL '30 days');
-CALL refresh_continuous_aggregate('orderbook_hourly', NULL, NOW() - INTERVAL '30 days');
-CALL refresh_continuous_aggregate('orderbook_daily', NULL, NOW() - INTERVAL '30 days');
+-- CALL refresh_continuous_aggregate() cannot run inside a transaction block,
+-- and sqlx wraps each migration in a transaction. The continuous aggregates
+-- will naturally handle stale materialized data through their background
+-- refresh policies. No manual refresh needed here.
 
 -- ===================
 -- 5. Run regular table cleanup
