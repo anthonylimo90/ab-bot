@@ -671,6 +671,7 @@ export interface Workspace {
   copy_trading_enabled: boolean;
   live_trading_enabled: boolean;
   exit_handler_enabled: boolean;
+  inactivity_days: number;
   my_role: WorkspaceRole;
   onboarding_completed?: boolean;
   created_by?: string;
@@ -824,6 +825,7 @@ export interface UpdateWorkspaceRequest {
   copy_trading_enabled?: boolean;
   live_trading_enabled?: boolean;
   exit_handler_enabled?: boolean;
+  inactivity_days?: number;
 }
 
 export interface UpdateOpportunitySelectionRequest {
@@ -1100,6 +1102,10 @@ export interface DynamicTunerStatus {
   opportunity_selection: OpportunitySelectionStatus;
   scanner_status: ScannerStatus;
   dynamic_config: DynamicConfigItem[];
+  watchdog_active: boolean;
+  watchdog_fill_rate: number | null;
+  watchdog_attempts: number | null;
+  watchdog_top_skip: string | null;
 }
 
 export interface DynamicConfigHistoryEntry {
@@ -1112,6 +1118,28 @@ export interface DynamicConfigHistoryEntry {
   metrics_snapshot?: Record<string, unknown> | null;
   outcome_metrics?: Record<string, unknown> | null;
   created_at: string;
+}
+
+// Risk allocation recalculation types
+export type RecalculateStrategy = "EQUAL_WEIGHT" | "PERFORMANCE_WEIGHTED" | "RISK_ADJUSTED";
+
+export interface RecalculateAllocationsRequest {
+  strategy: RecalculateStrategy;
+  preview: boolean;
+}
+
+export interface RecalculateAllocationResult {
+  wallet_address: string;
+  wallet_label?: string;
+  old_allocation_pct: number;
+  new_allocation_pct: number;
+  reason: string;
+}
+
+export interface RecalculateAllocationsResponse {
+  strategy: RecalculateStrategy;
+  results: RecalculateAllocationResult[];
+  applied: boolean;
 }
 
 // Risk monitoring types

@@ -56,6 +56,8 @@ import type {
   MarketRegimeResponse,
   CalibrationReport,
   CopyPerformanceResponse,
+  RecalculateAllocationsRequest,
+  RecalculateAllocationsResponse,
 } from "@/types/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
@@ -1010,6 +1012,20 @@ class ApiClient {
       // If JSON parsing fails, return a default result
       return { candidates_found: -1, wallets_promoted: 0, thresholds: {} };
     }
+  }
+
+  // Risk Allocation Recalculation
+  async recalculateAllocations(
+    workspaceId: string,
+    params: RecalculateAllocationsRequest,
+  ): Promise<RecalculateAllocationsResponse> {
+    return this.request<RecalculateAllocationsResponse>(
+      `/api/v1/workspaces/${workspaceId}/allocations/recalculate`,
+      {
+        method: "POST",
+        body: JSON.stringify(params),
+      },
+    );
   }
 
   // Onboarding
