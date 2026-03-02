@@ -1016,11 +1016,10 @@ class ApiClient {
 
   // Risk Allocation Recalculation
   async recalculateAllocations(
-    workspaceId: string,
     params: RecalculateAllocationsRequest,
   ): Promise<RecalculateAllocationsResponse> {
     return this.request<RecalculateAllocationsResponse>(
-      `/api/v1/workspaces/${workspaceId}/allocations/recalculate`,
+      `/api/v1/allocations/risk/recalculate`,
       {
         method: "POST",
         body: JSON.stringify(params),

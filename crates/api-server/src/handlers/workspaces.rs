@@ -170,7 +170,7 @@ struct WorkspaceDetailRow {
     copy_trading_enabled: bool,
     live_trading_enabled: bool,
     exit_handler_enabled: bool,
-    inactivity_days: Option<i32>,
+    inactivity_days: i32,
     role: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -318,7 +318,7 @@ pub async fn get_workspace(
             COALESCE(w.copy_trading_enabled, false) as copy_trading_enabled,
             COALESCE(w.live_trading_enabled, false) as live_trading_enabled,
             COALESCE(w.exit_handler_enabled, false) as exit_handler_enabled,
-            w.inactivity_days,
+            COALESCE(w.inactivity_days, 14) as inactivity_days,
             wm.role, w.created_at, w.updated_at
         FROM workspaces w
         INNER JOIN workspace_members wm ON w.id = wm.workspace_id
@@ -368,7 +368,7 @@ pub async fn get_workspace(
         copy_trading_enabled: workspace.copy_trading_enabled,
         live_trading_enabled: workspace.live_trading_enabled,
         exit_handler_enabled: workspace.exit_handler_enabled,
-        inactivity_days: workspace.inactivity_days.unwrap_or(14),
+        inactivity_days: workspace.inactivity_days,
         my_role: workspace.role,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
@@ -1768,7 +1768,7 @@ pub async fn get_dynamic_tuner_status(
                 .get("top_skip_reason")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let active = attempts.unwrap_or(0) >= 20 && fill_rate.unwrap_or(1.0) <= 0.0;
+            let active = attempts.unwrap_or(0) >= 5 && fill_rate.unwrap_or(1.0) <= 0.0;
             (active, fill_rate, attempts, top_skip)
         } else {
             (false, None, None, None)

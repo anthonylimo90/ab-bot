@@ -1121,25 +1121,34 @@ export interface DynamicConfigHistoryEntry {
 }
 
 // Risk allocation recalculation types
-export type RecalculateStrategy = "EQUAL_WEIGHT" | "PERFORMANCE_WEIGHTED" | "RISK_ADJUSTED";
+export type AllocationTier = "active" | "bench" | "all";
 
 export interface RecalculateAllocationsRequest {
-  strategy: RecalculateStrategy;
-  preview: boolean;
+  tier: AllocationTier;
+  auto_apply: boolean;
 }
 
-export interface RecalculateAllocationResult {
-  wallet_address: string;
-  wallet_label?: string;
-  old_allocation_pct: number;
-  new_allocation_pct: number;
-  reason: string;
+export interface RiskComponents {
+  sortino_normalized: number;
+  consistency: number;
+  roi_drawdown_ratio: number;
+  win_rate: number;
+  volatility: number;
+}
+
+export interface AllocationPreview {
+  address: string;
+  current_allocation_pct: number | null;
+  recommended_allocation_pct: number;
+  change_pct: number;
+  composite_score: number;
+  components: RiskComponents;
 }
 
 export interface RecalculateAllocationsResponse {
-  strategy: RecalculateStrategy;
-  results: RecalculateAllocationResult[];
+  previews: AllocationPreview[];
   applied: boolean;
+  wallet_count: number;
 }
 
 // Risk monitoring types

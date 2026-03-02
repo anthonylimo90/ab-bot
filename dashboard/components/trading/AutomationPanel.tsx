@@ -45,7 +45,7 @@ import {
   TrendingUp,
   XCircle,
 } from 'lucide-react';
-import type { OptimizerStatus, WalletBan, RecalculateAllocationsResponse, RecalculateStrategy } from '@/types/api';
+import type { OptimizerStatus, WalletBan, RecalculateAllocationsResponse, AllocationTier } from '@/types/api';
 
 interface OptimizationSettingsDraft {
   auto_optimize_enabled: boolean;
@@ -412,19 +412,24 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   });
 
   // Risk allocation recalculation
-  const [recalcStrategy, setRecalcStrategy] = useState<RecalculateStrategy>('PERFORMANCE_WEIGHTED');
+  const [recalcTier, setRecalcTier] = useState<AllocationTier>('active');
   const [recalcPreview, setRecalcPreview] = useState<RecalculateAllocationsResponse | null>(null);
+
+  // Reset preview on workspace change
+  useEffect(() => {
+    setRecalcPreview(null);
+  }, [workspaceId]);
 
   const recalcPreviewMutation = useMutation({
     mutationFn: () =>
-      api.recalculateAllocations(workspaceId, { strategy: recalcStrategy, preview: true }),
+      api.recalculateAllocations({ tier: recalcTier, auto_apply: false }),
     onSuccess: (data) => setRecalcPreview(data),
     onError: () => addToast({ type: 'error', title: 'Failed to preview allocations' }),
   });
 
   const recalcApplyMutation = useMutation({
     mutationFn: () =>
-      api.recalculateAllocations(workspaceId, { strategy: recalcStrategy, preview: false }),
+      api.recalculateAllocations({ tier: recalcTier, auto_apply: true }),
     onSuccess: () => {
       setRecalcPreview(null);
       queryClient.invalidateQueries({ queryKey: ['allocations'] });
@@ -1328,7 +1333,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                             min={3}
                             max={25}
                             step={1}
-                            value={Math.round(copyTradingDraft.near_resolution_margin * 100)}
+                            value={Number((copyTradingDraft.near_resolution_margin * 100).toFixed(1))}
                             onChange={(e) => {
                               const v = Number(e.target.value);
                               if (!Number.isFinite(v)) return;
@@ -1524,28 +1529,24 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                 <div className="rounded-lg border bg-background/50 p-4">
                   <p className="mb-3 text-sm font-medium">Risk Allocation</p>
                   <p className="mb-3 text-xs text-muted-foreground">
-                    Recalculate wallet allocation percentages based on a weighting strategy.
+                    Recalculate wallet allocation percentages using composite risk scoring (Sortino, consistency, ROI/drawdown, win rate).
                   </p>
                   <div className="grid gap-2 md:grid-cols-3 mb-3">
-                    {(['EQUAL_WEIGHT', 'PERFORMANCE_WEIGHTED', 'RISK_ADJUSTED'] as RecalculateStrategy[]).map(
-                      (strategy) => (
+                    {(['active', 'bench', 'all'] as AllocationTier[]).map(
+                      (tier) => (
                         <Button
-                          key={strategy}
+                          key={tier}
                           type="button"
                           size="sm"
-                          variant={recalcStrategy === strategy ? 'default' : 'outline'}
+                          variant={recalcTier === tier ? 'default' : 'outline'}
                           className="h-auto justify-start py-2 text-left"
                           onClick={() => {
-                            setRecalcStrategy(strategy);
+                            setRecalcTier(tier);
                             setRecalcPreview(null);
                           }}
                         >
                           <span className="block text-xs font-medium">
-                            {strategy === 'EQUAL_WEIGHT'
-                              ? 'Equal Weight'
-                              : strategy === 'PERFORMANCE_WEIGHTED'
-                                ? 'Performance'
-                                : 'Risk-Adjusted'}
+                            {tier === 'active' ? 'Active Tier' : tier === 'bench' ? 'Bench Tier' : 'All Tiers'}
                           </span>
                         </Button>
                       )
@@ -1578,31 +1579,46 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                     </Button>
                   </div>
 
-                  {recalcPreview && (
+                  {recalcPreview && recalcPreview.previews.length > 0 && (
                     <div className="mt-3 max-h-48 overflow-y-auto rounded border border-border/50">
                       <table className="w-full text-xs">
                         <thead className="bg-muted/50 sticky top-0">
                           <tr>
                             <th className="p-2 text-left">Wallet</th>
-                            <th className="p-2 text-right">Old %</th>
-                            <th className="p-2 text-right">New %</th>
-                            <th className="p-2 text-left">Reason</th>
+                            <th className="p-2 text-right">Current %</th>
+                            <th className="p-2 text-right">Recommended %</th>
+                            <th className="p-2 text-right">Change</th>
+                            <th className="p-2 text-right">Score</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {recalcPreview.results.map((r) => (
-                            <tr key={r.wallet_address} className="border-t border-border/30">
+                          {recalcPreview.previews.map((p) => (
+                            <tr key={p.address} className="border-t border-border/30">
                               <td className="p-2 font-mono">
-                                {r.wallet_label || `${r.wallet_address.slice(0, 8)}...`}
+                                {`${p.address.slice(0, 8)}...`}
                               </td>
-                              <td className="p-2 text-right tabular-nums">{r.old_allocation_pct.toFixed(1)}%</td>
-                              <td className="p-2 text-right tabular-nums">{r.new_allocation_pct.toFixed(1)}%</td>
-                              <td className="p-2 text-muted-foreground">{r.reason}</td>
+                              <td className="p-2 text-right tabular-nums">
+                                {p.current_allocation_pct != null ? `${p.current_allocation_pct.toFixed(1)}%` : '—'}
+                              </td>
+                              <td className="p-2 text-right tabular-nums">{p.recommended_allocation_pct.toFixed(1)}%</td>
+                              <td className={`p-2 text-right tabular-nums ${p.change_pct > 0 ? 'text-green-500' : p.change_pct < 0 ? 'text-red-500' : 'text-muted-foreground'}`}>
+                                {p.change_pct > 0 ? '+' : ''}{p.change_pct.toFixed(1)}%
+                              </td>
+                              <td className="p-2 text-right tabular-nums text-muted-foreground">{p.composite_score.toFixed(2)}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
+                      <div className="border-t border-border/30 px-2 py-1.5 text-xs text-muted-foreground">
+                        {recalcPreview.wallet_count} wallet{recalcPreview.wallet_count !== 1 ? 's' : ''}
+                        {recalcPreview.applied ? ' — applied' : ' — preview only'}
+                      </div>
                     </div>
+                  )}
+                  {recalcPreview && recalcPreview.previews.length === 0 && (
+                    <p className="mt-3 text-xs text-muted-foreground">
+                      No wallets with recent metrics found for this tier.
+                    </p>
                   )}
                 </div>
               </>
