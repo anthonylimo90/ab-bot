@@ -11,7 +11,7 @@ import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { queryKeys } from '@/lib/queryClient';
-import { ratioOrPercentToPercent, formatDynamicKey, formatDynamicConfigValue } from '@/lib/utils';
+import { ratioOrPercentToPercent, formatDynamicKey, formatDynamicConfigValue, formatSkipReason } from '@/lib/utils';
 import { RISK_PRESETS } from '@/lib/riskPresets';
 import type { RiskPreset } from '@/lib/riskPresets';
 import { TunerTimeline } from '@/components/analytics/TunerTimeline';
@@ -45,7 +45,7 @@ import {
   TrendingUp,
   XCircle,
 } from 'lucide-react';
-import type { OptimizerStatus, WalletBan } from '@/types/api';
+import type { OptimizerStatus, WalletBan, RecalculateAllocationsResponse, AllocationTier } from '@/types/api';
 
 interface OptimizationSettingsDraft {
   auto_optimize_enabled: boolean;
@@ -54,6 +54,7 @@ interface OptimizationSettingsDraft {
   min_sharpe: number;
   min_win_rate: number;
   min_trades_30d: number;
+  inactivity_days: number;
 }
 
 interface AutomationPanelProps {
@@ -133,7 +134,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function toSettingsDraft(status: OptimizerStatus): OptimizationSettingsDraft {
+function toSettingsDraft(status: OptimizerStatus, inactivityDays?: number): OptimizationSettingsDraft {
   return {
     auto_optimize_enabled: status.enabled,
     optimization_interval_hours: status.interval_hours || 12,
@@ -141,6 +142,7 @@ function toSettingsDraft(status: OptimizerStatus): OptimizationSettingsDraft {
     min_sharpe: status.criteria.min_sharpe ?? 1,
     min_win_rate: ratioOrPercentToPercent(status.criteria.min_win_rate),
     min_trades_30d: status.criteria.min_trades_30d ?? 10,
+    inactivity_days: inactivityDays ?? 14,
   };
 }
 
@@ -189,6 +191,7 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
         min_sharpe: settings.min_sharpe,
         min_win_rate: settings.min_win_rate,
         min_trades_30d: settings.min_trades_30d,
+        inactivity_days: settings.inactivity_days,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.optimizer.status(workspaceId) });
@@ -230,8 +233,8 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     if (!optimizerStatus) {
       return null;
     }
-    return toSettingsDraft(optimizerStatus);
-  }, [optimizerStatus]);
+    return toSettingsDraft(optimizerStatus, currentWorkspace?.inactivity_days);
+  }, [optimizerStatus, currentWorkspace?.inactivity_days]);
 
   const [settings, setSettings] = useState<OptimizationSettingsDraft | null>(null);
   const [opportunitySettings, setOpportunitySettings] = useState<OpportunitySelectionDraft | null>(
@@ -408,6 +411,34 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
     },
   });
 
+  // Risk allocation recalculation
+  const [recalcTier, setRecalcTier] = useState<AllocationTier>('active');
+  const [recalcPreview, setRecalcPreview] = useState<RecalculateAllocationsResponse | null>(null);
+
+  // Reset preview on workspace change
+  useEffect(() => {
+    setRecalcPreview(null);
+  }, [workspaceId]);
+
+  const recalcPreviewMutation = useMutation({
+    mutationFn: () =>
+      api.recalculateAllocations({ tier: recalcTier, auto_apply: false }),
+    onSuccess: (data) => setRecalcPreview(data),
+    onError: () => addToast({ type: 'error', title: 'Failed to preview allocations' }),
+  });
+
+  const recalcApplyMutation = useMutation({
+    mutationFn: () =>
+      api.recalculateAllocations({ tier: recalcTier, auto_apply: true }),
+    onSuccess: () => {
+      setRecalcPreview(null);
+      queryClient.invalidateQueries({ queryKey: ['allocations'] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.optimizer.status(workspaceId) });
+      addToast({ type: 'success', title: 'Allocations recalculated and applied' });
+    },
+    onError: () => addToast({ type: 'error', title: 'Failed to apply allocations' }),
+  });
+
   const updateSettings = (patch: Partial<OptimizationSettingsDraft>) => {
     setSettings((current) => (current ? { ...current, ...patch } : current));
   };
@@ -501,7 +532,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   }, [opportunitySettings, maxMarketsCap]);
 
   const getActionIcon = (action: string, evidence?: Record<string, unknown>) => {
-    // Inactivity demotions are logged as emergency_demote with evidence.trigger = 'Inactivity'
+    // FillRateZero demotions: orange icon, distinct from dormancy
+    if (action === 'emergency_demote' && evidence?.trigger === 'FillRateZero') {
+      return <AlertTriangle className="h-4 w-4 text-orange-500" />;
+    }
+    // Inactivity (dormancy) demotions: amber clock icon
     if (action === 'emergency_demote' && evidence?.trigger === 'Inactivity') {
       return <Clock className="h-4 w-4 text-amber-500" />;
     }
@@ -528,7 +563,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
   };
 
   const getActionBadge = (action: string, evidence?: Record<string, unknown>) => {
-    // Inactivity demotions get amber styling
+    // FillRateZero demotions get orange styling
+    if (action === 'emergency_demote' && evidence?.trigger === 'FillRateZero') {
+      return 'bg-orange-500/10 text-orange-500';
+    }
+    // Inactivity (dormancy) demotions get amber styling
     if (action === 'emergency_demote' && evidence?.trigger === 'Inactivity') {
       return 'bg-amber-500/10 text-amber-500';
     }
@@ -741,6 +780,27 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                       }}
                     />
                   </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="inactivity-days">Inactivity Threshold (days)</Label>
+                    <Input
+                      id="inactivity-days"
+                      type="number"
+                      min={1}
+                      max={90}
+                      step={1}
+                      value={settings.inactivity_days}
+                      onChange={(e) => {
+                        const next = Number(e.target.value);
+                        if (!Number.isFinite(next)) {
+                          return;
+                        }
+                        updateSettings({ inactivity_days: clamp(Math.round(next), 1, 90) });
+                      }}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Demote wallets with no on-chain trades for this many days.
+                    </p>
+                  </div>
                 </div>
 
                 <div className="flex justify-stretch sm:justify-end">
@@ -769,6 +829,24 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
               </div>
             ) : (
               <>
+                {dynamicTunerStatus.watchdog_active && (
+                  <div className="flex items-start gap-3 rounded-lg border border-orange-500/30 bg-orange-500/5 p-4">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-orange-500" />
+                    <div className="text-sm">
+                      <p className="font-medium text-orange-600">Watchdog Active — 0% Fill Rate</p>
+                      <p className="mt-1 text-muted-foreground">
+                        {dynamicTunerStatus.watchdog_attempts != null && (
+                          <span>{dynamicTunerStatus.watchdog_attempts} attempts, 0 fills. </span>
+                        )}
+                        {dynamicTunerStatus.watchdog_top_skip && (
+                          <span>Top skip: {formatSkipReason(dynamicTunerStatus.watchdog_top_skip)}. </span>
+                        )}
+                        Adaptive relaxation may be applied to latency, slippage, and min value thresholds.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 <div className="rounded-lg border bg-background/50 p-4">
                   <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                     <p className="text-sm font-medium">Opportunity Selection</p>
@@ -1249,21 +1327,24 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                           <p className="text-sm font-medium">Near-Resolution Margin</p>
                           <p className="text-xs text-muted-foreground">Skip markets within this margin of 0 or 1. Min 3% enforced by backend.</p>
                         </div>
-                        <Input
-                          type="number"
-                          min={0.03}
-                          max={0.25}
-                          step={0.01}
-                          value={copyTradingDraft.near_resolution_margin}
-                          onChange={(e) => {
-                            const v = Number(e.target.value);
-                            if (!Number.isFinite(v)) return;
-                            setCopyTradingDraft((d) =>
-                              d ? { ...d, near_resolution_margin: clamp(v, 0.03, 0.25) } : d
-                            );
-                          }}
-                          className="w-24 text-right"
-                        />
+                        <div className="flex items-center gap-1">
+                          <Input
+                            type="number"
+                            min={3}
+                            max={25}
+                            step={1}
+                            value={Number((copyTradingDraft.near_resolution_margin * 100).toFixed(1))}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              if (!Number.isFinite(v)) return;
+                              setCopyTradingDraft((d) =>
+                                d ? { ...d, near_resolution_margin: clamp(v, 3, 25) / 100 } : d
+                              );
+                            }}
+                            className="w-24 text-right"
+                          />
+                          <span className="text-sm text-muted-foreground">%</span>
+                        </div>
                       </div>
                     </div>
 
@@ -1443,6 +1524,103 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                     </div>
                   </div>
                 )}
+
+                {/* Risk Allocation Recalculate */}
+                <div className="rounded-lg border bg-background/50 p-4">
+                  <p className="mb-3 text-sm font-medium">Risk Allocation</p>
+                  <p className="mb-3 text-xs text-muted-foreground">
+                    Recalculate wallet allocation percentages using composite risk scoring (Sortino, consistency, ROI/drawdown, win rate).
+                  </p>
+                  <div className="grid gap-2 md:grid-cols-3 mb-3">
+                    {(['active', 'bench', 'all'] as AllocationTier[]).map(
+                      (tier) => (
+                        <Button
+                          key={tier}
+                          type="button"
+                          size="sm"
+                          variant={recalcTier === tier ? 'default' : 'outline'}
+                          className="h-auto justify-start py-2 text-left"
+                          onClick={() => {
+                            setRecalcTier(tier);
+                            setRecalcPreview(null);
+                          }}
+                        >
+                          <span className="block text-xs font-medium">
+                            {tier === 'active' ? 'Active Tier' : tier === 'bench' ? 'Bench Tier' : 'All Tiers'}
+                          </span>
+                        </Button>
+                      )
+                    )}
+                  </div>
+
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={recalcPreviewMutation.isPending || !hasWorkspace}
+                      onClick={() => recalcPreviewMutation.mutate()}
+                    >
+                      {recalcPreviewMutation.isPending ? (
+                        <RotateCcw className="mr-1 h-3 w-3 animate-spin" />
+                      ) : null}
+                      Preview
+                    </Button>
+                    <Button
+                      size="sm"
+                      disabled={!recalcPreview || recalcApplyMutation.isPending}
+                      onClick={() => recalcApplyMutation.mutate()}
+                    >
+                      {recalcApplyMutation.isPending ? (
+                        <RotateCcw className="mr-1 h-3 w-3 animate-spin" />
+                      ) : (
+                        <Save className="mr-1 h-3 w-3" />
+                      )}
+                      Apply
+                    </Button>
+                  </div>
+
+                  {recalcPreview && recalcPreview.previews.length > 0 && (
+                    <div className="mt-3 max-h-48 overflow-y-auto rounded border border-border/50">
+                      <table className="w-full text-xs">
+                        <thead className="bg-muted/50 sticky top-0">
+                          <tr>
+                            <th className="p-2 text-left">Wallet</th>
+                            <th className="p-2 text-right">Current %</th>
+                            <th className="p-2 text-right">Recommended %</th>
+                            <th className="p-2 text-right">Change</th>
+                            <th className="p-2 text-right">Score</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {recalcPreview.previews.map((p) => (
+                            <tr key={p.address} className="border-t border-border/30">
+                              <td className="p-2 font-mono">
+                                {`${p.address.slice(0, 8)}...`}
+                              </td>
+                              <td className="p-2 text-right tabular-nums">
+                                {p.current_allocation_pct != null ? `${p.current_allocation_pct.toFixed(1)}%` : '—'}
+                              </td>
+                              <td className="p-2 text-right tabular-nums">{p.recommended_allocation_pct.toFixed(1)}%</td>
+                              <td className={`p-2 text-right tabular-nums ${p.change_pct > 0 ? 'text-green-500' : p.change_pct < 0 ? 'text-red-500' : 'text-muted-foreground'}`}>
+                                {p.change_pct > 0 ? '+' : ''}{p.change_pct.toFixed(1)}%
+                              </td>
+                              <td className="p-2 text-right tabular-nums text-muted-foreground">{p.composite_score.toFixed(2)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      <div className="border-t border-border/30 px-2 py-1.5 text-xs text-muted-foreground">
+                        {recalcPreview.wallet_count} wallet{recalcPreview.wallet_count !== 1 ? 's' : ''}
+                        {recalcPreview.applied ? ' — applied' : ' — preview only'}
+                      </div>
+                    </div>
+                  )}
+                  {recalcPreview && recalcPreview.previews.length === 0 && (
+                    <p className="mt-3 text-xs text-muted-foreground">
+                      No wallets with recent metrics found for this tier.
+                    </p>
+                  )}
+                </div>
               </>
             )}
           </TabsContent>
@@ -1466,9 +1644,11 @@ export function AutomationPanel({ workspaceId, onRefresh }: AutomationPanelProps
                       <div className="min-w-0 flex-1">
                         <div className="mb-1 flex items-center gap-2">
                           <Badge className={`text-xs ${getActionBadge(entry.action, entry.evidence)}`}>
-                            {entry.action === 'emergency_demote' && entry.evidence?.trigger === 'Inactivity'
-                              ? 'inactivity demote'
-                              : entry.action.replace(/_/g, ' ')}
+                            {entry.action === 'emergency_demote' && entry.evidence?.trigger === 'FillRateZero'
+                              ? '0% fill rate'
+                              : entry.action === 'emergency_demote' && entry.evidence?.trigger === 'Inactivity'
+                                ? 'inactivity demote'
+                                : entry.action.replace(/_/g, ' ')}
                           </Badge>
                           <span className="text-xs text-muted-foreground">
                             {formatDistanceToNow(new Date(entry.created_at), { addSuffix: true })}

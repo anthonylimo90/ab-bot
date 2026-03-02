@@ -58,6 +58,7 @@ pub struct WorkspaceResponse {
     pub copy_trading_enabled: bool,
     pub live_trading_enabled: bool,
     pub exit_handler_enabled: bool,
+    pub inactivity_days: i32,
     pub my_role: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -115,6 +116,7 @@ pub struct UpdateWorkspaceRequest {
     pub copy_trading_enabled: Option<bool>,
     pub live_trading_enabled: Option<bool>,
     pub exit_handler_enabled: Option<bool>,
+    pub inactivity_days: Option<i32>,
 }
 
 /// Workspace member response.
@@ -168,6 +170,7 @@ struct WorkspaceDetailRow {
     copy_trading_enabled: bool,
     live_trading_enabled: bool,
     exit_handler_enabled: bool,
+    inactivity_days: i32,
     role: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -315,6 +318,7 @@ pub async fn get_workspace(
             COALESCE(w.copy_trading_enabled, false) as copy_trading_enabled,
             COALESCE(w.live_trading_enabled, false) as live_trading_enabled,
             COALESCE(w.exit_handler_enabled, false) as exit_handler_enabled,
+            COALESCE(w.inactivity_days, 14) as inactivity_days,
             wm.role, w.created_at, w.updated_at
         FROM workspaces w
         INNER JOIN workspace_members wm ON w.id = wm.workspace_id
@@ -364,6 +368,7 @@ pub async fn get_workspace(
         copy_trading_enabled: workspace.copy_trading_enabled,
         live_trading_enabled: workspace.live_trading_enabled,
         exit_handler_enabled: workspace.exit_handler_enabled,
+        inactivity_days: workspace.inactivity_days,
         my_role: workspace.role,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
@@ -460,6 +465,15 @@ pub async fn update_workspace(
         }
     }
 
+    // Validate inactivity_days range if provided
+    if let Some(days) = req.inactivity_days {
+        if !(1..=90).contains(&days) {
+            return Err(ApiError::BadRequest(
+                "inactivity_days must be between 1 and 90".into(),
+            ));
+        }
+    }
+
     // Build dynamic update
     let now = Utc::now();
     let mut set_parts = vec!["updated_at = $2".to_string()];
@@ -492,6 +506,7 @@ pub async fn update_workspace(
     add_param!(copy_trading_enabled, "copy_trading_enabled");
     add_param!(live_trading_enabled, "live_trading_enabled");
     add_param!(exit_handler_enabled, "exit_handler_enabled");
+    add_param!(inactivity_days, "inactivity_days");
 
     let query = format!(
         "UPDATE workspaces SET {} WHERE id = $1",
@@ -555,6 +570,9 @@ pub async fn update_workspace(
     }
     if let Some(exit_handler_enabled) = req.exit_handler_enabled {
         q = q.bind(exit_handler_enabled);
+    }
+    if let Some(inactivity_days) = req.inactivity_days {
+        q = q.bind(inactivity_days);
     }
 
     q.execute(&state.pool).await?;
@@ -1140,6 +1158,7 @@ struct DynamicTunerStateRow {
     last_run_at: Option<DateTime<Utc>>,
     last_run_status: Option<String>,
     last_run_reason: Option<String>,
+    last_metrics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1272,6 +1291,10 @@ pub struct DynamicTunerStatusResponse {
     pub opportunity_selection: OpportunitySelectionStatusResponse,
     pub scanner_status: ScannerStatusResponse,
     pub dynamic_config: Vec<DynamicConfigItemResponse>,
+    pub watchdog_active: bool,
+    pub watchdog_fill_rate: Option<f64>,
+    pub watchdog_attempts: Option<i64>,
+    pub watchdog_top_skip: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -1677,7 +1700,7 @@ pub async fn get_dynamic_tuner_status(
 
     let runtime_state: Option<DynamicTunerStateRow> = sqlx::query_as(
         r#"
-        SELECT last_run_at, last_run_status, last_run_reason
+        SELECT last_run_at, last_run_status, last_run_reason, last_metrics
         FROM dynamic_tuner_state
         WHERE singleton = TRUE
         LIMIT 1
@@ -1726,9 +1749,30 @@ pub async fn get_dynamic_tuner_status(
     let current_regime = format!("{:?}", *state.current_regime.read().await);
     let enabled = env_bool("DYNAMIC_TUNER_ENABLED", true);
     let apply_changes = env_bool("DYNAMIC_TUNER_APPLY", true);
-    let (last_run_at, last_run_status, last_run_reason) = match runtime_state {
-        Some(row) => (row.last_run_at, row.last_run_status, row.last_run_reason),
-        None => (None, None, None),
+    let (last_run_at, last_run_status, last_run_reason, last_metrics) = match runtime_state {
+        Some(row) => (
+            row.last_run_at,
+            row.last_run_status,
+            row.last_run_reason,
+            row.last_metrics,
+        ),
+        None => (None, None, None, None),
+    };
+
+    // Derive watchdog fields from last_metrics JSON
+    let (watchdog_active, watchdog_fill_rate, watchdog_attempts, watchdog_top_skip) = {
+        if let Some(ref metrics) = last_metrics {
+            let attempts = metrics.get("attempts").and_then(|v| v.as_i64());
+            let fill_rate = metrics.get("fill_rate").and_then(|v| v.as_f64());
+            let top_skip = metrics
+                .get("top_skip_reason")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let active = attempts.unwrap_or(0) >= 5 && fill_rate.unwrap_or(1.0) <= 0.0;
+            (active, fill_rate, attempts, top_skip)
+        } else {
+            (false, None, None, None)
+        }
     };
     let (last_change_at, last_change_action, last_change_reason, last_change_key) =
         match last_change {
@@ -1800,6 +1844,10 @@ pub async fn get_dynamic_tuner_status(
         opportunity_selection,
         scanner_status,
         dynamic_config,
+        watchdog_active,
+        watchdog_fill_rate,
+        watchdog_attempts,
+        watchdog_top_skip,
     }))
 }
 

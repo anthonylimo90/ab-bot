@@ -671,6 +671,7 @@ export interface Workspace {
   copy_trading_enabled: boolean;
   live_trading_enabled: boolean;
   exit_handler_enabled: boolean;
+  inactivity_days: number;
   my_role: WorkspaceRole;
   onboarding_completed?: boolean;
   created_by?: string;
@@ -824,6 +825,7 @@ export interface UpdateWorkspaceRequest {
   copy_trading_enabled?: boolean;
   live_trading_enabled?: boolean;
   exit_handler_enabled?: boolean;
+  inactivity_days?: number;
 }
 
 export interface UpdateOpportunitySelectionRequest {
@@ -1100,6 +1102,10 @@ export interface DynamicTunerStatus {
   opportunity_selection: OpportunitySelectionStatus;
   scanner_status: ScannerStatus;
   dynamic_config: DynamicConfigItem[];
+  watchdog_active: boolean;
+  watchdog_fill_rate: number | null;
+  watchdog_attempts: number | null;
+  watchdog_top_skip: string | null;
 }
 
 export interface DynamicConfigHistoryEntry {
@@ -1112,6 +1118,37 @@ export interface DynamicConfigHistoryEntry {
   metrics_snapshot?: Record<string, unknown> | null;
   outcome_metrics?: Record<string, unknown> | null;
   created_at: string;
+}
+
+// Risk allocation recalculation types
+export type AllocationTier = "active" | "bench" | "all";
+
+export interface RecalculateAllocationsRequest {
+  tier: AllocationTier;
+  auto_apply: boolean;
+}
+
+export interface RiskComponents {
+  sortino_normalized: number;
+  consistency: number;
+  roi_drawdown_ratio: number;
+  win_rate: number;
+  volatility: number;
+}
+
+export interface AllocationPreview {
+  address: string;
+  current_allocation_pct: number | null;
+  recommended_allocation_pct: number;
+  change_pct: number;
+  composite_score: number;
+  components: RiskComponents;
+}
+
+export interface RecalculateAllocationsResponse {
+  previews: AllocationPreview[];
+  applied: boolean;
+  wallet_count: number;
 }
 
 // Risk monitoring types

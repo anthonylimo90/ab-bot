@@ -74,7 +74,7 @@ cd dashboard && npm run dev      # Run dashboard (Next.js, port 3000)
 
 **Bot detection:** 50+ points = likely bot (trade interval, win rate, latency, 24/7 activity)
 
-**Demotion triggers (immediate):** 5+ consecutive losses, drawdown > 25%, circuit breaker trip, 0% copy fill rate (≥10 attempts, 0 fills in 24h)
+**Demotion triggers (immediate):** 5+ consecutive losses, drawdown > 25%, circuit breaker trip, 0% copy fill rate (≥5 attempts, 0 fills in 6h)
 
 **Demotion triggers (grace period):** ROI < -3% for 48h, Sharpe < 0.5 for 24h
 

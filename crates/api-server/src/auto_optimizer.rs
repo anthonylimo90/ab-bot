@@ -369,6 +369,8 @@ pub enum DemotionTrigger {
     LowSharpe,
     /// No trades in 14 days
     Inactivity,
+    /// 0% copy fill rate (≥5 attempts, 0 fills in 6h)
+    FillRateZero,
     /// Manual user action
     ManualDemote,
     /// Probation failed
@@ -385,6 +387,7 @@ impl DemotionTrigger {
                 | DemotionTrigger::CircuitBreaker
                 | DemotionTrigger::ManualDemote
                 | DemotionTrigger::Inactivity
+                | DemotionTrigger::FillRateZero
         )
     }
 
@@ -394,7 +397,7 @@ impl DemotionTrigger {
         match self {
             DemotionTrigger::NegativeRoi => Some(48), // Was 72 — shorter patience
             DemotionTrigger::LowSharpe => Some(24),   // Was 48 — shorter patience
-            DemotionTrigger::Inactivity => None,      // No grace period, but not immediate
+            DemotionTrigger::Inactivity => None, // Immediate — this arm is never reached for new demotions
             _ => None,
         }
     }
@@ -1096,7 +1099,7 @@ impl AutoOptimizer {
                     fills,
                     "Wallet has 0% copy fill rate over 6h, triggering demotion"
                 );
-                return Ok(Some(DemotionTrigger::Inactivity));
+                return Ok(Some(DemotionTrigger::FillRateZero));
             }
         }
 

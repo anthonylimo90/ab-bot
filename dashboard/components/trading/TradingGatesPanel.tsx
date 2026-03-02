@@ -3,7 +3,7 @@
 import { memo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Activity } from 'lucide-react';
-import { formatCurrency } from '@/lib/utils';
+import { formatCurrency, formatDynamicConfigValue } from '@/lib/utils';
 import type {
   Workspace,
   ServiceStatus,
@@ -203,28 +203,79 @@ function buildCopyTradingGates(dynamicTunerStatus: DynamicTunerStatus | null): G
   const gates: GateRow[] = [];
   const configs = dynamicTunerStatus.dynamic_config || [];
 
-  for (const cfg of configs) {
-    if (cfg.key === 'COPY_MIN_TRADE_VALUE') {
-      gates.push({
-        label: 'Min Trade Value',
-        status: 'green',
-        value: formatCurrency(cfg.current_value),
-      });
-    } else if (cfg.key === 'COPY_MAX_SLIPPAGE_PCT') {
-      gates.push({
-        label: 'Max Slippage',
-        status: 'green',
-        value: `${(cfg.current_value * 100).toFixed(2)}%`,
-      });
-    } else if (cfg.key === 'COPY_MAX_LATENCY_SECS') {
-      const mins = Math.floor(cfg.current_value / 60);
-      const secs = cfg.current_value % 60;
-      gates.push({
-        label: 'Max Trade Age',
-        status: 'green',
-        value: mins > 0 ? `${mins}m ${secs}s` : `${secs}s`,
-      });
-    }
+  const findConfig = (key: string) => configs.find((c) => c.key === key);
+
+  // Helper: detect relaxation from default (amber when > 1.5x default)
+  const relaxedStatus = (cfg: { current_value: number; default_value: number }): GateStatus => {
+    if (cfg.default_value === 0) return 'green';
+    const ratio = cfg.current_value / cfg.default_value;
+    return ratio > 1.5 ? 'amber' : 'green';
+  };
+
+  const minTradeValue = findConfig('COPY_MIN_TRADE_VALUE');
+  if (minTradeValue) {
+    gates.push({
+      label: 'Min Trade Value',
+      status: 'green',
+      value: formatDynamicConfigValue('COPY_MIN_TRADE_VALUE', minTradeValue.current_value),
+    });
+  }
+
+  const slippage = findConfig('COPY_MAX_SLIPPAGE_PCT');
+  if (slippage) {
+    gates.push({
+      label: 'Max Slippage',
+      status: relaxedStatus(slippage),
+      value: formatDynamicConfigValue('COPY_MAX_SLIPPAGE_PCT', slippage.current_value),
+    });
+  }
+
+  const latency = findConfig('COPY_MAX_LATENCY_SECS');
+  if (latency) {
+    gates.push({
+      label: 'Max Trade Age',
+      status: relaxedStatus(latency),
+      value: formatDynamicConfigValue('COPY_MAX_LATENCY_SECS', latency.current_value),
+    });
+  }
+
+  const margin = findConfig('COPY_NEAR_RESOLUTION_MARGIN');
+  if (margin) {
+    // Amber at the 3% floor (minimum enforcement by backend)
+    const atFloor = margin.current_value <= 0.03;
+    gates.push({
+      label: 'Near-Res Margin',
+      status: atFloor ? 'amber' : 'green',
+      value: formatDynamicConfigValue('COPY_NEAR_RESOLUTION_MARGIN', margin.current_value),
+    });
+  }
+
+  const positions = findConfig('COPY_MAX_OPEN_POSITIONS');
+  if (positions) {
+    // Red when at or above max
+    gates.push({
+      label: 'Max Positions',
+      status: 'green',
+      value: formatDynamicConfigValue('COPY_MAX_OPEN_POSITIONS', positions.current_value),
+    });
+  }
+
+  const dailyCap = findConfig('COPY_DAILY_CAPITAL_LIMIT');
+  if (dailyCap) {
+    gates.push({
+      label: 'Daily Capital Limit',
+      status: 'green',
+      value: formatDynamicConfigValue('COPY_DAILY_CAPITAL_LIMIT', dailyCap.current_value),
+    });
+  }
+
+  const totalCap = findConfig('COPY_TOTAL_CAPITAL');
+  if (totalCap) {
+    gates.push({
+      label: 'Total Copy Capital',
+      status: 'green',
+      value: formatDynamicConfigValue('COPY_TOTAL_CAPITAL', totalCap.current_value),
+    });
   }
 
   return gates;

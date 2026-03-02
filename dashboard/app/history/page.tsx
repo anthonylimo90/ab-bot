@@ -30,11 +30,13 @@ import {
   XCircle,
   Activity as ActivityIcon,
   SlidersHorizontal,
+  TrendingDown,
+  TrendingUp,
 } from "lucide-react";
 
 const PAGE_SIZE = 50;
 
-type ActivityFilter = "all" | "copied" | "skipped" | "failed";
+type ActivityFilter = "all" | "copied" | "skipped" | "failed" | "wallet_events";
 type HistoryTab = "activity" | "dynamic";
 
 const activityMeta = {
@@ -53,6 +55,16 @@ const activityMeta = {
     icon: <XCircle className="h-4 w-4 text-red-500" />,
     badgeClass: "bg-red-500/10 text-red-600",
   },
+  WALLET_DEMOTED: {
+    label: "Demoted",
+    icon: <TrendingDown className="h-4 w-4 text-orange-500" />,
+    badgeClass: "bg-orange-500/10 text-orange-600",
+  },
+  WALLET_PROMOTED: {
+    label: "Promoted",
+    icon: <TrendingUp className="h-4 w-4 text-green-500" />,
+    badgeClass: "bg-green-500/10 text-green-600",
+  },
 } as const;
 
 function matchesFilter(type: string, filter: ActivityFilter): boolean {
@@ -60,6 +72,7 @@ function matchesFilter(type: string, filter: ActivityFilter): boolean {
   if (filter === "copied") return type === "TRADE_COPIED";
   if (filter === "skipped") return type === "TRADE_COPY_SKIPPED";
   if (filter === "failed") return type === "TRADE_COPY_FAILED";
+  if (filter === "wallet_events") return type === "WALLET_DEMOTED" || type === "WALLET_PROMOTED";
   return true;
 }
 
@@ -215,6 +228,7 @@ export default function HistoryPage() {
                   <SelectItem value="copied">Copied</SelectItem>
                   <SelectItem value="skipped">Skipped</SelectItem>
                   <SelectItem value="failed">Failed</SelectItem>
+                  <SelectItem value="wallet_events">Wallet Events</SelectItem>
                 </SelectContent>
               </Select>
             </div>
