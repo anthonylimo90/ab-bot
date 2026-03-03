@@ -14,6 +14,15 @@ use wallet_tracker::profitability::{ProfitabilityAnalyzer, TimePeriod};
 use wallet_tracker::strategy_classifier::StrategyClassifier;
 use wallet_tracker::{MarketConditionAnalyzer, MarketRegime};
 
+/// Internal row type for Pearson correlation query results.
+#[derive(Debug, sqlx::FromRow)]
+struct CorrelationRow {
+    condition_id_a: String,
+    condition_id_b: String,
+    correlation: Option<f64>,
+    sample_size: i32,
+}
+
 use crate::schema::wallet_features_has_strategy_type;
 
 /// Configuration for the metrics calculator background job.
@@ -148,6 +157,8 @@ impl MetricsCalculator {
         let mut cycle_count: u64 = 0;
         // Run cleanup every 16 cycles (~4 hours at 15-min intervals)
         let cleanup_every: u64 = 16;
+        // Run market correlation computation every 672 cycles (~7 days at 15-min intervals)
+        let correlation_every: u64 = 672;
 
         loop {
             interval.tick().await;
@@ -166,6 +177,15 @@ impl MetricsCalculator {
                 {
                     Ok(_) => info!("Data hygiene cleanup completed successfully"),
                     Err(e) => warn!(error = %e, "Data hygiene cleanup failed (non-fatal)"),
+                }
+            }
+
+            // Weekly market correlation computation for cross-market signal generator.
+            // Computes Pearson r between same-category markets from orderbook_hourly.
+            if cycle_count.is_multiple_of(correlation_every) {
+                info!("Running weekly market correlation computation");
+                if let Err(e) = self.compute_market_correlations().await {
+                    warn!(error = %e, "Market correlation computation failed (non-fatal)");
                 }
             }
         }
@@ -257,6 +277,132 @@ impl MetricsCalculator {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Compute Pearson correlation coefficients between same-category markets.
+    ///
+    /// For each active category in `market_metadata`, self-joins `orderbook_hourly`
+    /// to compute pairwise correlations from hourly close prices over the last 90 days.
+    /// Pairs with `|r| > 0.50` and at least 168 overlapping observations (≈ 1 week)
+    /// are UPSERTed into `market_correlations`. Stale pairs (>14 days) are pruned.
+    async fn compute_market_correlations(&self) -> Result<()> {
+        let start = Utc::now();
+
+        // Acquire semaphore — this is a heavy cross-join computation
+        let _permit = if let Some(ref sem) = self.db_semaphore {
+            let permit = sem.acquire().await.expect("semaphore closed");
+            debug!("Correlation computation acquired DB semaphore permit");
+            Some(permit)
+        } else {
+            None
+        };
+
+        // Get distinct active categories from market_metadata
+        let categories: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT category FROM market_metadata WHERE category IS NOT NULL AND active = true",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        if categories.is_empty() {
+            info!("No active categories for correlation computation");
+            return Ok(());
+        }
+
+        let mut total_pairs: u64 = 0;
+
+        for category in &categories {
+            // Compute Pearson correlation for all market pairs within this category.
+            // Uses orderbook_hourly `close` (last yes_mid) as the price series.
+            // Canonical ordering (a < b) avoids duplicate pairs and matches the
+            // CHECK constraint on market_correlations.
+            let rows: Vec<CorrelationRow> = sqlx::query_as(
+                r#"
+                WITH hourly_prices AS (
+                    SELECT
+                        oh.market_id,
+                        oh.bucket,
+                        oh.close AS price
+                    FROM orderbook_hourly oh
+                    JOIN market_metadata mm ON mm.condition_id = oh.market_id
+                    WHERE mm.category = $1
+                      AND mm.active = true
+                      AND oh.bucket >= NOW() - INTERVAL '90 days'
+                      AND oh.close > 0
+                )
+                SELECT
+                    a.market_id AS condition_id_a,
+                    b.market_id AS condition_id_b,
+                    CORR(a.price, b.price) AS correlation,
+                    COUNT(*)::INT AS sample_size
+                FROM hourly_prices a
+                JOIN hourly_prices b
+                    ON a.bucket = b.bucket
+                    AND a.market_id < b.market_id
+                GROUP BY a.market_id, b.market_id
+                HAVING COUNT(*) >= 168
+                   AND ABS(CORR(a.price, b.price)) > 0.50
+                "#,
+            )
+            .bind(category)
+            .fetch_all(&self.pool)
+            .await?;
+
+            if rows.is_empty() {
+                continue;
+            }
+
+            // Filter out NULL correlations (degenerate pairs with zero variance)
+            let valid_rows: Vec<&CorrelationRow> =
+                rows.iter().filter(|r| r.correlation.is_some()).collect();
+
+            // Batch UPSERT into market_correlations
+            for chunk in valid_rows.chunks(50) {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "INSERT INTO market_correlations (condition_id_a, condition_id_b, correlation, category, sample_size, computed_at) ",
+                );
+                qb.push_values(chunk, |mut b, row| {
+                    // Safe unwrap: filtered above
+                    let corr = row.correlation.unwrap();
+                    b.push_bind(&row.condition_id_a)
+                        .push_bind(&row.condition_id_b)
+                        .push_bind(corr)
+                        .push_bind(category)
+                        .push_bind(row.sample_size)
+                        .push("NOW()");
+                });
+                qb.push(
+                    " ON CONFLICT (condition_id_a, condition_id_b) DO UPDATE SET \
+                     correlation = EXCLUDED.correlation, \
+                     category = EXCLUDED.category, \
+                     sample_size = EXCLUDED.sample_size, \
+                     computed_at = EXCLUDED.computed_at",
+                );
+                qb.build().execute(&self.pool).await?;
+                total_pairs += chunk.len() as u64;
+            }
+
+            // Yield between categories to avoid blocking the pool
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Prune stale correlation pairs not refreshed in the last 14 days
+        let deleted = sqlx::query(
+            "DELETE FROM market_correlations WHERE computed_at < NOW() - INTERVAL '14 days'",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let duration = (Utc::now() - start).num_seconds();
+        info!(
+            categories = categories.len(),
+            total_pairs,
+            stale_deleted = deleted.rows_affected(),
+            duration_secs = duration,
+            "Market correlation computation complete"
+        );
 
         Ok(())
     }
@@ -429,6 +575,15 @@ mod tests {
         assert_eq!(config.interval_secs, 900);
         assert_eq!(config.batch_size, 200);
         assert_eq!(config.recalc_after_hours, 6);
+    }
+
+    #[test]
+    fn test_correlation_cycle_gate() {
+        // 672 cycles × 15 min = ~7 days
+        let correlation_every: u64 = 672;
+        assert!(672_u64.is_multiple_of(correlation_every));
+        assert!(!671_u64.is_multiple_of(correlation_every));
+        assert!(1344_u64.is_multiple_of(correlation_every)); // 2 weeks
     }
 
     #[test]

@@ -189,6 +189,13 @@ impl AdvancedPredictor {
             0.0
         };
 
+        // Compute market correlation metrics from market_correlations table.
+        // Average correlation across all markets the wallet has traded in gives
+        // a proxy for how correlated the wallet's portfolio is to the broader market.
+        let (correlation_to_market, alpha, beta) = self
+            .compute_market_correlation_features(&metrics.address)
+            .await;
+
         Ok(PredictionFeatures {
             win_rate: metrics.win_rate,
             sharpe_ratio: metrics.sharpe_ratio,
@@ -206,15 +213,98 @@ impl AdvancedPredictor {
             recent_performance_7d: recent_7d,
             recent_performance_30d: recent_30d,
             performance_trend: trend,
-            correlation_to_market: 0.0, // Would need market data
-            alpha: 0.0,
-            beta: 1.0,
+            correlation_to_market,
+            alpha,
+            beta,
             timing_score: self.calculate_timing_score(metrics),
             position_sizing_score: self.calculate_position_sizing_score(metrics),
             diversification_score: 0.5, // Would need position data
             category_specialization: None,
             category_win_rate: metrics.win_rate,
         })
+    }
+
+    /// Compute market correlation features for a wallet.
+    ///
+    /// Uses the `market_correlations` table to measure how correlated the wallet's
+    /// traded markets are to the broader market. Returns (correlation, alpha, beta).
+    ///
+    /// - correlation_to_market: avg |r| across the wallet's traded markets
+    /// - alpha: wallet's excess return above the average market return
+    /// - beta: sensitivity to market moves (approximated from correlation data)
+    async fn compute_market_correlation_features(&self, address: &str) -> (f64, f64, f64) {
+        // Get the average correlation for markets this wallet has traded in.
+        // Higher values mean the wallet trades in correlated clusters.
+        // wallet_trades uses `condition_id` (nullable) as the market identifier.
+        let avg_corr: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT AVG(ABS(mc.correlation))::double precision
+            FROM market_correlations mc
+            WHERE mc.condition_id_a IN (
+                SELECT DISTINCT condition_id FROM wallet_trades
+                WHERE wallet_address = $1 AND condition_id IS NOT NULL
+            )
+            OR mc.condition_id_b IN (
+                SELECT DISTINCT condition_id FROM wallet_trades
+                WHERE wallet_address = $1 AND condition_id IS NOT NULL
+            )
+            "#,
+        )
+        .bind(address)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        let correlation = avg_corr.unwrap_or(0.0);
+
+        // Compute alpha and beta from the wallet's realized P&L vs market average.
+        // Alpha = wallet return - market return (excess return)
+        // Beta = correlation proxy (higher correlation → higher market sensitivity)
+        // Use source_wallet column to link positions to this wallet.
+        let wallet_return: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(realized_pnl)::double precision, 0)
+            FROM positions
+            WHERE LOWER(source_wallet) = LOWER($1)
+              AND exit_timestamp >= NOW() - INTERVAL '30 days'
+              AND realized_pnl IS NOT NULL
+            "#,
+        )
+        .bind(address)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        let avg_market_return: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT AVG(realized_pnl)::double precision
+            FROM positions
+            WHERE exit_timestamp >= NOW() - INTERVAL '30 days'
+              AND realized_pnl IS NOT NULL
+              AND source IN (1, 2, 3)
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        let wallet_ret = wallet_return.unwrap_or(0.0);
+        let market_ret = avg_market_return.unwrap_or(0.0);
+        let alpha = wallet_ret - market_ret;
+
+        // Beta approximation: a wallet that trades highly correlated markets
+        // has higher market sensitivity. Scale correlation to beta range [0.5, 1.5].
+        let beta = 0.5 + correlation;
+
+        debug!(
+            address = %address,
+            correlation,
+            alpha,
+            beta,
+            "Computed market correlation features"
+        );
+
+        (correlation, alpha, beta)
     }
 
     /// Get recent performance for a wallet.
@@ -606,15 +696,19 @@ impl MarketConditionAnalyzer {
         }
     }
 
-    /// Detect market regime using wallet performance aggregates from `wallet_success_metrics`.
+    /// Detect market regime using a blend of wallet performance aggregates
+    /// and orderbook microstructure data.
     ///
-    /// Uses rolling 7-day averages across all recently-computed wallets:
-    /// - Average win rate classifies bull (>0.60), bear (<0.50), or ranging
+    /// **Layer 1 — Wallet metrics** (from `wallet_success_metrics`):
+    /// - Average win rate classifies bull (>0.58), bear (<0.48), or ranging
     /// - Standard deviation of ROI classifies volatility
     ///
-    /// This is a lightweight alternative to `detect_regime()` that doesn't require
-    /// arb_opportunities data and is suitable for hourly MetricsCalculator integration.
+    /// **Layer 2 — Orderbook microstructure** (from `orderbook_hourly`):
+    /// - 24h price momentum (avg close change across active markets)
+    /// - Spread volatility (stddev of hourly avg_spread)
+    /// Used as a tiebreaker when wallet metrics alone fall into the ambiguous zone.
     pub async fn detect_regime_from_metrics(&self) -> Result<MarketRegime> {
+        // ── Layer 1: Wallet performance aggregates ──
         let row: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
             r#"
             SELECT
@@ -643,10 +737,46 @@ impl MarketConditionAnalyzer {
         let avg_win_rate = avg_win_rate.unwrap_or(0.50);
         let roi_stddev = roi_stddev.unwrap_or(0.15);
 
-        let is_bullish = avg_win_rate > 0.58;
-        let is_bearish = avg_win_rate < 0.48;
-        let is_volatile = roi_stddev > self.volatility_threshold_high;
-        let is_calm = roi_stddev < self.volatility_threshold_low;
+        // ── Layer 2: Orderbook microstructure (24h momentum + spread volatility) ──
+        // Query the hourly continuous aggregate for the last 24h.
+        // momentum: average (close - open) / open across all markets with data
+        // spread_vol: stddev of avg_spread across all hourly buckets
+        let ob_row: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
+            r#"
+            SELECT
+                AVG(
+                    CASE WHEN open > 0 THEN (close - open)::FLOAT8 / open::FLOAT8 ELSE 0 END
+                ) AS avg_momentum,
+                STDDEV_POP(avg_spread::FLOAT8) AS spread_volatility
+            FROM orderbook_hourly
+            WHERE bucket >= NOW() - INTERVAL '24 hours'
+              AND tick_count >= 2
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        let (avg_momentum, spread_vol) = ob_row.unwrap_or((None, None));
+        let avg_momentum = avg_momentum.unwrap_or(0.0);
+        let spread_vol = spread_vol.unwrap_or(0.0);
+
+        // ── Classification ──
+        // Primary signal: wallet metrics
+        let mut is_bullish = avg_win_rate > 0.58;
+        let mut is_bearish = avg_win_rate < 0.48;
+        let is_volatile = roi_stddev > self.volatility_threshold_high || spread_vol > 0.02;
+        let is_calm = roi_stddev < self.volatility_threshold_low && spread_vol < 0.005;
+
+        // Tiebreaker: when wallet metrics are in the ambiguous zone (0.48–0.58),
+        // use orderbook momentum to nudge the classification.
+        if !is_bullish && !is_bearish {
+            if avg_momentum > 0.005 {
+                is_bullish = true;
+            } else if avg_momentum < -0.005 {
+                is_bearish = true;
+            }
+        }
 
         let regime = if is_bullish && is_volatile {
             MarketRegime::BullVolatile
@@ -665,8 +795,10 @@ impl MarketConditionAnalyzer {
         debug!(
             avg_win_rate = avg_win_rate,
             roi_stddev = roi_stddev,
+            avg_momentum = avg_momentum,
+            spread_vol = spread_vol,
             regime = ?regime,
-            "Detected market regime from wallet metrics"
+            "Detected market regime (wallet + orderbook)"
         );
 
         Ok(regime)

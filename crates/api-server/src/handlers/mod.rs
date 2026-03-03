@@ -17,6 +17,7 @@ pub mod positions;
 pub mod recommendations;
 pub mod risk;
 pub mod risk_allocations;
+pub mod signals;
 pub mod trading;
 pub mod users;
 pub mod vault;

@@ -12,7 +12,7 @@ use auth::key_vault::KeyVault;
 use auth::rbac::RbacManager;
 use auth::{AuditLogger, AuditStorage, PostgresAuditStorage, TradingWallet};
 use polymarket_core::api::{ClobClient, PolygonClient};
-use polymarket_core::types::ArbOpportunity;
+use polymarket_core::types::{ArbOpportunity, QuantSignal};
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use trading_engine::copy_trader::CopyTrader;
 use trading_engine::executor::ExecutorConfig;
@@ -80,6 +80,8 @@ pub struct AppState {
     pub automation_tx: broadcast::Sender<AutomationEvent>,
     /// Broadcast channel for arb entry signals (feeds ArbAutoExecutor).
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
+    /// Broadcast channel for quant signals (feeds QuantSignalExecutor).
+    pub quant_signal_tx: broadcast::Sender<QuantSignal>,
     /// Wallet discovery service for querying profitable wallets from DB.
     pub wallet_discovery: Arc<WalletDiscovery>,
     /// Polygon RPC client for on-chain queries (balance, etc.).
@@ -105,6 +107,8 @@ pub struct AppState {
     pub arb_executor_heartbeat: Arc<AtomicI64>,
     /// Heartbeat timestamp (epoch secs) from exit handler loop — 0 means never updated.
     pub exit_handler_heartbeat: Arc<AtomicI64>,
+    /// Heartbeat timestamp (epoch secs) from quant signal executor — 0 means never updated.
+    pub quant_executor_heartbeat: Arc<AtomicI64>,
     /// Total copy-trading capital in cents (e.g. 1_000_000 = $10,000).
     pub copy_total_capital: Arc<AtomicI64>,
     /// Near-resolution margin stored as margin * 10,000 (e.g. 300 = 0.03). 0 = filter disabled.
@@ -123,6 +127,7 @@ impl AppState {
         signal_tx: broadcast::Sender<SignalUpdate>,
         automation_tx: broadcast::Sender<AutomationEvent>,
         arb_entry_tx: broadcast::Sender<ArbOpportunity>,
+        quant_signal_tx: broadcast::Sender<QuantSignal>,
     ) -> anyhow::Result<Self> {
         // Resolve encryption key for sensitive DB fields
         let encryption_key = std::env::var("ENCRYPTION_KEY").unwrap_or_else(|_| jwt_secret.clone());
@@ -489,6 +494,7 @@ impl AppState {
             signal_tx,
             automation_tx,
             arb_entry_tx,
+            quant_signal_tx,
             wallet_discovery,
             polygon_client,
             trade_monitor: None,
@@ -501,6 +507,7 @@ impl AppState {
             exit_handler_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
+            quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             copy_total_capital: Arc::new(AtomicI64::new(
                 std::env::var("COPY_TOTAL_CAPITAL")
                     .ok()

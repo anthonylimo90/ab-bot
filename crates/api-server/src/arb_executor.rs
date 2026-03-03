@@ -109,7 +109,7 @@ impl ArbExecutorConfig {
 }
 
 /// Cached mapping of market_id → (yes_token_id, no_token_id).
-struct OutcomeTokenCache {
+pub(crate) struct OutcomeTokenCache {
     clob_client: Arc<ClobClient>,
     tokens: RwLock<HashMap<String, (String, String)>>,
     /// Shared set of active (non-resolved) market IDs, populated on each refresh.
@@ -120,7 +120,7 @@ struct OutcomeTokenCache {
 }
 
 impl OutcomeTokenCache {
-    fn new(
+    pub(crate) fn new(
         clob_client: Arc<ClobClient>,
         active_clob_markets: Arc<RwLock<HashSet<String>>>,
     ) -> Self {
@@ -132,13 +132,13 @@ impl OutcomeTokenCache {
         }
     }
 
-    fn with_pool(mut self, pool: PgPool) -> Self {
+    pub(crate) fn with_pool(mut self, pool: PgPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
     /// Refresh the cache by fetching all markets from the CLOB API.
-    async fn refresh(&self) -> anyhow::Result<(usize, usize)> {
+    pub(crate) async fn refresh(&self) -> anyhow::Result<(usize, usize)> {
         let markets = self.clob_client.get_markets().await?;
         let mut map = HashMap::new();
         let mut active_set = HashSet::new();
@@ -223,7 +223,7 @@ impl OutcomeTokenCache {
     }
 
     /// Look up token IDs for a given market.
-    async fn get(&self, market_id: &str) -> Option<(String, String)> {
+    pub(crate) async fn get(&self, market_id: &str) -> Option<(String, String)> {
         self.tokens.read().await.get(market_id).cloned()
     }
 }
