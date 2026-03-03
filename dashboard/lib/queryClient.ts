@@ -142,6 +142,19 @@ export const queryKeys = {
     detail: (id: string) => [...queryKeys.orders.all(), "detail", id] as const,
   },
 
+  // Quant signals
+  signals: {
+    all: () => ["signals"] as const,
+    flow: (conditionId: string, windowMinutes?: number) =>
+      [...queryKeys.signals.all(), "flow", conditionId, windowMinutes] as const,
+    recent: (params?: { kind?: string; limit?: number }) =>
+      [...queryKeys.signals.all(), "recent", params] as const,
+    performance: (periodDays?: number) =>
+      [...queryKeys.signals.all(), "performance", periodDays] as const,
+    metadata: (params?: { category?: string; active?: boolean; limit?: number }) =>
+      [...queryKeys.signals.all(), "metadata", params] as const,
+  },
+
   // Rotation history
   rotationHistory: {
     all: () => ["rotation-history"] as const,

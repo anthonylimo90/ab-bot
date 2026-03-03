@@ -58,6 +58,10 @@ import type {
   CopyPerformanceResponse,
   RecalculateAllocationsRequest,
   RecalculateAllocationsResponse,
+  FlowFeatureResponse,
+  RecentSignalResponse,
+  StrategyPerformanceResponse,
+  MarketMetadataResponse,
 } from "@/types/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
@@ -109,6 +113,21 @@ function parsePosition(raw: Position): Position {
     take_profit: raw.take_profit != null ? Number(raw.take_profit) : undefined,
     realized_pnl:
       raw.realized_pnl != null ? Number(raw.realized_pnl) : undefined,
+  };
+}
+
+function parsePerformance(raw: StrategyPerformanceResponse): StrategyPerformanceResponse {
+  return { ...raw, net_pnl: Number(raw.net_pnl), avg_pnl: Number(raw.avg_pnl) };
+}
+
+function parseFlowFeature(raw: FlowFeatureResponse): FlowFeatureResponse {
+  return {
+    ...raw,
+    buy_volume: Number(raw.buy_volume),
+    sell_volume: Number(raw.sell_volume),
+    net_flow: Number(raw.net_flow),
+    imbalance_ratio: Number(raw.imbalance_ratio),
+    smart_money_flow: Number(raw.smart_money_flow),
   };
 }
 
@@ -1114,6 +1133,67 @@ class ApiClient {
     return this.request<Activity[]>(
       `/api/v1/activity${query ? `?${query}` : ""}`,
     );
+  }
+
+  // Quant Signals
+  async getFlowFeatures(params: {
+    condition_id: string;
+    window_minutes?: number;
+  }): Promise<FlowFeatureResponse[]> {
+    const sp = new URLSearchParams();
+    sp.set("condition_id", params.condition_id);
+    if (params.window_minutes) sp.set("window_minutes", String(params.window_minutes));
+    const raw = await this.request<FlowFeatureResponse[]>(`/api/v1/signals/flow?${sp}`);
+    return raw.map(parseFlowFeature);
+  }
+
+  async getRecentSignals(params?: {
+    kind?: string;
+    limit?: number;
+  }): Promise<RecentSignalResponse[]> {
+    const sp = new URLSearchParams();
+    if (params?.kind) sp.set("kind", params.kind);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<RecentSignalResponse[]>(
+      `/api/v1/signals/recent${q ? `?${q}` : ""}`,
+    );
+    return raw.map((r) => ({
+      ...r,
+      size_usd: r.size_usd != null ? Number(r.size_usd) : null,
+    }));
+  }
+
+  async getStrategyPerformance(params?: {
+    period_days?: number;
+  }): Promise<StrategyPerformanceResponse[]> {
+    const sp = new URLSearchParams();
+    if (params?.period_days) sp.set("period_days", String(params.period_days));
+    const q = sp.toString();
+    const raw = await this.request<StrategyPerformanceResponse[]>(
+      `/api/v1/signals/performance${q ? `?${q}` : ""}`,
+    );
+    return raw.map(parsePerformance);
+  }
+
+  async getMarketMetadata(params?: {
+    category?: string;
+    active?: boolean;
+    limit?: number;
+  }): Promise<MarketMetadataResponse[]> {
+    const sp = new URLSearchParams();
+    if (params?.category) sp.set("category", params.category);
+    if (params?.active !== undefined) sp.set("active", String(params.active));
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<MarketMetadataResponse[]>(
+      `/api/v1/signals/metadata${q ? `?${q}` : ""}`,
+    );
+    return raw.map((r) => ({
+      ...r,
+      volume: Number(r.volume),
+      liquidity: Number(r.liquidity),
+    }));
   }
 }
 

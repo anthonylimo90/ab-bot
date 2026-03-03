@@ -1215,3 +1215,64 @@ export interface RiskStatus {
   circuit_breaker: CircuitBreakerStatus;
   stop_loss: StopLossStats;
 }
+
+// Quant Signal types
+export type QuantSignalKind = "flow" | "cross_market" | "mean_reversion" | "resolution_proximity";
+export type SignalDirection = "BuyYes" | "BuyNo";
+export type SignalExecutionStatus = "pending" | "executed" | "skipped" | "expired";
+
+export interface FlowFeatureResponse {
+  condition_id: string;
+  window_end: string;
+  window_minutes: number;
+  buy_volume: number;
+  sell_volume: number;
+  net_flow: number;
+  imbalance_ratio: number;
+  unique_buyers: number;
+  unique_sellers: number;
+  smart_money_flow: number;
+  trade_count: number;
+}
+
+export interface RecentSignalResponse {
+  id: string;
+  kind: string;
+  condition_id: string;
+  direction: string;
+  confidence: number;
+  size_usd: number | null;
+  execution_status: string | null;
+  skip_reason: string | null;
+  position_id: string | null;
+  generated_at: string;
+  metadata: Record<string, unknown>;
+}
+
+export interface StrategyPerformanceResponse {
+  strategy: string;
+  period_end: string;
+  period_days: number;
+  total_signals: number;
+  executed: number;
+  wins: number;
+  losses: number;
+  net_pnl: number;
+  avg_pnl: number;
+  win_rate: number | null;
+  sharpe: number | null;
+  max_drawdown_pct: number | null;
+  avg_hold_hours: number | null;
+}
+
+export interface MarketMetadataResponse {
+  condition_id: string;
+  question: string;
+  category: string | null;
+  tags: string[];
+  end_date: string | null;
+  volume: number;
+  liquidity: number;
+  active: boolean;
+  fetched_at: string;
+}

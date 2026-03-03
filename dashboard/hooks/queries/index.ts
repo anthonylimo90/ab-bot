@@ -59,6 +59,14 @@ export {
   useResetCircuitBreakerMutation,
 } from "./useRiskQuery";
 
+// Signal queries
+export {
+  useFlowFeaturesQuery,
+  useRecentSignalsQuery,
+  useStrategyPerformanceQuery,
+  useMarketMetadataQuery,
+} from "./useSignalsQuery";
+
 // Allocation queries
 export {
   useAllocationsQuery,

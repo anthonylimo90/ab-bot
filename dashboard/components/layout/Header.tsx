@@ -415,11 +415,11 @@ export function Header() {
                 </div>
                 <div className="border-t px-3 py-2">
                   <Link
-                    href="/signals"
+                    href="/activity"
                     className="text-xs text-primary hover:underline"
                     onClick={() => setIsSignalDropdownOpen(false)}
                   >
-                    View All Signals
+                    View All Activity
                   </Link>
                 </div>
               </div>
