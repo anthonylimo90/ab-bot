@@ -8,17 +8,36 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useMarketsQuery } from "@/hooks/queries/useMarketsQuery";
+import { useMarketMetadataQuery } from "@/hooks/queries/useSignalsQuery";
 import { MarketCard } from "@/components/markets/MarketCard";
 import { MarketDetailSheet } from "@/components/markets/MarketDetailSheet";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { BarChart2, Search } from "lucide-react";
 
 export default function MarketsPage() {
   const [search, setSearch] = useState("");
   const [activeOnly, setActiveOnly] = useState(true);
+  const [category, setCategory] = useState<string>("all");
   const [selectedMarketId, setSelectedMarketId] = useState<string | null>(null);
+
+  const { data: metadata = [] } = useMarketMetadataQuery({ limit: 250 });
+  const categories = useMemo(() => {
+    const cats = new Set<string>();
+    metadata.forEach((m) => {
+      if (m.category) cats.add(m.category);
+    });
+    return Array.from(cats).sort();
+  }, [metadata]);
 
   const { data: markets = [], isLoading } = useMarketsQuery({
     active: activeOnly || undefined,
+    category: category !== "all" ? category : undefined,
     limit: 100,
   });
 
@@ -28,7 +47,7 @@ export default function MarketsPage() {
     return markets.filter(
       (m) =>
         m.question.toLowerCase().includes(lower) ||
-        m.category.toLowerCase().includes(lower),
+        (m.category ?? "").toLowerCase().includes(lower),
     );
   }, [markets, search]);
 
@@ -56,6 +75,19 @@ export default function MarketsPage() {
             className="pl-10"
           />
         </div>
+        <Select value={category} onValueChange={setCategory}>
+          <SelectTrigger className="w-[180px]">
+            <SelectValue placeholder="All Categories" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All Categories</SelectItem>
+            {categories.map((cat) => (
+              <SelectItem key={cat} value={cat}>
+                {cat}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <div className="flex items-center gap-2">
           <Switch
             id="active-only"

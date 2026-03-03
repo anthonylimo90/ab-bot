@@ -256,6 +256,9 @@ impl ProfitabilityAnalyzer {
         let consistency = self.calculate_consistency_score(&trade_pnls);
         let (win_streak, lose_streak, current) = self.calculate_streaks(&trades);
 
+        // Calculate average holding period from BUY→SELL pairing per market
+        let avg_hold_hours = Self::compute_avg_hold_time_hours(&trades);
+
         // Annualized return
         let days = period.to_days().unwrap_or(365) as f64;
         let annualized = ((1.0 + roi).powf(365.0 / days)) - 1.0;
@@ -282,7 +285,7 @@ impl ProfitabilityAnalyzer {
             expectancy,
             avg_position_size: avg_position,
             max_position_size: max_position,
-            avg_holding_period_hours: 24.0, // Simplified
+            avg_holding_period_hours: avg_hold_hours,
             consistency_score: consistency,
             winning_streak: win_streak,
             losing_streak: lose_streak,
@@ -390,6 +393,50 @@ impl ProfitabilityAnalyzer {
         .await?;
 
         Ok(())
+    }
+
+    /// Compute the average holding period in hours by pairing BUY→SELL trades
+    /// on the same market. Uses a FIFO (first-in-first-out) matching strategy:
+    /// the earliest unmatched BUY for a given `market_id` is paired with the
+    /// next SELL on that market. Unmatched trades (open positions) are excluded.
+    ///
+    /// Falls back to 24.0 hours if no matched pairs are found.
+    fn compute_avg_hold_time_hours(trades: &[TradeRecord]) -> f64 {
+        // Collect earliest buy timestamps per market (FIFO queue)
+        let mut buy_queues: HashMap<String, Vec<DateTime<Utc>>> = HashMap::new();
+        let mut hold_durations: Vec<f64> = Vec::new();
+
+        for trade in trades {
+            match trade.side {
+                TradeSide::Buy => {
+                    buy_queues
+                        .entry(trade.market_id.clone())
+                        .or_default()
+                        .push(trade.timestamp);
+                }
+                TradeSide::Sell => {
+                    if let Some(queue) = buy_queues.get_mut(&trade.market_id) {
+                        if let Some(buy_time) = queue.first().copied() {
+                            let hold_hours = trade
+                                .timestamp
+                                .signed_duration_since(buy_time)
+                                .num_seconds()
+                                .max(0) as f64
+                                / 3600.0;
+                            hold_durations.push(hold_hours);
+                            queue.remove(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if hold_durations.is_empty() {
+            24.0 // Fallback when no matched pairs
+        } else {
+            let sum: f64 = hold_durations.iter().sum();
+            sum / hold_durations.len() as f64
+        }
     }
 
     // Private calculation methods

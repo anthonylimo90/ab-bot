@@ -28,14 +28,19 @@ pub mod dynamic_tuner;
 pub mod email;
 pub mod error;
 pub mod exit_handler;
+pub mod flow_feature_calculator;
+pub mod gamma_syncer;
 pub mod handlers;
 pub mod metrics_calculator;
 pub mod middleware;
+pub mod quant_signal_executor;
 pub mod redis_forwarder;
 pub mod routes;
 pub mod runtime_sync;
 pub mod schema;
+pub mod signals;
 pub mod state;
+pub mod strategy_pnl_calculator;
 pub mod wallet_harvester;
 pub mod websocket;
 
@@ -46,11 +51,19 @@ pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
 pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
+pub use flow_feature_calculator::{spawn_flow_feature_calculator, FlowFeatureConfig};
+pub use gamma_syncer::{spawn_gamma_syncer, GammaSyncerConfig};
 pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
+pub use quant_signal_executor::{spawn_quant_signal_executor, QuantSignalExecutorConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
 pub use runtime_sync::reconcile_copy_runtime;
+pub use signals::{
+    spawn_cross_market_signal_generator, spawn_flow_signal_generator,
+    spawn_mean_reversion_signal_generator, spawn_resolution_signal_generator,
+};
 pub use state::AppState;
+pub use strategy_pnl_calculator::{spawn_strategy_pnl_calculator, StrategyPnlConfig};
 pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
 
 use axum::extract::DefaultBodyLimit;
@@ -140,6 +153,7 @@ impl ApiServer {
         let (signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (automation_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (arb_entry_tx, _) = broadcast::channel(config.ws_channel_capacity);
+        let (quant_signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
         // Create app state (not yet Arc-wrapped so copy trading fields can be set)
         let state = AppState::new(
@@ -150,6 +164,7 @@ impl ApiServer {
             signal_tx,
             automation_tx,
             arb_entry_tx,
+            quant_signal_tx,
         )
         .await?;
 
@@ -438,6 +453,68 @@ impl ApiServer {
             state.pool.clone(),
             db_semaphore.clone(),
         );
+
+        // Spawn Gamma API market metadata syncer (hourly, populates market_metadata)
+        let gamma_config = GammaSyncerConfig::from_env();
+        spawn_gamma_syncer(gamma_config, state.pool.clone(), db_semaphore.clone());
+
+        // Spawn flow feature calculator (5 min, aggregates wallet_trades → market_flow_features)
+        let flow_config = FlowFeatureConfig::from_env();
+        spawn_flow_feature_calculator(flow_config, state.pool.clone(), db_semaphore.clone());
+
+        // ── Quant signal system: executor + generators ──
+        // Executor receives QuantSignal from broadcast channel and evaluates/executes.
+        let quant_config = Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env()));
+        spawn_quant_signal_executor(
+            quant_config,
+            state.quant_signal_tx.subscribe(),
+            state.signal_tx.clone(),
+            state.order_executor.clone(),
+            state.circuit_breaker.clone(),
+            state.clob_client.clone(),
+            state.pool.clone(),
+            state.active_clob_markets.clone(),
+            state.quant_executor_heartbeat.clone(),
+        );
+
+        // Signal generators — each polls feature tables and emits QuantSignal
+        use signals::{
+            cross_market_signal::CrossMarketSignalConfig, flow_signal::FlowSignalConfig,
+            mean_reversion_signal::MeanReversionSignalConfig,
+            resolution_signal::ResolutionSignalConfig,
+        };
+
+        let flow_signal_config = FlowSignalConfig::from_env();
+        spawn_flow_signal_generator(
+            flow_signal_config,
+            state.pool.clone(),
+            state.quant_signal_tx.clone(),
+        );
+
+        let resolution_config = ResolutionSignalConfig::from_env();
+        spawn_resolution_signal_generator(
+            resolution_config,
+            state.pool.clone(),
+            state.quant_signal_tx.clone(),
+        );
+
+        let mean_rev_config = MeanReversionSignalConfig::from_env();
+        spawn_mean_reversion_signal_generator(
+            mean_rev_config,
+            state.pool.clone(),
+            state.quant_signal_tx.clone(),
+        );
+
+        let cross_market_config = CrossMarketSignalConfig::from_env();
+        spawn_cross_market_signal_generator(
+            cross_market_config,
+            state.pool.clone(),
+            state.quant_signal_tx.clone(),
+        );
+
+        // Spawn strategy P&L calculator (6h, computes per-strategy performance snapshots)
+        let pnl_config = StrategyPnlConfig::from_env();
+        spawn_strategy_pnl_calculator(pnl_config, state.pool.clone(), db_semaphore.clone());
 
         // Spawn metrics calculator (populates wallet_success_metrics + market regime)
         let metrics_config = MetricsCalculatorConfig::from_env();

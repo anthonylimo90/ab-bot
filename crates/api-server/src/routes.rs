@@ -13,7 +13,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::handlers::{
     activity, admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health,
     invites, markets, onboarding, order_signing, positions, recommendations, risk,
-    risk_allocations, trading, users, vault, wallet_auth, wallets, workspaces,
+    risk_allocations, signals, trading, users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -144,6 +144,11 @@ use crate::websocket;
         workspaces::update_copy_trading_config,
         // Arb executor config
         workspaces::update_arb_executor_config,
+        // Signals (quant signal system)
+        signals::get_flow_features,
+        signals::get_market_metadata,
+        signals::get_recent_signals,
+        signals::get_strategy_performance,
     ),
     components(
         schemas(
@@ -278,6 +283,11 @@ use crate::websocket;
             workspaces::CopyTradingConfigResponse,
             workspaces::UpdateArbExecutorConfigRequest,
             workspaces::ArbExecutorConfigResponse,
+            // Signals
+            signals::FlowFeatureResponse,
+            signals::MarketMetadataResponse,
+            signals::RecentSignalResponse,
+            signals::StrategyPerformanceResponse,
         )
     ),
     tags(
@@ -302,6 +312,7 @@ use crate::websocket;
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "activity", description = "Activity feed from copy trade history"),
         (name = "risk", description = "Risk monitoring and circuit breaker management"),
+        (name = "signals", description = "Quant signal system: flow features, performance, and recent signals"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
     )
 )]
@@ -481,6 +492,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/invites",
             get(invites::list_invites),
+        )
+        // Signal endpoints (read-only for all members)
+        .route("/api/v1/signals/flow", get(signals::get_flow_features))
+        .route(
+            "/api/v1/signals/metadata",
+            get(signals::get_market_metadata),
+        )
+        .route("/api/v1/signals/recent", get(signals::get_recent_signals))
+        .route(
+            "/api/v1/signals/performance",
+            get(signals::get_strategy_performance),
         )
         // Activity feed (read-only for all members)
         .route("/api/v1/activity", get(activity::list_activity))

@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { PortfolioChart } from "@/components/charts/PortfolioChart";
 import { AllocationPie } from "@/components/charts/AllocationPie";
 import { LiveActivityFeed } from "@/components/discover/LiveActivityFeed";
+import { MarketRegimeBadge } from "@/components/discover/MarketRegimeBadge";
 import {
   Activity,
   ArrowRight,
@@ -163,10 +164,13 @@ export function DashboardHome() {
           </div>
           <LiveIndicator />
         </div>
-        <Badge variant="secondary" className="w-fit items-center gap-1">
-          <ModeIcon className="h-3 w-3" />
-          {modeLabel} Mode
-        </Badge>
+        <div className="flex items-center gap-2">
+          <MarketRegimeBadge />
+          <Badge variant="secondary" className="w-fit items-center gap-1">
+            <ModeIcon className="h-3 w-3" />
+            {modeLabel} Mode
+          </Badge>
+        </div>
       </div>
 
       {/* Watchdog alert */}

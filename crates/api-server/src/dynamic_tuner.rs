@@ -40,6 +40,7 @@ const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
 const KEY_ARB_MAX_SIGNAL_AGE_SECS: &str = "ARB_MAX_SIGNAL_AGE_SECS";
 const KEY_COPY_TOTAL_CAPITAL: &str = "COPY_TOTAL_CAPITAL";
 const KEY_COPY_NEAR_RESOLUTION_MARGIN: &str = "COPY_NEAR_RESOLUTION_MARGIN";
+const KEY_QUANT_BASE_POSITION_SIZE: &str = "QUANT_BASE_POSITION_SIZE";
 
 const EPSILON: f64 = 1e-6;
 
@@ -87,6 +88,12 @@ struct TuningMetrics {
     recent_drawdown: f64,
     cb_tripped: bool,
     current_regime: String,
+    /// Number of currently open copy-trade positions (source = 2).
+    copy_open_positions: f64,
+    /// Configured max copy-trade positions (capacity denominator).
+    copy_max_positions: f64,
+    /// Quant strategy net P&L over the last 7 days.
+    quant_pnl_7d: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -759,6 +766,35 @@ impl DynamicTuner {
             (max_markets_current * desired_market_factor).round(),
         );
 
+        // QUANT_BASE_POSITION_SIZE: auto-raise when copy trading is winding down
+        // and quant strategies are profitable. Capital reallocation from copy → quant.
+        let quant_size_current = rows
+            .get(KEY_QUANT_BASE_POSITION_SIZE)
+            .map(|r| decimal_to_f64(r.current_value))
+            .unwrap_or(30.0);
+
+        // Position utilization: current copy positions / configured max
+        let copy_utilization = if metrics.copy_max_positions > 0.0 {
+            metrics.copy_open_positions / metrics.copy_max_positions
+        } else {
+            1.0
+        };
+
+        let desired_quant_size = if copy_utilization < 0.25 && metrics.quant_pnl_7d > 0.0 {
+            // Copy trading is nearly idle and quant is profitable — raise by 10%
+            quant_size_current * 1.10
+        } else if copy_utilization < 0.50 && metrics.quant_pnl_7d > 0.0 {
+            // Copy trading partially wound down — modest 5% raise
+            quant_size_current * 1.05
+        } else if metrics.quant_pnl_7d < -50.0 {
+            // Quant strategies are bleeding — pull back by 10%
+            quant_size_current * 0.90
+        } else {
+            // Hold steady
+            quant_size_current
+        };
+        targets.insert(KEY_QUANT_BASE_POSITION_SIZE.to_string(), desired_quant_size);
+
         targets
     }
 
@@ -898,6 +934,41 @@ impl DynamicTuner {
             0.0
         };
 
+        // Count currently open copy-trade positions (source = 2 is copy_trade)
+        let copy_open_positions: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM positions
+            WHERE source = 2
+              AND status IN (1, 2)
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        // Copy trading position capacity: use the configured max from env.
+        // This avoids the semantic mismatch of comparing a point-in-time concurrent
+        // count against a daily entry rate.
+        let copy_max_positions: f64 = std::env::var("COPY_MAX_OPEN_POSITIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15.0);
+
+        // Quant strategy net P&L over the last 7 days
+        let quant_pnl_7d: Decimal = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(realized_pnl), 0)
+            FROM positions
+            WHERE source = 3
+              AND exit_timestamp >= NOW() - INTERVAL '7 days'
+              AND realized_pnl IS NOT NULL
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(Decimal::ZERO);
+
         Ok(TuningMetrics {
             slippage_skip_rate: ratio(slippage_skips, attempts),
             below_min_skip_rate: ratio(below_min_skips, attempts),
@@ -919,6 +990,9 @@ impl DynamicTuner {
             recent_drawdown: decimal_to_f64(drawdown),
             cb_tripped: cb_state.tripped,
             current_regime: "Uncertain".to_string(),
+            copy_open_positions: copy_open_positions as f64,
+            copy_max_positions: copy_max_positions,
+            quant_pnl_7d: decimal_to_f64(quant_pnl_7d),
         })
     }
 
@@ -1067,6 +1141,14 @@ impl DynamicTuner {
                 min_value: Decimal::new(3, 2), // 0.03 (3%) floor — never fully disabled
                 max_value: Decimal::new(25, 2), // 0.25 ceiling
                 max_step_pct: Decimal::new(50, 2),
+            },
+            // ── Quant signal executor tuning knob ──
+            ConfigSeed {
+                key: KEY_QUANT_BASE_POSITION_SIZE,
+                default_value: env_decimal("QUANT_BASE_POSITION_SIZE", Decimal::new(30, 0)),
+                min_value: Decimal::new(10, 0),    // $10 floor
+                max_value: Decimal::new(200, 0),   // $200 ceiling
+                max_step_pct: Decimal::new(15, 2), // 15% per cycle
             },
         ];
 
@@ -1845,6 +1927,7 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
         KEY_ARB_MAX_SIGNAL_AGE_SECS,
         KEY_COPY_TOTAL_CAPITAL,
         KEY_COPY_NEAR_RESOLUTION_MARGIN,
+        KEY_QUANT_BASE_POSITION_SIZE,
     ] {
         if let Some(bounds) = fallback_bounds_for_key(key) {
             map.insert(key.to_string(), bounds);
@@ -1868,6 +1951,7 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
         KEY_ARB_MAX_SIGNAL_AGE_SECS => Some((Decimal::new(5, 0), Decimal::new(300, 0))),
         KEY_COPY_TOTAL_CAPITAL => Some((Decimal::new(100, 0), Decimal::new(500000, 0))),
         KEY_COPY_NEAR_RESOLUTION_MARGIN => Some((Decimal::new(3, 2), Decimal::new(25, 2))),
+        KEY_QUANT_BASE_POSITION_SIZE => Some((Decimal::new(10, 0), Decimal::new(200, 0))),
         _ => None,
     }
 }
