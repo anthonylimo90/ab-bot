@@ -8,7 +8,6 @@ import type { Position, PositionStatus } from "@/types/api";
 interface PositionFilters {
   status?: PositionStatus;
   market?: string;
-  copyTradesOnly?: boolean;
 }
 
 export function usePositionsQuery(filters?: PositionFilters) {
@@ -18,7 +17,6 @@ export function usePositionsQuery(filters?: PositionFilters) {
       api.getPositions({
         status: filters?.status,
         market_id: filters?.market,
-        copy_trades_only: filters?.copyTradesOnly,
       }),
     staleTime: 30 * 1000,
     refetchInterval: 30 * 1000,
@@ -77,11 +75,3 @@ export function useOpenPositions() {
   };
 }
 
-export function useCopyTradePositions() {
-  const query = usePositionsQuery({ copyTradesOnly: true });
-
-  return {
-    ...query,
-    copyPositions: query.data ?? [],
-  };
-}

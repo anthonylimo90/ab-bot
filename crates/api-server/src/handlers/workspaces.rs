@@ -55,44 +55,12 @@ pub struct WorkspaceResponse {
     /// Masked alchemy API key (shows only last 4 chars).
     pub alchemy_api_key: Option<String>,
     pub arb_auto_execute: bool,
-    pub copy_trading_enabled: bool,
     pub live_trading_enabled: bool,
     pub exit_handler_enabled: bool,
     pub inactivity_days: i32,
     pub my_role: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Optimizer status response for automatic workspaces.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct OptimizerStatusResponse {
-    pub enabled: bool,
-    pub last_run_at: Option<DateTime<Utc>>,
-    pub next_run_at: Option<DateTime<Utc>>,
-    pub interval_hours: i32,
-    pub criteria: OptimizerCriteria,
-    pub active_wallet_count: i32,
-    pub bench_wallet_count: i32,
-    pub portfolio_metrics: PortfolioMetrics,
-}
-
-/// Optimizer selection criteria.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct OptimizerCriteria {
-    pub min_roi_30d: Option<Decimal>,
-    pub min_sharpe: Option<Decimal>,
-    pub min_win_rate: Option<Decimal>,
-    pub min_trades_30d: Option<i32>,
-}
-
-/// Aggregated portfolio metrics from active wallets.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PortfolioMetrics {
-    pub total_roi_30d: Decimal,
-    pub avg_sharpe: Decimal,
-    pub avg_win_rate: Decimal,
-    pub total_value: Decimal,
 }
 
 /// Update workspace request (owner only).
@@ -113,7 +81,6 @@ pub struct UpdateWorkspaceRequest {
     pub polygon_rpc_url: Option<String>,
     pub alchemy_api_key: Option<String>,
     pub arb_auto_execute: Option<bool>,
-    pub copy_trading_enabled: Option<bool>,
     pub live_trading_enabled: Option<bool>,
     pub exit_handler_enabled: Option<bool>,
     pub inactivity_days: Option<i32>,
@@ -167,7 +134,6 @@ struct WorkspaceDetailRow {
     polygon_rpc_url: Option<String>,
     alchemy_api_key: Option<String>,
     arb_auto_execute: bool,
-    copy_trading_enabled: bool,
     live_trading_enabled: bool,
     exit_handler_enabled: bool,
     inactivity_days: i32,
@@ -315,7 +281,6 @@ pub async fn get_workspace(
             w.trading_wallet_address, w.walletconnect_project_id,
             w.polygon_rpc_url, w.alchemy_api_key,
             COALESCE(w.arb_auto_execute, false) as arb_auto_execute,
-            COALESCE(w.copy_trading_enabled, false) as copy_trading_enabled,
             COALESCE(w.live_trading_enabled, false) as live_trading_enabled,
             COALESCE(w.exit_handler_enabled, false) as exit_handler_enabled,
             COALESCE(w.inactivity_days, 14) as inactivity_days,
@@ -365,7 +330,6 @@ pub async fn get_workspace(
         polygon_rpc_url: workspace.polygon_rpc_url,
         alchemy_api_key: masked_alchemy_key,
         arb_auto_execute: workspace.arb_auto_execute,
-        copy_trading_enabled: workspace.copy_trading_enabled,
         live_trading_enabled: workspace.live_trading_enabled,
         exit_handler_enabled: workspace.exit_handler_enabled,
         inactivity_days: workspace.inactivity_days,
@@ -503,7 +467,6 @@ pub async fn update_workspace(
     add_param!(polygon_rpc_url, "polygon_rpc_url");
     add_param!(alchemy_api_key, "alchemy_api_key");
     add_param!(arb_auto_execute, "arb_auto_execute");
-    add_param!(copy_trading_enabled, "copy_trading_enabled");
     add_param!(live_trading_enabled, "live_trading_enabled");
     add_param!(exit_handler_enabled, "exit_handler_enabled");
     add_param!(inactivity_days, "inactivity_days");
@@ -561,9 +524,6 @@ pub async fn update_workspace(
     }
     if let Some(arb_auto_execute) = req.arb_auto_execute {
         q = q.bind(arb_auto_execute);
-    }
-    if let Some(copy_trading_enabled) = req.copy_trading_enabled {
-        q = q.bind(copy_trading_enabled);
     }
     if let Some(live_trading_enabled) = req.live_trading_enabled {
         q = q.bind(live_trading_enabled);
@@ -966,138 +926,6 @@ pub async fn remove_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Database row for optimizer status.
-#[derive(Debug, sqlx::FromRow)]
-struct OptimizerSettingsRow {
-    auto_optimize_enabled: bool,
-    optimization_interval_hours: i32,
-    last_optimization_at: Option<DateTime<Utc>>,
-    min_roi_30d: Option<Decimal>,
-    min_sharpe: Option<Decimal>,
-    min_win_rate: Option<Decimal>,
-    min_trades_30d: Option<i32>,
-    total_budget: Decimal,
-}
-
-/// Database row for wallet counts.
-#[derive(Debug, sqlx::FromRow)]
-struct WalletCountsRow {
-    active_count: i64,
-    bench_count: i64,
-}
-
-/// Database row for portfolio metrics.
-#[derive(Debug, sqlx::FromRow)]
-struct PortfolioMetricsRow {
-    avg_roi: Decimal,
-    avg_sharpe: Decimal,
-    avg_win_rate: Decimal,
-}
-
-/// Get optimizer status for a workspace.
-#[utoipa::path(
-    get,
-    path = "/api/v1/workspaces/{workspace_id}/optimizer-status",
-    params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
-    ),
-    responses(
-        (status = 200, description = "Optimizer status", body = OptimizerStatusResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Not a member of this workspace"),
-        (status = 404, description = "Workspace not found"),
-    ),
-    security(("bearer_auth" = [])),
-    tag = "workspaces"
-)]
-pub async fn get_optimizer_status(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
-) -> ApiResult<Json<OptimizerStatusResponse>> {
-    let user_id =
-        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
-    }
-
-    // Get workspace optimizer settings
-    let settings: OptimizerSettingsRow = sqlx::query_as(
-        r#"
-        SELECT
-            auto_optimize_enabled,
-            optimization_interval_hours,
-            last_optimization_at,
-            min_roi_30d, min_sharpe, min_win_rate, min_trades_30d,
-            total_budget
-        FROM workspaces WHERE id = $1
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| ApiError::NotFound("Workspace not found".into()))?;
-
-    // Get wallet counts by tier
-    let counts: WalletCountsRow = sqlx::query_as(
-        r#"
-        SELECT
-            COUNT(*) FILTER (WHERE tier = 'active') as active_count,
-            COUNT(*) FILTER (WHERE tier = 'bench') as bench_count
-        FROM workspace_wallet_allocations WHERE workspace_id = $1
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_one(&state.pool)
-    .await?;
-
-    // Get aggregated portfolio metrics from active wallets
-    let metrics: PortfolioMetricsRow = sqlx::query_as(
-        r#"
-        SELECT
-            COALESCE(AVG(backtest_roi), 0) as avg_roi,
-            COALESCE(AVG(backtest_sharpe), 0) as avg_sharpe,
-            COALESCE(AVG(backtest_win_rate), 0) as avg_win_rate
-        FROM workspace_wallet_allocations
-        WHERE workspace_id = $1 AND tier = 'active'
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_one(&state.pool)
-    .await?;
-
-    // Calculate next run time
-    let next_run_at = settings.last_optimization_at.map(|last_run| {
-        last_run + chrono::Duration::hours(settings.optimization_interval_hours as i64)
-    });
-
-    Ok(Json(OptimizerStatusResponse {
-        enabled: settings.auto_optimize_enabled,
-        last_run_at: settings.last_optimization_at,
-        next_run_at,
-        interval_hours: settings.optimization_interval_hours,
-        criteria: OptimizerCriteria {
-            min_roi_30d: settings.min_roi_30d,
-            min_sharpe: settings.min_sharpe,
-            min_win_rate: settings.min_win_rate,
-            min_trades_30d: settings.min_trades_30d,
-        },
-        active_wallet_count: counts.active_count as i32,
-        bench_wallet_count: counts.bench_count as i32,
-        portfolio_metrics: PortfolioMetrics {
-            total_roi_30d: metrics.avg_roi,
-            avg_sharpe: metrics.avg_sharpe,
-            avg_win_rate: metrics.avg_win_rate,
-            total_value: settings.total_budget,
-        },
-    }))
-}
-
 /// Service status for a single background service.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ServiceStatusItem {
@@ -1111,7 +939,6 @@ pub struct ServiceStatusItem {
 pub struct ServiceStatusResponse {
     pub harvester: ServiceStatusItem,
     pub metrics_calculator: ServiceStatusItem,
-    pub copy_trading: ServiceStatusItem,
     pub arb_executor: ServiceStatusItem,
     pub exit_handler: ServiceStatusItem,
     pub live_trading: ServiceStatusItem,
@@ -1121,20 +948,10 @@ const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
 const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
 const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
-const KEY_COPY_MIN_TRADE_VALUE: &str = "COPY_MIN_TRADE_VALUE";
-const KEY_COPY_MAX_SLIPPAGE_PCT: &str = "COPY_MAX_SLIPPAGE_PCT";
-const KEY_COPY_MAX_LATENCY_SECS: &str = "COPY_MAX_LATENCY_SECS";
-const KEY_COPY_DAILY_CAPITAL_LIMIT: &str = "COPY_DAILY_CAPITAL_LIMIT";
-const KEY_COPY_MAX_OPEN_POSITIONS: &str = "COPY_MAX_OPEN_POSITIONS";
-const KEY_COPY_STOP_LOSS_PCT: &str = "COPY_STOP_LOSS_PCT";
-const KEY_COPY_TAKE_PROFIT_PCT: &str = "COPY_TAKE_PROFIT_PCT";
-const KEY_COPY_MAX_HOLD_HOURS: &str = "COPY_MAX_HOLD_HOURS";
 const KEY_ARB_POSITION_SIZE: &str = "ARB_POSITION_SIZE";
 const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
 const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
 const KEY_ARB_MAX_SIGNAL_AGE_SECS: &str = "ARB_MAX_SIGNAL_AGE_SECS";
-const KEY_COPY_TOTAL_CAPITAL: &str = "COPY_TOTAL_CAPITAL";
-const KEY_COPY_NEAR_RESOLUTION_MARGIN: &str = "COPY_NEAR_RESOLUTION_MARGIN";
 const ARB_RUNTIME_STATS_LATEST: &str = "arb:runtime:stats:latest";
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1319,46 +1136,6 @@ pub struct UpdateOpportunitySelectionRequest {
     pub exploration_slots: Option<i64>,
 }
 
-/// Request to update copy trading dynamic config thresholds.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct UpdateCopyTradingConfigRequest {
-    /// Minimum USD value for a trade to be copied.
-    pub min_trade_value: Option<f64>,
-    /// Maximum acceptable slippage as a ratio (e.g. 0.01 = 1%).
-    pub max_slippage_pct: Option<f64>,
-    /// Maximum trade age in seconds before a trade is considered too stale.
-    pub max_latency_secs: Option<i64>,
-    /// Daily capital deployment limit (USD).
-    pub daily_capital_limit: Option<f64>,
-    /// Maximum number of open copy positions.
-    pub max_open_positions: Option<i64>,
-    /// Stop-loss percentage as ratio (e.g. 0.15 = 15%).
-    pub stop_loss_pct: Option<f64>,
-    /// Take-profit percentage as ratio (e.g. 0.25 = 25%).
-    pub take_profit_pct: Option<f64>,
-    /// Maximum hold time in hours before force-closing.
-    pub max_hold_hours: Option<i64>,
-    /// Total copy-trading capital budget (USD).
-    pub total_capital: Option<f64>,
-    /// Near-resolution filter margin (e.g. 0.03). 0 = disabled.
-    pub near_resolution_margin: Option<f64>,
-}
-
-/// Response after updating copy trading config.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CopyTradingConfigResponse {
-    pub min_trade_value: Option<f64>,
-    pub max_slippage_pct: Option<f64>,
-    pub max_latency_secs: Option<i64>,
-    pub daily_capital_limit: Option<f64>,
-    pub max_open_positions: Option<i64>,
-    pub stop_loss_pct: Option<f64>,
-    pub take_profit_pct: Option<f64>,
-    pub max_hold_hours: Option<i64>,
-    pub total_capital: Option<f64>,
-    pub near_resolution_margin: Option<f64>,
-}
-
 /// Request to update arb executor dynamic config thresholds.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateArbExecutorConfigRequest {
@@ -1429,7 +1206,6 @@ pub async fn get_service_status(
 
     #[derive(sqlx::FromRow)]
     struct WorkspaceServiceFlags {
-        copy_trading_enabled: bool,
         arb_auto_execute: bool,
         live_trading_enabled: bool,
         exit_handler_enabled: bool,
@@ -1438,7 +1214,6 @@ pub async fn get_service_status(
     let flags: WorkspaceServiceFlags = sqlx::query_as(
         r#"
         SELECT
-            COALESCE(copy_trading_enabled, FALSE) as copy_trading_enabled,
             COALESCE(arb_auto_execute, FALSE) as arb_auto_execute,
             COALESCE(live_trading_enabled, FALSE) as live_trading_enabled,
             COALESCE(exit_handler_enabled, FALSE) as exit_handler_enabled
@@ -1460,36 +1235,6 @@ pub async fn get_service_status(
     let metrics_enabled = std::env::var("METRICS_CALCULATOR_ENABLED")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
-
-    let copy_trading_env = std::env::var("COPY_TRADING_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
-    let copy_runtime_initialized = state.trade_monitor.is_some() && state.copy_trader.is_some();
-    let copy_monitor_active = if let Some(monitor) = &state.trade_monitor {
-        monitor.is_active().await
-    } else {
-        false
-    };
-    let workspace_copy_wallets: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(DISTINCT LOWER(tw.address))::bigint
-        FROM tracked_wallets tw
-        JOIN workspace_wallet_allocations wwa
-          ON LOWER(wwa.wallet_address) = LOWER(tw.address)
-        WHERE wwa.workspace_id = $1
-          AND wwa.tier = 'active'
-          AND tw.copy_enabled = TRUE
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
-    let copy_running = flags.copy_trading_enabled
-        && copy_trading_env
-        && copy_runtime_initialized
-        && copy_monitor_active
-        && workspace_copy_wallets > 0;
 
     // Check arb executor — read runtime config for actual enabled state
     let arb_runtime_enabled = if let Some(ref arb_config) = state.arb_executor_config {
@@ -1542,25 +1287,6 @@ pub async fn get_service_status(
             running: metrics_enabled,
             reason: if !metrics_enabled {
                 Some("METRICS_CALCULATOR_ENABLED is disabled".to_string())
-            } else {
-                None
-            },
-        },
-        copy_trading: ServiceStatusItem {
-            running: copy_running,
-            reason: if !flags.copy_trading_enabled {
-                Some("Workspace copy_trading_enabled=false".to_string())
-            } else if !copy_trading_env {
-                Some("Global COPY_TRADING_ENABLED=false".to_string())
-            } else if !copy_runtime_initialized {
-                Some("Copy runtime is not initialized".to_string())
-            } else if !copy_monitor_active {
-                Some("Trade monitor is not active".to_string())
-            } else if workspace_copy_wallets == 0 {
-                Some(
-                    "No active copy-enabled wallets for this workspace (run allocation reconciliation)"
-                        .to_string(),
-                )
             } else {
                 None
             },
@@ -2048,311 +1774,6 @@ pub async fn update_opportunity_selection_settings(
     }))
 }
 
-/// Update copy trading dynamic config thresholds.
-#[utoipa::path(
-    put,
-    path = "/api/v1/workspaces/{workspace_id}/dynamic-tuning/copy-trading",
-    params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
-    ),
-    request_body = UpdateCopyTradingConfigRequest,
-    responses(
-        (status = 200, description = "Updated copy trading config", body = CopyTradingConfigResponse),
-        (status = 400, description = "Invalid parameters"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Not a member / insufficient role"),
-    ),
-    security(("bearer_auth" = [])),
-    tag = "workspaces"
-)]
-pub async fn update_copy_trading_config(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
-    Json(req): Json<UpdateCopyTradingConfigRequest>,
-) -> ApiResult<Json<CopyTradingConfigResponse>> {
-    let user_id =
-        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
-    if role != "owner" && role != "admin" {
-        return Err(ApiError::Forbidden(
-            "Only workspace owners/admins can update copy trading config".into(),
-        ));
-    }
-
-    if req.min_trade_value.is_none()
-        && req.max_slippage_pct.is_none()
-        && req.max_latency_secs.is_none()
-        && req.daily_capital_limit.is_none()
-        && req.max_open_positions.is_none()
-        && req.stop_loss_pct.is_none()
-        && req.take_profit_pct.is_none()
-        && req.max_hold_hours.is_none()
-        && req.total_capital.is_none()
-        && req.near_resolution_margin.is_none()
-    {
-        return Err(ApiError::BadRequest(
-            "Provide at least one field to update".into(),
-        ));
-    }
-
-    let mut updates: Vec<(String, Decimal, String)> = Vec::new();
-
-    if let Some(v) = req.min_trade_value {
-        let (min, max, max_step) = copy_trading_dynamic_bounds(KEY_COPY_MIN_TRADE_VALUE)
-            .expect("bounds defined for COPY_MIN_TRADE_VALUE");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid min_trade_value".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_MIN_TRADE_VALUE.to_string(),
-            clamped,
-            format!("manual workspace update: min_trade_value={}", clamped),
-        ));
-        let _ = (min, max, max_step); // suppress unused
-    }
-
-    if let Some(v) = req.max_slippage_pct {
-        let (min, max, max_step) = copy_trading_dynamic_bounds(KEY_COPY_MAX_SLIPPAGE_PCT)
-            .expect("bounds defined for COPY_MAX_SLIPPAGE_PCT");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid max_slippage_pct".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_MAX_SLIPPAGE_PCT.to_string(),
-            clamped,
-            format!("manual workspace update: max_slippage_pct={}", clamped),
-        ));
-        let _ = max_step;
-    }
-
-    if let Some(v) = req.max_latency_secs {
-        let (min, max, max_step) = copy_trading_dynamic_bounds(KEY_COPY_MAX_LATENCY_SECS)
-            .expect("bounds defined for COPY_MAX_LATENCY_SECS");
-        let dec = Decimal::new(v, 0);
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_MAX_LATENCY_SECS.to_string(),
-            clamped,
-            format!("manual workspace update: max_latency_secs={}", clamped),
-        ));
-        let _ = max_step;
-    }
-
-    if let Some(v) = req.daily_capital_limit {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_DAILY_CAPITAL_LIMIT).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid daily_capital_limit".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_DAILY_CAPITAL_LIMIT.to_string(),
-            clamped,
-            format!("manual workspace update: daily_capital_limit={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.max_open_positions {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_MAX_OPEN_POSITIONS).expect("bounds defined");
-        let dec = Decimal::new(v, 0);
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_MAX_OPEN_POSITIONS.to_string(),
-            clamped,
-            format!("manual workspace update: max_open_positions={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.stop_loss_pct {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_STOP_LOSS_PCT).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid stop_loss_pct".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_STOP_LOSS_PCT.to_string(),
-            clamped,
-            format!("manual workspace update: stop_loss_pct={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.take_profit_pct {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_TAKE_PROFIT_PCT).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid take_profit_pct".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_TAKE_PROFIT_PCT.to_string(),
-            clamped,
-            format!("manual workspace update: take_profit_pct={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.max_hold_hours {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_MAX_HOLD_HOURS).expect("bounds defined");
-        let dec = Decimal::new(v, 0);
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_MAX_HOLD_HOURS.to_string(),
-            clamped,
-            format!("manual workspace update: max_hold_hours={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.total_capital {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_TOTAL_CAPITAL).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid total_capital".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_TOTAL_CAPITAL.to_string(),
-            clamped,
-            format!("manual workspace update: total_capital={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.near_resolution_margin {
-        let (min, max, _) =
-            copy_trading_dynamic_bounds(KEY_COPY_NEAR_RESOLUTION_MARGIN).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid near_resolution_margin".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_COPY_NEAR_RESOLUTION_MARGIN.to_string(),
-            clamped,
-            format!(
-                "manual workspace update: near_resolution_margin={}",
-                clamped
-            ),
-        ));
-    }
-
-    // Write each update to DB + history
-    for (key, value, reason) in &updates {
-        let old_value: Option<Decimal> =
-            sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
-                .bind(key)
-                .fetch_optional(&state.pool)
-                .await?;
-
-        let (min_value, max_value, max_step_pct) =
-            copy_trading_dynamic_bounds(key).ok_or_else(|| {
-                ApiError::Internal(format!("Unsupported dynamic config key: {}", key))
-            })?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO dynamic_config (
-                key, current_value, default_value, min_value, max_value,
-                max_step_pct, enabled, last_good_value, pending_eval, pending_baseline,
-                last_applied_at, updated_by, last_reason
-            )
-            VALUES ($1, $2, $2, $3, $4, $5, TRUE, $2, FALSE, NULL, NULL, 'workspace_manual', $6)
-            ON CONFLICT (key) DO UPDATE SET
-                current_value = $2,
-                last_good_value = $2,
-                pending_eval = FALSE,
-                pending_baseline = NULL,
-                last_applied_at = NULL,
-                updated_by = 'workspace_manual',
-                last_reason = $6
-            "#,
-        )
-        .bind(key)
-        .bind(*value)
-        .bind(min_value)
-        .bind(max_value)
-        .bind(max_step_pct)
-        .bind(reason)
-        .execute(&state.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO dynamic_config_history
-                (config_key, old_value, new_value, action, reason)
-            VALUES ($1, $2, $3, 'manual_update', $4)
-            "#,
-        )
-        .bind(key)
-        .bind(old_value)
-        .bind(*value)
-        .bind(reason)
-        .execute(&state.pool)
-        .await?;
-    }
-
-    // Publish to Redis for live hot-swap
-    publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref())
-        .await
-        .map_err(|error| {
-            ApiError::Internal(format!(
-                "Failed publishing dynamic config updates to runtime subscribers: {}",
-                error
-            ))
-        })?;
-
-    // Read back fresh values
-    let rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
-        r#"
-        SELECT
-            key, current_value, default_value, min_value, max_value,
-            max_step_pct, enabled, last_good_value, pending_eval,
-            last_applied_at, last_reason, updated_at
-        FROM dynamic_config
-        WHERE key = ANY($1)
-        ORDER BY key
-        "#,
-    )
-    .bind(vec![
-        KEY_COPY_MIN_TRADE_VALUE,
-        KEY_COPY_MAX_SLIPPAGE_PCT,
-        KEY_COPY_MAX_LATENCY_SECS,
-        KEY_COPY_DAILY_CAPITAL_LIMIT,
-        KEY_COPY_MAX_OPEN_POSITIONS,
-        KEY_COPY_STOP_LOSS_PCT,
-        KEY_COPY_TAKE_PROFIT_PCT,
-        KEY_COPY_MAX_HOLD_HOURS,
-        KEY_COPY_TOTAL_CAPITAL,
-        KEY_COPY_NEAR_RESOLUTION_MARGIN,
-    ])
-    .fetch_all(&state.pool)
-    .await?;
-
-    let find_f64 = |key: &str| -> Option<f64> {
-        rows.iter()
-            .find(|r| r.key == key)
-            .map(|r| decimal_to_f64(r.current_value))
-    };
-    let find_i64 = |key: &str| -> Option<i64> {
-        rows.iter()
-            .find(|r| r.key == key)
-            .map(|r| decimal_to_f64(r.current_value) as i64)
-    };
-
-    Ok(Json(CopyTradingConfigResponse {
-        min_trade_value: find_f64(KEY_COPY_MIN_TRADE_VALUE),
-        max_slippage_pct: find_f64(KEY_COPY_MAX_SLIPPAGE_PCT),
-        max_latency_secs: find_i64(KEY_COPY_MAX_LATENCY_SECS),
-        daily_capital_limit: find_f64(KEY_COPY_DAILY_CAPITAL_LIMIT),
-        max_open_positions: find_i64(KEY_COPY_MAX_OPEN_POSITIONS),
-        stop_loss_pct: find_f64(KEY_COPY_STOP_LOSS_PCT),
-        take_profit_pct: find_f64(KEY_COPY_TAKE_PROFIT_PCT),
-        max_hold_hours: find_i64(KEY_COPY_MAX_HOLD_HOURS),
-        total_capital: find_f64(KEY_COPY_TOTAL_CAPITAL),
-        near_resolution_margin: find_f64(KEY_COPY_NEAR_RESOLUTION_MARGIN),
-    }))
-}
-
 /// List dynamic tuning history (changes, recommendations, rollbacks, evaluations).
 #[utoipa::path(
     get,
@@ -2469,67 +1890,6 @@ fn opportunity_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> 
         )),
         KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => {
             Some((Decimal::ZERO, Decimal::new(2, 0), Decimal::new(100, 2)))
-        }
-        _ => None,
-    }
-}
-
-/// Returns (min, max, max_step_pct) bounds for copy trading dynamic config keys.
-fn copy_trading_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> {
-    match key {
-        // $0.50 – $50.00, 18% step
-        KEY_COPY_MIN_TRADE_VALUE => Some((
-            Decimal::new(50, 2),
-            Decimal::new(50, 0),
-            Decimal::new(18, 2),
-        )),
-        // 0.25% – 15%, 25% step
-        KEY_COPY_MAX_SLIPPAGE_PCT => Some((
-            Decimal::new(25, 4),
-            Decimal::new(15, 2),
-            Decimal::new(25, 2),
-        )),
-        // 60s – 900s, 20% step
-        KEY_COPY_MAX_LATENCY_SECS => Some((
-            Decimal::new(60, 0),
-            Decimal::new(900, 0),
-            Decimal::new(20, 2),
-        )),
-        // $100 – $50,000, 20% step
-        KEY_COPY_DAILY_CAPITAL_LIMIT => Some((
-            Decimal::new(100, 0),
-            Decimal::new(50000, 0),
-            Decimal::new(20, 2),
-        )),
-        // 1 – 50, 25% step
-        KEY_COPY_MAX_OPEN_POSITIONS => {
-            Some((Decimal::new(1, 0), Decimal::new(50, 0), Decimal::new(25, 2)))
-        }
-        // 5% – 50%, 20% step (stored as ratio: 0.05 – 0.50)
-        KEY_COPY_STOP_LOSS_PCT => {
-            Some((Decimal::new(5, 2), Decimal::new(50, 2), Decimal::new(20, 2)))
-        }
-        // 5% – 100%, 20% step (stored as ratio: 0.05 – 1.00)
-        KEY_COPY_TAKE_PROFIT_PCT => Some((
-            Decimal::new(5, 2),
-            Decimal::new(100, 2),
-            Decimal::new(20, 2),
-        )),
-        // 1h – 720h, 20% step
-        KEY_COPY_MAX_HOLD_HOURS => Some((
-            Decimal::new(1, 0),
-            Decimal::new(720, 0),
-            Decimal::new(20, 2),
-        )),
-        // $100 – $500,000, 20% step
-        KEY_COPY_TOTAL_CAPITAL => Some((
-            Decimal::new(100, 0),
-            Decimal::new(500000, 0),
-            Decimal::new(20, 2),
-        )),
-        // 0.03 – 0.25, 50% step (3% floor matches copy_trader MIN_MARGIN_RAW)
-        KEY_COPY_NEAR_RESOLUTION_MARGIN => {
-            Some((Decimal::new(3, 2), Decimal::new(25, 2), Decimal::new(50, 2)))
         }
         _ => None,
     }

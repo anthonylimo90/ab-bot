@@ -53,7 +53,7 @@ export interface UpdateUserRequest {
   password?: string;
 }
 
-// WalletPosition - shared UI position format used by WalletCard and ManualPositions
+// WalletPosition - shared UI position format used by ManualPositions
 export interface WalletPosition {
   id: string;
   marketId: string;
@@ -94,7 +94,6 @@ export interface Position {
   unrealized_pnl_pct: number;
   stop_loss?: number;
   take_profit?: number;
-  is_copy_trade: boolean;
   source_wallet?: string;
   realized_pnl?: number;
   opened_at: string;
@@ -143,51 +142,6 @@ export interface Orderbook {
   no_bids: PriceLevel[];
   no_asks: PriceLevel[];
   spread: SpreadInfo;
-}
-
-// Wallet types
-export interface TrackedWallet {
-  address: string;
-  label?: string;
-  copy_enabled: boolean;
-  allocation_pct: number;
-  max_position_size: number;
-  success_score: number;
-  total_pnl: number;
-  win_rate: number;
-  total_trades: number;
-  added_at: string;
-  last_activity?: string;
-}
-
-export interface WalletMetrics {
-  address: string;
-  roi: number;
-  sharpe_ratio: number;
-  sortino_ratio?: number;
-  volatility?: number;
-  max_drawdown: number;
-  avg_trade_size: number;
-  avg_hold_time_hours: number;
-  profit_factor: number;
-  recent_pnl_30d: number;
-  category_win_rates: Record<string, number>;
-  calculated_at: string;
-}
-
-// For display purposes (combines TrackedWallet with additional UI data)
-export interface Wallet extends TrackedWallet {
-  metrics?: WalletMetrics;
-  equity_curve?: { time: string; value: number }[];
-  prediction?: {
-    success_probability: number;
-    confidence: number;
-    category:
-      | "HIGH_POTENTIAL"
-      | "MODERATE"
-      | "LOW_POTENTIAL"
-      | "INSUFFICIENT_DATA";
-  };
 }
 
 // Order types
@@ -354,36 +308,8 @@ export interface PortfolioHistory {
   value: number;
 }
 
-// Allocation types
-export type AllocationStrategy =
-  | "EQUAL_WEIGHT"
-  | "PERFORMANCE_WEIGHTED"
-  | "RISK_ADJUSTED"
-  | "CUSTOM";
-
-export interface StrategyAllocation {
-  strategy_id: string;
-  strategy_type: "WALLET" | "ARBITRAGE";
-  wallet_address?: string;
-  allocation_percent: number;
-  allocation_amount: number;
-}
-
-export interface AllocationConfig {
-  id: string;
-  total_capital: number;
-  strategy: AllocationStrategy;
-  allocations: StrategyAllocation[];
-  active: boolean;
-  created_at: string;
-  updated_at: string;
-}
-
 // Activity types
 export type ActivityType =
-  | "TRADE_COPIED"
-  | "TRADE_COPY_SKIPPED"
-  | "TRADE_COPY_FAILED"
   | "POSITION_OPENED"
   | "POSITION_CLOSED"
   | "STOP_LOSS_TRIGGERED"
@@ -392,11 +318,7 @@ export type ActivityType =
   | "ARB_POSITION_OPENED"
   | "ARB_POSITION_CLOSED"
   | "ARB_EXECUTION_FAILED"
-  | "ARB_EXIT_FAILED"
-  | "RECOMMENDATION_NEW"
-  | "ALLOCATION_ACTIVATED"
-  | "WALLET_DEMOTED"
-  | "WALLET_PROMOTED";
+  | "ARB_EXIT_FAILED";
 
 export interface Activity {
   id: string;
@@ -407,52 +329,6 @@ export interface Activity {
   details?: Record<string, unknown>;
   pnl?: number;
   created_at: string;
-}
-
-// Recommendation types
-export interface Recommendation {
-  id: string;
-  type: "COPY_WALLET" | "ARBITRAGE" | "POSITION_EXIT";
-  confidence: number;
-  wallet?: Wallet;
-  expected_return?: number;
-  risk_level: "LOW" | "MEDIUM" | "HIGH";
-  reason: string;
-  created_at: string;
-  expires_at?: string;
-}
-
-// Trade classification types (Event vs Arb)
-export type TradeClassification = "event" | "arbitrage" | "mixed";
-export type TradingStyle = "event_trader" | "arb_trader" | "mixed";
-export type CopyBehavior = "copy_all" | "events_only" | "arb_threshold";
-export type WalletTier = "active" | "bench" | "untracked";
-
-// Copy settings for a wallet
-export interface CopySettings {
-  copy_behavior: CopyBehavior;
-  allocation_pct: number;
-  max_position_size: number;
-  arb_threshold_pct?: number; // Min spread % for arb replication
-}
-
-// Decision Brief for wallet strategy profiling
-export interface DecisionBrief {
-  trading_style: TradingStyle;
-  slippage_tolerance: "tight" | "moderate" | "loose";
-  preferred_categories: string[];
-  typical_hold_time: string;
-  event_trade_ratio: number;
-  arb_trade_ratio: number;
-  fitness_score: number;
-  fitness_reasons: string[];
-}
-
-// Extended wallet with roster info
-export interface RosterWallet extends Wallet {
-  tier: WalletTier;
-  copy_settings?: CopySettings;
-  decision_brief?: DecisionBrief;
 }
 
 // Vault types (connected user wallets for live trading)
@@ -500,7 +376,6 @@ export type PositionUpdateType =
   | "PriceChanged";
 export type SignalType =
   | "Arbitrage"
-  | "CopyTrade"
   | "StopLoss"
   | "TakeProfit"
   | "Alert";
@@ -546,62 +421,6 @@ export type WebSocketMessage =
   | { type: "Ping" }
   | { type: "Pong" };
 
-// Discovery/Live trades types
-export type PredictionCategory =
-  | "HIGH_POTENTIAL"
-  | "MODERATE"
-  | "LOW_POTENTIAL"
-  | "INSUFFICIENT_DATA";
-
-export interface WalletTrade {
-  transaction_hash: string;
-  wallet_address: string;
-  asset_id: string;
-  side: string;
-  price: number;
-  quantity: number;
-  value: number;
-  timestamp: string;
-  title?: string;
-  outcome?: string;
-}
-
-export interface LiveTrade {
-  wallet_address: string;
-  wallet_label?: string;
-  tx_hash: string;
-  timestamp: string;
-  market_id: string;
-  market_question?: string;
-  outcome: string;
-  direction: "buy" | "sell";
-  price: number;
-  quantity: number;
-  value: number;
-}
-
-export interface DiscoveredWallet {
-  address: string;
-  rank: number;
-  roi_7d: number;
-  roi_30d: number;
-  roi_90d: number;
-  sharpe_ratio: number;
-  sortino_ratio?: number;
-  volatility?: number;
-  total_trades: number;
-  win_rate: number;
-  max_drawdown: number;
-  prediction: PredictionCategory;
-  confidence: number;
-  is_tracked: boolean;
-  trades_24h: number;
-  total_pnl: number;
-  composite_score?: number;
-  strategy_type?: string;
-  staleness_days: number;
-}
-
 // Market regime types
 export type MarketRegimeType =
   | "BullVolatile"
@@ -616,34 +435,6 @@ export interface MarketRegimeResponse {
   label: string;
   icon: string;
   description: string;
-}
-
-// Calibration types
-export interface CalibrationBucket {
-  lower: number;
-  upper: number;
-  avg_predicted: number;
-  observed_rate: number;
-  count: number;
-  gap: number;
-}
-
-export interface CalibrationReport {
-  buckets: CalibrationBucket[];
-  ece: number;
-  total_predictions: number;
-  recommended_threshold: number;
-}
-
-// Copy performance types
-export interface CopyPerformanceResponse {
-  address: string;
-  reported_win_rate: number;
-  copy_win_rate: number | null;
-  copy_trade_count: number;
-  copy_total_pnl: number;
-  divergence_pp: number | null;
-  has_significant_divergence: boolean;
 }
 
 // Workspace types
@@ -668,7 +459,6 @@ export interface Workspace {
   polygon_rpc_url?: string;
   alchemy_api_key?: string;
   arb_auto_execute: boolean;
-  copy_trading_enabled: boolean;
   live_trading_enabled: boolean;
   exit_handler_enabled: boolean;
   inactivity_days: number;
@@ -712,83 +502,6 @@ export interface WorkspaceInvite {
   inviter_email?: string;
 }
 
-export interface WorkspaceAllocation {
-  id: string;
-  workspace_id: string;
-  wallet_address: string;
-  allocation_pct: number;
-  max_position_size?: number;
-  tier: "active" | "bench";
-  auto_assigned: boolean;
-  auto_assigned_reason?: string;
-  backtest_roi?: number;
-  backtest_sharpe?: number;
-  backtest_win_rate?: number;
-  copy_behavior: CopyBehavior;
-  arb_threshold_pct?: number;
-  added_by?: string;
-  added_at: string;
-  updated_at: string;
-  // Pin status (prevents auto-demotion)
-  pinned?: boolean;
-  pinned_at?: string;
-  pinned_by?: string;
-  // Probation status (new wallets)
-  probation_until?: string;
-  probation_allocation_pct?: number;
-  // Loss tracking
-  consecutive_losses?: number;
-  last_loss_at?: string;
-  // Confidence score
-  confidence_score?: number;
-  // Grace period
-  grace_period_started_at?: string;
-  grace_period_reason?: string;
-  // Wallet metadata
-  wallet_label?: string;
-  wallet_success_score?: number;
-  // Fill rate (computed from copy_trade_history over 24h)
-  fill_rate_24h?: number;
-  fill_attempts_24h?: number;
-  fill_count_24h?: number;
-}
-
-// Wallet ban (prevents auto-promotion)
-export interface WalletBan {
-  id: string;
-  wallet_address: string;
-  reason?: string;
-  banned_at: string;
-  expires_at?: string;
-}
-
-export interface RotationHistoryEntry {
-  id: string;
-  action: string;
-  wallet_in?: string;
-  wallet_out?: string;
-  reason: string;
-  evidence: Record<string, unknown>;
-  triggered_by?: string;
-  is_automatic: boolean;
-  notification_sent: boolean;
-  acknowledged: boolean;
-  acknowledged_at?: string;
-  acknowledged_by?: string;
-  created_at: string;
-}
-
-export interface OnboardingStatus {
-  workspace_id?: string;
-  workspace_name?: string;
-  setup_mode?: SetupMode;
-  onboarding_completed: boolean;
-  onboarding_step: number;
-  total_budget?: number;
-  active_wallet_count: number;
-  bench_wallet_count: number;
-}
-
 export interface UserSettings {
   user_id: string;
   onboarding_completed: boolean;
@@ -822,7 +535,6 @@ export interface UpdateWorkspaceRequest {
   polygon_rpc_url?: string;
   alchemy_api_key?: string;
   arb_auto_execute?: boolean;
-  copy_trading_enabled?: boolean;
   live_trading_enabled?: boolean;
   exit_handler_enabled?: boolean;
   inactivity_days?: number;
@@ -861,86 +573,6 @@ export interface AcceptInviteResponse {
   // Only present for new users
   token?: string;
   user?: User;
-}
-
-export interface AddAllocationRequest {
-  allocation_pct?: number;
-  max_position_size?: number;
-  tier?: "active" | "bench";
-  copy_behavior?: CopyBehavior;
-  arb_threshold_pct?: number;
-}
-
-export interface UpdateAllocationRequest {
-  allocation_pct?: number;
-  max_position_size?: number;
-  copy_behavior?: CopyBehavior;
-  arb_threshold_pct?: number;
-}
-
-export interface SetBudgetRequest {
-  total_budget: number;
-  reserved_cash_pct?: number;
-}
-
-export interface AutoSetupConfig {
-  min_roi_30d?: number;
-  min_sharpe?: number;
-  min_win_rate?: number;
-  min_trades_30d?: number;
-}
-
-export interface AutoSelectedWallet {
-  address: string;
-  allocation_pct: number;
-  roi_30d?: number;
-  sharpe_ratio?: number;
-  win_rate?: number;
-  reason: string;
-}
-
-export interface AutoSetupResponse {
-  success: boolean;
-  message: string;
-  selected_wallets: AutoSelectedWallet[];
-}
-
-// Optimizer Status types
-export interface OptimizerCriteria {
-  min_roi_30d: number | null;
-  min_sharpe: number | null;
-  min_win_rate: number | null;
-  min_trades_30d: number | null;
-}
-
-export interface OptimizerPortfolioMetrics {
-  total_roi_30d: number;
-  avg_sharpe: number;
-  avg_win_rate: number;
-  total_value: number;
-}
-
-export interface OptimizerStatus {
-  enabled: boolean;
-  last_run_at: string | null;
-  next_run_at: string | null;
-  interval_hours: number;
-  criteria: OptimizerCriteria;
-  active_wallet_count: number;
-  bench_wallet_count: number;
-  portfolio_metrics: OptimizerPortfolioMetrics;
-}
-
-export interface OptimizationResult {
-  candidates_found: number;
-  wallets_promoted: number;
-  thresholds: {
-    min_roi_30d?: number;
-    min_sharpe?: number;
-    min_win_rate?: number;
-    min_trades_30d?: number;
-  };
-  message?: string;
 }
 
 // Order Signing Types (for MetaMask trade signing)
@@ -1023,7 +655,6 @@ export interface ServiceStatusItem {
 export interface ServiceStatus {
   harvester: ServiceStatusItem;
   metrics_calculator: ServiceStatusItem;
-  copy_trading: ServiceStatusItem;
   arb_executor: ServiceStatusItem;
   exit_handler: ServiceStatusItem;
   live_trading: ServiceStatusItem;
@@ -1118,37 +749,6 @@ export interface DynamicConfigHistoryEntry {
   metrics_snapshot?: Record<string, unknown> | null;
   outcome_metrics?: Record<string, unknown> | null;
   created_at: string;
-}
-
-// Risk allocation recalculation types
-export type AllocationTier = "active" | "bench" | "all";
-
-export interface RecalculateAllocationsRequest {
-  tier: AllocationTier;
-  auto_apply: boolean;
-}
-
-export interface RiskComponents {
-  sortino_normalized: number;
-  consistency: number;
-  roi_drawdown_ratio: number;
-  win_rate: number;
-  volatility: number;
-}
-
-export interface AllocationPreview {
-  address: string;
-  current_allocation_pct: number | null;
-  recommended_allocation_pct: number;
-  change_pct: number;
-  composite_score: number;
-  components: RiskComponents;
-}
-
-export interface RecalculateAllocationsResponse {
-  previews: AllocationPreview[];
-  applied: boolean;
-  wallet_count: number;
 }
 
 // Risk monitoring types

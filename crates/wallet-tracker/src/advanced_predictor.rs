@@ -260,14 +260,15 @@ impl AdvancedPredictor {
         // Compute alpha and beta from the wallet's realized P&L vs market average.
         // Alpha = wallet return - market return (excess return)
         // Beta = correlation proxy (higher correlation → higher market sensitivity)
-        // Use source_wallet column to link positions to this wallet.
+        // TODO: source_wallet column has been dropped from positions. Using wallet_trades
+        // to approximate the wallet's realized PnL over the last 30 days.
         let wallet_return: Option<f64> = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(realized_pnl)::double precision, 0)
-            FROM positions
-            WHERE LOWER(source_wallet) = LOWER($1)
-              AND exit_timestamp >= NOW() - INTERVAL '30 days'
-              AND realized_pnl IS NOT NULL
+            SELECT COALESCE(SUM(value)::double precision, 0)
+            FROM wallet_trades
+            WHERE LOWER(wallet_address) = LOWER($1)
+              AND timestamp >= NOW() - INTERVAL '30 days'
+              AND side = 'SELL'
             "#,
         )
         .bind(address)
@@ -308,14 +309,21 @@ impl AdvancedPredictor {
     }
 
     /// Get recent performance for a wallet.
+    ///
+    /// TODO: copy_trade_history has been dropped. Approximate recent performance
+    /// using the signed cashflow from wallet_trades (sell value - buy value).
     async fn get_recent_performance(&self, address: &str, period: Duration) -> Result<f64> {
         let since = Utc::now() - period;
 
         let result: Option<Decimal> = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(SUM(pnl), 0) as total_pnl
-            FROM copy_trade_history
-            WHERE source_wallet = $1 AND created_at >= $2
+            SELECT COALESCE(
+                SUM(CASE WHEN side = 'SELL' THEN value ELSE -value END),
+                0
+            ) AS net_cashflow
+            FROM wallet_trades
+            WHERE LOWER(wallet_address) = LOWER($1)
+              AND timestamp >= $2
             "#,
         )
         .bind(address)
@@ -706,6 +714,7 @@ impl MarketConditionAnalyzer {
     /// **Layer 2 — Orderbook microstructure** (from `orderbook_hourly`):
     /// - 24h price momentum (avg close change across active markets)
     /// - Spread volatility (stddev of hourly avg_spread)
+    ///
     /// Used as a tiebreaker when wallet metrics alone fall into the ambiguous zone.
     pub async fn detect_regime_from_metrics(&self) -> Result<MarketRegime> {
         // ── Layer 1: Wallet performance aggregates ──

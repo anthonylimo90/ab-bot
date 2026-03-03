@@ -20,9 +20,6 @@
 //! ```
 
 pub mod arb_executor;
-pub mod auto_optimizer;
-pub mod copy_trade_stop_loss;
-pub mod copy_trading;
 pub mod crypto;
 pub mod dynamic_tuner;
 pub mod email;
@@ -45,9 +42,6 @@ pub mod wallet_harvester;
 pub mod websocket;
 
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
-pub use auto_optimizer::AutoOptimizer;
-pub use copy_trade_stop_loss::{spawn_copy_stop_loss_monitor, CopyStopLossConfig};
-pub use copy_trading::{spawn_copy_trading_monitor, CopyTradingConfig};
 pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
 pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
@@ -57,7 +51,6 @@ pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
 pub use quant_signal_executor::{spawn_quant_signal_executor, QuantSignalExecutorConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
-pub use runtime_sync::reconcile_copy_runtime;
 pub use signals::{
     spawn_cross_market_signal_generator, spawn_flow_signal_generator,
     spawn_mean_reversion_signal_generator, spawn_resolution_signal_generator,
@@ -71,14 +64,11 @@ use axum::http::Request;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock, Semaphore};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::{info, warn, Level};
-use trading_engine::copy_trader::CopyTrader;
-use wallet_tracker::trade_monitor::{MonitorConfig, TradeMonitor};
+use tracing::{info, Level};
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -151,18 +141,16 @@ impl ApiServer {
         let (orderbook_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (position_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
-        let (automation_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (arb_entry_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (quant_signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
-        // Create app state (not yet Arc-wrapped so copy trading fields can be set)
+        // Create app state
         let state = AppState::new(
             pool,
             config.jwt_secret.clone(),
             orderbook_tx,
             position_tx,
             signal_tx,
-            automation_tx,
             arb_entry_tx,
             quant_signal_tx,
         )
@@ -173,94 +161,6 @@ impl ApiServer {
 
     /// Run the server.
     pub async fn run(mut self) -> anyhow::Result<()> {
-        // ── Copy trading setup (must happen before Arc-wrapping state) ──
-        let mut copy_config = CopyTradingConfig::from_env();
-        if !copy_config.enabled {
-            match crate::runtime_sync::any_workspace_copy_enabled(&self.state.pool).await {
-                Ok(true) => {
-                    copy_config.enabled = true;
-                    info!(
-                        "Enabling copy trading runtime because at least one workspace has copy_trading_enabled=true"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed reading workspace copy_trading_enabled flags; falling back to env-only copy config"
-                    );
-                }
-            }
-        }
-        #[allow(clippy::type_complexity)]
-        let mut copy_monitor_args: Option<(
-            CopyTradingConfig,
-            Arc<TradeMonitor>,
-            Arc<RwLock<CopyTrader>>,
-            Arc<AtomicI64>,
-        )> = None;
-
-        if copy_config.enabled {
-            let trade_monitor = Arc::new(TradeMonitor::new(
-                self.state.clob_client.clone(),
-                MonitorConfig::from_env(),
-            ));
-            let total_capital = std::env::var("COPY_TOTAL_CAPITAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(rust_decimal::Decimal::new(10000, 0));
-            let copy_trader = CopyTrader::new(
-                self.state.order_executor.clone(),
-                total_capital,
-                self.state.copy_near_resolution_margin.clone(),
-            )
-            .with_policy(trading_engine::CopyTradingPolicy::from_env());
-            let copy_trader = Arc::new(RwLock::new(copy_trader));
-            let copy_latency_atomic = Arc::new(AtomicI64::new(copy_config.max_latency_secs));
-
-            if let Err(e) = crate::dynamic_tuner::sync_dynamic_config_snapshot_to_copy_trader(
-                &self.state.pool,
-                &copy_trader,
-                Some(&copy_latency_atomic),
-                Some(&self.state.copy_total_capital),
-                Some(&self.state.copy_near_resolution_margin),
-            )
-            .await
-            {
-                warn!(
-                    error = %e,
-                    "Failed to apply startup dynamic config snapshot; falling back to env policy"
-                );
-            }
-
-            // Store in AppState so allocation handlers can sync at runtime
-            self.state.trade_monitor = Some(trade_monitor.clone());
-            self.state.copy_trader = Some(copy_trader.clone());
-
-            match crate::runtime_sync::reconcile_copy_runtime(
-                &self.state.pool,
-                Some(&trade_monitor),
-                Some(&copy_trader),
-            )
-            .await
-            {
-                Ok(stats) => {
-                    if stats.desired_wallets == 0 {
-                        warn!("Copy trading runtime is enabled but no active wallets are eligible");
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to reconcile copy runtime on startup; copy monitor may start empty"
-                    );
-                }
-            }
-
-            copy_monitor_args =
-                Some((copy_config, trade_monitor, copy_trader, copy_latency_atomic));
-        }
-
         // ── Pre-create arb executor config Arc (must happen before Arc-wrapping state) ──
         let mut arb_config_pre = ArbExecutorConfig::from_env();
         if !arb_config_pre.enabled {
@@ -273,7 +173,7 @@ impl ApiServer {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    warn!(
+                    tracing::warn!(
                         error = %e,
                         "Failed to read workspace arb_auto_execute flags; falling back to env-only arb config"
                     );
@@ -295,7 +195,7 @@ impl ApiServer {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    warn!(
+                    tracing::warn!(
                         error = %e,
                         "Failed to read workspace exit_handler_enabled flags; falling back to env-only exit config"
                     );
@@ -304,26 +204,6 @@ impl ApiServer {
         }
         let exit_config_arc = Arc::new(RwLock::new(exit_config_pre));
         self.state.exit_handler_config = Some(exit_config_arc.clone());
-
-        // Pre-create stop-loss config Arc (must happen before Arc-wrapping state)
-        let stop_loss_config_arc: Option<Arc<tokio::sync::RwLock<CopyStopLossConfig>>> =
-            if copy_monitor_args.is_some() {
-                let arc = Arc::new(tokio::sync::RwLock::new(CopyStopLossConfig::from_env()));
-                self.state.copy_stop_loss_config = Some(arc.clone());
-                Some(arc)
-            } else {
-                None
-            };
-
-        // ── Create auto-optimizer event channel (before Arc wrap so we can set field) ──
-        let (optimizer_base, optimizer_rx) =
-            AutoOptimizer::with_event_channel(self.state.pool.clone());
-        // Extract sender before builder chain to avoid future refactor divergence
-        self.state.optimizer_event_tx = optimizer_base.event_sender();
-        let optimizer_base = optimizer_base.with_runtime_handles(
-            self.state.trade_monitor.clone(),
-            self.state.copy_trader.clone(),
-        );
 
         // ── Wrap state in Arc and build router ──
         let state = Arc::new(self.state);
@@ -411,29 +291,14 @@ impl ApiServer {
             state.exit_handler_heartbeat.clone(),
         );
 
-        // Spawn auto-optimizer background service (channel created before Arc wrap)
-        let optimizer = Arc::new(optimizer_base.with_db_semaphore(db_semaphore.clone()));
-        tokio::spawn(optimizer.start(Some(optimizer_rx)));
-
-        // Extract the latency atomic (if copy trading is active) so the
-        // dynamic config subscriber can write to it at runtime.
-        let copy_latency_atomic: Option<Arc<AtomicI64>> = copy_monitor_args
-            .as_ref()
-            .map(|(_, _, _, atomic)| atomic.clone());
-
-        // Subscribe local runtime to dynamic updates (copy-trader knobs + arb executor)
+        // Subscribe local runtime to dynamic updates (arb executor config knobs)
         let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
             .or_else(|_| std::env::var("REDIS_URL"))
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         spawn_dynamic_config_subscriber(
             redis_url,
-            state.copy_trader.clone(),
             state.pool.clone(),
-            copy_latency_atomic,
-            state.copy_stop_loss_config.clone(),
             state.arb_executor_config.clone(),
-            Some(state.copy_total_capital.clone()),
-            Some(state.copy_near_resolution_margin.clone()),
         );
 
         // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
@@ -532,42 +397,6 @@ impl ApiServer {
                 interval_secs = metrics_config.interval_secs,
                 batch_size = metrics_config.batch_size,
                 "Metrics calculator background job spawned (with regime detection)"
-            );
-        }
-
-        // Start copy trading monitor (objects were created above, before Arc wrap)
-        if let Some((copy_config, trade_monitor, copy_trader, latency_atomic)) = copy_monitor_args {
-            trade_monitor.start().await?;
-            spawn_copy_trading_monitor(
-                copy_config,
-                trade_monitor.clone(),
-                copy_trader.clone(),
-                state.circuit_breaker.clone(),
-                state.signal_tx.clone(),
-                state.pool.clone(),
-                latency_atomic,
-                state.active_clob_markets.clone(),
-                state.copy_total_capital.clone(),
-            );
-
-            // Spawn copy-trade stop-loss / mirror-exit monitor
-            // (Arc was pre-created above so the subscriber can reference it)
-            if let Some(sl_config) = stop_loss_config_arc {
-                spawn_copy_stop_loss_monitor(
-                    sl_config,
-                    state.pool.clone(),
-                    state.order_executor.clone(),
-                    state.circuit_breaker.clone(),
-                    state.clob_client.clone(),
-                    copy_trader,
-                    Some(trade_monitor),
-                    state.signal_tx.clone(),
-                    state.optimizer_event_tx.clone(),
-                );
-            }
-
-            tracing::info!(
-                "Copy trading monitor stack initialized (with stop-loss + mirror exits)"
             );
         }
 

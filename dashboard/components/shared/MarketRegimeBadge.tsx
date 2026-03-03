@@ -6,7 +6,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useMarketRegimeQuery } from "@/hooks/queries/useDiscoverQuery";
+import { useMarketRegimeQuery } from "@/hooks/queries/useSignalsQuery";
 import type { MarketRegimeType } from "@/types/api";
 
 const regimeStyles: Record<

@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 
 use auth::jwt::{JwtAuth, JwtConfig};
 use auth::key_vault::KeyVault;
@@ -14,14 +14,11 @@ use auth::{AuditLogger, AuditStorage, PostgresAuditStorage, TradingWallet};
 use polymarket_core::api::{ClobClient, PolygonClient};
 use polymarket_core::types::{ArbOpportunity, QuantSignal};
 use risk_manager::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use trading_engine::copy_trader::CopyTrader;
 use trading_engine::executor::ExecutorConfig;
 use trading_engine::OrderExecutor;
 use wallet_tracker::discovery::WalletDiscovery;
-use wallet_tracker::trade_monitor::TradeMonitor;
 use wallet_tracker::MarketRegime;
 
-use crate::auto_optimizer::AutomationEvent;
 use crate::email::{EmailClient, EmailConfig};
 use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 
@@ -76,8 +73,6 @@ pub struct AppState {
     pub position_tx: broadcast::Sender<PositionUpdate>,
     /// Broadcast channel for trading signals.
     pub signal_tx: broadcast::Sender<SignalUpdate>,
-    /// Broadcast channel for automation events (circuit breaker trips, etc.).
-    pub automation_tx: broadcast::Sender<AutomationEvent>,
     /// Broadcast channel for arb entry signals (feeds ArbAutoExecutor).
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     /// Broadcast channel for quant signals (feeds QuantSignalExecutor).
@@ -86,19 +81,12 @@ pub struct AppState {
     pub wallet_discovery: Arc<WalletDiscovery>,
     /// Polygon RPC client for on-chain queries (balance, etc.).
     pub polygon_client: Option<PolygonClient>,
-    /// Trade monitor for copy trading (None if copy trading disabled).
-    pub trade_monitor: Option<Arc<TradeMonitor>>,
-    /// Copy trader (None if copy trading disabled).
-    pub copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     /// Current detected market regime, updated hourly by MetricsCalculator.
     pub current_regime: Arc<RwLock<MarketRegime>>,
     /// Shared Redis connection for dynamic config pub/sub (None if Redis unavailable).
     pub redis_conn: Option<redis::aio::ConnectionManager>,
-    /// Set of active (non-resolved) CLOB market IDs, refreshed by OutcomeTokenCache.
-    /// Used by CopyTradingMonitor to skip resolved markets before hitting the CLOB.
+    /// Set of active (non-resolved) CLOB market IDs, refreshed periodically.
     pub active_clob_markets: Arc<RwLock<HashSet<String>>>,
-    /// Shared copy-trade stop-loss config for runtime hot-swap (None if copy trading disabled).
-    pub copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
     /// Shared arb executor config for runtime hot-swap (None if arb executor disabled).
     pub arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
     /// Shared exit handler config for runtime hot-swap (None if exit handler disabled).
@@ -109,12 +97,6 @@ pub struct AppState {
     pub exit_handler_heartbeat: Arc<AtomicI64>,
     /// Heartbeat timestamp (epoch secs) from quant signal executor — 0 means never updated.
     pub quant_executor_heartbeat: Arc<AtomicI64>,
-    /// Total copy-trading capital in cents (e.g. 1_000_000 = $10,000).
-    pub copy_total_capital: Arc<AtomicI64>,
-    /// Near-resolution margin stored as margin * 10,000 (e.g. 300 = 0.03). 0 = filter disabled.
-    pub copy_near_resolution_margin: Arc<AtomicI64>,
-    /// Sender for pushing events to the auto-optimizer (position closes, CB trips, etc.).
-    pub optimizer_event_tx: Option<mpsc::Sender<AutomationEvent>>,
 }
 
 impl AppState {
@@ -125,7 +107,6 @@ impl AppState {
         orderbook_tx: broadcast::Sender<OrderbookUpdate>,
         position_tx: broadcast::Sender<PositionUpdate>,
         signal_tx: broadcast::Sender<SignalUpdate>,
-        automation_tx: broadcast::Sender<AutomationEvent>,
         arb_entry_tx: broadcast::Sender<ArbOpportunity>,
         quant_signal_tx: broadcast::Sender<QuantSignal>,
     ) -> anyhow::Result<Self> {
@@ -492,37 +473,18 @@ impl AppState {
             orderbook_tx,
             position_tx,
             signal_tx,
-            automation_tx,
             arb_entry_tx,
             quant_signal_tx,
             wallet_discovery,
             polygon_client,
-            trade_monitor: None,
-            copy_trader: None,
             current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
             redis_conn,
             active_clob_markets: Arc::new(RwLock::new(HashSet::new())),
-            copy_stop_loss_config: None,
             arb_executor_config: None,
             exit_handler_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
-            copy_total_capital: Arc::new(AtomicI64::new(
-                std::env::var("COPY_TOTAL_CAPITAL")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .map(|dollars| (dollars * 100.0) as i64)
-                    .unwrap_or(1_000_000), // $10,000 default
-            )),
-            copy_near_resolution_margin: Arc::new(AtomicI64::new(
-                std::env::var("COPY_NEAR_RESOLUTION_MARGIN")
-                    .ok()
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .map(|m| (m * 10_000.0) as i64)
-                    .unwrap_or(300), // 0.03 default
-            )),
-            optimizer_event_tx: None,
         })
     }
 
@@ -564,19 +526,6 @@ impl AppState {
         update: SignalUpdate,
     ) -> Result<usize, broadcast::error::SendError<SignalUpdate>> {
         self.signal_tx.send(update)
-    }
-
-    /// Subscribe to automation events.
-    pub fn subscribe_automation(&self) -> broadcast::Receiver<AutomationEvent> {
-        self.automation_tx.subscribe()
-    }
-
-    /// Publish an automation event.
-    pub fn publish_automation(
-        &self,
-        event: AutomationEvent,
-    ) -> Result<usize, broadcast::error::SendError<AutomationEvent>> {
-        self.automation_tx.send(event)
     }
 
     /// Subscribe to arb entry signals.

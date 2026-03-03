@@ -28,9 +28,6 @@ export const ManualPositions = memo(function ManualPositions({
         <CardTitle className="text-base flex items-center gap-2">
           <Package className="h-5 w-5" />
           Manual Positions
-          <span className="text-sm text-muted-foreground font-normal">
-            (not from copy trading)
-          </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-2">

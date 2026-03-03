@@ -19,8 +19,6 @@ pub enum PositionSource {
     Manual,
     /// Arbitrage detection.
     Arbitrage,
-    /// Copied from another wallet.
-    CopyTrade { source_wallet: String },
     /// Signal from recommendation engine.
     Recommendation { signal_id: Uuid },
 }
@@ -326,10 +324,6 @@ impl PositionManager {
             total_unrealized_pnl: total_unrealized,
             total_realized_pnl: total_realized,
             arbitrage_positions: by_source(&PositionSource::Arbitrage),
-            copy_trade_positions: positions
-                .iter()
-                .filter(|p| matches!(&p.source, PositionSource::CopyTrade { .. }))
-                .count(),
             manual_positions: by_source(&PositionSource::Manual),
         }
     }
@@ -393,7 +387,6 @@ pub struct PositionManagerStats {
     pub total_unrealized_pnl: Decimal,
     pub total_realized_pnl: Decimal,
     pub arbitrage_positions: usize,
-    pub copy_trade_positions: usize,
     pub manual_positions: usize,
 }
 

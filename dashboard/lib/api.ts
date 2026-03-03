@@ -3,17 +3,12 @@ import type {
   PositionStatus,
   Market,
   Orderbook,
-  TrackedWallet,
-  WalletMetrics,
-  WalletTrade,
   Order,
   PlaceOrderRequest,
   BacktestParams,
   BacktestResult,
   HealthResponse,
   ApiError,
-  LiveTrade,
-  DiscoveredWallet,
   User,
   WalletUser,
   AuthResponse,
@@ -26,10 +21,6 @@ import type {
   Workspace,
   WorkspaceMember,
   WorkspaceInvite,
-  WorkspaceAllocation,
-  WalletBan,
-  RotationHistoryEntry,
-  OnboardingStatus,
   CreateWorkspaceRequest,
   UpdateWorkspaceRequest,
   UpdateOpportunitySelectionRequest,
@@ -37,15 +28,7 @@ import type {
   InviteInfo,
   AcceptInviteRequest,
   AcceptInviteResponse,
-  AddAllocationRequest,
-  UpdateAllocationRequest,
-  SetBudgetRequest,
-  AutoSetupConfig,
-  AutoSetupResponse,
-  SetupMode,
   WorkspaceRole,
-  OptimizerStatus,
-  OptimizationResult,
   ServiceStatus,
   DynamicTunerStatus,
   DynamicConfigHistoryEntry,
@@ -54,10 +37,6 @@ import type {
   CircuitBreakerStatus,
   CircuitBreakerConfig,
   MarketRegimeResponse,
-  CalibrationReport,
-  CopyPerformanceResponse,
-  RecalculateAllocationsRequest,
-  RecalculateAllocationsResponse,
   FlowFeatureResponse,
   RecentSignalResponse,
   StrategyPerformanceResponse,
@@ -339,7 +318,6 @@ class ApiClient {
   async getPositions(params?: {
     market_id?: string;
     outcome?: "yes" | "no";
-    copy_trades_only?: boolean;
     status?: PositionStatus;
     limit?: number;
     offset?: number;
@@ -347,8 +325,6 @@ class ApiClient {
     const searchParams = new URLSearchParams();
     if (params?.market_id) searchParams.set("market_id", params.market_id);
     if (params?.outcome) searchParams.set("outcome", params.outcome);
-    if (params?.copy_trades_only !== undefined)
-      searchParams.set("copy_trades_only", String(params.copy_trades_only));
     if (params?.status) searchParams.set("status", params.status);
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
@@ -381,84 +357,6 @@ class ApiClient {
       },
     );
     return parsePosition(raw);
-  }
-
-  // Wallets
-  async getWallets(params?: {
-    copy_enabled?: boolean;
-    min_score?: number;
-    limit?: number;
-    offset?: number;
-  }): Promise<TrackedWallet[]> {
-    const searchParams = new URLSearchParams();
-    if (params?.copy_enabled !== undefined)
-      searchParams.set("copy_enabled", String(params.copy_enabled));
-    if (params?.min_score)
-      searchParams.set("min_score", String(params.min_score));
-    if (params?.limit) searchParams.set("limit", String(params.limit));
-    if (params?.offset) searchParams.set("offset", String(params.offset));
-    const query = searchParams.toString();
-    return this.request<TrackedWallet[]>(
-      `/api/v1/wallets${query ? `?${query}` : ""}`,
-    );
-  }
-
-  async getWallet(address: string): Promise<TrackedWallet> {
-    return this.request<TrackedWallet>(`/api/v1/wallets/${address}`);
-  }
-
-  async addWallet(params: {
-    address: string;
-    label?: string;
-    copy_enabled?: boolean;
-    allocation_pct?: number;
-    max_position_size?: number;
-  }): Promise<TrackedWallet> {
-    return this.request<TrackedWallet>("/api/v1/wallets", {
-      method: "POST",
-      body: JSON.stringify(params),
-    });
-  }
-
-  async updateWallet(
-    address: string,
-    params: {
-      label?: string;
-      copy_enabled?: boolean;
-      allocation_pct?: number;
-      max_position_size?: number;
-    },
-  ): Promise<TrackedWallet> {
-    return this.request<TrackedWallet>(`/api/v1/wallets/${address}`, {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
-  }
-
-  async deleteWallet(address: string): Promise<void> {
-    return this.request<void>(`/api/v1/wallets/${address}`, {
-      method: "DELETE",
-    });
-  }
-
-  async getWalletMetrics(address: string): Promise<WalletMetrics> {
-    return this.request<WalletMetrics>(`/api/v1/wallets/${address}/metrics`);
-  }
-
-  async getWalletTrades(
-    address: string,
-    params?: {
-      limit?: number;
-      offset?: number;
-    },
-  ): Promise<WalletTrade[]> {
-    const searchParams = new URLSearchParams();
-    if (params?.limit) searchParams.set("limit", String(params.limit));
-    if (params?.offset) searchParams.set("offset", String(params.offset));
-    const query = searchParams.toString();
-    return this.request<WalletTrade[]>(
-      `/api/v1/wallets/${address}/trades${query ? `?${query}` : ""}`,
-    );
   }
 
   // Orders
@@ -509,62 +407,8 @@ class ApiClient {
     return this.request<BacktestResult>(`/api/v1/backtest/results/${resultId}`);
   }
 
-  // Discovery
-  async getLiveTrades(params?: {
-    wallet?: string;
-    limit?: number;
-    min_value?: number;
-  }): Promise<LiveTrade[]> {
-    const searchParams = new URLSearchParams();
-    if (params?.wallet) searchParams.set("wallet", params.wallet);
-    if (params?.limit) searchParams.set("limit", String(params.limit));
-    if (params?.min_value)
-      searchParams.set("min_value", String(params.min_value));
-    const query = searchParams.toString();
-    return this.request<LiveTrade[]>(
-      `/api/v1/discover/trades${query ? `?${query}` : ""}`,
-    );
-  }
-
   async getMarketRegime(): Promise<MarketRegimeResponse> {
     return this.request<MarketRegimeResponse>("/api/v1/regime/current");
-  }
-
-  async getCalibrationReport(): Promise<CalibrationReport> {
-    return this.request<CalibrationReport>("/api/v1/discover/calibration");
-  }
-
-  async getCopyPerformance(address: string): Promise<CopyPerformanceResponse> {
-    return this.request<CopyPerformanceResponse>(
-      `/api/v1/discover/wallets/${address}/copy-performance`,
-    );
-  }
-
-  async discoverWallets(params?: {
-    sort_by?: "roi" | "sharpe" | "winRate" | "trades" | "composite";
-    period?: "7d" | "30d" | "90d";
-    min_trades?: number;
-    min_win_rate?: number;
-    limit?: number;
-  }): Promise<DiscoveredWallet[]> {
-    const searchParams = new URLSearchParams();
-    if (params?.sort_by) searchParams.set("sort_by", params.sort_by);
-    if (params?.period) searchParams.set("period", params.period);
-    if (params?.min_trades)
-      searchParams.set("min_trades", String(params.min_trades));
-    if (params?.min_win_rate)
-      searchParams.set("min_win_rate", String(params.min_win_rate));
-    if (params?.limit) searchParams.set("limit", String(params.limit));
-    const query = searchParams.toString();
-    return this.request<DiscoveredWallet[]>(
-      `/api/v1/discover/wallets${query ? `?${query}` : ""}`,
-    );
-  }
-
-  async getDiscoveredWallet(address: string): Promise<DiscoveredWallet> {
-    return this.request<DiscoveredWallet>(
-      `/api/v1/discover/wallets/${address}`,
-    );
   }
 
   // Vault (Connected Wallets for Live Trading)
@@ -730,12 +574,6 @@ class ApiClient {
     );
   }
 
-  async getOptimizerStatus(workspaceId: string): Promise<OptimizerStatus> {
-    return this.request<OptimizerStatus>(
-      `/api/v1/workspaces/${workspaceId}/optimizer-status`,
-    );
-  }
-
   async getServiceStatus(workspaceId: string): Promise<ServiceStatus> {
     return this.request<ServiceStatus>(
       `/api/v1/workspaces/${workspaceId}/service-status`,
@@ -758,38 +596,6 @@ class ApiClient {
         method: "PUT",
         body: JSON.stringify(params),
       },
-    );
-  }
-
-  async updateCopyTradingConfig(
-    workspaceId: string,
-    params: {
-      min_trade_value?: number;
-      max_slippage_pct?: number;
-      max_latency_secs?: number;
-      daily_capital_limit?: number;
-      max_open_positions?: number;
-      stop_loss_pct?: number;
-      take_profit_pct?: number;
-      max_hold_hours?: number;
-      total_capital?: number;
-      near_resolution_margin?: number;
-    },
-  ): Promise<{
-    min_trade_value: number | null;
-    max_slippage_pct: number | null;
-    max_latency_secs: number | null;
-    daily_capital_limit: number | null;
-    max_open_positions: number | null;
-    stop_loss_pct: number | null;
-    take_profit_pct: number | null;
-    max_hold_hours: number | null;
-    total_capital: number | null;
-    near_resolution_margin: number | null;
-  }> {
-    return this.request(
-      `/api/v1/workspaces/${workspaceId}/dynamic-tuning/copy-trading`,
-      { method: "PUT", body: JSON.stringify(params) },
     );
   }
 
@@ -873,211 +679,6 @@ class ApiClient {
         body: JSON.stringify(params || {}),
       },
     );
-  }
-
-  // Workspace Allocations
-  async listAllocations(): Promise<WorkspaceAllocation[]> {
-    return this.request<WorkspaceAllocation[]>("/api/v1/allocations");
-  }
-
-  async addAllocation(
-    address: string,
-    params?: AddAllocationRequest,
-  ): Promise<WorkspaceAllocation> {
-    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}`, {
-      method: "POST",
-      body: JSON.stringify(params || {}),
-    });
-  }
-
-  async updateAllocation(
-    address: string,
-    params: UpdateAllocationRequest,
-  ): Promise<WorkspaceAllocation> {
-    return this.request<WorkspaceAllocation>(`/api/v1/allocations/${address}`, {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
-  }
-
-  async removeAllocation(address: string): Promise<void> {
-    return this.request<void>(`/api/v1/allocations/${address}`, {
-      method: "DELETE",
-    });
-  }
-
-  async promoteAllocation(address: string): Promise<WorkspaceAllocation> {
-    return this.request<WorkspaceAllocation>(
-      `/api/v1/allocations/${address}/promote`,
-      {
-        method: "POST",
-      },
-    );
-  }
-
-  async demoteAllocation(address: string): Promise<WorkspaceAllocation> {
-    return this.request<WorkspaceAllocation>(
-      `/api/v1/allocations/${address}/demote`,
-      {
-        method: "POST",
-      },
-    );
-  }
-
-  // Pin/Unpin Wallet (prevents auto-demotion)
-  async pinAllocation(
-    address: string,
-  ): Promise<{ success: boolean; pinned: boolean; message: string }> {
-    return this.request<{ success: boolean; pinned: boolean; message: string }>(
-      `/api/v1/allocations/${address}/pin`,
-      {
-        method: "PUT",
-      },
-    );
-  }
-
-  async unpinAllocation(
-    address: string,
-  ): Promise<{ success: boolean; pinned: boolean; message: string }> {
-    return this.request<{ success: boolean; pinned: boolean; message: string }>(
-      `/api/v1/allocations/${address}/pin`,
-      {
-        method: "DELETE",
-      },
-    );
-  }
-
-  // Wallet Bans (prevents auto-promotion)
-  async listBans(): Promise<{ bans: WalletBan[] }> {
-    return this.request<{ bans: WalletBan[] }>("/api/v1/allocations/bans");
-  }
-
-  async banWallet(params: {
-    wallet_address: string;
-    reason?: string;
-    expires_at?: string;
-  }): Promise<WalletBan> {
-    return this.request<WalletBan>("/api/v1/allocations/bans", {
-      method: "POST",
-      body: JSON.stringify(params),
-    });
-  }
-
-  async unbanWallet(address: string): Promise<void> {
-    return this.request<void>(`/api/v1/allocations/bans/${address}`, {
-      method: "DELETE",
-    });
-  }
-
-  // Auto-Rotation
-  async listRotationHistory(params?: {
-    limit?: number;
-    offset?: number;
-    unacknowledged_only?: boolean;
-  }): Promise<RotationHistoryEntry[]> {
-    const searchParams = new URLSearchParams();
-    if (params?.limit) searchParams.set("limit", String(params.limit));
-    if (params?.offset) searchParams.set("offset", String(params.offset));
-    if (params?.unacknowledged_only !== undefined) {
-      searchParams.set(
-        "unacknowledged_only",
-        String(params.unacknowledged_only),
-      );
-    }
-    const query = searchParams.toString();
-    return this.request<RotationHistoryEntry[]>(
-      `/api/v1/auto-rotation/history${query ? `?${query}` : ""}`,
-    );
-  }
-
-  async acknowledgeRotation(entryId: string): Promise<RotationHistoryEntry> {
-    return this.request<RotationHistoryEntry>(
-      `/api/v1/auto-rotation/${entryId}/acknowledge`,
-      {
-        method: "PUT",
-      },
-    );
-  }
-
-  async triggerOptimization(): Promise<OptimizationResult> {
-    // The endpoint may return 200 OK with body or 202 Accepted without body
-    const response = await fetch(
-      `${this.baseUrl}/api/v1/auto-rotation/trigger`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
-        },
-      },
-    );
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({
-        code: "UNKNOWN_ERROR",
-        message: `HTTP ${response.status}`,
-      }));
-      throw new Error(error.message || `HTTP ${response.status}`);
-    }
-
-    // Handle both 200 with body and 202/204 without body
-    if (response.status === 204 || response.status === 202) {
-      return { candidates_found: -1, wallets_promoted: 0, thresholds: {} };
-    }
-
-    try {
-      return await response.json();
-    } catch {
-      // If JSON parsing fails, return a default result
-      return { candidates_found: -1, wallets_promoted: 0, thresholds: {} };
-    }
-  }
-
-  // Risk Allocation Recalculation
-  async recalculateAllocations(
-    params: RecalculateAllocationsRequest,
-  ): Promise<RecalculateAllocationsResponse> {
-    return this.request<RecalculateAllocationsResponse>(
-      `/api/v1/allocations/risk/recalculate`,
-      {
-        method: "POST",
-        body: JSON.stringify(params),
-      },
-    );
-  }
-
-  // Onboarding
-  async getOnboardingStatus(): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>("/api/v1/onboarding/status");
-  }
-
-  async setOnboardingMode(mode: SetupMode): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>("/api/v1/onboarding/mode", {
-      method: "PUT",
-      body: JSON.stringify({ mode }),
-    });
-  }
-
-  async setOnboardingBudget(
-    params: SetBudgetRequest,
-  ): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>("/api/v1/onboarding/budget", {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
-  }
-
-  async runAutoSetup(config?: AutoSetupConfig): Promise<AutoSetupResponse> {
-    return this.request<AutoSetupResponse>("/api/v1/onboarding/auto-setup", {
-      method: "POST",
-      body: JSON.stringify(config || {}),
-    });
-  }
-
-  async completeOnboarding(): Promise<OnboardingStatus> {
-    return this.request<OnboardingStatus>("/api/v1/onboarding/complete", {
-      method: "PUT",
-    });
   }
 
   // Risk Monitoring

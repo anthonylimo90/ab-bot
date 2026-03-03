@@ -597,10 +597,6 @@ export default function RiskPage() {
                   status={serviceStatus.metrics_calculator}
                 />
                 <ServicePill
-                  name="Copy Trading"
-                  status={serviceStatus.copy_trading}
-                />
-                <ServicePill
                   name="Arb Executor"
                   status={serviceStatus.arb_executor}
                 />

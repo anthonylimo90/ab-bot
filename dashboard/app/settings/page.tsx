@@ -32,7 +32,6 @@ import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
 import { useWalletStore } from '@/stores/wallet-store';
 import api from '@/lib/api';
 import Link from 'next/link';
-import { TradingGatesPanel } from '@/components/trading/TradingGatesPanel';
 import { formatCurrency } from '@/lib/utils';
 
 export default function SettingsPage() {
@@ -49,7 +48,6 @@ export default function SettingsPage() {
   const [isSavingTradingConfig, setIsSavingTradingConfig] = useState(false);
   const [polygonRpcUrl, setPolygonRpcUrl] = useState('');
   const [alchemyApiKey, setAlchemyApiKey] = useState('');
-  const [copyTradingEnabled, setCopyTradingEnabled] = useState(false);
   const [arbAutoExecute, setArbAutoExecute] = useState(false);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
   const [exitHandlerEnabled, setExitHandlerEnabled] = useState(false);
@@ -109,14 +107,6 @@ export default function SettingsPage() {
     refetchInterval: 30000,
   });
 
-  // Fetch dynamic tuner status (for gates panel)
-  const { data: dynamicTunerStatus } = useQuery({
-    queryKey: ['dynamic-tuner-status', currentWorkspace?.id],
-    queryFn: () => api.getDynamicTunerStatus(currentWorkspace!.id),
-    enabled: !!currentWorkspace?.id,
-    refetchInterval: 30000,
-  });
-
   // Initialize risk form from API data
   useEffect(() => {
     if (riskStatus?.circuit_breaker?.config) {
@@ -141,7 +131,6 @@ export default function SettingsPage() {
     if (currentWorkspace) {
       setPolygonRpcUrl(currentWorkspace.polygon_rpc_url || '');
       setAlchemyApiKey(''); // Never pre-fill masked key
-      setCopyTradingEnabled(currentWorkspace.copy_trading_enabled ?? false);
       setArbAutoExecute(currentWorkspace.arb_auto_execute ?? false);
       setLiveTradingEnabled(currentWorkspace.live_trading_enabled ?? false);
       setExitHandlerEnabled(currentWorkspace.exit_handler_enabled ?? false);
@@ -188,7 +177,6 @@ export default function SettingsPage() {
     setIsSavingTradingConfig(true);
     try {
       const updates: Record<string, unknown> = {
-        copy_trading_enabled: copyTradingEnabled,
         arb_auto_execute: arbAutoExecute,
         live_trading_enabled: liveTradingEnabled,
         exit_handler_enabled: exitHandlerEnabled,
@@ -306,16 +294,6 @@ export default function SettingsPage() {
           Manage your account, trading configuration, and risk parameters
         </p>
       </div>
-
-      {/* Trading Gates Panel */}
-      {currentWorkspace && (
-        <TradingGatesPanel
-          workspace={currentWorkspace}
-          serviceStatus={serviceStatus ?? null}
-          riskStatus={riskStatus ?? null}
-          dynamicTunerStatus={dynamicTunerStatus ?? null}
-        />
-      )}
 
       {/* Account */}
       <Card>
@@ -519,7 +497,7 @@ export default function SettingsPage() {
                 className="w-full rounded border bg-background px-3 py-2 text-sm"
               />
               <p className="text-xs text-muted-foreground">
-                Required for copy trading and wallet monitoring. Accepted providers:
+                Required for wallet monitoring and on-chain operations. Accepted providers:
                 Alchemy, Infura, Ankr, Polygon, LlamaRPC, DRPC, PublicNode, 1RPC,
                 Tenderly, Particle Network.
               </p>
@@ -541,20 +519,6 @@ export default function SettingsPage() {
               <p className="text-xs text-muted-foreground">
                 Alternative to Polygon RPC URL. Leave empty to keep current key.
               </p>
-            </div>
-
-            {/* Copy Trading Toggle */}
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="font-medium">Copy Trading</p>
-                <p className="text-sm text-muted-foreground">
-                  Automatically replicate trades from tracked wallets
-                </p>
-              </div>
-              <Switch
-                checked={copyTradingEnabled}
-                onCheckedChange={setCopyTradingEnabled}
-              />
             </div>
 
             {/* Arb Auto-Execute Toggle */}

@@ -3,7 +3,7 @@
 import { StrategyPerformanceTable } from "@/components/signals/StrategyPerformanceTable";
 import { RecentSignalsFeed } from "@/components/signals/RecentSignalsFeed";
 import { FlowFeaturesChart } from "@/components/signals/FlowFeaturesChart";
-import { MarketRegimeBadge } from "@/components/discover/MarketRegimeBadge";
+import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
 import { Zap } from "lucide-react";
 
 export default function SignalsPage() {

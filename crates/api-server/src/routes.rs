@@ -11,9 +11,9 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    activity, admin_workspaces, allocations, auth, auto_rotation, backtest, discover, health,
-    invites, markets, onboarding, order_signing, positions, recommendations, risk,
-    risk_allocations, signals, trading, users, vault, wallet_auth, wallets, workspaces,
+    activity, admin_workspaces, auth, backtest, discover, health, markets, order_signing,
+    positions, recommendations, risk, signals, trading, users, vault, wallet_auth, wallets,
+    workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -47,11 +47,6 @@ use crate::websocket;
         positions::list_positions,
         positions::get_position,
         positions::close_position,
-        wallets::list_tracked_wallets,
-        wallets::add_tracked_wallet,
-        wallets::get_wallet,
-        wallets::update_wallet,
-        wallets::remove_wallet,
         wallets::get_wallet_metrics,
         wallets::get_wallet_trades,
         trading::place_order,
@@ -64,8 +59,6 @@ use crate::websocket;
         discover::discover_wallets,
         discover::get_discovered_wallet,
         discover::get_current_regime,
-        discover::get_calibration_report,
-        discover::get_copy_performance,
 
         vault::store_wallet,
         vault::list_wallets,
@@ -96,40 +89,10 @@ use crate::websocket;
         workspaces::list_members,
         workspaces::update_member_role,
         workspaces::remove_member,
-        workspaces::get_optimizer_status,
         workspaces::get_service_status,
         workspaces::get_dynamic_tuner_status,
         workspaces::update_opportunity_selection_settings,
         workspaces::get_dynamic_tuning_history,
-        // Invites
-        invites::list_invites,
-        invites::create_invite,
-        invites::revoke_invite,
-        invites::get_invite_info,
-        invites::accept_invite,
-        // Allocations
-        allocations::list_allocations,
-        allocations::add_allocation,
-        allocations::update_allocation,
-        allocations::remove_allocation,
-        allocations::promote_allocation,
-        allocations::demote_allocation,
-        allocations::pin_allocation,
-        allocations::unpin_allocation,
-        allocations::ban_wallet,
-        allocations::unban_wallet,
-        allocations::list_bans,
-        // Auto-rotation
-        auto_rotation::list_rotation_history,
-        auto_rotation::acknowledge_entry,
-        auto_rotation::trigger_optimization,
-        // Onboarding
-        onboarding::get_status,
-        onboarding::set_mode,
-        onboarding::set_budget,
-        onboarding::auto_setup,
-        onboarding::complete_onboarding,
-
         // Order signing (MetaMask)
         order_signing::prepare_order,
         order_signing::submit_order,
@@ -140,8 +103,6 @@ use crate::websocket;
         risk::manual_trip_circuit_breaker,
         risk::reset_circuit_breaker,
         risk::update_circuit_breaker_config,
-        // Copy trading config
-        workspaces::update_copy_trading_config,
         // Arb executor config
         workspaces::update_arb_executor_config,
         // Signals (quant signal system)
@@ -181,9 +142,6 @@ use crate::websocket;
             markets::SpreadInfo,
             positions::PositionResponse,
             positions::ClosePositionRequest,
-            wallets::TrackedWalletResponse,
-            wallets::AddWalletRequest,
-            wallets::UpdateWalletRequest,
             wallets::WalletMetricsResponse,
             wallets::WalletTradeResponse,
             trading::PlaceOrderRequest,
@@ -200,9 +158,6 @@ use crate::websocket;
             discover::DiscoveredWallet,
             discover::PredictionCategory,
             discover::MarketRegimeResponse,
-            discover::CalibrationBucketResponse,
-            discover::CalibrationReportResponse,
-            discover::CopyPerformanceResponse,
 
             vault::StoreWalletRequest,
             vault::WalletInfo,
@@ -225,39 +180,12 @@ use crate::websocket;
             workspaces::UpdateWorkspaceRequest,
             workspaces::WorkspaceMemberResponse,
             workspaces::UpdateMemberRoleRequest,
-            workspaces::OptimizerStatusResponse,
-            workspaces::OptimizerCriteria,
-            workspaces::PortfolioMetrics,
             workspaces::ServiceStatusResponse,
             workspaces::ServiceStatusItem,
             workspaces::DynamicTunerStatusResponse,
             workspaces::DynamicSignalThresholdsResponse,
             workspaces::DynamicConfigItemResponse,
             workspaces::DynamicConfigHistoryEntryResponse,
-            // Invites
-            invites::InviteResponse,
-            invites::CreateInviteRequest,
-            invites::AcceptInviteRequest,
-            invites::AcceptInviteResponse,
-            invites::InviteInfoResponse,
-            // Allocations
-            allocations::AllocationResponse,
-            allocations::AddAllocationRequest,
-            allocations::UpdateAllocationRequest,
-            allocations::PinResponse,
-            allocations::BanWalletRequest,
-            allocations::BanResponse,
-            allocations::BanListResponse,
-            // Auto-rotation
-            auto_rotation::RotationHistoryResponse,
-            // Onboarding
-            onboarding::OnboardingStatusResponse,
-            onboarding::SetModeRequest,
-            onboarding::SetBudgetRequest,
-            onboarding::AutoSetupRequest,
-            onboarding::AutoSetupResponse,
-            onboarding::AutoSelectedWallet,
-
             // Order signing
             order_signing::PrepareOrderRequest,
             order_signing::PrepareOrderResponse,
@@ -279,8 +207,6 @@ use crate::websocket;
             risk::StopLossStatsResponse,
             risk::RecentStopExecution,
             risk::UpdateCircuitBreakerConfigRequest,
-            workspaces::UpdateCopyTradingConfigRequest,
-            workspaces::CopyTradingConfigResponse,
             workspaces::UpdateArbExecutorConfigRequest,
             workspaces::ArbExecutorConfigResponse,
             // Signals
@@ -295,7 +221,7 @@ use crate::websocket;
         (name = "health", description = "Health check endpoints"),
         (name = "markets", description = "Market data endpoints"),
         (name = "positions", description = "Position management"),
-        (name = "wallets", description = "Wallet tracking for copy trading"),
+        (name = "wallets", description = "Wallet tracking"),
         (name = "trading", description = "Order execution"),
         (name = "backtest", description = "Backtesting operations"),
         (name = "discover", description = "Wallet discovery and live trade monitoring"),
@@ -304,13 +230,8 @@ use crate::websocket;
         (name = "users", description = "User management (admin only)"),
         (name = "admin_workspaces", description = "Workspace management (platform admin only)"),
         (name = "workspaces", description = "User workspace operations"),
-        (name = "invites", description = "Workspace invite management"),
-        (name = "allocations", description = "Wallet roster allocations"),
-        (name = "auto_rotation", description = "Auto-rotation history and optimization"),
-        (name = "onboarding", description = "Setup wizard and onboarding"),
-
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
-        (name = "activity", description = "Activity feed from copy trade history"),
+        (name = "activity", description = "Activity feed from execution reports"),
         (name = "risk", description = "Risk monitoring and circuit breaker management"),
         (name = "signals", description = "Quant signal system: flow features, performance, and recent signals"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
@@ -376,14 +297,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(discover::get_discovered_wallet),
         )
         .route("/api/v1/regime/current", get(discover::get_current_regime))
-        .route(
-            "/api/v1/discover/calibration",
-            get(discover::get_calibration_report),
-        )
-        .route(
-            "/api/v1/discover/wallets/:address/copy-performance",
-            get(discover::get_copy_performance),
-        )
         // Recommendations (public for demo purposes)
         .route(
             "/api/v1/recommendations/rotation",
@@ -396,12 +309,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/recommendations/:id/accept",
             post(recommendations::accept_recommendation),
-        )
-        // Invite info and acceptance (public - token validates access)
-        .route("/api/v1/invites/:token", get(invites::get_invite_info))
-        .route(
-            "/api/v1/invites/:token/accept",
-            post(invites::accept_invite),
         )
         // WebSocket endpoints (auth handled via query param or message)
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
@@ -431,8 +338,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(positions::get_position),
         )
         // Wallet endpoints (read-only)
-        .route("/api/v1/wallets", get(wallets::list_tracked_wallets))
-        .route("/api/v1/wallets/:address", get(wallets::get_wallet))
         .route(
             "/api/v1/wallets/:address/metrics",
             get(wallets::get_wallet_metrics),
@@ -474,10 +379,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(workspaces::list_members),
         )
         .route(
-            "/api/v1/workspaces/:workspace_id/optimizer-status",
-            get(workspaces::get_optimizer_status),
-        )
-        .route(
             "/api/v1/workspaces/:workspace_id/service-status",
             get(workspaces::get_service_status),
         )
@@ -488,10 +389,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/history",
             get(workspaces::get_dynamic_tuning_history),
-        )
-        .route(
-            "/api/v1/workspaces/:workspace_id/invites",
-            get(invites::list_invites),
         )
         // Signal endpoints (read-only for all members)
         .route("/api/v1/signals/flow", get(signals::get_flow_features))
@@ -511,15 +408,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/workspaces/:workspace_id/risk/status",
             get(risk::get_risk_status),
         )
-        // Allocations (read-only for all members)
-        .route("/api/v1/allocations", get(allocations::list_allocations))
-        // Auto-rotation history (read-only for all members)
-        .route(
-            "/api/v1/auto-rotation/history",
-            get(auto_rotation::list_rotation_history),
-        )
-        // Onboarding status (read for all)
-        .route("/api/v1/onboarding/status", get(onboarding::get_status))
         // Apply auth middleware
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -542,10 +430,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/positions/:position_id/close",
             post(positions::close_position),
         )
-        // Wallet management
-        .route("/api/v1/wallets", post(wallets::add_tracked_wallet))
-        .route("/api/v1/wallets/:address", put(wallets::update_wallet))
-        .route("/api/v1/wallets/:address", delete(wallets::remove_wallet))
         // Backtest operations
         .route("/api/v1/backtest", post(backtest::run_backtest))
         // Vault operations (write)
@@ -572,56 +456,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/workspaces/:workspace_id/members/:member_id",
             delete(workspaces::remove_member),
         )
-        .route(
-            "/api/v1/workspaces/:workspace_id/invites",
-            post(invites::create_invite),
-        )
-        .route(
-            "/api/v1/workspaces/:workspace_id/invites/:invite_id",
-            delete(invites::revoke_invite),
-        )
-        // Allocation management (owner/admin can modify)
-        .route(
-            "/api/v1/allocations/:address",
-            post(allocations::add_allocation),
-        )
-        .route(
-            "/api/v1/allocations/:address",
-            put(allocations::update_allocation),
-        )
-        .route(
-            "/api/v1/allocations/:address",
-            delete(allocations::remove_allocation),
-        )
-        .route(
-            "/api/v1/allocations/:address/promote",
-            post(allocations::promote_allocation),
-        )
-        .route(
-            "/api/v1/allocations/:address/demote",
-            post(allocations::demote_allocation),
-        )
-        // Pin/unpin wallet (prevents auto-demotion)
-        .route(
-            "/api/v1/allocations/:address/pin",
-            put(allocations::pin_allocation),
-        )
-        .route(
-            "/api/v1/allocations/:address/pin",
-            delete(allocations::unpin_allocation),
-        )
-        // Wallet bans (prevents auto-promotion)
-        .route("/api/v1/allocations/bans", post(allocations::ban_wallet))
-        .route("/api/v1/allocations/bans", get(allocations::list_bans))
-        .route(
-            "/api/v1/allocations/bans/:address",
-            delete(allocations::unban_wallet),
-        )
-        // Risk-based allocation recalculation
-        .route(
-            "/api/v1/allocations/risk/recalculate",
-            post(risk_allocations::recalculate_allocations),
-        )
         // Circuit breaker manual controls
         .route(
             "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/trip",
@@ -630,26 +464,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/risk/circuit-breaker/reset",
             post(risk::reset_circuit_breaker),
-        )
-        // Auto-rotation operations
-        .route(
-            "/api/v1/auto-rotation/:entry_id/acknowledge",
-            put(auto_rotation::acknowledge_entry),
-        )
-        .route(
-            "/api/v1/auto-rotation/trigger",
-            post(auto_rotation::trigger_optimization),
-        )
-        // Onboarding operations
-        .route("/api/v1/onboarding/mode", put(onboarding::set_mode))
-        .route("/api/v1/onboarding/budget", put(onboarding::set_budget))
-        .route(
-            "/api/v1/onboarding/auto-setup",
-            post(onboarding::auto_setup),
-        )
-        .route(
-            "/api/v1/onboarding/complete",
-            put(onboarding::complete_onboarding),
         )
         // Apply trader check first, then auth
         .layer(axum_middleware::from_fn_with_state(
@@ -719,10 +533,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             put(risk::update_circuit_breaker_config),
         )
         .route(
-            "/api/v1/workspaces/:workspace_id/dynamic-tuning/copy-trading",
-            put(workspaces::update_copy_trading_config),
-        )
-        .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/arb-executor",
             put(workspaces::update_arb_executor_config),
         )
@@ -763,6 +573,5 @@ mod tests {
         assert!(json.contains("health"));
         assert!(json.contains("markets"));
         assert!(json.contains("workspaces"));
-        assert!(json.contains("allocations"));
     }
 }

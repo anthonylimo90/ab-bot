@@ -49,7 +49,7 @@ impl SuccessPrediction {
         Utc::now() < valid_until
     }
 
-    /// Check if the wallet is recommended for copy trading.
+    /// Check if the wallet is recommended for following.
     pub fn is_recommended(&self) -> bool {
         self.success_probability >= 0.65 && self.confidence >= 0.5
     }

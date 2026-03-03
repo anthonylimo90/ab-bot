@@ -19,41 +19,73 @@ import {
   useDynamicConfigHistoryQuery,
 } from "@/hooks/queries/useHistoryQuery";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { formatCurrency, formatTimeAgo, cn, formatDynamicKey, formatDynamicConfigValue, formatSkipReason } from "@/lib/utils";
+import { formatCurrency, formatTimeAgo, cn, formatDynamicKey, formatDynamicConfigValue } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import {
   History,
   ChevronLeft,
   ChevronRight,
-  Copy,
-  AlertCircle,
   XCircle,
   Activity as ActivityIcon,
   SlidersHorizontal,
   TrendingDown,
   TrendingUp,
+  Zap,
+  DollarSign,
+  CheckCircle2,
+  ShieldAlert,
 } from "lucide-react";
 
 const PAGE_SIZE = 50;
 
-type ActivityFilter = "all" | "copied" | "skipped" | "failed" | "wallet_events";
+type ActivityFilter = "all" | "arb" | "risk" | "wallet_events";
 type HistoryTab = "activity" | "dynamic";
 
 const activityMeta = {
-  TRADE_COPIED: {
-    label: "Copied",
-    icon: <Copy className="h-4 w-4 text-blue-500" />,
+  POSITION_OPENED: {
+    label: "Opened",
+    icon: <DollarSign className="h-4 w-4 text-green-500" />,
+    badgeClass: "bg-green-500/10 text-green-600",
+  },
+  POSITION_CLOSED: {
+    label: "Closed",
+    icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
     badgeClass: "bg-blue-500/10 text-blue-600",
   },
-  TRADE_COPY_SKIPPED: {
-    label: "Skipped",
-    icon: <AlertCircle className="h-4 w-4 text-yellow-500" />,
+  ARBITRAGE_DETECTED: {
+    label: "Arb Detected",
+    icon: <Zap className="h-4 w-4 text-yellow-500" />,
     badgeClass: "bg-yellow-500/10 text-yellow-600",
   },
-  TRADE_COPY_FAILED: {
-    label: "Failed",
+  ARB_POSITION_OPENED: {
+    label: "Arb Opened",
+    icon: <DollarSign className="h-4 w-4 text-green-500" />,
+    badgeClass: "bg-green-500/10 text-green-600",
+  },
+  ARB_POSITION_CLOSED: {
+    label: "Arb Closed",
+    icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
+    badgeClass: "bg-blue-500/10 text-blue-600",
+  },
+  ARB_EXECUTION_FAILED: {
+    label: "Arb Failed",
     icon: <XCircle className="h-4 w-4 text-red-500" />,
     badgeClass: "bg-red-500/10 text-red-600",
+  },
+  ARB_EXIT_FAILED: {
+    label: "Exit Failed",
+    icon: <ShieldAlert className="h-4 w-4 text-red-400" />,
+    badgeClass: "bg-red-500/10 text-red-600",
+  },
+  STOP_LOSS_TRIGGERED: {
+    label: "Stop Loss",
+    icon: <TrendingDown className="h-4 w-4 text-orange-500" />,
+    badgeClass: "bg-orange-500/10 text-orange-600",
+  },
+  TAKE_PROFIT_TRIGGERED: {
+    label: "Take Profit",
+    icon: <TrendingUp className="h-4 w-4 text-green-500" />,
+    badgeClass: "bg-green-500/10 text-green-600",
   },
   WALLET_DEMOTED: {
     label: "Demoted",
@@ -69,9 +101,8 @@ const activityMeta = {
 
 function matchesFilter(type: string, filter: ActivityFilter): boolean {
   if (filter === "all") return true;
-  if (filter === "copied") return type === "TRADE_COPIED";
-  if (filter === "skipped") return type === "TRADE_COPY_SKIPPED";
-  if (filter === "failed") return type === "TRADE_COPY_FAILED";
+  if (filter === "arb") return type.startsWith("ARB_") || type === "ARBITRAGE_DETECTED";
+  if (filter === "risk") return type === "STOP_LOSS_TRIGGERED" || type === "TAKE_PROFIT_TRIGGERED";
   if (filter === "wallet_events") return type === "WALLET_DEMOTED" || type === "WALLET_PROMOTED";
   return true;
 }
@@ -127,19 +158,19 @@ export default function HistoryPage() {
     [activity, activityFilter],
   );
 
-  const copiedCount = useMemo(
-    () => filteredActivity.filter((item) => item.type === "TRADE_COPIED").length,
+  const arbCount = useMemo(
+    () => filteredActivity.filter((item) => item.type.startsWith("ARB_") || item.type === "ARBITRAGE_DETECTED").length,
     [filteredActivity],
   );
-  const skippedCount = useMemo(
+  const riskCount = useMemo(
     () =>
-      filteredActivity.filter((item) => item.type === "TRADE_COPY_SKIPPED")
+      filteredActivity.filter((item) => item.type === "STOP_LOSS_TRIGGERED" || item.type === "TAKE_PROFIT_TRIGGERED")
         .length,
     [filteredActivity],
   );
   const failedCount = useMemo(
     () =>
-      filteredActivity.filter((item) => item.type === "TRADE_COPY_FAILED")
+      filteredActivity.filter((item) => item.type === "ARB_EXECUTION_FAILED" || item.type === "ARB_EXIT_FAILED")
         .length,
     [filteredActivity],
   );
@@ -148,16 +179,6 @@ export default function HistoryPage() {
       filteredActivity.reduce((sum, item) => sum + Number(item.pnl ?? 0), 0),
     [filteredActivity],
   );
-
-  const skipBreakdown = useMemo(() => {
-    const counts: Record<string, number> = {};
-    filteredActivity
-      .filter((a) => a.type === "TRADE_COPY_SKIPPED" && a.skip_reason)
-      .forEach((a) => {
-        counts[a.skip_reason!] = (counts[a.skip_reason!] || 0) + 1;
-      });
-    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
-  }, [filteredActivity]);
 
   return (
     <ErrorBoundary>
@@ -168,18 +189,18 @@ export default function HistoryPage() {
             History
           </h1>
           <p className="text-muted-foreground">
-            Copy-trade outcomes and dynamic runtime tuning changes
+            Trading outcomes and dynamic runtime tuning changes
           </p>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <MetricCard
-            title="Net P&L / Slippage"
+            title="Net P&L"
             value={formatCurrency(netPnl, { showSign: true })}
             trend={netPnl >= 0 ? "up" : "down"}
           />
-          <MetricCard title="Copied" value={String(copiedCount)} trend="neutral" />
-          <MetricCard title="Skipped" value={String(skippedCount)} trend="neutral" />
+          <MetricCard title="Arb Events" value={String(arbCount)} trend="neutral" />
+          <MetricCard title="Risk Events" value={String(riskCount)} trend="neutral" />
           <MetricCard
             title="Failed"
             value={String(failedCount)}
@@ -187,27 +208,12 @@ export default function HistoryPage() {
           />
         </div>
 
-        {skipBreakdown.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-medium text-muted-foreground">Skip reasons:</span>
-            {skipBreakdown.map(([reason, count]) => (
-              <Badge
-                key={reason}
-                variant="outline"
-                className="text-xs bg-yellow-500/5 text-yellow-700 border-yellow-500/20"
-              >
-                {formatSkipReason(reason)} ({count})
-              </Badge>
-            ))}
-          </div>
-        )}
-
         <Tabs
           value={historyTab}
           onValueChange={(value) => setHistoryTab(value as HistoryTab)}
         >
           <TabsList className="grid w-full max-w-md grid-cols-2">
-            <TabsTrigger value="activity">Copy Activity</TabsTrigger>
+            <TabsTrigger value="activity">Trading Activity</TabsTrigger>
             <TabsTrigger value="dynamic">Dynamic Config</TabsTrigger>
           </TabsList>
 
@@ -225,9 +231,8 @@ export default function HistoryPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">All Activity</SelectItem>
-                  <SelectItem value="copied">Copied</SelectItem>
-                  <SelectItem value="skipped">Skipped</SelectItem>
-                  <SelectItem value="failed">Failed</SelectItem>
+                  <SelectItem value="arb">Arbitrage</SelectItem>
+                  <SelectItem value="risk">Risk Events</SelectItem>
                   <SelectItem value="wallet_events">Wallet Events</SelectItem>
                 </SelectContent>
               </Select>
@@ -247,7 +252,7 @@ export default function HistoryPage() {
                   <History className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
                   <h3 className="text-lg font-medium mb-2">No activity</h3>
                   <p className="text-muted-foreground">
-                    Activity will appear here as copy trades are processed.
+                    Activity will appear here as trades are processed.
                   </p>
                 </CardContent>
               </Card>
@@ -290,13 +295,8 @@ export default function HistoryPage() {
                                 </td>
                                 <td className="p-4 text-sm">
                                   <p className="break-words">{item.message}</p>
-                                  {(item.skip_reason || item.error_message) && (
+                                  {item.error_message && (
                                     <div className="mt-1 flex flex-wrap gap-1">
-                                      {item.skip_reason && (
-                                        <span className="rounded bg-yellow-500/10 px-1.5 py-0.5 text-xs text-yellow-700">
-                                          {formatSkipReason(item.skip_reason)}
-                                        </span>
-                                      )}
                                       {item.error_message && (
                                         <span className="rounded bg-red-500/10 px-1.5 py-0.5 text-xs text-red-700">
                                           error: {item.error_message}

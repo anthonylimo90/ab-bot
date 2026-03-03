@@ -15,7 +15,7 @@ const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
   title: 'AB-Bot | Polymarket Trading Dashboard',
-  description: 'Automated trading and copy trading for Polymarket',
+  description: 'Automated arbitrage trading for Polymarket',
 };
 
 export default function RootLayout({

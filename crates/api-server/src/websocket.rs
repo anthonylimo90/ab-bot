@@ -88,10 +88,8 @@ pub struct SignalUpdate {
 #[serde(rename_all = "snake_case")]
 pub enum SignalType {
     Arbitrage,
-    CopyTrade,
-    StopLoss,
-    TakeProfit,
     Alert,
+    QuantSignal,
 }
 
 /// WebSocket message wrapper.

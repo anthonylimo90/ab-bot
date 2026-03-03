@@ -1,4 +1,4 @@
-//! Workspace and onboarding types.
+//! Workspace types.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -72,11 +72,6 @@ impl std::str::FromStr for WorkspaceRole {
 }
 
 impl WorkspaceRole {
-    /// Check if this role can modify the roster (add/remove/promote wallets)
-    pub fn can_modify_roster(&self) -> bool {
-        matches!(self, Self::Owner | Self::Admin)
-    }
-
     /// Check if this role can manage members (invite/remove/change roles)
     pub fn can_manage_members(&self) -> bool {
         matches!(self, Self::Owner | Self::Admin)
@@ -88,108 +83,7 @@ impl WorkspaceRole {
     }
 }
 
-/// Wallet tier in the roster
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum WalletTier {
-    Active,
-    #[default]
-    Bench,
-}
-
-impl std::fmt::Display for WalletTier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Active => write!(f, "active"),
-            Self::Bench => write!(f, "bench"),
-        }
-    }
-}
-
-impl std::str::FromStr for WalletTier {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "active" => Ok(Self::Active),
-            "bench" => Ok(Self::Bench),
-            _ => Err(format!("Invalid wallet tier: {}", s)),
-        }
-    }
-}
-
-/// Copy behavior setting for a wallet
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CopyBehavior {
-    #[default]
-    CopyAll,
-    EventsOnly,
-    ArbThreshold,
-}
-
-impl std::fmt::Display for CopyBehavior {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CopyAll => write!(f, "copy_all"),
-            Self::EventsOnly => write!(f, "events_only"),
-            Self::ArbThreshold => write!(f, "arb_threshold"),
-        }
-    }
-}
-
-impl std::str::FromStr for CopyBehavior {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "copy_all" => Ok(Self::CopyAll),
-            "events_only" => Ok(Self::EventsOnly),
-            "arb_threshold" => Ok(Self::ArbThreshold),
-            _ => Err(format!("Invalid copy behavior: {}", s)),
-        }
-    }
-}
-
-/// Rotation action type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RotationAction {
-    Promote,
-    Demote,
-    Replace,
-    Add,
-    Remove,
-}
-
-impl std::fmt::Display for RotationAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Promote => write!(f, "promote"),
-            Self::Demote => write!(f, "demote"),
-            Self::Replace => write!(f, "replace"),
-            Self::Add => write!(f, "add"),
-            Self::Remove => write!(f, "remove"),
-        }
-    }
-}
-
-impl std::str::FromStr for RotationAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "promote" => Ok(Self::Promote),
-            "demote" => Ok(Self::Demote),
-            "replace" => Ok(Self::Replace),
-            "add" => Ok(Self::Add),
-            "remove" => Ok(Self::Remove),
-            _ => Err(format!("Invalid rotation action: {}", s)),
-        }
-    }
-}
-
-/// A workspace (shared roster container)
+/// A workspace (shared configuration container)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Uuid,
@@ -250,74 +144,4 @@ pub struct UserSettings {
     pub preferences: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-/// Wallet allocation within a workspace roster
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceWalletAllocation {
-    pub id: Uuid,
-    pub workspace_id: Uuid,
-    pub wallet_address: String,
-
-    // Allocation
-    pub allocation_pct: Decimal,
-    pub max_position_size: Option<Decimal>,
-
-    // Tier
-    pub tier: WalletTier,
-
-    // Auto-assignment
-    pub auto_assigned: bool,
-    pub auto_assigned_reason: Option<String>,
-
-    // Backtest results
-    pub backtest_roi: Option<Decimal>,
-    pub backtest_sharpe: Option<Decimal>,
-    pub backtest_win_rate: Option<Decimal>,
-
-    // Copy settings
-    pub copy_behavior: CopyBehavior,
-    pub arb_threshold_pct: Option<Decimal>,
-
-    // Audit
-    pub added_by: Option<Uuid>,
-    pub added_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// A pending workspace invite
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceInvite {
-    pub id: Uuid,
-    pub workspace_id: Uuid,
-    pub email: String,
-    pub role: WorkspaceRole,
-    pub invited_by: Uuid,
-    pub expires_at: DateTime<Utc>,
-    pub accepted_at: Option<DateTime<Utc>>,
-    pub created_at: DateTime<Utc>,
-
-    // Denormalized for display
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inviter_email: Option<String>,
-}
-
-/// An entry in the auto-rotation history
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoRotationHistoryEntry {
-    pub id: Uuid,
-    pub workspace_id: Uuid,
-    pub action: RotationAction,
-    pub wallet_in: Option<String>,
-    pub wallet_out: Option<String>,
-    pub reason: String,
-    pub evidence: serde_json::Value,
-    pub triggered_by: Option<Uuid>,
-    pub notification_sent: bool,
-    pub acknowledged: bool,
-    pub acknowledged_at: Option<DateTime<Utc>>,
-    pub acknowledged_by: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
 }

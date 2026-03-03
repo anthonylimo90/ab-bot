@@ -53,3 +53,12 @@ export function useMarketMetadataQuery(params?: {
     staleTime: 5 * 60_000,
   });
 }
+
+export function useMarketRegimeQuery() {
+  return useQuery({
+    queryKey: ["regime", "current"],
+    queryFn: () => api.getMarketRegime(),
+    staleTime: 5 * 60_000,
+    refetchInterval: 5 * 60_000,
+  });
+}

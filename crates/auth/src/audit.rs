@@ -31,12 +31,6 @@ pub enum AuditAction {
     ManualExit,
     EmergencyExitAll,
 
-    // Copy Trading
-    AddTrackedWallet,
-    RemoveTrackedWallet,
-    UpdateTrackedWallet,
-    CopyTradeExecuted,
-
     // Risk Management
     CreateStopLoss,
     RemoveStopLoss,

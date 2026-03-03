@@ -8,47 +8,32 @@ import {
 } from "@/hooks/queries/usePositionsQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { useAllocationsQuery } from "@/hooks/queries/useAllocationsQuery";
 import { useRiskStatusQuery } from "@/hooks/queries/useRiskQuery";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { PortfolioChart } from "@/components/charts/PortfolioChart";
-import { AllocationPie } from "@/components/charts/AllocationPie";
-import { LiveActivityFeed } from "@/components/discover/LiveActivityFeed";
-import { MarketRegimeBadge } from "@/components/discover/MarketRegimeBadge";
 import {
   Activity,
   ArrowRight,
-  Copy,
   TrendingDown,
   Zap,
-  AlertCircle,
-  XCircle,
   DollarSign,
   CheckCircle2,
   ShieldAlert,
-  Search,
-  PieChart,
-  TrendingUp,
-  Target,
-  Settings2,
-  Star,
+  AlertCircle,
+  XCircle,
   LineChart,
+  BarChart2,
 } from "lucide-react";
-import { formatCurrency, formatSkipReason } from "@/lib/utils";
+import { formatCurrency } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { TimeAgo } from "@/components/shared/TimeAgo";
 
 const activityIcons: Record<string, React.ReactNode> = {
-  TRADE_COPIED: <Copy className="h-4 w-4 text-blue-500" />,
-  TRADE_COPY_SKIPPED: <AlertCircle className="h-4 w-4 text-yellow-500" />,
-  TRADE_COPY_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
   STOP_LOSS_TRIGGERED: <TrendingDown className="h-4 w-4 text-loss" />,
-  RECOMMENDATION_NEW: <Activity className="h-4 w-4 text-purple-500" />,
   ARBITRAGE_DETECTED: <Zap className="h-4 w-4 text-yellow-500" />,
   ARB_POSITION_OPENED: <DollarSign className="h-4 w-4 text-profit" />,
   ARB_POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
@@ -56,14 +41,10 @@ const activityIcons: Record<string, React.ReactNode> = {
   ARB_EXIT_FAILED: <ShieldAlert className="h-4 w-4 text-red-400" />,
   POSITION_OPENED: <AlertCircle className="h-4 w-4 text-profit" />,
   POSITION_CLOSED: <AlertCircle className="h-4 w-4 text-muted-foreground" />,
-  WALLET_DEMOTED: <TrendingDown className="h-4 w-4 text-orange-500" />,
-  WALLET_PROMOTED: <TrendingUp className="h-4 w-4 text-profit" />,
 };
 
 export function DashboardHome() {
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: allocations = [] } = useAllocationsQuery(currentWorkspace?.id);
-  const activeWallets = allocations.filter((a) => a.tier === "active");
   const { openPositions, totalUnrealizedPnl } = useOpenPositions();
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: closedPositions = [] } = usePositionsQuery({ status: "closed" });
@@ -90,26 +71,6 @@ export function DashboardHome() {
   }, [openPositions, totalUnrealizedPnl, closedPositions, riskStatus]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
-  // Watchdog: detect zero fills with skips
-  const watchdog = useMemo(() => {
-    const copiedCount = activities.filter((a) => a.type === "TRADE_COPIED").length;
-    const skippedItems = activities.filter((a) => a.type === "TRADE_COPY_SKIPPED");
-    if (copiedCount === 0 && skippedItems.length > 0) {
-      // Find top skip reason
-      const counts: Record<string, number> = {};
-      skippedItems.forEach((a) => {
-        if (a.skip_reason) counts[a.skip_reason] = (counts[a.skip_reason] || 0) + 1;
-      });
-      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-      return {
-        show: true,
-        skippedCount: skippedItems.length,
-        topReason: sorted[0] ? formatSkipReason(sorted[0][0]) : undefined,
-      };
-    }
-    return { show: false, skippedCount: 0 };
-  }, [activities]);
-
   // Derive equity curve from closed positions (accumulated realized P&L)
   const equityCurve = useMemo(() => {
     if (closedPositions.length === 0) return [];
@@ -129,26 +90,6 @@ export function DashboardHome() {
     });
   }, [closedPositions]);
 
-  // Derive allocation pie data from active wallets
-  const allocationData = useMemo(() => {
-    const colors = [
-      "#3b82f6",
-      "#10b981",
-      "#f59e0b",
-      "#ef4444",
-      "#8b5cf6",
-    ];
-    return activeWallets.map((w, i) => ({
-      name: w.wallet_label || `${w.wallet_address.slice(0, 6)}...${w.wallet_address.slice(-4)}`,
-      value: Number(w.allocation_pct) || 0,
-      color: colors[i % colors.length],
-    }));
-  }, [activeWallets]);
-
-  const isAutomatic = currentWorkspace?.setup_mode === "automatic";
-  const modeLabel = isAutomatic ? "Guided" : "Custom";
-  const ModeIcon = isAutomatic ? Target : Settings2;
-
   return (
     <div className="space-y-5 sm:space-y-6">
       {/* Page Header */}
@@ -164,36 +105,10 @@ export function DashboardHome() {
           </div>
           <LiveIndicator />
         </div>
-        <div className="flex items-center gap-2">
-          <MarketRegimeBadge />
-          <Badge variant="secondary" className="w-fit items-center gap-1">
-            <ModeIcon className="h-3 w-3" />
-            {modeLabel} Mode
-          </Badge>
-        </div>
       </div>
 
-      {/* Watchdog alert */}
-      {watchdog.show && (
-        <div className="flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3">
-          <AlertCircle className="h-5 w-5 text-amber-500 shrink-0" />
-          <div className="flex-1 text-sm">
-            <span className="font-medium text-amber-600">No trades executing</span>
-            {" \u2014 "}
-            <span className="text-muted-foreground">
-              {watchdog.skippedCount} skipped{watchdog.topReason ? `. Top reason: ${watchdog.topReason}` : ""}
-            </span>
-          </div>
-          <Link href="/history">
-            <Button variant="ghost" size="sm" className="text-amber-600 hover:text-amber-700">
-              View Details <ArrowRight className="ml-1 h-3 w-3" />
-            </Button>
-          </Link>
-        </div>
-      )}
-
       {/* Stats Grid */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         <MetricCard
           title="Portfolio Value"
           value={formatCurrency(stats.total_value)}
@@ -207,16 +122,6 @@ export function DashboardHome() {
           trend={stats.today_pnl >= 0 ? "up" : "down"}
         />
         <MetricCard
-          title="Active Wallets"
-          value={`${activeWallets.length}/5`}
-          changeLabel={
-            activeWallets.length < 5
-              ? `${5 - activeWallets.length} slots available`
-              : "Roster full"
-          }
-          trend="neutral"
-        />
-        <MetricCard
           title="Open Positions"
           value={stats.active_positions.toString()}
           changeLabel={`Win rate: ${(stats.win_rate || 0).toFixed(0)}%`}
@@ -226,28 +131,22 @@ export function DashboardHome() {
 
       {/* Quick Actions Row */}
       <div className="flex flex-wrap gap-2">
-        <Link href="/discover">
+        <Link href="/markets">
           <Button variant="outline" size="sm" className="gap-2">
-            <Search className="h-4 w-4 text-blue-500" />
-            Discover
+            <BarChart2 className="h-4 w-4 text-blue-500" />
+            Markets
           </Button>
         </Link>
-        <Link href="/trading">
+        <Link href="/signals">
           <Button variant="outline" size="sm" className="gap-2">
-            <PieChart className="h-4 w-4 text-green-500" />
-            Positions ({stats.active_positions})
+            <Zap className="h-4 w-4 text-green-500" />
+            Quant Signals
           </Button>
         </Link>
         <Link href="/backtest">
           <Button variant="outline" size="sm" className="gap-2">
             <LineChart className="h-4 w-4 text-purple-500" />
             Backtest
-          </Button>
-        </Link>
-        <Link href="/roster">
-          <Button variant="outline" size="sm" className="gap-2">
-            <Star className="h-4 w-4 text-yellow-500" />
-            Wallets ({activeWallets.length}/5)
           </Button>
         </Link>
       </div>
@@ -277,8 +176,8 @@ export function DashboardHome() {
             <div className="max-h-[320px] space-y-4 overflow-y-auto sm:max-h-[350px]">
               {activities.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">
-                  No recent activity yet. Activity will appear here when wallets
-                  make trades.
+                  No recent activity yet. Activity will appear here when trades
+                  occur.
                 </p>
               ) : (
                 activities.slice(0, 8).map((item, index) => (
@@ -319,36 +218,17 @@ export function DashboardHome() {
           </CardContent>
         </Card>
 
-        {/* Live Activity Feed */}
-        <LiveActivityFeed className="lg:col-span-1" />
-      </div>
-
-      {/* Charts */}
-      <div className="grid gap-4 lg:grid-cols-2">
+        {/* Equity Curve */}
         <Card>
           <CardHeader>
             <CardTitle>Equity Curve</CardTitle>
           </CardHeader>
           <CardContent>
             {equityCurve.length > 1 ? (
-              <PortfolioChart data={equityCurve} height={250} />
+              <PortfolioChart data={equityCurve} height={320} />
             ) : (
-              <div className="flex items-center justify-center h-[250px] text-sm text-muted-foreground">
+              <div className="flex items-center justify-center h-[320px] text-sm text-muted-foreground">
                 Close positions to see your equity curve
-              </div>
-            )}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Wallet Allocation</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {allocationData.length > 0 ? (
-              <AllocationPie data={allocationData} showLegend />
-            ) : (
-              <div className="flex items-center justify-center h-[250px] text-sm text-muted-foreground">
-                Add active wallets to see allocation
               </div>
             )}
           </CardContent>

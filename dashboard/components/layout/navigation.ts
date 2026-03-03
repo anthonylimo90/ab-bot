@@ -1,7 +1,5 @@
 import {
   LayoutDashboard,
-  Search,
-  TrendingUp,
   Settings,
   LineChart,
   History,
@@ -16,7 +14,6 @@ export interface NavItem {
   href: string;
   label: string;
   icon: LucideIcon;
-  badge?: "active" | "watching";
 }
 
 export interface NavSection {
@@ -32,8 +29,6 @@ export const primaryNavSections: NavSection[] = [
   {
     title: "Trading",
     items: [
-      { href: "/discover", label: "Discover", icon: Search },
-      { href: "/trading", label: "Trading", icon: TrendingUp, badge: "active" },
       { href: "/markets", label: "Markets", icon: BarChart2 },
       { href: "/signals", label: "Quant Signals", icon: Zap },
       { href: "/activity", label: "Activity", icon: Activity },

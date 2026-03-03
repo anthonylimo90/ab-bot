@@ -108,19 +108,6 @@ export const queryKeys = {
       [...queryKeys.optimizer.all, "status", workspaceId] as const,
   },
 
-  // Allocations
-  allocations: {
-    all: () => ["allocations"] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.allocations.all(), "workspace", workspaceId] as const,
-    list: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), "list"] as const,
-    active: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), "active"] as const,
-    bench: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), "bench"] as const,
-  },
-
   // Risk monitoring
   risk: {
     all: () => ["risk"] as const,
