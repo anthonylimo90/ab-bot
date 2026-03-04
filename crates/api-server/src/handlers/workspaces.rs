@@ -1898,20 +1898,18 @@ fn opportunity_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> 
 /// Returns (min, max, max_step_pct) bounds for arb executor dynamic config keys.
 fn arb_executor_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> {
     match key {
-        // $10 – $500, 20% step
-        KEY_ARB_POSITION_SIZE => Some((
-            Decimal::new(10, 0),
-            Decimal::new(500, 0),
-            Decimal::new(20, 2),
-        )),
+        // $5 – $25, 20% step (small wallet)
+        KEY_ARB_POSITION_SIZE => {
+            Some((Decimal::new(5, 0), Decimal::new(25, 0), Decimal::new(20, 2)))
+        }
         // 0.0005 – 0.05, 15% step
         KEY_ARB_MIN_NET_PROFIT => {
             Some((Decimal::new(5, 4), Decimal::new(5, 2), Decimal::new(15, 2)))
         }
-        // $25 – $1,000, 20% step
+        // $10 – $200, 20% step (small wallet)
         KEY_ARB_MIN_BOOK_DEPTH => Some((
-            Decimal::new(25, 0),
-            Decimal::new(1000, 0),
+            Decimal::new(10, 0),
+            Decimal::new(200, 0),
             Decimal::new(20, 2),
         )),
         // 5s – 300s, 25% step

@@ -875,9 +875,9 @@ impl DynamicTuner {
             // ── Arb executor tuning knobs ──
             ConfigSeed {
                 key: KEY_ARB_POSITION_SIZE,
-                default_value: env_decimal("ARB_POSITION_SIZE", Decimal::new(50, 0)),
-                min_value: Decimal::new(10, 0),  // $10 floor
-                max_value: Decimal::new(500, 0), // $500 ceiling
+                default_value: env_decimal("ARB_POSITION_SIZE", Decimal::new(10, 0)),
+                min_value: Decimal::new(5, 0),  // $5 floor
+                max_value: Decimal::new(25, 0), // $25 ceiling (small wallet)
                 max_step_pct: Decimal::new(20, 2),
             },
             ConfigSeed {
@@ -889,9 +889,9 @@ impl DynamicTuner {
             },
             ConfigSeed {
                 key: KEY_ARB_MIN_BOOK_DEPTH,
-                default_value: env_decimal("ARB_MIN_BOOK_DEPTH", Decimal::new(100, 0)),
-                min_value: Decimal::new(25, 0),   // $25 floor
-                max_value: Decimal::new(1000, 0), // $1,000 ceiling
+                default_value: env_decimal("ARB_MIN_BOOK_DEPTH", Decimal::new(25, 0)),
+                min_value: Decimal::new(10, 0),  // $10 floor
+                max_value: Decimal::new(200, 0), // $200 ceiling (small wallet)
                 max_step_pct: Decimal::new(20, 2),
             },
             ConfigSeed {
