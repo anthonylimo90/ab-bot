@@ -27,4 +27,4 @@ ALTER TABLE workspaces DROP COLUMN IF EXISTS last_optimization_at;
 
 -- Delete copy-trading dynamic config rows
 DELETE FROM dynamic_config WHERE key LIKE 'COPY_%';
-DELETE FROM dynamic_config_history WHERE key LIKE 'COPY_%';
+DELETE FROM dynamic_config_history WHERE config_key LIKE 'COPY_%';
