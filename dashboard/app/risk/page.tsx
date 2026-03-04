@@ -1,7 +1,5 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -27,11 +25,12 @@ import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import {
   useRiskStatusQuery,
+  useDynamicTunerQuery,
+  useServiceStatusQuery,
   useManualTripMutation,
   useResetCircuitBreakerMutation,
 } from "@/hooks/queries/useRiskQuery";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { api } from "@/lib/api";
 import { formatCurrency, formatPercent, cn } from "@/lib/utils";
 import {
   ShieldAlert,
@@ -39,7 +38,6 @@ import {
   ShieldOff,
   Activity,
   Zap,
-  Clock,
   AlertTriangle,
 } from "lucide-react";
 import type { TripReason, ServiceStatusItem } from "@/types/api";
@@ -61,17 +59,6 @@ function formatTimeRemaining(resumeAt: string): string {
   const hrs = Math.floor(mins / 60);
   const remMins = mins % 60;
   return `${hrs}h ${remMins}m`;
-}
-
-function formatRelativeTime(dateStr: string): string {
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
 }
 
 function ServicePill({
@@ -119,39 +106,18 @@ export default function RiskPage() {
   const workspaceId = currentWorkspace?.id;
 
   const { data: riskStatus, isLoading, error } = useRiskStatusQuery(workspaceId);
-
-  const { data: serviceStatus } = useQuery({
-    queryKey: ["service-status", workspaceId],
-    queryFn: () => api.getServiceStatus(workspaceId!),
-    enabled: Boolean(workspaceId),
-    refetchInterval: 30000,
-    staleTime: 15000,
-  });
-  const { data: dynamicTunerStatus } = useQuery({
-    queryKey: ["dynamic-tuner-status", workspaceId],
-    queryFn: () => api.getDynamicTunerStatus(workspaceId!),
-    enabled: Boolean(workspaceId),
-    refetchInterval: 30000,
-    staleTime: 15000,
-  });
+  const { data: serviceStatus } = useServiceStatusQuery(workspaceId);
+  const { data: dynamicTunerStatus } = useDynamicTunerQuery(workspaceId);
 
   const tripMutation = useManualTripMutation(workspaceId);
   const resetMutation = useResetCircuitBreakerMutation(workspaceId);
 
   const cb = riskStatus?.circuit_breaker;
-  const sl = riskStatus?.stop_loss;
 
   const drawdownPct =
     cb && cb.peak_value > 0
       ? ((cb.peak_value - cb.current_value) / cb.peak_value) * 100
       : 0;
-  const arbMonitorCap = useMemo(
-    () =>
-      dynamicTunerStatus?.dynamic_config.find(
-        (item) => item.key === "ARB_MONITOR_MAX_MARKETS",
-      )?.current_value,
-    [dynamicTunerStatus],
-  );
 
   return (
     <ErrorBoundary>
@@ -354,102 +320,6 @@ export default function RiskPage() {
           </div>
         )}
 
-        {/* Stop-Loss Section */}
-        {sl && (
-          <div className="grid gap-6 lg:grid-cols-2">
-            {/* Stats */}
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="flex items-center gap-2 text-base">
-                  <Zap className="h-4 w-4" />
-                  Stop-Loss Rules
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <p className="text-sm text-muted-foreground">Active</p>
-                    <p className="text-2xl font-bold tabular-nums">
-                      {sl.active_rules}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-sm text-muted-foreground">Executed</p>
-                    <p className="text-2xl font-bold tabular-nums">
-                      {sl.executed_rules}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {sl.fixed_stops > 0 && (
-                    <Badge variant="secondary">
-                      Fixed: {sl.fixed_stops}
-                    </Badge>
-                  )}
-                  {sl.percentage_stops > 0 && (
-                    <Badge variant="secondary">
-                      Percentage: {sl.percentage_stops}
-                    </Badge>
-                  )}
-                  {sl.trailing_stops > 0 && (
-                    <Badge variant="secondary">
-                      Trailing: {sl.trailing_stops}
-                    </Badge>
-                  )}
-                  {sl.time_based_stops > 0 && (
-                    <Badge variant="secondary">
-                      Time-Based: {sl.time_based_stops}
-                    </Badge>
-                  )}
-                  {sl.total_rules === 0 && (
-                    <p className="text-sm text-muted-foreground">
-                      No stop-loss rules configured
-                    </p>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Recent Executions */}
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="flex items-center gap-2 text-base">
-                  <Clock className="h-4 w-4" />
-                  Recent Executions
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                {sl.recent_executions.length === 0 ? (
-                  <p className="text-sm text-muted-foreground py-4 text-center">
-                    No stop-loss executions yet
-                  </p>
-                ) : (
-                  <div className="space-y-2">
-                    {sl.recent_executions.map((exec) => (
-                      <div
-                        key={exec.id}
-                        className="flex flex-col gap-2 rounded-lg border px-3 py-2 sm:flex-row sm:items-center sm:justify-between"
-                      >
-                        <div className="flex min-w-0 items-center gap-2">
-                          <Badge variant="outline" className="text-xs">
-                            {exec.stop_type}
-                          </Badge>
-                          <span className="max-w-[160px] truncate text-sm font-mono text-muted-foreground">
-                            {exec.market_id}
-                          </span>
-                        </div>
-                        <span className="text-xs text-muted-foreground whitespace-nowrap">
-                          {formatRelativeTime(exec.executed_at)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-        )}
-
         {/* Signal Quality Thresholds */}
         <Card>
           <CardHeader className="pb-3">
@@ -510,72 +380,6 @@ export default function RiskPage() {
             </div>
           </CardContent>
         </Card>
-
-        {/* Dynamic Tuner */}
-        {dynamicTunerStatus && (
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Zap className="h-4 w-4" />
-                Dynamic Tuner
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="flex flex-wrap gap-2">
-                <Badge variant={dynamicTunerStatus.enabled ? "default" : "secondary"}>
-                  {dynamicTunerStatus.enabled ? "Enabled" : "Disabled"}
-                </Badge>
-                <Badge variant="outline">
-                  {dynamicTunerStatus.mode === "apply" ? "Apply mode" : "Shadow mode"}
-                </Badge>
-                <Badge variant="outline">
-                  Regime: {dynamicTunerStatus.current_regime}
-                </Badge>
-                <Badge variant={dynamicTunerStatus.frozen ? "destructive" : "secondary"}>
-                  {dynamicTunerStatus.frozen ? "Frozen" : "Active"}
-                </Badge>
-                {arbMonitorCap !== undefined && (
-                  <Badge variant="outline">
-                    Market cap: {Math.round(arbMonitorCap)}
-                  </Badge>
-                )}
-              </div>
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="rounded-lg border p-3">
-                  <p className="text-xs text-muted-foreground">Last run</p>
-                  <p className="text-sm font-medium">
-                    {dynamicTunerStatus.last_run_at
-                      ? `${new Date(dynamicTunerStatus.last_run_at).toLocaleString()} (${formatRelativeTime(dynamicTunerStatus.last_run_at)})`
-                      : "Not recorded"}
-                  </p>
-                  {dynamicTunerStatus.last_run_status && (
-                    <p className="text-xs text-muted-foreground">
-                      Status: {dynamicTunerStatus.last_run_status}
-                    </p>
-                  )}
-                </div>
-                <div className="rounded-lg border p-3">
-                  <p className="text-xs text-muted-foreground">Last change</p>
-                  <p className="text-sm font-medium">
-                    {dynamicTunerStatus.last_change_at
-                      ? `${new Date(dynamicTunerStatus.last_change_at).toLocaleString()} (${formatRelativeTime(dynamicTunerStatus.last_change_at)})`
-                      : "No dynamic change yet"}
-                  </p>
-                  {dynamicTunerStatus.last_change_key && (
-                    <p className="text-xs text-muted-foreground">
-                      {dynamicTunerStatus.last_change_action}: {dynamicTunerStatus.last_change_key}
-                    </p>
-                  )}
-                </div>
-              </div>
-              {dynamicTunerStatus.freeze_reason && (
-                <p className="text-xs text-loss">
-                  Freeze reason: {dynamicTunerStatus.freeze_reason}
-                </p>
-              )}
-            </CardContent>
-          </Card>
-        )}
 
         {/* Service Health */}
         {serviceStatus && (
