@@ -1,13 +1,14 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useRecentSignalsQuery } from "@/hooks/queries/useSignalsQuery";
 import { formatTimeAgo, cn } from "@/lib/utils";
-import { ArrowUp, ArrowDown } from "lucide-react";
+import { ArrowUp, ArrowDown, ChevronDown, ChevronRight } from "lucide-react";
 
 type KindFilter = "all" | "flow" | "cross_market" | "mean_reversion" | "resolution_proximity";
 
@@ -32,8 +33,13 @@ const STATUS_STYLES: Record<string, string> = {
   expired: "bg-red-500/10 text-red-600 border-red-500/20",
 };
 
-export function RecentSignalsFeed() {
+interface RecentSignalsFeedProps {
+  onConditionClick?: (conditionId: string) => void;
+}
+
+export function RecentSignalsFeed({ onConditionClick }: RecentSignalsFeedProps) {
   const [kindFilter, setKindFilter] = useState<KindFilter>("all");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const queryKind = kindFilter === "all" ? undefined : kindFilter;
   const { data: signals = [], isLoading } = useRecentSignalsQuery({
     kind: queryKind,
@@ -83,93 +89,186 @@ export function RecentSignalsFeed() {
               const statusStyle =
                 STATUS_STYLES[signal.execution_status || "pending"] ||
                 STATUS_STYLES.pending;
+              const isExpanded = expandedId === signal.id;
 
               return (
-                <div
-                  key={signal.id}
-                  className="flex items-center gap-3 p-3 rounded-lg border hover:bg-muted/30 transition-colors"
-                >
-                  {/* Direction arrow */}
+                <div key={signal.id}>
                   <div
-                    className={cn(
-                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
-                      isBuyYes
-                        ? "bg-green-500/10 text-green-600"
-                        : "bg-red-500/10 text-red-600",
-                    )}
+                    className="flex items-center gap-3 p-3 rounded-lg border hover:bg-muted/30 transition-colors cursor-pointer"
+                    onClick={() =>
+                      setExpandedId(isExpanded ? null : signal.id)
+                    }
                   >
-                    {isBuyYes ? (
-                      <ArrowUp className="h-4 w-4" />
-                    ) : (
-                      <ArrowDown className="h-4 w-4" />
-                    )}
-                  </div>
-
-                  {/* Signal info */}
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <Badge
-                        variant="outline"
-                        className={cn("text-xs", kindStyle)}
-                      >
-                        {KIND_LABELS[signal.kind] || signal.kind}
-                      </Badge>
-                      <span
-                        className={cn(
-                          "text-xs font-medium",
-                          isBuyYes ? "text-green-600" : "text-red-600",
-                        )}
-                      >
-                        {signal.direction}
-                      </span>
-                      {signal.execution_status && (
-                        <Badge
-                          variant="outline"
-                          className={cn("text-xs", statusStyle)}
-                        >
-                          {signal.execution_status}
-                        </Badge>
+                    {/* Expand indicator */}
+                    <div className="shrink-0 text-muted-foreground">
+                      {isExpanded ? (
+                        <ChevronDown className="h-3 w-3" />
+                      ) : (
+                        <ChevronRight className="h-3 w-3" />
                       )}
                     </div>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <span className="truncate max-w-[140px]" title={signal.condition_id}>
-                        {signal.condition_id.slice(0, 8)}...
-                      </span>
-                      <span>{formatTimeAgo(signal.generated_at)}</span>
-                      {signal.skip_reason && (
-                        <span className="text-amber-600" title={signal.skip_reason}>
-                          skip: {signal.skip_reason}
+
+                    {/* Direction arrow */}
+                    <div
+                      className={cn(
+                        "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
+                        isBuyYes
+                          ? "bg-green-500/10 text-green-600"
+                          : "bg-red-500/10 text-red-600",
+                      )}
+                    >
+                      {isBuyYes ? (
+                        <ArrowUp className="h-4 w-4" />
+                      ) : (
+                        <ArrowDown className="h-4 w-4" />
+                      )}
+                    </div>
+
+                    {/* Signal info */}
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Badge
+                          variant="outline"
+                          className={cn("text-xs", kindStyle)}
+                        >
+                          {KIND_LABELS[signal.kind] || signal.kind}
+                        </Badge>
+                        <span
+                          className={cn(
+                            "text-xs font-medium",
+                            isBuyYes ? "text-green-600" : "text-red-600",
+                          )}
+                        >
+                          {signal.direction}
+                        </span>
+                        {signal.execution_status && (
+                          <Badge
+                            variant="outline"
+                            className={cn("text-xs", statusStyle)}
+                          >
+                            {signal.execution_status}
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <span className="truncate max-w-[140px]" title={signal.condition_id}>
+                          {signal.condition_id.slice(0, 8)}...
+                        </span>
+                        <span>{formatTimeAgo(signal.generated_at)}</span>
+                        {signal.skip_reason && (
+                          <span className="text-amber-600" title={signal.skip_reason}>
+                            skip: {signal.skip_reason}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Confidence + size */}
+                    <div className="shrink-0 text-right space-y-1">
+                      <div className="flex items-center gap-1.5">
+                        <div className="w-16 h-1.5 rounded-full bg-muted overflow-hidden">
+                          <div
+                            className={cn(
+                              "h-full rounded-full",
+                              signal.confidence >= 0.7
+                                ? "bg-green-500"
+                                : signal.confidence >= 0.5
+                                  ? "bg-yellow-500"
+                                  : "bg-red-500",
+                            )}
+                            style={{ width: `${signal.confidence * 100}%` }}
+                          />
+                        </div>
+                        <span className="text-xs tabular-nums font-medium w-8">
+                          {(signal.confidence * 100).toFixed(0)}%
+                        </span>
+                      </div>
+                      {signal.size_usd != null && (
+                        <span className="text-xs tabular-nums text-muted-foreground">
+                          ${signal.size_usd.toFixed(2)}
                         </span>
                       )}
                     </div>
                   </div>
 
-                  {/* Confidence + size */}
-                  <div className="shrink-0 text-right space-y-1">
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-16 h-1.5 rounded-full bg-muted overflow-hidden">
-                        <div
-                          className={cn(
-                            "h-full rounded-full",
-                            signal.confidence >= 0.7
-                              ? "bg-green-500"
-                              : signal.confidence >= 0.5
-                                ? "bg-yellow-500"
-                                : "bg-red-500",
+                  {/* Expanded metadata panel */}
+                  {isExpanded && (
+                    <div className="ml-6 mr-3 mb-1 mt-1 rounded-lg border bg-muted/20 p-3 space-y-3">
+                      <div className="grid grid-cols-2 gap-3 text-xs">
+                        {/* Condition ID */}
+                        <div>
+                          <span className="text-muted-foreground">Condition ID</span>
+                          <p
+                            className={cn(
+                              "font-mono mt-0.5 truncate",
+                              onConditionClick && "text-blue-600 cursor-pointer hover:underline",
+                            )}
+                            title={signal.condition_id}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onConditionClick?.(signal.condition_id);
+                            }}
+                          >
+                            {signal.condition_id}
+                          </p>
+                        </div>
+
+                        {/* Position ID */}
+                        <div>
+                          <span className="text-muted-foreground">Position</span>
+                          {signal.position_id ? (
+                            <Link
+                              href="/positions"
+                              className="block font-mono mt-0.5 text-blue-600 hover:underline truncate"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {signal.position_id.slice(0, 12)}...
+                            </Link>
+                          ) : (
+                            <p className="mt-0.5 text-muted-foreground">-</p>
                           )}
-                          style={{ width: `${signal.confidence * 100}%` }}
-                        />
+                        </div>
+
+                        {/* Skip reason */}
+                        {signal.skip_reason && (
+                          <div className="col-span-2">
+                            <span className="text-muted-foreground">Skip Reason</span>
+                            <p className="mt-0.5 text-amber-600">
+                              {signal.skip_reason}
+                            </p>
+                          </div>
+                        )}
                       </div>
-                      <span className="text-xs tabular-nums font-medium w-8">
-                        {(signal.confidence * 100).toFixed(0)}%
-                      </span>
+
+                      {/* Metadata key-value grid */}
+                      {Object.keys(signal.metadata).length > 0 && (
+                        <div>
+                          <span className="text-xs text-muted-foreground mb-1 block">
+                            Metadata
+                          </span>
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1">
+                            {Object.entries(signal.metadata).map(
+                              ([key, value]) => (
+                                <div
+                                  key={key}
+                                  className="flex justify-between text-xs gap-1"
+                                >
+                                  <span className="text-muted-foreground truncate">
+                                    {key}
+                                  </span>
+                                  <span className="font-mono tabular-nums">
+                                    {typeof value === "number"
+                                      ? value.toFixed(4)
+                                      : String(value)}
+                                  </span>
+                                </div>
+                              ),
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    {signal.size_usd != null && (
-                      <span className="text-xs tabular-nums text-muted-foreground">
-                        ${signal.size_usd.toFixed(2)}
-                      </span>
-                    )}
-                  </div>
+                  )}
                 </div>
               );
             })}

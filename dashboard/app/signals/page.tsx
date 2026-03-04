@@ -1,12 +1,17 @@
 "use client";
 
+import { useState } from "react";
 import { StrategyPerformanceTable } from "@/components/signals/StrategyPerformanceTable";
 import { RecentSignalsFeed } from "@/components/signals/RecentSignalsFeed";
 import { FlowFeaturesChart } from "@/components/signals/FlowFeaturesChart";
+import { SignalFunnel } from "@/components/signals/SignalFunnel";
+import { SkipReasonChart } from "@/components/signals/SkipReasonChart";
 import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
 import { Zap } from "lucide-react";
 
 export default function SignalsPage() {
+  const [activeConditionId, setActiveConditionId] = useState<string | undefined>();
+
   return (
     <div className="space-y-5 sm:space-y-6 p-6">
       {/* Header */}
@@ -26,13 +31,17 @@ export default function SignalsPage() {
       {/* Strategy Performance — full width */}
       <StrategyPerformanceTable />
 
-      {/* Two-column: Recent Signals + Flow Features */}
+      {/* Signal Funnel — full width */}
+      <SignalFunnel />
+
+      {/* Two-column: Recent Signals + Flow Features / Skip Reasons */}
       <div className="grid gap-4 sm:gap-6 lg:grid-cols-5">
         <div className="lg:col-span-3">
-          <RecentSignalsFeed />
+          <RecentSignalsFeed onConditionClick={setActiveConditionId} />
         </div>
-        <div className="lg:col-span-2">
-          <FlowFeaturesChart />
+        <div className="lg:col-span-2 space-y-4 sm:space-y-6">
+          <FlowFeaturesChart initialConditionId={activeConditionId} />
+          <SkipReasonChart />
         </div>
       </div>
     </div>
