@@ -7,7 +7,6 @@ import type { Activity, DynamicConfigHistoryEntry } from "@/types/api";
 
 export interface HistoryFilters {
   outcome?: "yes" | "no";
-  copyTradesOnly?: boolean;
   market?: string;
   limit?: number;
   offset?: number;
@@ -24,7 +23,6 @@ export function useClosedPositionsQuery(filters?: HistoryFilters) {
       api.getPositions({
         status: "closed",
         outcome: filters?.outcome,
-        copy_trades_only: filters?.copyTradesOnly,
         market_id: filters?.market,
         limit: filters?.limit ?? 50,
         offset: filters?.offset ?? 0,

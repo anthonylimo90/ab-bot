@@ -6,12 +6,10 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { useActivity } from "@/hooks/useActivity";
-import { formatTimeAgo, cn, formatSkipReason } from "@/lib/utils";
+import { formatTimeAgo, cn } from "@/lib/utils";
 import {
   Zap,
-  Copy,
   TrendingDown,
-  AlertCircle,
   Activity,
   XCircle,
   DollarSign,
@@ -21,12 +19,10 @@ import {
 import type { ActivityType } from "@/types/api";
 
 const activityIcons: Record<string, React.ReactNode> = {
-  TRADE_COPIED: <Copy className="h-4 w-4 text-blue-500" />,
-  TRADE_COPY_SKIPPED: <AlertCircle className="h-4 w-4 text-yellow-500" />,
-  TRADE_COPY_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
+  POSITION_OPENED: <DollarSign className="h-4 w-4 text-profit" />,
+  POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
   STOP_LOSS_TRIGGERED: <TrendingDown className="h-4 w-4 text-loss" />,
   TAKE_PROFIT_TRIGGERED: <CheckCircle2 className="h-4 w-4 text-profit" />,
-  RECOMMENDATION_NEW: <Activity className="h-4 w-4 text-purple-500" />,
   ARBITRAGE_DETECTED: <Zap className="h-4 w-4 text-yellow-500" />,
   ARB_POSITION_OPENED: <DollarSign className="h-4 w-4 text-profit" />,
   ARB_POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
@@ -34,11 +30,10 @@ const activityIcons: Record<string, React.ReactNode> = {
   ARB_EXIT_FAILED: <ShieldAlert className="h-4 w-4 text-red-400" />,
 };
 
-type ActivityFilter = "all" | "CopyTrade" | "Arbitrage" | "StopLoss" | "Alert";
+type ActivityFilter = "all" | "Arbitrage" | "StopLoss";
 
 const FILTER_MAP: Record<ActivityFilter, ActivityType[] | null> = {
   all: null,
-  CopyTrade: ["TRADE_COPIED", "TRADE_COPY_SKIPPED", "TRADE_COPY_FAILED"],
   Arbitrage: [
     "ARBITRAGE_DETECTED",
     "ARB_POSITION_OPENED",
@@ -47,7 +42,6 @@ const FILTER_MAP: Record<ActivityFilter, ActivityType[] | null> = {
     "ARB_EXIT_FAILED",
   ],
   StopLoss: ["STOP_LOSS_TRIGGERED", "TAKE_PROFIT_TRIGGERED"],
-  Alert: ["RECOMMENDATION_NEW"],
 };
 
 export default function ActivityPage() {
@@ -84,10 +78,8 @@ export default function ActivityPage() {
         <div className="overflow-x-auto pb-1">
           <TabsList className="w-max min-w-full sm:w-auto">
             <TabsTrigger value="all">All</TabsTrigger>
-            <TabsTrigger value="CopyTrade">Copy Trade</TabsTrigger>
             <TabsTrigger value="Arbitrage">Arbitrage</TabsTrigger>
             <TabsTrigger value="StopLoss">Stop Loss</TabsTrigger>
-            <TabsTrigger value="Alert">Alert</TabsTrigger>
           </TabsList>
         </div>
 
@@ -128,14 +120,6 @@ export default function ActivityPage() {
                       </span>
                     </div>
                     <p className="text-sm break-words">{item.message}</p>
-                    {item.type === "TRADE_COPY_SKIPPED" && item.skip_reason && (
-                      <Badge
-                        variant="outline"
-                        className="text-xs bg-yellow-500/10 text-yellow-600 border-yellow-500/20 w-fit"
-                      >
-                        {formatSkipReason(item.skip_reason)}
-                      </Badge>
-                    )}
                   </div>
                   {item.pnl !== undefined && (
                     <span

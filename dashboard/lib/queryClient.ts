@@ -35,8 +35,6 @@ export const queryKeys = {
   // Wallets
   wallets: {
     all: () => ["wallets"] as const,
-    roster: () => [...queryKeys.wallets.all(), "roster"] as const,
-    bench: () => [...queryKeys.wallets.all(), "bench"] as const,
     detail: (address: string) =>
       [...queryKeys.wallets.all(), "detail", address] as const,
     metrics: (address: string) =>
@@ -53,72 +51,11 @@ export const queryKeys = {
       [...queryKeys.markets.all, "orderbook", id] as const,
   },
 
-  // Discovery
-  discover: {
-    all: () => ["discover"] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.discover.all(), "workspace", workspaceId] as const,
-    wallets: (filters?: unknown, workspaceId?: string) =>
-      [
-        ...(workspaceId
-          ? queryKeys.discover.byWorkspace(workspaceId)
-          : queryKeys.discover.all()),
-        "wallets",
-        filters,
-      ] as const,
-    leaderboard: (workspaceId?: string) =>
-      [
-        ...(workspaceId
-          ? queryKeys.discover.byWorkspace(workspaceId)
-          : queryKeys.discover.all()),
-        "leaderboard",
-      ] as const,
-    trades: (
-      params?: { wallet?: string; limit?: number; minValue?: number },
-      workspaceId?: string,
-    ) =>
-      [
-        ...(workspaceId
-          ? queryKeys.discover.byWorkspace(workspaceId)
-          : queryKeys.discover.all()),
-        "trades",
-        params,
-      ] as const,
-  },
-
-  // Portfolio
-  portfolio: {
-    all: () => ["portfolio"] as const,
-    stats: () => [...queryKeys.portfolio.all(), "stats"] as const,
-    history: (period: string) =>
-      [...queryKeys.portfolio.all(), "history", period] as const,
-  },
-
   // Backtest
   backtest: {
     all: ["backtest"] as const,
     results: () => [...queryKeys.backtest.all, "results"] as const,
     detail: (id: string) => [...queryKeys.backtest.all, "detail", id] as const,
-  },
-
-  // Optimizer
-  optimizer: {
-    all: ["optimizer"] as const,
-    status: (workspaceId: string) =>
-      [...queryKeys.optimizer.all, "status", workspaceId] as const,
-  },
-
-  // Allocations
-  allocations: {
-    all: () => ["allocations"] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.allocations.all(), "workspace", workspaceId] as const,
-    list: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), "list"] as const,
-    active: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), "active"] as const,
-    bench: (workspaceId: string) =>
-      [...queryKeys.allocations.byWorkspace(workspaceId), "bench"] as const,
   },
 
   // Risk monitoring
@@ -153,18 +90,5 @@ export const queryKeys = {
       [...queryKeys.signals.all(), "performance", periodDays] as const,
     metadata: (params?: { category?: string; active?: boolean; limit?: number }) =>
       [...queryKeys.signals.all(), "metadata", params] as const,
-  },
-
-  // Rotation history
-  rotationHistory: {
-    all: () => ["rotation-history"] as const,
-    byWorkspace: (workspaceId: string) =>
-      [...queryKeys.rotationHistory.all(), "workspace", workspaceId] as const,
-    list: (workspaceId: string, params?: { unacknowledgedOnly?: boolean }) =>
-      [
-        ...queryKeys.rotationHistory.byWorkspace(workspaceId),
-        "list",
-        params,
-      ] as const,
   },
 } as const;

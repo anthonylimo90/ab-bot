@@ -344,13 +344,8 @@ pub async fn discover_wallets(
 
             let mut wallets: Vec<DiscoveredWallet> = Vec::with_capacity(discovered.len());
             for (i, dw) in discovered.iter().enumerate() {
-                let is_tracked = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
-                )
-                .bind(dw.address.to_lowercase())
-                .fetch_one(&state.pool)
-                .await
-                .unwrap_or(false);
+                // TODO: tracked_wallets table has been dropped with the copy-trading system.
+                let is_tracked = false;
 
                 let strategy_type = strategy_map.get(&dw.address.to_lowercase()).cloned();
                 wallets.push(map_to_api_wallet(
@@ -528,13 +523,8 @@ pub async fn get_discovered_wallet(
         .await
     {
         Ok(Some(dw)) => {
-            let is_tracked = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM tracked_wallets WHERE LOWER(address) = $1)",
-            )
-            .bind(&address)
-            .fetch_one(&state.pool)
-            .await
-            .unwrap_or(false);
+            // TODO: tracked_wallets table has been dropped with the copy-trading system.
+            let is_tracked = false;
 
             let strategy_map =
                 fetch_strategy_types(&state.pool, std::slice::from_ref(&address)).await;
@@ -553,186 +543,3 @@ pub async fn get_discovered_wallet(
     }
 }
 
-/// Calibration bucket response for a probability range.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CalibrationBucketResponse {
-    /// Lower bound of the probability range (inclusive).
-    pub lower: f64,
-    /// Upper bound of the probability range (exclusive).
-    pub upper: f64,
-    /// Average predicted probability within this bucket.
-    pub avg_predicted: f64,
-    /// Observed success fraction (actual wins / total).
-    pub observed_rate: f64,
-    /// Number of predictions in this bucket.
-    pub count: usize,
-    /// Calibration gap: |avg_predicted - observed_rate|.
-    pub gap: f64,
-}
-
-/// Full calibration report for prediction reliability.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CalibrationReportResponse {
-    /// Per-bucket calibration statistics.
-    pub buckets: Vec<CalibrationBucketResponse>,
-    /// Expected Calibration Error (lower is better).
-    pub ece: f64,
-    /// Total predictions evaluated.
-    pub total_predictions: usize,
-    /// Recommended threshold based on calibration data.
-    pub recommended_threshold: f64,
-}
-
-/// Get the prediction calibration report.
-///
-/// Shows how well the ensemble predictions match actual copy trade outcomes,
-/// bucketed by probability range. Used to display a reliability diagram.
-#[utoipa::path(
-    get,
-    path = "/api/v1/discover/calibration",
-    tag = "discover",
-    responses(
-        (status = 200, description = "Calibration report", body = CalibrationReportResponse),
-        (status = 500, description = "Internal error")
-    )
-)]
-pub async fn get_calibration_report(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<CalibrationReportResponse>> {
-    let calibrator = wallet_tracker::PredictionCalibrator::new(state.pool.clone());
-
-    match calibrator.calibrate().await {
-        Ok(report) => {
-            let buckets = report
-                .buckets
-                .into_iter()
-                .map(|b| CalibrationBucketResponse {
-                    lower: b.lower,
-                    upper: b.upper,
-                    avg_predicted: b.avg_predicted,
-                    observed_rate: b.observed_rate,
-                    count: b.count,
-                    gap: b.gap,
-                })
-                .collect();
-
-            Ok(Json(CalibrationReportResponse {
-                buckets,
-                ece: report.ece,
-                total_predictions: report.total_predictions,
-                recommended_threshold: report.recommended_threshold,
-            }))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to generate calibration report");
-            Err(ApiError::Internal(
-                "Failed to generate calibration report".into(),
-            ))
-        }
-    }
-}
-
-/// Copy trade performance for a specific wallet.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CopyPerformanceResponse {
-    /// Wallet address.
-    pub address: String,
-    /// Reported win rate from wallet metrics (0-100).
-    pub reported_win_rate: f64,
-    /// Actual win rate from copy trade outcomes (0-100).
-    pub copy_win_rate: Option<f64>,
-    /// Number of copy trades executed for this wallet.
-    pub copy_trade_count: i64,
-    /// Total PnL from copy trades.
-    pub copy_total_pnl: f64,
-    /// Divergence: |reported - copy| in percentage points (null if no data).
-    pub divergence_pp: Option<f64>,
-    /// Whether there's a significant divergence (>15pp).
-    pub has_significant_divergence: bool,
-}
-
-/// Get copy trade performance for a wallet.
-///
-/// Compares the wallet's reported win rate against actual copy trade outcomes,
-/// identifying any divergence between on-paper and actual performance.
-#[utoipa::path(
-    get,
-    path = "/api/v1/discover/wallets/{address}/copy-performance",
-    tag = "discover",
-    params(
-        ("address" = String, Path, description = "Wallet address")
-    ),
-    responses(
-        (status = 200, description = "Copy performance comparison", body = CopyPerformanceResponse),
-        (status = 404, description = "Wallet not found")
-    )
-)]
-pub async fn get_copy_performance(
-    State(state): State<Arc<AppState>>,
-    Path(address): Path<String>,
-) -> ApiResult<Json<CopyPerformanceResponse>> {
-    let address = address.to_lowercase();
-
-    // Get the reported win rate from wallet metrics
-    let reported = sqlx::query_as::<_, (f64,)>(
-        r#"
-        SELECT COALESCE(win_rate_30d, 0)::FLOAT8
-        FROM wallet_success_metrics
-        WHERE LOWER(address) = $1
-        ORDER BY calculated_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(&address)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::warn!(error = %e, "Failed to query wallet metrics");
-        ApiError::Internal("Failed to query wallet metrics".into())
-    })?;
-
-    let reported_win_rate = reported.map(|r| r.0 * 100.0).unwrap_or(0.0);
-
-    // Get actual copy trade performance
-    let copy_stats = sqlx::query_as::<_, (i64, f64, f64)>(
-        r#"
-        SELECT
-            COUNT(*)::INT8 AS trade_count,
-            COALESCE(SUM(pnl), 0)::FLOAT8 AS total_pnl,
-            CASE WHEN COUNT(*) > 0
-                THEN (COUNT(CASE WHEN pnl > 0 THEN 1 END)::FLOAT8 / COUNT(*)::FLOAT8) * 100.0
-                ELSE 0
-            END AS copy_win_rate
-        FROM copy_trade_history
-        WHERE LOWER(source_wallet) = $1
-        "#,
-    )
-    .bind(&address)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        tracing::warn!(error = %e, "Failed to query copy trade history");
-        ApiError::Internal("Failed to query copy trade performance".into())
-    })?;
-
-    let (copy_trade_count, copy_total_pnl, copy_wr) = copy_stats.unwrap_or((0, 0.0, 0.0));
-
-    let copy_win_rate = if copy_trade_count > 0 {
-        Some(copy_wr)
-    } else {
-        None
-    };
-
-    let divergence_pp = copy_win_rate.map(|cwr| (reported_win_rate - cwr).abs());
-    let has_significant_divergence = divergence_pp.is_some_and(|d| d > 15.0);
-
-    Ok(Json(CopyPerformanceResponse {
-        address,
-        reported_win_rate,
-        copy_win_rate,
-        copy_trade_count,
-        copy_total_pnl,
-        divergence_pp,
-        has_significant_divergence,
-    }))
-}

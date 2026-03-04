@@ -1,4 +1,4 @@
-//! Activity feed handler — serves persisted copy trade history as activity items.
+//! Activity feed handler — serves recent execution reports as activity items.
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -46,21 +46,19 @@ fn default_limit() -> i64 {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct ActivityRow {
+struct ExecutionReportRow {
     id: Uuid,
+    market_id: String,
+    side: i16,
     status: i16,
-    source_wallet: String,
-    source_market_id: String,
-    source_direction: i16,
-    copy_price: Option<Decimal>,
-    copy_quantity: Option<Decimal>,
-    slippage: Option<Decimal>,
-    skip_reason: Option<String>,
+    filled_quantity: Decimal,
+    average_price: Decimal,
     error_message: Option<String>,
-    created_at: DateTime<Utc>,
+    source: i16,
+    executed_at: DateTime<Utc>,
 }
 
-/// List recent activity from copy trade history.
+/// List recent activity from execution reports.
 #[utoipa::path(
     get,
     path = "/api/v1/activity",
@@ -75,110 +73,89 @@ pub async fn list_activity(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ActivityQuery>,
 ) -> ApiResult<Json<Vec<ActivityResponse>>> {
-    let rows: Vec<ActivityRow> = sqlx::query_as(
+    // TODO: copy_trade_history has been dropped; activity is now sourced from execution_reports.
+    let rows: Vec<ExecutionReportRow> = sqlx::query_as(
         r#"
         SELECT
-            id, status, source_wallet, source_market_id,
-            source_direction, copy_price, copy_quantity,
-            slippage, skip_reason, error_message, created_at
-        FROM copy_trade_history
-        ORDER BY created_at DESC
+            id, market_id, side, status, filled_quantity,
+            average_price, error_message, source, executed_at
+        FROM execution_reports
+        ORDER BY executed_at DESC
         LIMIT $1 OFFSET $2
         "#,
     )
     .bind(query.limit)
     .bind(query.offset)
     .fetch_all(&state.pool)
-    .await?;
+    .await
+    .unwrap_or_default();
 
     let activities: Vec<ActivityResponse> = rows
         .into_iter()
         .map(|row| {
-            let direction = if row.source_direction == 0 {
-                "buy"
-            } else {
-                "sell"
-            };
-            let skip_reason = row.skip_reason.clone();
+            let direction = if row.side == 0 { "buy" } else { "sell" };
             let error_message = row.error_message.clone();
-            let market_short = if row.source_market_id.len() > 20 {
-                format!("{}...", &row.source_market_id[..20])
+            let market_short = if row.market_id.len() > 20 {
+                format!("{}...", &row.market_id[..20])
             } else {
-                row.source_market_id.clone()
+                row.market_id.clone()
+            };
+
+            let source_label = match row.source {
+                1 => "arbitrage",
+                2 => "legacy",
+                3 => "stop_loss",
+                _ => "manual",
             };
 
             let (activity_type, message) = match row.status {
-                1 => {
-                    let qty = row.copy_quantity.map(|q| q.to_string()).unwrap_or_default();
-                    let price = row
-                        .copy_price
-                        .map(|p| format!("@ ${}", p))
-                        .unwrap_or_default();
-                    (
-                        "TRADE_COPIED".to_string(),
-                        format!(
-                            "Copied {} {} {qty} {price} from {}",
-                            direction,
-                            market_short,
-                            &row.source_wallet[..8.min(row.source_wallet.len())]
-                        ),
-                    )
-                }
+                // filled
                 3 => (
-                    "TRADE_COPY_SKIPPED".to_string(),
+                    "TRADE_EXECUTED".to_string(),
                     format!(
-                        "Skipped {} {} from {}{}",
+                        "Executed {} {} qty={} @ ${} ({})",
                         direction,
                         market_short,
-                        &row.source_wallet[..8.min(row.source_wallet.len())],
-                        skip_reason
-                            .as_ref()
-                            .map(|reason| format!(" ({reason})"))
-                            .unwrap_or_default()
+                        row.filled_quantity,
+                        row.average_price,
+                        source_label,
                     ),
                 ),
-                4 => (
-                    "TRADE_COPY_FAILED".to_string(),
+                // cancelled / rejected / expired
+                4..=6 => (
+                    "TRADE_FAILED".to_string(),
                     format!(
-                        "Failed {} {} from {}{}",
+                        "Failed {} {}{}",
                         direction,
                         market_short,
-                        &row.source_wallet[..8.min(row.source_wallet.len())],
                         error_message
                             .as_ref()
-                            .map(|reason| format!(": {reason}"))
-                            .unwrap_or_default()
+                            .map(|e| format!(": {e}"))
+                            .unwrap_or_default(),
                     ),
                 ),
                 _ => (
-                    "TRADE_COPIED".to_string(),
-                    format!(
-                        "Trade {} {} from {}",
-                        direction,
-                        market_short,
-                        &row.source_wallet[..8.min(row.source_wallet.len())]
-                    ),
+                    "TRADE_PENDING".to_string(),
+                    format!("Pending {} {}", direction, market_short),
                 ),
             };
 
-            let pnl = row.slippage.filter(|s| *s != Decimal::ZERO);
             let details = Some(serde_json::json!({
-                "source_wallet": row.source_wallet,
-                "source_market_id": row.source_market_id,
+                "market_id": row.market_id,
                 "direction": direction,
-                "skip_reason": skip_reason.clone(),
-                "error_message": error_message.clone(),
+                "source": source_label,
+                "status": row.status,
             }));
 
             ActivityResponse {
                 id: row.id.to_string(),
                 activity_type,
                 message,
-                skip_reason,
+                skip_reason: None,
                 error_message,
                 details,
-                pnl,
-                created_at: row.created_at,
+                pnl: None,
+                created_at: row.executed_at,
             }
         })
         .collect();

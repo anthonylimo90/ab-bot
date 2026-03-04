@@ -1,4 +1,4 @@
-//! Dynamic runtime tuning for copy-trading and arbitrage thresholds.
+//! Dynamic runtime tuning for arbitrage and quant signal thresholds.
 //!
 //! The tuner senses execution quality + market conditions every few minutes,
 //! computes bounded targets, applies gradual updates, and broadcasts config
@@ -12,7 +12,6 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration as TokioDuration};
@@ -20,26 +19,15 @@ use tracing::{error, info, warn};
 use wallet_tracker::MarketRegime;
 
 use risk_manager::circuit_breaker::CircuitBreaker;
-use trading_engine::copy_trader::CopyTrader;
 
-const KEY_COPY_MIN_TRADE_VALUE: &str = "COPY_MIN_TRADE_VALUE";
-const KEY_COPY_MAX_SLIPPAGE_PCT: &str = "COPY_MAX_SLIPPAGE_PCT";
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
 const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
 const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
-const KEY_COPY_MAX_LATENCY_SECS: &str = "COPY_MAX_LATENCY_SECS";
-const KEY_COPY_DAILY_CAPITAL_LIMIT: &str = "COPY_DAILY_CAPITAL_LIMIT";
-const KEY_COPY_MAX_OPEN_POSITIONS: &str = "COPY_MAX_OPEN_POSITIONS";
-const KEY_COPY_STOP_LOSS_PCT: &str = "COPY_STOP_LOSS_PCT";
-const KEY_COPY_TAKE_PROFIT_PCT: &str = "COPY_TAKE_PROFIT_PCT";
-const KEY_COPY_MAX_HOLD_HOURS: &str = "COPY_MAX_HOLD_HOURS";
 const KEY_ARB_POSITION_SIZE: &str = "ARB_POSITION_SIZE";
 const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
 const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
 const KEY_ARB_MAX_SIGNAL_AGE_SECS: &str = "ARB_MAX_SIGNAL_AGE_SECS";
-const KEY_COPY_TOTAL_CAPITAL: &str = "COPY_TOTAL_CAPITAL";
-const KEY_COPY_NEAR_RESOLUTION_MARGIN: &str = "COPY_NEAR_RESOLUTION_MARGIN";
 const KEY_QUANT_BASE_POSITION_SIZE: &str = "QUANT_BASE_POSITION_SIZE";
 
 const EPSILON: f64 = 1e-6;
@@ -88,10 +76,6 @@ struct TuningMetrics {
     recent_drawdown: f64,
     cb_tripped: bool,
     current_regime: String,
-    /// Number of currently open copy-trade positions (source = 2).
-    copy_open_positions: f64,
-    /// Configured max copy-trade positions (capacity denominator).
-    copy_max_positions: f64,
     /// Quant strategy net P&L over the last 7 days.
     quant_pnl_7d: f64,
 }
@@ -627,14 +611,6 @@ impl DynamicTuner {
     ) -> HashMap<String, f64> {
         let mut targets = HashMap::new();
 
-        let min_trade_current = rows
-            .get(KEY_COPY_MIN_TRADE_VALUE)
-            .map(|r| decimal_to_f64(r.current_value))
-            .unwrap_or(2.0);
-        let slippage_current = rows
-            .get(KEY_COPY_MAX_SLIPPAGE_PCT)
-            .map(|r| decimal_to_f64(r.current_value))
-            .unwrap_or(0.01);
         let arb_profit_current = rows
             .get(KEY_ARB_MIN_PROFIT_THRESHOLD)
             .map(|r| decimal_to_f64(r.current_value))
@@ -644,8 +620,6 @@ impl DynamicTuner {
             .map(|r| decimal_to_f64(r.current_value))
             .unwrap_or(300.0);
 
-        let bootstrap_active = self.config.bootstrap_enabled
-            && metrics.attempts_last_window < self.config.bootstrap_max_attempts as f64;
         let no_trade_watchdog = metrics.attempts_last_window
             >= self.config.no_trade_min_attempts as f64
             && metrics.fills_last_window <= EPSILON;
@@ -655,82 +629,14 @@ impl DynamicTuner {
             .unwrap_or("none")
             .to_string();
 
-        let (regime_min_trade_mult, regime_buffer, regime_safety_margin) = match regime {
-            MarketRegime::BullCalm => (0.95, 0.0012, 0.0010),
+        let (_, _, regime_safety_margin) = match regime {
+            MarketRegime::BullCalm => (0.95_f64, 0.0012_f64, 0.0010_f64),
             MarketRegime::BullVolatile => (1.03, 0.0020, 0.0018),
             MarketRegime::BearCalm => (1.05, 0.0018, 0.0022),
             MarketRegime::BearVolatile => (1.10, 0.0028, 0.0030),
             MarketRegime::Ranging => (1.00, 0.0016, 0.0018),
             MarketRegime::Uncertain => (1.07, 0.0022, 0.0025),
         };
-
-        // COPY_MIN_TRADE_VALUE: lower when many useful trades are skipped by minimum,
-        // raise when slippage/noise dominates.
-        let below_min_push_down = ((metrics.below_min_skip_rate - 0.20).max(0.0) * 0.35).min(0.20);
-        let slippage_push_up = ((metrics.slippage_skip_rate - 0.15).max(0.0) * 0.45).min(0.25);
-        let pnl_push_up = if metrics.recent_pnl < 0.0 { 0.05 } else { 0.0 };
-        let mut desired_min_trade = min_trade_current
-            * (1.0 - below_min_push_down + slippage_push_up + pnl_push_up)
-            * regime_min_trade_mult;
-        if bootstrap_active {
-            desired_min_trade = desired_min_trade.min(5.0);
-        }
-        if no_trade_watchdog {
-            desired_min_trade = match top_skip.as_str() {
-                "below_minimum" => desired_min_trade.min((min_trade_current * 0.70).max(0.50)),
-                "too_stale" => desired_min_trade.min((min_trade_current * 0.85).max(0.50)),
-                // Near-resolution and market_not_active are infrastructure/cache problems,
-                // not parameter problems. Pin to current value to prevent drift —
-                // the base formula already moved desired_min_trade away from current.
-                "near_resolution" | "market_not_active" => min_trade_current,
-                _ => desired_min_trade.min((min_trade_current * 0.80).max(0.50)),
-            };
-        }
-        targets.insert(KEY_COPY_MIN_TRADE_VALUE.to_string(), desired_min_trade);
-
-        // COPY_MAX_SLIPPAGE_PCT: set near recent p90 + buffer.
-        let fill_relax = if metrics.successful_fill_rate < 0.35 {
-            0.0010
-        } else {
-            0.0
-        };
-        let mut desired_slippage = (metrics.realized_slippage_p90 + regime_buffer + fill_relax)
-            .max(slippage_current * 0.7)
-            .min(slippage_current * 1.4);
-        if bootstrap_active {
-            desired_slippage = desired_slippage.max(0.02);
-        }
-        if no_trade_watchdog {
-            desired_slippage = match top_skip.as_str() {
-                "slippage" => desired_slippage.max((slippage_current * 1.50).max(0.015)),
-                "too_stale" => desired_slippage.max((slippage_current * 1.10).max(0.012)),
-                // Near-resolution and market_not_active are infrastructure/cache problems.
-                // Cannot be fixed by relaxing slippage — pin to current to prevent drift.
-                // The base formula drives desired_slippage toward 0 when p90 = 0 (no fills).
-                "near_resolution" | "market_not_active" => slippage_current,
-                _ => desired_slippage.max((slippage_current * 1.15).max(0.012)),
-            };
-        }
-        targets.insert(KEY_COPY_MAX_SLIPPAGE_PCT.to_string(), desired_slippage);
-
-        // COPY_MAX_LATENCY_SECS: relax when trades are rejected as too_stale,
-        // tighten slightly otherwise to prefer fresher fills.
-        let latency_current = rows
-            .get(KEY_COPY_MAX_LATENCY_SECS)
-            .map(|r| decimal_to_f64(r.current_value))
-            .unwrap_or(120.0);
-        let desired_latency = if no_trade_watchdog && top_skip == "too_stale" {
-            // Most skips are stale trades — relax the threshold to let them through.
-            (latency_current * 1.30).min(300.0)
-        } else if no_trade_watchdog || bootstrap_active {
-            // No fills yet (watchdog or bootstrap) but staleness isn't the top issue.
-            // Hold latency steady — tightening during 0-fill phases is counter-productive.
-            latency_current
-        } else {
-            // Normal operation — tighten slightly toward fresher fills.
-            (latency_current * 0.95).max(60.0)
-        };
-        targets.insert(KEY_COPY_MAX_LATENCY_SECS.to_string(), desired_latency);
 
         // ARB_MIN_PROFIT_THRESHOLD: expected slippage + safety margin.
         let expected_arb_slippage = (metrics.realized_slippage_p90 * 2.0).max(0.0015);
@@ -766,25 +672,14 @@ impl DynamicTuner {
             (max_markets_current * desired_market_factor).round(),
         );
 
-        // QUANT_BASE_POSITION_SIZE: auto-raise when copy trading is winding down
-        // and quant strategies are profitable. Capital reallocation from copy → quant.
+        // QUANT_BASE_POSITION_SIZE: adjust based on quant strategy profitability.
         let quant_size_current = rows
             .get(KEY_QUANT_BASE_POSITION_SIZE)
             .map(|r| decimal_to_f64(r.current_value))
             .unwrap_or(30.0);
 
-        // Position utilization: current copy positions / configured max
-        let copy_utilization = if metrics.copy_max_positions > 0.0 {
-            metrics.copy_open_positions / metrics.copy_max_positions
-        } else {
-            1.0
-        };
-
-        let desired_quant_size = if copy_utilization < 0.25 && metrics.quant_pnl_7d > 0.0 {
-            // Copy trading is nearly idle and quant is profitable — raise by 10%
-            quant_size_current * 1.10
-        } else if copy_utilization < 0.50 && metrics.quant_pnl_7d > 0.0 {
-            // Copy trading partially wound down — modest 5% raise
+        let desired_quant_size = if metrics.quant_pnl_7d > 0.0 {
+            // Quant strategies are profitable — modest 5% raise
             quant_size_current * 1.05
         } else if metrics.quant_pnl_7d < -50.0 {
             // Quant strategies are bleeding — pull back by 10%
@@ -835,49 +730,6 @@ impl DynamicTuner {
         &self,
         redis_manager: Option<&mut redis::aio::ConnectionManager>,
     ) -> anyhow::Result<TuningMetrics> {
-        let window_minutes = self.config.no_trade_window_minutes.max(5);
-        let row: (i64, i64, i64, i64, Decimal) = sqlx::query_as(
-            r#"
-            SELECT
-                COUNT(*)::bigint AS attempts,
-                COALESCE(SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END), 0)::bigint AS fills,
-                COALESCE(SUM(CASE WHEN status = 3 AND COALESCE(skip_reason, '') = 'slippage' THEN 1 ELSE 0 END), 0)::bigint AS slippage_skips,
-                COALESCE(SUM(CASE WHEN status = 3 AND COALESCE(skip_reason, '') = 'below_minimum' THEN 1 ELSE 0 END), 0)::bigint AS below_min_skips,
-                COALESCE(
-                    PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY ABS(slippage))
-                    FILTER (WHERE status = 1 AND slippage IS NOT NULL),
-                    0
-                )::numeric AS slippage_p90
-            FROM copy_trade_history
-            WHERE created_at >= NOW() - make_interval(mins => $1::int)
-            "#,
-        )
-        .bind(window_minutes as i32)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let top_skip_reason: Option<String> = sqlx::query_scalar(
-            r#"
-            SELECT skip_reason
-            FROM copy_trade_history
-            WHERE status = 3
-              AND skip_reason IS NOT NULL
-              AND created_at >= NOW() - make_interval(mins => $1::int)
-            GROUP BY skip_reason
-            ORDER BY COUNT(*) DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(window_minutes as i32)
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or(None);
-
-        let attempts = row.0.max(0) as f64;
-        let fills = row.1.max(0) as f64;
-        let slippage_skips = row.2.max(0) as f64;
-        let below_min_skips = row.3.max(0) as f64;
-
         let recent_pnl: Decimal = sqlx::query_scalar(
             r#"
             SELECT COALESCE(SUM(realized_pnl), 0)
@@ -934,27 +786,6 @@ impl DynamicTuner {
             0.0
         };
 
-        // Count currently open copy-trade positions (source = 2 is copy_trade)
-        let copy_open_positions: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM positions
-            WHERE source = 2
-              AND status IN (1, 2)
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
-
-        // Copy trading position capacity: use the configured max from env.
-        // This avoids the semantic mismatch of comparing a point-in-time concurrent
-        // count against a daily entry rate.
-        let copy_max_positions: f64 = std::env::var("COPY_MAX_OPEN_POSITIONS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(15.0);
-
         // Quant strategy net P&L over the last 7 days
         let quant_pnl_7d: Decimal = sqlx::query_scalar(
             r#"
@@ -970,13 +801,13 @@ impl DynamicTuner {
         .unwrap_or(Decimal::ZERO);
 
         Ok(TuningMetrics {
-            slippage_skip_rate: ratio(slippage_skips, attempts),
-            below_min_skip_rate: ratio(below_min_skips, attempts),
-            successful_fill_rate: ratio(fills, attempts),
-            attempts_last_window: attempts,
-            fills_last_window: fills,
-            top_skip_reason,
-            realized_slippage_p90: decimal_to_f64(row.4).abs(),
+            slippage_skip_rate: 0.0,
+            below_min_skip_rate: 0.0,
+            successful_fill_rate: 0.0,
+            attempts_last_window: 0.0,
+            fills_last_window: 0.0,
+            top_skip_reason: None,
+            realized_slippage_p90: 0.0,
             depth_proxy,
             volatility_proxy,
             ws_stall_rate,
@@ -990,8 +821,6 @@ impl DynamicTuner {
             recent_drawdown: decimal_to_f64(drawdown),
             cb_tripped: cb_state.tripped,
             current_regime: "Uncertain".to_string(),
-            copy_open_positions: copy_open_positions as f64,
-            copy_max_positions: copy_max_positions,
             quant_pnl_7d: decimal_to_f64(quant_pnl_7d),
         })
     }
@@ -1015,20 +844,6 @@ impl DynamicTuner {
 
     async fn seed_defaults(&self) -> anyhow::Result<()> {
         let seeds = vec![
-            ConfigSeed {
-                key: KEY_COPY_MIN_TRADE_VALUE,
-                default_value: env_decimal("COPY_MIN_TRADE_VALUE", Decimal::new(2, 0)),
-                min_value: Decimal::new(50, 2), // $0.50 floor (was $2)
-                max_value: Decimal::new(50, 0),
-                max_step_pct: Decimal::new(18, 2), // 18% per cycle (was 12%)
-            },
-            ConfigSeed {
-                key: KEY_COPY_MAX_SLIPPAGE_PCT,
-                default_value: env_decimal("COPY_MAX_SLIPPAGE_PCT", Decimal::new(1, 2)),
-                min_value: Decimal::new(25, 4),    // 0.25% floor
-                max_value: Decimal::new(15, 2),    // 15% ceiling (was 5%)
-                max_step_pct: Decimal::new(25, 2), // 25% per cycle (was 15%)
-            },
             ConfigSeed {
                 key: KEY_ARB_MIN_PROFIT_THRESHOLD,
                 default_value: env_decimal("ARB_MIN_PROFIT_THRESHOLD", Decimal::new(5, 3)),
@@ -1056,48 +871,6 @@ impl DynamicTuner {
                 min_value: Decimal::ZERO,
                 max_value: Decimal::new(2, 0),
                 max_step_pct: Decimal::new(100, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_MAX_LATENCY_SECS,
-                default_value: env_decimal("COPY_MAX_LATENCY_SECS", Decimal::new(120, 0)),
-                min_value: Decimal::new(30, 0),    // 30 second floor
-                max_value: Decimal::new(300, 0),   // 5 minute ceiling (was 15 min)
-                max_step_pct: Decimal::new(20, 2), // 20% per cycle
-            },
-            ConfigSeed {
-                key: KEY_COPY_DAILY_CAPITAL_LIMIT,
-                default_value: env_decimal("COPY_DAILY_CAPITAL_LIMIT", Decimal::new(5000, 0)),
-                min_value: Decimal::new(100, 0),   // $100 floor
-                max_value: Decimal::new(50000, 0), // $50,000 ceiling
-                max_step_pct: Decimal::new(20, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_MAX_OPEN_POSITIONS,
-                default_value: env_decimal("COPY_MAX_OPEN_POSITIONS", Decimal::new(15, 0)),
-                min_value: Decimal::new(1, 0),
-                max_value: Decimal::new(50, 0),
-                max_step_pct: Decimal::new(25, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_STOP_LOSS_PCT,
-                default_value: env_decimal("COPY_STOP_LOSS_PCT", Decimal::new(15, 2)),
-                min_value: Decimal::new(5, 2),  // 5% floor
-                max_value: Decimal::new(50, 2), // 50% ceiling
-                max_step_pct: Decimal::new(20, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_TAKE_PROFIT_PCT,
-                default_value: env_decimal("COPY_TAKE_PROFIT_PCT", Decimal::new(25, 2)),
-                min_value: Decimal::new(5, 2),   // 5% floor
-                max_value: Decimal::new(100, 2), // 100% ceiling
-                max_step_pct: Decimal::new(20, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_MAX_HOLD_HOURS,
-                default_value: env_decimal("COPY_MAX_HOLD_HOURS", Decimal::new(72, 0)),
-                min_value: Decimal::new(1, 0),   // 1 hour floor
-                max_value: Decimal::new(720, 0), // 30 days ceiling
-                max_step_pct: Decimal::new(20, 2),
             },
             // ── Arb executor tuning knobs ──
             ConfigSeed {
@@ -1127,20 +900,6 @@ impl DynamicTuner {
                 min_value: Decimal::new(5, 0),   // 5s floor
                 max_value: Decimal::new(300, 0), // 300s ceiling
                 max_step_pct: Decimal::new(25, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_TOTAL_CAPITAL,
-                default_value: env_decimal("COPY_TOTAL_CAPITAL", Decimal::new(10000, 0)),
-                min_value: Decimal::new(100, 0),    // $100 floor
-                max_value: Decimal::new(500000, 0), // $500,000 ceiling
-                max_step_pct: Decimal::new(20, 2),
-            },
-            ConfigSeed {
-                key: KEY_COPY_NEAR_RESOLUTION_MARGIN,
-                default_value: env_decimal("COPY_NEAR_RESOLUTION_MARGIN", Decimal::new(3, 2)),
-                min_value: Decimal::new(3, 2), // 0.03 (3%) floor — never fully disabled
-                max_value: Decimal::new(25, 2), // 0.25 ceiling
-                max_step_pct: Decimal::new(50, 2),
             },
             // ── Quant signal executor tuning knob ──
             ConfigSeed {
@@ -1396,28 +1155,17 @@ impl DynamicTuner {
 }
 
 /// Subscribes to dynamic config updates and applies them to local API runtime.
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_dynamic_config_subscriber(
     redis_url: String,
-    copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     pool: PgPool,
-    max_latency_secs: Option<Arc<AtomicI64>>,
-    copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
     arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
-    copy_total_capital: Option<Arc<AtomicI64>>,
-    copy_near_resolution_margin: Option<Arc<AtomicI64>>,
 ) {
     tokio::spawn(async move {
         loop {
             if let Err(e) = run_dynamic_config_subscriber(
                 redis_url.as_str(),
-                copy_trader.clone(),
                 pool.clone(),
-                max_latency_secs.clone(),
-                copy_stop_loss_config.clone(),
                 arb_executor_config.clone(),
-                copy_total_capital.clone(),
-                copy_near_resolution_margin.clone(),
             )
             .await
             {
@@ -1430,40 +1178,10 @@ pub fn spawn_dynamic_config_subscriber(
     info!("Dynamic config subscriber spawned");
 }
 
-/// Applies the current dynamic config snapshot to the local copy-trader policy.
-///
-/// This is used at startup to prefer DB-backed runtime configuration when
-/// available, while still allowing env defaults as fallback if dynamic config
-/// tables are missing or not yet seeded.
-pub async fn sync_dynamic_config_snapshot_to_copy_trader(
-    pool: &PgPool,
-    copy_trader: &Arc<RwLock<CopyTrader>>,
-    max_latency_secs: Option<&Arc<AtomicI64>>,
-    copy_total_capital: Option<&Arc<AtomicI64>>,
-    copy_near_resolution_margin: Option<&Arc<AtomicI64>>,
-) -> anyhow::Result<()> {
-    let bounds = load_dynamic_bounds(pool).await;
-    apply_startup_snapshot_to_copy_trader(
-        pool,
-        copy_trader,
-        &bounds,
-        max_latency_secs,
-        copy_total_capital,
-        copy_near_resolution_margin,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn run_dynamic_config_subscriber(
     redis_url: &str,
-    copy_trader: Option<Arc<RwLock<CopyTrader>>>,
     pool: PgPool,
-    max_latency_secs: Option<Arc<AtomicI64>>,
-    copy_stop_loss_config: Option<Arc<RwLock<crate::copy_trade_stop_loss::CopyStopLossConfig>>>,
     arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
-    copy_total_capital: Option<Arc<AtomicI64>>,
-    copy_near_resolution_margin: Option<Arc<AtomicI64>>,
 ) -> anyhow::Result<()> {
     let allowed_sources = load_allowed_update_sources();
     let bounds = load_dynamic_bounds(&pool).await;
@@ -1477,23 +1195,6 @@ async fn run_dynamic_config_subscriber(
         channel = channels::CONFIG_UPDATES,
         "Subscribed to dynamic config updates"
     );
-
-    // Subscribe before snapshot application so updates published during startup
-    // are queued and processed after snapshot reconciliation.
-    if let Some(ref trader) = copy_trader {
-        if let Err(e) = apply_startup_snapshot_to_copy_trader(
-            &pool,
-            trader,
-            &bounds,
-            max_latency_secs.as_ref(),
-            copy_total_capital.as_ref(),
-            copy_near_resolution_margin.as_ref(),
-        )
-        .await
-        {
-            warn!(error = %e, "Failed applying startup dynamic config snapshot to copy trader");
-        }
-    }
 
     // Apply startup snapshot to arb executor config
     if let Some(ref arb_config) = arb_executor_config {
@@ -1544,97 +1245,6 @@ async fn run_dynamic_config_subscriber(
         }
         update.value = validated;
 
-        if let Some(ref trader) = copy_trader {
-            if apply_to_copy_trader(trader, &update).await {
-                info!(
-                    key = %update.key,
-                    value = %update.value,
-                    source = %update.source,
-                    "Applied dynamic config in api-server"
-                );
-            }
-        }
-
-        // Apply latency threshold directly to the shared atomic
-        if update.key == KEY_COPY_MAX_LATENCY_SECS {
-            if let Some(ref atomic) = max_latency_secs {
-                if let Some(secs) = update.value.to_i64() {
-                    atomic.store(secs, Ordering::Relaxed);
-                    info!(
-                        key = %update.key,
-                        value = %update.value,
-                        source = %update.source,
-                        "Applied dynamic config in api-server"
-                    );
-                }
-            }
-        }
-
-        // Apply stop-loss/take-profit/hold-hours to shared config
-        if let Some(ref sl_config) = copy_stop_loss_config {
-            let applied = match update.key.as_str() {
-                KEY_COPY_STOP_LOSS_PCT => {
-                    sl_config.write().await.stop_loss_pct = update.value;
-                    true
-                }
-                KEY_COPY_TAKE_PROFIT_PCT => {
-                    sl_config.write().await.take_profit_pct = update.value;
-                    true
-                }
-                KEY_COPY_MAX_HOLD_HOURS => {
-                    if let Some(h) = update.value.to_i64() {
-                        sl_config.write().await.max_hold_hours = h;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            };
-            if applied {
-                info!(
-                    key = %update.key,
-                    value = %update.value,
-                    source = %update.source,
-                    "Applied stop-loss config update at runtime"
-                );
-            }
-        }
-
-        // Apply copy total capital to shared atomic (stored as cents)
-        if update.key == KEY_COPY_TOTAL_CAPITAL {
-            if let Some(ref atomic) = copy_total_capital {
-                if let Some(dollars) = update.value.to_i64() {
-                    atomic.store(dollars * 100, Ordering::Relaxed);
-                    info!(
-                        key = %update.key,
-                        value = %update.value,
-                        source = %update.source,
-                        "Applied copy total capital update at runtime"
-                    );
-                }
-            }
-        }
-
-        // Apply near-resolution margin to shared atomic (stored as margin * 10,000)
-        if update.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
-            if let Some(ref atomic) = copy_near_resolution_margin {
-                // value is e.g. 0.03 → store as 300; floor at 300 (3%) to match MIN_MARGIN_RAW
-                let margin_raw = (update.value * Decimal::new(10_000, 0))
-                    .to_i64()
-                    .unwrap_or(300)
-                    .max(300); // Floor at 3% (MIN_MARGIN_RAW) — never allow 0
-                atomic.store(margin_raw, Ordering::Relaxed);
-                info!(
-                    key = %update.key,
-                    value = %update.value,
-                    margin_raw,
-                    source = %update.source,
-                    "Applied near-resolution margin update at runtime"
-                );
-            }
-        }
-
         // Apply arb executor config updates
         if let Some(ref arb_config) = arb_executor_config {
             let applied = match update.key.as_str() {
@@ -1672,37 +1282,6 @@ async fn run_dynamic_config_subscriber(
     }
 
     Ok(())
-}
-
-async fn apply_to_copy_trader(
-    copy_trader: &Arc<RwLock<CopyTrader>>,
-    update: &DynamicConfigUpdate,
-) -> bool {
-    let mut trader = copy_trader.write().await;
-
-    match update.key.as_str() {
-        KEY_COPY_MIN_TRADE_VALUE => {
-            trader.set_min_trade_value(update.value);
-            true
-        }
-        KEY_COPY_MAX_SLIPPAGE_PCT => {
-            trader.set_max_slippage_pct(update.value);
-            true
-        }
-        KEY_COPY_DAILY_CAPITAL_LIMIT => {
-            trader.set_daily_capital_limit(update.value);
-            true
-        }
-        KEY_COPY_MAX_OPEN_POSITIONS => {
-            if let Some(n) = update.value.to_u64() {
-                trader.set_max_open_positions(n as usize);
-                true
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1743,82 +1322,6 @@ async fn load_dynamic_bounds(pool: &PgPool) -> HashMap<String, (Decimal, Decimal
             .map(|row| (row.key, (row.min_value, row.max_value)))
             .collect()
     }
-}
-
-async fn apply_startup_snapshot_to_copy_trader(
-    pool: &PgPool,
-    copy_trader: &Arc<RwLock<CopyTrader>>,
-    bounds: &HashMap<String, (Decimal, Decimal)>,
-    max_latency_secs: Option<&Arc<AtomicI64>>,
-    copy_total_capital: Option<&Arc<AtomicI64>>,
-    copy_near_resolution_margin: Option<&Arc<AtomicI64>>,
-) -> anyhow::Result<()> {
-    let rows: Vec<DynamicValueRow> = sqlx::query_as(
-        r#"
-        SELECT key, current_value
-        FROM dynamic_config
-        WHERE enabled = TRUE
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut applied = 0usize;
-    for row in rows {
-        let Some(value) = clamp_dynamic_value(&row.key, row.current_value, bounds) else {
-            continue;
-        };
-        let update = DynamicConfigUpdate {
-            key: row.key.clone(),
-            value,
-            reason: "startup snapshot".to_string(),
-            source: "dynamic_tuner_sync".to_string(),
-            timestamp: Utc::now(),
-            metrics: serde_json::json!({ "sync": "subscriber_bootstrap" }),
-        };
-
-        if apply_to_copy_trader(copy_trader, &update).await {
-            applied += 1;
-        }
-
-        // Apply latency threshold to the shared atomic
-        if row.key == KEY_COPY_MAX_LATENCY_SECS {
-            if let Some(atomic) = max_latency_secs {
-                if let Some(secs) = value.to_i64() {
-                    atomic.store(secs, Ordering::Relaxed);
-                    applied += 1;
-                }
-            }
-        }
-
-        // Apply total capital to the shared atomic (stored as cents)
-        if row.key == KEY_COPY_TOTAL_CAPITAL {
-            if let Some(atomic) = copy_total_capital {
-                if let Some(dollars) = value.to_i64() {
-                    atomic.store(dollars * 100, Ordering::Relaxed);
-                    applied += 1;
-                }
-            }
-        }
-
-        // Apply near-resolution margin to the shared atomic (stored as margin * 10,000)
-        if row.key == KEY_COPY_NEAR_RESOLUTION_MARGIN {
-            if let Some(atomic) = copy_near_resolution_margin {
-                let margin_raw = (value * Decimal::new(10_000, 0))
-                    .to_i64()
-                    .unwrap_or(300)
-                    .max(300); // Floor at 3% — match MIN_MARGIN_RAW
-                atomic.store(margin_raw, Ordering::Relaxed);
-                applied += 1;
-            }
-        }
-    }
-
-    info!(
-        applied,
-        "Applied startup dynamic config snapshot to copy trader"
-    );
-    Ok(())
 }
 
 /// Applies the current dynamic config snapshot to the arb executor config.
@@ -1914,9 +1417,6 @@ fn clamp_dynamic_value(
 fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
     let mut map = HashMap::new();
     for key in [
-        KEY_COPY_MIN_TRADE_VALUE,
-        KEY_COPY_MAX_SLIPPAGE_PCT,
-        KEY_COPY_MAX_LATENCY_SECS,
         KEY_ARB_MIN_PROFIT_THRESHOLD,
         KEY_ARB_MONITOR_MAX_MARKETS,
         KEY_ARB_MONITOR_EXPLORATION_SLOTS,
@@ -1925,8 +1425,6 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
         KEY_ARB_MIN_NET_PROFIT,
         KEY_ARB_MIN_BOOK_DEPTH,
         KEY_ARB_MAX_SIGNAL_AGE_SECS,
-        KEY_COPY_TOTAL_CAPITAL,
-        KEY_COPY_NEAR_RESOLUTION_MARGIN,
         KEY_QUANT_BASE_POSITION_SIZE,
     ] {
         if let Some(bounds) = fallback_bounds_for_key(key) {
@@ -1938,9 +1436,6 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
 
 fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     match key {
-        KEY_COPY_MIN_TRADE_VALUE => Some((Decimal::new(50, 2), Decimal::new(50, 0))),
-        KEY_COPY_MAX_SLIPPAGE_PCT => Some((Decimal::new(25, 4), Decimal::new(15, 2))),
-        KEY_COPY_MAX_LATENCY_SECS => Some((Decimal::new(30, 0), Decimal::new(300, 0))),
         KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),
@@ -1949,8 +1444,6 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
         KEY_ARB_MIN_NET_PROFIT => Some((Decimal::new(5, 4), Decimal::new(5, 2))),
         KEY_ARB_MIN_BOOK_DEPTH => Some((Decimal::new(25, 0), Decimal::new(1000, 0))),
         KEY_ARB_MAX_SIGNAL_AGE_SECS => Some((Decimal::new(5, 0), Decimal::new(300, 0))),
-        KEY_COPY_TOTAL_CAPITAL => Some((Decimal::new(100, 0), Decimal::new(500000, 0))),
-        KEY_COPY_NEAR_RESOLUTION_MARGIN => Some((Decimal::new(3, 2), Decimal::new(25, 2))),
         KEY_QUANT_BASE_POSITION_SIZE => Some((Decimal::new(10, 0), Decimal::new(200, 0))),
         _ => None,
     }
@@ -1988,6 +1481,7 @@ fn env_aggressiveness_level() -> Decimal {
     }
 }
 
+#[allow(dead_code)]
 fn ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator <= 0.0 {
         return 0.0;

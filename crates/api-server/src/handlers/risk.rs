@@ -6,7 +6,6 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -121,36 +120,6 @@ fn trip_reason_to_string(reason: &risk_manager::circuit_breaker::TripReason) -> 
     }
 }
 
-fn stop_type_label(stop_type: i16) -> String {
-    match stop_type {
-        0 => "fixed".to_string(),
-        1 => "percentage".to_string(),
-        2 => "trailing".to_string(),
-        3 => "time_based".to_string(),
-        _ => "unknown".to_string(),
-    }
-}
-
-#[derive(FromRow)]
-struct StopLossStatsRow {
-    total: i64,
-    active: i64,
-    executed: i64,
-    fixed: i64,
-    percentage: i64,
-    trailing: i64,
-    time_based: i64,
-}
-
-#[derive(FromRow)]
-struct RecentStopRow {
-    id: Uuid,
-    position_id: Uuid,
-    market_id: String,
-    stop_type: i16,
-    executed_at: DateTime<Utc>,
-}
-
 /// Get risk monitoring status for a workspace.
 #[utoipa::path(
     get,
@@ -219,67 +188,17 @@ pub async fn get_risk_status(
         },
     };
 
-    // Query stop-loss aggregate stats from DB
-    let stats_row: StopLossStatsRow = sqlx::query_as(
-        r#"
-        SELECT
-            COUNT(*) as total,
-            COUNT(*) FILTER (WHERE activated = TRUE AND executed = FALSE) as active,
-            COUNT(*) FILTER (WHERE executed = TRUE) as executed,
-            COUNT(*) FILTER (WHERE stop_type = 0) as fixed,
-            COUNT(*) FILTER (WHERE stop_type = 1) as percentage,
-            COUNT(*) FILTER (WHERE stop_type = 2) as trailing,
-            COUNT(*) FILTER (WHERE stop_type = 3) as time_based
-        FROM stop_loss_rules sl
-        JOIN positions p ON p.id = sl.position_id
-        JOIN workspace_wallet_allocations wwa
-          ON LOWER(wwa.wallet_address) = LOWER(p.source_wallet)
-        WHERE wwa.workspace_id = $1
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_one(&state.pool)
-    .await?;
-
-    // Query recent executed stop-loss rules
-    let recent_rows: Vec<RecentStopRow> = sqlx::query_as(
-        r#"
-        SELECT sl.id, sl.position_id, sl.market_id, sl.stop_type, sl.executed_at
-        FROM stop_loss_rules sl
-        JOIN positions p ON p.id = sl.position_id
-        JOIN workspace_wallet_allocations wwa
-          ON LOWER(wwa.wallet_address) = LOWER(p.source_wallet)
-        WHERE wwa.workspace_id = $1
-          AND sl.executed = TRUE
-          AND sl.executed_at IS NOT NULL
-        ORDER BY executed_at DESC
-        LIMIT 10
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_all(&state.pool)
-    .await?;
-
-    let recent_executions: Vec<RecentStopExecution> = recent_rows
-        .into_iter()
-        .map(|r| RecentStopExecution {
-            id: r.id.to_string(),
-            position_id: r.position_id.to_string(),
-            market_id: r.market_id,
-            stop_type: stop_type_label(r.stop_type),
-            executed_at: r.executed_at,
-        })
-        .collect();
-
+    // TODO: stop_loss_rules table has been dropped with the copy-trading system.
+    // Return zeroed stats until a replacement stop-loss mechanism is implemented.
     let stop_loss = StopLossStatsResponse {
-        total_rules: stats_row.total,
-        active_rules: stats_row.active,
-        executed_rules: stats_row.executed,
-        fixed_stops: stats_row.fixed,
-        percentage_stops: stats_row.percentage,
-        trailing_stops: stats_row.trailing,
-        time_based_stops: stats_row.time_based,
-        recent_executions,
+        total_rules: 0,
+        active_rules: 0,
+        executed_rules: 0,
+        fixed_stops: 0,
+        percentage_stops: 0,
+        trailing_stops: 0,
+        time_based_stops: 0,
+        recent_executions: vec![],
     };
 
     Ok(Json(RiskStatusResponse {

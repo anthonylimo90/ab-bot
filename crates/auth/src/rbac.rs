@@ -52,7 +52,6 @@ pub enum Resource {
 
     // Trading resources
     StopLoss,
-    CopyTrading,
     Backtest,
 
     // Configuration
@@ -287,8 +286,6 @@ impl DefaultRoles {
         role.add_permission(Permission::new(Resource::StopLoss, Action::Create));
         role.add_permission(Permission::new(Resource::StopLoss, Action::Update));
         role.add_permission(Permission::new(Resource::StopLoss, Action::Delete));
-        role.add_permission(Permission::new(Resource::CopyTrading, Action::Read));
-        role.add_permission(Permission::new(Resource::CopyTrading, Action::Update));
         role.add_permission(Permission::new(Resource::Backtest, Action::Create));
         role.add_permission(Permission::new(Resource::Backtest, Action::Execute));
 
@@ -318,21 +315,6 @@ impl DefaultRoles {
         role
     }
 
-    /// Create the Copy Trader role (specialized trader).
-    pub fn copy_trader() -> Role {
-        let mut role = Role::new("copy_trader", "Can manage copy trading operations");
-
-        role.inherit_from("viewer");
-
-        role.add_permission(Permission::new(Resource::CopyTrading, Action::Create));
-        role.add_permission(Permission::new(Resource::CopyTrading, Action::Update));
-        role.add_permission(Permission::new(Resource::CopyTrading, Action::Delete));
-        role.add_permission(Permission::new(Resource::Wallet, Action::Create));
-        role.add_permission(Permission::new(Resource::Wallet, Action::Update));
-
-        role
-    }
-
     /// Create the Risk Manager role.
     pub fn risk_manager() -> Role {
         let mut role = Role::new("risk_manager", "Can configure risk settings");
@@ -353,7 +335,6 @@ impl DefaultRoles {
             Self::viewer(),
             Self::trader(),
             Self::platform_admin(),
-            Self::copy_trader(),
             Self::risk_manager(),
         ]
     }

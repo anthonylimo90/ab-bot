@@ -41,11 +41,6 @@ pub struct PositionResponse {
     /// Take profit price (if set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<Decimal>,
-    /// Whether this is a copy trade.
-    pub is_copy_trade: bool,
-    /// Source wallet (for copy trades).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_wallet: Option<String>,
     /// Realized P&L (for closed positions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realized_pnl: Option<Decimal>,
@@ -73,8 +68,6 @@ pub struct ListPositionsQuery {
     pub market_id: Option<String>,
     /// Filter by outcome.
     pub outcome: Option<String>,
-    /// Filter by copy trades only.
-    pub copy_trades_only: Option<bool>,
     /// Filter by status (open/closed/all).
     #[serde(default = "default_status")]
     pub status: String,
@@ -106,8 +99,6 @@ struct PositionRow {
     unrealized_pnl: Decimal,
     stop_loss: Option<Decimal>,
     take_profit: Option<Decimal>,
-    is_copy_trade: bool,
-    source_wallet: Option<String>,
     realized_pnl: Option<Decimal>,
     opened_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -140,20 +131,17 @@ pub async fn list_positions(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
-               is_copy_trade, source_wallet, realized_pnl,
-               opened_at, updated_at, is_open
+               realized_pnl, opened_at, updated_at, is_open
         FROM positions
         WHERE ($1::text IS NULL OR market_id = $1)
           AND ($2::text IS NULL OR outcome = $2)
-          AND ($3::bool IS NULL OR is_copy_trade = $3)
-          AND ($4::bool IS NULL OR is_open = $4)
+          AND ($3::bool IS NULL OR is_open = $3)
         ORDER BY opened_at DESC
-        LIMIT $5 OFFSET $6
+        LIMIT $4 OFFSET $5
         "#,
     )
     .bind(&query.market_id)
     .bind(&query.outcome)
-    .bind(query.copy_trades_only)
     .bind(status_filter)
     .bind(query.limit)
     .bind(query.offset)
@@ -184,8 +172,6 @@ pub async fn list_positions(
                 unrealized_pnl_pct: pnl_pct,
                 stop_loss: row.stop_loss,
                 take_profit: row.take_profit,
-                is_copy_trade: row.is_copy_trade,
-                source_wallet: row.source_wallet,
                 realized_pnl: row.realized_pnl,
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
@@ -217,8 +203,7 @@ pub async fn get_position(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
-               is_copy_trade, source_wallet, realized_pnl,
-               opened_at, updated_at, is_open
+               realized_pnl, opened_at, updated_at, is_open
         FROM positions
         WHERE id = $1
         "#,
@@ -250,8 +235,6 @@ pub async fn get_position(
                 unrealized_pnl_pct: pnl_pct,
                 stop_loss: row.stop_loss,
                 take_profit: row.take_profit,
-                is_copy_trade: row.is_copy_trade,
-                source_wallet: row.source_wallet,
                 realized_pnl: row.realized_pnl,
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
@@ -289,8 +272,7 @@ pub async fn close_position(
         r#"
         SELECT id, market_id, outcome, side, quantity, entry_price,
                current_price, unrealized_pnl, stop_loss, take_profit,
-               is_copy_trade, source_wallet, realized_pnl,
-               opened_at, updated_at, is_open
+               realized_pnl, opened_at, updated_at, is_open
         FROM positions
         WHERE id = $1 AND is_open = true
         "#,
@@ -372,8 +354,6 @@ pub async fn close_position(
         unrealized_pnl_pct: pnl_pct,
         stop_loss: row.stop_loss,
         take_profit: row.take_profit,
-        is_copy_trade: row.is_copy_trade,
-        source_wallet: row.source_wallet,
         realized_pnl: row.realized_pnl,
         opened_at: row.opened_at,
         updated_at: Utc::now(),
@@ -398,8 +378,6 @@ mod tests {
             unrealized_pnl_pct: Decimal::new(10, 0),
             stop_loss: Some(Decimal::new(45, 2)),
             take_profit: None,
-            is_copy_trade: false,
-            source_wallet: None,
             realized_pnl: None,
             opened_at: Utc::now(),
             updated_at: Utc::now(),

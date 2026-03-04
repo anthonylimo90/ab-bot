@@ -71,7 +71,6 @@ export function Header() {
   const signalDropdownRef = useRef<HTMLDivElement>(null);
 
   const isTradingActive =
-    currentWorkspace?.copy_trading_enabled ||
     currentWorkspace?.live_trading_enabled ||
     currentWorkspace?.arb_auto_execute ||
     false;
@@ -81,7 +80,6 @@ export function Header() {
       if (!currentWorkspace) throw new Error("No workspace");
       const pausing = isTradingActive;
       return api.updateWorkspace(currentWorkspace.id, {
-        copy_trading_enabled: !pausing,
         live_trading_enabled: !pausing,
         arb_auto_execute: !pausing,
       });
@@ -89,7 +87,6 @@ export function Header() {
     onSuccess: (updatedWorkspace) => {
       setCurrentWorkspace(updatedWorkspace);
       const paused =
-        !updatedWorkspace.copy_trading_enabled &&
         !updatedWorkspace.live_trading_enabled &&
         !updatedWorkspace.arb_auto_execute;
       if (paused) {

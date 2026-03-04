@@ -4,47 +4,10 @@ export {
   usePositionQuery,
   useClosePositionMutation,
   useOpenPositions,
-  useCopyTradePositions,
 } from "./usePositionsQuery";
 
-// Wallet queries
-export {
-  useWalletsQuery,
-  useWalletQuery,
-  useWalletMetricsQuery,
-  useTrackWalletMutation,
-  useUntrackWalletMutation,
-  useUpdateWalletMutation,
-  useRosterWallets,
-  useBenchWallets,
-} from "./useWalletsQuery";
-
-// Discovery queries
-export {
-  useDiscoverWalletsQuery,
-  useLiveTradesQuery,
-  useLeaderboardQuery,
-} from "./useDiscoverQuery";
-
-// Recommendations queries
-export {
-  useRotationRecommendationsQuery,
-  useDismissRecommendation,
-  useAcceptRecommendation,
-  type RotationRecommendation,
-  type RecommendationType,
-  type RecommendationReason,
-  type Urgency,
-} from "./useRecommendationsQuery";
-
-// Optimizer queries
-export {
-  useOptimizerStatusQuery,
-  useRotationHistoryQuery,
-  useTriggerOptimizationMutation,
-  useAcknowledgeRotationMutation,
-  useUnacknowledgedRotationCount,
-} from "./useOptimizerQuery";
+// Wallet balance query
+export { useWalletBalanceQuery } from "./useWalletsQuery";
 
 // History queries
 export {
@@ -55,8 +18,12 @@ export {
 // Risk monitoring queries
 export {
   useRiskStatusQuery,
+  useDynamicTunerQuery,
+  useServiceStatusQuery,
   useManualTripMutation,
   useResetCircuitBreakerMutation,
+  useUpdateOpportunitySelectionMutation,
+  useUpdateArbExecutorMutation,
 } from "./useRiskQuery";
 
 // Signal queries
@@ -65,18 +32,5 @@ export {
   useRecentSignalsQuery,
   useStrategyPerformanceQuery,
   useMarketMetadataQuery,
+  useMarketRegimeQuery,
 } from "./useSignalsQuery";
-
-// Allocation queries
-export {
-  useAllocationsQuery,
-  useActiveAllocationsQuery,
-  useBenchAllocationsQuery,
-  useAddAllocationMutation,
-  useUpdateAllocationMutation,
-  usePromoteAllocationMutation,
-  useDemoteAllocationMutation,
-  useRemoveAllocationMutation,
-  usePinAllocationMutation,
-  useUnpinAllocationMutation,
-} from "./useAllocationsQuery";

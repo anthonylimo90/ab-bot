@@ -2,7 +2,7 @@
 //!
 //! Background task that periodically computes per-strategy performance snapshots
 //! by joining `quant_signals → positions` (for quant strategies) and querying
-//! `positions` directly (for arb and copy_trade sources).
+//! `positions` directly (for arb source).
 //!
 //! Results are written to `strategy_pnl_snapshots` for dashboard display
 //! and dynamic tuner feedback.
@@ -94,7 +94,7 @@ struct StrategyPnlRow {
     avg_hold_hours: Option<f64>,
 }
 
-/// Row type for source-based P&L (arb, copy_trade).
+/// Row type for source-based P&L (arb).
 #[derive(Debug, sqlx::FromRow)]
 struct SourcePnlRow {
     total_positions: i64,
@@ -187,32 +187,6 @@ async fn compute_cycle(
         .fetch_optional(pool)
         .await?;
 
-        // ── Copy trade strategy: positions with source = 2 ──
-        let copy_row = sqlx::query_as::<_, SourcePnlRow>(
-            r#"
-            SELECT
-                COUNT(*)::bigint AS total_positions,
-                COUNT(*) FILTER (WHERE realized_pnl > 0 AND state = 4)::bigint AS wins,
-                COUNT(*) FILTER (WHERE realized_pnl <= 0 AND state = 4)::bigint AS losses,
-                SUM(realized_pnl) FILTER (WHERE state = 4) AS net_pnl,
-                AVG(realized_pnl) FILTER (WHERE state = 4) AS avg_pnl,
-                AVG(
-                    EXTRACT(EPOCH FROM (exit_timestamp - entry_timestamp)) / 3600.0
-                ) FILTER (
-                    WHERE state = 4
-                      AND exit_timestamp IS NOT NULL
-                ) AS avg_hold_hours
-            FROM positions
-            WHERE source = 2
-              AND entry_timestamp >= $1
-              AND entry_timestamp <= $2
-            "#,
-        )
-        .bind(window_start)
-        .bind(now)
-        .fetch_optional(pool)
-        .await?;
-
         // ── Acquire semaphore for DB writes ──
         let _permit = db_semaphore.acquire().await.expect("semaphore closed");
 
@@ -267,35 +241,6 @@ async fn compute_cycle(
                     row.avg_pnl.unwrap_or(Decimal::ZERO),
                     win_rate,
                     None, // arb Sharpe computed separately if needed
-                    row.avg_hold_hours.unwrap_or(0.0),
-                )
-                .await?;
-                total_rows += 1;
-            }
-        }
-
-        // Upsert copy_trade snapshot
-        if let Some(row) = &copy_row {
-            if row.total_positions > 0 {
-                let win_rate = if (row.wins + row.losses) > 0 {
-                    Some(row.wins as f64 / (row.wins + row.losses) as f64)
-                } else {
-                    None
-                };
-
-                upsert_snapshot(
-                    pool,
-                    "copy_trade",
-                    now,
-                    period_days,
-                    row.total_positions as i32,
-                    row.total_positions as i32,
-                    row.wins as i32,
-                    row.losses as i32,
-                    row.net_pnl.unwrap_or(Decimal::ZERO),
-                    row.avg_pnl.unwrap_or(Decimal::ZERO),
-                    win_rate,
-                    None,
                     row.avg_hold_hours.unwrap_or(0.0),
                 )
                 .await?;
@@ -446,7 +391,7 @@ mod tests {
     #[test]
     fn test_sharpe_calculation_logic() {
         // Simulate: [10.0, -5.0, 8.0, -2.0, 12.0]
-        let vals = vec![10.0_f64, -5.0, 8.0, -2.0, 12.0];
+        let vals = [10.0_f64, -5.0, 8.0, -2.0, 12.0];
         let n = vals.len() as f64;
         let mean = vals.iter().sum::<f64>() / n; // 4.6
         let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);

@@ -36,7 +36,7 @@ interface UseActivityReturn {
 
 // Map signal type to activity type
 function signalToActivity(signal: SignalUpdate): Activity {
-  let type: ActivityType = "RECOMMENDATION_NEW";
+  let type: ActivityType = "ARBITRAGE_DETECTED";
   let message = "";
 
   switch (signal.signal_type) {
@@ -69,21 +69,6 @@ function signalToActivity(signal: SignalUpdate): Activity {
       }
       break;
     }
-    case "CopyTrade":
-      if (signal.action === "skipped") {
-        type = "TRADE_COPY_SKIPPED";
-        message = `Skipped: ${signal.metadata?.reason || "Unknown reason"}`;
-      } else if (signal.action === "failed") {
-        type = "TRADE_COPY_FAILED";
-        message = `Failed: ${signal.metadata?.error || "Unknown error"}`;
-      } else if (signal.action === "copied") {
-        type = "TRADE_COPIED";
-        message = `Copied trade on ${signal.market_id}`;
-      } else {
-        type = "TRADE_COPIED";
-        message = `Copy trade signal: ${signal.action} on ${signal.market_id}`;
-      }
-      break;
     case "StopLoss":
       type = "STOP_LOSS_TRIGGERED";
       message = `Stop-loss triggered on ${signal.market_id}`;
@@ -97,7 +82,7 @@ function signalToActivity(signal: SignalUpdate): Activity {
         type = "ARB_EXIT_FAILED";
         message = `Exit failed: ${signal.metadata?.reason || "Unknown reason"}`;
       } else {
-        type = "RECOMMENDATION_NEW";
+        type = "ARBITRAGE_DETECTED";
         message = String(signal.metadata?.message || signal.action);
       }
       break;
@@ -172,22 +157,15 @@ export function useActivity(): UseActivityReturn {
     // Fire toast notification
     const toast = useToastStore.getState();
     switch (activity.type) {
-      case "TRADE_COPIED":
-        toast.success("Trade Copied", activity.message);
-        break;
       case "ARB_POSITION_OPENED":
         toast.success("Arb Position Opened", activity.message);
         break;
       case "ARB_POSITION_CLOSED":
         toast.info("Arb Position Closed", activity.message);
         break;
-      case "TRADE_COPY_FAILED":
       case "ARB_EXECUTION_FAILED":
       case "ARB_EXIT_FAILED":
         toast.error("Trading Error", activity.message);
-        break;
-      case "TRADE_COPY_SKIPPED":
-        toast.warning("Trade Skipped", activity.message);
         break;
       case "STOP_LOSS_TRIGGERED":
       case "TAKE_PROFIT_TRIGGERED":

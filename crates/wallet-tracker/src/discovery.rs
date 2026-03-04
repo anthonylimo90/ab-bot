@@ -233,9 +233,9 @@ impl WalletDiscovery {
                 *rejection_reasons.entry("low_win_rate").or_insert(0) += 1;
             } else if wallet.total_volume < criteria.min_volume {
                 *rejection_reasons.entry("low_volume").or_insert(0) += 1;
-            } else if criteria.exclude_bots && wallet.bot_score.map_or(false, |s| s >= 50) {
+            } else if criteria.exclude_bots && wallet.bot_score.is_some_and(|s| s >= 50) {
                 *rejection_reasons.entry("bot_detected").or_insert(0) += 1;
-            } else if criteria.min_roi.map_or(false, |min| wallet.roi < min) {
+            } else if criteria.min_roi.is_some_and(|min| wallet.roi < min) {
                 *rejection_reasons.entry("low_roi").or_insert(0) += 1;
             } else if criteria.max_staleness_days > 0 {
                 let cutoff = Utc::now() - Duration::days(criteria.max_staleness_days as i64);

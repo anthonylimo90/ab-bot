@@ -2,21 +2,16 @@
 
 pub mod activity;
 pub mod admin_workspaces;
-pub mod allocations;
 pub mod auth;
-pub mod auto_rotation;
 pub mod backtest;
 
 pub mod discover;
 pub mod health;
-pub mod invites;
 pub mod markets;
-pub mod onboarding;
 pub mod order_signing;
 pub mod positions;
 pub mod recommendations;
 pub mod risk;
-pub mod risk_allocations;
 pub mod signals;
 pub mod trading;
 pub mod users;

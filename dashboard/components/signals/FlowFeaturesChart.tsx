@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -24,9 +24,21 @@ function formatTime(dateStr: string) {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-export function FlowFeaturesChart() {
+interface FlowFeaturesChartProps {
+  initialConditionId?: string;
+}
+
+export function FlowFeaturesChart({ initialConditionId }: FlowFeaturesChartProps) {
   const [conditionId, setConditionId] = useState("");
   const [inputValue, setInputValue] = useState("");
+
+  // Sync from external prop
+  useEffect(() => {
+    if (initialConditionId) {
+      setConditionId(initialConditionId);
+      setInputValue(initialConditionId);
+    }
+  }, [initialConditionId]);
   const { data: features = [], isLoading } = useFlowFeaturesQuery(
     conditionId,
     60,

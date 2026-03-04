@@ -139,34 +139,6 @@ export function calculatePnL(
   return { amount, percent };
 }
 
-/** Map raw skip-reason strings to human-readable labels. */
-export function formatSkipReason(reason: string): string {
-  const SKIP_LABELS: Record<string, string> = {
-    market_not_active: "Resolved Market",
-    below_minimum: "Below Min Value",
-    trade_too_old: "Stale Trade",
-    too_stale: "Stale Trade",
-    SlippageTooHigh: "High Slippage",
-    slippage: "High Slippage",
-    market_cache_empty: "Cache Loading",
-    near_resolution: "Near Resolution",
-    duplicate: "Duplicate",
-    insufficient_capital: "Insufficient Capital",
-    max_positions_reached: "Max Positions",
-    position_limit: "Max Positions",
-    wallet_not_active: "Wallet Not Active",
-    circuit_breaker: "Circuit Breaker",
-    daily_limit: "Daily Limit",
-    zero_capital: "Zero Capital",
-    market_not_found: "Market Not Found",
-    order_rejected: "Order Rejected",
-    invalid_fill: "Invalid Fill",
-    not_copied: "Not Copied",
-    execution_error: "Execution Error",
-  };
-  return SKIP_LABELS[reason] ?? reason.replace(/_/g, " ");
-}
-
 export function formatDynamicKey(key: string | null): string {
   if (!key) return "(global)";
   const labels: Record<string, string> = {
@@ -174,20 +146,10 @@ export function formatDynamicKey(key: string | null): string {
     ARB_MONITOR_EXPLORATION_SLOTS: "Exploration Slots",
     ARB_MONITOR_MAX_MARKETS: "Max Monitored Markets",
     ARB_MIN_PROFIT_THRESHOLD: "Min Net Profit Threshold",
-    COPY_MIN_TRADE_VALUE: "Min Copy Trade Value",
-    COPY_MAX_SLIPPAGE_PCT: "Max Copy Slippage",
-    COPY_MAX_LATENCY_SECS: "Max Copy Trade Age",
-    COPY_DAILY_CAPITAL_LIMIT: "Daily Capital Limit",
-    COPY_MAX_OPEN_POSITIONS: "Max Open Positions",
-    COPY_STOP_LOSS_PCT: "Stop-Loss %",
-    COPY_TAKE_PROFIT_PCT: "Take-Profit %",
-    COPY_MAX_HOLD_HOURS: "Max Hold Hours",
     ARB_POSITION_SIZE: "Arb Position Size",
     ARB_MIN_NET_PROFIT: "Arb Min Net Profit",
     ARB_MIN_BOOK_DEPTH: "Arb Min Book Depth",
     ARB_MAX_SIGNAL_AGE_SECS: "Arb Max Signal Age",
-    COPY_TOTAL_CAPITAL: "Total Copy Capital",
-    COPY_NEAR_RESOLUTION_MARGIN: "Near-Resolution Margin",
   };
   return labels[key] ?? key;
 }
@@ -202,12 +164,6 @@ export function formatDynamicConfigValue(
     if (value >= 1.5) return "discovery";
     return "balanced";
   }
-  if (key === "COPY_MAX_LATENCY_SECS") {
-    const secs = Math.round(value);
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return m > 0 ? `${m}m ${s}s` : `${s}s`;
-  }
   if (key === "ARB_POSITION_SIZE") return formatCurrency(value);
   if (key === "ARB_MIN_NET_PROFIT") return value.toFixed(4);
   if (key === "ARB_MIN_BOOK_DEPTH") return formatCurrency(value);
@@ -216,22 +172,6 @@ export function formatDynamicConfigValue(
     const m = Math.floor(secs / 60);
     const s = secs % 60;
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
-  }
-  if (key === "COPY_MIN_TRADE_VALUE") return formatCurrency(value);
-  // Backend stores slippage as ratio (0.01 = 1%), so multiply by 100
-  if (key === "COPY_MAX_SLIPPAGE_PCT") return `${(value * 100).toFixed(2)}%`;
-  if (key === "COPY_DAILY_CAPITAL_LIMIT") return formatCurrency(value);
-  if (key === "COPY_MAX_OPEN_POSITIONS") return String(Math.round(value));
-  // Backend stores stop-loss/take-profit as ratio (0.15 = 15%)
-  if (key === "COPY_STOP_LOSS_PCT") return `${(value * 100).toFixed(1)}%`;
-  if (key === "COPY_TAKE_PROFIT_PCT") return `${(value * 100).toFixed(1)}%`;
-  if (key === "COPY_MAX_HOLD_HOURS") {
-    const h = Math.round(value);
-    return h >= 24 ? `${(h / 24).toFixed(1)}d` : `${h}h`;
-  }
-  if (key === "COPY_TOTAL_CAPITAL") return formatCurrency(value);
-  if (key === "COPY_NEAR_RESOLUTION_MARGIN") {
-    return value === 0 ? "disabled" : `\u00b1${(value * 100).toFixed(1)}%`;
   }
   return Number.isInteger(value) ? String(value) : value.toFixed(4);
 }

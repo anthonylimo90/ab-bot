@@ -18,7 +18,6 @@ pub mod channels {
     pub const ARB_EXIT: &str = "arb:exit";
     pub const ARB_PRICES: &str = "arb:prices";
     pub const ARB_ALERTS: &str = "arb:alerts";
-    pub const COPY_SIGNALS: &str = "copy:signals";
     pub const ORDERBOOK_UPDATES: &str = "orderbook:updates";
 }
 
@@ -29,8 +28,6 @@ pub struct RedisForwarderConfig {
     pub redis_url: String,
     /// Whether to subscribe to arbitrage signals.
     pub subscribe_arb: bool,
-    /// Whether to subscribe to copy trade signals.
-    pub subscribe_copy: bool,
     /// Whether to subscribe to orderbook updates.
     pub subscribe_orderbook: bool,
     /// Reconnection delay in seconds.
@@ -42,7 +39,6 @@ impl Default for RedisForwarderConfig {
         Self {
             redis_url: "redis://127.0.0.1:6379".to_string(),
             subscribe_arb: true,
-            subscribe_copy: true,
             subscribe_orderbook: true,
             reconnect_delay_secs: 5,
         }
@@ -56,9 +52,6 @@ impl RedisForwarderConfig {
             redis_url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
             subscribe_arb: std::env::var("REDIS_SUBSCRIBE_ARB")
-                .map(|v| v == "true")
-                .unwrap_or(true),
-            subscribe_copy: std::env::var("REDIS_SUBSCRIBE_COPY")
                 .map(|v| v == "true")
                 .unwrap_or(true),
             subscribe_orderbook: std::env::var("REDIS_SUBSCRIBE_ORDERBOOK")
@@ -131,11 +124,6 @@ impl RedisForwarder {
             debug!("Subscribed to arbitrage channels");
         }
 
-        if self.config.subscribe_copy {
-            pubsub.subscribe(channels::COPY_SIGNALS).await?;
-            debug!("Subscribed to copy trading channel");
-        }
-
         if self.config.subscribe_orderbook {
             pubsub.subscribe(channels::ORDERBOOK_UPDATES).await?;
             debug!("Subscribed to orderbook updates channel");
@@ -175,9 +163,6 @@ impl RedisForwarder {
             }
             channels::ARB_ALERTS => {
                 self.handle_arb_alert(payload).await?;
-            }
-            channels::COPY_SIGNALS => {
-                self.handle_copy_signal(payload).await?;
             }
             channels::ORDERBOOK_UPDATES => {
                 self.handle_orderbook_update(payload).await?;
@@ -308,52 +293,6 @@ impl RedisForwarder {
         Ok(())
     }
 
-    async fn handle_copy_signal(&self, payload: &str) -> anyhow::Result<()> {
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        struct CopySignal {
-            wallet_address: String,
-            market_id: String,
-            outcome_id: String,
-            action: String,
-            quantity: String,
-            price: String,
-            #[serde(default)]
-            timestamp: Option<String>,
-        }
-
-        let copy: CopySignal = serde_json::from_str(payload)?;
-
-        let signal = SignalUpdate {
-            signal_id: uuid::Uuid::new_v4(),
-            signal_type: SignalType::CopyTrade,
-            market_id: copy.market_id.clone(),
-            outcome_id: copy.outcome_id,
-            action: copy.action,
-            confidence: 1.0,
-            timestamp: copy
-                .timestamp
-                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
-            metadata: serde_json::json!({
-                "wallet_address": copy.wallet_address,
-                "quantity": copy.quantity,
-                "price": copy.price,
-            }),
-        };
-
-        let _ = self.signal_tx.send(signal);
-
-        info!(
-            market_id = %copy.market_id,
-            wallet = %copy.wallet_address,
-            "Forwarded copy trade signal"
-        );
-
-        Ok(())
-    }
-
     async fn handle_orderbook_update(&self, payload: &str) -> anyhow::Result<()> {
         #[derive(serde::Deserialize)]
         struct RawOrderbookUpdate {
@@ -422,7 +361,6 @@ mod tests {
         let config = RedisForwarderConfig::default();
         assert_eq!(config.redis_url, "redis://127.0.0.1:6379");
         assert!(config.subscribe_arb);
-        assert!(config.subscribe_copy);
         assert!(config.subscribe_orderbook);
         assert_eq!(config.reconnect_delay_secs, 5);
     }
@@ -441,32 +379,5 @@ mod tests {
 
         let arb: ArbOpportunity = serde_json::from_str(json).unwrap();
         assert_eq!(arb.market_id, "test-market");
-    }
-
-    #[test]
-    fn test_copy_signal_parsing() {
-        let json = r#"{
-            "wallet_address": "0x123",
-            "market_id": "test-market",
-            "outcome_id": "yes",
-            "action": "buy",
-            "quantity": "100",
-            "price": "0.50"
-        }"#;
-
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        struct CopySignal {
-            wallet_address: String,
-            market_id: String,
-            outcome_id: String,
-            action: String,
-            quantity: String,
-            price: String,
-        }
-
-        let copy: CopySignal = serde_json::from_str(json).unwrap();
-        assert_eq!(copy.wallet_address, "0x123");
-        assert_eq!(copy.market_id, "test-market");
     }
 }

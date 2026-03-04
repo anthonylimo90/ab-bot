@@ -113,7 +113,7 @@ pub(crate) struct OutcomeTokenCache {
     clob_client: Arc<ClobClient>,
     tokens: RwLock<HashMap<String, (String, String)>>,
     /// Shared set of active (non-resolved) market IDs, populated on each refresh.
-    /// Copy trading monitor reads this to skip resolved markets before hitting CLOB.
+    /// Used to skip resolved markets before hitting CLOB.
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
     /// Database pool for persisting token→condition_id mappings.
     pool: Option<PgPool>,
@@ -178,7 +178,7 @@ impl OutcomeTokenCache {
         *self.tokens.write().await = map;
         *self.active_clob_markets.write().await = active_set;
 
-        // Batch UPSERT token→condition_id mappings to DB for copy trading resolution
+        // Batch UPSERT token→condition_id mappings to DB for resolution checks
         if let Some(ref pool) = self.pool {
             if let Err(e) = Self::upsert_token_condition_cache(pool, &token_condition_pairs).await {
                 warn!(error = %e, "Failed to update token_condition_cache");
