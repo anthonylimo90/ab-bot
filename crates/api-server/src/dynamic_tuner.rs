@@ -848,7 +848,10 @@ impl DynamicTuner {
                 key: KEY_ARB_MIN_PROFIT_THRESHOLD,
                 default_value: env_decimal("ARB_MIN_PROFIT_THRESHOLD", Decimal::new(5, 3)),
                 min_value: Decimal::new(2, 3),
-                max_value: Decimal::new(5, 2),
+                // Temporarily capped at 0.005 to force-clamp the stale 0.05 DB value
+                // down to the correct threshold.  Revert to Decimal::new(5, 2) once
+                // the production row reads 0.005.
+                max_value: Decimal::new(5, 3),
                 max_step_pct: Decimal::new(12, 2),
             },
             ConfigSeed {
