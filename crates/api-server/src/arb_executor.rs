@@ -301,22 +301,41 @@ impl ArbAutoExecutor {
             "Starting arb auto-executor (always-on, per-signal guard)"
         );
 
-        // Initial token cache load
-        match self.token_cache.refresh().await {
-            Ok((count, active_set_size)) => info!(
-                markets = count,
-                active_set_size, "Outcome token cache loaded"
-            ),
-            Err(e) => warn!(error = %e, "Failed to load token cache, will retry"),
-        }
+        // Mark liveness immediately so the dashboard doesn't flag a stale heartbeat
+        // while the slow initial cache load runs.
+        self.heartbeat
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
 
-        // Load active positions for dedup
+        // Load active positions for dedup (fast DB query, do this first)
         if let Ok(active) = self.position_repo.get_active().await {
             let mut set = self.active_markets.write().await;
             for pos in &active {
                 set.insert(pos.market_id.clone());
             }
             info!(active_positions = %active.len(), "Loaded active positions for dedup");
+        }
+
+        // Initial token cache load — can take minutes with 190k+ markets and rate limiting.
+        // Keep heartbeat alive during the slow load so the dashboard doesn't flag us as stale.
+        {
+            let hb = self.heartbeat.clone();
+            let keeper = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(15));
+                loop {
+                    tick.tick().await;
+                    hb.store(Utc::now().timestamp(), Ordering::Relaxed);
+                }
+            });
+
+            match self.token_cache.refresh().await {
+                Ok((count, active_set_size)) => info!(
+                    markets = count,
+                    active_set_size, "Outcome token cache loaded"
+                ),
+                Err(e) => warn!(error = %e, "Failed to load token cache, will retry"),
+            }
+
+            keeper.abort();
         }
 
         let cache_interval = tokio::time::Duration::from_secs(startup_cfg.cache_refresh_secs);
