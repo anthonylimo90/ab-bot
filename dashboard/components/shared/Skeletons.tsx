@@ -111,54 +111,6 @@ export function ActivityFeedSkeleton({ items = 4 }: { items?: number }) {
   );
 }
 
-export function WalletCardSkeleton() {
-  return (
-    <Card>
-      <CardContent className="p-6">
-        <div className="flex flex-col gap-6">
-          <div className="flex items-center gap-4">
-            <BaseSkeleton className="h-10 w-10 rounded-full" />
-            <div className="space-y-2">
-              <BaseSkeleton className="h-4 w-32" />
-              <BaseSkeleton className="h-3 w-24" />
-            </div>
-          </div>
-          <div className="grid grid-cols-5 gap-4">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <div key={i} className="space-y-1">
-                <BaseSkeleton className="h-3 w-12" />
-                <BaseSkeleton className="h-4 w-16" />
-              </div>
-            ))}
-          </div>
-          <BaseSkeleton className="h-20 w-full rounded-lg" />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-export function AllocationPieSkeleton() {
-  return (
-    <div className="space-y-4">
-      <div className="flex justify-center">
-        <BaseSkeleton className="h-[200px] w-[200px] rounded-full" />
-      </div>
-      <div className="space-y-3">
-        {Array.from({ length: 4 }).map((_, i) => (
-          <div key={i} className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <BaseSkeleton className="h-3 w-3 rounded-full" />
-              <BaseSkeleton className="h-4 w-20" />
-            </div>
-            <BaseSkeleton className="h-4 w-12" />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 export function DashboardSkeleton() {
   return (
     <div className="space-y-6">
@@ -168,37 +120,16 @@ export function DashboardSkeleton() {
           <BaseSkeleton className="h-8 w-32" />
           <BaseSkeleton className="h-4 w-48" />
         </div>
-        <BaseSkeleton className="h-10 w-36" />
       </div>
 
       {/* Stats Grid */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {Array.from({ length: 4 }).map((_, i) => (
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+        {Array.from({ length: 3 }).map((_, i) => (
           <MetricCardSkeleton key={i} />
         ))}
       </div>
 
-      {/* Charts */}
-      <div className="grid gap-6 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader>
-            <BaseSkeleton className="h-6 w-32" />
-          </CardHeader>
-          <CardContent>
-            <ChartSkeleton />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <BaseSkeleton className="h-6 w-40" />
-          </CardHeader>
-          <CardContent>
-            <AllocationPieSkeleton />
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Activity & Recommendations */}
+      {/* Activity + Equity Curve */}
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
@@ -210,14 +141,10 @@ export function DashboardSkeleton() {
         </Card>
         <Card>
           <CardHeader>
-            <BaseSkeleton className="h-6 w-40" />
+            <BaseSkeleton className="h-6 w-32" />
           </CardHeader>
           <CardContent>
-            <div className="space-y-4">
-              {Array.from({ length: 2 }).map((_, i) => (
-                <BaseSkeleton key={i} className="h-36 w-full rounded-lg" />
-              ))}
-            </div>
+            <ChartSkeleton height={320} />
           </CardContent>
         </Card>
       </div>

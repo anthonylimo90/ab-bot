@@ -38,7 +38,7 @@ import {
 
 const PAGE_SIZE = 50;
 
-type ActivityFilter = "all" | "arb" | "risk" | "wallet_events";
+type ActivityFilter = "all" | "arb" | "risk";
 type HistoryTab = "activity" | "dynamic";
 
 const activityMeta = {
@@ -87,23 +87,12 @@ const activityMeta = {
     icon: <TrendingUp className="h-4 w-4 text-green-500" />,
     badgeClass: "bg-green-500/10 text-green-600",
   },
-  WALLET_DEMOTED: {
-    label: "Demoted",
-    icon: <TrendingDown className="h-4 w-4 text-orange-500" />,
-    badgeClass: "bg-orange-500/10 text-orange-600",
-  },
-  WALLET_PROMOTED: {
-    label: "Promoted",
-    icon: <TrendingUp className="h-4 w-4 text-green-500" />,
-    badgeClass: "bg-green-500/10 text-green-600",
-  },
 } as const;
 
 function matchesFilter(type: string, filter: ActivityFilter): boolean {
   if (filter === "all") return true;
   if (filter === "arb") return type.startsWith("ARB_") || type === "ARBITRAGE_DETECTED";
   if (filter === "risk") return type === "STOP_LOSS_TRIGGERED" || type === "TAKE_PROFIT_TRIGGERED";
-  if (filter === "wallet_events") return type === "WALLET_DEMOTED" || type === "WALLET_PROMOTED";
   return true;
 }
 
@@ -233,7 +222,6 @@ export default function HistoryPage() {
                   <SelectItem value="all">All Activity</SelectItem>
                   <SelectItem value="arb">Arbitrage</SelectItem>
                   <SelectItem value="risk">Risk Events</SelectItem>
-                  <SelectItem value="wallet_events">Wallet Events</SelectItem>
                 </SelectContent>
               </Select>
             </div>

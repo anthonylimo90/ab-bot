@@ -173,21 +173,5 @@ export function formatDynamicConfigValue(
     const s = secs % 60;
     return m > 0 ? `${m}m ${s}s` : `${s}s`;
   }
-  if (key === "COPY_MIN_TRADE_VALUE") return formatCurrency(value);
-  // Backend stores slippage as ratio (0.01 = 1%), so multiply by 100
-  if (key === "COPY_MAX_SLIPPAGE_PCT") return `${(value * 100).toFixed(2)}%`;
-  if (key === "COPY_DAILY_CAPITAL_LIMIT") return formatCurrency(value);
-  if (key === "COPY_MAX_OPEN_POSITIONS") return String(Math.round(value));
-  // Backend stores stop-loss/take-profit as ratio (0.15 = 15%)
-  if (key === "COPY_STOP_LOSS_PCT") return `${(value * 100).toFixed(1)}%`;
-  if (key === "COPY_TAKE_PROFIT_PCT") return `${(value * 100).toFixed(1)}%`;
-  if (key === "COPY_MAX_HOLD_HOURS") {
-    const h = Math.round(value);
-    return h >= 24 ? `${(h / 24).toFixed(1)}d` : `${h}h`;
-  }
-  if (key === "COPY_TOTAL_CAPITAL") return formatCurrency(value);
-  if (key === "COPY_NEAR_RESOLUTION_MARGIN") {
-    return value === 0 ? "disabled" : `\u00b1${(value * 100).toFixed(1)}%`;
-  }
   return Number.isInteger(value) ? String(value) : value.toFixed(4);
 }

@@ -4,20 +4,18 @@ import { createContext, useContext, useEffect, useState } from "react";
 import { useAuthStore } from "@/stores/auth-store";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useWalletStore } from "@/stores/wallet-store";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, RefreshCw } from "lucide-react";
 
 interface WorkspaceContextValue {
   isInitializing: boolean;
   needsWorkspaceSelection: boolean;
-  needsSetup: boolean;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue>({
   isInitializing: true,
   needsWorkspaceSelection: false,
-  needsSetup: false,
 });
 
 export function useWorkspaceContext() {
@@ -43,7 +41,6 @@ interface WorkspaceProviderProps {
 
 export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const pathname = usePathname();
-  const router = useRouter();
   const { isAuthenticated, _hasHydrated: authHydrated, user } = useAuthStore();
   const {
     currentWorkspace,
@@ -135,24 +132,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     workspaces.length > 0 &&
     !isExemptRoute;
 
-  const needsSetup =
-    hasInitialized &&
-    currentWorkspace &&
-    currentWorkspace.onboarding_completed === false &&
-    pathname !== "/workspace/setup" &&
-    !isExemptRoute;
-
-  // Auto-redirect to setup if needed
-  useEffect(() => {
-    if (needsSetup && !isLoading) {
-      router.push("/workspace/setup");
-    }
-  }, [needsSetup, isLoading, router]);
-
   const contextValue: WorkspaceContextValue = {
     isInitializing,
     needsWorkspaceSelection: Boolean(needsWorkspaceSelection),
-    needsSetup: Boolean(needsSetup),
   };
 
   // Show retry UI if initialization failed
