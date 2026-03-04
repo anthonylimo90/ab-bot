@@ -18,8 +18,12 @@ export {
 // Risk monitoring queries
 export {
   useRiskStatusQuery,
+  useDynamicTunerQuery,
+  useServiceStatusQuery,
   useManualTripMutation,
   useResetCircuitBreakerMutation,
+  useUpdateOpportunitySelectionMutation,
+  useUpdateArbExecutorMutation,
 } from "./useRiskQuery";
 
 // Signal queries
