@@ -8,8 +8,10 @@ import {
 } from "@/hooks/queries/usePositionsQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { useRiskStatusQuery } from "@/hooks/queries/useRiskQuery";
+import { useRiskStatusQuery, useDynamicTunerQuery } from "@/hooks/queries/useRiskQuery";
 import { MetricCard } from "@/components/shared/MetricCard";
+import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
+import { Badge } from "@/components/ui/badge";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -47,6 +49,7 @@ export function DashboardHome() {
   const { currentWorkspace } = useWorkspaceStore();
   const { openPositions, totalUnrealizedPnl } = useOpenPositions();
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
+  const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
   const { data: closedPositions = [] } = usePositionsQuery({ status: "closed" });
   const stats = useMemo(() => {
     const totalValue = openPositions.reduce(
@@ -107,8 +110,44 @@ export function DashboardHome() {
         </div>
       </div>
 
+      {/* System Status Strip */}
+      {(riskStatus || dynamicTunerStatus) && (
+        <Card>
+          <CardContent className="p-4">
+            <div className="flex flex-wrap items-center gap-4">
+              {/* Circuit Breaker */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">Circuit Breaker:</span>
+                {riskStatus?.circuit_breaker?.tripped ? (
+                  <Badge variant="destructive" className="text-xs">TRIPPED</Badge>
+                ) : (
+                  <Badge className="bg-profit/10 text-profit border-profit/20 text-xs" variant="outline">OK</Badge>
+                )}
+              </div>
+              {/* Market Regime */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">Regime:</span>
+                <MarketRegimeBadge />
+              </div>
+              {/* Scanner Markets */}
+              {dynamicTunerStatus?.scanner_status && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-muted-foreground">Scanner:</span>
+                  <span className="text-xs font-medium">
+                    {dynamicTunerStatus.scanner_status.monitored_markets} markets
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    ({dynamicTunerStatus.scanner_status.core_markets} core / {dynamicTunerStatus.scanner_status.exploration_markets} explore)
+                  </span>
+                </div>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Stats Grid */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
           title="Portfolio Value"
           value={formatCurrency(stats.total_value)}
@@ -120,6 +159,11 @@ export function DashboardHome() {
           value={formatCurrency(stats.today_pnl, { showSign: true })}
           change={stats.today_pnl_percent}
           trend={stats.today_pnl >= 0 ? "up" : "down"}
+        />
+        <MetricCard
+          title="Unrealized P&L"
+          value={formatCurrency(totalUnrealizedPnl, { showSign: true })}
+          trend={totalUnrealizedPnl > 0 ? "up" : totalUnrealizedPnl < 0 ? "down" : "neutral"}
         />
         <MetricCard
           title="Open Positions"
