@@ -542,4 +542,3 @@ pub async fn get_discovered_wallet(
         }
     }
 }
-

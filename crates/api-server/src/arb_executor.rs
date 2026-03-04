@@ -178,6 +178,16 @@ impl OutcomeTokenCache {
         *self.tokens.write().await = map;
         *self.active_clob_markets.write().await = active_set;
 
+        // Deduplicate by token_id (same token can appear if cursor pages overlap)
+        let deduped: std::collections::HashMap<&str, &str> = token_condition_pairs
+            .iter()
+            .map(|(t, c)| (t.as_str(), c.as_str()))
+            .collect();
+        let token_condition_pairs: Vec<(String, String)> = deduped
+            .into_iter()
+            .map(|(t, c)| (t.to_owned(), c.to_owned()))
+            .collect();
+
         // Batch UPSERT token→condition_id mappings to DB for resolution checks
         if let Some(ref pool) = self.pool {
             if let Err(e) = Self::upsert_token_condition_cache(pool, &token_condition_pairs).await {

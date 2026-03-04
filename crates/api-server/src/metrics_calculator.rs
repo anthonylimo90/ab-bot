@@ -428,11 +428,6 @@ impl MetricsCalculator {
                 -- Active in the last 90 days
                 AND wf.last_trade >= NOW() - INTERVAL '90 days'
             ORDER BY
-                -- Tier 0: actively tracked wallets get absolute priority
-                CASE WHEN EXISTS (
-                    SELECT 1 FROM workspace_wallet_allocations wwa
-                    WHERE LOWER(wwa.wallet_address) = LOWER(wf.address)
-                ) THEN 0 ELSE 1 END,
                 -- Prioritize never-calculated
                 CASE WHEN wsm.last_computed IS NULL THEN 0 ELSE 1 END,
                 -- Then by staleness

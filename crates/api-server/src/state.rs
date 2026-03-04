@@ -184,6 +184,11 @@ impl AppState {
         let order_executor = Arc::new(OrderExecutor::new(clob_client.clone(), executor_config));
 
         if live_trading {
+            tracing::info!(
+                live_env = live_trading_env,
+                live_workspace = live_trading_workspace,
+                "Live trading enabled — initializing wallet"
+            );
             let startup_wallet = resolve_startup_wallet_address(&pool)
                 .await
                 .context("Failed resolving startup trading wallet address")?;
@@ -334,6 +339,12 @@ impl AppState {
                     }
                 }
             }
+        } else {
+            tracing::info!(
+                live_env = live_trading_env,
+                live_workspace = live_trading_workspace,
+                "Live trading NOT enabled — running in paper mode"
+            );
         }
 
         // Create circuit breaker for risk management
