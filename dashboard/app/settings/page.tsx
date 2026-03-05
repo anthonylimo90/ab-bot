@@ -29,6 +29,8 @@ import { useWorkspaceStore } from '@/stores/workspace-store';
 import { InviteMemberDialog } from '@/components/workspace/InviteMemberDialog';
 import { MemberList } from '@/components/workspace/MemberList';
 import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
+import { InfoTooltip } from '@/components/shared/InfoTooltip';
+import { PageIntro } from '@/components/shared/PageIntro';
 import { useWalletStore } from '@/stores/wallet-store';
 import api from '@/lib/api';
 import Link from 'next/link';
@@ -88,7 +90,7 @@ export default function SettingsPage() {
   const { data: invites = [] } = useQuery({
     queryKey: ['workspace', currentWorkspace?.id, 'invites'],
     queryFn: () => api.listWorkspaceInvites(currentWorkspace!.id),
-    enabled: !!currentWorkspace?.id,
+    enabled: !!currentWorkspace?.id && canInvite,
   });
 
   // Fetch service status
@@ -291,9 +293,19 @@ export default function SettingsPage() {
       <div>
         <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">Settings</h1>
         <p className="text-muted-foreground">
-          Manage your account, trading configuration, and risk parameters
+          Manage your team, wallet setup, automation, and safety controls
         </p>
       </div>
+
+      <PageIntro
+        title="What you can change here"
+        description="This page controls who can access the workspace, which wallet the bot can trade with, whether automated trading is allowed, and what safety limits stop the system."
+        bullets={[
+          "Account and Wallet sections control where live trades are sent.",
+          "Trading Configuration controls whether the system is allowed to place real trades automatically.",
+          "Risk Management defines the limits that pause trading when losses or instability appear."
+        ]}
+      />
 
       {/* Account */}
       <Card>
@@ -303,26 +315,29 @@ export default function SettingsPage() {
             Account
           </CardTitle>
           <CardDescription>
-            Wallet configuration for live trading
+            Choose which wallet the bot is allowed to use for live trading
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="rounded-lg border p-4">
             <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <p className="font-medium">Connected Wallets</p>
+                <p className="flex items-center gap-2 font-medium">
+                  <span>Connected Wallets</span>
+                  <InfoTooltip content="These are the wallets stored for this workspace. The wallet marked Active is the one the bot will use for live trading." />
+                </p>
                 <p className="text-sm text-muted-foreground">
-                  Primary wallet is used automatically for live trading
+                  The wallet marked Active is used automatically for live trading
                 </p>
               </div>
-              <Button onClick={() => setConnectWalletOpen(true)} className="w-full sm:w-auto">Connect Wallet</Button>
+              <Button onClick={() => setConnectWalletOpen(true)} className="w-full sm:w-auto">Add Wallet</Button>
             </div>
 
             {walletLoading && connectedWallets.length === 0 ? (
               <p className="text-sm text-muted-foreground">Loading wallets...</p>
             ) : connectedWallets.length === 0 ? (
               <p className="text-sm text-muted-foreground">
-                No wallets connected yet. Connect one to enable live trading.
+                No wallets connected yet. Add one before turning on live trading.
               </p>
             ) : (
               <div className="space-y-2">
@@ -354,7 +369,7 @@ export default function SettingsPage() {
                             onClick={() => handleMakePrimary(wallet.address)}
                             disabled={walletLoading}
                           >
-                            Set Active
+                            Use for Trading
                           </Button>
                         )}
                         <Button
@@ -385,13 +400,14 @@ export default function SettingsPage() {
               Wallet Connection
             </CardTitle>
             <CardDescription>
-              Configure WalletConnect for MetaMask and other wallet connections
+              Set up browser wallet sign-in for people who use MetaMask or other WalletConnect-compatible wallets
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="walletconnect-project-id">
+              <label className="inline-flex items-center gap-1 text-sm font-medium" htmlFor="walletconnect-project-id">
                 WalletConnect Project ID
+                <InfoTooltip content="This is the app identifier from WalletConnect Cloud. Without it, browser wallets cannot connect to this dashboard." />
               </label>
               <div className="flex flex-col gap-2 sm:flex-row">
                 <input
@@ -431,7 +447,7 @@ export default function SettingsPage() {
             {!walletConnectProjectId && !currentWorkspace.walletconnect_project_id && (
               <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-3">
                 <p className="text-sm text-yellow-500">
-                  Wallet connection requires a WalletConnect project ID. Create a free account at WalletConnect Cloud to get started.
+                  Browser wallet sign-in is not ready yet. Add a WalletConnect project ID to enable MetaMask and similar wallets.
                 </p>
               </div>
             )}
@@ -440,7 +456,7 @@ export default function SettingsPage() {
               <div className="rounded-lg border border-green-500/20 bg-green-500/10 p-3">
                 <p className="text-sm text-green-500 flex items-center gap-2">
                   <Check className="h-4 w-4" />
-                  Wallet connection is configured. Users can connect their MetaMask wallets.
+                  Browser wallet connection is configured.
                 </p>
               </div>
             )}
@@ -457,17 +473,20 @@ export default function SettingsPage() {
               Trading Configuration
             </CardTitle>
             <CardDescription>
-              Configure trading services and blockchain connectivity
+              Control the services and permissions the bot needs before it can trade automatically
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
             {/* Service Status Indicators */}
             {serviceStatus && (
               <div className="rounded-lg border p-4 space-y-2">
-                <p className="text-sm font-medium mb-3">Service Status</p>
+                <p className="flex items-center gap-2 text-sm font-medium mb-3">
+                  <span>Service Status</span>
+                  <InfoTooltip content="These services must be healthy for automated trading to work correctly. A stopped service usually means the bot cannot monitor or execute trades reliably." />
+                </p>
                 {Object.entries(serviceStatus).map(([key, status]) => (
                   <div key={key} className="flex flex-col gap-1 text-sm sm:flex-row sm:items-center sm:justify-between">
-                    <span className="capitalize">{key.replace(/_/g, ' ')}</span>
+                <span className="capitalize">{key.replace(/_/g, ' ')}</span>
                     <div className="flex items-center gap-2">
                       <span
                         className={`inline-block h-2 w-2 rounded-full ${
@@ -485,8 +504,9 @@ export default function SettingsPage() {
 
             {/* Polygon RPC */}
             <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="polygon-rpc-url">
+              <label className="inline-flex items-center gap-1 text-sm font-medium" htmlFor="polygon-rpc-url">
                 Polygon RPC URL
+                <InfoTooltip content="This is the blockchain connection used to read wallet balances and send on-chain transactions. If it is missing or slow, live trading can fail." />
               </label>
               <input
                 id="polygon-rpc-url"
@@ -497,7 +517,7 @@ export default function SettingsPage() {
                 className="w-full rounded border bg-background px-3 py-2 text-sm"
               />
               <p className="text-xs text-muted-foreground">
-                Required for wallet monitoring and on-chain operations. Accepted providers:
+                Needed for wallet monitoring and blockchain operations. Accepted providers:
                 Alchemy, Infura, Ankr, Polygon, LlamaRPC, DRPC, PublicNode, 1RPC,
                 Tenderly, Particle Network.
               </p>
@@ -505,8 +525,9 @@ export default function SettingsPage() {
 
             {/* Alchemy API Key */}
             <div className="space-y-2">
-              <label className="text-sm font-medium" htmlFor="alchemy-api-key">
+              <label className="inline-flex items-center gap-1 text-sm font-medium" htmlFor="alchemy-api-key">
                 Alchemy API Key
+                <InfoTooltip content="If you use Alchemy, you can supply the API key directly here instead of entering the full RPC URL." />
               </label>
               <input
                 id="alchemy-api-key"
@@ -517,7 +538,7 @@ export default function SettingsPage() {
                 className="w-full rounded border bg-background px-3 py-2 text-sm"
               />
               <p className="text-xs text-muted-foreground">
-                Alternative to Polygon RPC URL. Leave empty to keep current key.
+                Optional shortcut for Alchemy users. Leave empty to keep the current key.
               </p>
             </div>
 
@@ -526,7 +547,7 @@ export default function SettingsPage() {
               <div>
                 <p className="font-medium">Arbitrage Auto-Execute</p>
                 <p className="text-sm text-muted-foreground">
-                  Automatically execute detected arbitrage opportunities
+                  Let the bot place arbitrage trades automatically when it finds a qualified opportunity
                 </p>
               </div>
               <Switch
@@ -540,7 +561,7 @@ export default function SettingsPage() {
               <div>
                 <p className="font-medium">Exit Handler</p>
                 <p className="text-sm text-muted-foreground">
-                  Automatically close positions via market exit or resolution
+                  Let the bot close positions automatically when an exit condition or market resolution is reached
                 </p>
               </div>
               <Switch
@@ -554,7 +575,7 @@ export default function SettingsPage() {
               <div>
                 <p className="font-medium">Live Trading</p>
                 <p className="text-sm text-muted-foreground">
-                  Execute real orders with connected wallet
+                  Allow the system to place real trades with the active wallet
                 </p>
               </div>
               <Switch
@@ -566,7 +587,7 @@ export default function SettingsPage() {
               <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-3">
                 <p className="text-sm text-yellow-500 flex items-center gap-2">
                   <AlertTriangle className="h-4 w-4" />
-                  Live trading uses real funds. Ensure a wallet is connected and funded.
+                  Live trading uses real funds. Only turn this on when the active wallet is correct and funded.
                 </p>
               </div>
             )}
@@ -584,7 +605,7 @@ export default function SettingsPage() {
               ) : (
                 <>
                   <Save className="mr-2 h-4 w-4" />
-                  Save Trading Configuration
+                  Save Trading Settings
                 </>
               )}
             </Button>
@@ -603,13 +624,13 @@ export default function SettingsPage() {
                   Team
                 </CardTitle>
                 <CardDescription>
-                  Manage workspace members and invitations
+                  Control who can access this workspace and what they are allowed to do
                 </CardDescription>
               </div>
               {canInvite && (
                 <Button onClick={() => setInviteDialogOpen(true)}>
                   <UserPlus className="mr-2 h-4 w-4" />
-                  Invite Member
+                  Invite Teammate
                 </Button>
               )}
             </div>
@@ -617,7 +638,7 @@ export default function SettingsPage() {
           <CardContent className="space-y-6">
             {/* Members List */}
             <div>
-              <h3 className="text-sm font-medium mb-3">Members ({members.length})</h3>
+              <h3 className="text-sm font-medium mb-3">Workspace Members ({members.length})</h3>
               {membersLoading ? (
                 <div className="text-center py-4 text-muted-foreground">Loading...</div>
               ) : (
@@ -667,7 +688,7 @@ export default function SettingsPage() {
               User Management
             </CardTitle>
             <CardDescription>
-              Manage user accounts and permissions
+              Platform-wide account management for administrators
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -676,7 +697,7 @@ export default function SettingsPage() {
                 <div>
                   <p className="font-medium">Manage Users</p>
                   <p className="text-sm text-muted-foreground">
-                    Create, edit, and delete user accounts
+                    Create, edit, and remove platform user accounts
                   </p>
                 </div>
                 <ChevronRight className="h-5 w-5 text-muted-foreground" />
@@ -695,7 +716,7 @@ export default function SettingsPage() {
               Risk Management
             </CardTitle>
             <CardDescription>
-              Circuit breaker configuration — protects against cascading losses
+              Safety limits that pause automated trading when losses or instability exceed your limits
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
@@ -708,7 +729,7 @@ export default function SettingsPage() {
                   <div className="rounded-lg border border-red-500/20 bg-red-500/10 p-3">
                     <p className="text-sm text-red-500 flex items-center gap-2">
                       <AlertTriangle className="h-4 w-4" />
-                      Circuit breaker is tripped — trading is paused
+                      Safety stop is active and automated trading is paused
                       {riskStatus.circuit_breaker.trip_reason && (
                         <> (reason: {riskStatus.circuit_breaker.trip_reason})</>
                       )}
@@ -719,9 +740,12 @@ export default function SettingsPage() {
                 {/* Max Daily Loss */}
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <p className="font-medium">Max Daily Loss</p>
+                    <p className="flex items-center gap-2 font-medium">
+                      <span>Max Daily Loss</span>
+                      <InfoTooltip content="If losses for the day pass this amount, the system pauses automated trading." />
+                    </p>
                     <p className="text-sm text-muted-foreground">
-                      Trips circuit breaker when daily P&L exceeds this loss
+                      Pause automated trading when daily losses pass this amount
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -741,9 +765,12 @@ export default function SettingsPage() {
                 {/* Max Drawdown */}
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <p className="font-medium">Max Drawdown</p>
+                    <p className="flex items-center gap-2 font-medium">
+                      <span>Max Drawdown</span>
+                      <InfoTooltip content="Drawdown measures how far the portfolio has fallen from its recent peak. If the drop gets too large, the system pauses trading." />
+                    </p>
                     <p className="text-sm text-muted-foreground">
-                      Trips when portfolio drops this % from peak value
+                      Pause trading when portfolio value falls this far from its recent peak
                     </p>
                   </div>
                   <div className="flex items-center gap-2">

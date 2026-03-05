@@ -23,6 +23,7 @@ import {
 import { MetricCard } from "@/components/shared/MetricCard";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import { PageIntro } from "@/components/shared/PageIntro";
 import {
   useRiskStatusQuery,
   useDynamicTunerQuery,
@@ -148,6 +149,16 @@ export default function RiskPage() {
             </div>
           )}
         </div>
+
+        <PageIntro
+          title="What this page means"
+          description="This page tells you whether the system is safe to trade automatically, slowing itself down, or fully paused to avoid losses."
+          bullets={[
+            "If the circuit breaker is operational, automated trading is allowed to continue.",
+            "If it is in recovery mode, the system is trading cautiously after a recent issue.",
+            "If it is tripped, the system has halted automated trading and needs cooldown time or manual intervention."
+          ]}
+        />
 
         {/* Circuit Breaker Status Banner */}
         {cb && (

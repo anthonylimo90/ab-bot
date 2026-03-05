@@ -1,8 +1,7 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { useAccount, useSignMessage, useDisconnect } from 'wagmi';
-import { SiweMessage } from 'siwe';
+import { useAccount, useSignMessage } from 'wagmi';
 import api from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { useToastStore } from '@/stores/toast-store';
@@ -23,7 +22,6 @@ export function useWalletAuth(): UseWalletAuthReturn {
 
   const { address, isConnected } = useAccount();
   const { signMessageAsync } = useSignMessage();
-  const { disconnect } = useDisconnect();
 
   const setAuth = useAuthStore((state) => state.setAuth);
   const addToast = useToastStore((state) => state.addToast);
@@ -39,7 +37,7 @@ export function useWalletAuth(): UseWalletAuthReturn {
 
     try {
       // Step 1: Get challenge from server
-      const { message: siweMessage, nonce } = await api.walletChallenge(address);
+      const { message: siweMessage } = await api.walletChallenge(address);
 
       // Step 2: Sign the message with MetaMask
       const signature = await signMessageAsync({ message: siweMessage });

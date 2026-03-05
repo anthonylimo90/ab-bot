@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useFlowFeaturesQuery } from "@/hooks/queries/useSignalsQuery";
 import { Search } from "lucide-react";
 import {
@@ -61,7 +62,10 @@ export function FlowFeaturesChart({ initialConditionId }: FlowFeaturesChartProps
   return (
     <Card className="flex flex-col">
       <CardHeader>
-        <CardTitle>Flow Features</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <span>Flow Features</span>
+          <InfoTooltip content="This shows buying and selling pressure for a specific market condition over time. Use it when you want to understand why the system liked or ignored a signal." />
+        </CardTitle>
         <form onSubmit={handleSubmit} className="mt-2">
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />

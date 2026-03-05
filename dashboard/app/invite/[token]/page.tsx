@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -16,7 +16,7 @@ export default function InviteAcceptPage() {
   const params = useParams();
   const router = useRouter();
   const token = params.token as string;
-  const { isAuthenticated, user, setAuth } = useAuthStore();
+  const { isAuthenticated, user, setAuth, logout } = useAuthStore();
   const { switchWorkspace, fetchWorkspaces } = useWorkspaceStore();
 
   const [inviteInfo, setInviteInfo] = useState<InviteInfo | null>(null);
@@ -25,8 +25,6 @@ export default function InviteAcceptPage() {
   const [isAccepting, setIsAccepting] = useState(false);
   const [accepted, setAccepted] = useState(false);
 
-  // Form state for new users
-  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
 
@@ -44,15 +42,31 @@ export default function InviteAcceptPage() {
     fetchInviteInfo();
   }, [token]);
 
+  const inviteEmail = inviteInfo?.email ?? '';
+  const isMatchingSignedInUser = isAuthenticated && user?.email === inviteEmail;
+  const needsDifferentAccount = isAuthenticated && user?.email !== inviteEmail;
+  const canCreateAccount = !inviteInfo?.user_exists;
+  const shouldCreateAccount = !isMatchingSignedInUser;
+
+  const acceptButtonLabel = useMemo(() => {
+    if (isMatchingSignedInUser) {
+      return 'Accept Invite';
+    }
+
+    return canCreateAccount ? `Create Account for ${inviteEmail}` : 'Sign in to Accept';
+  }, [canCreateAccount, inviteEmail, isMatchingSignedInUser]);
+
   const handleAccept = async () => {
     setIsAccepting(true);
     setError(null);
 
     try {
       const response = await api.acceptInvite(token, {
-        email: !isAuthenticated ? email : undefined,
-        password: !isAuthenticated ? password : undefined,
-        name: !isAuthenticated ? name : undefined,
+        email: shouldCreateAccount ? inviteEmail : undefined,
+        password: shouldCreateAccount ? password : undefined,
+        name: shouldCreateAccount ? name : undefined,
+      }, {
+        auth: isMatchingSignedInUser,
       });
 
       // If new user, set auth
@@ -70,6 +84,13 @@ export default function InviteAcceptPage() {
     } finally {
       setIsAccepting(false);
     }
+  };
+
+  const handleSignIn = () => {
+    if (isAuthenticated) {
+      logout();
+    }
+    router.push(`/login?redirect=/invite/${token}`);
   };
 
   const formatRole = (role: string) => {
@@ -152,7 +173,7 @@ export default function InviteAcceptPage() {
             </div>
           )}
 
-          {isAuthenticated && user?.email === inviteInfo?.email ? (
+          {isMatchingSignedInUser ? (
             // Logged in user matches invite email - can accept directly
             <>
               <p className="text-sm text-center text-muted-foreground">
@@ -169,7 +190,7 @@ export default function InviteAcceptPage() {
                 )}
               </Button>
             </>
-          ) : isAuthenticated && user?.email !== inviteInfo?.email ? (
+          ) : needsDifferentAccount ? (
             // Logged in as different user - show warning
             <>
               <div className="rounded-md bg-yellow-500/10 border border-yellow-500/20 p-3 text-sm text-yellow-700 dark:text-yellow-400">
@@ -179,124 +200,134 @@ export default function InviteAcceptPage() {
                   but you&apos;re signed in as <span className="font-medium">{user?.email}</span>.
                 </p>
               </div>
-              <p className="text-sm text-center text-muted-foreground mt-2">
-                Sign out and create an account with the invited email, or use the form below.
-              </p>
+              {canCreateAccount ? (
+                <>
+                  <p className="text-sm text-center text-muted-foreground mt-2">
+                    This email does not have an account yet. Create one for the invited email to continue.
+                  </p>
 
-              <div className="space-y-4 mt-4">
-                <div className="grid gap-2">
-                  <Label htmlFor="name">Name (optional)</Label>
-                  <Input
-                    id="name"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="Your name"
-                  />
+                  <div className="space-y-4 mt-4">
+                    <div className="grid gap-2">
+                      <Label htmlFor="invite-email">Invited email</Label>
+                      <Input id="invite-email" value={inviteEmail} disabled />
+                    </div>
+
+                    <div className="grid gap-2">
+                      <Label htmlFor="name">Name (optional)</Label>
+                      <Input
+                        id="name"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                        placeholder="Your name"
+                      />
+                    </div>
+
+                    <div className="grid gap-2">
+                      <Label htmlFor="password">Password for new account</Label>
+                      <Input
+                        id="password"
+                        type="password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Min. 8 characters"
+                        required
+                      />
+                    </div>
+
+                    <Button
+                      className="w-full"
+                      onClick={handleAccept}
+                      disabled={isAccepting || !password}
+                    >
+                      {isAccepting ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Creating Account...
+                        </>
+                      ) : (
+                        acceptButtonLabel
+                      )}
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <div className="space-y-3 mt-4">
+                  <p className="text-sm text-center text-muted-foreground">
+                    Sign in as <span className="font-medium">{inviteEmail}</span> to accept this invite.
+                  </p>
+                  <Button className="w-full" onClick={handleSignIn}>
+                    Sign in as invited user
+                  </Button>
                 </div>
-
-                <div className="grid gap-2">
-                  <Label htmlFor="password">Password for new account</Label>
-                  <Input
-                    id="password"
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Min. 8 characters"
-                    required
-                  />
-                </div>
-
-                <Button
-                  className="w-full"
-                  onClick={handleAccept}
-                  disabled={isAccepting || !password}
-                >
-                  {isAccepting ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Creating Account...
-                    </>
-                  ) : (
-                    `Create Account for ${inviteInfo?.email}`
-                  )}
-                </Button>
-              </div>
+              )}
             </>
           ) : (
             <>
-              <p className="text-sm text-center text-muted-foreground">
-                Create an account to join this workspace
-              </p>
+              {canCreateAccount ? (
+                <>
+                  <p className="text-sm text-center text-muted-foreground">
+                    Create an account for the invited email to join this workspace
+                  </p>
 
-              <div className="space-y-4">
-                <div className="grid gap-2">
-                  <Label htmlFor="email">Email</Label>
-                  <Input
-                    id="email"
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="you@example.com"
-                    required
-                  />
-                </div>
+                  <div className="space-y-4">
+                    <div className="grid gap-2">
+                      <Label htmlFor="invite-email">Invited email</Label>
+                      <Input id="invite-email" type="email" value={inviteEmail} disabled />
+                    </div>
 
-                <div className="grid gap-2">
-                  <Label htmlFor="name">Name (optional)</Label>
-                  <Input
-                    id="name"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="Your name"
-                  />
-                </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="name">Name (optional)</Label>
+                      <Input
+                        id="name"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                        placeholder="Your name"
+                      />
+                    </div>
 
-                <div className="grid gap-2">
-                  <Label htmlFor="password">Password</Label>
-                  <Input
-                    id="password"
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="Min. 8 characters"
-                    required
-                  />
-                </div>
+                    <div className="grid gap-2">
+                      <Label htmlFor="password">Password</Label>
+                      <Input
+                        id="password"
+                        type="password"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        placeholder="Min. 8 characters"
+                        required
+                      />
+                    </div>
 
-                <Button
-                  className="w-full"
-                  onClick={handleAccept}
-                  disabled={isAccepting || !email || !password}
-                >
-                  {isAccepting ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Creating Account...
-                    </>
-                  ) : (
-                    'Create Account & Join'
-                  )}
-                </Button>
-              </div>
+                    <Button
+                      className="w-full"
+                      onClick={handleAccept}
+                      disabled={isAccepting || !password}
+                    >
+                      {isAccepting ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Creating Account...
+                        </>
+                      ) : (
+                        acceptButtonLabel
+                      )}
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm text-center text-muted-foreground">
+                    An account already exists for <span className="font-medium">{inviteEmail}</span>.
+                    Sign in with that email to accept this invite.
+                  </p>
 
-              <div className="relative">
-                <div className="absolute inset-0 flex items-center">
-                  <span className="w-full border-t" />
-                </div>
-                <div className="relative flex justify-center text-xs uppercase">
-                  <span className="bg-background px-2 text-muted-foreground">
-                    or
-                  </span>
-                </div>
-              </div>
-
-              <Button
-                variant="outline"
-                className="w-full"
-                onClick={() => router.push(`/login?redirect=/invite/${token}`)}
-              >
-                Sign in with existing account
-              </Button>
+                  <Button
+                    className="w-full"
+                    onClick={handleSignIn}
+                  >
+                    Sign in with existing account
+                  </Button>
+                </>
+              )}
             </>
           )}
 

@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useRecentSignalsQuery } from "@/hooks/queries/useSignalsQuery";
 import { cn } from "@/lib/utils";
 
@@ -55,7 +56,10 @@ export function SignalFunnel() {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-base">Signal Funnel</CardTitle>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <span>Signal Funnel</span>
+          <InfoTooltip content="Think of this as the system's decision pipeline: generated means an idea was found, executed means a trade was placed, skipped means it was rejected, and expired means the opportunity got too old." />
+        </CardTitle>
       </CardHeader>
       <CardContent>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

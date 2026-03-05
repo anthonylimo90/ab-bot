@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
+import { PageIntro } from "@/components/shared/PageIntro";
 import { useActivity } from "@/hooks/useActivity";
 import { formatTimeAgo, cn } from "@/lib/utils";
 import {
@@ -28,6 +29,18 @@ const activityIcons: Record<string, React.ReactNode> = {
   ARB_POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
   ARB_EXECUTION_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
   ARB_EXIT_FAILED: <ShieldAlert className="h-4 w-4 text-red-400" />,
+};
+
+const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
+  POSITION_OPENED: "Position Opened",
+  POSITION_CLOSED: "Position Closed",
+  STOP_LOSS_TRIGGERED: "Stop Loss Triggered",
+  TAKE_PROFIT_TRIGGERED: "Take Profit Triggered",
+  ARBITRAGE_DETECTED: "Arbitrage Found",
+  ARB_POSITION_OPENED: "Arbitrage Opened",
+  ARB_POSITION_CLOSED: "Arbitrage Closed",
+  ARB_EXECUTION_FAILED: "Trade Failed",
+  ARB_EXIT_FAILED: "Exit Failed",
 };
 
 type ActivityFilter = "all" | "Arbitrage" | "StopLoss";
@@ -71,6 +84,16 @@ export default function ActivityPage() {
         <ConnectionStatus status={status} />
       </div>
 
+      <PageIntro
+        title="What shows up here"
+        description="This feed records the major events the system sees while it is scanning, trading, pausing, or exiting positions."
+        bullets={[
+          "Use this page to understand what the system just did in time order.",
+          "Arbitrage events are trade opportunities and executions.",
+          "Stop loss and take profit events show when the system exited to protect gains or limit losses."
+        ]}
+      />
+
       <Tabs
         value={filter}
         onValueChange={(v) => setFilter(v as ActivityFilter)}
@@ -113,7 +136,7 @@ export default function ActivityPage() {
                   <div className="min-w-0 flex-1 space-y-1">
                     <div className="flex items-center gap-2">
                       <Badge variant="outline" className="text-xs">
-                        {item.type.replace(/_/g, " ")}
+                        {ACTIVITY_LABELS[item.type] ?? item.type.replace(/_/g, " ")}
                       </Badge>
                       <span className="text-xs text-muted-foreground">
                         {formatTimeAgo(item.created_at)}

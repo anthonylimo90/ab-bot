@@ -4,6 +4,7 @@ import { usePathname } from 'next/navigation';
 import { Header } from './Header';
 import { Sidebar } from './Sidebar';
 import { WorkspaceGate } from '@/components/workspace/WorkspaceGate';
+import { ActivityProvider } from '@/hooks/useActivity';
 
 // Routes that should not show the app shell (header/sidebar)
 const AUTH_ROUTES = ['/login', '/signup', '/forgot-password', '/reset-password'];
@@ -29,15 +30,17 @@ export function AppShell({ children }: AppShellProps) {
   // All other routes get the full app shell with workspace gate
   return (
     <WorkspaceGate>
-      <div className="relative min-h-screen bg-background">
-        <Header />
-        <Sidebar />
-        <main className="md:pl-64">
-          <div className="container mx-auto p-4 md:p-6 lg:p-8">
-            {children}
-          </div>
-        </main>
-      </div>
+      <ActivityProvider>
+        <div className="relative min-h-screen bg-background">
+          <Header />
+          <Sidebar />
+          <main className="md:pl-64">
+            <div className="container mx-auto p-4 md:p-6 lg:p-8">
+              {children}
+            </div>
+          </main>
+        </div>
+      </ActivityProvider>
     </WorkspaceGate>
   );
 }

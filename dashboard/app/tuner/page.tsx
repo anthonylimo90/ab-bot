@@ -9,6 +9,8 @@ import { MetricCard } from "@/components/shared/MetricCard";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
+import { PageIntro } from "@/components/shared/PageIntro";
 import {
   useDynamicTunerQuery,
   useUpdateOpportunitySelectionMutation,
@@ -103,6 +105,16 @@ export default function TunerPage() {
           </div>
         </div>
 
+        <PageIntro
+          title="What this page controls"
+          description="This page shows how the system tunes itself while it scans markets and decides which trades are worth taking."
+          bullets={[
+            "Opportunity Selection controls how adventurous the scanner should be when choosing ideas.",
+            "Arb Executor Config controls how large a trade can be and how strict the system is before acting.",
+            "If a value is left blank, the system keeps using its current setting shown as the placeholder."
+          ]}
+        />
+
         {isLoading && (
           <div className="flex items-center justify-center py-12">
             <p className="text-muted-foreground">Loading tuner status...</p>
@@ -144,7 +156,10 @@ export default function TunerPage() {
             {/* Watchdog Card */}
             <Card>
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">Watchdog</CardTitle>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <span>Watchdog</span>
+                  <InfoTooltip content="The watchdog monitors live execution quality. It helps detect when the bot should become more cautious because fills are failing or market conditions have changed." />
+                </CardTitle>
               </CardHeader>
               <CardContent>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
@@ -158,7 +173,10 @@ export default function TunerPage() {
                   </div>
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">
-                      Fill Rate
+                      <span className="inline-flex items-center gap-1">
+                        Fill Rate
+                        <InfoTooltip content="Fill rate is the percentage of attempted trades that were actually completed." />
+                      </span>
                     </p>
                     <p className="text-lg font-bold tabular-nums">
                       {tuner.watchdog_fill_rate != null
@@ -176,7 +194,10 @@ export default function TunerPage() {
                   </div>
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">
-                      Top Skip
+                      <span className="inline-flex items-center gap-1">
+                        Top Skip
+                        <InfoTooltip content="This is the most common reason recent trades were rejected or not executed." />
+                      </span>
                     </p>
                     <p className="text-sm font-medium truncate">
                       {tuner.watchdog_top_skip ?? "-"}
@@ -189,15 +210,19 @@ export default function TunerPage() {
             {/* Opportunity Selection Card */}
             <Card>
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">
-                  Opportunity Selection
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <span>Opportunity Selection</span>
+                  <InfoTooltip content="These settings control how selective the system is when deciding which potential trades deserve attention." />
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="flex flex-col sm:flex-row sm:items-end gap-4">
                   <div className="space-y-2">
                     <p className="text-xs text-muted-foreground">
-                      Aggressiveness
+                      <span className="inline-flex items-center gap-1">
+                        Aggressiveness
+                        <InfoTooltip content="Stable favors fewer, safer ideas. Discovery explores more possible trades. Balanced sits in between." />
+                      </span>
                     </p>
                     <div className="flex gap-1">
                       {(["stable", "balanced", "discovery"] as const).map(
@@ -219,7 +244,10 @@ export default function TunerPage() {
                   </div>
                   <div className="space-y-2">
                     <p className="text-xs text-muted-foreground">
-                      Exploration Slots
+                      <span className="inline-flex items-center gap-1">
+                        Exploration Slots
+                        <InfoTooltip content="This is how many lower-confidence opportunities the scanner is allowed to keep watching at the same time." />
+                      </span>
                     </p>
                     <Input
                       type="number"
@@ -250,15 +278,19 @@ export default function TunerPage() {
             {/* Arb Executor Config Card */}
             <Card>
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">
-                  Arb Executor Config
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <span>Arb Executor Config</span>
+                  <InfoTooltip content="These rules decide when an arbitrage idea is strong enough to trade and how much capital can be used." />
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                   <div className="space-y-1">
                     <p className="text-xs text-muted-foreground">
-                      Position Size ($)
+                      <span className="inline-flex items-center gap-1">
+                        Position Size ($)
+                        <InfoTooltip content="Maximum dollar amount the system can commit to one arbitrage trade." />
+                      </span>
                     </p>
                     <Input
                       type="number"
@@ -274,7 +306,10 @@ export default function TunerPage() {
                   </div>
                   <div className="space-y-1">
                     <p className="text-xs text-muted-foreground">
-                      Min Net Profit
+                      <span className="inline-flex items-center gap-1">
+                        Min Net Profit
+                        <InfoTooltip content="Minimum expected profit after fees and slippage before the system will trade." />
+                      </span>
                     </p>
                     <Input
                       type="number"
@@ -291,7 +326,10 @@ export default function TunerPage() {
                   </div>
                   <div className="space-y-1">
                     <p className="text-xs text-muted-foreground">
-                      Min Book Depth ($)
+                      <span className="inline-flex items-center gap-1">
+                        Min Book Depth ($)
+                        <InfoTooltip content="Minimum amount of liquidity required in the order book so the trade can be entered without moving the price too much." />
+                      </span>
                     </p>
                     <Input
                       type="number"
@@ -307,7 +345,10 @@ export default function TunerPage() {
                   </div>
                   <div className="space-y-1">
                     <p className="text-xs text-muted-foreground">
-                      Max Signal Age (s)
+                      <span className="inline-flex items-center gap-1">
+                        Max Signal Age (s)
+                        <InfoTooltip content="How old a signal can be before it is considered stale and ignored." />
+                      </span>
                     </p>
                     <Input
                       type="number"

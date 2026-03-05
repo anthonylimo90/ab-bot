@@ -154,13 +154,16 @@ class ApiClient {
   private async request<T>(
     endpoint: string,
     options: RequestInit = {},
+    requestOptions?: {
+      auth?: boolean;
+    },
   ): Promise<T> {
     const headers: HeadersInit = {
       "Content-Type": "application/json",
       ...options.headers,
     };
 
-    if (this.token) {
+    if (requestOptions?.auth !== false && this.token) {
       (headers as Record<string, string>)["Authorization"] =
         `Bearer ${this.token}`;
     }
@@ -671,6 +674,9 @@ class ApiClient {
   async acceptInvite(
     token: string,
     params?: AcceptInviteRequest,
+    options?: {
+      auth?: boolean;
+    },
   ): Promise<AcceptInviteResponse> {
     return this.request<AcceptInviteResponse>(
       `/api/v1/invites/${token}/accept`,
@@ -678,6 +684,7 @@ class ApiClient {
         method: "POST",
         body: JSON.stringify(params || {}),
       },
+      options,
     );
   }
 

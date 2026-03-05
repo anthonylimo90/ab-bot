@@ -87,6 +87,11 @@ use crate::websocket;
         workspaces::update_workspace,
         workspaces::switch_workspace,
         workspaces::list_members,
+        workspaces::list_workspace_invites,
+        workspaces::create_workspace_invite,
+        workspaces::revoke_workspace_invite,
+        workspaces::get_invite_info,
+        workspaces::accept_invite,
         workspaces::update_member_role,
         workspaces::remove_member,
         workspaces::get_service_status,
@@ -179,6 +184,11 @@ use crate::websocket;
             workspaces::WorkspaceResponse,
             workspaces::UpdateWorkspaceRequest,
             workspaces::WorkspaceMemberResponse,
+            workspaces::WorkspaceInviteResponse,
+            workspaces::CreateInviteRequest,
+            workspaces::InviteInfoResponse,
+            workspaces::AcceptInviteRequest,
+            workspaces::AcceptInviteResponse,
             workspaces::UpdateMemberRoleRequest,
             workspaces::ServiceStatusResponse,
             workspaces::ServiceStatusItem,
@@ -310,6 +320,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/recommendations/:id/accept",
             post(recommendations::accept_recommendation),
         )
+        .route("/api/v1/invites/:token", get(workspaces::get_invite_info))
+        .route(
+            "/api/v1/invites/:token/accept",
+            post(workspaces::accept_invite),
+        )
         // WebSocket endpoints (auth handled via query param or message)
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))
@@ -377,6 +392,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/members",
             get(workspaces::list_members),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites",
+            get(workspaces::list_workspace_invites),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites",
+            post(workspaces::create_workspace_invite),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites/:invite_id",
+            delete(workspaces::revoke_workspace_invite),
         )
         .route(
             "/api/v1/workspaces/:workspace_id/service-status",

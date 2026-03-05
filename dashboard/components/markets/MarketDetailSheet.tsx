@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useMarketQuery, useOrderbookQuery } from "@/hooks/queries/useMarketsQuery";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { formatCurrency } from "@/lib/utils";
@@ -71,6 +72,9 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
                     {market.description}
                   </p>
                 )}
+                <p className="mt-2 text-sm text-muted-foreground">
+                  If you believe the event will happen, you would usually look at the Yes side. If you believe it will not happen, you would usually look at the No side.
+                </p>
                 <div className="flex flex-wrap gap-2 mt-2">
                   <Badge variant="outline">{market.category}</Badge>
                   <Badge variant={market.active ? "default" : "secondary"}>
@@ -83,7 +87,10 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
               <div className="grid grid-cols-2 gap-4">
                 <Card>
                   <CardContent className="p-4 text-center">
-                    <p className="text-xs text-muted-foreground mb-1">Yes Price</p>
+                    <p className="mb-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
+                      Yes Price
+                      <InfoTooltip content="The current price for buying the 'Yes' outcome. A higher price means the market thinks this outcome is more likely." />
+                    </p>
                     <p className="text-2xl font-bold tabular-nums text-profit">
                       {(market.yes_price * 100).toFixed(1)}¢
                     </p>
@@ -91,7 +98,10 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
                 </Card>
                 <Card>
                   <CardContent className="p-4 text-center">
-                    <p className="text-xs text-muted-foreground mb-1">No Price</p>
+                    <p className="mb-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
+                      No Price
+                      <InfoTooltip content="The current price for buying the 'No' outcome. A higher price means the market thinks the event is less likely to happen." />
+                    </p>
                     <p className="text-2xl font-bold tabular-nums text-loss">
                       {(market.no_price * 100).toFixed(1)}¢
                     </p>
@@ -121,7 +131,10 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
 
           {/* Orderbook */}
           <div>
-            <h3 className="text-sm font-medium mb-2">Orderbook</h3>
+            <h3 className="mb-2 flex items-center gap-2 text-sm font-medium">
+              <span>Orderbook</span>
+              <InfoTooltip content="The order book shows the current buy and sell offers waiting in the market. Tighter spreads usually mean trading is easier." />
+            </h3>
             {isOrderbookLoading ? (
               <div className="space-y-2">
                 {Array.from({ length: 5 }).map((_, i) => (

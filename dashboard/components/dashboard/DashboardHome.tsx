@@ -9,8 +9,10 @@ import {
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useRiskStatusQuery, useDynamicTunerQuery } from "@/hooks/queries/useRiskQuery";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
+import { PageIntro } from "@/components/shared/PageIntro";
 import { Badge } from "@/components/ui/badge";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
@@ -43,6 +45,17 @@ const activityIcons: Record<string, React.ReactNode> = {
   ARB_EXIT_FAILED: <ShieldAlert className="h-4 w-4 text-red-400" />,
   POSITION_OPENED: <AlertCircle className="h-4 w-4 text-profit" />,
   POSITION_CLOSED: <AlertCircle className="h-4 w-4 text-muted-foreground" />,
+};
+
+const activityLabels: Record<string, string> = {
+  STOP_LOSS_TRIGGERED: "Stop Loss Triggered",
+  ARBITRAGE_DETECTED: "Arbitrage Found",
+  ARB_POSITION_OPENED: "Arbitrage Opened",
+  ARB_POSITION_CLOSED: "Arbitrage Closed",
+  ARB_EXECUTION_FAILED: "Trade Failed",
+  ARB_EXIT_FAILED: "Exit Failed",
+  POSITION_OPENED: "Position Opened",
+  POSITION_CLOSED: "Position Closed",
 };
 
 export function DashboardHome() {
@@ -110,6 +123,16 @@ export function DashboardHome() {
         </div>
       </div>
 
+      <PageIntro
+        title="What this dashboard shows"
+        description="This is your high-level system summary. It tells you whether the bot is healthy, what your open trades look like, and what the system has done most recently."
+        bullets={[
+          "Start with the status strip to confirm trading is safe and the scanner is active.",
+          "Portfolio metrics summarize current exposure and recent profit or loss.",
+          "Recent Activity gives the fastest explanation of what the system just did."
+        ]}
+      />
+
       {/* System Status Strip */}
       {(riskStatus || dynamicTunerStatus) && (
         <Card>
@@ -117,22 +140,31 @@ export function DashboardHome() {
             <div className="flex flex-wrap items-center gap-4">
               {/* Circuit Breaker */}
               <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">Circuit Breaker:</span>
+                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                  Automated Safety
+                  <InfoTooltip content="This shows whether the system's automatic safety stop is allowing trades, recovering cautiously, or fully paused." />
+                </span>
                 {riskStatus?.circuit_breaker?.tripped ? (
-                  <Badge variant="destructive" className="text-xs">TRIPPED</Badge>
+                  <Badge variant="destructive" className="text-xs">Paused</Badge>
                 ) : (
-                  <Badge className="bg-profit/10 text-profit border-profit/20 text-xs" variant="outline">OK</Badge>
+                  <Badge className="bg-profit/10 text-profit border-profit/20 text-xs" variant="outline">Healthy</Badge>
                 )}
               </div>
               {/* Market Regime */}
               <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground">Regime:</span>
+                <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                  Market Conditions
+                  <InfoTooltip content="This is the system's short label for the current market environment, such as calm, volatile, bullish, or bearish." />
+                </span>
                 <MarketRegimeBadge />
               </div>
               {/* Scanner Markets */}
               {dynamicTunerStatus?.scanner_status && (
                 <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">Scanner:</span>
+                  <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                    Scanner Coverage
+                    <InfoTooltip content="This shows how many markets the bot is actively watching right now. Core markets are higher-priority, while explore markets are experimental." />
+                  </span>
                   <span className="text-xs font-medium">
                     {dynamicTunerStatus.scanner_status.monitored_markets} markets
                   </span>
@@ -239,6 +271,9 @@ export function DashboardHome() {
                     </div>
                     <div className="min-w-0 flex-1 space-y-1">
                       <p className="text-sm break-words">{item.message}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {activityLabels[item.type] ?? item.type}
+                      </p>
                       <TimeAgo
                         date={item.created_at}
                         className="text-xs text-muted-foreground"

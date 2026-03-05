@@ -11,6 +11,8 @@ import { useMarketsQuery } from "@/hooks/queries/useMarketsQuery";
 import { useMarketMetadataQuery } from "@/hooks/queries/useSignalsQuery";
 import { MarketCard } from "@/components/markets/MarketCard";
 import { MarketDetailSheet } from "@/components/markets/MarketDetailSheet";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
+import { PageIntro } from "@/components/shared/PageIntro";
 import {
   Select,
   SelectContent,
@@ -63,6 +65,16 @@ export default function MarketsPage() {
         </p>
       </div>
 
+      <PageIntro
+        title="What you can do here"
+        description="Browse live prediction markets, see the current Yes and No prices, and open a market to inspect its order book in more detail."
+        bullets={[
+          "A Yes price is what it currently costs to buy the 'this happens' side of a market.",
+          "A No price is what it costs to buy the 'this does not happen' side.",
+          "Open a market card to view price depth, spreads, and more details before acting."
+        ]}
+      />
+
       {/* Filters */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <div className="relative flex-1">
@@ -94,8 +106,9 @@ export default function MarketsPage() {
             checked={activeOnly}
             onCheckedChange={setActiveOnly}
           />
-          <Label htmlFor="active-only" className="text-sm">
+          <Label htmlFor="active-only" className="inline-flex items-center gap-1 text-sm">
             Active only
+            <InfoTooltip content="When enabled, resolved or closed markets are hidden so you only see markets that can still move." />
           </Label>
         </div>
       </div>

@@ -30,7 +30,6 @@ import {
 } from "@/stores/wallet-store";
 import { useMutation } from "@tanstack/react-query";
 import { useActivity } from "@/hooks/useActivity";
-import { useActivityStore } from "@/stores/activity-store";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
@@ -64,9 +63,7 @@ export function Header() {
   const { user, logout } = useAuthStore();
   const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
   const toast = useToastStore();
-  const { status: wsStatus, activities } = useActivity();
-  const globalUnread = useActivityStore((s) => s.unreadCount);
-  const resetGlobalUnread = useActivityStore((s) => s.reset);
+  const { status: wsStatus, activities, unreadCount, markAsRead } = useActivity();
   const [isSignalDropdownOpen, setIsSignalDropdownOpen] = useState(false);
   const signalDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -375,14 +372,14 @@ export function Header() {
               className="relative"
               onClick={() => {
                 setIsSignalDropdownOpen(!isSignalDropdownOpen);
-                if (!isSignalDropdownOpen) resetGlobalUnread();
+                if (!isSignalDropdownOpen) markAsRead();
               }}
               aria-label="View signals"
             >
               <Bell className="h-4 w-4" />
-              {globalUnread > 0 && (
+              {unreadCount > 0 && (
                 <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-bold text-destructive-foreground">
-                  {globalUnread > 99 ? "99+" : globalUnread}
+                  {unreadCount > 99 ? "99+" : unreadCount}
                 </span>
               )}
             </Button>

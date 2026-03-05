@@ -6,6 +6,7 @@ import { RecentSignalsFeed } from "@/components/signals/RecentSignalsFeed";
 import { FlowFeaturesChart } from "@/components/signals/FlowFeaturesChart";
 import { SignalFunnel } from "@/components/signals/SignalFunnel";
 import { SkipReasonChart } from "@/components/signals/SkipReasonChart";
+import { PageIntro } from "@/components/shared/PageIntro";
 import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
 import { Zap } from "lucide-react";
 
@@ -27,6 +28,16 @@ export default function SignalsPage() {
         </div>
         <MarketRegimeBadge />
       </div>
+
+      <PageIntro
+        title="How to read this page"
+        description="This page explains why the system is seeing possible trades and what happened after each one was evaluated."
+        bullets={[
+          "Start with Recent Signals to see the newest trade ideas and whether they were executed or skipped.",
+          "Use Signal Funnel and Skip Reasons to understand where opportunities are being filtered out.",
+          "If a condition looks interesting, click it in Recent Signals to load its flow chart on the right."
+        ]}
+      />
 
       {/* Strategy Performance — full width */}
       <StrategyPerformanceTable />

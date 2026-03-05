@@ -1,9 +1,17 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import {
+  createElement,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useWebSocket, ConnectionStatus } from "./useWebSocket";
 import { useToastStore } from "@/stores/toast-store";
-import { useActivityStore } from "@/stores/activity-store";
 import { api } from "@/lib/api";
 import type {
   Activity,
@@ -33,6 +41,8 @@ interface UseActivityReturn {
   unreadCount: number;
   markAsRead: () => void;
 }
+
+const ActivityContext = createContext<UseActivityReturn | null>(null);
 
 // Map signal type to activity type
 function signalToActivity(signal: SignalUpdate): Activity {
@@ -104,7 +114,11 @@ function signalToActivity(signal: SignalUpdate): Activity {
   };
 }
 
-export function useActivity(): UseActivityReturn {
+export function ActivityProvider({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   const [activities, setActivities] = useState<Activity[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const seenIds = useRef(new Set<string>());
@@ -152,7 +166,6 @@ export function useActivity(): UseActivityReturn {
 
     setActivities((prev) => [activity, ...prev].slice(0, 50));
     setUnreadCount((prev) => prev + 1);
-    useActivityStore.getState().increment();
 
     // Fire toast notification
     const toast = useToastStore.getState();
@@ -184,10 +197,25 @@ export function useActivity(): UseActivityReturn {
     setUnreadCount(0);
   }, []);
 
-  return {
-    activities,
-    status,
-    unreadCount,
-    markAsRead,
-  };
+  const value = useMemo(
+    () => ({
+      activities,
+      status,
+      unreadCount,
+      markAsRead,
+    }),
+    [activities, status, unreadCount, markAsRead],
+  );
+
+  return createElement(ActivityContext.Provider, { value }, children);
+}
+
+export function useActivity(): UseActivityReturn {
+  const context = useContext(ActivityContext);
+
+  if (!context) {
+    throw new Error("useActivity must be used within an ActivityProvider");
+  }
+
+  return context;
 }

@@ -12,6 +12,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useStrategyPerformanceQuery } from "@/hooks/queries/useSignalsQuery";
 import { cn } from "@/lib/utils";
 
@@ -47,7 +48,10 @@ export function StrategyPerformanceTable() {
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
-        <CardTitle>Strategy Performance</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <span>Strategy Performance</span>
+          <InfoTooltip content="This compares how each signal type has been performing. Net P&L is total profit or loss, win rate is the share of profitable trades, and max drawdown shows the worst pullback during the period." />
+        </CardTitle>
         <div className="flex gap-1">
           {[7, 30].map((d) => (
             <button

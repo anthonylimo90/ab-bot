@@ -19,6 +19,8 @@ import {
 import { MetricCard } from "@/components/shared/MetricCard";
 import { LiveIndicator } from "@/components/shared/LiveIndicator";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
+import { PageIntro } from "@/components/shared/PageIntro";
 import {
   useOpenPositions,
   usePositionsQuery,
@@ -142,8 +144,8 @@ export default function PositionsPage() {
               if (!update) return pos;
               return {
                 ...pos,
-                current_price: update.price || pos.current_price,
-                unrealized_pnl: update.pnl || pos.unrealized_pnl,
+                current_price: update.price ?? pos.current_price,
+                unrealized_pnl: update.pnl ?? pos.unrealized_pnl,
               };
             });
           },
@@ -209,6 +211,16 @@ export default function PositionsPage() {
           />
         </div>
 
+        <PageIntro
+          title="How to read positions"
+          description="Positions are trades the system has already entered. Open positions are still active, while closed positions show completed outcomes."
+          bullets={[
+            "Unrealized P&L is the profit or loss if the open trade were closed right now.",
+            "Win rate is based on closed trades only, so it may change as more positions finish.",
+            "State tells you where a position is in its lifecycle, such as open, closing, or failed."
+          ]}
+        />
+
         {/* Metric Cards */}
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <MetricCard
@@ -270,7 +282,10 @@ export default function PositionsPage() {
                       Side
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-muted-foreground">
-                      State
+                      <span className="inline-flex items-center gap-1">
+                        State
+                        <InfoTooltip content="State explains where the position currently is in its lifecycle, such as active, waiting to close, closed, or failed." />
+                      </span>
                     </th>
                     <th className="px-4 py-3 text-right font-medium text-muted-foreground">
                       Qty

@@ -2,6 +2,7 @@
 
 import { useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useRecentSignalsQuery } from "@/hooks/queries/useSignalsQuery";
 import {
   ResponsiveContainer,
@@ -32,7 +33,10 @@ export function SkipReasonChart() {
     return (
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Skip Reasons</CardTitle>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <span>Skip Reasons</span>
+            <InfoTooltip content="This summarizes the most common reasons the system decided not to place a trade after generating a signal." />
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="flex items-center justify-center h-[200px] text-sm text-muted-foreground">
@@ -46,7 +50,10 @@ export function SkipReasonChart() {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-base">Skip Reasons</CardTitle>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <span>Skip Reasons</span>
+          <InfoTooltip content="This summarizes the most common reasons the system decided not to place a trade after generating a signal." />
+        </CardTitle>
       </CardHeader>
       <CardContent>
         <ResponsiveContainer width="100%" height={Math.max(200, chartData.length * 36)}>

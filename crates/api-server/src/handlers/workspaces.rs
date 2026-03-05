@@ -1,22 +1,29 @@
 //! Workspace handlers for regular users.
 
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+    Argon2,
+};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use polymarket_core::types::ArbOpportunity;
+use rand::Rng;
 use redis::AsyncCommands;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::sync::Arc;
 use url::Url;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use auth::{AuditAction, Claims};
+use auth::{AuditAction, Claims, UserRole};
 
 use crate::crypto;
 use crate::error::{ApiError, ApiResult};
@@ -102,6 +109,58 @@ pub struct UpdateMemberRoleRequest {
     pub role: String,
 }
 
+/// Workspace invite response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkspaceInviteResponse {
+    pub id: String,
+    pub workspace_id: String,
+    pub email: String,
+    pub role: String,
+    pub invited_by: String,
+    pub expires_at: DateTime<Utc>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub workspace_name: Option<String>,
+    pub inviter_email: Option<String>,
+}
+
+/// Create invite request.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateInviteRequest {
+    pub email: String,
+    pub role: String,
+}
+
+/// Public invite details.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InviteInfoResponse {
+    pub workspace_name: String,
+    pub inviter_email: String,
+    pub email: String,
+    pub role: String,
+    pub expires_at: DateTime<Utc>,
+    pub user_exists: bool,
+}
+
+/// Accept invite request.
+#[derive(Debug, Deserialize, ToSchema, Default)]
+pub struct AcceptInviteRequest {
+    pub email: Option<String>,
+    pub password: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Accept invite response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AcceptInviteResponse {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub role: String,
+    pub is_new_user: bool,
+    pub token: Option<String>,
+    pub user: Option<crate::handlers::auth::UserInfo>,
+}
+
 /// Database row for user's workspace list.
 #[derive(Debug, sqlx::FromRow)]
 struct UserWorkspaceRow {
@@ -140,6 +199,71 @@ struct WorkspaceDetailRow {
     role: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct WorkspaceInviteRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    email: String,
+    role: String,
+    invited_by: Uuid,
+    expires_at: DateTime<Utc>,
+    accepted_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    workspace_name: Option<String>,
+    inviter_email: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct InviteLookupRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    workspace_name: String,
+    email: String,
+    role: String,
+    inviter_email: String,
+    expires_at: DateTime<Utc>,
+    accepted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct InviteAcceptUserRow {
+    id: Uuid,
+    email: String,
+}
+
+fn generate_invite_token() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    hex::encode(bytes)
+}
+
+fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn validate_invite_email(email: &str) -> Result<(), ApiError> {
+    let email_parts: Vec<&str> = email.splitn(2, '@').collect();
+    if email_parts.len() != 2
+        || email_parts[0].is_empty()
+        || email_parts[1].len() < 3
+        || !email_parts[1].contains('.')
+        || email_parts[1].starts_with('.')
+        || email_parts[1].ends_with('.')
+    {
+        return Err(ApiError::BadRequest("Invalid email address".into()));
+    }
+
+    Ok(())
+}
+
+fn extract_optional_claims(state: &AppState, headers: &HeaderMap) -> Option<Claims> {
+    let auth_header = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let token = auth_header.strip_prefix("Bearer ")?;
+    state.jwt_auth.validate_token(token).ok()
 }
 
 /// Get user's role in a workspace.
@@ -717,6 +841,666 @@ pub async fn list_members(
         .collect();
 
     Ok(Json(response))
+}
+
+/// List pending and historical invites for a workspace.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/invites",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    responses(
+        (status = 200, description = "List of workspace invites", body = Vec<WorkspaceInviteResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only owner or admin can view invites"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn list_workspace_invites(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+) -> ApiResult<Json<Vec<WorkspaceInviteResponse>>> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let caller_role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&caller_role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only workspace owner or admin can view invites".into(),
+        ));
+    }
+
+    let invites: Vec<WorkspaceInviteRow> = sqlx::query_as(
+        r#"
+        SELECT
+            wi.id,
+            wi.workspace_id,
+            wi.email,
+            wi.role,
+            wi.invited_by,
+            wi.expires_at,
+            wi.accepted_at,
+            wi.created_at,
+            w.name AS workspace_name,
+            inviter.email AS inviter_email
+        FROM workspace_invites wi
+        INNER JOIN workspaces w ON w.id = wi.workspace_id
+        INNER JOIN users inviter ON inviter.id = wi.invited_by
+        WHERE wi.workspace_id = $1
+        ORDER BY wi.created_at DESC
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(
+        invites
+            .into_iter()
+            .map(|invite| WorkspaceInviteResponse {
+                id: invite.id.to_string(),
+                workspace_id: invite.workspace_id.to_string(),
+                email: invite.email,
+                role: invite.role,
+                invited_by: invite.invited_by.to_string(),
+                expires_at: invite.expires_at,
+                accepted_at: invite.accepted_at,
+                created_at: invite.created_at,
+                workspace_name: invite.workspace_name,
+                inviter_email: invite.inviter_email,
+            })
+            .collect(),
+    ))
+}
+
+/// Create a new workspace invite.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/invites",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = CreateInviteRequest,
+    responses(
+        (status = 201, description = "Invite created", body = WorkspaceInviteResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only owner or admin can invite members"),
+        (status = 409, description = "Invite already exists or user is already a member"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn create_workspace_invite(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(workspace_id): Path<String>,
+    payload: Result<Json<CreateInviteRequest>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<WorkspaceInviteResponse>)> {
+    let Json(req) = payload.map_err(|e| {
+        tracing::warn!(error = %e, "Create invite request JSON parsing failed");
+        ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
+    })?;
+
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+
+    let caller_role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&caller_role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only workspace owner or admin can invite members".into(),
+        ));
+    }
+
+    let role = req.role.trim().to_lowercase();
+    if !["admin", "member", "viewer"].contains(&role.as_str()) {
+        return Err(ApiError::BadRequest(
+            "Role must be 'admin', 'member', or 'viewer'".into(),
+        ));
+    }
+
+    if role == "admin" && caller_role != "owner" {
+        return Err(ApiError::Forbidden(
+            "Only the workspace owner can invite another admin".into(),
+        ));
+    }
+
+    let email = req.email.trim().to_string();
+    validate_invite_email(&email)?;
+
+    let existing_member: Option<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT 1
+        FROM workspace_members wm
+        INNER JOIN users u ON u.id = wm.user_id
+        WHERE wm.workspace_id = $1 AND u.email = $2
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(&email)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if existing_member.is_some() {
+        return Err(ApiError::Conflict(
+            "That email already belongs to a member of this workspace".into(),
+        ));
+    }
+
+    let existing_invite: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id
+        FROM workspace_invites
+        WHERE workspace_id = $1
+          AND email = $2
+          AND accepted_at IS NULL
+          AND expires_at > $3
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(&email)
+    .bind(Utc::now())
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if existing_invite.is_some() {
+        return Err(ApiError::Conflict(
+            "There is already an active invite for that email".into(),
+        ));
+    }
+
+    let email_client = state.email_client.as_ref().ok_or_else(|| {
+        ApiError::BadRequest(
+            "Email sending is not configured, so invites cannot be delivered".into(),
+        )
+    })?;
+
+    let workspace_name: (String,) = sqlx::query_as("SELECT name FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+    let inviter_email: (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await?;
+
+    let token = generate_invite_token();
+    let token_hash = hash_token(&token);
+    let expires_at = Utc::now() + Duration::days(7);
+    let created_at = Utc::now();
+    let invite_id = Uuid::new_v4();
+
+    let mut tx = state.pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, invited_by, expires_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(invite_id)
+    .bind(workspace_id)
+    .bind(&email)
+    .bind(&role)
+    .bind(&token_hash)
+    .bind(user_id)
+    .bind(expires_at)
+    .bind(created_at)
+    .execute(&mut *tx)
+    .await?;
+
+    let invite_link = format!(
+        "{}/invite/{}",
+        std::env::var("DASHBOARD_URL").unwrap_or_else(|_| "http://localhost:3002".to_string()),
+        token
+    );
+
+    let subject = format!("You've been invited to join {} on AB-Bot", workspace_name.0);
+    let body = format!(
+        "You've been invited to join the workspace '{}' on AB-Bot as a {}.\n\n\
+        Open this link to accept the invite:\n{}\n\n\
+        This invite expires in 7 days.",
+        workspace_name.0, role, invite_link
+    );
+
+    email_client.send_simple(&email, &subject, &body).await.map_err(|e| {
+        tracing::error!(error = %e, email = %email, "Failed to send workspace invite email");
+        ApiError::Internal("Failed to send invite email".into())
+    })?;
+
+    tx.commit().await?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("workspace_invite_created".to_string()),
+        &invite_id.to_string(),
+        serde_json::json!({
+            "workspace_id": workspace_id.to_string(),
+            "email": &email,
+            "role": &role,
+        }),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(WorkspaceInviteResponse {
+            id: invite_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            email,
+            role,
+            invited_by: user_id.to_string(),
+            expires_at,
+            accepted_at: None,
+            created_at,
+            workspace_name: Some(workspace_name.0),
+            inviter_email: Some(inviter_email.0),
+        }),
+    ))
+}
+
+/// Revoke a workspace invite.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/workspaces/{workspace_id}/invites/{invite_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("invite_id" = String, Path, description = "Invite ID")
+    ),
+    responses(
+        (status = 204, description = "Invite revoked"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only owner or admin can revoke invites"),
+        (status = 404, description = "Invite not found"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "workspaces"
+)]
+pub async fn revoke_workspace_invite(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((workspace_id, invite_id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    let user_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let workspace_id = Uuid::parse_str(&workspace_id)
+        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+    let invite_id = Uuid::parse_str(&invite_id)
+        .map_err(|_| ApiError::BadRequest("Invalid invite ID format".into()))?;
+
+    let caller_role = get_user_role(&state.pool, workspace_id, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
+
+    if !["owner", "admin"].contains(&caller_role.as_str()) {
+        return Err(ApiError::Forbidden(
+            "Only workspace owner or admin can revoke invites".into(),
+        ));
+    }
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM workspace_invites
+        WHERE id = $1 AND workspace_id = $2 AND accepted_at IS NULL
+        "#,
+    )
+    .bind(invite_id)
+    .bind(workspace_id)
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Invite not found".into()));
+    }
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("workspace_invite_revoked".to_string()),
+        &invite_id.to_string(),
+        serde_json::json!({
+            "workspace_id": workspace_id.to_string(),
+        }),
+    );
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Look up a public invite by token.
+#[utoipa::path(
+    get,
+    path = "/api/v1/invites/{token}",
+    params(
+        ("token" = String, Path, description = "Invite token")
+    ),
+    responses(
+        (status = 200, description = "Invite details", body = InviteInfoResponse),
+        (status = 404, description = "Invite not found"),
+        (status = 410, description = "Invite expired or already used"),
+    ),
+    tag = "workspaces"
+)]
+pub async fn get_invite_info(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+) -> ApiResult<Json<InviteInfoResponse>> {
+    let invite = sqlx::query_as::<_, InviteLookupRow>(
+        r#"
+        SELECT
+            wi.id,
+            wi.workspace_id,
+            w.name AS workspace_name,
+            wi.email,
+            wi.role,
+            inviter.email AS inviter_email,
+            wi.expires_at,
+            wi.accepted_at
+        FROM workspace_invites wi
+        INNER JOIN workspaces w ON w.id = wi.workspace_id
+        INNER JOIN users inviter ON inviter.id = wi.invited_by
+        WHERE wi.token_hash = $1
+        "#,
+    )
+    .bind(hash_token(&token))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Invite not found".into()))?;
+
+    if invite.accepted_at.is_some() {
+        return Err(ApiError::Gone("Invite has already been accepted".into()));
+    }
+
+    if invite.expires_at <= Utc::now() {
+        return Err(ApiError::Gone("Invite has expired".into()));
+    }
+
+    let user_exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM users WHERE email = $1")
+        .bind(&invite.email)
+        .fetch_optional(&state.pool)
+        .await?;
+
+    Ok(Json(InviteInfoResponse {
+        workspace_name: invite.workspace_name,
+        inviter_email: invite.inviter_email,
+        email: invite.email,
+        role: invite.role,
+        expires_at: invite.expires_at,
+        user_exists: user_exists.is_some(),
+    }))
+}
+
+/// Accept a workspace invite as an existing or newly created user.
+#[utoipa::path(
+    post,
+    path = "/api/v1/invites/{token}/accept",
+    params(
+        ("token" = String, Path, description = "Invite token")
+    ),
+    request_body = AcceptInviteRequest,
+    responses(
+        (status = 200, description = "Invite accepted", body = AcceptInviteResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Authentication required for existing account"),
+        (status = 403, description = "Invite belongs to a different email"),
+        (status = 404, description = "Invite not found"),
+        (status = 409, description = "Account already exists for invite email"),
+        (status = 410, description = "Invite expired or already used"),
+    ),
+    tag = "workspaces"
+)]
+pub async fn accept_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    payload: Result<Json<AcceptInviteRequest>, JsonRejection>,
+) -> ApiResult<Json<AcceptInviteResponse>> {
+    let Json(req) = payload.map_err(|e| {
+        tracing::warn!(error = %e, "Accept invite request JSON parsing failed");
+        ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
+    })?;
+
+    let invite = sqlx::query_as::<_, InviteLookupRow>(
+        r#"
+        SELECT
+            wi.id,
+            wi.workspace_id,
+            w.name AS workspace_name,
+            wi.email,
+            wi.role,
+            inviter.email AS inviter_email,
+            wi.expires_at,
+            wi.accepted_at
+        FROM workspace_invites wi
+        INNER JOIN workspaces w ON w.id = wi.workspace_id
+        INNER JOIN users inviter ON inviter.id = wi.invited_by
+        WHERE wi.token_hash = $1
+        "#,
+    )
+    .bind(hash_token(&token))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Invite not found".into()))?;
+
+    if invite.accepted_at.is_some() {
+        return Err(ApiError::Gone("Invite has already been accepted".into()));
+    }
+
+    if invite.expires_at <= Utc::now() {
+        return Err(ApiError::Gone("Invite has expired".into()));
+    }
+
+    let claims = extract_optional_claims(&state, &headers);
+    let requested_email = req
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&invite.email);
+    let requested_name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let requested_password = req
+        .password
+        .as_deref()
+        .filter(|value| !value.is_empty());
+
+    if !requested_email.eq_ignore_ascii_case(&invite.email) {
+        return Err(ApiError::BadRequest(
+            "This invite can only be accepted by the invited email address".into(),
+        ));
+    }
+
+    let mut is_new_user = false;
+    let mut auth_token = None;
+    let auth_user: Option<crate::handlers::auth::UserInfo>;
+    let accepted_by_user_id: Uuid;
+
+    let mut tx = state.pool.begin().await?;
+
+    if let Some(password) = requested_password {
+        if password.len() < 8 {
+            return Err(ApiError::BadRequest(
+                "Password must be at least 8 characters".into(),
+            ));
+        }
+
+        let existing_user: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
+            .bind(&invite.email)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        if existing_user.is_some() {
+            return Err(ApiError::Conflict(
+                "An account already exists for this invite email. Sign in to accept the invite."
+                    .into(),
+            ));
+        }
+
+        let password_to_hash = password.to_string();
+        let password_hash = tokio::task::spawn_blocking(move || {
+            let salt = SaltString::generate(&mut OsRng);
+            let argon2 = Argon2::default();
+            argon2
+                .hash_password(password_to_hash.as_bytes(), &salt)
+                .map(|hash| hash.to_string())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
+
+        let user_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let platform_role: i16 = 1;
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, email, password_hash, role, name, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $6)
+            "#,
+        )
+        .bind(user_id)
+        .bind(&invite.email)
+        .bind(&password_hash)
+        .bind(platform_role)
+        .bind(&requested_name)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+
+        let claims = Claims::new(user_id.to_string(), UserRole::Trader, 24).with_email(&invite.email);
+        let token = state
+            .jwt_auth
+            .create_token_with_claims(&claims)
+            .map_err(|e| ApiError::Internal(format!("Token generation failed: {}", e)))?;
+
+        auth_token = Some(token);
+        auth_user = Some(crate::handlers::auth::UserInfo {
+            id: user_id.to_string(),
+            email: invite.email.clone(),
+            name: requested_name,
+            role: "Trader".to_string(),
+            created_at,
+        });
+        accepted_by_user_id = user_id;
+        is_new_user = true;
+    } else if let Some(claims) = claims {
+        let user_id = Uuid::parse_str(&claims.sub)
+            .map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+        let user: InviteAcceptUserRow = sqlx::query_as(
+            r#"
+            SELECT id, email
+            FROM users
+            WHERE id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
+
+        if !user.email.eq_ignore_ascii_case(&invite.email) {
+            return Err(ApiError::Forbidden(
+                "This invite was sent to a different email address".into(),
+            ));
+        }
+
+        auth_user = None;
+        accepted_by_user_id = user.id;
+    } else {
+        let existing_user: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM users WHERE email = $1")
+            .bind(&invite.email)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        if existing_user.is_some() {
+            return Err(ApiError::Unauthorized(
+                "Sign in as the invited email to accept this invite".into(),
+            ));
+        }
+
+        return Err(ApiError::BadRequest(
+            "Create an account to accept this invite".into(),
+        ));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO workspace_members (workspace_id, user_id, role, joined_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (workspace_id, user_id) DO NOTHING
+        "#,
+    )
+    .bind(invite.workspace_id)
+    .bind(accepted_by_user_id)
+    .bind(&invite.role)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO user_settings (user_id, default_workspace_id, created_at, updated_at)
+        VALUES ($1, $2, $3, $3)
+        ON CONFLICT (user_id) DO UPDATE SET
+            default_workspace_id = $2,
+            updated_at = $3
+        "#,
+    )
+    .bind(accepted_by_user_id)
+    .bind(invite.workspace_id)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    let update_result = sqlx::query(
+        "UPDATE workspace_invites SET accepted_at = $1 WHERE id = $2 AND accepted_at IS NULL",
+    )
+    .bind(Utc::now())
+    .bind(invite.id)
+    .execute(&mut *tx)
+    .await?;
+
+    if update_result.rows_affected() == 0 {
+        return Err(ApiError::Gone("Invite has already been accepted".into()));
+    }
+
+    tx.commit().await?;
+
+    state.audit_logger.log_user_action(
+        &accepted_by_user_id.to_string(),
+        AuditAction::Custom("workspace_invite_accepted".to_string()),
+        &invite.workspace_id.to_string(),
+        serde_json::json!({
+            "invite_id": invite.id.to_string(),
+            "workspace_id": invite.workspace_id.to_string(),
+            "role": invite.role,
+            "is_new_user": is_new_user,
+        }),
+    );
+
+    Ok(Json(AcceptInviteResponse {
+        workspace_id: invite.workspace_id.to_string(),
+        workspace_name: invite.workspace_name,
+        role: invite.role,
+        is_new_user,
+        token: auth_token,
+        user: auth_user,
+    }))
 }
 
 /// Update a member's role (owner/admin only).
