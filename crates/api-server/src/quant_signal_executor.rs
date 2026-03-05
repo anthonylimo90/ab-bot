@@ -315,7 +315,7 @@ impl QuantSignalExecutor {
             SELECT DISTINCT p.market_id
             FROM positions p
             JOIN quant_signals qs ON qs.position_id = p.id
-            WHERE p.state IN ('pending', 'open', 'exit_ready', 'closing')
+            WHERE p.state IN (0, 1, 2, 3) -- Pending, Open, ExitReady, Closing
             "#,
         )
         .fetch_all(&self.pool)

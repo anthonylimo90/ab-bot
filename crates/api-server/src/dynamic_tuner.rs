@@ -639,18 +639,26 @@ impl DynamicTuner {
         };
 
         // ARB_MIN_PROFIT_THRESHOLD: expected slippage + safety margin.
-        let expected_arb_slippage = (metrics.realized_slippage_p90 * 2.0).max(0.0015);
-        let low_depth_penalty = (0.0010 - metrics.depth_proxy).max(0.0) * 0.3;
-        let vol_penalty = metrics.volatility_proxy * 0.01;
-        let mut desired_arb_profit =
-            expected_arb_slippage + regime_safety_margin + low_depth_penalty + vol_penalty;
-        if no_trade_watchdog && top_skip != "slippage" {
-            desired_arb_profit *= 0.90;
+        //
+        // Guard: only tune when we have real execution data.  With zero
+        // attempts AND zero fills the metrics are phantom values and any
+        // movement is pure noise — the tuner should hold steady rather
+        // than drift upward into a death spiral.
+        if metrics.attempts_last_window >= 1.0 || metrics.fills_last_window >= 1.0 {
+            let expected_arb_slippage = (metrics.realized_slippage_p90 * 2.0).max(0.0015);
+            let low_depth_penalty = (0.0010 - metrics.depth_proxy).max(0.0) * 0.3;
+            let vol_penalty = metrics.volatility_proxy * 0.01;
+            let mut desired_arb_profit =
+                expected_arb_slippage + regime_safety_margin + low_depth_penalty + vol_penalty;
+            if no_trade_watchdog && top_skip != "slippage" {
+                desired_arb_profit *= 0.90;
+            }
+            // No ratchet floor — apply_step_limit already caps movement
+            // to max_step_pct (12%) per cycle, which is sufficient.
+            // The old `.max(current * 0.7)` prevented the tuner from
+            // correcting its own upward drift.
+            targets.insert(KEY_ARB_MIN_PROFIT_THRESHOLD.to_string(), desired_arb_profit);
         }
-        targets.insert(
-            KEY_ARB_MIN_PROFIT_THRESHOLD.to_string(),
-            desired_arb_profit.max(arb_profit_current * 0.7),
-        );
 
         // ARB_MONITOR_MAX_MARKETS: adapt to stream health + throughput.
         let health_penalty = (metrics.ws_stall_rate * 0.9 + metrics.ws_reset_rate * 0.6).min(1.0);

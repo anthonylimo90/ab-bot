@@ -94,15 +94,15 @@ impl ArbExecutorConfig {
             min_position_size: std::env::var("ARB_MIN_POSITION_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(25, 0)),
+                .unwrap_or(Decimal::new(5, 0)), // $5 floor (small wallet)
             max_position_size: std::env::var("ARB_MAX_POSITION_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(200, 0)),
+                .unwrap_or(Decimal::new(25, 0)), // $25 ceiling (small wallet)
             min_book_depth: std::env::var("ARB_MIN_BOOK_DEPTH")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(100, 0)),
+                .unwrap_or(Decimal::new(25, 0)), // $25 min depth (small wallet)
             fee_rate: Decimal::new(2, 2), // Always 2% on Polymarket
         }
     }
@@ -293,18 +293,55 @@ impl ArbAutoExecutor {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let startup_cfg = self.snapshot_config().await;
 
+        let live_ready = self.order_executor.is_live_ready().await;
         info!(
             enabled = startup_cfg.enabled,
+            live_ready,
             position_size = %startup_cfg.position_size,
+            min_position_size = %startup_cfg.min_position_size,
+            max_position_size = %startup_cfg.max_position_size,
+            dynamic_sizing = startup_cfg.dynamic_sizing,
             min_net_profit = %startup_cfg.min_net_profit,
+            min_book_depth = %startup_cfg.min_book_depth,
             max_signal_age_secs = startup_cfg.max_signal_age_secs,
-            "Starting arb auto-executor (always-on, per-signal guard)"
+            "Arb executor startup readiness check"
         );
+        if !live_ready {
+            warn!(
+                "OrderExecutor NOT in live mode — all orders will be paper-traded. \
+                   Check WALLET_PRIVATE_KEY and wallet initialization logs."
+            );
+        }
+        if !startup_cfg.enabled {
+            warn!("ARB_AUTO_EXECUTE is disabled — signals will be logged but not executed.");
+        }
 
         // Mark liveness immediately so the dashboard doesn't flag a stale heartbeat
         // while the slow initial cache load runs.
         self.heartbeat
             .store(Utc::now().timestamp(), Ordering::Relaxed);
+
+        // Clean up stale positions: any position stuck in Pending (0) for >24h
+        // is almost certainly a failed paper trade that will block the dedup set forever.
+        match sqlx::query(
+            r#"
+            UPDATE positions
+            SET state = 5, failure_reason = 'stale_cleanup: stuck in Pending >24h'
+            WHERE state = 0 AND entry_timestamp < NOW() - INTERVAL '24 hours'
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        {
+            Ok(result) if result.rows_affected() > 0 => {
+                info!(
+                    cleaned = result.rows_affected(),
+                    "Closed stale Pending positions (>24h old)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "Failed to clean up stale positions"),
+        }
 
         // Load active positions for dedup (fast DB query, do this first)
         if let Ok(active) = self.position_repo.get_active().await {
