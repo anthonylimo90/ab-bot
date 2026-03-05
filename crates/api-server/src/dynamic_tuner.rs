@@ -848,7 +848,9 @@ impl DynamicTuner {
                 key: KEY_ARB_MIN_PROFIT_THRESHOLD,
                 default_value: env_decimal("ARB_MIN_PROFIT_THRESHOLD", Decimal::new(5, 3)),
                 min_value: Decimal::new(2, 3),
-                max_value: Decimal::new(5, 2),
+                // Hard-cap at 0.005 (0.5%) — real arb spreads are 0.5-2%.
+                // Higher values create a death spiral: no signals → tuner raises → even fewer signals.
+                max_value: Decimal::new(5, 3),
                 max_step_pct: Decimal::new(12, 2),
             },
             ConfigSeed {
