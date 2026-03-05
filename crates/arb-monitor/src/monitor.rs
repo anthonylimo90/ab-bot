@@ -1221,7 +1221,8 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
 
 fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     match key {
-        KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
+        // Hard-cap at 0.005 (0.5%) — higher values cause a death spiral.
+        KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 3))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),
         KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => Some((Decimal::ZERO, Decimal::new(2, 0))),
