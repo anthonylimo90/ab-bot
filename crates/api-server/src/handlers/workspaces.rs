@@ -1417,7 +1417,7 @@ pub async fn get_dynamic_tuner_status(
     let signal_thresholds = DynamicSignalThresholdsResponse {
         min_net_profit_threshold_pct: min_profit_ratio * 100.0,
         signal_cooldown_secs: env_i64("ARB_SIGNAL_COOLDOWN_SECS", 60),
-        min_depth_usd: env_f64("ARB_MIN_BOOK_DEPTH", 100.0),
+        min_depth_usd: env_f64("ARB_MIN_BOOK_DEPTH", 25.0),
         trading_fee_pct: env_f64(
             "ARB_TRADING_FEE_PCT",
             decimal_to_f64(ArbOpportunity::DEFAULT_FEE),

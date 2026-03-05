@@ -611,10 +611,6 @@ impl DynamicTuner {
     ) -> HashMap<String, f64> {
         let mut targets = HashMap::new();
 
-        let arb_profit_current = rows
-            .get(KEY_ARB_MIN_PROFIT_THRESHOLD)
-            .map(|r| decimal_to_f64(r.current_value))
-            .unwrap_or(0.005);
         let max_markets_current = rows
             .get(KEY_ARB_MONITOR_MAX_MARKETS)
             .map(|r| decimal_to_f64(r.current_value))
@@ -738,6 +734,23 @@ impl DynamicTuner {
         &self,
         redis_manager: Option<&mut redis::aio::ConnectionManager>,
     ) -> anyhow::Result<TuningMetrics> {
+        let (attempts_last_window, fills_last_window): (f64, f64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*)::double precision AS attempts_last_window,
+                COUNT(*) FILTER (
+                    WHERE state IN (1, 2, 3, 4, 6, 7)
+                )::double precision AS fills_last_window
+            FROM positions
+            WHERE exit_strategy = 0
+              AND entry_timestamp >= NOW() - ($1::bigint * INTERVAL '1 minute')
+            "#,
+        )
+        .bind(self.config.no_trade_window_minutes)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0.0, 0.0));
+
         let recent_pnl: Decimal = sqlx::query_scalar(
             r#"
             SELECT COALESCE(SUM(realized_pnl), 0)
@@ -811,9 +824,9 @@ impl DynamicTuner {
         Ok(TuningMetrics {
             slippage_skip_rate: 0.0,
             below_min_skip_rate: 0.0,
-            successful_fill_rate: 0.0,
-            attempts_last_window: 0.0,
-            fills_last_window: 0.0,
+            successful_fill_rate: ratio(fills_last_window, attempts_last_window),
+            attempts_last_window,
+            fills_last_window,
             top_skip_reason: None,
             realized_slippage_p90: 0.0,
             depth_proxy,
@@ -945,8 +958,14 @@ impl DynamicTuner {
                     max_value = EXCLUDED.max_value,
                     max_step_pct = EXCLUDED.max_step_pct,
                     default_value = EXCLUDED.default_value,
-                    current_value = LEAST(GREATEST(dynamic_config.current_value, EXCLUDED.min_value), EXCLUDED.max_value),
-                    last_good_value = LEAST(GREATEST(dynamic_config.last_good_value, EXCLUDED.min_value), EXCLUDED.max_value)
+                    current_value = CASE
+                        WHEN dynamic_config.updated_by = 'bootstrap' THEN EXCLUDED.default_value
+                        ELSE LEAST(GREATEST(dynamic_config.current_value, EXCLUDED.min_value), EXCLUDED.max_value)
+                    END,
+                    last_good_value = CASE
+                        WHEN dynamic_config.updated_by = 'bootstrap' THEN EXCLUDED.default_value
+                        ELSE LEAST(GREATEST(dynamic_config.last_good_value, EXCLUDED.min_value), EXCLUDED.max_value)
+                    END
                 "#,
             )
             .bind(seed.key)
@@ -1446,13 +1465,13 @@ fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
 
 fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     match key {
-        KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 2))),
+        KEY_ARB_MIN_PROFIT_THRESHOLD => Some((Decimal::new(2, 3), Decimal::new(5, 3))),
         KEY_ARB_MONITOR_MAX_MARKETS => Some((Decimal::new(25, 0), Decimal::new(1500, 0))),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((Decimal::new(1, 0), Decimal::new(500, 0))),
         KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => Some((Decimal::ZERO, Decimal::new(2, 0))),
-        KEY_ARB_POSITION_SIZE => Some((Decimal::new(10, 0), Decimal::new(500, 0))),
+        KEY_ARB_POSITION_SIZE => Some((Decimal::new(5, 0), Decimal::new(25, 0))),
         KEY_ARB_MIN_NET_PROFIT => Some((Decimal::new(5, 4), Decimal::new(5, 2))),
-        KEY_ARB_MIN_BOOK_DEPTH => Some((Decimal::new(25, 0), Decimal::new(1000, 0))),
+        KEY_ARB_MIN_BOOK_DEPTH => Some((Decimal::new(10, 0), Decimal::new(200, 0))),
         KEY_ARB_MAX_SIGNAL_AGE_SECS => Some((Decimal::new(5, 0), Decimal::new(300, 0))),
         KEY_QUANT_BASE_POSITION_SIZE => Some((Decimal::new(10, 0), Decimal::new(200, 0))),
         _ => None,

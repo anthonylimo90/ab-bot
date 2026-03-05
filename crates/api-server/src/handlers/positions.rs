@@ -129,14 +129,22 @@ pub async fn list_positions(
 
     let rows: Vec<PositionRow> = sqlx::query_as(
         r#"
-        SELECT id, market_id, outcome, side, quantity, entry_price,
-               current_price, unrealized_pnl, stop_loss, take_profit,
-               realized_pnl, opened_at, updated_at, is_open
+        SELECT id, market_id,
+               COALESCE(outcome, 'both') AS outcome,
+               COALESCE(side, 'long') AS side,
+               quantity,
+               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
+               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+               unrealized_pnl, stop_loss, take_profit,
+               realized_pnl,
+               COALESCE(opened_at, entry_timestamp) AS opened_at,
+               COALESCE(updated_at, entry_timestamp) AS updated_at,
+               is_open
         FROM positions
         WHERE ($1::text IS NULL OR market_id = $1)
-          AND ($2::text IS NULL OR outcome = $2)
+          AND ($2::text IS NULL OR COALESCE(outcome, 'both') = $2)
           AND ($3::bool IS NULL OR is_open = $3)
-        ORDER BY opened_at DESC
+        ORDER BY COALESCE(opened_at, entry_timestamp) DESC
         LIMIT $4 OFFSET $5
         "#,
     )
@@ -201,9 +209,17 @@ pub async fn get_position(
 ) -> ApiResult<Json<PositionResponse>> {
     let row: Option<PositionRow> = sqlx::query_as(
         r#"
-        SELECT id, market_id, outcome, side, quantity, entry_price,
-               current_price, unrealized_pnl, stop_loss, take_profit,
-               realized_pnl, opened_at, updated_at, is_open
+        SELECT id, market_id,
+               COALESCE(outcome, 'both') AS outcome,
+               COALESCE(side, 'long') AS side,
+               quantity,
+               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
+               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+               unrealized_pnl, stop_loss, take_profit,
+               realized_pnl,
+               COALESCE(opened_at, entry_timestamp) AS opened_at,
+               COALESCE(updated_at, entry_timestamp) AS updated_at,
+               is_open
         FROM positions
         WHERE id = $1
         "#,
@@ -270,9 +286,17 @@ pub async fn close_position(
     // First, fetch the position
     let row: Option<PositionRow> = sqlx::query_as(
         r#"
-        SELECT id, market_id, outcome, side, quantity, entry_price,
-               current_price, unrealized_pnl, stop_loss, take_profit,
-               realized_pnl, opened_at, updated_at, is_open
+        SELECT id, market_id,
+               COALESCE(outcome, 'both') AS outcome,
+               COALESCE(side, 'long') AS side,
+               quantity,
+               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
+               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+               unrealized_pnl, stop_loss, take_profit,
+               realized_pnl,
+               COALESCE(opened_at, entry_timestamp) AS opened_at,
+               COALESCE(updated_at, entry_timestamp) AS updated_at,
+               is_open
         FROM positions
         WHERE id = $1 AND is_open = true
         "#,

@@ -323,13 +323,21 @@ impl ArbAutoExecutor {
 
         // Clean up stale positions: any position stuck in Pending (0) for >24h
         // is almost certainly a failed paper trade that will block the dedup set forever.
+        let stale_cleanup_reason = serde_json::to_string(&FailureReason::Unknown {
+            message: "stale_cleanup: stuck in Pending >24h".to_string(),
+        })
+        .unwrap_or_else(|_| {
+            r#"{"unknown":{"message":"stale_cleanup: stuck in Pending >24h"}}"#.to_string()
+        });
+
         match sqlx::query(
             r#"
             UPDATE positions
-            SET state = 5, failure_reason = 'stale_cleanup: stuck in Pending >24h'
+            SET state = 5, failure_reason = $1
             WHERE state = 0 AND entry_timestamp < NOW() - INTERVAL '24 hours'
             "#,
         )
+        .bind(&stale_cleanup_reason)
         .execute(&self.pool)
         .await
         {
