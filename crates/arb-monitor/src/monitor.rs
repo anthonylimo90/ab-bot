@@ -916,9 +916,6 @@ impl ArbMonitor {
 
         let mut next = HashSet::new();
         for market_id in selected.selected_ids {
-            if let Some(stats) = self.market_stats.get_mut(&market_id) {
-                stats.last_selected_at = Some(now);
-            }
             next.insert(market_id);
         }
 
@@ -930,6 +927,7 @@ impl ArbMonitor {
         self.last_rerank_at = Some(now);
         let changed = next != previous;
         if !changed {
+            self.mark_markets_selected(previous.iter(), now);
             return SelectionRebuildOutcome::default();
         }
 
@@ -956,6 +954,8 @@ impl ArbMonitor {
             self.core_market_count = selected.core_count;
             self.exploration_market_count = selected.exploration_count;
             self.last_selection_apply_at = Some(now);
+            let applied_markets: Vec<String> = self.eligible_markets.iter().cloned().collect();
+            self.mark_markets_selected(applied_markets.iter(), now);
             SelectionRebuildOutcome {
                 applied: true,
                 changed: true,
@@ -964,6 +964,7 @@ impl ArbMonitor {
                 asset_delta,
             }
         } else {
+            self.mark_markets_selected(previous.iter(), now);
             SelectionRebuildOutcome {
                 applied: false,
                 changed: true,
@@ -996,6 +997,17 @@ impl ArbMonitor {
         }
 
         previous_assets.symmetric_difference(&next_assets).count()
+    }
+
+    fn mark_markets_selected<'a, I>(&mut self, market_ids: I, at: DateTime<Utc>)
+    where
+        I: IntoIterator<Item = &'a String>,
+    {
+        for market_id in market_ids {
+            if let Some(stats) = self.market_stats.get_mut(market_id) {
+                stats.last_selected_at = Some(at);
+            }
+        }
     }
 
     fn track_market_evaluation(&mut self, market_id: &str, at: DateTime<Utc>) {
