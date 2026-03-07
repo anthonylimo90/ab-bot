@@ -49,6 +49,24 @@ pub struct RuntimeStats {
     pub resets_last_minute: f64,
     pub monitored_markets: f64,
     #[serde(default)]
+    pub monitored_assets: f64,
+    #[serde(default)]
+    pub evaluated_books_per_minute: f64,
+    #[serde(default)]
+    pub profitable_books_per_minute: f64,
+    #[serde(default)]
+    pub eligible_profitable_books_per_minute: f64,
+    #[serde(default)]
+    pub filtered_by_selection_per_minute: f64,
+    #[serde(default)]
+    pub filtered_by_profit_per_minute: f64,
+    #[serde(default)]
+    pub filtered_by_depth_per_minute: f64,
+    #[serde(default)]
+    pub filtered_by_cooldown_per_minute: f64,
+    #[serde(default)]
+    pub entry_signals_per_minute: f64,
+    #[serde(default)]
     pub core_markets: f64,
     #[serde(default)]
     pub exploration_markets: f64,

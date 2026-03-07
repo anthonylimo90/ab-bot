@@ -8,6 +8,7 @@
 use chrono::Utc;
 use polymarket_core::api::ClobClient;
 use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::types::Market;
 use polymarket_core::types::{
     ArbOpportunity, ExitStrategy, FailureReason, MarketOrder, OrderSide, Position,
 };
@@ -17,7 +18,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
@@ -117,6 +118,8 @@ pub(crate) struct OutcomeTokenCache {
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
     /// Database pool for persisting token→condition_id mappings.
     pool: Option<PgPool>,
+    /// Serialize cache mutations to avoid overlapping upserts deadlocking.
+    refresh_lock: Mutex<()>,
 }
 
 impl OutcomeTokenCache {
@@ -129,6 +132,7 @@ impl OutcomeTokenCache {
             tokens: RwLock::new(HashMap::new()),
             active_clob_markets,
             pool: None,
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -139,6 +143,7 @@ impl OutcomeTokenCache {
 
     /// Refresh the cache by fetching all markets from the CLOB API.
     pub(crate) async fn refresh(&self) -> anyhow::Result<(usize, usize)> {
+        let _guard = self.refresh_lock.lock().await;
         let markets = self.clob_client.get_markets().await?;
         let mut map = HashMap::new();
         let mut active_set = HashSet::new();
@@ -183,10 +188,11 @@ impl OutcomeTokenCache {
             .iter()
             .map(|(t, c)| (t.as_str(), c.as_str()))
             .collect();
-        let token_condition_pairs: Vec<(String, String)> = deduped
+        let mut token_condition_pairs: Vec<(String, String)> = deduped
             .into_iter()
             .map(|(t, c)| (t.to_owned(), c.to_owned()))
             .collect();
+        token_condition_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Batch UPSERT token→condition_id mappings to DB for resolution checks
         if let Some(ref pool) = self.pool {
@@ -203,6 +209,84 @@ impl OutcomeTokenCache {
         Ok((count, active_set_size))
     }
 
+    /// Hydrate a single market into the cache without forcing a full-market refresh.
+    pub(crate) async fn hydrate_market(
+        &self,
+        market_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        if let Some(ids) = self.get(market_id).await {
+            return Ok(Some(ids));
+        }
+
+        let market = match self.clob_client.get_market_by_id(market_id).await {
+            Ok(market) => market,
+            Err(e) => {
+                warn!(market_id = %market_id, error = %e, "Failed to fetch single market for token cache hydration");
+                return Ok(None);
+            }
+        };
+
+        let _guard = self.refresh_lock.lock().await;
+        Ok(self.apply_market_update(&market).await?)
+    }
+
+    async fn apply_market_update(
+        &self,
+        market: &Market,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let mut tokens = self.tokens.write().await;
+        let mut active_markets = self.active_clob_markets.write().await;
+
+        if market.resolved {
+            active_markets.remove(&market.id);
+            for outcome in &market.outcomes {
+                active_markets.remove(&outcome.token_id);
+            }
+        } else {
+            active_markets.insert(market.id.clone());
+            for outcome in &market.outcomes {
+                active_markets.insert(outcome.token_id.clone());
+            }
+        }
+
+        let token_pair = if market.outcomes.len() == 2 {
+            let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
+                (
+                    market.outcomes[0].token_id.clone(),
+                    market.outcomes[1].token_id.clone(),
+                )
+            } else {
+                (
+                    market.outcomes[1].token_id.clone(),
+                    market.outcomes[0].token_id.clone(),
+                )
+            };
+            tokens.insert(market.id.clone(), (yes_id.clone(), no_id.clone()));
+            Some((yes_id, no_id))
+        } else {
+            tokens.remove(&market.id);
+            None
+        };
+        drop(tokens);
+        drop(active_markets);
+
+        if let Some(ref pool) = self.pool {
+            let mut token_condition_pairs: Vec<(String, String)> = market
+                .outcomes
+                .iter()
+                .map(|outcome| (outcome.token_id.clone(), market.id.clone()))
+                .collect();
+            token_condition_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Err(e) = Self::upsert_token_condition_cache(pool, &token_condition_pairs).await {
+                warn!(market_id = %market.id, error = %e, "Failed to update token_condition_cache during single-market hydration");
+            } else {
+                debug!(market_id = %market.id, pairs = token_condition_pairs.len(), "Hydrated token_condition_cache for single market");
+            }
+        }
+
+        Ok(token_pair)
+    }
+
     /// Batch UPSERT token→condition_id mappings into the database cache.
     async fn upsert_token_condition_cache(
         pool: &PgPool,
@@ -212,8 +296,8 @@ impl OutcomeTokenCache {
             return Ok(());
         }
 
-        // Batch in chunks of 500 to stay under PostgreSQL parameter limits
-        const BATCH_SIZE: usize = 500;
+        // Batch in smaller deterministic chunks to reduce row-lock contention.
+        const BATCH_SIZE: usize = 250;
         for chunk in pairs.chunks(BATCH_SIZE) {
             let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO token_condition_cache (token_id, condition_id, updated_at) ",
@@ -224,7 +308,7 @@ impl OutcomeTokenCache {
                     .push_bind(chrono::Utc::now());
             });
             qb.push(
-                " ON CONFLICT (token_id) DO UPDATE SET condition_id = EXCLUDED.condition_id, updated_at = EXCLUDED.updated_at",
+                " ON CONFLICT (token_id) DO UPDATE SET condition_id = EXCLUDED.condition_id, updated_at = EXCLUDED.updated_at WHERE token_condition_cache.condition_id IS DISTINCT FROM EXCLUDED.condition_id",
             );
             qb.build().execute(pool).await?;
         }
@@ -235,6 +319,43 @@ impl OutcomeTokenCache {
     /// Look up token IDs for a given market.
     pub(crate) async fn get(&self, market_id: &str) -> Option<(String, String)> {
         self.tokens.read().await.get(market_id).cloned()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ArbExecutorRuntimeStatus {
+    pub enabled: bool,
+    pub live_ready: bool,
+    pub signals_seen: u64,
+    pub lagged_signals: u64,
+    pub disabled_skips: u64,
+    pub stale_skips: u64,
+    pub min_profit_skips: u64,
+    pub active_position_skips: u64,
+    pub circuit_breaker_skips: u64,
+    pub token_lookup_skips: u64,
+    pub depth_skips: u64,
+    pub zero_cost_skips: u64,
+    pub execution_failures: u64,
+    pub executed: u64,
+    pub cache_refresh_failures: u64,
+    pub last_signal_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_decision_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_market_id: Option<String>,
+    pub last_decision: Option<String>,
+}
+
+impl ArbExecutorRuntimeStatus {
+    fn record_signal(&mut self, market_id: &str) {
+        self.signals_seen = self.signals_seen.saturating_add(1);
+        self.last_signal_at = Some(Utc::now());
+        self.last_market_id = Some(market_id.to_string());
+    }
+
+    fn record_decision(&mut self, market_id: &str, decision: impl Into<String>) {
+        self.last_decision_at = Some(Utc::now());
+        self.last_market_id = Some(market_id.to_string());
+        self.last_decision = Some(decision.into());
     }
 }
 
@@ -253,6 +374,8 @@ pub struct ArbAutoExecutor {
     active_markets: Arc<RwLock<HashSet<String>>>,
     /// Heartbeat timestamp (epoch secs) — updated every loop iteration to prove liveness.
     heartbeat: Arc<AtomicI64>,
+    /// Shared executor runtime status for dashboard/API inspection.
+    runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
 }
 
 impl ArbAutoExecutor {
@@ -269,6 +392,7 @@ impl ArbAutoExecutor {
         active_markets: Arc<RwLock<HashSet<String>>>,
         active_clob_markets: Arc<RwLock<HashSet<String>>>,
         heartbeat: Arc<AtomicI64>,
+        runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
     ) -> Self {
         Self {
             config,
@@ -281,6 +405,7 @@ impl ArbAutoExecutor {
             token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool),
             active_markets,
             heartbeat,
+            runtime_status,
         }
     }
 
@@ -294,6 +419,22 @@ impl ArbAutoExecutor {
         let startup_cfg = self.snapshot_config().await;
 
         let live_ready = self.order_executor.is_live_ready().await;
+        {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.enabled = startup_cfg.enabled;
+            runtime.live_ready = live_ready;
+            runtime.record_decision(
+                "startup",
+                format!(
+                    "startup enabled={} live_ready={} min_profit={} min_depth={} max_signal_age_secs={}",
+                    startup_cfg.enabled,
+                    live_ready,
+                    startup_cfg.min_net_profit,
+                    startup_cfg.min_book_depth,
+                    startup_cfg.max_signal_age_secs
+                ),
+            );
+        }
         info!(
             enabled = startup_cfg.enabled,
             live_ready,
@@ -407,6 +548,11 @@ impl ArbAutoExecutor {
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
+                            {
+                                let mut runtime = self.runtime_status.write().await;
+                                runtime.lagged_signals = runtime.lagged_signals.saturating_add(n as u64);
+                                runtime.record_decision("channel", format!("lagged {} arb signals", n));
+                            }
                             warn!(skipped = n, "Arb executor lagged, skipped signals");
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -418,7 +564,13 @@ impl ArbAutoExecutor {
                 _ = cache_ticker.tick() => {
                     match self.token_cache.refresh().await {
                         Ok((count, active_set_size)) => debug!(markets = count, active_set_size, "Token cache refreshed"),
-                        Err(e) => warn!(error = %e, "Token cache refresh failed"),
+                        Err(e) => {
+                            let mut runtime = self.runtime_status.write().await;
+                            runtime.cache_refresh_failures =
+                                runtime.cache_refresh_failures.saturating_add(1);
+                            runtime.record_decision("cache", format!("refresh failed: {e}"));
+                            warn!(error = %e, "Token cache refresh failed");
+                        }
                     }
                 }
                 _ = heartbeat_ticker.tick() => {
@@ -434,6 +586,13 @@ impl ArbAutoExecutor {
     /// Process a single arb signal through validation → execution → tracking.
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
         let cfg = self.snapshot_config().await;
+        let live_ready = self.order_executor.is_live_ready().await;
+        {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.enabled = cfg.enabled;
+            runtime.live_ready = live_ready;
+            runtime.record_signal(&arb.market_id);
+        }
 
         // Persist every arb signal to arb_opportunities for the DynamicTuner's
         // depth_proxy and events_per_min calculations. Fire-and-forget to avoid
@@ -460,6 +619,9 @@ impl ArbAutoExecutor {
 
         // Per-signal guard: skip processing when disabled at runtime
         if !cfg.enabled {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.disabled_skips = runtime.disabled_skips.saturating_add(1);
+            runtime.record_decision(&arb.market_id, "skipped: executor disabled");
             return Ok(());
         }
 
@@ -470,6 +632,15 @@ impl ArbAutoExecutor {
             .signed_duration_since(arb.timestamp)
             .num_seconds();
         if age_secs > cfg.max_signal_age_secs {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.stale_skips = runtime.stale_skips.saturating_add(1);
+            runtime.record_decision(
+                market_id,
+                format!(
+                    "skipped: stale signal age={} max={}",
+                    age_secs, cfg.max_signal_age_secs
+                ),
+            );
             info!(
                 market_id = %market_id,
                 age_secs = age_secs,
@@ -481,6 +652,15 @@ impl ArbAutoExecutor {
 
         // 2. Check minimum profit threshold
         if arb.net_profit < cfg.min_net_profit {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.min_profit_skips = runtime.min_profit_skips.saturating_add(1);
+            runtime.record_decision(
+                market_id,
+                format!(
+                    "skipped: net profit {} below {}",
+                    arb.net_profit, cfg.min_net_profit
+                ),
+            );
             info!(
                 market_id = %market_id,
                 net_profit = %arb.net_profit,
@@ -494,6 +674,9 @@ impl ArbAutoExecutor {
         {
             let active = self.active_markets.read().await;
             if active.contains(market_id) {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.active_position_skips = runtime.active_position_skips.saturating_add(1);
+                runtime.record_decision(market_id, "skipped: active position exists");
                 info!(market_id = %market_id, "Active position exists, skipping");
                 return Ok(());
             }
@@ -501,6 +684,9 @@ impl ArbAutoExecutor {
 
         // 4. Circuit breaker check
         if !self.circuit_breaker.can_trade().await {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.circuit_breaker_skips = runtime.circuit_breaker_skips.saturating_add(1);
+            runtime.record_decision(market_id, "skipped: circuit breaker tripped");
             warn!(market_id = %market_id, "Circuit breaker tripped, skipping arb trade");
             return Ok(());
         }
@@ -511,17 +697,28 @@ impl ArbAutoExecutor {
             None => {
                 warn!(
                     market_id = %market_id,
-                    "No token IDs cached for market, attempting refresh"
+                    "No token IDs cached for market, attempting single-market hydration"
                 );
-                // Try a single refresh and retry
-                if let Err(e) = self.token_cache.refresh().await {
-                    error!(error = %e, "Token cache refresh failed");
-                    return Ok(());
-                }
-                match self.token_cache.get(market_id).await {
-                    Some(ids) => ids,
-                    None => {
-                        warn!(market_id = %market_id, "Market not found after refresh, skipping");
+                match self.token_cache.hydrate_market(market_id).await {
+                    Ok(Some(ids)) => ids,
+                    Ok(None) => {
+                        let mut runtime = self.runtime_status.write().await;
+                        runtime.token_lookup_skips = runtime.token_lookup_skips.saturating_add(1);
+                        runtime.record_decision(
+                            market_id,
+                            "skipped: token lookup failed after single-market hydration",
+                        );
+                        warn!(market_id = %market_id, "Market not found after single-market hydration, skipping");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let mut runtime = self.runtime_status.write().await;
+                        runtime.token_lookup_skips = runtime.token_lookup_skips.saturating_add(1);
+                        runtime.record_decision(
+                            market_id,
+                            format!("skipped: token cache hydration failed: {e}"),
+                        );
+                        warn!(market_id = %market_id, error = %e, "Token cache hydration failed");
                         return Ok(());
                     }
                 }
@@ -546,6 +743,15 @@ impl ArbAutoExecutor {
                 let no_depth: Decimal = nb.asks.iter().map(|l| l.price * l.size).sum();
 
                 if yes_depth < cfg.min_book_depth || no_depth < cfg.min_book_depth {
+                    let mut runtime = self.runtime_status.write().await;
+                    runtime.depth_skips = runtime.depth_skips.saturating_add(1);
+                    runtime.record_decision(
+                        market_id,
+                        format!(
+                            "skipped: insufficient depth yes={} no={} min={}",
+                            yes_depth, no_depth, cfg.min_book_depth
+                        ),
+                    );
                     info!(
                         market_id = %market_id,
                         yes_depth = %yes_depth,
@@ -587,6 +793,9 @@ impl ArbAutoExecutor {
         };
 
         if arb.total_cost.is_zero() {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.zero_cost_skips = runtime.zero_cost_skips.saturating_add(1);
+            runtime.record_decision(market_id, "skipped: zero total cost");
             warn!(market_id = %market_id, "Zero total_cost, skipping");
             return Ok(());
         }
@@ -629,6 +838,12 @@ impl ArbAutoExecutor {
         let yes_report = match self.order_executor.execute_market_order(yes_order).await {
             Ok(report) => report,
             Err(e) => {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+                runtime.record_decision(
+                    market_id,
+                    format!("execution failure: YES order error: {e}"),
+                );
                 error!(error = %e, market_id = %market_id, "YES order execution error");
                 position.mark_entry_failed(FailureReason::ConnectivityError {
                     message: format!("YES order error: {e}"),
@@ -644,6 +859,12 @@ impl ArbAutoExecutor {
             let msg = yes_report
                 .error_message
                 .unwrap_or_else(|| "YES order not filled".to_string());
+            let mut runtime = self.runtime_status.write().await;
+            runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+            runtime.record_decision(
+                market_id,
+                format!("execution failure: YES order rejected: {msg}"),
+            );
             warn!(market_id = %market_id, reason = %msg, "YES order failed");
             position.mark_entry_failed(FailureReason::OrderRejected { message: msg });
             let _ = self.position_repo.update(&position).await;
@@ -657,6 +878,10 @@ impl ArbAutoExecutor {
         let no_report = match self.order_executor.execute_market_order(no_order).await {
             Ok(report) => report,
             Err(e) => {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+                runtime
+                    .record_decision(market_id, format!("execution failure: NO order error: {e}"));
                 error!(error = %e, market_id = %market_id, "NO order execution error (one-legged)");
                 position.mark_entry_failed(FailureReason::ConnectivityError {
                     message: format!("NO order error (one-legged, YES filled): {e}"),
@@ -672,6 +897,12 @@ impl ArbAutoExecutor {
             let msg = no_report
                 .error_message
                 .unwrap_or_else(|| "NO order not filled".to_string());
+            let mut runtime = self.runtime_status.write().await;
+            runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+            runtime.record_decision(
+                market_id,
+                format!("execution failure: NO order rejected: {msg}"),
+            );
             warn!(
                 market_id = %market_id,
                 reason = %msg,
@@ -724,6 +955,17 @@ impl ArbAutoExecutor {
         };
         let _ = self.signal_tx.send(signal);
 
+        {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.executed = runtime.executed.saturating_add(1);
+            runtime.record_decision(
+                market_id,
+                format!(
+                    "executed: position={} estimated_pnl={}",
+                    position.id, estimated_pnl
+                ),
+            );
+        }
         info!(
             market_id = %market_id,
             position_id = %position.id,
@@ -766,6 +1008,7 @@ pub fn spawn_arb_auto_executor(
     active_markets: Arc<RwLock<HashSet<String>>>,
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
+    runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
 ) {
     let executor = ArbAutoExecutor::new(
         config,
@@ -778,6 +1021,7 @@ pub fn spawn_arb_auto_executor(
         active_markets,
         active_clob_markets,
         heartbeat,
+        runtime_status,
     );
 
     tokio::spawn(async move {

@@ -1077,10 +1077,13 @@ pub async fn create_workspace_invite(
         workspace_name.0, role, invite_link
     );
 
-    email_client.send_simple(&email, &subject, &body).await.map_err(|e| {
-        tracing::error!(error = %e, email = %email, "Failed to send workspace invite email");
-        ApiError::Internal("Failed to send invite email".into())
-    })?;
+    email_client
+        .send_simple(&email, &subject, &body)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, email = %email, "Failed to send workspace invite email");
+            ApiError::Internal("Failed to send invite email".into())
+        })?;
 
     tx.commit().await?;
 
@@ -1314,10 +1317,7 @@ pub async fn accept_invite(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let requested_password = req
-        .password
-        .as_deref()
-        .filter(|value| !value.is_empty());
+    let requested_password = req.password.as_deref().filter(|value| !value.is_empty());
 
     if !requested_email.eq_ignore_ascii_case(&invite.email) {
         return Err(ApiError::BadRequest(
@@ -1339,10 +1339,11 @@ pub async fn accept_invite(
             ));
         }
 
-        let existing_user: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE email = $1")
-            .bind(&invite.email)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let existing_user: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM users WHERE email = $1")
+                .bind(&invite.email)
+                .fetch_optional(&mut *tx)
+                .await?;
 
         if existing_user.is_some() {
             return Err(ApiError::Conflict(
@@ -1382,7 +1383,8 @@ pub async fn accept_invite(
         .execute(&mut *tx)
         .await?;
 
-        let claims = Claims::new(user_id.to_string(), UserRole::Trader, 24).with_email(&invite.email);
+        let claims =
+            Claims::new(user_id.to_string(), UserRole::Trader, 24).with_email(&invite.email);
         let token = state
             .jwt_auth
             .create_token_with_claims(&claims)
@@ -1802,6 +1804,24 @@ struct ScannerMarketInsightSnapshot {
 struct ArbRuntimeStatsSnapshot {
     monitored_markets: f64,
     #[serde(default)]
+    monitored_assets: f64,
+    #[serde(default)]
+    evaluated_books_per_minute: f64,
+    #[serde(default)]
+    profitable_books_per_minute: f64,
+    #[serde(default)]
+    eligible_profitable_books_per_minute: f64,
+    #[serde(default)]
+    filtered_by_selection_per_minute: f64,
+    #[serde(default)]
+    filtered_by_profit_per_minute: f64,
+    #[serde(default)]
+    filtered_by_depth_per_minute: f64,
+    #[serde(default)]
+    filtered_by_cooldown_per_minute: f64,
+    #[serde(default)]
+    entry_signals_per_minute: f64,
+    #[serde(default)]
     core_markets: f64,
     #[serde(default)]
     exploration_markets: f64,
@@ -1855,11 +1875,45 @@ pub struct ScannerMarketInsightResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ScannerStatusResponse {
     pub monitored_markets: i64,
+    pub monitored_assets: i64,
+    pub evaluated_books_per_minute: i64,
+    pub profitable_books_per_minute: i64,
+    pub eligible_profitable_books_per_minute: i64,
+    pub filtered_by_selection_per_minute: i64,
+    pub filtered_by_profit_per_minute: i64,
+    pub filtered_by_depth_per_minute: i64,
+    pub filtered_by_cooldown_per_minute: i64,
+    pub entry_signals_per_minute: i64,
     pub core_markets: i64,
     pub exploration_markets: i64,
     pub last_rerank_at: Option<DateTime<Utc>>,
     pub last_resubscribe_at: Option<DateTime<Utc>>,
     pub selected_markets: Vec<ScannerMarketInsightResponse>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArbExecutorStatusResponse {
+    pub enabled: bool,
+    pub live_ready: bool,
+    pub task_alive: bool,
+    pub heartbeat_age_secs: Option<i64>,
+    pub signals_seen: i64,
+    pub lagged_signals: i64,
+    pub executed: i64,
+    pub execution_failures: i64,
+    pub disabled_skips: i64,
+    pub stale_skips: i64,
+    pub min_profit_skips: i64,
+    pub active_position_skips: i64,
+    pub circuit_breaker_skips: i64,
+    pub token_lookup_skips: i64,
+    pub depth_skips: i64,
+    pub zero_cost_skips: i64,
+    pub cache_refresh_failures: i64,
+    pub last_signal_at: Option<DateTime<Utc>>,
+    pub last_decision_at: Option<DateTime<Utc>>,
+    pub last_market_id: Option<String>,
+    pub last_decision: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1891,6 +1945,7 @@ pub struct DynamicTunerStatusResponse {
     pub signal_thresholds: DynamicSignalThresholdsResponse,
     pub opportunity_selection: OpportunitySelectionStatusResponse,
     pub scanner_status: ScannerStatusResponse,
+    pub arb_executor_status: ArbExecutorStatusResponse,
     pub dynamic_config: Vec<DynamicConfigItemResponse>,
     pub watchdog_active: bool,
     pub watchdog_fill_rate: Option<f64>,
@@ -2300,6 +2355,19 @@ pub async fn get_dynamic_tuner_status(
         .unwrap_or_default();
     let scanner_status = ScannerStatusResponse {
         monitored_markets: runtime_stats.monitored_markets.round() as i64,
+        monitored_assets: runtime_stats.monitored_assets.round() as i64,
+        evaluated_books_per_minute: runtime_stats.evaluated_books_per_minute.round() as i64,
+        profitable_books_per_minute: runtime_stats.profitable_books_per_minute.round() as i64,
+        eligible_profitable_books_per_minute: runtime_stats
+            .eligible_profitable_books_per_minute
+            .round() as i64,
+        filtered_by_selection_per_minute: runtime_stats.filtered_by_selection_per_minute.round()
+            as i64,
+        filtered_by_profit_per_minute: runtime_stats.filtered_by_profit_per_minute.round() as i64,
+        filtered_by_depth_per_minute: runtime_stats.filtered_by_depth_per_minute.round() as i64,
+        filtered_by_cooldown_per_minute: runtime_stats.filtered_by_cooldown_per_minute.round()
+            as i64,
+        entry_signals_per_minute: runtime_stats.entry_signals_per_minute.round() as i64,
         core_markets: runtime_stats.core_markets.round() as i64,
         exploration_markets: runtime_stats.exploration_markets.round() as i64,
         last_rerank_at: runtime_stats.last_rerank_at,
@@ -2329,6 +2397,39 @@ pub async fn get_dynamic_tuner_status(
         max_markets_cap: max_markets_cap.round() as i64,
         recommendation,
     };
+    let arb_heartbeat_ts = state
+        .arb_executor_heartbeat
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let arb_heartbeat_age_secs = if arb_heartbeat_ts > 0 {
+        Some((chrono::Utc::now().timestamp() - arb_heartbeat_ts).max(0))
+    } else {
+        None
+    };
+    let arb_task_alive = arb_heartbeat_age_secs.map(|age| age < 120).unwrap_or(false);
+    let arb_runtime = state.arb_executor_status.read().await.clone();
+    let arb_executor_status = ArbExecutorStatusResponse {
+        enabled: arb_runtime.enabled,
+        live_ready: arb_runtime.live_ready,
+        task_alive: arb_task_alive,
+        heartbeat_age_secs: arb_heartbeat_age_secs,
+        signals_seen: arb_runtime.signals_seen as i64,
+        lagged_signals: arb_runtime.lagged_signals as i64,
+        executed: arb_runtime.executed as i64,
+        execution_failures: arb_runtime.execution_failures as i64,
+        disabled_skips: arb_runtime.disabled_skips as i64,
+        stale_skips: arb_runtime.stale_skips as i64,
+        min_profit_skips: arb_runtime.min_profit_skips as i64,
+        active_position_skips: arb_runtime.active_position_skips as i64,
+        circuit_breaker_skips: arb_runtime.circuit_breaker_skips as i64,
+        token_lookup_skips: arb_runtime.token_lookup_skips as i64,
+        depth_skips: arb_runtime.depth_skips as i64,
+        zero_cost_skips: arb_runtime.zero_cost_skips as i64,
+        cache_refresh_failures: arb_runtime.cache_refresh_failures as i64,
+        last_signal_at: arb_runtime.last_signal_at,
+        last_decision_at: arb_runtime.last_decision_at,
+        last_market_id: arb_runtime.last_market_id,
+        last_decision: arb_runtime.last_decision,
+    };
 
     Ok(Json(DynamicTunerStatusResponse {
         enabled,
@@ -2353,6 +2454,7 @@ pub async fn get_dynamic_tuner_status(
         signal_thresholds,
         opportunity_selection,
         scanner_status,
+        arb_executor_status,
         dynamic_config,
         watchdog_active,
         watchdog_fill_rate,

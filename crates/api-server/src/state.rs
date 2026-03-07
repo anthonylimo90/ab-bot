@@ -89,6 +89,8 @@ pub struct AppState {
     pub active_clob_markets: Arc<RwLock<HashSet<String>>>,
     /// Shared arb executor config for runtime hot-swap (None if arb executor disabled).
     pub arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
+    /// Shared arb executor runtime status for dashboard/API inspection.
+    pub arb_executor_status: Arc<RwLock<crate::arb_executor::ArbExecutorRuntimeStatus>>,
     /// Shared exit handler config for runtime hot-swap (None if exit handler disabled).
     pub exit_handler_config: Option<Arc<RwLock<crate::exit_handler::ExitHandlerConfig>>>,
     /// Heartbeat timestamp (epoch secs) from arb executor loop — 0 means never updated.
@@ -492,6 +494,9 @@ impl AppState {
             redis_conn,
             active_clob_markets: Arc::new(RwLock::new(HashSet::new())),
             arb_executor_config: None,
+            arb_executor_status: Arc::new(RwLock::new(
+                crate::arb_executor::ArbExecutorRuntimeStatus::default(),
+            )),
             exit_handler_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),

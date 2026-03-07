@@ -376,6 +376,117 @@ export default function TunerPage() {
               </CardContent>
             </Card>
 
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <span>Arb Executor Status</span>
+                  <InfoTooltip content="This shows whether the executor is alive, whether it is ready to trade live, and how recent arb signals have been filtered or executed." />
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Enabled</p>
+                    <Badge
+                      variant={tuner.arb_executor_status.enabled ? "default" : "secondary"}
+                    >
+                      {tuner.arb_executor_status.enabled ? "Yes" : "No"}
+                    </Badge>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Live Ready</p>
+                    <Badge
+                      variant={tuner.arb_executor_status.live_ready ? "default" : "secondary"}
+                    >
+                      {tuner.arb_executor_status.live_ready ? "Yes" : "No"}
+                    </Badge>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Task Alive</p>
+                    <Badge
+                      variant={tuner.arb_executor_status.task_alive ? "default" : "destructive"}
+                    >
+                      {tuner.arb_executor_status.task_alive ? "Alive" : "Stale"}
+                    </Badge>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Heartbeat Age</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.arb_executor_status.heartbeat_age_secs != null
+                        ? `${tuner.arb_executor_status.heartbeat_age_secs}s`
+                        : "-"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+                  <MetricCard title="Signals Seen" value={String(tuner.arb_executor_status.signals_seen)} trend="neutral" />
+                  <MetricCard title="Executed" value={String(tuner.arb_executor_status.executed)} trend="neutral" />
+                  <MetricCard title="Exec Failures" value={String(tuner.arb_executor_status.execution_failures)} trend={tuner.arb_executor_status.execution_failures > 0 ? "down" : "neutral"} />
+                  <MetricCard title="Depth Skips" value={String(tuner.arb_executor_status.depth_skips)} trend={tuner.arb_executor_status.depth_skips > 0 ? "down" : "neutral"} />
+                  <MetricCard title="Cache Failures" value={String(tuner.arb_executor_status.cache_refresh_failures)} trend={tuner.arb_executor_status.cache_refresh_failures > 0 ? "down" : "neutral"} />
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Min Profit Skips</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.arb_executor_status.min_profit_skips}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Active Position Skips</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.arb_executor_status.active_position_skips}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Circuit Breaker Skips</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.arb_executor_status.circuit_breaker_skips}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Token Lookup Skips</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.arb_executor_status.token_lookup_skips}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border p-3 space-y-2">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-xs text-muted-foreground">Last Signal</p>
+                    <p className="text-sm font-medium">
+                      {tuner.arb_executor_status.last_signal_at
+                        ? formatTimeAgo(tuner.arb_executor_status.last_signal_at)
+                        : "Never"}
+                    </p>
+                  </div>
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-xs text-muted-foreground">Last Decision</p>
+                    <p className="text-sm font-medium">
+                      {tuner.arb_executor_status.last_decision_at
+                        ? formatTimeAgo(tuner.arb_executor_status.last_decision_at)
+                        : "Never"}
+                    </p>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-muted-foreground">Last Market</p>
+                    <p className="font-mono text-xs break-all">
+                      {tuner.arb_executor_status.last_market_id ?? "-"}
+                    </p>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-muted-foreground">Last Decision Detail</p>
+                    <p className="text-sm">
+                      {tuner.arb_executor_status.last_decision ?? "-"}
+                    </p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
             {/* Dynamic Config Table */}
             <Card>
               <CardHeader className="pb-3">

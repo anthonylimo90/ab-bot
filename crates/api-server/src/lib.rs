@@ -274,6 +274,7 @@ impl ApiServer {
             arb_dedup.clone(),
             state.active_clob_markets.clone(),
             state.arb_executor_heartbeat.clone(),
+            state.arb_executor_status.clone(),
         );
 
         // Spawn exit handler unconditionally (per-tick guard checks enabled)

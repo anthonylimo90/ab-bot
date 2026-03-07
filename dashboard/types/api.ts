@@ -698,6 +698,15 @@ export interface ScannerMarketInsight {
 
 export interface ScannerStatus {
   monitored_markets: number;
+  monitored_assets: number;
+  evaluated_books_per_minute: number;
+  profitable_books_per_minute: number;
+  eligible_profitable_books_per_minute: number;
+  filtered_by_selection_per_minute: number;
+  filtered_by_profit_per_minute: number;
+  filtered_by_depth_per_minute: number;
+  filtered_by_cooldown_per_minute: number;
+  entry_signals_per_minute: number;
   core_markets: number;
   exploration_markets: number;
   last_rerank_at: string | null;
@@ -711,6 +720,30 @@ export interface OpportunitySelectionStatus {
   exploration_slots: number;
   max_markets_cap: number;
   recommendation: string;
+}
+
+export interface ArbExecutorStatus {
+  enabled: boolean;
+  live_ready: boolean;
+  task_alive: boolean;
+  heartbeat_age_secs: number | null;
+  signals_seen: number;
+  lagged_signals: number;
+  executed: number;
+  execution_failures: number;
+  disabled_skips: number;
+  stale_skips: number;
+  min_profit_skips: number;
+  active_position_skips: number;
+  circuit_breaker_skips: number;
+  token_lookup_skips: number;
+  depth_skips: number;
+  zero_cost_skips: number;
+  cache_refresh_failures: number;
+  last_signal_at: string | null;
+  last_decision_at: string | null;
+  last_market_id: string | null;
+  last_decision: string | null;
 }
 
 export interface DynamicTunerStatus {
@@ -732,6 +765,7 @@ export interface DynamicTunerStatus {
   signal_thresholds: DynamicSignalThresholds;
   opportunity_selection: OpportunitySelectionStatus;
   scanner_status: ScannerStatus;
+  arb_executor_status: ArbExecutorStatus;
   dynamic_config: DynamicConfigItem[];
   watchdog_active: boolean;
   watchdog_fill_rate: number | null;

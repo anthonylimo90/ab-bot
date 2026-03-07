@@ -18,8 +18,8 @@ use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-/// Minimum depth (in USD) at best ask for both sides.
-const MIN_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0); // $100
+/// Default minimum depth (in USD) at best ask for both sides.
+const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0); // $100
 
 /// Cooldown period between signals for the same market (seconds).
 const SIGNAL_COOLDOWN_SECS: i64 = 60;
@@ -162,6 +162,45 @@ struct MarketOpportunityStats {
     last_selected_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ArbTelemetryCounters {
+    evaluated_books: u64,
+    profitable_books: u64,
+    eligible_profitable_books: u64,
+    filtered_by_selection: u64,
+    filtered_by_profit: u64,
+    filtered_by_depth: u64,
+    filtered_by_cooldown: u64,
+    entry_signals: u64,
+}
+
+impl ArbTelemetryCounters {
+    fn as_runtime_stats(self) -> ArbTelemetryRuntimeStats {
+        ArbTelemetryRuntimeStats {
+            evaluated_books_per_minute: self.evaluated_books as f64,
+            profitable_books_per_minute: self.profitable_books as f64,
+            eligible_profitable_books_per_minute: self.eligible_profitable_books as f64,
+            filtered_by_selection_per_minute: self.filtered_by_selection as f64,
+            filtered_by_profit_per_minute: self.filtered_by_profit as f64,
+            filtered_by_depth_per_minute: self.filtered_by_depth as f64,
+            filtered_by_cooldown_per_minute: self.filtered_by_cooldown as f64,
+            entry_signals_per_minute: self.entry_signals as f64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ArbTelemetryRuntimeStats {
+    evaluated_books_per_minute: f64,
+    profitable_books_per_minute: f64,
+    eligible_profitable_books_per_minute: f64,
+    filtered_by_selection_per_minute: f64,
+    filtered_by_profit_per_minute: f64,
+    filtered_by_depth_per_minute: f64,
+    filtered_by_cooldown_per_minute: f64,
+    entry_signals_per_minute: f64,
+}
+
 #[derive(Debug, Clone)]
 struct RankedMarket {
     market_id: String,
@@ -187,6 +226,8 @@ pub struct ArbMonitor {
     market_outcomes: HashMap<String, (String, String)>,
     /// Minimum net profit threshold for entry signals.
     min_profit_threshold: Decimal,
+    /// Minimum order book depth required on both sides before signaling.
+    min_book_depth: Decimal,
     /// Last signal timestamp per market (for dedup/cooldown).
     last_signal_time: HashMap<String, DateTime<Utc>>,
     /// Aggressiveness profile used for dynamic scoring.
@@ -247,6 +288,11 @@ impl ArbMonitor {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| Decimal::new(5, 3));
+        let min_book_depth = std::env::var("ARB_MONITOR_MIN_BOOK_DEPTH")
+            .or_else(|_| std::env::var("ARB_MIN_BOOK_DEPTH"))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MIN_BOOK_DEPTH_USD);
         let max_markets_env = std::env::var(KEY_ARB_MONITOR_MAX_MARKETS)
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
@@ -296,6 +342,7 @@ impl ArbMonitor {
             order_books: HashMap::new(),
             market_outcomes: HashMap::new(),
             min_profit_threshold,
+            min_book_depth,
             last_signal_time: HashMap::new(),
             aggressiveness_profile,
             scoring_weights,
@@ -349,9 +396,12 @@ impl ArbMonitor {
         info!(
             total_markets = self.all_market_ids.len(),
             active_markets = self.eligible_markets.len(),
+            active_assets = self.active_subscription_asset_count(),
             max_cap = ?self.max_markets_cap,
             aggressiveness = ?self.aggressiveness_profile,
             exploration_slots = self.exploration_slots,
+            min_profit_threshold = %self.min_profit_threshold,
+            min_book_depth = %self.min_book_depth,
             "Initialized arb market universe"
         );
 
@@ -400,6 +450,7 @@ impl ArbMonitor {
         let mut updates_since_tick = 0u64;
         let mut stalls_since_tick = 0u64;
         let mut resets_since_tick = 0u64;
+        let mut arb_telemetry = ArbTelemetryCounters::default();
         let mut resubscribe_requested = false;
 
         const MAX_RESUBSCRIBE_RETRIES: u32 = 10;
@@ -468,11 +519,22 @@ impl ArbMonitor {
                     crate::touch_health_file();
                 }
                 _ = stats_tick.tick() => {
+                    let arb_runtime = arb_telemetry.as_runtime_stats();
+                    let monitored_assets = self.active_subscription_asset_count() as f64;
                     let stats = RuntimeStats {
                         updates_per_minute: updates_since_tick as f64,
                         stalls_last_minute: stalls_since_tick as f64,
                         resets_last_minute: resets_since_tick as f64,
                         monitored_markets: self.eligible_markets.len() as f64,
+                        monitored_assets,
+                        evaluated_books_per_minute: arb_runtime.evaluated_books_per_minute,
+                        profitable_books_per_minute: arb_runtime.profitable_books_per_minute,
+                        eligible_profitable_books_per_minute: arb_runtime.eligible_profitable_books_per_minute,
+                        filtered_by_selection_per_minute: arb_runtime.filtered_by_selection_per_minute,
+                        filtered_by_profit_per_minute: arb_runtime.filtered_by_profit_per_minute,
+                        filtered_by_depth_per_minute: arb_runtime.filtered_by_depth_per_minute,
+                        filtered_by_cooldown_per_minute: arb_runtime.filtered_by_cooldown_per_minute,
+                        entry_signals_per_minute: arb_runtime.entry_signals_per_minute,
                         core_markets: self.core_market_count as f64,
                         exploration_markets: self.exploration_market_count as f64,
                         last_rerank_at: self.last_rerank_at,
@@ -482,9 +544,28 @@ impl ArbMonitor {
                     if let Err(e) = self.signal_publisher.publish_runtime_stats(&stats).await {
                         warn!(error = %e, "Failed to publish arb runtime stats");
                     }
+                    info!(
+                        monitored_markets = self.eligible_markets.len(),
+                        monitored_assets = monitored_assets as u64,
+                        min_profit_threshold = %self.min_profit_threshold,
+                        min_book_depth = %self.min_book_depth,
+                        updates = updates_since_tick,
+                        evaluated_books = arb_telemetry.evaluated_books,
+                        profitable_books = arb_telemetry.profitable_books,
+                        eligible_profitable_books = arb_telemetry.eligible_profitable_books,
+                        filtered_by_selection = arb_telemetry.filtered_by_selection,
+                        filtered_by_profit = arb_telemetry.filtered_by_profit,
+                        filtered_by_depth = arb_telemetry.filtered_by_depth,
+                        filtered_by_cooldown = arb_telemetry.filtered_by_cooldown,
+                        entry_signals = arb_telemetry.entry_signals,
+                        stalls = stalls_since_tick,
+                        resets = resets_since_tick,
+                        "Arb monitor minute telemetry"
+                    );
                     updates_since_tick = 0;
                     stalls_since_tick = 0;
                     resets_since_tick = 0;
+                    arb_telemetry = ArbTelemetryCounters::default();
                     if self.rebuild_eligible_markets() {
                         info!(
                             active_markets = self.eligible_markets.len(),
@@ -535,7 +616,7 @@ impl ArbMonitor {
                     };
 
                     updates_since_tick += 1;
-                    self.process_update(update).await?;
+                    self.process_update(update, &mut arb_telemetry).await?;
                     health_tick += 1;
 
                     if health_tick.is_multiple_of(100) {
@@ -718,8 +799,16 @@ impl ArbMonitor {
         assets.into_iter().collect()
     }
 
+    fn active_subscription_asset_count(&self) -> usize {
+        self.active_subscription_asset_ids().len()
+    }
+
     /// Process an order book update.
-    async fn process_update(&mut self, update: OrderBookUpdate) -> Result<()> {
+    async fn process_update(
+        &mut self,
+        update: OrderBookUpdate,
+        arb_telemetry: &mut ArbTelemetryCounters,
+    ) -> Result<()> {
         let eligible_for_entries = self.eligible_markets.contains(&update.market_id);
 
         // Store the updated order book
@@ -750,36 +839,64 @@ impl ArbMonitor {
                 };
 
                 // Check liquidity depth on both sides before considering arb
-                let has_depth = binary_book.entry_cost_with_depth(MIN_DEPTH_USD).is_some();
+                let has_depth = binary_book
+                    .entry_cost_with_depth(self.min_book_depth)
+                    .is_some();
                 let observed_at = Utc::now();
                 self.track_market_evaluation(&update.market_id, observed_at);
+                arb_telemetry.evaluated_books = arb_telemetry.evaluated_books.saturating_add(1);
 
                 // Calculate arbitrage opportunity
                 if let Some(arb) =
                     ArbOpportunity::calculate(&binary_book, ArbOpportunity::DEFAULT_FEE)
                 {
-                    if arb.is_profitable() && has_depth {
-                        self.track_market_opportunity(&arb.market_id, arb.net_profit, observed_at);
+                    if arb.is_profitable() {
+                        arb_telemetry.profitable_books =
+                            arb_telemetry.profitable_books.saturating_add(1);
+                        if has_depth {
+                            self.track_market_opportunity(
+                                &arb.market_id,
+                                arb.net_profit,
+                                observed_at,
+                            );
+                        }
                     }
 
-                    if eligible_for_entries
-                        && arb.is_profitable()
-                        && arb.net_profit >= self.min_profit_threshold
-                        && has_depth
-                    {
-                        // Dedup/cooldown: skip if we signaled this market recently
-                        let should_signal = match self.last_signal_time.get(&arb.market_id) {
-                            Some(last) => {
-                                (observed_at - *last).num_seconds() >= SIGNAL_COOLDOWN_SECS
-                            }
-                            None => true,
-                        };
+                    if arb.is_profitable() {
+                        if !eligible_for_entries {
+                            arb_telemetry.filtered_by_selection =
+                                arb_telemetry.filtered_by_selection.saturating_add(1);
+                        } else {
+                            arb_telemetry.eligible_profitable_books =
+                                arb_telemetry.eligible_profitable_books.saturating_add(1);
+                            if arb.net_profit < self.min_profit_threshold {
+                                arb_telemetry.filtered_by_profit =
+                                    arb_telemetry.filtered_by_profit.saturating_add(1);
+                            } else if !has_depth {
+                                arb_telemetry.filtered_by_depth =
+                                    arb_telemetry.filtered_by_depth.saturating_add(1);
+                            } else {
+                                // Dedup/cooldown: skip if we signaled this market recently
+                                let should_signal = match self.last_signal_time.get(&arb.market_id)
+                                {
+                                    Some(last) => {
+                                        (observed_at - *last).num_seconds() >= SIGNAL_COOLDOWN_SECS
+                                    }
+                                    None => true,
+                                };
 
-                        if should_signal {
-                            self.last_signal_time
-                                .insert(arb.market_id.clone(), observed_at);
-                            self.track_market_signal(&arb.market_id, observed_at);
-                            self.handle_arb_opportunity(&arb, &binary_book).await?;
+                                if should_signal {
+                                    self.last_signal_time
+                                        .insert(arb.market_id.clone(), observed_at);
+                                    self.track_market_signal(&arb.market_id, observed_at);
+                                    arb_telemetry.entry_signals =
+                                        arb_telemetry.entry_signals.saturating_add(1);
+                                    self.handle_arb_opportunity(&arb, &binary_book).await?;
+                                } else {
+                                    arb_telemetry.filtered_by_cooldown =
+                                        arb_telemetry.filtered_by_cooldown.saturating_add(1);
+                                }
+                            }
                         }
                     }
                 }
