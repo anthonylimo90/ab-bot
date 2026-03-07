@@ -354,11 +354,11 @@ impl QuantSignalExecutor {
         let gen_at = signal.generated_at;
 
         tokio::spawn(async move {
-            let _ = sqlx::query(
+            if let Err(error) = sqlx::query(
                 r#"
                 INSERT INTO quant_signals (id, kind, condition_id, direction, confidence, size_usd, metadata, generated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (id) DO NOTHING
+                ON CONFLICT (id, generated_at) DO NOTHING
                 "#,
             )
             .bind(signal_id)
@@ -370,7 +370,16 @@ impl QuantSignalExecutor {
             .bind(&meta)
             .bind(gen_at)
             .execute(&pool)
-            .await;
+            .await
+            {
+                warn!(
+                    error = %error,
+                    signal_id = %signal_id,
+                    kind = %kind_str,
+                    condition_id = %cid,
+                    "Failed to persist quant signal"
+                );
+            }
         });
 
         // Step 1: Check enabled
@@ -742,25 +751,42 @@ impl QuantSignalExecutor {
         status: &str,
         skip_reason: Option<&str>,
     ) {
-        let _ = sqlx::query(
+        if let Err(error) = sqlx::query(
             "UPDATE quant_signals SET execution_status = $1, skip_reason = $2 WHERE id = $3",
         )
         .bind(status)
         .bind(skip_reason)
         .bind(signal_id)
         .execute(&self.pool)
-        .await;
+        .await
+        {
+            warn!(
+                error = %error,
+                signal_id = %signal_id,
+                status = %status,
+                skip_reason = skip_reason,
+                "Failed to update quant signal status"
+            );
+        }
     }
 
     /// Link an executed signal to its position.
     async fn link_signal_to_position(&self, signal_id: uuid::Uuid, position_id: uuid::Uuid) {
-        let _ = sqlx::query(
+        if let Err(error) = sqlx::query(
             "UPDATE quant_signals SET execution_status = 'executed', position_id = $1 WHERE id = $2",
         )
         .bind(position_id)
         .bind(signal_id)
         .execute(&self.pool)
-        .await;
+        .await
+        {
+            warn!(
+                error = %error,
+                signal_id = %signal_id,
+                position_id = %position_id,
+                "Failed to link quant signal to position"
+            );
+        }
     }
 
     /// Publish a failure signal to WebSocket.
