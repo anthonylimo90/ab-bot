@@ -2834,6 +2834,11 @@ fn aggressiveness_to_level(value: &str) -> Option<f64> {
 
 fn opportunity_dynamic_bounds(key: &str) -> Option<(Decimal, Decimal, Decimal)> {
     match key {
+        KEY_ARB_MONITOR_MAX_MARKETS => Some((
+            Decimal::new(25, 0),
+            Decimal::new(1500, 0),
+            Decimal::new(15, 2),
+        )),
         KEY_ARB_MONITOR_EXPLORATION_SLOTS => Some((
             Decimal::new(1, 0),
             Decimal::new(500, 0),
