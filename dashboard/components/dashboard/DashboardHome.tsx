@@ -70,6 +70,34 @@ export function DashboardHome() {
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
   const { data: closedPositions = [] } = usePositionsQuery({ status: "closed" });
+  const isTradingManuallyPaused =
+    Boolean(currentWorkspace) &&
+    !currentWorkspace?.live_trading_enabled &&
+    !currentWorkspace?.arb_auto_execute;
+  const isCircuitBreakerPaused = Boolean(riskStatus?.circuit_breaker?.tripped);
+  const automationStatus = isCircuitBreakerPaused
+    ? {
+        label: "Paused",
+        variant: "destructive" as const,
+        className: "text-xs",
+        tooltip:
+          "The circuit breaker is active, so automated trading is paused until the risk controls allow it again.",
+      }
+    : isTradingManuallyPaused
+      ? {
+          label: "Manually paused",
+          variant: "warning" as const,
+          className: "text-xs",
+          tooltip:
+            "Automation is paused from workspace settings, even though the automatic safety stop is not currently tripped.",
+        }
+      : {
+          label: "Healthy",
+          variant: "outline" as const,
+          className: "bg-profit/10 text-profit border-profit/20 text-xs",
+          tooltip:
+            "Automated trading is enabled and the safety stop is not currently blocking trading.",
+        };
   const stats = useMemo(() => {
     const totalValue = openPositions.reduce(
       (sum, p) => sum + p.quantity * p.current_price,
@@ -148,13 +176,14 @@ export function DashboardHome() {
               <div className="flex items-center gap-2">
                 <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                   Automated Safety
-                  <InfoTooltip content="This shows whether the system's automatic safety stop is allowing trades, recovering cautiously, or fully paused." />
+                  <InfoTooltip content={automationStatus.tooltip} />
                 </span>
-                {riskStatus?.circuit_breaker?.tripped ? (
-                  <Badge variant="destructive" className="text-xs">Paused</Badge>
-                ) : (
-                  <Badge className="bg-profit/10 text-profit border-profit/20 text-xs" variant="outline">Healthy</Badge>
-                )}
+                <Badge
+                  variant={automationStatus.variant}
+                  className={automationStatus.className}
+                >
+                  {automationStatus.label}
+                </Badge>
               </div>
               {/* Market Regime */}
               <div className="flex items-center gap-2">

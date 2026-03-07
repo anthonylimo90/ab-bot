@@ -40,7 +40,7 @@ export default function SettingsPage() {
   const toast = useToastStore();
   const queryClient = useQueryClient();
   const { user } = useAuthStore();
-  const { currentWorkspace } = useWorkspaceStore();
+  const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
   const { appearance, updateAppearance } = useSettingsStore();
 
   const [connectWalletOpen, setConnectWalletOpen] = useState(false);
@@ -185,7 +185,8 @@ export default function SettingsPage() {
       };
       if (polygonRpcUrl) updates.polygon_rpc_url = polygonRpcUrl;
       if (alchemyApiKey) updates.alchemy_api_key = alchemyApiKey;
-      await api.updateWorkspace(currentWorkspace.id, updates);
+      const updatedWorkspace = await api.updateWorkspace(currentWorkspace.id, updates);
+      setCurrentWorkspace(updatedWorkspace);
       toast.success('Trading config saved', 'Your trading configuration has been updated');
       queryClient.invalidateQueries({ queryKey: ['workspace'] });
       queryClient.invalidateQueries({ queryKey: ['workspace', currentWorkspace.id, 'service-status'] });
