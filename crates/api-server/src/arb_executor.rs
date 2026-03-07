@@ -6,7 +6,7 @@
 //! sequential YES + NO market orders.
 
 use chrono::Utc;
-use polymarket_core::api::ClobClient;
+use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::PositionRepository;
 use polymarket_core::types::Market;
 use polymarket_core::types::{
@@ -112,6 +112,7 @@ impl ArbExecutorConfig {
 /// Cached mapping of market_id → (yes_token_id, no_token_id).
 pub(crate) struct OutcomeTokenCache {
     clob_client: Arc<ClobClient>,
+    gamma_client: GammaClient,
     tokens: RwLock<HashMap<String, (String, String)>>,
     /// Shared set of active (non-resolved) market IDs, populated on each refresh.
     /// Used to skip resolved markets before hitting CLOB.
@@ -129,6 +130,7 @@ impl OutcomeTokenCache {
     ) -> Self {
         Self {
             clob_client,
+            gamma_client: GammaClient::new(None),
             tokens: RwLock::new(HashMap::new()),
             active_clob_markets,
             pool: None,
@@ -141,10 +143,17 @@ impl OutcomeTokenCache {
         self
     }
 
-    /// Refresh the cache by fetching all markets from the CLOB API.
+    /// Refresh the cache using Gamma as the source of tradable markets.
     pub(crate) async fn refresh(&self) -> anyhow::Result<(usize, usize)> {
         let _guard = self.refresh_lock.lock().await;
-        let markets = self.clob_client.get_markets().await?;
+        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(200);
+        let markets = self
+            .gamma_client
+            .get_all_tradable_markets(gamma_page_size)
+            .await?;
         let mut map = HashMap::new();
         let mut active_set = HashSet::new();
         // Collect token_id → condition_id mappings for DB cache

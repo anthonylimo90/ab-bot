@@ -869,6 +869,12 @@ struct ClobMarket {
     #[serde(default)]
     closed: bool,
     #[serde(default)]
+    archived: bool,
+    #[serde(default, alias = "accepting_orders")]
+    accepting_orders: bool,
+    #[serde(default, alias = "enable_order_book")]
+    enable_order_book: bool,
+    #[serde(default)]
     active: bool,
 }
 
@@ -902,7 +908,11 @@ impl From<ClobMarket> for Market {
             volume: m.volume.and_then(|v| v.parse().ok()).unwrap_or_default(),
             liquidity: m.liquidity.and_then(|v| v.parse().ok()).unwrap_or_default(),
             end_date: m.end_date.and_then(|s| s.parse().ok()),
-            resolved: m.closed && !m.active,
+            // CLOB `active=true` still returns many closed historical markets.
+            // Treat explicit `closed` / `archived` as authoritative for liveness.
+            resolved: m.closed
+                || m.archived
+                || (!m.accepting_orders && !m.enable_order_book && !m.active),
             resolution: None,
         }
     }
@@ -2120,5 +2130,39 @@ mod authenticated_tests {
         let debug_str = format!("{:?}", auth_client);
         assert!(!debug_str.contains("secret-key"));
         assert!(!debug_str.contains("secret-pass"));
+    }
+
+    #[test]
+    fn test_closed_clob_market_is_treated_as_resolved_even_if_active_true() {
+        let market = ClobMarket {
+            condition_id: "0xdeadbeef".to_string(),
+            question: "Historical market".to_string(),
+            description: None,
+            tokens: vec![
+                ClobToken {
+                    token_id: "yes".to_string(),
+                    outcome: "Yes".to_string(),
+                    price: Some(0.4),
+                    winner: None,
+                },
+                ClobToken {
+                    token_id: "no".to_string(),
+                    outcome: "No".to_string(),
+                    price: Some(0.6),
+                    winner: None,
+                },
+            ],
+            volume: None,
+            liquidity: None,
+            end_date: Some("2024-01-01T00:00:00Z".to_string()),
+            closed: true,
+            archived: false,
+            accepting_orders: false,
+            enable_order_book: false,
+            active: true,
+        };
+
+        let converted: Market = market.into();
+        assert!(converted.resolved);
     }
 }

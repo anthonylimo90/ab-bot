@@ -663,11 +663,12 @@ impl DynamicTuner {
         } else {
             0.0
         };
-        let throughput_penalty = if metrics.updates_per_minute < 120.0 {
-            0.10
-        } else {
-            0.0
-        };
+        let throughput_penalty =
+            if metrics.updates_per_minute > EPSILON && metrics.updates_per_minute < 120.0 {
+                0.10
+            } else {
+                0.0
+            };
 
         let desired_market_factor =
             (1.0 - health_penalty - throughput_penalty + throughput_bonus).clamp(0.70, 1.20);

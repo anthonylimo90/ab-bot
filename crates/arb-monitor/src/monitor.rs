@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use polymarket_core::api::clob::websocket_runtime_stats_snapshot;
 use polymarket_core::api::clob::OrderBookUpdate;
-use polymarket_core::api::ClobClient;
+use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::config::Config;
 use polymarket_core::db;
 use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, OrderBook};
@@ -219,6 +219,7 @@ struct RankedMarket {
 /// Main arbitrage monitor service.
 pub struct ArbMonitor {
     clob_client: ClobClient,
+    gamma_client: GammaClient,
     position_tracker: PositionTracker,
     signal_publisher: SignalPublisher,
     /// Current order books by (market_id, outcome_id).
@@ -276,6 +277,7 @@ impl ArbMonitor {
 
         // Create CLOB client
         let clob_client = ClobClient::new(config.polymarket.clob_url, config.polymarket.ws_url);
+        let gamma_client = GammaClient::new(None);
 
         // Create position tracker
         let position_tracker = PositionTracker::new(pool.clone());
@@ -338,6 +340,7 @@ impl ArbMonitor {
 
         Ok(Self {
             clob_client,
+            gamma_client,
             position_tracker,
             signal_publisher,
             order_books: HashMap::new(),
@@ -368,12 +371,18 @@ impl ArbMonitor {
     pub async fn run(&mut self) -> Result<()> {
         info!("Fetching active markets...");
 
-        // Fetch markets and identify binary markets
-        let markets = self.clob_client.get_markets().await?;
-        let binary_markets: Vec<_> = markets
-            .iter()
-            .filter(|m| m.outcomes.len() == 2 && !m.resolved)
-            .collect();
+        // Fetch tradable markets from Gamma, which is authoritative for active
+        // discovery. CLOB `/markets?active=true` currently includes many closed
+        // historical markets and starves the websocket selection.
+        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(200);
+        let markets = self
+            .gamma_client
+            .get_all_tradable_markets(gamma_page_size)
+            .await?;
+        let binary_markets: Vec<_> = markets.iter().filter(|m| m.outcomes.len() == 2).collect();
 
         for market in &binary_markets {
             self.market_profiles.insert(

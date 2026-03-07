@@ -3,6 +3,7 @@
 //! The Gamma API (`gamma-api.polymarket.com`) provides market metadata
 //! absent from CLOB: categories, tags, end dates, resolution criteria.
 
+use crate::types::{Market, Outcome};
 use crate::{Error, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -39,12 +40,33 @@ pub struct GammaMarket {
     /// Whether the market is currently active.
     #[serde(default = "default_true")]
     pub active: bool,
+    /// Whether the market is closed/resolved.
+    #[serde(default)]
+    pub closed: bool,
+    /// Whether the market is archived.
+    #[serde(default)]
+    pub archived: bool,
+    /// Whether the market accepts orders right now.
+    #[serde(default, alias = "acceptingOrders")]
+    pub accepting_orders: bool,
+    /// Whether the market has an order book enabled.
+    #[serde(default, alias = "enableOrderBook")]
+    pub enable_order_book: bool,
     /// Market description / resolution criteria.
     #[serde(default)]
     pub description: Option<String>,
     /// Market slug for URL construction.
     #[serde(default)]
     pub slug: Option<String>,
+    /// JSON-encoded list of outcome labels.
+    #[serde(default)]
+    pub outcomes: Option<String>,
+    /// JSON-encoded list of CLOB token ids aligned with outcomes.
+    #[serde(default, alias = "clobTokenIds")]
+    pub clob_token_ids: Option<String>,
+    /// JSON-encoded list of current outcome prices aligned with outcomes.
+    #[serde(default, alias = "outcomePrices")]
+    pub outcome_prices: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -82,6 +104,77 @@ impl From<GammaMarket> for ParsedGammaMarket {
                 .unwrap_or(Decimal::ZERO),
             active: m.active,
         }
+    }
+}
+
+impl GammaMarket {
+    /// Returns whether the market is currently tradable on the order book.
+    pub fn is_tradable(&self) -> bool {
+        self.active
+            && !self.closed
+            && !self.archived
+            && self.accepting_orders
+            && self.enable_order_book
+    }
+
+    fn parse_string_array(raw: Option<&str>) -> Option<Vec<String>> {
+        let raw = raw?;
+        serde_json::from_str::<Vec<String>>(raw).ok()
+    }
+
+    fn parse_decimal_array(raw: Option<&str>) -> Option<Vec<Decimal>> {
+        let raw = raw?;
+        let values = serde_json::from_str::<Vec<String>>(raw).ok()?;
+        Some(
+            values
+                .into_iter()
+                .map(|value| value.parse().unwrap_or(Decimal::ZERO))
+                .collect(),
+        )
+    }
+
+    /// Convert a tradable Gamma market into the shared `Market` type.
+    pub fn into_market(self) -> Option<Market> {
+        let outcome_names = Self::parse_string_array(self.outcomes.as_deref())?;
+        let token_ids = Self::parse_string_array(self.clob_token_ids.as_deref())?;
+        let prices = Self::parse_decimal_array(self.outcome_prices.as_deref()).unwrap_or_default();
+
+        if outcome_names.len() != 2
+            || token_ids.len() != 2
+            || outcome_names.len() != token_ids.len()
+        {
+            return None;
+        }
+
+        let outcomes = outcome_names
+            .into_iter()
+            .zip(token_ids)
+            .enumerate()
+            .map(|(idx, (name, token_id))| Outcome {
+                id: token_id.clone(),
+                name,
+                token_id,
+                price: prices.get(idx).copied(),
+            })
+            .collect();
+
+        Some(Market {
+            id: self.condition_id,
+            question: self.question,
+            description: self.description,
+            outcomes,
+            volume: self
+                .volume
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(Decimal::ZERO),
+            liquidity: self
+                .liquidity
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(Decimal::ZERO),
+            end_date: self.end_date.and_then(|value| value.parse().ok()),
+            resolved: self.closed || self.archived,
+            resolution: None,
+        })
     }
 }
 
@@ -216,6 +309,16 @@ impl GammaClient {
         Ok(all_markets)
     }
 
+    /// Fetch all currently tradable binary markets from the Gamma API.
+    pub async fn get_all_tradable_markets(&self, page_size: u32) -> Result<Vec<Market>> {
+        let markets = self.get_all_markets(page_size).await?;
+        Ok(markets
+            .into_iter()
+            .filter(GammaMarket::is_tradable)
+            .filter_map(GammaMarket::into_market)
+            .collect())
+    }
+
     /// Fetch a single market by condition ID.
     pub async fn get_market(&self, condition_id: &str) -> Result<GammaMarket> {
         let url = format!("{}/markets/{}", self.base_url, condition_id);
@@ -313,13 +416,54 @@ mod tests {
             volume: Some("50000.50".to_string()),
             liquidity: Some("12000".to_string()),
             active: true,
+            closed: false,
+            archived: false,
+            accepting_orders: true,
+            enable_order_book: true,
             description: None,
             slug: None,
+            outcomes: None,
+            clob_token_ids: None,
+            outcome_prices: None,
         };
 
         let parsed = ParsedGammaMarket::from(gamma);
         assert_eq!(parsed.condition_id, "0x1234");
         assert_eq!(parsed.volume, Decimal::new(5000050, 2));
         assert!(parsed.end_date.is_some());
+    }
+
+    #[test]
+    fn test_gamma_market_into_market() {
+        let gamma = GammaMarket {
+            condition_id: "0x1234".to_string(),
+            question: "Will BTC hit $100k?".to_string(),
+            category: Some("Crypto".to_string()),
+            tags: vec!["bitcoin".to_string()],
+            end_date: Some("2026-06-01T00:00:00Z".to_string()),
+            volume: Some("50000.50".to_string()),
+            liquidity: Some("12000".to_string()),
+            active: true,
+            closed: false,
+            archived: false,
+            accepting_orders: true,
+            enable_order_book: true,
+            description: Some("Resolves YES if...".to_string()),
+            slug: Some("will-btc-hit-100k".to_string()),
+            outcomes: Some("[\"Yes\",\"No\"]".to_string()),
+            clob_token_ids: Some("[\"1\",\"2\"]".to_string()),
+            outcome_prices: Some("[\"0.42\",\"0.58\"]".to_string()),
+        };
+
+        assert!(gamma.is_tradable());
+        let market = gamma
+            .into_market()
+            .expect("tradable gamma market should convert");
+        assert_eq!(market.id, "0x1234");
+        assert_eq!(market.outcomes.len(), 2);
+        assert_eq!(market.outcomes[0].token_id, "1");
+        assert_eq!(market.outcomes[1].name, "No");
+        assert_eq!(market.outcomes[0].price, Some(Decimal::new(42, 2)));
+        assert!(!market.resolved);
     }
 }

@@ -9,7 +9,7 @@
 //! so closed positions unblock their markets for future trades.
 
 use chrono::Utc;
-use polymarket_core::api::ClobClient;
+use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::PositionRepository;
 use polymarket_core::types::{FailureReason, MarketOrder, OrderSide, Position};
 use risk_manager::circuit_breaker::CircuitBreaker;
@@ -66,20 +66,27 @@ impl ExitHandlerConfig {
 
 /// Cached mapping of market_id → (yes_token_id, no_token_id).
 struct OutcomeTokenCache {
-    clob_client: Arc<ClobClient>,
+    gamma_client: GammaClient,
     tokens: RwLock<HashMap<String, (String, String)>>,
 }
 
 impl OutcomeTokenCache {
-    fn new(clob_client: Arc<ClobClient>) -> Self {
+    fn new() -> Self {
         Self {
-            clob_client,
+            gamma_client: GammaClient::new(None),
             tokens: RwLock::new(HashMap::new()),
         }
     }
 
     async fn refresh(&self) -> anyhow::Result<usize> {
-        let markets = self.clob_client.get_markets().await?;
+        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(200);
+        let markets = self
+            .gamma_client
+            .get_all_tradable_markets(gamma_page_size)
+            .await?;
         let mut map = HashMap::new();
 
         for market in &markets {
@@ -143,7 +150,7 @@ impl ExitHandler {
             circuit_breaker,
             clob_client: clob_client.clone(),
             signal_tx,
-            token_cache: OutcomeTokenCache::new(clob_client),
+            token_cache: OutcomeTokenCache::new(),
             arb_dedup,
             heartbeat,
         }
@@ -406,24 +413,21 @@ impl ExitHandler {
 
         debug!(count = positions.len(), "Checking market resolutions");
 
-        // Collect unique market IDs
+        // Collect unique market IDs and check them individually. This avoids
+        // pulling the entire CLOB market universe every resolution tick.
         let market_ids: HashSet<String> = positions.iter().map(|p| p.market_id.clone()).collect();
-
-        // Fetch markets from CLOB
-        let markets = match self.clob_client.get_markets().await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch markets for resolution check");
-                return Ok(());
+        let mut resolved_market_ids = HashSet::new();
+        for market_id in &market_ids {
+            match self.clob_client.get_market_by_id(market_id).await {
+                Ok(market) if market.resolved => {
+                    resolved_market_ids.insert(market_id.clone());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(market_id = %market_id, error = %e, "Failed to fetch market for resolution check");
+                }
             }
-        };
-
-        // Find resolved markets that match our positions
-        let resolved_market_ids: HashSet<String> = markets
-            .iter()
-            .filter(|m| m.resolved && market_ids.contains(&m.id))
-            .map(|m| m.id.clone())
-            .collect();
+        }
 
         if resolved_market_ids.is_empty() {
             debug!("No resolved markets found for held positions");
