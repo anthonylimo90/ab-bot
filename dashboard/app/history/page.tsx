@@ -18,6 +18,11 @@ import {
   useActivityHistoryQuery,
   useDynamicConfigHistoryQuery,
 } from "@/hooks/queries/useHistoryQuery";
+import {
+  isArbitrageActivity,
+  isFailedActivity,
+  isRiskActivity,
+} from "@/lib/activity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { formatCurrency, formatTimeAgo, cn, formatDynamicKey, formatDynamicConfigValue } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -51,6 +56,21 @@ const activityMeta = {
     label: "Closed",
     icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
     badgeClass: "bg-blue-500/10 text-blue-600",
+  },
+  TRADE_EXECUTED: {
+    label: "Trade Executed",
+    icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
+    badgeClass: "bg-blue-500/10 text-blue-600",
+  },
+  TRADE_FAILED: {
+    label: "Trade Failed",
+    icon: <XCircle className="h-4 w-4 text-red-500" />,
+    badgeClass: "bg-red-500/10 text-red-600",
+  },
+  TRADE_PENDING: {
+    label: "Trade Pending",
+    icon: <ActivityIcon className="h-4 w-4 text-muted-foreground" />,
+    badgeClass: "bg-muted text-muted-foreground",
   },
   ARBITRAGE_DETECTED: {
     label: "Arb Detected",
@@ -89,10 +109,13 @@ const activityMeta = {
   },
 } as const;
 
-function matchesFilter(type: string, filter: ActivityFilter): boolean {
+function matchesFilter(
+  item: { type: string; details?: Record<string, unknown> },
+  filter: ActivityFilter,
+): boolean {
   if (filter === "all") return true;
-  if (filter === "arb") return type.startsWith("ARB_") || type === "ARBITRAGE_DETECTED";
-  if (filter === "risk") return type === "STOP_LOSS_TRIGGERED" || type === "TAKE_PROFIT_TRIGGERED";
+  if (filter === "arb") return isArbitrageActivity(item);
+  if (filter === "risk") return isRiskActivity(item);
   return true;
 }
 
@@ -143,24 +166,20 @@ export default function HistoryPage() {
   });
 
   const filteredActivity = useMemo(
-    () => activity.filter((item) => matchesFilter(item.type, activityFilter)),
+    () => activity.filter((item) => matchesFilter(item, activityFilter)),
     [activity, activityFilter],
   );
 
   const arbCount = useMemo(
-    () => filteredActivity.filter((item) => item.type.startsWith("ARB_") || item.type === "ARBITRAGE_DETECTED").length,
+    () => filteredActivity.filter((item) => isArbitrageActivity(item)).length,
     [filteredActivity],
   );
   const riskCount = useMemo(
-    () =>
-      filteredActivity.filter((item) => item.type === "STOP_LOSS_TRIGGERED" || item.type === "TAKE_PROFIT_TRIGGERED")
-        .length,
+    () => filteredActivity.filter((item) => isRiskActivity(item)).length,
     [filteredActivity],
   );
   const failedCount = useMemo(
-    () =>
-      filteredActivity.filter((item) => item.type === "ARB_EXECUTION_FAILED" || item.type === "ARB_EXIT_FAILED")
-        .length,
+    () => filteredActivity.filter((item) => isFailedActivity(item)).length,
     [filteredActivity],
   );
   const netPnl = useMemo(

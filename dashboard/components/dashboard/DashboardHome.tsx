@@ -45,6 +45,9 @@ const activityIcons: Record<string, React.ReactNode> = {
   ARB_EXIT_FAILED: <ShieldAlert className="h-4 w-4 text-red-400" />,
   POSITION_OPENED: <AlertCircle className="h-4 w-4 text-profit" />,
   POSITION_CLOSED: <AlertCircle className="h-4 w-4 text-muted-foreground" />,
+  TRADE_EXECUTED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
+  TRADE_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
+  TRADE_PENDING: <Activity className="h-4 w-4 text-muted-foreground" />,
 };
 
 const activityLabels: Record<string, string> = {
@@ -56,6 +59,9 @@ const activityLabels: Record<string, string> = {
   ARB_EXIT_FAILED: "Exit Failed",
   POSITION_OPENED: "Position Opened",
   POSITION_CLOSED: "Position Closed",
+  TRADE_EXECUTED: "Trade Executed",
+  TRADE_FAILED: "Trade Failed",
+  TRADE_PENDING: "Trade Pending",
 };
 
 export function DashboardHome() {

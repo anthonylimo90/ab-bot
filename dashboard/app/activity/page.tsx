@@ -7,6 +7,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { PageIntro } from "@/components/shared/PageIntro";
 import { useActivity } from "@/hooks/useActivity";
+import { isArbitrageActivity, isRiskActivity } from "@/lib/activity";
 import { formatTimeAgo, cn } from "@/lib/utils";
 import {
   Zap,
@@ -22,6 +23,9 @@ import type { ActivityType } from "@/types/api";
 const activityIcons: Record<string, React.ReactNode> = {
   POSITION_OPENED: <DollarSign className="h-4 w-4 text-profit" />,
   POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
+  TRADE_EXECUTED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
+  TRADE_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
+  TRADE_PENDING: <Activity className="h-4 w-4 text-muted-foreground" />,
   STOP_LOSS_TRIGGERED: <TrendingDown className="h-4 w-4 text-loss" />,
   TAKE_PROFIT_TRIGGERED: <CheckCircle2 className="h-4 w-4 text-profit" />,
   ARBITRAGE_DETECTED: <Zap className="h-4 w-4 text-yellow-500" />,
@@ -34,6 +38,9 @@ const activityIcons: Record<string, React.ReactNode> = {
 const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
   POSITION_OPENED: "Position Opened",
   POSITION_CLOSED: "Position Closed",
+  TRADE_EXECUTED: "Trade Executed",
+  TRADE_FAILED: "Trade Failed",
+  TRADE_PENDING: "Trade Pending",
   STOP_LOSS_TRIGGERED: "Stop Loss Triggered",
   TAKE_PROFIT_TRIGGERED: "Take Profit Triggered",
   ARBITRAGE_DETECTED: "Arbitrage Found",
@@ -45,18 +52,6 @@ const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
 
 type ActivityFilter = "all" | "Arbitrage" | "StopLoss";
 
-const FILTER_MAP: Record<ActivityFilter, ActivityType[] | null> = {
-  all: null,
-  Arbitrage: [
-    "ARBITRAGE_DETECTED",
-    "ARB_POSITION_OPENED",
-    "ARB_POSITION_CLOSED",
-    "ARB_EXECUTION_FAILED",
-    "ARB_EXIT_FAILED",
-  ],
-  StopLoss: ["STOP_LOSS_TRIGGERED", "TAKE_PROFIT_TRIGGERED"],
-};
-
 export default function ActivityPage() {
   const { activities, status, unreadCount, markAsRead } = useActivity();
   const [filter, setFilter] = useState<ActivityFilter>("all");
@@ -65,9 +60,14 @@ export default function ActivityPage() {
     markAsRead();
   }, [markAsRead]);
 
-  const filtered = filter === "all"
-    ? activities
-    : activities.filter((a) => FILTER_MAP[filter]?.includes(a.type));
+  const filtered =
+    filter === "all"
+      ? activities
+      : activities.filter((activity) =>
+          filter === "Arbitrage"
+            ? isArbitrageActivity(activity)
+            : isRiskActivity(activity),
+        );
 
   return (
     <div className="space-y-5 sm:space-y-6 p-6">

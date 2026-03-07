@@ -312,6 +312,9 @@ export interface PortfolioHistory {
 export type ActivityType =
   | "POSITION_OPENED"
   | "POSITION_CLOSED"
+  | "TRADE_EXECUTED"
+  | "TRADE_FAILED"
+  | "TRADE_PENDING"
   | "STOP_LOSS_TRIGGERED"
   | "TAKE_PROFIT_TRIGGERED"
   | "ARBITRAGE_DETECTED"
