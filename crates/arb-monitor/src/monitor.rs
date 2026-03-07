@@ -33,6 +33,10 @@ const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
 const DEFAULT_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO: f64 = 0.08;
 /// Maximum age of a held selection before a periodic rerank is allowed to refresh it anyway.
 const DEFAULT_SELECTION_FORCE_REFRESH_SECS: i64 = 10 * 60;
+/// Minimum time to keep an exploration market before allowing routine replacement.
+const DEFAULT_EXPLORATION_HOLD_SECS: i64 = 10 * 60;
+/// Minimum challenger score edge required to evict a held exploration incumbent.
+const DEFAULT_EXPLORATION_SWAP_MIN_SCORE_DELTA: f64 = 0.75;
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
@@ -295,6 +299,8 @@ pub struct ArbMonitor {
     core_market_count: usize,
     /// Number of exploration markets in current selection.
     exploration_market_count: usize,
+    /// Markets currently occupying exploration slots in the live selection.
+    current_exploration_markets: HashSet<String>,
     /// Last time market selection was re-ranked.
     last_rerank_at: Option<DateTime<Utc>>,
     /// Last time a reranked selection was actually applied to the live subscription.
@@ -309,6 +315,10 @@ pub struct ArbMonitor {
     selection_resubscribe_min_delta_ratio: f64,
     /// Maximum time to hold a stable selection before allowing a periodic refresh.
     selection_force_refresh_secs: i64,
+    /// Minimum time to keep an exploration incumbent before allowing routine rotation.
+    exploration_hold_secs: i64,
+    /// Required score advantage before replacing a held exploration incumbent.
+    exploration_swap_min_score_delta: f64,
     /// Dynamic config update stream from Redis.
     dynamic_config_rx: mpsc::UnboundedReceiver<DynamicConfigUpdate>,
     /// Bounds for dynamic keys loaded from DB (fallbacks if unavailable).
@@ -400,6 +410,17 @@ impl ArbMonitor {
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_SELECTION_FORCE_REFRESH_SECS);
+        let exploration_hold_secs = std::env::var("ARB_EXPLORATION_HOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_EXPLORATION_HOLD_SECS);
+        let exploration_swap_min_score_delta =
+            std::env::var("ARB_EXPLORATION_SWAP_MIN_SCORE_DELTA")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(DEFAULT_EXPLORATION_SWAP_MIN_SCORE_DELTA);
 
         let dynamic_redis_url =
             std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
@@ -425,6 +446,7 @@ impl ArbMonitor {
             selection_snapshot: Vec::new(),
             core_market_count: 0,
             exploration_market_count: 0,
+            current_exploration_markets: HashSet::new(),
             last_rerank_at: None,
             last_selection_apply_at: None,
             last_resubscribe_at: None,
@@ -432,6 +454,8 @@ impl ArbMonitor {
             selection_resubscribe_min_market_delta,
             selection_resubscribe_min_delta_ratio,
             selection_force_refresh_secs,
+            exploration_hold_secs,
+            exploration_swap_min_score_delta,
             dynamic_config_rx,
             dynamic_bounds,
             allowed_dynamic_sources: load_allowed_dynamic_sources(),
@@ -907,10 +931,13 @@ impl ArbMonitor {
             &self.market_profiles,
             &self.market_stats,
             &self.eligible_markets,
+            &self.current_exploration_markets,
             self.scoring_weights,
             self.min_profit_threshold,
             active_count,
             self.exploration_slots,
+            self.exploration_hold_secs,
+            self.exploration_swap_min_score_delta,
             now,
         );
 
@@ -953,6 +980,7 @@ impl ArbMonitor {
             self.selection_snapshot = selected.insights;
             self.core_market_count = selected.core_count;
             self.exploration_market_count = selected.exploration_count;
+            self.current_exploration_markets = selected.exploration_ids.iter().cloned().collect();
             self.last_selection_apply_at = Some(now);
             let applied_markets: Vec<String> = self.eligible_markets.iter().cloned().collect();
             self.mark_markets_selected(applied_markets.iter(), now);
@@ -1486,6 +1514,7 @@ struct MarketSelectionResult {
     insights: Vec<RuntimeMarketInsight>,
     core_count: usize,
     exploration_count: usize,
+    exploration_ids: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1494,10 +1523,13 @@ fn select_market_ids(
     profiles: &HashMap<String, MarketProfile>,
     stats: &HashMap<String, MarketOpportunityStats>,
     currently_eligible: &HashSet<String>,
+    current_exploration_markets: &HashSet<String>,
     weights: ScoringWeights,
     min_profit_threshold: Decimal,
     active_count: usize,
     requested_exploration_slots: usize,
+    exploration_hold_secs: i64,
+    exploration_swap_min_score_delta: f64,
     now: DateTime<Utc>,
 ) -> MarketSelectionResult {
     if active_count == 0 || ordered_market_ids.is_empty() {
@@ -1506,6 +1538,7 @@ fn select_market_ids(
             insights: Vec::new(),
             core_count: 0,
             exploration_count: 0,
+            exploration_ids: Vec::new(),
         };
     }
 
@@ -1550,11 +1583,57 @@ fn select_market_ids(
             })
             .collect();
         exploration_pool.sort_by(|a, b| compare_f64_desc(a.total_score, b.total_score));
-
-        let picked: Vec<RankedMarket> = exploration_pool
-            .into_iter()
-            .take(exploration_slots)
+        let exploration_map: HashMap<String, RankedMarket> = exploration_pool
+            .iter()
+            .cloned()
+            .map(|ranked_market| (ranked_market.market_id.clone(), ranked_market))
             .collect();
+        let mut incumbents: Vec<RankedMarket> = current_exploration_markets
+            .iter()
+            .filter_map(|market_id| exploration_map.get(market_id).cloned())
+            .collect();
+        incumbents.sort_by(|a, b| compare_f64_desc(a.total_score, b.total_score));
+        let challengers: Vec<RankedMarket> = exploration_pool
+            .into_iter()
+            .filter(|ranked_market| !current_exploration_markets.contains(&ranked_market.market_id))
+            .collect();
+
+        let mut picked: Vec<RankedMarket> = Vec::new();
+        let mut used_market_ids: HashSet<String> = selected_ids.iter().cloned().collect();
+        let mut incumbent_idx = 0usize;
+        let mut challenger_idx = 0usize;
+
+        for _ in 0..exploration_slots {
+            let incumbent =
+                next_available_ranked(&incumbents, &mut incumbent_idx, &used_market_ids);
+            let challenger =
+                next_available_ranked(&challengers, &mut challenger_idx, &used_market_ids);
+            let chosen = match (incumbent, challenger) {
+                (Some(incumbent), Some(challenger))
+                    if incumbent_is_held(
+                        stats,
+                        &incumbent.market_id,
+                        now,
+                        exploration_hold_secs,
+                    ) && challenger.total_score
+                        < incumbent.total_score + exploration_swap_min_score_delta =>
+                {
+                    incumbent
+                }
+                (Some(incumbent), Some(challenger)) => {
+                    if challenger.total_score > incumbent.total_score {
+                        challenger
+                    } else {
+                        incumbent
+                    }
+                }
+                (Some(incumbent), None) => incumbent,
+                (None, Some(challenger)) => challenger,
+                (None, None) => break,
+            };
+            used_market_ids.insert(chosen.market_id.clone());
+            picked.push(chosen);
+        }
         selected_ids.extend(picked.iter().map(|p| p.market_id.clone()));
         selected.extend(picked);
     }
@@ -1578,6 +1657,13 @@ fn select_market_ids(
     let selected_map: HashMap<String, RankedMarket> = selected
         .into_iter()
         .map(|ranked_market| (ranked_market.market_id.clone(), ranked_market))
+        .collect();
+    let exploration_count = exploration_slots.min(active_count.saturating_sub(core_count));
+    let exploration_ids: Vec<String> = selected_ids
+        .iter()
+        .skip(core_count)
+        .take(exploration_count)
+        .cloned()
         .collect();
 
     let insights: Vec<RuntimeMarketInsight> = selected_ids
@@ -1611,8 +1697,36 @@ fn select_market_ids(
         selected_ids,
         insights,
         core_count,
-        exploration_count: exploration_slots.min(active_count.saturating_sub(core_count)),
+        exploration_count,
+        exploration_ids,
     }
+}
+
+fn next_available_ranked(
+    ranked: &[RankedMarket],
+    cursor: &mut usize,
+    used_market_ids: &HashSet<String>,
+) -> Option<RankedMarket> {
+    while let Some(candidate) = ranked.get(*cursor) {
+        *cursor += 1;
+        if !used_market_ids.contains(&candidate.market_id) {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+fn incumbent_is_held(
+    stats: &HashMap<String, MarketOpportunityStats>,
+    market_id: &str,
+    now: DateTime<Utc>,
+    hold_secs: i64,
+) -> bool {
+    stats
+        .get(market_id)
+        .and_then(|market_stats| market_stats.last_selected_at)
+        .map(|last_selected_at| (now - last_selected_at).num_seconds() < hold_secs)
+        .unwrap_or(false)
 }
 
 fn fallback_dynamic_bounds() -> HashMap<String, (Decimal, Decimal)> {
@@ -1745,10 +1859,13 @@ mod tests {
             &profiles,
             &stats,
             &HashSet::new(),
+            &HashSet::new(),
             ScoringWeights::for_profile(AggressivenessProfile::Balanced),
             Decimal::new(5, 3),
             2,
             0,
+            DEFAULT_EXPLORATION_HOLD_SECS,
+            DEFAULT_EXPLORATION_SWAP_MIN_SCORE_DELTA,
             now,
         );
 
@@ -1805,10 +1922,13 @@ mod tests {
             &profiles,
             &stats,
             &HashSet::from(["core-a".to_string(), "core-b".to_string()]),
+            &HashSet::new(),
             ScoringWeights::for_profile(AggressivenessProfile::Balanced),
             Decimal::new(5, 3),
             3,
             1,
+            DEFAULT_EXPLORATION_HOLD_SECS,
+            DEFAULT_EXPLORATION_SWAP_MIN_SCORE_DELTA,
             now,
         );
 
@@ -1835,5 +1955,87 @@ mod tests {
         assert!(discovery.selection_quality_weight > stable.selection_quality_weight);
         assert!(discovery.exploration_novelty_weight > stable.exploration_novelty_weight);
         assert!(discovery.exploration_unseen_bonus > stable.exploration_unseen_bonus);
+    }
+
+    #[test]
+    fn held_exploration_market_is_retained_without_material_challenger_edge() {
+        let now = Utc::now();
+        let ordered = vec![
+            "core-a".to_string(),
+            "core-b".to_string(),
+            "incumbent-x".to_string(),
+            "challenger-y".to_string(),
+        ];
+
+        let profiles = HashMap::from([
+            ("core-a".to_string(), profile(2_000.0, 5_000.0)),
+            ("core-b".to_string(), profile(1_900.0, 4_900.0)),
+            ("incumbent-x".to_string(), profile(1_750.0, 4_000.0)),
+            ("challenger-y".to_string(), profile(1_760.0, 4_050.0)),
+        ]);
+
+        let stats = HashMap::from([
+            (
+                "core-a".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 400,
+                    profitable_books: 45,
+                    signaled_books: 20,
+                    ewma_net_profit: 0.011,
+                    last_seen_at: Some(now - Duration::minutes(1)),
+                    last_selected_at: Some(now - Duration::seconds(30)),
+                    ..Default::default()
+                },
+            ),
+            (
+                "core-b".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 350,
+                    profitable_books: 38,
+                    signaled_books: 16,
+                    ewma_net_profit: 0.010,
+                    last_seen_at: Some(now - Duration::minutes(2)),
+                    last_selected_at: Some(now - Duration::seconds(30)),
+                    ..Default::default()
+                },
+            ),
+            (
+                "incumbent-x".to_string(),
+                MarketOpportunityStats {
+                    evaluated_books: 120,
+                    profitable_books: 10,
+                    signaled_books: 4,
+                    ewma_net_profit: 0.006,
+                    last_seen_at: Some(now - Duration::seconds(20)),
+                    last_selected_at: Some(now - Duration::seconds(45)),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let current_eligible = HashSet::from([
+            "core-a".to_string(),
+            "core-b".to_string(),
+            "incumbent-x".to_string(),
+        ]);
+        let current_exploration = HashSet::from(["incumbent-x".to_string()]);
+
+        let selected = select_market_ids(
+            &ordered,
+            &profiles,
+            &stats,
+            &current_eligible,
+            &current_exploration,
+            ScoringWeights::for_profile(AggressivenessProfile::Balanced),
+            Decimal::new(5, 3),
+            3,
+            1,
+            15 * 60,
+            10.0,
+            now,
+        );
+
+        assert!(selected.selected_ids.contains(&"incumbent-x".to_string()));
+        assert_eq!(selected.exploration_ids, vec!["incumbent-x".to_string()]);
     }
 }
