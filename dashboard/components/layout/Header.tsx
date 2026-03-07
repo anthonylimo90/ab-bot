@@ -8,7 +8,6 @@ import {
   LogOut,
   ChevronDown,
   Menu,
-  X,
   Target,
   Settings2,
   Wallet,
@@ -34,7 +33,7 @@ import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
 import { useToastStore } from "@/stores/toast-store";
-import { primaryNavSections } from "@/components/layout/navigation";
+import { MobileNavDrawer } from "@/components/layout/MobileNavDrawer";
 import api from "@/lib/api";
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
@@ -59,7 +58,6 @@ export function Header() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [showConnectModal, setShowConnectModal] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const mobileMenuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
   const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
   const toast = useToastStore();
@@ -125,6 +123,13 @@ export function Header() {
     walletBalanceError instanceof Error
       ? walletBalanceError.message
       : "Unable to fetch wallet balance";
+  const walletSummary = hasWallet
+    ? hasUsdcBalance
+      ? usdCompactFormatter.format(usdcBalance)
+      : isWalletBalancePending
+        ? "Loading balance"
+        : "Balance unavailable"
+    : "No wallet connected";
 
   const modeLabel =
     currentWorkspace?.setup_mode === "automatic" ? "Guided" : "Custom";
@@ -135,12 +140,6 @@ export function Header() {
     function handleClickOutside(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         setIsUserMenuOpen(false);
-      }
-      if (
-        mobileMenuRef.current &&
-        !mobileMenuRef.current.contains(event.target as Node)
-      ) {
-        setIsMobileMenuOpen(false);
       }
       if (
         signalDropdownRef.current &&
@@ -156,25 +155,6 @@ export function Header() {
   useEffect(() => {
     setIsMobileMenuOpen(false);
   }, [pathname]);
-
-  useEffect(() => {
-    if (!isMobileMenuOpen) return;
-
-    const originalOverflow = document.body.style.overflow;
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setIsMobileMenuOpen(false);
-      }
-    };
-
-    document.body.style.overflow = "hidden";
-    document.addEventListener("keydown", handleEscape);
-
-    return () => {
-      document.body.style.overflow = originalOverflow;
-      document.removeEventListener("keydown", handleEscape);
-    };
-  }, [isMobileMenuOpen]);
 
   const handleLogout = () => {
     logout();
@@ -197,6 +177,21 @@ export function Header() {
       <div className="flex h-16 items-center justify-between gap-2 px-3 sm:px-4 md:px-6">
         {/* Logo & Brand */}
         <div className="flex items-center gap-2 sm:gap-4">
+          <div className="md:hidden">
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(isMobileMenuOpen && "bg-accent")}
+              onClick={() => setIsMobileMenuOpen((open) => !open)}
+              aria-label={
+                isMobileMenuOpen ? "Close navigation menu" : "Open navigation menu"
+              }
+              aria-expanded={isMobileMenuOpen}
+              aria-haspopup="dialog"
+            >
+              <Menu className="h-5 w-5" />
+            </Button>
+          </div>
           <Link href="/" className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground font-bold">
               AB
@@ -213,127 +208,6 @@ export function Header() {
               <ModeIcon className="h-3 w-3" />
               {modeLabel}
             </Badge>
-          )}
-        </div>
-
-        {/* Mobile Menu Toggle */}
-        <div className="md:hidden" ref={mobileMenuRef}>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-            aria-label={
-              isMobileMenuOpen ? "Close navigation menu" : "Open navigation menu"
-            }
-            aria-expanded={isMobileMenuOpen}
-          >
-            {isMobileMenuOpen ? (
-              <X className="h-5 w-5" />
-            ) : (
-              <Menu className="h-5 w-5" />
-            )}
-          </Button>
-
-          {/* Mobile Menu Dropdown */}
-          {isMobileMenuOpen && (
-            <div
-              className="fixed inset-x-0 bottom-0 top-16 z-50 border-t bg-background/95 p-4 backdrop-blur supports-[backdrop-filter]:bg-background/80"
-              role="dialog"
-              aria-modal="true"
-              aria-label="Mobile navigation"
-            >
-              <div className="mx-auto h-full w-full max-w-screen-sm overflow-y-auto pb-8">
-                {primaryNavSections.map((section) => (
-                  <div key={section.title} className="mb-5">
-                    <h3 className="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                      {section.title}
-                    </h3>
-                    <div className="space-y-1">
-                      {section.items.map((item) => {
-                        const isActive =
-                          pathname === item.href ||
-                          (item.href !== "/" && pathname.startsWith(item.href));
-                        const Icon = item.icon;
-                        return (
-                          <Link
-                            key={item.href}
-                            href={item.href}
-                            className={cn(
-                              "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
-                              isActive
-                                ? "bg-primary text-primary-foreground"
-                                : "text-muted-foreground hover:bg-accent",
-                            )}
-                          >
-                            <Icon className="h-4 w-4" />
-                            {item.label}
-                          </Link>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))}
-
-                {/* Mobile quick actions */}
-                <div className="space-y-2 border-t pt-4">
-                  {currentWorkspace && (
-                    <Button
-                      variant="outline"
-                      className={cn(
-                        "h-10 w-full justify-start gap-2",
-                        isTradingActive
-                          ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
-                          : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
-                      )}
-                      disabled={toggleTradingMutation.isPending}
-                      onClick={() => toggleTradingMutation.mutate()}
-                    >
-                      {toggleTradingMutation.isPending ? (
-                        <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                      ) : isTradingActive ? (
-                        <Pause className="h-4 w-4" />
-                      ) : (
-                        <Play className="h-4 w-4" />
-                      )}
-                      {isTradingActive ? "Pause trading" : "Resume trading"}
-                    </Button>
-                  )}
-
-                  {currentWorkspace && (
-                    <div className="flex items-center gap-2 rounded-lg bg-muted/50 px-3 py-2 text-sm text-muted-foreground">
-                      <ModeIcon className="h-4 w-4" />
-                      <span>{modeLabel} Mode</span>
-                    </div>
-                  )}
-
-                  <Link
-                    href="/settings"
-                    className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent"
-                    onClick={() => setIsMobileMenuOpen(false)}
-                  >
-                    <Settings className="h-4 w-4" />
-                    Settings
-                  </Link>
-                  <button
-                    onClick={handleLogout}
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-destructive hover:bg-accent"
-                  >
-                    <LogOut className="h-4 w-4" />
-                    Sign out
-                  </button>
-                  {user?.email && (
-                    <p className="px-3 text-xs text-muted-foreground">
-                      Signed in as {user.email}
-                    </p>
-                  )}
-                  {hasWallet && primaryWallet && (
-                    <p className="px-3 text-xs text-muted-foreground">
-                      Wallet: {walletLabel}
-                    </p>
-                  )}
-                </div>
-              </div>
-            </div>
           )}
         </div>
 
@@ -571,6 +445,24 @@ export function Header() {
           </div>
         </div>
       </div>
+      <MobileNavDrawer
+        open={isMobileMenuOpen}
+        onOpenChange={setIsMobileMenuOpen}
+        pathname={pathname}
+        userName={user?.name}
+        userEmail={user?.email}
+        userRole={currentWorkspace?.my_role || user?.role}
+        hasWallet={hasWallet}
+        walletLabel={primaryWallet ? walletLabel : null}
+        walletSummary={walletSummary}
+        showWorkspaceDetails={Boolean(currentWorkspace)}
+        modeLabel={modeLabel}
+        isTradingActive={isTradingActive}
+        isTradingPending={toggleTradingMutation.isPending}
+        onToggleTrading={() => toggleTradingMutation.mutate()}
+        onConnectWallet={() => setShowConnectModal(true)}
+        onLogout={handleLogout}
+      />
     </header>
   );
 }

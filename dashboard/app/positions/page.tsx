@@ -260,19 +260,21 @@ export default function PositionsPage() {
             setClosedPage(0);
           }}
         >
-          <TabsList>
-            <TabsTrigger value="open">
-              Open ({openPositions.length})
-            </TabsTrigger>
-            <TabsTrigger value="closed">Closed ({closedCount})</TabsTrigger>
-          </TabsList>
+          <div className="overflow-x-auto pb-1">
+            <TabsList className="w-max min-w-full sm:min-w-0">
+              <TabsTrigger value="open">
+                Open ({openPositions.length})
+              </TabsTrigger>
+              <TabsTrigger value="closed">Closed ({closedCount})</TabsTrigger>
+            </TabsList>
+          </div>
         </Tabs>
 
         {/* Positions Table */}
         <Card>
           <CardContent className="p-0">
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+            <div className="overflow-x-auto pb-1">
+              <table className="w-full min-w-[860px] text-sm">
                 <thead>
                   <tr className="border-b bg-muted/50">
                     <th className="px-4 py-3 text-left font-medium text-muted-foreground">
@@ -473,7 +475,7 @@ export default function PositionsPage() {
 
             {/* Pagination for closed tab */}
             {activeTab === "closed" && closedCount > PAGE_SIZE && (
-              <div className="flex items-center justify-between border-t px-4 py-3">
+              <div className="flex flex-col gap-2 border-t px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                 <span className="text-sm text-muted-foreground">
                   Page {closedPage + 1} of {totalClosedPages}
                 </span>

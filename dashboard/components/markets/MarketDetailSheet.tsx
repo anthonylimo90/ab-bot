@@ -44,19 +44,47 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
     enabled: !!marketId,
   });
 
+  useEffect(() => {
+    if (!marketId) return;
+
+    const originalOverflow = document.body.style.overflow;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.body.style.overflow = originalOverflow;
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [marketId, onClose]);
+
   if (!marketId) return null;
 
   return (
-    <div className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm">
-      <div className="fixed inset-y-0 right-0 w-full max-w-lg border-l bg-background shadow-lg overflow-y-auto">
+    <div
+      className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Market details"
+      onClick={onClose}
+    >
+      <div
+        className="fixed inset-y-0 right-0 w-full max-w-lg overflow-y-auto border-l bg-background shadow-lg"
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="flex items-center justify-between p-4 border-b">
           <h2 className="text-lg font-semibold">Market Details</h2>
-          <Button variant="ghost" size="icon" onClick={onClose}>
+          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close market details">
             <X className="h-4 w-4" />
           </Button>
         </div>
 
-        <div className="p-4 space-y-4">
+        <div className="space-y-4 p-3 sm:p-4">
           {isMarketLoading ? (
             <div className="space-y-3">
               <Skeleton className="h-6 w-full" />
@@ -84,7 +112,7 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
               </div>
 
               {/* Prices */}
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid gap-4 sm:grid-cols-2">
                 <Card>
                   <CardContent className="p-4 text-center">
                     <p className="mb-1 inline-flex items-center gap-1 text-xs text-muted-foreground">
@@ -110,7 +138,7 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
               </div>
 
               {/* Market stats */}
-              <div className="grid grid-cols-2 gap-4 text-sm">
+              <div className="grid gap-4 text-sm sm:grid-cols-2">
                 <div>
                   <p className="text-muted-foreground">24h Volume</p>
                   <p className="font-medium">{formatCurrency(market.volume_24h)}</p>
@@ -144,7 +172,7 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
             ) : orderbook ? (
               <div className="space-y-3">
                 {/* Spread info */}
-                <div className="flex gap-4 text-xs">
+                <div className="flex flex-wrap gap-2 text-xs">
                   <Badge variant="outline">
                     Yes spread: {(orderbook.spread.yes_spread * 100).toFixed(1)}¢
                   </Badge>

@@ -54,7 +54,7 @@ export default function MarketsPage() {
   }, [markets, search]);
 
   return (
-    <div className="space-y-5 sm:space-y-6 p-6">
+    <div className="space-y-5 sm:space-y-6">
       <div>
         <h1 className="flex items-center gap-2 text-2xl font-bold tracking-tight sm:text-3xl">
           <BarChart2 className="h-8 w-8" />
@@ -76,7 +76,7 @@ export default function MarketsPage() {
       />
 
       {/* Filters */}
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+      <div className="flex flex-col gap-4 sm:flex-row sm:flex-wrap sm:items-center">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
@@ -88,7 +88,7 @@ export default function MarketsPage() {
           />
         </div>
         <Select value={category} onValueChange={setCategory}>
-          <SelectTrigger className="w-[180px]">
+          <SelectTrigger className="w-full sm:w-[180px]">
             <SelectValue placeholder="All Categories" />
           </SelectTrigger>
           <SelectContent>

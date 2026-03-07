@@ -220,10 +220,12 @@ export default function HistoryPage() {
           value={historyTab}
           onValueChange={(value) => setHistoryTab(value as HistoryTab)}
         >
-          <TabsList className="grid w-full max-w-md grid-cols-2">
-            <TabsTrigger value="activity">Trading Activity</TabsTrigger>
-            <TabsTrigger value="dynamic">Dynamic Config</TabsTrigger>
-          </TabsList>
+          <div className="overflow-x-auto pb-1">
+            <TabsList className="grid w-full min-w-[20rem] grid-cols-2 sm:max-w-md">
+              <TabsTrigger value="activity">Trading Activity</TabsTrigger>
+              <TabsTrigger value="dynamic">Dynamic Config</TabsTrigger>
+            </TabsList>
+          </div>
 
           <TabsContent value="activity" className="mt-4 space-y-4">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -270,7 +272,7 @@ export default function HistoryPage() {
                     <CardTitle>Activity Log</CardTitle>
                   </CardHeader>
                   <CardContent>
-                    <div className="overflow-x-auto">
+                    <div className="overflow-x-auto pb-1">
                       <table className="w-full min-w-[680px]">
                         <thead className="border-b bg-muted/50">
                           <tr>
@@ -399,7 +401,7 @@ export default function HistoryPage() {
                     </CardTitle>
                   </CardHeader>
                   <CardContent>
-                    <div className="overflow-x-auto">
+                    <div className="overflow-x-auto pb-1">
                       <table className="w-full min-w-[920px]">
                         <thead className="border-b bg-muted/50">
                           <tr>

@@ -34,8 +34,8 @@ export function AppShell({ children }: AppShellProps) {
         <div className="relative min-h-screen bg-background">
           <Header />
           <Sidebar />
-          <main className="md:pl-64">
-            <div className="container mx-auto p-4 md:p-6 lg:p-8">
+          <main className="min-w-0 md:pl-64">
+            <div className="mx-auto w-full max-w-screen-2xl px-4 py-4 md:px-6 md:py-6 lg:px-8 lg:py-8">
               {children}
             </div>
           </main>

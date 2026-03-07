@@ -41,7 +41,7 @@ export function MarketCard({ market, onSelect }: MarketCardProps) {
           </div>
         </div>
 
-        <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <div className="flex flex-col gap-1 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
           <span>Vol 24h: {formatCurrency(market.volume_24h)}</span>
           <span>Liq: {formatCurrency(market.liquidity)}</span>
         </div>

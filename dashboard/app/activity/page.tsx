@@ -53,7 +53,7 @@ const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
 type ActivityFilter = "all" | "Arbitrage" | "StopLoss";
 
 export default function ActivityPage() {
-  const { activities, status, unreadCount, markAsRead } = useActivity();
+  const { activities, status, markAsRead } = useActivity();
   const [filter, setFilter] = useState<ActivityFilter>("all");
 
   useEffect(() => {
@@ -70,7 +70,7 @@ export default function ActivityPage() {
         );
 
   return (
-    <div className="space-y-5 sm:space-y-6 p-6">
+    <div className="space-y-5 sm:space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-bold tracking-tight sm:text-3xl">
@@ -81,7 +81,9 @@ export default function ActivityPage() {
             Live trading signals and system events
           </p>
         </div>
-        <ConnectionStatus status={status} />
+        <div className="w-full sm:w-auto">
+          <ConnectionStatus status={status} />
+        </div>
       </div>
 
       <PageIntro
@@ -106,61 +108,61 @@ export default function ActivityPage() {
           </TabsList>
         </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <span>Activity Feed</span>
-            <Badge variant="secondary">{filtered.length}</Badge>
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-3">
-            {filtered.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">
-                No activity yet. Events will appear here as trades are detected.
-              </p>
-            ) : (
-              filtered.map((item, index) => (
-                <div
-                  key={item.id}
-                  className={cn(
-                    "flex items-start gap-3 p-3 rounded-lg border hover:bg-muted/30 transition-colors",
-                    index === 0 && "animate-slide-in",
-                  )}
-                >
-                  <div className="mt-0.5">
-                    {activityIcons[item.type] || (
-                      <Activity className="h-4 w-4" />
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex flex-wrap items-center gap-2">
+              <span>Activity Feed</span>
+              <Badge variant="secondary">{filtered.length}</Badge>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-3">
+              {filtered.length === 0 ? (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  No activity yet. Events will appear here as trades are detected.
+                </p>
+              ) : (
+                filtered.map((item, index) => (
+                  <div
+                    key={item.id}
+                    className={cn(
+                      "flex flex-col gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/30 sm:flex-row sm:items-start",
+                      index === 0 && "animate-slide-in",
+                    )}
+                  >
+                    <div className="mt-0.5">
+                      {activityIcons[item.type] || (
+                        <Activity className="h-4 w-4" />
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant="outline" className="text-xs">
+                          {ACTIVITY_LABELS[item.type] ?? item.type.replace(/_/g, " ")}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {formatTimeAgo(item.created_at)}
+                        </span>
+                      </div>
+                      <p className="text-sm break-words">{item.message}</p>
+                    </div>
+                    {item.pnl !== undefined && (
+                      <span
+                        className={cn(
+                          "text-sm font-medium tabular-nums sm:shrink-0",
+                          item.pnl >= 0 ? "text-profit" : "text-loss",
+                        )}
+                      >
+                        {item.pnl >= 0 ? "+" : ""}
+                        ${Math.abs(item.pnl).toFixed(2)}
+                      </span>
                     )}
                   </div>
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex items-center gap-2">
-                      <Badge variant="outline" className="text-xs">
-                        {ACTIVITY_LABELS[item.type] ?? item.type.replace(/_/g, " ")}
-                      </Badge>
-                      <span className="text-xs text-muted-foreground">
-                        {formatTimeAgo(item.created_at)}
-                      </span>
-                    </div>
-                    <p className="text-sm break-words">{item.message}</p>
-                  </div>
-                  {item.pnl !== undefined && (
-                    <span
-                      className={cn(
-                        "text-sm font-medium tabular-nums shrink-0",
-                        item.pnl >= 0 ? "text-profit" : "text-loss",
-                      )}
-                    >
-                      {item.pnl >= 0 ? "+" : ""}
-                      ${Math.abs(item.pnl).toFixed(2)}
-                    </span>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-        </CardContent>
-      </Card>
+                ))
+              )}
+            </div>
+          </CardContent>
+        </Card>
       </Tabs>
     </div>
   );

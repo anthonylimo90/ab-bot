@@ -343,7 +343,7 @@ export default function RiskPage() {
             <p className="text-sm text-muted-foreground mb-4">
               Filters applied before arb entry signals are published.
             </p>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-lg border p-3">
                 <p className="text-xs text-muted-foreground mb-1">
                   Min Net Profit

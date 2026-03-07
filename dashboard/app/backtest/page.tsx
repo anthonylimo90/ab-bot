@@ -591,7 +591,7 @@ export default function BacktestPage() {
 
           {/* Extended metrics (if available) */}
           {results.calmar_ratio != null && (
-            <div className="grid gap-4 md:grid-cols-4">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               <MetricCard
                 title="Calmar Ratio"
                 value={results.calmar_ratio.toFixed(2)}
@@ -647,7 +647,7 @@ export default function BacktestPage() {
               <CardTitle>Performance Breakdown</CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <div>
                   <p className="text-sm text-muted-foreground">Final Value</p>
                   <p className="font-medium tabular-nums">
@@ -751,8 +751,8 @@ export default function BacktestPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
+                <div className="overflow-x-auto pb-1">
+                  <table className="w-full min-w-[760px] text-sm">
                     <thead>
                       <tr className="border-b text-muted-foreground">
                         <th className="text-left py-2 pr-4 font-medium">
@@ -922,7 +922,7 @@ export default function BacktestPage() {
                         {result.end_date?.split("T")[0]}
                       </p>
                     </div>
-                    <div className="text-right">
+                    <div className="text-left sm:text-right">
                       <p
                         className={cn(
                           "font-medium tabular-nums",

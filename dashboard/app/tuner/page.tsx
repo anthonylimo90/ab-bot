@@ -173,7 +173,7 @@ export default function TunerPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Status</p>
                     <Badge
@@ -227,7 +227,7 @@ export default function TunerPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="flex flex-col sm:flex-row sm:items-end gap-4">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-end">
                   <div className="space-y-2">
                     <p className="text-xs text-muted-foreground">
                       <span className="inline-flex items-center gap-1">
@@ -235,7 +235,7 @@ export default function TunerPage() {
                         <InfoTooltip content="Stable favors fewer, safer ideas. Discovery explores more possible trades. Balanced sits in between." />
                       </span>
                     </p>
-                    <div className="flex gap-1">
+                    <div className="flex flex-wrap gap-1">
                       {(["stable", "balanced", "discovery"] as const).map(
                         (level) => (
                           <Button
@@ -264,7 +264,7 @@ export default function TunerPage() {
                       type="number"
                       value={effectiveSlots}
                       onChange={(e) => setExplSlots(e.target.value)}
-                      className="w-24"
+                      className="w-full sm:w-24"
                       min={0}
                     />
                   </div>
@@ -279,12 +279,13 @@ export default function TunerPage() {
                       type="number"
                       value={effectiveMaxMarketsCap}
                       onChange={(e) => setMaxMarketsCap(e.target.value)}
-                      className="w-28"
+                      className="w-full sm:w-28"
                       min={25}
                     />
                   </div>
                   <Button
                     size="sm"
+                    className="w-full lg:w-auto"
                     onClick={handleSaveOpp}
                     disabled={
                       oppMutation.isPending || (!aggLevel && !explSlots && !maxMarketsCap)
@@ -310,7 +311,7 @@ export default function TunerPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="space-y-1">
                     <p className="text-xs text-muted-foreground">
                       <span className="inline-flex items-center gap-1">
@@ -391,6 +392,7 @@ export default function TunerPage() {
                 </div>
                 <Button
                   size="sm"
+                  className="w-full sm:w-auto"
                   onClick={handleSaveArb}
                   disabled={
                     arbMutation.isPending ||
@@ -410,7 +412,7 @@ export default function TunerPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Enabled</p>
                     <Badge
@@ -445,7 +447,7 @@ export default function TunerPage() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
                   <MetricCard title="Signals Seen" value={String(tuner.arb_executor_status.signals_seen)} trend="neutral" />
                   <MetricCard title="Executed" value={String(tuner.arb_executor_status.executed)} trend="neutral" />
                   <MetricCard title="Exec Failures" value={String(tuner.arb_executor_status.execution_failures)} trend={tuner.arb_executor_status.execution_failures > 0 ? "down" : "neutral"} />
@@ -453,7 +455,7 @@ export default function TunerPage() {
                   <MetricCard title="Cache Failures" value={String(tuner.arb_executor_status.cache_refresh_failures)} trend={tuner.arb_executor_status.cache_refresh_failures > 0 ? "down" : "neutral"} />
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Min Profit Skips</p>
                     <p className="text-lg font-bold tabular-nums">
@@ -521,7 +523,7 @@ export default function TunerPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Markets</p>
                     <p className="text-lg font-bold tabular-nums">
@@ -553,7 +555,7 @@ export default function TunerPage() {
                     </p>
                   </div>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">WS Snapshots / Min</p>
                     <p className="text-lg font-bold tabular-nums">
@@ -585,7 +587,7 @@ export default function TunerPage() {
                     </p>
                   </div>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Best Net Profit</p>
                     <p className="text-lg font-bold tabular-nums">
@@ -620,7 +622,7 @@ export default function TunerPage() {
                     </p>
                   </div>
                 </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Near Misses ≤ 1 bp</p>
                     <p className="text-lg font-bold tabular-nums">
@@ -704,8 +706,8 @@ export default function TunerPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="p-0">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
+                <div className="overflow-x-auto pb-1">
+                  <table className="w-full min-w-[720px] text-sm">
                     <thead>
                       <tr className="border-b bg-muted/50">
                         <th className="px-4 py-2 text-left font-medium text-muted-foreground">
@@ -785,8 +787,8 @@ export default function TunerPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="p-0">
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
+                  <div className="overflow-x-auto pb-1">
+                    <table className="w-full min-w-[980px] text-sm">
                       <thead>
                         <tr className="border-b bg-muted/50">
                           <th className="px-3 py-2 text-left font-medium text-muted-foreground">
