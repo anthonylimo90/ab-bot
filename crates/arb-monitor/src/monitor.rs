@@ -27,6 +27,12 @@ const SIGNAL_COOLDOWN_SECS: i64 = 60;
 
 /// How often to check for stale positions (every N order book updates).
 const STALE_CHECK_INTERVAL: u64 = 500;
+/// Minimum number of market replacements before a periodic rerank triggers a resubscribe.
+const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
+/// Minimum relative market-set delta before a periodic rerank triggers a resubscribe.
+const DEFAULT_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO: f64 = 0.08;
+/// Maximum age of a held selection before a periodic rerank is allowed to refresh it anyway.
+const DEFAULT_SELECTION_FORCE_REFRESH_SECS: i64 = 10 * 60;
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
 const KEY_ARB_MONITOR_MAX_MARKETS: &str = "ARB_MONITOR_MAX_MARKETS";
@@ -173,6 +179,13 @@ struct ArbTelemetryCounters {
     filtered_by_depth: u64,
     filtered_by_cooldown: u64,
     entry_signals: u64,
+    near_miss_under_1bp: u64,
+    near_miss_under_5bps: u64,
+    near_miss_under_25bps: u64,
+    near_miss_under_50bps: u64,
+    best_net_profit_bps: f64,
+    best_eligible_net_profit_bps: f64,
+    closest_threshold_gap_bps: Option<f64>,
 }
 
 impl ArbTelemetryCounters {
@@ -186,6 +199,13 @@ impl ArbTelemetryCounters {
             filtered_by_depth_per_minute: self.filtered_by_depth as f64,
             filtered_by_cooldown_per_minute: self.filtered_by_cooldown as f64,
             entry_signals_per_minute: self.entry_signals as f64,
+            near_miss_under_1bp_per_minute: self.near_miss_under_1bp as f64,
+            near_miss_under_5bps_per_minute: self.near_miss_under_5bps as f64,
+            near_miss_under_25bps_per_minute: self.near_miss_under_25bps as f64,
+            near_miss_under_50bps_per_minute: self.near_miss_under_50bps as f64,
+            best_net_profit_bps_per_minute: self.best_net_profit_bps,
+            best_eligible_net_profit_bps_per_minute: self.best_eligible_net_profit_bps,
+            closest_threshold_gap_bps_per_minute: self.closest_threshold_gap_bps,
         }
     }
 }
@@ -200,6 +220,29 @@ struct ArbTelemetryRuntimeStats {
     filtered_by_depth_per_minute: f64,
     filtered_by_cooldown_per_minute: f64,
     entry_signals_per_minute: f64,
+    near_miss_under_1bp_per_minute: f64,
+    near_miss_under_5bps_per_minute: f64,
+    near_miss_under_25bps_per_minute: f64,
+    near_miss_under_50bps_per_minute: f64,
+    best_net_profit_bps_per_minute: f64,
+    best_eligible_net_profit_bps_per_minute: f64,
+    closest_threshold_gap_bps_per_minute: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SelectionRebuildReason {
+    Startup,
+    DynamicConfig,
+    PeriodicRerank,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SelectionRebuildOutcome {
+    applied: bool,
+    changed: bool,
+    suppressed: bool,
+    market_delta: usize,
+    asset_delta: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -254,10 +297,18 @@ pub struct ArbMonitor {
     exploration_market_count: usize,
     /// Last time market selection was re-ranked.
     last_rerank_at: Option<DateTime<Utc>>,
+    /// Last time a reranked selection was actually applied to the live subscription.
+    last_selection_apply_at: Option<DateTime<Utc>>,
     /// Last time the websocket subscription was rebuilt.
     last_resubscribe_at: Option<DateTime<Utc>>,
     /// Number of slots dedicated to exploration.
     exploration_slots: usize,
+    /// Absolute market-set delta needed before a periodic rerank swaps subscriptions.
+    selection_resubscribe_min_market_delta: usize,
+    /// Relative market-set delta needed before a periodic rerank swaps subscriptions.
+    selection_resubscribe_min_delta_ratio: f64,
+    /// Maximum time to hold a stable selection before allowing a periodic refresh.
+    selection_force_refresh_secs: i64,
     /// Dynamic config update stream from Redis.
     dynamic_config_rx: mpsc::UnboundedReceiver<DynamicConfigUpdate>,
     /// Bounds for dynamic keys loaded from DB (fallbacks if unavailable).
@@ -333,6 +384,22 @@ impl ArbMonitor {
             .and_then(decimal_to_cap)
             .or(exploration_slots_env)
             .unwrap_or(aggressiveness_profile.default_exploration_slots());
+        let selection_resubscribe_min_market_delta =
+            std::env::var("ARB_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA);
+        let selection_resubscribe_min_delta_ratio =
+            std::env::var("ARB_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(DEFAULT_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO);
+        let selection_force_refresh_secs = std::env::var("ARB_SELECTION_FORCE_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_SELECTION_FORCE_REFRESH_SECS);
 
         let dynamic_redis_url =
             std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
@@ -359,8 +426,12 @@ impl ArbMonitor {
             core_market_count: 0,
             exploration_market_count: 0,
             last_rerank_at: None,
+            last_selection_apply_at: None,
             last_resubscribe_at: None,
             exploration_slots,
+            selection_resubscribe_min_market_delta,
+            selection_resubscribe_min_delta_ratio,
+            selection_force_refresh_secs,
             dynamic_config_rx,
             dynamic_bounds,
             allowed_dynamic_sources: load_allowed_dynamic_sources(),
@@ -401,7 +472,7 @@ impl ArbMonitor {
             compare_f64_desc(score_a, score_b)
         });
         self.position_tracker.load_active_positions().await?;
-        let _ = self.rebuild_eligible_markets();
+        let _ = self.rebuild_eligible_markets(SelectionRebuildReason::Startup);
 
         info!(
             total_markets = self.all_market_ids.len(),
@@ -410,6 +481,9 @@ impl ArbMonitor {
             max_cap = ?self.max_markets_cap,
             aggressiveness = ?self.aggressiveness_profile,
             exploration_slots = self.exploration_slots,
+            selection_min_market_delta = self.selection_resubscribe_min_market_delta,
+            selection_min_delta_ratio = self.selection_resubscribe_min_delta_ratio,
+            selection_force_refresh_secs = self.selection_force_refresh_secs,
             min_profit_threshold = %self.min_profit_threshold,
             min_book_depth = %self.min_book_depth,
             "Initialized arb market universe"
@@ -461,6 +535,10 @@ impl ArbMonitor {
         let mut stalls_since_tick = 0u64;
         let mut resets_since_tick = 0u64;
         let mut arb_telemetry = ArbTelemetryCounters::default();
+        let mut selection_applied_since_tick = 0u64;
+        let mut selection_suppressed_since_tick = 0u64;
+        let mut last_selection_market_delta = 0usize;
+        let mut last_selection_asset_delta = 0usize;
         let mut resubscribe_requested = false;
         let mut ws_runtime_prev = websocket_runtime_stats_snapshot();
 
@@ -521,7 +599,18 @@ impl ArbMonitor {
             tokio::select! {
                 maybe_cfg = self.dynamic_config_rx.recv() => {
                     if let Some(update) = maybe_cfg {
-                        if self.apply_dynamic_update(update) {
+                        let outcome = self.apply_dynamic_update(update);
+                        if outcome.applied {
+                            selection_applied_since_tick = selection_applied_since_tick.saturating_add(1);
+                        }
+                        if outcome.suppressed {
+                            selection_suppressed_since_tick = selection_suppressed_since_tick.saturating_add(1);
+                        }
+                        if outcome.changed {
+                            last_selection_market_delta = outcome.market_delta;
+                            last_selection_asset_delta = outcome.asset_delta;
+                        }
+                        if outcome.applied {
                             resubscribe_requested = true;
                         }
                     }
@@ -567,6 +656,17 @@ impl ArbMonitor {
                         filtered_by_depth_per_minute: arb_runtime.filtered_by_depth_per_minute,
                         filtered_by_cooldown_per_minute: arb_runtime.filtered_by_cooldown_per_minute,
                         entry_signals_per_minute: arb_runtime.entry_signals_per_minute,
+                        near_miss_under_1bp_per_minute: arb_runtime.near_miss_under_1bp_per_minute,
+                        near_miss_under_5bps_per_minute: arb_runtime.near_miss_under_5bps_per_minute,
+                        near_miss_under_25bps_per_minute: arb_runtime.near_miss_under_25bps_per_minute,
+                        near_miss_under_50bps_per_minute: arb_runtime.near_miss_under_50bps_per_minute,
+                        best_net_profit_bps_per_minute: arb_runtime.best_net_profit_bps_per_minute,
+                        best_eligible_net_profit_bps_per_minute: arb_runtime.best_eligible_net_profit_bps_per_minute,
+                        closest_threshold_gap_bps_per_minute: arb_runtime.closest_threshold_gap_bps_per_minute,
+                        selection_refreshes_applied_per_minute: selection_applied_since_tick as f64,
+                        selection_refreshes_suppressed_per_minute: selection_suppressed_since_tick as f64,
+                        last_selection_market_delta: last_selection_market_delta as f64,
+                        last_selection_asset_delta: last_selection_asset_delta as f64,
                         core_markets: self.core_market_count as f64,
                         exploration_markets: self.exploration_market_count as f64,
                         last_rerank_at: self.last_rerank_at,
@@ -595,6 +695,17 @@ impl ArbMonitor {
                         filtered_by_depth = arb_telemetry.filtered_by_depth,
                         filtered_by_cooldown = arb_telemetry.filtered_by_cooldown,
                         entry_signals = arb_telemetry.entry_signals,
+                        near_miss_under_1bp = arb_telemetry.near_miss_under_1bp,
+                        near_miss_under_5bps = arb_telemetry.near_miss_under_5bps,
+                        near_miss_under_25bps = arb_telemetry.near_miss_under_25bps,
+                        near_miss_under_50bps = arb_telemetry.near_miss_under_50bps,
+                        best_net_profit_bps = stats.best_net_profit_bps_per_minute,
+                        best_eligible_net_profit_bps = stats.best_eligible_net_profit_bps_per_minute,
+                        closest_threshold_gap_bps = ?stats.closest_threshold_gap_bps_per_minute,
+                        selection_refreshes_applied = selection_applied_since_tick,
+                        selection_refreshes_suppressed = selection_suppressed_since_tick,
+                        last_selection_market_delta,
+                        last_selection_asset_delta,
                         ws_text_messages = stats.ws_text_messages_per_minute as u64,
                         ws_orderbook_updates = stats.ws_orderbook_updates_per_minute as u64,
                         ws_parse_misses = stats.ws_parse_misses_per_minute as u64,
@@ -614,12 +725,32 @@ impl ArbMonitor {
                     stalls_since_tick = 0;
                     resets_since_tick = 0;
                     arb_telemetry = ArbTelemetryCounters::default();
-                    if self.rebuild_eligible_markets() {
+                    selection_applied_since_tick = 0;
+                    selection_suppressed_since_tick = 0;
+                    last_selection_market_delta = 0;
+                    last_selection_asset_delta = 0;
+                    let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::PeriodicRerank);
+                    if outcome.applied {
+                        selection_applied_since_tick = selection_applied_since_tick.saturating_add(1);
+                        last_selection_market_delta = outcome.market_delta;
+                        last_selection_asset_delta = outcome.asset_delta;
                         info!(
                             active_markets = self.eligible_markets.len(),
                             "Refreshed monitored markets using dynamic opportunity scoring"
                         );
                         resubscribe_requested = true;
+                    } else if outcome.suppressed {
+                        selection_suppressed_since_tick = selection_suppressed_since_tick.saturating_add(1);
+                        last_selection_market_delta = outcome.market_delta;
+                        last_selection_asset_delta = outcome.asset_delta;
+                        info!(
+                            market_delta = outcome.market_delta,
+                            asset_delta = outcome.asset_delta,
+                            threshold_markets = self.selection_resubscribe_min_market_delta,
+                            threshold_ratio = self.selection_resubscribe_min_delta_ratio,
+                            hold_secs = self.selection_force_refresh_secs,
+                            "Suppressed periodic selection refresh due to immaterial delta"
+                        );
                     }
                 }
                 maybe_update = tokio::time::timeout(StdDuration::from_secs(update_timeout_secs), updates.recv()) => {
@@ -684,7 +815,7 @@ impl ArbMonitor {
         }
     }
 
-    fn apply_dynamic_update(&mut self, update: DynamicConfigUpdate) -> bool {
+    fn apply_dynamic_update(&mut self, update: DynamicConfigUpdate) -> SelectionRebuildOutcome {
         if !self
             .allowed_dynamic_sources
             .contains(update.source.as_str())
@@ -694,13 +825,13 @@ impl ArbMonitor {
                 key = %update.key,
                 "Ignoring dynamic update from unauthorized source"
             );
-            return false;
+            return SelectionRebuildOutcome::default();
         }
 
         let Some(value) = clamp_dynamic_value(&update.key, update.value, &self.dynamic_bounds)
         else {
             warn!(key = %update.key, "Ignoring unsupported dynamic config key");
-            return false;
+            return SelectionRebuildOutcome::default();
         };
         if value != update.value {
             warn!(
@@ -719,48 +850,51 @@ impl ArbMonitor {
                     threshold = %self.min_profit_threshold,
                     "Applied dynamic ARB_MIN_PROFIT_THRESHOLD"
                 );
-                false
+                SelectionRebuildOutcome::default()
             }
             KEY_ARB_MONITOR_MAX_MARKETS => {
                 let cap = decimal_to_cap(value);
                 self.max_markets_cap = cap;
-                let changed = self.rebuild_eligible_markets();
+                let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::DynamicConfig);
                 info!(
                     cap = ?self.max_markets_cap,
                     active_markets = self.eligible_markets.len(),
                     "Applied dynamic ARB_MONITOR_MAX_MARKETS"
                 );
-                changed
+                outcome
             }
             KEY_ARB_MONITOR_EXPLORATION_SLOTS => {
                 let slots = decimal_to_cap(value).unwrap_or(self.exploration_slots.max(1));
                 self.exploration_slots = slots;
-                let changed = self.rebuild_eligible_markets();
+                let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::DynamicConfig);
                 info!(
                     exploration_slots = self.exploration_slots,
                     active_markets = self.eligible_markets.len(),
                     "Applied dynamic ARB_MONITOR_EXPLORATION_SLOTS"
                 );
-                changed
+                outcome
             }
             KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => {
                 let level = value.to_f64().unwrap_or(1.0);
                 self.aggressiveness_profile = AggressivenessProfile::from_level(level);
                 self.scoring_weights = ScoringWeights::for_profile(self.aggressiveness_profile);
-                let changed = self.rebuild_eligible_markets();
+                let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::DynamicConfig);
                 info!(
                     aggressiveness = self.aggressiveness_profile.as_str(),
                     level,
                     active_markets = self.eligible_markets.len(),
                     "Applied dynamic ARB_MONITOR_AGGRESSIVENESS_LEVEL"
                 );
-                changed
+                outcome
             }
-            _ => false,
+            _ => SelectionRebuildOutcome::default(),
         }
     }
 
-    fn rebuild_eligible_markets(&mut self) -> bool {
+    fn rebuild_eligible_markets(
+        &mut self,
+        reason: SelectionRebuildReason,
+    ) -> SelectionRebuildOutcome {
         let previous = self.eligible_markets.clone();
         let active_count = self
             .max_markets_cap
@@ -793,13 +927,75 @@ impl ArbMonitor {
             next.insert(position.market_id.clone());
         }
 
-        let changed = next != previous;
-        self.eligible_markets = next;
-        self.selection_snapshot = selected.insights;
-        self.core_market_count = selected.core_count;
-        self.exploration_market_count = selected.exploration_count;
         self.last_rerank_at = Some(now);
-        changed
+        let changed = next != previous;
+        if !changed {
+            return SelectionRebuildOutcome::default();
+        }
+
+        let market_delta = previous.symmetric_difference(&next).count();
+        let asset_delta = self.selection_asset_delta(&previous, &next);
+        let forced = matches!(
+            reason,
+            SelectionRebuildReason::Startup | SelectionRebuildReason::DynamicConfig
+        );
+        let ratio_threshold =
+            (previous.len() as f64 * self.selection_resubscribe_min_delta_ratio).ceil() as usize;
+        let material_market_delta = market_delta
+            >= self
+                .selection_resubscribe_min_market_delta
+                .max(ratio_threshold.max(1));
+        let hold_expired = self
+            .last_selection_apply_at
+            .map(|last| (now - last).num_seconds() >= self.selection_force_refresh_secs)
+            .unwrap_or(true);
+
+        if forced || material_market_delta || hold_expired {
+            self.eligible_markets = next;
+            self.selection_snapshot = selected.insights;
+            self.core_market_count = selected.core_count;
+            self.exploration_market_count = selected.exploration_count;
+            self.last_selection_apply_at = Some(now);
+            SelectionRebuildOutcome {
+                applied: true,
+                changed: true,
+                suppressed: false,
+                market_delta,
+                asset_delta,
+            }
+        } else {
+            SelectionRebuildOutcome {
+                applied: false,
+                changed: true,
+                suppressed: true,
+                market_delta,
+                asset_delta,
+            }
+        }
+    }
+
+    fn selection_asset_delta(
+        &self,
+        previous_markets: &HashSet<String>,
+        next_markets: &HashSet<String>,
+    ) -> usize {
+        let mut previous_assets = HashSet::new();
+        for market_id in previous_markets {
+            if let Some((yes_id, no_id)) = self.market_outcomes.get(market_id) {
+                previous_assets.insert(yes_id.as_str());
+                previous_assets.insert(no_id.as_str());
+            }
+        }
+
+        let mut next_assets = HashSet::new();
+        for market_id in next_markets {
+            if let Some((yes_id, no_id)) = self.market_outcomes.get(market_id) {
+                next_assets.insert(yes_id.as_str());
+                next_assets.insert(no_id.as_str());
+            }
+        }
+
+        previous_assets.symmetric_difference(&next_assets).count()
     }
 
     fn track_market_evaluation(&mut self, market_id: &str, at: DateTime<Utc>) {
@@ -898,6 +1094,44 @@ impl ArbMonitor {
                 if let Some(arb) =
                     ArbOpportunity::calculate(&binary_book, ArbOpportunity::DEFAULT_FEE)
                 {
+                    let net_profit_bps = arb.net_profit.to_f64().unwrap_or(0.0) * 10_000.0;
+                    arb_telemetry.best_net_profit_bps =
+                        arb_telemetry.best_net_profit_bps.max(net_profit_bps);
+                    if eligible_for_entries && has_depth {
+                        arb_telemetry.best_eligible_net_profit_bps = arb_telemetry
+                            .best_eligible_net_profit_bps
+                            .max(net_profit_bps);
+                        let threshold_gap_bps = ((self.min_profit_threshold - arb.net_profit)
+                            .max(Decimal::ZERO))
+                        .to_f64()
+                        .unwrap_or(0.0)
+                            * 10_000.0;
+                        if threshold_gap_bps > 0.0 {
+                            arb_telemetry.closest_threshold_gap_bps = Some(
+                                arb_telemetry
+                                    .closest_threshold_gap_bps
+                                    .map(|prev| prev.min(threshold_gap_bps))
+                                    .unwrap_or(threshold_gap_bps),
+                            );
+                            if threshold_gap_bps <= 1.0 {
+                                arb_telemetry.near_miss_under_1bp =
+                                    arb_telemetry.near_miss_under_1bp.saturating_add(1);
+                            }
+                            if threshold_gap_bps <= 5.0 {
+                                arb_telemetry.near_miss_under_5bps =
+                                    arb_telemetry.near_miss_under_5bps.saturating_add(1);
+                            }
+                            if threshold_gap_bps <= 25.0 {
+                                arb_telemetry.near_miss_under_25bps =
+                                    arb_telemetry.near_miss_under_25bps.saturating_add(1);
+                            }
+                            if threshold_gap_bps <= 50.0 {
+                                arb_telemetry.near_miss_under_50bps =
+                                    arb_telemetry.near_miss_under_50bps.saturating_add(1);
+                            }
+                        }
+                    }
+
                     if arb.is_profitable() {
                         arb_telemetry.profitable_books =
                             arb_telemetry.profitable_books.saturating_add(1);

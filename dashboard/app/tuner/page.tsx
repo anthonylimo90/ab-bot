@@ -585,6 +585,76 @@ export default function TunerPage() {
                     </p>
                   </div>
                 </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Best Net Profit</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.best_net_profit_bps_per_minute.toFixed(1)} bps
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Best Eligible Profit</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.best_eligible_net_profit_bps_per_minute.toFixed(1)}{" "}
+                      bps
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Closest Gap To Threshold</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.closest_threshold_gap_bps_per_minute === null
+                        ? "-"
+                        : `${tuner.scanner_status.closest_threshold_gap_bps_per_minute.toFixed(1)} bps`}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Near Misses ≤ 5 bps</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.near_miss_under_5bps_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Near Misses ≤ 50 bps</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.near_miss_under_50bps_per_minute}
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Near Misses ≤ 1 bp</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.near_miss_under_1bp_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Near Misses ≤ 25 bps</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.near_miss_under_25bps_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Selection Applied / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.selection_refreshes_applied_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">
+                      Selection Suppressed / Min
+                    </p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.selection_refreshes_suppressed_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Last Selection Delta</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.last_selection_market_delta} m /{" "}
+                      {tuner.scanner_status.last_selection_asset_delta} a
+                    </p>
+                  </div>
+                </div>
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                   <div className="rounded-lg border p-3">
                     <p className="text-xs text-muted-foreground mb-1">Last WS Message</p>

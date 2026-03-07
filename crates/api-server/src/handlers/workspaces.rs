@@ -1832,6 +1832,28 @@ struct ArbRuntimeStatsSnapshot {
     #[serde(default)]
     entry_signals_per_minute: f64,
     #[serde(default)]
+    near_miss_under_1bp_per_minute: f64,
+    #[serde(default)]
+    near_miss_under_5bps_per_minute: f64,
+    #[serde(default)]
+    near_miss_under_25bps_per_minute: f64,
+    #[serde(default)]
+    near_miss_under_50bps_per_minute: f64,
+    #[serde(default)]
+    best_net_profit_bps_per_minute: f64,
+    #[serde(default)]
+    best_eligible_net_profit_bps_per_minute: f64,
+    #[serde(default)]
+    closest_threshold_gap_bps_per_minute: Option<f64>,
+    #[serde(default)]
+    selection_refreshes_applied_per_minute: f64,
+    #[serde(default)]
+    selection_refreshes_suppressed_per_minute: f64,
+    #[serde(default)]
+    last_selection_market_delta: f64,
+    #[serde(default)]
+    last_selection_asset_delta: f64,
+    #[serde(default)]
     core_markets: f64,
     #[serde(default)]
     exploration_markets: f64,
@@ -1909,6 +1931,17 @@ pub struct ScannerStatusResponse {
     pub filtered_by_depth_per_minute: i64,
     pub filtered_by_cooldown_per_minute: i64,
     pub entry_signals_per_minute: i64,
+    pub near_miss_under_1bp_per_minute: i64,
+    pub near_miss_under_5bps_per_minute: i64,
+    pub near_miss_under_25bps_per_minute: i64,
+    pub near_miss_under_50bps_per_minute: i64,
+    pub best_net_profit_bps_per_minute: f64,
+    pub best_eligible_net_profit_bps_per_minute: f64,
+    pub closest_threshold_gap_bps_per_minute: Option<f64>,
+    pub selection_refreshes_applied_per_minute: i64,
+    pub selection_refreshes_suppressed_per_minute: i64,
+    pub last_selection_market_delta: i64,
+    pub last_selection_asset_delta: i64,
     pub core_markets: i64,
     pub exploration_markets: i64,
     pub last_rerank_at: Option<DateTime<Utc>>,
@@ -2409,6 +2442,25 @@ pub async fn get_dynamic_tuner_status(
         filtered_by_cooldown_per_minute: runtime_stats.filtered_by_cooldown_per_minute.round()
             as i64,
         entry_signals_per_minute: runtime_stats.entry_signals_per_minute.round() as i64,
+        near_miss_under_1bp_per_minute: runtime_stats.near_miss_under_1bp_per_minute.round() as i64,
+        near_miss_under_5bps_per_minute: runtime_stats.near_miss_under_5bps_per_minute.round()
+            as i64,
+        near_miss_under_25bps_per_minute: runtime_stats.near_miss_under_25bps_per_minute.round()
+            as i64,
+        near_miss_under_50bps_per_minute: runtime_stats.near_miss_under_50bps_per_minute.round()
+            as i64,
+        best_net_profit_bps_per_minute: runtime_stats.best_net_profit_bps_per_minute,
+        best_eligible_net_profit_bps_per_minute: runtime_stats
+            .best_eligible_net_profit_bps_per_minute,
+        closest_threshold_gap_bps_per_minute: runtime_stats.closest_threshold_gap_bps_per_minute,
+        selection_refreshes_applied_per_minute: runtime_stats
+            .selection_refreshes_applied_per_minute
+            .round() as i64,
+        selection_refreshes_suppressed_per_minute: runtime_stats
+            .selection_refreshes_suppressed_per_minute
+            .round() as i64,
+        last_selection_market_delta: runtime_stats.last_selection_market_delta.round() as i64,
+        last_selection_asset_delta: runtime_stats.last_selection_asset_delta.round() as i64,
         core_markets: runtime_stats.core_markets.round() as i64,
         exploration_markets: runtime_stats.exploration_markets.round() as i64,
         last_rerank_at: runtime_stats.last_rerank_at,

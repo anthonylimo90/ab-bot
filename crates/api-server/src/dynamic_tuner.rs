@@ -615,6 +615,10 @@ impl DynamicTuner {
             .get(KEY_ARB_MONITOR_MAX_MARKETS)
             .map(|r| decimal_to_f64(r.current_value))
             .unwrap_or(300.0);
+        let max_markets_default = rows
+            .get(KEY_ARB_MONITOR_MAX_MARKETS)
+            .map(|r| decimal_to_f64(r.default_value))
+            .unwrap_or(300.0);
 
         let no_trade_watchdog = metrics.attempts_last_window
             >= self.config.no_trade_min_attempts as f64
@@ -672,9 +676,18 @@ impl DynamicTuner {
 
         let desired_market_factor =
             (1.0 - health_penalty - throughput_penalty + throughput_bonus).clamp(0.70, 1.20);
+        let healthy_stream = metrics.updates_per_minute >= 1_000.0 && health_penalty < 0.10;
+        let desired_market_target =
+            if healthy_stream && max_markets_current + EPSILON < max_markets_default {
+                // Once ingestion is healthy again, bias back toward the configured
+                // default cap. apply_step_limit still bounds the live change rate.
+                max_markets_default
+            } else {
+                (max_markets_current * desired_market_factor).round()
+            };
         targets.insert(
             KEY_ARB_MONITOR_MAX_MARKETS.to_string(),
-            (max_markets_current * desired_market_factor).round(),
+            desired_market_target,
         );
 
         // QUANT_BASE_POSITION_SIZE: adjust based on quant strategy profitability.

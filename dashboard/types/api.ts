@@ -713,6 +713,17 @@ export interface ScannerStatus {
   filtered_by_depth_per_minute: number;
   filtered_by_cooldown_per_minute: number;
   entry_signals_per_minute: number;
+  near_miss_under_1bp_per_minute: number;
+  near_miss_under_5bps_per_minute: number;
+  near_miss_under_25bps_per_minute: number;
+  near_miss_under_50bps_per_minute: number;
+  best_net_profit_bps_per_minute: number;
+  best_eligible_net_profit_bps_per_minute: number;
+  closest_threshold_gap_bps_per_minute: number | null;
+  selection_refreshes_applied_per_minute: number;
+  selection_refreshes_suppressed_per_minute: number;
+  last_selection_market_delta: number;
+  last_selection_asset_delta: number;
   core_markets: number;
   exploration_markets: number;
   last_rerank_at: string | null;
