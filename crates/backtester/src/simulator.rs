@@ -566,7 +566,11 @@ impl BacktestSimulator {
         snapshots: &[MarketSnapshot],
     ) {
         for snapshot in snapshots {
-            if let Some(pos) = state.positions.get_mut(&snapshot.market_id) {
+            for pos in state
+                .positions
+                .values_mut()
+                .filter(|position| position.market_id == snapshot.market_id)
+            {
                 let price = if pos.outcome_id == "yes" {
                     snapshot.yes_bid
                 } else {
@@ -730,7 +734,10 @@ impl BacktestSimulator {
             current_price: execution_price,
         };
 
-        state.positions.insert(signal.market_id.clone(), position);
+        state.positions.insert(
+            position_key(&signal.market_id, &signal.outcome_id),
+            position,
+        );
 
         // Record trade
         let trade = TradeRecord {
@@ -770,7 +777,10 @@ impl BacktestSimulator {
         state: &mut SimulationState,
         snapshot: &MarketSnapshot,
     ) -> Result<Option<TradeRecord>> {
-        let position = match state.positions.remove(&signal.market_id) {
+        let position = match state
+            .positions
+            .remove(&position_key(&signal.market_id, &signal.outcome_id))
+        {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -841,10 +851,11 @@ impl BacktestSimulator {
         }
 
         // Find and update the entry trade
-        let entry_trade_idx = state
-            .trades
-            .iter()
-            .position(|t| t.market_id == signal.market_id && t.exit_time.is_none());
+        let entry_trade_idx = state.trades.iter().position(|t| {
+            t.market_id == signal.market_id
+                && t.outcome_id == signal.outcome_id
+                && t.exit_time.is_none()
+        });
 
         if let Some(idx) = entry_trade_idx {
             state.trades[idx].exit_time = Some(snapshot.timestamp);
@@ -874,12 +885,12 @@ impl BacktestSimulator {
     }
 
     fn close_all_positions(&self, state: &mut SimulationState, context: &StrategyContext) {
-        let positions: Vec<_> = state.positions.keys().cloned().collect();
+        let positions: Vec<_> = state.positions.values().cloned().collect();
 
-        for market_id in positions {
-            if let Some(snapshots) = context.market_data.get(&market_id) {
+        for position in positions {
+            if let Some(snapshots) = context.market_data.get(&position.market_id) {
                 if let Some(snapshot) = snapshots.last() {
-                    let signal = Signal::close(&market_id, "");
+                    let signal = Signal::close(&position.market_id, &position.outcome_id);
                     let _ = self.execute_close(&signal, state, snapshot);
                 }
             }
@@ -1233,6 +1244,10 @@ struct SimulationState {
     losing_trades: usize,
     total_wins: Decimal,
     total_losses: Decimal,
+}
+
+fn position_key(market_id: &str, outcome_id: &str) -> String {
+    format!("{market_id}:{outcome_id}")
 }
 
 impl SimulationState {

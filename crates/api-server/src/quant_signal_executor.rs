@@ -203,10 +203,10 @@ struct QuantSignalExecutor {
     position_repo: PositionRepository,
     pool: PgPool,
     token_cache: OutcomeTokenCache,
-    /// Markets with open quant positions (dedup).
-    active_quant_markets: Arc<RwLock<HashSet<String>>>,
     /// Per-strategy risk state (daily P&L, consecutive losses).
     strategy_states: HashMap<QuantSignalKind, StrategyState>,
+    /// Closed quant positions that have already been folded into strategy state.
+    processed_strategy_outcomes: HashSet<uuid::Uuid>,
     heartbeat: Arc<AtomicI64>,
 }
 
@@ -242,8 +242,8 @@ impl QuantSignalExecutor {
             position_repo,
             pool,
             token_cache,
-            active_quant_markets: Arc::new(RwLock::new(HashSet::new())),
             strategy_states,
+            processed_strategy_outcomes: HashSet::new(),
             heartbeat,
         }
     }
@@ -269,13 +269,15 @@ impl QuantSignalExecutor {
             warn!(error = %e, "Initial token cache refresh failed");
         }
 
-        // Load active quant positions from DB for dedup
-        self.load_active_positions().await;
+        // Rebuild today's per-strategy realized outcomes on startup.
+        self.sync_strategy_outcomes().await;
 
         let mut cache_ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         cache_ticker.tick().await; // skip first tick (just loaded)
 
         let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut outcome_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        outcome_ticker.tick().await;
 
         loop {
             self.heartbeat
@@ -303,39 +305,71 @@ impl QuantSignalExecutor {
                         warn!(error = %e, "Token cache refresh failed");
                     }
                 }
+                _ = outcome_ticker.tick() => {
+                    self.sync_strategy_outcomes().await;
+                }
                 _ = heartbeat_ticker.tick() => { /* keeps heartbeat advancing */ }
             }
         }
     }
 
-    /// Load active quant positions from DB into the dedup set.
-    async fn load_active_positions(&self) {
-        let rows: Vec<(String,)> = match sqlx::query_as(
+    /// Fold today's closed quant outcomes back into the in-memory strategy breakers.
+    async fn sync_strategy_outcomes(&mut self) {
+        #[derive(sqlx::FromRow)]
+        struct QuantOutcomeRow {
+            position_id: uuid::Uuid,
+            kind: String,
+            realized_pnl: Decimal,
+        }
+
+        let today = Utc::now().date_naive();
+        let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+            today.and_hms_opt(0, 0, 0).expect("valid midnight"),
+            Utc,
+        );
+        let rows: Vec<QuantOutcomeRow> = match sqlx::query_as(
             r#"
-            SELECT DISTINCT p.market_id
+            SELECT
+                p.id AS position_id,
+                qs.kind,
+                p.realized_pnl
             FROM positions p
             JOIN quant_signals qs ON qs.position_id = p.id
-            WHERE p.state IN (0, 1, 2, 3) -- Pending, Open, ExitReady, Closing
+            WHERE p.source = 3
+              AND p.state = 4
+              AND p.realized_pnl IS NOT NULL
+              AND p.exit_timestamp >= $1
+            ORDER BY p.exit_timestamp ASC
             "#,
         )
+        .bind(today_start)
         .fetch_all(&self.pool)
         .await
         {
             Ok(rows) => rows,
             Err(e) => {
-                warn!(error = %e, "Failed to load active quant positions for dedup");
+                warn!(error = %e, "Failed syncing quant strategy outcomes");
                 return;
             }
         };
 
-        let mut active = self.active_quant_markets.write().await;
-        for (market_id,) in rows {
-            active.insert(market_id);
+        let cfg = self.snapshot_config().await;
+        for row in rows {
+            if !self.processed_strategy_outcomes.insert(row.position_id) {
+                continue;
+            }
+
+            if let Some(kind) = parse_quant_signal_kind(&row.kind) {
+                self.record_strategy_outcome(
+                    kind,
+                    row.realized_pnl,
+                    row.realized_pnl > Decimal::ZERO,
+                    &cfg,
+                );
+            } else {
+                warn!(kind = %row.kind, position_id = %row.position_id, "Unknown quant signal kind while syncing outcomes");
+            }
         }
-        info!(
-            count = active.len(),
-            "Loaded active quant positions for dedup"
-        );
     }
 
     /// Process a single quant signal through the 15-step pipeline.
@@ -429,15 +463,29 @@ impl QuantSignalExecutor {
         }
 
         // Step 5: Dedup — skip if open position in same condition_id
+        match self
+            .position_repo
+            .active_position_exists_for_market_source(&signal.condition_id, 3)
+            .await
         {
-            let active = self.active_quant_markets.read().await;
-            if active.contains(&signal.condition_id) {
+            Ok(true) => {
                 debug!(
                     signal_id = %signal.id,
                     condition_id = &signal.condition_id,
                     "Duplicate market, skipping"
                 );
                 self.update_signal_status(signal.id, "skipped", Some("duplicate"))
+                    .await;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    signal_id = %signal.id,
+                    error = %e,
+                    "Failed active quant market dedup check"
+                );
+                self.update_signal_status(signal.id, "skipped", Some("dedup_check_failed"))
                     .await;
                 return Ok(());
             }
@@ -567,16 +615,26 @@ impl QuantSignalExecutor {
         };
 
         // Step 11: Portfolio check — max open quant positions
-        {
-            let active = self.active_quant_markets.read().await;
-            if active.len() >= cfg.max_quant_positions {
+        match self.position_repo.count_active_by_source(3).await {
+            Ok(open_count) if open_count as usize >= cfg.max_quant_positions => {
                 debug!(
                     signal_id = %signal.id,
-                    open = active.len(),
+                    open = open_count,
                     max = cfg.max_quant_positions,
                     "Max quant positions reached, skipping"
                 );
                 self.update_signal_status(signal.id, "skipped", Some("max_positions_reached"))
+                    .await;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    signal_id = %signal.id,
+                    error = %e,
+                    "Failed quant position count check"
+                );
+                self.update_signal_status(signal.id, "skipped", Some("position_count_failed"))
                     .await;
                 return Ok(());
             }
@@ -644,7 +702,6 @@ impl QuantSignalExecutor {
                 let _ = self.position_repo.update(&position).await;
                 self.update_signal_status(signal.id, "failed", Some("execution_error"))
                     .await;
-                self.record_strategy_outcome(signal.kind, Decimal::ZERO, false, &cfg);
                 self.publish_failure_signal(&signal.condition_id, &format!("Order failed: {e}"));
                 return Ok(());
             }
@@ -662,26 +719,15 @@ impl QuantSignalExecutor {
             let _ = self.position_repo.update(&position).await;
             self.update_signal_status(signal.id, "failed", Some("order_rejected"))
                 .await;
-            self.record_strategy_outcome(signal.kind, Decimal::ZERO, false, &cfg);
             self.publish_failure_signal(&signal.condition_id, "Order rejected by exchange");
             return Ok(());
         }
 
-        // Step 14: Mark position OPEN, update dedup set, record with circuit breaker
+        // Step 14: Mark position OPEN
         if let Err(e) = position.mark_open() {
             error!(error = %e, "Failed to transition position to OPEN");
         }
         let _ = self.position_repo.update(&position).await;
-        self.active_quant_markets
-            .write()
-            .await
-            .insert(signal.condition_id.clone());
-
-        // Record with circuit breaker (estimated PnL = 0 at entry, success = true)
-        let _ = self.circuit_breaker.record_trade(Decimal::ZERO, true).await;
-
-        // Record success with per-strategy state (PnL = 0 at entry, counted as win)
-        self.record_strategy_outcome(signal.kind, Decimal::ZERO, true, &cfg);
 
         // Link signal to position
         self.link_signal_to_position(signal.id, position.id).await;
@@ -813,6 +859,16 @@ impl QuantSignalExecutor {
             metadata: serde_json::json!({ "reason": reason }),
         };
         let _ = self.signal_tx.send(signal);
+    }
+}
+
+fn parse_quant_signal_kind(kind: &str) -> Option<QuantSignalKind> {
+    match kind {
+        "flow" => Some(QuantSignalKind::Flow),
+        "cross_market" => Some(QuantSignalKind::CrossMarket),
+        "mean_reversion" => Some(QuantSignalKind::MeanReversion),
+        "resolution_proximity" => Some(QuantSignalKind::ResolutionProximity),
+        _ => None,
     }
 }
 

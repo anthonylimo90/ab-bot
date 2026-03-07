@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::data_store::MarketSnapshot;
 
@@ -170,12 +170,16 @@ impl StrategyContext {
 
     /// Get position for a market.
     pub fn get_position(&self, market_id: &str) -> Option<&Position> {
-        self.positions.get(market_id)
+        self.positions
+            .values()
+            .find(|position| position.market_id == market_id)
     }
 
     /// Check if we have a position in a market.
     pub fn has_position(&self, market_id: &str) -> bool {
-        self.positions.contains_key(market_id)
+        self.positions
+            .values()
+            .any(|position| position.market_id == market_id)
     }
 
     /// Get latest snapshot for a market.
@@ -414,7 +418,13 @@ impl Strategy for ArbitrageStrategy {
         let mut signals = Vec::new();
 
         // Skip if at max positions
-        if context.positions.len() >= self.max_positions {
+        let open_markets = context
+            .positions
+            .values()
+            .map(|position| position.market_id.clone())
+            .collect::<HashSet<_>>()
+            .len();
+        if open_markets >= self.max_positions {
             return Ok(signals);
         }
 
@@ -441,13 +451,6 @@ impl Strategy for ArbitrageStrategy {
                     // Calculate expected profit after fees
                     let expected_profit = spread - round_trip_fee(self.trading_fee_pct);
 
-                    // Buy the cheaper side
-                    let (outcome, price) = if snapshot.yes_ask < snapshot.no_ask {
-                        ("yes", snapshot.yes_ask)
-                    } else {
-                        ("no", snapshot.no_ask)
-                    };
-
                     // Confidence based on expected profit relative to fees
                     let confidence = expected_profit
                         .to_string()
@@ -455,14 +458,17 @@ impl Strategy for ArbitrageStrategy {
                         .unwrap_or(0.5)
                         .clamp(0.0, 1.0);
 
-                    let signal = Signal::buy(market_id, outcome, self.position_size)
-                        .with_entry_price(price)
-                        .with_confidence(confidence)
-                        .with_metadata("spread", &spread.to_string())
-                        .with_metadata("expected_profit", &expected_profit.to_string())
-                        .with_metadata("threshold", &min_spread.to_string());
-
-                    signals.push(signal);
+                    let per_leg_size = self.position_size / Decimal::TWO;
+                    for (outcome, price) in [("yes", snapshot.yes_ask), ("no", snapshot.no_ask)] {
+                        let signal = Signal::buy(market_id, outcome, per_leg_size)
+                            .with_entry_price(price)
+                            .with_confidence(confidence)
+                            .with_metadata("spread", &spread.to_string())
+                            .with_metadata("expected_profit", &expected_profit.to_string())
+                            .with_metadata("threshold", &min_spread.to_string())
+                            .with_metadata("entry_style", "two_leg_arb");
+                        signals.push(signal);
+                    }
                 }
             }
         }

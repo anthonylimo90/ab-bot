@@ -43,7 +43,7 @@ pub struct RunBacktestRequest {
 }
 
 fn default_fee() -> Decimal {
-    Decimal::new(1, 3) // 0.1%
+    Decimal::new(2, 2) // 2.0%
 }
 
 /// Strategy configuration.
@@ -557,7 +557,8 @@ async fn run_backtest_task(
             min_spread,
             max_position,
         } => {
-            let mut strategy = ArbitrageStrategy::new(min_spread, max_position, 10);
+            let mut strategy =
+                ArbitrageStrategy::new(min_spread, max_position, 10).with_fee(fee_pct);
             run_strategy(&simulator, &mut strategy, start_date, end_date).await
         }
         StrategyConfig::Momentum {

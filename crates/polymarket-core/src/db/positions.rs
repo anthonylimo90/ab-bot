@@ -15,6 +15,12 @@ pub struct PositionRepository {
     pool: PgPool,
 }
 
+/// Active exit-on-correction position plus its persisted source.
+pub struct ExitCandidate {
+    pub position: Position,
+    pub source: i16,
+}
+
 impl PositionRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -277,6 +283,34 @@ impl PositionRepository {
         Ok(rows.iter().map(Self::row_to_position).collect())
     }
 
+    /// Get open ExitOnCorrection positions that still need exit evaluation.
+    pub async fn get_open_exit_candidates(&self) -> Result<Vec<ExitCandidate>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                source
+            FROM positions
+            WHERE exit_strategy = 1 AND state = 1
+            ORDER BY entry_timestamp ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|row| ExitCandidate {
+                position: Self::row_to_position(row),
+                source: row.get::<Option<i16>, _>("source").unwrap_or(0),
+            })
+            .collect())
+    }
+
     /// Get ExitFailed positions eligible for retry (retry_count < 3).
     pub async fn get_failed_exits(&self) -> Result<Vec<Position>> {
         let rows = sqlx::query(
@@ -354,5 +388,47 @@ impl PositionRepository {
             win_count: row.get::<Option<i64>, _>("wins").unwrap_or(0) as u64,
             loss_count: row.get::<Option<i64>, _>("losses").unwrap_or(0) as u64,
         })
+    }
+
+    /// Returns true when a source already has an active position in the market.
+    pub async fn active_position_exists_for_market_source(
+        &self,
+        market_id: &str,
+        source: i16,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM positions
+                WHERE market_id = $1
+                  AND source = $2
+                  AND state NOT IN (4, 5)
+            )
+            "#,
+        )
+        .bind(market_id)
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(exists)
+    }
+
+    /// Count active positions for a single source.
+    pub async fn count_active_by_source(&self, source: i16) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM positions
+            WHERE source = $1
+              AND state NOT IN (4, 5)
+            "#,
+        )
+        .bind(source)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
     }
 }

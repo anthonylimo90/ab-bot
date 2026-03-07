@@ -940,13 +940,8 @@ impl ArbAutoExecutor {
         // Add to dedup set
         self.active_markets.write().await.insert(market_id.clone());
 
-        // 14. Record trade with circuit breaker (estimated profit)
+        // 14. Publish success signal
         let estimated_pnl = arb.net_profit * quantity;
-        if let Err(e) = self.circuit_breaker.record_trade(estimated_pnl, true).await {
-            warn!(error = %e, "Failed to record trade with circuit breaker");
-        }
-
-        // 15. Publish success signal
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
             signal_type: SignalType::Arbitrage,

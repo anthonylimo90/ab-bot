@@ -33,6 +33,12 @@ pub struct ExitHandlerConfig {
     pub exit_poll_interval_secs: u64,
     /// How often to check market resolutions (seconds).
     pub resolution_check_secs: u64,
+    /// Unrealized profit target for generic quant exits.
+    pub quant_take_profit_pct: Decimal,
+    /// Unrealized loss threshold for generic quant exits.
+    pub quant_stop_loss_pct: Decimal,
+    /// Maximum holding period for generic quant exits.
+    pub quant_max_hold_hours: i64,
 }
 
 impl Default for ExitHandlerConfig {
@@ -41,6 +47,9 @@ impl Default for ExitHandlerConfig {
             enabled: false,
             exit_poll_interval_secs: 30,
             resolution_check_secs: 300,
+            quant_take_profit_pct: Decimal::new(15, 2),
+            quant_stop_loss_pct: Decimal::new(10, 2),
+            quant_max_hold_hours: 24,
         }
     }
 }
@@ -60,6 +69,18 @@ impl ExitHandlerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
+            quant_take_profit_pct: std::env::var("QUANT_TAKE_PROFIT_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(15, 2)),
+            quant_stop_loss_pct: std::env::var("QUANT_STOP_LOSS_PCT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(10, 2)),
+            quant_max_hold_hours: std::env::var("QUANT_MAX_HOLD_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24),
         }
     }
 }
@@ -169,6 +190,9 @@ impl ExitHandler {
             enabled = startup_cfg.enabled,
             exit_poll_secs = startup_cfg.exit_poll_interval_secs,
             resolution_check_secs = startup_cfg.resolution_check_secs,
+            quant_take_profit_pct = %startup_cfg.quant_take_profit_pct,
+            quant_stop_loss_pct = %startup_cfg.quant_stop_loss_pct,
+            quant_max_hold_hours = startup_cfg.quant_max_hold_hours,
             "Starting exit handler (always-on, per-tick guard)"
         );
 
@@ -197,8 +221,12 @@ impl ExitHandler {
             tokio::select! {
                 _ = exit_ticker.tick() => {
                     // Per-tick guard: skip when disabled at runtime
-                    if !self.snapshot_config().await.enabled {
+                    let cfg = self.snapshot_config().await;
+                    if !cfg.enabled {
                         continue;
+                    }
+                    if let Err(e) = self.evaluate_open_positions(&cfg).await {
+                        error!(error = %e, "Failed to evaluate open positions for exit");
                     }
                     if let Err(e) = self.process_exit_ready().await {
                         error!(error = %e, "Failed to process exit-ready positions");
@@ -221,6 +249,40 @@ impl ExitHandler {
                 }
             }
         }
+    }
+
+    /// Evaluate open ExitOnCorrection positions and promote exit-eligible ones.
+    async fn evaluate_open_positions(&self, cfg: &ExitHandlerConfig) -> anyhow::Result<()> {
+        let mut candidates = self.position_repo.get_open_exit_candidates().await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        debug!(count = candidates.len(), "Evaluating open exit candidates");
+
+        let fee = Decimal::new(2, 2);
+        for candidate in &mut candidates {
+            let Some((yes_bid, no_bid)) = self.current_exit_bids(&candidate.position).await? else {
+                continue;
+            };
+
+            candidate.position.update_pnl(yes_bid, no_bid, fee);
+            self.position_repo.update(&candidate.position).await?;
+
+            if self.should_mark_exit_ready(&candidate.position, candidate.source, cfg) {
+                if let Err(e) = candidate.position.mark_exit_ready() {
+                    warn!(
+                        position_id = %candidate.position.id,
+                        error = %e,
+                        "Cannot mark exit candidate ready"
+                    );
+                    continue;
+                }
+                self.position_repo.update(&candidate.position).await?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Process ExitReady positions (ExitOnCorrection strategy).
@@ -276,83 +338,83 @@ impl ExitHandler {
             }
         };
 
-        // Execute YES sell
-        let yes_order = MarketOrder::new(
-            market_id.clone(),
-            yes_token_id,
-            OrderSide::Sell,
-            position.quantity,
-        );
-
-        let yes_report = match self.order_executor.execute_market_order(yes_order).await {
-            Ok(report) => report,
-            Err(e) => {
-                error!(error = %e, market_id = %market_id, "YES sell order error");
-                position.mark_exit_failed(FailureReason::ConnectivityError {
-                    message: format!("YES sell error: {e}"),
-                });
-                let _ = self.position_repo.update(position).await;
-                self.publish_alert(&market_id, "exit_failed", "YES sell order error");
-                return Ok(());
-            }
-        };
-
-        if !yes_report.is_success() {
-            let msg = yes_report
-                .error_message
-                .unwrap_or_else(|| "YES sell not filled".to_string());
-            position.mark_exit_failed(FailureReason::OrderRejected {
-                message: format!("YES sell failed: {msg}"),
-            });
-            let _ = self.position_repo.update(position).await;
-            self.publish_alert(&market_id, "exit_failed", "YES sell order rejected");
-            return Ok(());
-        }
-
-        let yes_price = yes_report.average_price;
-
-        // Execute NO sell
-        let no_order = MarketOrder::new(
-            market_id.clone(),
-            no_token_id,
-            OrderSide::Sell,
-            position.quantity,
-        );
-
-        let no_report = match self.order_executor.execute_market_order(no_order).await {
-            Ok(report) => report,
-            Err(e) => {
-                error!(error = %e, market_id = %market_id, "NO sell order error (YES already sold)");
-                position.mark_exit_failed(FailureReason::ConnectivityError {
-                    message: format!("NO sell error (YES sold at {yes_price}): {e}"),
-                });
-                let _ = self.position_repo.update(position).await;
-                self.publish_alert(
-                    &market_id,
-                    "exit_failed",
-                    "NO sell order error (one-legged)",
-                );
-                return Ok(());
-            }
-        };
-
-        if !no_report.is_success() {
-            let msg = no_report
-                .error_message
-                .unwrap_or_else(|| "NO sell not filled".to_string());
-            position.mark_exit_failed(FailureReason::OrderRejected {
-                message: format!("NO sell failed (YES sold at {yes_price}): {msg}"),
-            });
-            let _ = self.position_repo.update(position).await;
-            self.publish_alert(
-                &market_id,
-                "exit_failed",
-                "NO sell order rejected (one-legged)",
+        let (has_yes, has_no) = held_outcomes(position);
+        let yes_price = if has_yes {
+            let yes_order = MarketOrder::new(
+                market_id.clone(),
+                yes_token_id,
+                OrderSide::Sell,
+                position.quantity,
             );
-            return Ok(());
-        }
 
-        let no_price = no_report.average_price;
+            let yes_report = match self.order_executor.execute_market_order(yes_order).await {
+                Ok(report) => report,
+                Err(e) => {
+                    error!(error = %e, market_id = %market_id, "YES sell order error");
+                    position.mark_exit_failed(FailureReason::ConnectivityError {
+                        message: format!("YES sell error: {e}"),
+                    });
+                    let _ = self.position_repo.update(position).await;
+                    self.publish_alert(&market_id, "exit_failed", "YES sell order error");
+                    return Ok(());
+                }
+            };
+
+            if !yes_report.is_success() {
+                let msg = yes_report
+                    .error_message
+                    .unwrap_or_else(|| "YES sell not filled".to_string());
+                position.mark_exit_failed(FailureReason::OrderRejected {
+                    message: format!("YES sell failed: {msg}"),
+                });
+                let _ = self.position_repo.update(position).await;
+                self.publish_alert(&market_id, "exit_failed", "YES sell order rejected");
+                return Ok(());
+            }
+
+            yes_report.average_price
+        } else {
+            Decimal::ZERO
+        };
+
+        let no_price = if has_no {
+            let no_order = MarketOrder::new(
+                market_id.clone(),
+                no_token_id,
+                OrderSide::Sell,
+                position.quantity,
+            );
+
+            let no_report = match self.order_executor.execute_market_order(no_order).await {
+                Ok(report) => report,
+                Err(e) => {
+                    error!(error = %e, market_id = %market_id, "NO sell order error");
+                    position.mark_exit_failed(FailureReason::ConnectivityError {
+                        message: format!("NO sell error: {e}"),
+                    });
+                    let _ = self.position_repo.update(position).await;
+                    self.publish_alert(&market_id, "exit_failed", "NO sell order error");
+                    return Ok(());
+                }
+            };
+
+            if !no_report.is_success() {
+                let msg = no_report
+                    .error_message
+                    .unwrap_or_else(|| "NO sell not filled".to_string());
+                position.mark_exit_failed(FailureReason::OrderRejected {
+                    message: format!("NO sell failed: {msg}"),
+                });
+                let _ = self.position_repo.update(position).await;
+                self.publish_alert(&market_id, "exit_failed", "NO sell order rejected");
+                return Ok(());
+            }
+
+            no_report.average_price
+        } else {
+            Decimal::ZERO
+        };
+
         let fee = Decimal::new(2, 2); // 2%
 
         // Close position
@@ -402,6 +464,88 @@ impl ExitHandler {
         );
 
         Ok(())
+    }
+
+    async fn current_exit_bids(
+        &self,
+        position: &Position,
+    ) -> anyhow::Result<Option<(Decimal, Decimal)>> {
+        let market_id = position.market_id.as_str();
+        let (yes_token_id, no_token_id) = match self.token_cache.get(market_id).await {
+            Some(ids) => ids,
+            None => {
+                let _ = self.token_cache.refresh().await;
+                match self.token_cache.get(market_id).await {
+                    Some(ids) => ids,
+                    None => {
+                        warn!(market_id = %market_id, "No token IDs for exit price evaluation");
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        let (has_yes, has_no) = held_outcomes(position);
+        let yes_bid = if has_yes {
+            match self
+                .order_executor
+                .clob_client()
+                .get_order_book(&yes_token_id)
+                .await
+            {
+                Ok(book) => book.best_bid().unwrap_or(Decimal::ZERO),
+                Err(e) => {
+                    warn!(market_id = %market_id, error = %e, "Failed loading YES orderbook for exit evaluation");
+                    return Ok(None);
+                }
+            }
+        } else {
+            Decimal::ZERO
+        };
+
+        let no_bid = if has_no {
+            match self
+                .order_executor
+                .clob_client()
+                .get_order_book(&no_token_id)
+                .await
+            {
+                Ok(book) => book.best_bid().unwrap_or(Decimal::ZERO),
+                Err(e) => {
+                    warn!(market_id = %market_id, error = %e, "Failed loading NO orderbook for exit evaluation");
+                    return Ok(None);
+                }
+            }
+        } else {
+            Decimal::ZERO
+        };
+
+        Ok(Some((yes_bid, no_bid)))
+    }
+
+    fn should_mark_exit_ready(
+        &self,
+        position: &Position,
+        source: i16,
+        cfg: &ExitHandlerConfig,
+    ) -> bool {
+        if source == 3 {
+            let entry_cost = position.entry_cost();
+            let pnl_pct = if entry_cost > Decimal::ZERO {
+                (position.unrealized_pnl / entry_cost) * Decimal::new(100, 0)
+            } else {
+                Decimal::ZERO
+            };
+            let held_hours = Utc::now()
+                .signed_duration_since(position.entry_timestamp)
+                .num_hours();
+
+            pnl_pct >= cfg.quant_take_profit_pct
+                || pnl_pct <= -cfg.quant_stop_loss_pct
+                || held_hours >= cfg.quant_max_hold_hours
+        } else {
+            position.unrealized_pnl > Decimal::ZERO
+        }
     }
 
     /// Check for HoldToResolution positions whose markets have resolved.
@@ -702,4 +846,31 @@ mod tests {
         assert_eq!(config.exit_poll_interval_secs, 30);
         assert_eq!(config.resolution_check_secs, 300);
     }
+
+    #[test]
+    fn test_held_outcomes_for_single_leg_positions() {
+        let yes_only = Position::new(
+            "m1".to_string(),
+            Decimal::new(55, 2),
+            Decimal::ZERO,
+            Decimal::ONE,
+            polymarket_core::types::ExitStrategy::ExitOnCorrection,
+        );
+        assert_eq!(held_outcomes(&yes_only), (true, false));
+
+        let no_only = Position::new(
+            "m1".to_string(),
+            Decimal::ZERO,
+            Decimal::new(45, 2),
+            Decimal::ONE,
+            polymarket_core::types::ExitStrategy::ExitOnCorrection,
+        );
+        assert_eq!(held_outcomes(&no_only), (false, true));
+    }
+}
+
+fn held_outcomes(position: &Position) -> (bool, bool) {
+    let has_yes = position.yes_entry_price > Decimal::ZERO;
+    let has_no = position.no_entry_price > Decimal::ZERO;
+    (has_yes, has_no)
 }

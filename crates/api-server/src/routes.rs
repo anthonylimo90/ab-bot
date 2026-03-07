@@ -236,7 +236,7 @@ use crate::websocket;
         (name = "backtest", description = "Backtesting operations"),
         (name = "discover", description = "Wallet discovery and live trade monitoring"),
         (name = "vault", description = "Secure wallet key management"),
-        (name = "recommendations", description = "AI-powered rotation recommendations"),
+        (name = "recommendations", description = "Advisory wallet rotation and research recommendations"),
         (name = "users", description = "User management (admin only)"),
         (name = "admin_workspaces", description = "Workspace management (platform admin only)"),
         (name = "workspaces", description = "User workspace operations"),

@@ -292,6 +292,9 @@ impl ApiServer {
             state.exit_handler_heartbeat.clone(),
         );
 
+        // Quant executor config is shared with the dynamic config subscriber.
+        let quant_config = Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env()));
+
         // Subscribe local runtime to dynamic updates (arb executor config knobs)
         let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
             .or_else(|_| std::env::var("REDIS_URL"))
@@ -300,6 +303,7 @@ impl ApiServer {
             redis_url,
             state.pool.clone(),
             state.arb_executor_config.clone(),
+            Some(quant_config.clone()),
         );
 
         // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
@@ -330,7 +334,6 @@ impl ApiServer {
 
         // ── Quant signal system: executor + generators ──
         // Executor receives QuantSignal from broadcast channel and evaluates/executes.
-        let quant_config = Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env()));
         spawn_quant_signal_executor(
             quant_config,
             state.quant_signal_tx.subscribe(),

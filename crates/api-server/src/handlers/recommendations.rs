@@ -102,7 +102,7 @@ fn decimal_to_f64(d: Option<Decimal>) -> f64 {
     d.and_then(|v| v.to_f64()).unwrap_or(0.0)
 }
 
-/// Get rotation recommendations.
+/// Get advisory wallet rotation recommendations.
 #[utoipa::path(
     get,
     path = "/api/v1/recommendations/rotation",
@@ -347,7 +347,7 @@ pub async fn accept_recommendation(
     State(_state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // In a real implementation, this would execute the recommended action
+    // This endpoint is advisory-only today; it does not mutate a live roster.
     tracing::info!(recommendation_id = %id, "Recommendation accepted");
     Ok(Json(serde_json::json!({ "status": "accepted", "id": id })))
 }

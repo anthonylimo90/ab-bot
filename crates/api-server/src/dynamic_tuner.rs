@@ -1202,6 +1202,9 @@ pub fn spawn_dynamic_config_subscriber(
     redis_url: String,
     pool: PgPool,
     arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
+    quant_executor_config: Option<
+        Arc<RwLock<crate::quant_signal_executor::QuantSignalExecutorConfig>>,
+    >,
 ) {
     tokio::spawn(async move {
         loop {
@@ -1209,6 +1212,7 @@ pub fn spawn_dynamic_config_subscriber(
                 redis_url.as_str(),
                 pool.clone(),
                 arb_executor_config.clone(),
+                quant_executor_config.clone(),
             )
             .await
             {
@@ -1225,6 +1229,9 @@ async fn run_dynamic_config_subscriber(
     redis_url: &str,
     pool: PgPool,
     arb_executor_config: Option<Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
+    quant_executor_config: Option<
+        Arc<RwLock<crate::quant_signal_executor::QuantSignalExecutorConfig>>,
+    >,
 ) -> anyhow::Result<()> {
     let allowed_sources = load_allowed_update_sources();
     let bounds = load_dynamic_bounds(&pool).await;
@@ -1243,6 +1250,12 @@ async fn run_dynamic_config_subscriber(
     if let Some(ref arb_config) = arb_executor_config {
         if let Err(e) = apply_startup_snapshot_to_arb_executor(&pool, arb_config, &bounds).await {
             warn!(error = %e, "Failed applying startup dynamic config snapshot to arb executor");
+        }
+    }
+    if let Some(ref quant_config) = quant_executor_config {
+        if let Err(e) = apply_startup_snapshot_to_quant_executor(&pool, quant_config, &bounds).await
+        {
+            warn!(error = %e, "Failed applying startup dynamic config snapshot to quant executor");
         }
     }
 
@@ -1319,6 +1332,24 @@ async fn run_dynamic_config_subscriber(
                     value = %update.value,
                     source = %update.source,
                     "Applied arb executor config update at runtime"
+                );
+            }
+        }
+
+        if let Some(ref quant_config) = quant_executor_config {
+            let applied = match update.key.as_str() {
+                KEY_QUANT_BASE_POSITION_SIZE => {
+                    quant_config.write().await.base_position_size_usd = update.value;
+                    true
+                }
+                _ => false,
+            };
+            if applied {
+                info!(
+                    key = %update.key,
+                    value = %update.value,
+                    source = %update.source,
+                    "Applied quant executor config update at runtime"
                 );
             }
         }
@@ -1422,6 +1453,46 @@ async fn apply_startup_snapshot_to_arb_executor(
     info!(
         applied,
         "Applied startup dynamic config snapshot to arb executor"
+    );
+    Ok(())
+}
+
+/// Applies the current dynamic config snapshot to the quant executor config.
+async fn apply_startup_snapshot_to_quant_executor(
+    pool: &PgPool,
+    quant_config: &Arc<RwLock<crate::quant_signal_executor::QuantSignalExecutorConfig>>,
+    bounds: &HashMap<String, (Decimal, Decimal)>,
+) -> anyhow::Result<()> {
+    let rows: Vec<DynamicValueRow> = sqlx::query_as(
+        r#"
+        SELECT key, current_value
+        FROM dynamic_config
+        WHERE enabled = TRUE
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut applied = 0usize;
+    for row in rows {
+        let Some(value) = clamp_dynamic_value(&row.key, row.current_value, bounds) else {
+            continue;
+        };
+        let did_apply = match row.key.as_str() {
+            KEY_QUANT_BASE_POSITION_SIZE => {
+                quant_config.write().await.base_position_size_usd = value;
+                true
+            }
+            _ => false,
+        };
+        if did_apply {
+            applied += 1;
+        }
+    }
+
+    info!(
+        applied,
+        "Applied startup dynamic config snapshot to quant executor"
     );
     Ok(())
 }
