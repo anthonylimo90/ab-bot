@@ -656,17 +656,22 @@ impl OrderExecutor {
             ));
         }
 
+        let market_amount = match order.side {
+            OrderSide::Buy => order.quantity * price,
+            OrderSide::Sell => order.quantity,
+        };
+
         // Create signed order (FOK for market orders, expiration=0)
         let signed_order = client
-            .create_order(
+            .create_market_order(
                 &order.outcome_id,
                 signing_side,
                 price,
-                order.quantity,
+                market_amount,
                 OrderType::Fok,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to create market order: {}", e))?;
 
         // Post the order (FOK for market orders)
         let response = client

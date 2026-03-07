@@ -6,6 +6,7 @@
 use crate::types::{Market, Outcome};
 use crate::{Error, Result};
 use chrono::{DateTime, Utc};
+use reqwest::header::RETRY_AFTER;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::Duration as StdDuration;
@@ -13,6 +14,8 @@ use tracing::{debug, warn};
 
 /// Gamma API base URL.
 const DEFAULT_BASE_URL: &str = "https://gamma-api.polymarket.com";
+const DEFAULT_MAX_PAGE_SIZE: u32 = 100;
+const DEFAULT_PAGE_DELAY_MS: u64 = 125;
 
 /// Market metadata from the Gamma API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +218,34 @@ impl GammaClient {
         }
     }
 
+    fn retry_after_delay(response: &reqwest::Response) -> Option<StdDuration> {
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(StdDuration::from_secs)
+    }
+
+    fn capped_page_size(page_size: u32) -> u32 {
+        page_size.max(1).min(
+            std::env::var("GAMMA_MAX_PAGE_SIZE")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_MAX_PAGE_SIZE)
+                .max(1),
+        )
+    }
+
+    fn page_delay() -> StdDuration {
+        StdDuration::from_millis(
+            std::env::var("GAMMA_PAGE_DELAY_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_PAGE_DELAY_MS),
+        )
+    }
+
     /// Execute an HTTP GET with retry and exponential backoff.
     ///
     /// Retries on 5xx server errors and 429 rate-limit responses.
@@ -236,11 +267,15 @@ impl GammaClient {
                         url = url,
                         "Gamma API error, retrying"
                     );
+                    let retry_after = Self::retry_after_delay(&response);
                     let backoff = if is_rate_limited {
                         StdDuration::from_millis(2000 * 2u64.pow(attempt))
                     } else {
                         StdDuration::from_millis(500 * 2u64.pow(attempt))
                     };
+                    let backoff = retry_after
+                        .map(|delay| delay.max(backoff))
+                        .unwrap_or(backoff);
                     tokio::time::sleep(backoff).await;
                     last_error = Some(Error::Api {
                         message: format!("Gamma API returned {}", status),
@@ -298,18 +333,32 @@ impl GammaClient {
     ///
     /// Stops when a page returns fewer results than the page size.
     pub async fn get_all_markets(&self, page_size: u32) -> Result<Vec<GammaMarket>> {
+        let capped_page_size = Self::capped_page_size(page_size);
+        if capped_page_size != page_size {
+            warn!(
+                requested = page_size,
+                capped = capped_page_size,
+                "Clamped Gamma page size to reduce rate-limit pressure"
+            );
+        }
+
         let mut all_markets = Vec::new();
         let mut offset = 0u32;
+        let page_delay = Self::page_delay();
 
         loop {
-            let page = self.get_markets(page_size, offset).await?;
+            let page = self.get_markets(capped_page_size, offset).await?;
             let page_len = page.len() as u32;
             all_markets.extend(page);
 
-            if page_len < page_size {
+            if page_len < capped_page_size {
                 break;
             }
-            offset += page_size;
+            offset += capped_page_size;
+
+            if !page_delay.is_zero() {
+                tokio::time::sleep(page_delay).await;
+            }
 
             // Yield to prevent blocking the executor during large fetches
             tokio::task::yield_now().await;

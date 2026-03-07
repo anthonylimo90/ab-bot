@@ -723,9 +723,20 @@ impl QuantSignalExecutor {
         &mut self,
         kind: QuantSignalKind,
         pnl: Decimal,
-        _success: bool,
+        success: bool,
         cfg: &QuantSignalExecutorConfig,
     ) {
+        // Entry submissions do not realize P&L. Treat zero-P&L events as
+        // operational noise rather than strategy losses so client-side rejects
+        // and startup retries do not trip the per-strategy breaker.
+        if pnl.is_zero() {
+            debug!(
+                kind = kind.as_str(),
+                success, "Skipping zero-PnL quant strategy outcome"
+            );
+            return;
+        }
+
         if let Some(state) = self.strategy_states.get_mut(&kind) {
             let halted = state.record_outcome(
                 pnl,

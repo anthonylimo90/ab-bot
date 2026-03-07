@@ -3,13 +3,15 @@
 //! This module provides both read-only and authenticated access to the
 //! Polymarket CLOB API for order book data and order management.
 
-use crate::signing::{OrderSigner, SignedOrder};
+use crate::signing::{OrderData, OrderSigner, SignedOrder};
 use crate::types::{Market, OrderBook, Outcome, PriceLevel};
 use crate::{Error, Result};
+use alloy_primitives::U256;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rust_decimal::Decimal;
+use rust_decimal::RoundingStrategy;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -19,6 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
+
+const COLLATERAL_DECIMALS: u32 = 6;
+const MARKET_ORDER_SIZE_SCALE: u32 = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct WebSocketRuntimeStatsSnapshot {
@@ -1794,6 +1799,93 @@ impl AuthenticatedClobClient {
         Ok(signed)
     }
 
+    /// Create and sign a market order using Polymarket's amount-based semantics.
+    ///
+    /// For BUY orders, `amount` is the USDC notional to spend.
+    /// For SELL orders, `amount` is the token quantity to sell.
+    pub async fn create_market_order(
+        &self,
+        token_id: &str,
+        side: crate::signing::OrderSide,
+        price: Decimal,
+        amount: Decimal,
+        order_type: OrderType,
+    ) -> Result<SignedOrder> {
+        match self.get_balance_allowance(None, "COLLATERAL").await {
+            Ok(ba) => {
+                info!(
+                    balance = %ba.balance,
+                    allowance = %ba.allowance,
+                    maker = %self.address(),
+                    "CLOB USDC balance/allowance check"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to check CLOB balance/allowance (continuing)");
+            }
+        }
+
+        if amount <= Decimal::ZERO {
+            return Err(Error::Order {
+                message: "Market order amount must be positive".to_string(),
+            });
+        }
+        if price <= Decimal::ZERO {
+            return Err(Error::Order {
+                message: "Market order price must be positive".to_string(),
+            });
+        }
+
+        let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
+        let signer = if neg_risk {
+            &self.neg_risk_signer
+        } else {
+            &self.signer
+        };
+
+        let fee_rate = self.get_fee_rate_bps(token_id).await.unwrap_or(0);
+        let (maker_amount, taker_amount) = calculate_market_order_amounts(side, amount, price)?;
+        let token_id = U256::from_str_radix(token_id, 10).map_err(|_| Error::Order {
+            message: format!("Invalid token id: {token_id}"),
+        })?;
+
+        info!(
+            token_id = %token_id,
+            side = ?side,
+            price = %price,
+            amount = %amount,
+            fee_rate_bps = fee_rate,
+            neg_risk = neg_risk,
+            order_type = ?order_type,
+            "Building market order"
+        );
+
+        let mut order = OrderData::new(
+            signer.address(),
+            token_id,
+            side,
+            maker_amount,
+            taker_amount,
+            0,
+        );
+        order.fee_rate_bps = U256::from(fee_rate);
+        order.expiration = match order_type {
+            OrderType::Gtd => U256::from(current_timestamp() + 3600),
+            _ => U256::ZERO,
+        };
+
+        info!(
+            maker_amount = %order.maker_amount,
+            taker_amount = %order.taker_amount,
+            salt = %order.salt,
+            "Market order built with amounts"
+        );
+
+        signer.sign_order(&order).await.map_err(|e| Error::Signing {
+            message: format!("Failed to sign order: {e}"),
+        })
+    }
+
     /// Post a signed order to the CLOB.
     pub async fn post_order(
         &self,
@@ -1971,6 +2063,90 @@ impl AuthenticatedClobClient {
     }
 }
 
+fn market_price_scale(price: Decimal) -> u32 {
+    price.normalize().scale().clamp(1, 4)
+}
+
+fn market_amount_scale(price_scale: u32) -> u32 {
+    price_scale.saturating_add(2)
+}
+
+fn round_down(value: Decimal, scale: u32) -> Decimal {
+    value.trunc_with_scale(scale)
+}
+
+fn round_up(value: Decimal, scale: u32) -> Decimal {
+    value.round_dp_with_strategy(scale, RoundingStrategy::ToPositiveInfinity)
+}
+
+fn decimal_places(value: Decimal) -> u32 {
+    value.normalize().scale()
+}
+
+fn to_fixed_u128(value: Decimal, scale: u32) -> u128 {
+    value
+        .trunc_with_scale(scale)
+        .trunc_with_scale(COLLATERAL_DECIMALS)
+        .mantissa()
+        .unsigned_abs()
+}
+
+fn calculate_market_order_amounts(
+    side: crate::signing::OrderSide,
+    amount: Decimal,
+    price: Decimal,
+) -> Result<(U256, U256)> {
+    if amount <= Decimal::ZERO || price <= Decimal::ZERO {
+        return Err(Error::Order {
+            message: "Market order amount and price must be positive".to_string(),
+        });
+    }
+
+    let price_scale = market_price_scale(price);
+    let amount_scale = market_amount_scale(price_scale);
+    let raw_price = round_down(price, price_scale);
+
+    let (raw_maker_amt, raw_taker_amt) = match side {
+        crate::signing::OrderSide::Buy => {
+            let raw_maker_amt = round_down(amount, MARKET_ORDER_SIZE_SCALE);
+            if raw_maker_amt <= Decimal::ZERO {
+                return Err(Error::Order {
+                    message: "Market BUY amount rounds down to zero".to_string(),
+                });
+            }
+            let mut raw_taker_amt = raw_maker_amt / raw_price;
+            if decimal_places(raw_taker_amt) > amount_scale {
+                raw_taker_amt = round_up(raw_taker_amt, amount_scale + 4);
+                if decimal_places(raw_taker_amt) > amount_scale {
+                    raw_taker_amt = round_down(raw_taker_amt, amount_scale);
+                }
+            }
+            (raw_maker_amt, raw_taker_amt)
+        }
+        crate::signing::OrderSide::Sell => {
+            let raw_maker_amt = round_down(amount, MARKET_ORDER_SIZE_SCALE);
+            if raw_maker_amt <= Decimal::ZERO {
+                return Err(Error::Order {
+                    message: "Market SELL amount rounds down to zero".to_string(),
+                });
+            }
+            let mut raw_taker_amt = raw_maker_amt * raw_price;
+            if decimal_places(raw_taker_amt) > amount_scale {
+                raw_taker_amt = round_up(raw_taker_amt, amount_scale + 4);
+                if decimal_places(raw_taker_amt) > amount_scale {
+                    raw_taker_amt = round_down(raw_taker_amt, amount_scale);
+                }
+            }
+            (raw_maker_amt, raw_taker_amt)
+        }
+    };
+
+    Ok((
+        U256::from(to_fixed_u128(raw_maker_amt, MARKET_ORDER_SIZE_SCALE)),
+        U256::from(to_fixed_u128(raw_taker_amt, amount_scale)),
+    ))
+}
+
 /// Get current Unix timestamp in seconds.
 fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -2081,6 +2257,32 @@ mod authenticated_tests {
 
         assert!(signed.signature.starts_with("0x"));
         assert_eq!(signed.side, "BUY");
+    }
+
+    #[test]
+    fn test_calculate_market_order_amounts_buy_uses_usdc_notional() {
+        let (maker_amount, taker_amount) = calculate_market_order_amounts(
+            crate::signing::OrderSide::Buy,
+            Decimal::new(2500, 2), // $25.00
+            Decimal::new(48, 2),   // 0.48
+        )
+        .unwrap();
+
+        assert_eq!(maker_amount, U256::from(25_000_000u64));
+        assert_eq!(taker_amount, U256::from(52_083_300u64));
+    }
+
+    #[test]
+    fn test_calculate_market_order_amounts_sell_uses_share_size() {
+        let (maker_amount, taker_amount) = calculate_market_order_amounts(
+            crate::signing::OrderSide::Sell,
+            Decimal::new(521, 2), // 5.21 shares
+            Decimal::new(48, 2),  // 0.48
+        )
+        .unwrap();
+
+        assert_eq!(maker_amount, U256::from(5_210_000u64));
+        assert_eq!(taker_amount, U256::from(2_500_800u64));
     }
 
     #[test]

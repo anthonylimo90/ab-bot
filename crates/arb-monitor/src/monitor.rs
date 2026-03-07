@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default minimum depth (in USD) at best ask for both sides.
 const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0); // $100
@@ -44,7 +44,7 @@ const KEY_ARB_MONITOR_EXPLORATION_SLOTS: &str = "ARB_MONITOR_EXPLORATION_SLOTS";
 const KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL: &str = "ARB_MONITOR_AGGRESSIVENESS_LEVEL";
 const OPPORTUNITY_EWMA_ALPHA: f64 = 0.25;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggressivenessProfile {
     Stable,
     Balanced,
@@ -902,6 +902,13 @@ impl ArbMonitor {
 
         match update.key.as_str() {
             KEY_ARB_MIN_PROFIT_THRESHOLD => {
+                if self.min_profit_threshold == value {
+                    debug!(
+                        threshold = %self.min_profit_threshold,
+                        "Ignoring no-op dynamic ARB_MIN_PROFIT_THRESHOLD update"
+                    );
+                    return SelectionRebuildOutcome::default();
+                }
                 self.min_profit_threshold = value;
                 info!(
                     threshold = %self.min_profit_threshold,
@@ -911,6 +918,13 @@ impl ArbMonitor {
             }
             KEY_ARB_MONITOR_MAX_MARKETS => {
                 let cap = decimal_to_cap(value);
+                if self.max_markets_cap == cap {
+                    debug!(
+                        cap = ?self.max_markets_cap,
+                        "Ignoring no-op dynamic ARB_MONITOR_MAX_MARKETS update"
+                    );
+                    return SelectionRebuildOutcome::default();
+                }
                 self.max_markets_cap = cap;
                 let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::DynamicConfig);
                 info!(
@@ -922,6 +936,13 @@ impl ArbMonitor {
             }
             KEY_ARB_MONITOR_EXPLORATION_SLOTS => {
                 let slots = decimal_to_cap(value).unwrap_or(self.exploration_slots.max(1));
+                if self.exploration_slots == slots {
+                    debug!(
+                        exploration_slots = self.exploration_slots,
+                        "Ignoring no-op dynamic ARB_MONITOR_EXPLORATION_SLOTS update"
+                    );
+                    return SelectionRebuildOutcome::default();
+                }
                 self.exploration_slots = slots;
                 let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::DynamicConfig);
                 info!(
@@ -933,7 +954,15 @@ impl ArbMonitor {
             }
             KEY_ARB_MONITOR_AGGRESSIVENESS_LEVEL => {
                 let level = value.to_f64().unwrap_or(1.0);
-                self.aggressiveness_profile = AggressivenessProfile::from_level(level);
+                let profile = AggressivenessProfile::from_level(level);
+                if self.aggressiveness_profile == profile {
+                    debug!(
+                        aggressiveness = self.aggressiveness_profile.as_str(),
+                        level, "Ignoring no-op dynamic ARB_MONITOR_AGGRESSIVENESS_LEVEL update"
+                    );
+                    return SelectionRebuildOutcome::default();
+                }
+                self.aggressiveness_profile = profile;
                 self.scoring_weights = ScoringWeights::for_profile(self.aggressiveness_profile);
                 let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::DynamicConfig);
                 info!(
