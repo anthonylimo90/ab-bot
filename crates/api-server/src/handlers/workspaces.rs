@@ -10,7 +10,6 @@ use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
-use polymarket_core::types::ArbOpportunity;
 use rand::Rng;
 use redis::AsyncCommands;
 use rust_decimal::prelude::ToPrimitive;
@@ -1840,9 +1839,17 @@ struct ArbRuntimeStatsSnapshot {
     #[serde(default)]
     near_miss_under_50bps_per_minute: f64,
     #[serde(default)]
+    gross_positive_but_net_negative_per_minute: f64,
+    #[serde(default)]
+    best_gross_profit_bps_per_minute: f64,
+    #[serde(default)]
     best_net_profit_bps_per_minute: f64,
     #[serde(default)]
+    best_eligible_gross_profit_bps_per_minute: f64,
+    #[serde(default)]
     best_eligible_net_profit_bps_per_minute: f64,
+    #[serde(default)]
+    best_fee_drag_bps_per_minute: f64,
     #[serde(default)]
     closest_threshold_gap_bps_per_minute: Option<f64>,
     #[serde(default)]
@@ -1935,8 +1942,12 @@ pub struct ScannerStatusResponse {
     pub near_miss_under_5bps_per_minute: i64,
     pub near_miss_under_25bps_per_minute: i64,
     pub near_miss_under_50bps_per_minute: i64,
+    pub gross_positive_but_net_negative_per_minute: i64,
+    pub best_gross_profit_bps_per_minute: f64,
     pub best_net_profit_bps_per_minute: f64,
+    pub best_eligible_gross_profit_bps_per_minute: f64,
     pub best_eligible_net_profit_bps_per_minute: f64,
+    pub best_fee_drag_bps_per_minute: f64,
     pub closest_threshold_gap_bps_per_minute: Option<f64>,
     pub selection_refreshes_applied_per_minute: i64,
     pub selection_refreshes_suppressed_per_minute: i64,
@@ -2322,10 +2333,7 @@ pub async fn get_dynamic_tuner_status(
         min_net_profit_threshold_pct: min_profit_ratio * 100.0,
         signal_cooldown_secs: env_i64("ARB_SIGNAL_COOLDOWN_SECS", 60),
         min_depth_usd: env_f64("ARB_MIN_BOOK_DEPTH", 25.0),
-        trading_fee_pct: env_f64(
-            "ARB_TRADING_FEE_PCT",
-            decimal_to_f64(ArbOpportunity::DEFAULT_FEE),
-        ),
+        trading_fee_pct: env_f64("ARB_TRADING_FEE_PCT", 0.0),
     };
 
     let runtime_state: Option<DynamicTunerStateRow> = sqlx::query_as(
@@ -2449,9 +2457,16 @@ pub async fn get_dynamic_tuner_status(
             as i64,
         near_miss_under_50bps_per_minute: runtime_stats.near_miss_under_50bps_per_minute.round()
             as i64,
+        gross_positive_but_net_negative_per_minute: runtime_stats
+            .gross_positive_but_net_negative_per_minute
+            .round() as i64,
+        best_gross_profit_bps_per_minute: runtime_stats.best_gross_profit_bps_per_minute,
         best_net_profit_bps_per_minute: runtime_stats.best_net_profit_bps_per_minute,
+        best_eligible_gross_profit_bps_per_minute: runtime_stats
+            .best_eligible_gross_profit_bps_per_minute,
         best_eligible_net_profit_bps_per_minute: runtime_stats
             .best_eligible_net_profit_bps_per_minute,
+        best_fee_drag_bps_per_minute: runtime_stats.best_fee_drag_bps_per_minute,
         closest_threshold_gap_bps_per_minute: runtime_stats.closest_threshold_gap_bps_per_minute,
         selection_refreshes_applied_per_minute: runtime_stats
             .selection_refreshes_applied_per_minute

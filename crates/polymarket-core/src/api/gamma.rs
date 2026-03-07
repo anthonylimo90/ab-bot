@@ -28,6 +28,12 @@ pub struct GammaMarket {
     /// Market tags for finer classification.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Whether the market currently has trading fees enabled.
+    #[serde(default, alias = "feesEnabled")]
+    pub fees_enabled: bool,
+    /// Optional fee type label from Gamma.
+    #[serde(default, alias = "feeType")]
+    pub fee_type: Option<String>,
     /// When the market is expected to resolve.
     #[serde(alias = "endDate", alias = "end_date")]
     pub end_date: Option<String>,
@@ -174,6 +180,10 @@ impl GammaMarket {
             end_date: self.end_date.and_then(|value| value.parse().ok()),
             resolved: self.closed || self.archived,
             resolution: None,
+            category: self.category,
+            tags: self.tags,
+            fees_enabled: self.fees_enabled,
+            fee_type: self.fee_type,
         })
     }
 }
@@ -412,6 +422,8 @@ mod tests {
             question: "Test?".to_string(),
             category: Some("Politics".to_string()),
             tags: vec!["election".to_string()],
+            fees_enabled: false,
+            fee_type: None,
             end_date: Some("2026-06-01T00:00:00Z".to_string()),
             volume: Some("50000.50".to_string()),
             liquidity: Some("12000".to_string()),
@@ -440,6 +452,8 @@ mod tests {
             question: "Will BTC hit $100k?".to_string(),
             category: Some("Crypto".to_string()),
             tags: vec!["bitcoin".to_string()],
+            fees_enabled: true,
+            fee_type: Some("curve".to_string()),
             end_date: Some("2026-06-01T00:00:00Z".to_string()),
             volume: Some("50000.50".to_string()),
             liquidity: Some("12000".to_string()),

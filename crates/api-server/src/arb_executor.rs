@@ -810,18 +810,21 @@ impl ArbAutoExecutor {
         }
         let quantity = position_size / arb.total_cost;
 
-        // Fee drag tracking: log the expected fees vs expected profit
-        let expected_fees = quantity * arb.total_cost * cfg.fee_rate;
+        // Fee drag tracking: `fee_drag` is the worst-case reduction in resolution payout per pair.
+        let expected_fees = quantity * arb.fee_drag;
         let expected_gross = arb.gross_profit * quantity;
         let expected_net = arb.net_profit * quantity;
 
         info!(
             market_id = %market_id,
             net_profit_per_share = %arb.net_profit,
+            gross_profit_per_share = %arb.gross_profit,
+            fee_drag_per_share = %arb.fee_drag,
+            worst_case_payout_per_share = %arb.worst_case_payout,
             total_cost = %arb.total_cost,
             position_size = %position_size,
             quantity = %quantity,
-            expected_fees = %expected_fees,
+            expected_fee_drag = %expected_fees,
             expected_gross = %expected_gross,
             expected_net = %expected_net,
             "Executing arb trade"

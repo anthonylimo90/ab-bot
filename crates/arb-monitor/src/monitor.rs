@@ -187,8 +187,12 @@ struct ArbTelemetryCounters {
     near_miss_under_5bps: u64,
     near_miss_under_25bps: u64,
     near_miss_under_50bps: u64,
+    gross_positive_but_net_negative: u64,
+    best_gross_profit_bps: f64,
     best_net_profit_bps: f64,
+    best_eligible_gross_profit_bps: f64,
     best_eligible_net_profit_bps: f64,
+    best_fee_drag_bps: f64,
     closest_threshold_gap_bps: Option<f64>,
 }
 
@@ -207,8 +211,12 @@ impl ArbTelemetryCounters {
             near_miss_under_5bps_per_minute: self.near_miss_under_5bps as f64,
             near_miss_under_25bps_per_minute: self.near_miss_under_25bps as f64,
             near_miss_under_50bps_per_minute: self.near_miss_under_50bps as f64,
+            gross_positive_but_net_negative_per_minute: self.gross_positive_but_net_negative as f64,
+            best_gross_profit_bps_per_minute: self.best_gross_profit_bps,
             best_net_profit_bps_per_minute: self.best_net_profit_bps,
+            best_eligible_gross_profit_bps_per_minute: self.best_eligible_gross_profit_bps,
             best_eligible_net_profit_bps_per_minute: self.best_eligible_net_profit_bps,
+            best_fee_drag_bps_per_minute: self.best_fee_drag_bps,
             closest_threshold_gap_bps_per_minute: self.closest_threshold_gap_bps,
         }
     }
@@ -228,8 +236,12 @@ struct ArbTelemetryRuntimeStats {
     near_miss_under_5bps_per_minute: f64,
     near_miss_under_25bps_per_minute: f64,
     near_miss_under_50bps_per_minute: f64,
+    gross_positive_but_net_negative_per_minute: f64,
+    best_gross_profit_bps_per_minute: f64,
     best_net_profit_bps_per_minute: f64,
+    best_eligible_gross_profit_bps_per_minute: f64,
     best_eligible_net_profit_bps_per_minute: f64,
+    best_fee_drag_bps_per_minute: f64,
     closest_threshold_gap_bps_per_minute: Option<f64>,
 }
 
@@ -289,6 +301,8 @@ pub struct ArbMonitor {
     all_market_ids: Vec<String>,
     /// Static market metadata used in ranking.
     market_profiles: HashMap<String, MarketProfile>,
+    /// Whether a market currently uses Polymarket's fee-enabled pricing model.
+    market_fees_enabled: HashMap<String, bool>,
     /// Rolling market-level opportunity stats used for dynamic scoring.
     market_stats: HashMap<String, MarketOpportunityStats>,
     /// Active market subset based on cap.
@@ -441,6 +455,7 @@ impl ArbMonitor {
             max_markets_cap,
             all_market_ids: Vec::new(),
             market_profiles: HashMap::new(),
+            market_fees_enabled: HashMap::new(),
             market_stats: HashMap::new(),
             eligible_markets: HashSet::new(),
             selection_snapshot: Vec::new(),
@@ -487,6 +502,8 @@ impl ArbMonitor {
                     volume: market.volume.to_f64().unwrap_or(0.0),
                 },
             );
+            self.market_fees_enabled
+                .insert(market.id.clone(), market.fees_enabled);
         }
 
         self.all_market_ids = binary_markets.iter().map(|m| m.id.clone()).collect();
@@ -500,6 +517,11 @@ impl ArbMonitor {
 
         info!(
             total_markets = self.all_market_ids.len(),
+            fee_enabled_markets = self
+                .market_fees_enabled
+                .values()
+                .filter(|enabled| **enabled)
+                .count(),
             active_markets = self.eligible_markets.len(),
             active_assets = self.active_subscription_asset_count(),
             max_cap = ?self.max_markets_cap,
@@ -684,8 +706,15 @@ impl ArbMonitor {
                         near_miss_under_5bps_per_minute: arb_runtime.near_miss_under_5bps_per_minute,
                         near_miss_under_25bps_per_minute: arb_runtime.near_miss_under_25bps_per_minute,
                         near_miss_under_50bps_per_minute: arb_runtime.near_miss_under_50bps_per_minute,
+                        gross_positive_but_net_negative_per_minute: arb_runtime
+                            .gross_positive_but_net_negative_per_minute,
+                        best_gross_profit_bps_per_minute: arb_runtime
+                            .best_gross_profit_bps_per_minute,
                         best_net_profit_bps_per_minute: arb_runtime.best_net_profit_bps_per_minute,
+                        best_eligible_gross_profit_bps_per_minute: arb_runtime
+                            .best_eligible_gross_profit_bps_per_minute,
                         best_eligible_net_profit_bps_per_minute: arb_runtime.best_eligible_net_profit_bps_per_minute,
+                        best_fee_drag_bps_per_minute: arb_runtime.best_fee_drag_bps_per_minute,
                         closest_threshold_gap_bps_per_minute: arb_runtime.closest_threshold_gap_bps_per_minute,
                         selection_refreshes_applied_per_minute: selection_applied_since_tick as f64,
                         selection_refreshes_suppressed_per_minute: selection_suppressed_since_tick as f64,
@@ -723,8 +752,12 @@ impl ArbMonitor {
                         near_miss_under_5bps = arb_telemetry.near_miss_under_5bps,
                         near_miss_under_25bps = arb_telemetry.near_miss_under_25bps,
                         near_miss_under_50bps = arb_telemetry.near_miss_under_50bps,
+                        gross_positive_but_net_negative = arb_telemetry.gross_positive_but_net_negative,
+                        best_gross_profit_bps = stats.best_gross_profit_bps_per_minute,
                         best_net_profit_bps = stats.best_net_profit_bps_per_minute,
+                        best_eligible_gross_profit_bps = stats.best_eligible_gross_profit_bps_per_minute,
                         best_eligible_net_profit_bps = stats.best_eligible_net_profit_bps_per_minute,
+                        best_fee_drag_bps = stats.best_fee_drag_bps_per_minute,
                         closest_threshold_gap_bps = ?stats.closest_threshold_gap_bps_per_minute,
                         selection_refreshes_applied = selection_applied_since_tick,
                         selection_refreshes_suppressed = selection_suppressed_since_tick,
@@ -1126,18 +1159,32 @@ impl ArbMonitor {
                 let has_depth = binary_book
                     .entry_cost_with_depth(self.min_book_depth)
                     .is_some();
+                let fees_enabled = self
+                    .market_fees_enabled
+                    .get(&update.market_id)
+                    .copied()
+                    .unwrap_or(false);
                 let observed_at = Utc::now();
                 self.track_market_evaluation(&update.market_id, observed_at);
                 arb_telemetry.evaluated_books = arb_telemetry.evaluated_books.saturating_add(1);
 
                 // Calculate arbitrage opportunity
                 if let Some(arb) =
-                    ArbOpportunity::calculate(&binary_book, ArbOpportunity::DEFAULT_FEE)
+                    ArbOpportunity::calculate_with_fees_enabled(&binary_book, fees_enabled)
                 {
+                    let gross_profit_bps = arb.gross_profit.to_f64().unwrap_or(0.0) * 10_000.0;
                     let net_profit_bps = arb.net_profit.to_f64().unwrap_or(0.0) * 10_000.0;
+                    let fee_drag_bps = arb.fee_drag.to_f64().unwrap_or(0.0) * 10_000.0;
+                    arb_telemetry.best_gross_profit_bps =
+                        arb_telemetry.best_gross_profit_bps.max(gross_profit_bps);
                     arb_telemetry.best_net_profit_bps =
                         arb_telemetry.best_net_profit_bps.max(net_profit_bps);
+                    arb_telemetry.best_fee_drag_bps =
+                        arb_telemetry.best_fee_drag_bps.max(fee_drag_bps);
                     if eligible_for_entries && has_depth {
+                        arb_telemetry.best_eligible_gross_profit_bps = arb_telemetry
+                            .best_eligible_gross_profit_bps
+                            .max(gross_profit_bps);
                         arb_telemetry.best_eligible_net_profit_bps = arb_telemetry
                             .best_eligible_net_profit_bps
                             .max(net_profit_bps);
@@ -1182,6 +1229,10 @@ impl ArbMonitor {
                                 observed_at,
                             );
                         }
+                    } else if arb.gross_profit > Decimal::ZERO {
+                        arb_telemetry.gross_positive_but_net_negative = arb_telemetry
+                            .gross_positive_but_net_negative
+                            .saturating_add(1);
                     }
 
                     if arb.is_profitable() {

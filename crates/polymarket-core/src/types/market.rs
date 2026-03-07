@@ -1,6 +1,7 @@
 //! Market-related types for Polymarket data.
 
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,14 @@ pub struct Market {
     pub end_date: Option<DateTime<Utc>>,
     pub resolved: bool,
     pub resolution: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub fees_enabled: bool,
+    #[serde(default)]
+    pub fee_type: Option<String>,
 }
 
 /// A single outcome (e.g., YES or NO) within a market.
@@ -121,11 +130,21 @@ pub struct ArbOpportunity {
     pub total_cost: Decimal,
     pub gross_profit: Decimal,
     pub net_profit: Decimal,
+    #[serde(default)]
+    pub fee_drag: Decimal,
+    #[serde(default)]
+    pub worst_case_payout: Decimal,
+    #[serde(default)]
+    pub yes_fee_shares: Decimal,
+    #[serde(default)]
+    pub no_fee_shares: Decimal,
 }
 
 impl ArbOpportunity {
     /// Default fee percentage (2%).
     pub const DEFAULT_FEE: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
+    /// Current fee-enabled market base rate from Polymarket docs.
+    pub const FEE_ENABLED_BASE_RATE: Decimal = Decimal::from_parts(25, 0, 0, false, 2); // 0.25
 
     /// Calculate arbitrage opportunity from a binary market book.
     ///
@@ -152,12 +171,69 @@ impl ArbOpportunity {
             total_cost,
             gross_profit,
             net_profit,
+            fee_drag: total_cost * fee,
+            worst_case_payout: Decimal::ONE - (total_cost * fee),
+            yes_fee_shares: Decimal::ZERO,
+            no_fee_shares: Decimal::ZERO,
+        })
+    }
+
+    /// Calculate arbitrage profitability using Polymarket's fee-enabled market model.
+    ///
+    /// When fees are enabled, Polymarket currently charges buy-side fees in shares.
+    /// For a YES+NO pair held to resolution, the guaranteed payout is reduced by the
+    /// larger of the two entry-share fees.
+    pub fn calculate_with_fees_enabled(
+        book: &BinaryMarketBook,
+        fees_enabled: bool,
+    ) -> Option<Self> {
+        let (yes_ask, no_ask, total_cost) = book.entry_cost()?;
+        if total_cost <= Decimal::ZERO {
+            return None;
+        }
+
+        let gross_profit = Decimal::ONE - total_cost;
+        let yes_fee_shares = Self::estimate_buy_fee_shares(yes_ask, fees_enabled);
+        let no_fee_shares = Self::estimate_buy_fee_shares(no_ask, fees_enabled);
+        let fee_drag = yes_fee_shares.max(no_fee_shares);
+        let worst_case_payout = (Decimal::ONE - fee_drag).max(Decimal::ZERO);
+        let net_profit = worst_case_payout - total_cost;
+
+        Some(Self {
+            market_id: book.market_id.clone(),
+            timestamp: book.timestamp,
+            yes_ask,
+            no_ask,
+            total_cost,
+            gross_profit,
+            net_profit,
+            fee_drag,
+            worst_case_payout,
+            yes_fee_shares,
+            no_fee_shares,
         })
     }
 
     /// Returns true if this is a profitable arbitrage opportunity.
     pub fn is_profitable(&self) -> bool {
         self.net_profit > Decimal::ZERO
+    }
+
+    fn estimate_buy_fee_shares(price: Decimal, fees_enabled: bool) -> Decimal {
+        if !fees_enabled {
+            return Decimal::ZERO;
+        }
+
+        let bounded_price = price.max(Decimal::ZERO).min(Decimal::ONE);
+        let curve_input = bounded_price * (Decimal::ONE - bounded_price);
+        if curve_input <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        let base_rate = Self::FEE_ENABLED_BASE_RATE.to_f64().unwrap_or(0.25);
+        let curve_value = curve_input.to_f64().unwrap_or(0.0);
+        let fee_shares = base_rate * curve_value.powi(2);
+        Decimal::from_f64_retain(fee_shares).unwrap_or(Decimal::ZERO)
     }
 }
 
@@ -208,6 +284,73 @@ mod tests {
         assert_eq!(arb.gross_profit, Decimal::new(6, 2));
         assert_eq!(arb.net_profit, Decimal::new(412, 4)); // 0.0412
         assert!(arb.is_profitable());
+    }
+
+    #[test]
+    fn test_fee_free_market_uses_zero_fee_drag() {
+        let book = BinaryMarketBook {
+            market_id: "test".to_string(),
+            timestamp: Utc::now(),
+            yes_book: OrderBook {
+                market_id: "test".to_string(),
+                outcome_id: "yes".to_string(),
+                timestamp: Utc::now(),
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: Decimal::new(48, 2),
+                    size: Decimal::new(100, 0),
+                }],
+            },
+            no_book: OrderBook {
+                market_id: "test".to_string(),
+                outcome_id: "no".to_string(),
+                timestamp: Utc::now(),
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: Decimal::new(46, 2),
+                    size: Decimal::new(100, 0),
+                }],
+            },
+        };
+
+        let arb = ArbOpportunity::calculate_with_fees_enabled(&book, false).unwrap();
+        assert_eq!(arb.fee_drag, Decimal::ZERO);
+        assert_eq!(arb.worst_case_payout, Decimal::ONE);
+        assert_eq!(arb.net_profit, Decimal::new(6, 2));
+    }
+
+    #[test]
+    fn test_fee_enabled_market_uses_share_fee_drag() {
+        let book = BinaryMarketBook {
+            market_id: "test".to_string(),
+            timestamp: Utc::now(),
+            yes_book: OrderBook {
+                market_id: "test".to_string(),
+                outcome_id: "yes".to_string(),
+                timestamp: Utc::now(),
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: Decimal::new(55, 2),
+                    size: Decimal::new(100, 0),
+                }],
+            },
+            no_book: OrderBook {
+                market_id: "test".to_string(),
+                outcome_id: "no".to_string(),
+                timestamp: Utc::now(),
+                bids: vec![],
+                asks: vec![PriceLevel {
+                    price: Decimal::new(40, 2),
+                    size: Decimal::new(100, 0),
+                }],
+            },
+        };
+
+        let arb = ArbOpportunity::calculate_with_fees_enabled(&book, true).unwrap();
+        assert!(arb.fee_drag > Decimal::ZERO);
+        assert_eq!(arb.fee_drag, arb.yes_fee_shares.max(arb.no_fee_shares));
+        assert_eq!(arb.worst_case_payout, Decimal::ONE - arb.fee_drag);
+        assert!(arb.net_profit < arb.gross_profit);
     }
 
     #[test]

@@ -85,9 +85,17 @@ pub struct RuntimeStats {
     #[serde(default)]
     pub near_miss_under_50bps_per_minute: f64,
     #[serde(default)]
+    pub gross_positive_but_net_negative_per_minute: f64,
+    #[serde(default)]
+    pub best_gross_profit_bps_per_minute: f64,
+    #[serde(default)]
     pub best_net_profit_bps_per_minute: f64,
     #[serde(default)]
+    pub best_eligible_gross_profit_bps_per_minute: f64,
+    #[serde(default)]
     pub best_eligible_net_profit_bps_per_minute: f64,
+    #[serde(default)]
+    pub best_fee_drag_bps_per_minute: f64,
     #[serde(default)]
     pub closest_threshold_gap_bps_per_minute: Option<f64>,
     #[serde(default)]
