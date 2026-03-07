@@ -838,6 +838,7 @@ impl ArbAutoExecutor {
             quantity,
             ExitStrategy::HoldToResolution,
         );
+        position.apply_arb_fee_model(&arb);
 
         if let Err(e) = self.position_repo.insert(&position).await {
             error!(error = %e, "Failed to persist pending position");

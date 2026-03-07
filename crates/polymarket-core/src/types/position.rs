@@ -1,5 +1,6 @@
 //! Position tracking types for arbitrage positions.
 
+use super::market::ArbOpportunity;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,32 @@ pub enum PositionState {
     ExitFailed,
     /// Position is stalled (no updates for extended period), needs investigation.
     Stalled,
+}
+
+/// Fee model attached to a position at entry time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionFeeModel {
+    /// Legacy flat-fee approximation using `ArbOpportunity::DEFAULT_FEE`.
+    LegacyFlat,
+    /// Share-based fee accounting using per-leg entry fee shares.
+    ShareBased,
+}
+
+impl PositionFeeModel {
+    pub fn from_i16(value: i16) -> Self {
+        match value {
+            1 => Self::ShareBased,
+            _ => Self::LegacyFlat,
+        }
+    }
+
+    pub fn as_i16(self) -> i16 {
+        match self {
+            Self::LegacyFlat => 0,
+            Self::ShareBased => 1,
+        }
+    }
 }
 
 /// Reason for position failure.
@@ -95,6 +122,14 @@ pub struct Position {
     pub last_updated: DateTime<Utc>,
     /// State before entering Stalled (for reliable recovery).
     pub pre_stall_state: Option<PositionState>,
+    /// Entry-time fee model for P&L calculations.
+    pub fee_model: PositionFeeModel,
+    /// Worst-case resolution payout per share after entry-time fees.
+    pub resolution_payout_per_share: Decimal,
+    /// Buy-side fee charged in YES shares at entry.
+    pub yes_entry_fee_shares: Decimal,
+    /// Buy-side fee charged in NO shares at entry.
+    pub no_entry_fee_shares: Decimal,
 }
 
 /// Maximum retry attempts before giving up.
@@ -113,6 +148,8 @@ impl Position {
         exit_strategy: ExitStrategy,
     ) -> Self {
         let now = Utc::now();
+        let legacy_entry_fee_drag =
+            (yes_entry_price + no_entry_price) * ArbOpportunity::DEFAULT_FEE;
         Self {
             id: Uuid::new_v4(),
             market_id,
@@ -131,6 +168,10 @@ impl Position {
             retry_count: 0,
             last_updated: now,
             pre_stall_state: None,
+            fee_model: PositionFeeModel::LegacyFlat,
+            resolution_payout_per_share: (Decimal::ONE - legacy_entry_fee_drag).max(Decimal::ZERO),
+            yes_entry_fee_shares: Decimal::ZERO,
+            no_entry_fee_shares: Decimal::ZERO,
         }
     }
 
@@ -139,23 +180,55 @@ impl Position {
         (self.yes_entry_price + self.no_entry_price) * self.quantity
     }
 
+    /// Apply share-based fee terms from an arbitrage opportunity.
+    pub fn apply_arb_fee_model(&mut self, arb: &ArbOpportunity) {
+        self.fee_model = PositionFeeModel::ShareBased;
+        self.resolution_payout_per_share = arb.worst_case_payout.max(Decimal::ZERO);
+        self.yes_entry_fee_shares = arb.yes_fee_shares.max(Decimal::ZERO);
+        self.no_entry_fee_shares = arb.no_fee_shares.max(Decimal::ZERO);
+    }
+
+    fn net_yes_shares(&self) -> Decimal {
+        self.quantity * (Decimal::ONE - self.yes_entry_fee_shares).max(Decimal::ZERO)
+    }
+
+    fn net_no_shares(&self) -> Decimal {
+        self.quantity * (Decimal::ONE - self.no_entry_fee_shares).max(Decimal::ZERO)
+    }
+
     /// Update unrealized P&L based on current market prices.
-    /// `fee` is the fee **rate** (e.g. 0.02 = 2%), applied to notional value of each leg.
+    /// `fee` is only used for legacy flat-fee positions.
     pub fn update_pnl(&mut self, yes_bid: Decimal, no_bid: Decimal, fee: Decimal) {
         let entry_cost = self.entry_cost();
         match self.exit_strategy {
             ExitStrategy::ExitOnCorrection => {
-                let exit_value = (yes_bid + no_bid) * self.quantity;
-                // Fee = rate * notional on entry + rate * notional on exit
-                let entry_fees = fee * entry_cost;
-                let exit_fees = fee * exit_value;
-                self.unrealized_pnl = exit_value - entry_cost - entry_fees - exit_fees;
+                self.unrealized_pnl = match self.fee_model {
+                    PositionFeeModel::LegacyFlat => {
+                        let exit_value = (yes_bid + no_bid) * self.quantity;
+                        let entry_fees = fee * entry_cost;
+                        let exit_fees = fee * exit_value;
+                        exit_value - entry_cost - entry_fees - exit_fees
+                    }
+                    // Share-based fees are taken at entry; live exit value reflects the
+                    // smaller YES/NO share balances that remain after those fees.
+                    PositionFeeModel::ShareBased => {
+                        let exit_value =
+                            (yes_bid * self.net_yes_shares()) + (no_bid * self.net_no_shares());
+                        exit_value - entry_cost
+                    }
+                };
             }
             ExitStrategy::HoldToResolution => {
-                let guaranteed_return = Decimal::ONE * self.quantity;
-                // Fee = rate * notional on entry only (resolution has no trading fee)
-                let entry_fees = fee * entry_cost;
-                self.unrealized_pnl = guaranteed_return - entry_cost - entry_fees;
+                self.unrealized_pnl = match self.fee_model {
+                    PositionFeeModel::LegacyFlat => {
+                        let guaranteed_return = Decimal::ONE * self.quantity;
+                        let entry_fees = fee * entry_cost;
+                        guaranteed_return - entry_cost - entry_fees
+                    }
+                    PositionFeeModel::ShareBased => {
+                        (self.resolution_payout_per_share * self.quantity) - entry_cost
+                    }
+                };
             }
         }
     }
@@ -203,9 +276,7 @@ impl Position {
     }
 
     /// Close the position via market exit (selling both sides).
-    /// `fee` is the fee **rate** (e.g. 0.02 = 2%), applied to notional value.
-    ///
-    /// Returns an error if the position is already closed or in a terminal state.
+    /// `fee` is only used for legacy flat-fee positions.
     pub fn close_via_exit(
         &mut self,
         yes_exit_price: Decimal,
@@ -226,18 +297,24 @@ impl Position {
 
         let exit_value = (yes_exit_price + no_exit_price) * self.quantity;
         let entry_cost = self.entry_cost();
-        // Fee = rate * notional on entry + rate * notional on exit
-        let entry_fees = fee * entry_cost;
-        let exit_fees = fee * exit_value;
-        self.realized_pnl = Some(exit_value - entry_cost - entry_fees - exit_fees);
+        self.realized_pnl = Some(match self.fee_model {
+            PositionFeeModel::LegacyFlat => {
+                let entry_fees = fee * entry_cost;
+                let exit_fees = fee * exit_value;
+                exit_value - entry_cost - entry_fees - exit_fees
+            }
+            PositionFeeModel::ShareBased => {
+                let net_exit_value = (yes_exit_price * self.net_yes_shares())
+                    + (no_exit_price * self.net_no_shares());
+                net_exit_value - entry_cost
+            }
+        });
         self.unrealized_pnl = Decimal::ZERO;
         Ok(())
     }
 
     /// Close the position via market resolution (guaranteed $1.00 per share).
-    /// `fee` is the fee **rate** (e.g. 0.02 = 2%), applied to notional value.
-    ///
-    /// Returns an error if the position is already closed or in a terminal state.
+    /// `fee` is only used for legacy flat-fee positions.
     pub fn close_via_resolution(&mut self, fee: Decimal) -> std::result::Result<(), String> {
         if self.state == PositionState::Closed {
             return Err("Position is already closed".to_string());
@@ -249,11 +326,17 @@ impl Position {
         self.exit_timestamp = Some(Utc::now());
         self.state = PositionState::Closed;
 
-        let guaranteed_return = Decimal::ONE * self.quantity;
         let entry_cost = self.entry_cost();
-        // Fee = rate * notional on entry only (resolution has no trading fee)
-        let entry_fees = fee * entry_cost;
-        self.realized_pnl = Some(guaranteed_return - entry_cost - entry_fees);
+        self.realized_pnl = Some(match self.fee_model {
+            PositionFeeModel::LegacyFlat => {
+                let guaranteed_return = Decimal::ONE * self.quantity;
+                let entry_fees = fee * entry_cost;
+                guaranteed_return - entry_cost - entry_fees
+            }
+            PositionFeeModel::ShareBased => {
+                (self.resolution_payout_per_share * self.quantity) - entry_cost
+            }
+        });
         self.unrealized_pnl = Decimal::ZERO;
         Ok(())
     }
@@ -566,6 +649,85 @@ mod tests {
 
         // Double-close via resolution should fail
         assert!(pos.close_via_resolution(fee).is_err());
+    }
+
+    #[test]
+    fn test_share_fee_model_resolution_pnl_uses_stored_payout() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::HoldToResolution,
+        );
+        let arb = ArbOpportunity {
+            market_id: "market123".to_string(),
+            timestamp: Utc::now(),
+            yes_ask: Decimal::new(48, 2),
+            no_ask: Decimal::new(46, 2),
+            total_cost: Decimal::new(94, 2),
+            gross_profit: Decimal::new(6, 2),
+            net_profit: Decimal::new(4, 2),
+            fee_drag: Decimal::new(2, 2),
+            worst_case_payout: Decimal::new(98, 2),
+            yes_fee_shares: Decimal::new(1, 2),
+            no_fee_shares: Decimal::new(2, 2),
+        };
+        pos.apply_arb_fee_model(&arb);
+        pos.mark_open().unwrap();
+
+        pos.update_pnl(
+            Decimal::new(10, 2),
+            Decimal::new(10, 2),
+            Decimal::new(99, 2),
+        );
+        assert_eq!(pos.fee_model, PositionFeeModel::ShareBased);
+        assert_eq!(pos.unrealized_pnl, Decimal::new(400, 2));
+
+        pos.close_via_resolution(Decimal::new(99, 2)).unwrap();
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(400, 2)));
+    }
+
+    #[test]
+    fn test_share_fee_model_exit_on_correction_uses_net_shares() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+        let arb = ArbOpportunity {
+            market_id: "market123".to_string(),
+            timestamp: Utc::now(),
+            yes_ask: Decimal::new(48, 2),
+            no_ask: Decimal::new(46, 2),
+            total_cost: Decimal::new(94, 2),
+            gross_profit: Decimal::new(6, 2),
+            net_profit: Decimal::new(4, 2),
+            fee_drag: Decimal::new(2, 2),
+            worst_case_payout: Decimal::new(98, 2),
+            yes_fee_shares: Decimal::new(1, 2),
+            no_fee_shares: Decimal::new(2, 2),
+        };
+        pos.apply_arb_fee_model(&arb);
+        pos.mark_open().unwrap();
+        pos.mark_exit_ready().unwrap();
+
+        pos.update_pnl(
+            Decimal::new(50, 2),
+            Decimal::new(50, 2),
+            Decimal::new(99, 2),
+        );
+        assert_eq!(pos.unrealized_pnl, Decimal::new(450, 2));
+
+        pos.close_via_exit(
+            Decimal::new(50, 2),
+            Decimal::new(50, 2),
+            Decimal::new(99, 2),
+        )
+        .unwrap();
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(450, 2)));
     }
 
     #[test]

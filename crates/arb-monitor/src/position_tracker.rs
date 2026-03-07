@@ -72,6 +72,8 @@ impl PositionTracker {
             quantity,
             exit_strategy,
         );
+        let mut position = position;
+        position.apply_arb_fee_model(arb);
 
         self.repo.insert(&position).await?;
 

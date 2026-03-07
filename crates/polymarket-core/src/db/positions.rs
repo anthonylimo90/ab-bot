@@ -1,6 +1,9 @@
 //! Database operations for positions.
 
-use crate::types::{ExitStrategy, FailureReason, Position, PositionState, PositionStats};
+use crate::types::{
+    ArbOpportunity, ExitStrategy, FailureReason, Position, PositionFeeModel, PositionState,
+    PositionStats,
+};
 use crate::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -29,9 +32,13 @@ impl PositionRepository {
             INSERT INTO positions (
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16
+            )
             "#,
         )
         .bind(position.id)
@@ -46,6 +53,10 @@ impl PositionRepository {
         .bind(failure_reason_json)
         .bind(position.retry_count as i32)
         .bind(position.last_updated)
+        .bind(position.fee_model.as_i16())
+        .bind(position.resolution_payout_per_share)
+        .bind(position.yes_entry_fee_shares)
+        .bind(position.no_entry_fee_shares)
         .execute(&self.pool)
         .await?;
 
@@ -70,7 +81,11 @@ impl PositionRepository {
                 no_exit_price = $7,
                 failure_reason = $8,
                 retry_count = $9,
-                last_updated = $10
+                last_updated = $10,
+                fee_model = $11,
+                resolution_payout_per_share = $12,
+                yes_entry_fee_shares = $13,
+                no_entry_fee_shares = $14
             WHERE id = $1
             "#,
         )
@@ -84,6 +99,10 @@ impl PositionRepository {
         .bind(failure_reason_json)
         .bind(position.retry_count as i32)
         .bind(position.last_updated)
+        .bind(position.fee_model.as_i16())
+        .bind(position.resolution_payout_per_share)
+        .bind(position.yes_entry_fee_shares)
+        .bind(position.no_entry_fee_shares)
         .execute(&self.pool)
         .await?;
 
@@ -98,7 +117,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE id = $1
             "#,
@@ -120,11 +140,17 @@ impl PositionRepository {
             .get::<Option<chrono::DateTime<Utc>>, _>("last_updated")
             .unwrap_or_else(|| r.get("entry_timestamp"));
 
+        let yes_entry_price: Decimal = r.get("yes_entry_price");
+        let no_entry_price: Decimal = r.get("no_entry_price");
+        let legacy_resolution_payout = (Decimal::ONE
+            - ((yes_entry_price + no_entry_price) * ArbOpportunity::DEFAULT_FEE))
+            .max(Decimal::ZERO);
+
         Position {
             id: r.get("id"),
             market_id: r.get("market_id"),
-            yes_entry_price: r.get("yes_entry_price"),
-            no_entry_price: r.get("no_entry_price"),
+            yes_entry_price,
+            no_entry_price,
             quantity: r.get("quantity"),
             entry_timestamp: r.get("entry_timestamp"),
             exit_strategy: match r.get::<i16, _>("exit_strategy") {
@@ -151,6 +177,18 @@ impl PositionRepository {
             retry_count: r.get::<Option<i32>, _>("retry_count").unwrap_or(0) as u32,
             last_updated,
             pre_stall_state: None, // Runtime-only; not persisted to DB
+            fee_model: PositionFeeModel::from_i16(
+                r.get::<Option<i16>, _>("fee_model").unwrap_or(0),
+            ),
+            resolution_payout_per_share: r
+                .get::<Option<Decimal>, _>("resolution_payout_per_share")
+                .unwrap_or(legacy_resolution_payout),
+            yes_entry_fee_shares: r
+                .get::<Option<Decimal>, _>("yes_entry_fee_shares")
+                .unwrap_or(Decimal::ZERO),
+            no_entry_fee_shares: r
+                .get::<Option<Decimal>, _>("no_entry_fee_shares")
+                .unwrap_or(Decimal::ZERO),
         }
     }
 
@@ -163,7 +201,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE state NOT IN (4, 5)
             ORDER BY entry_timestamp DESC
@@ -183,7 +222,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE state IN (6, 7)
             ORDER BY last_updated ASC
@@ -203,7 +243,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE state = 2
             ORDER BY last_updated ASC
@@ -223,7 +264,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE exit_strategy = 0 AND state IN (1, 2)
             ORDER BY entry_timestamp ASC
@@ -243,7 +285,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE state = 6 AND retry_count < 3
             ORDER BY last_updated ASC
@@ -265,7 +308,8 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
-                failure_reason, retry_count, last_updated
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
             WHERE state = 5
               AND retry_count < 3
