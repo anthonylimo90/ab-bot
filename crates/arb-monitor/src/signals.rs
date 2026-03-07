@@ -47,6 +47,16 @@ pub struct RuntimeStats {
     pub updates_per_minute: f64,
     pub stalls_last_minute: f64,
     pub resets_last_minute: f64,
+    #[serde(default)]
+    pub ws_text_messages_per_minute: f64,
+    #[serde(default)]
+    pub ws_orderbook_updates_per_minute: f64,
+    #[serde(default)]
+    pub ws_parse_misses_per_minute: f64,
+    #[serde(default)]
+    pub ws_snapshot_messages_per_minute: f64,
+    #[serde(default)]
+    pub ws_price_change_messages_per_minute: f64,
     pub monitored_markets: f64,
     #[serde(default)]
     pub monitored_assets: f64,
@@ -74,6 +84,16 @@ pub struct RuntimeStats {
     pub last_rerank_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_resubscribe_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ws_last_message_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ws_last_orderbook_update_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ws_last_parse_miss_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ws_last_parse_miss_kind: Option<String>,
+    #[serde(default)]
+    pub ws_last_message_kind: Option<String>,
     #[serde(default)]
     pub selected_markets: Vec<RuntimeMarketInsight>,
 }

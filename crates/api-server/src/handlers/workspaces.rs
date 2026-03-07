@@ -1806,6 +1806,16 @@ struct ArbRuntimeStatsSnapshot {
     #[serde(default)]
     monitored_assets: f64,
     #[serde(default)]
+    ws_text_messages_per_minute: f64,
+    #[serde(default)]
+    ws_orderbook_updates_per_minute: f64,
+    #[serde(default)]
+    ws_parse_misses_per_minute: f64,
+    #[serde(default)]
+    ws_snapshot_messages_per_minute: f64,
+    #[serde(default)]
+    ws_price_change_messages_per_minute: f64,
+    #[serde(default)]
     evaluated_books_per_minute: f64,
     #[serde(default)]
     profitable_books_per_minute: f64,
@@ -1829,6 +1839,16 @@ struct ArbRuntimeStatsSnapshot {
     last_rerank_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_resubscribe_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    ws_last_message_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    ws_last_orderbook_update_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    ws_last_parse_miss_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    ws_last_parse_miss_kind: Option<String>,
+    #[serde(default)]
+    ws_last_message_kind: Option<String>,
     #[serde(default)]
     selected_markets: Vec<ScannerMarketInsightSnapshot>,
 }
@@ -1876,6 +1896,11 @@ pub struct ScannerMarketInsightResponse {
 pub struct ScannerStatusResponse {
     pub monitored_markets: i64,
     pub monitored_assets: i64,
+    pub ws_text_messages_per_minute: i64,
+    pub ws_orderbook_updates_per_minute: i64,
+    pub ws_parse_misses_per_minute: i64,
+    pub ws_snapshot_messages_per_minute: i64,
+    pub ws_price_change_messages_per_minute: i64,
     pub evaluated_books_per_minute: i64,
     pub profitable_books_per_minute: i64,
     pub eligible_profitable_books_per_minute: i64,
@@ -1888,6 +1913,11 @@ pub struct ScannerStatusResponse {
     pub exploration_markets: i64,
     pub last_rerank_at: Option<DateTime<Utc>>,
     pub last_resubscribe_at: Option<DateTime<Utc>>,
+    pub ws_last_message_at: Option<DateTime<Utc>>,
+    pub ws_last_orderbook_update_at: Option<DateTime<Utc>>,
+    pub ws_last_parse_miss_at: Option<DateTime<Utc>>,
+    pub ws_last_parse_miss_kind: Option<String>,
+    pub ws_last_message_kind: Option<String>,
     pub selected_markets: Vec<ScannerMarketInsightResponse>,
 }
 
@@ -1973,6 +2003,8 @@ pub struct UpdateOpportunitySelectionRequest {
     pub aggressiveness: Option<String>,
     /// Number of exploration slots reserved in market selection.
     pub exploration_slots: Option<i64>,
+    /// Maximum number of markets the scanner may actively monitor.
+    pub max_markets_cap: Option<i64>,
 }
 
 /// Request to update arb executor dynamic config thresholds.
@@ -2356,6 +2388,15 @@ pub async fn get_dynamic_tuner_status(
     let scanner_status = ScannerStatusResponse {
         monitored_markets: runtime_stats.monitored_markets.round() as i64,
         monitored_assets: runtime_stats.monitored_assets.round() as i64,
+        ws_text_messages_per_minute: runtime_stats.ws_text_messages_per_minute.round() as i64,
+        ws_orderbook_updates_per_minute: runtime_stats.ws_orderbook_updates_per_minute.round()
+            as i64,
+        ws_parse_misses_per_minute: runtime_stats.ws_parse_misses_per_minute.round() as i64,
+        ws_snapshot_messages_per_minute: runtime_stats.ws_snapshot_messages_per_minute.round()
+            as i64,
+        ws_price_change_messages_per_minute: runtime_stats
+            .ws_price_change_messages_per_minute
+            .round() as i64,
         evaluated_books_per_minute: runtime_stats.evaluated_books_per_minute.round() as i64,
         profitable_books_per_minute: runtime_stats.profitable_books_per_minute.round() as i64,
         eligible_profitable_books_per_minute: runtime_stats
@@ -2372,6 +2413,11 @@ pub async fn get_dynamic_tuner_status(
         exploration_markets: runtime_stats.exploration_markets.round() as i64,
         last_rerank_at: runtime_stats.last_rerank_at,
         last_resubscribe_at: runtime_stats.last_resubscribe_at,
+        ws_last_message_at: runtime_stats.ws_last_message_at,
+        ws_last_orderbook_update_at: runtime_stats.ws_last_orderbook_update_at,
+        ws_last_parse_miss_at: runtime_stats.ws_last_parse_miss_at,
+        ws_last_parse_miss_kind: runtime_stats.ws_last_parse_miss_kind,
+        ws_last_message_kind: runtime_stats.ws_last_message_kind,
         selected_markets: runtime_stats
             .selected_markets
             .into_iter()
@@ -2507,7 +2553,10 @@ pub async fn update_opportunity_selection_settings(
         ));
     }
 
-    if req.aggressiveness.is_none() && req.exploration_slots.is_none() {
+    if req.aggressiveness.is_none()
+        && req.exploration_slots.is_none()
+        && req.max_markets_cap.is_none()
+    {
         return Err(ApiError::BadRequest(
             "Provide at least one field to update".into(),
         ));
@@ -2538,6 +2587,22 @@ pub async fn update_opportunity_selection_settings(
             format!(
                 "manual workspace update: exploration_slots={}",
                 exploration_slots
+            ),
+        ));
+    }
+
+    if let Some(max_markets_cap) = req.max_markets_cap {
+        if !(25..=1500).contains(&max_markets_cap) {
+            return Err(ApiError::BadRequest(
+                "max_markets_cap must be between 25 and 1500".into(),
+            ));
+        }
+        updates.push((
+            KEY_ARB_MONITOR_MAX_MARKETS.to_string(),
+            Decimal::new(max_markets_cap, 0),
+            format!(
+                "manual workspace update: max_markets_cap={}",
+                max_markets_cap
             ),
         ));
     }

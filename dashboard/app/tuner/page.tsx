@@ -40,6 +40,7 @@ export default function TunerPage() {
   // Opportunity selection local state
   const [aggLevel, setAggLevel] = useState<Aggressiveness | null>(null);
   const [explSlots, setExplSlots] = useState<string>("");
+  const [maxMarketsCap, setMaxMarketsCap] = useState<string>("");
 
   // Arb executor local state
   const [posSize, setPosSize] = useState<string>("");
@@ -51,15 +52,25 @@ export default function TunerPage() {
     aggLevel ?? (tuner?.opportunity_selection?.aggressiveness as Aggressiveness | undefined) ?? "balanced";
   const effectiveSlots =
     explSlots || String(tuner?.opportunity_selection?.exploration_slots ?? "");
+  const effectiveMaxMarketsCap =
+    maxMarketsCap || String(tuner?.opportunity_selection?.max_markets_cap ?? "");
+  const formatOptionalTimeAgo = (value: string | null | undefined) =>
+    value ? formatTimeAgo(value) : "Never";
 
   const handleSaveOpp = () => {
-    const params: { aggressiveness?: Aggressiveness; exploration_slots?: number } = {};
+    const params: {
+      aggressiveness?: Aggressiveness;
+      exploration_slots?: number;
+      max_markets_cap?: number;
+    } = {};
     if (aggLevel) params.aggressiveness = aggLevel;
     if (explSlots) params.exploration_slots = Number(explSlots);
+    if (maxMarketsCap) params.max_markets_cap = Number(maxMarketsCap);
     oppMutation.mutate(params, {
       onSuccess: () => {
         setAggLevel(null);
         setExplSlots("");
+        setMaxMarketsCap("");
       },
     });
   };
@@ -257,11 +268,26 @@ export default function TunerPage() {
                       min={0}
                     />
                   </div>
+                  <div className="space-y-2">
+                    <p className="text-xs text-muted-foreground">
+                      <span className="inline-flex items-center gap-1">
+                        Max Monitored Markets
+                        <InfoTooltip content="This is the persistent market-cap limit used by the scanner when it ranks and rotates the arb universe." />
+                      </span>
+                    </p>
+                    <Input
+                      type="number"
+                      value={effectiveMaxMarketsCap}
+                      onChange={(e) => setMaxMarketsCap(e.target.value)}
+                      className="w-28"
+                      min={25}
+                    />
+                  </div>
                   <Button
                     size="sm"
                     onClick={handleSaveOpp}
                     disabled={
-                      oppMutation.isPending || (!aggLevel && !explSlots)
+                      oppMutation.isPending || (!aggLevel && !explSlots && !maxMarketsCap)
                     }
                   >
                     {oppMutation.isPending ? "Saving..." : "Save"}
@@ -481,6 +507,119 @@ export default function TunerPage() {
                     <p className="text-xs text-muted-foreground">Last Decision Detail</p>
                     <p className="text-sm">
                       {tuner.arb_executor_status.last_decision ?? "-"}
+                    </p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <span>Scanner Runtime</span>
+                  <InfoTooltip content="These counters show whether the websocket is receiving market frames, whether they are being parsed into orderbook updates, and how much of that flow reaches arb evaluation." />
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Markets</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.monitored_markets}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Assets</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.monitored_assets}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">WS Text / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.ws_text_messages_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">WS Book Updates / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.ws_orderbook_updates_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">WS Parse Misses / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.ws_parse_misses_per_minute}
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-5 gap-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">WS Snapshots / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.ws_snapshot_messages_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">WS Price Changes / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.ws_price_change_messages_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Evaluated Books / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.evaluated_books_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Profitable Books / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.profitable_books_per_minute}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Entry Signals / Min</p>
+                    <p className="text-lg font-bold tabular-nums">
+                      {tuner.scanner_status.entry_signals_per_minute}
+                    </p>
+                  </div>
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Last WS Message</p>
+                    <p className="text-sm font-medium">
+                      {formatOptionalTimeAgo(tuner.scanner_status.ws_last_message_at)}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {tuner.scanner_status.ws_last_message_kind ?? "-"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Last WS Book Update</p>
+                    <p className="text-sm font-medium">
+                      {formatOptionalTimeAgo(
+                        tuner.scanner_status.ws_last_orderbook_update_at,
+                      )}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Last Parse Miss</p>
+                    <p className="text-sm font-medium">
+                      {formatOptionalTimeAgo(
+                        tuner.scanner_status.ws_last_parse_miss_at,
+                      )}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      {tuner.scanner_status.ws_last_parse_miss_kind ?? "-"}
+                    </p>
+                  </div>
+                  <div className="rounded-lg border p-3">
+                    <p className="text-xs text-muted-foreground mb-1">Last Resubscribe</p>
+                    <p className="text-sm font-medium">
+                      {formatOptionalTimeAgo(
+                        tuner.scanner_status.last_resubscribe_at,
+                      )}
                     </p>
                   </div>
                 </div>

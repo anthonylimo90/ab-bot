@@ -543,6 +543,7 @@ export interface UpdateWorkspaceRequest {
 export interface UpdateOpportunitySelectionRequest {
   aggressiveness?: "stable" | "balanced" | "discovery";
   exploration_slots?: number;
+  max_markets_cap?: number;
 }
 
 export interface CreateInviteRequest {
@@ -699,6 +700,11 @@ export interface ScannerMarketInsight {
 export interface ScannerStatus {
   monitored_markets: number;
   monitored_assets: number;
+  ws_text_messages_per_minute: number;
+  ws_orderbook_updates_per_minute: number;
+  ws_parse_misses_per_minute: number;
+  ws_snapshot_messages_per_minute: number;
+  ws_price_change_messages_per_minute: number;
   evaluated_books_per_minute: number;
   profitable_books_per_minute: number;
   eligible_profitable_books_per_minute: number;
@@ -711,6 +717,11 @@ export interface ScannerStatus {
   exploration_markets: number;
   last_rerank_at: string | null;
   last_resubscribe_at: string | null;
+  ws_last_message_at: string | null;
+  ws_last_orderbook_update_at: string | null;
+  ws_last_parse_miss_at: string | null;
+  ws_last_parse_miss_kind: string | null;
+  ws_last_message_kind: string | null;
   selected_markets: ScannerMarketInsight[];
 }
 

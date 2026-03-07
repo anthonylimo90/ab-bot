@@ -13,12 +13,95 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration as StdDuration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, Default)]
+pub struct WebSocketRuntimeStatsSnapshot {
+    pub subscribed_assets: usize,
+    pub subscriptions_started_total: u64,
+    pub text_messages_received_total: u64,
+    pub orderbook_updates_emitted_total: u64,
+    pub parse_misses_total: u64,
+    pub snapshot_messages_total: u64,
+    pub price_change_messages_total: u64,
+    pub invalid_operation_messages_total: u64,
+    pub ping_messages_received_total: u64,
+    pub pong_messages_received_total: u64,
+    pub last_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_orderbook_update_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_parse_miss_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_parse_miss_kind: Option<String>,
+    pub last_message_kind: Option<String>,
+}
+
+static WS_RUNTIME_STATS: LazyLock<Mutex<WebSocketRuntimeStatsSnapshot>> =
+    LazyLock::new(|| Mutex::new(WebSocketRuntimeStatsSnapshot::default()));
+
+pub fn websocket_runtime_stats_snapshot() -> WebSocketRuntimeStatsSnapshot {
+    WS_RUNTIME_STATS
+        .lock()
+        .map(|stats| stats.clone())
+        .unwrap_or_default()
+}
+
+fn update_ws_runtime_stats(apply: impl FnOnce(&mut WebSocketRuntimeStatsSnapshot)) {
+    if let Ok(mut stats) = WS_RUNTIME_STATS.lock() {
+        apply(&mut stats);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WsParseKind {
+    ControlPing,
+    ControlPong,
+    InvalidOperation,
+    InvalidJson,
+    Snapshot,
+    PriceChange,
+    EmptyPriceChange,
+    UnsupportedArray,
+    UnsupportedObject,
+    UnsupportedValue,
+}
+
+impl WsParseKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ControlPing => "control_ping",
+            Self::ControlPong => "control_pong",
+            Self::InvalidOperation => "invalid_operation",
+            Self::InvalidJson => "invalid_json",
+            Self::Snapshot => "snapshot",
+            Self::PriceChange => "price_change",
+            Self::EmptyPriceChange => "empty_price_change",
+            Self::UnsupportedArray => "unsupported_array",
+            Self::UnsupportedObject => "unsupported_object",
+            Self::UnsupportedValue => "unsupported_value",
+        }
+    }
+
+    fn is_parse_miss(self) -> bool {
+        matches!(
+            self,
+            Self::InvalidOperation
+                | Self::InvalidJson
+                | Self::EmptyPriceChange
+                | Self::UnsupportedArray
+                | Self::UnsupportedObject
+                | Self::UnsupportedValue
+        )
+    }
+}
+
+struct ParsedWsMessage {
+    updates: Vec<OrderBookUpdate>,
+    kind: WsParseKind,
+}
 
 /// Polymarket CLOB API client for order book data.
 pub struct ClobClient {
@@ -458,6 +541,11 @@ impl ClobClient {
             "custom_feature_enabled": false
         });
         write.send(Message::Text(subscribe_msg.to_string())).await?;
+        update_ws_runtime_stats(|stats| {
+            stats.subscribed_assets = asset_ids.len();
+            stats.subscriptions_started_total = stats.subscriptions_started_total.saturating_add(1);
+            stats.last_message_kind = Some("subscription_started".to_string());
+        });
         info!("Subscribed to {} assets via WebSocket", asset_ids.len());
 
         // Use a persistent deadline that only resets when data is actually received.
@@ -501,8 +589,53 @@ impl ClobClient {
 
                     match msg {
                         Ok(Message::Text(text)) => {
-                            let updates = parse_ws_updates(&text, &mut order_books_by_asset);
-                            for update in updates {
+                            let parsed = parse_ws_message(&text, &mut order_books_by_asset);
+                            let now = chrono::Utc::now();
+                            update_ws_runtime_stats(|stats| {
+                                stats.text_messages_received_total =
+                                    stats.text_messages_received_total.saturating_add(1);
+                                stats.last_message_at = Some(now);
+                                stats.last_message_kind =
+                                    Some(parsed.kind.as_str().to_string());
+                                match parsed.kind {
+                                    WsParseKind::Snapshot => {
+                                        stats.snapshot_messages_total =
+                                            stats.snapshot_messages_total.saturating_add(1);
+                                    }
+                                    WsParseKind::PriceChange => {
+                                        stats.price_change_messages_total =
+                                            stats.price_change_messages_total.saturating_add(1);
+                                    }
+                                    WsParseKind::InvalidOperation => {
+                                        stats.invalid_operation_messages_total =
+                                            stats.invalid_operation_messages_total.saturating_add(1);
+                                    }
+                                    WsParseKind::ControlPing => {
+                                        stats.ping_messages_received_total =
+                                            stats.ping_messages_received_total.saturating_add(1);
+                                    }
+                                    WsParseKind::ControlPong => {
+                                        stats.pong_messages_received_total =
+                                            stats.pong_messages_received_total.saturating_add(1);
+                                    }
+                                    _ => {}
+                                }
+                                if parsed.kind.is_parse_miss() {
+                                    stats.parse_misses_total =
+                                        stats.parse_misses_total.saturating_add(1);
+                                    stats.last_parse_miss_at = Some(now);
+                                    stats.last_parse_miss_kind =
+                                        Some(parsed.kind.as_str().to_string());
+                                }
+                                if !parsed.updates.is_empty() {
+                                    stats.orderbook_updates_emitted_total = stats
+                                        .orderbook_updates_emitted_total
+                                        .saturating_add(parsed.updates.len() as u64);
+                                    stats.last_orderbook_update_at = Some(now);
+                                }
+                            });
+
+                            for update in parsed.updates {
                                 if tx.send(update).await.is_err() {
                                     warn!("Receiver dropped, closing WebSocket");
                                     return Ok(());
@@ -510,12 +643,30 @@ impl ClobClient {
                             }
                         }
                         Ok(Message::Ping(data)) => {
+                            let now = chrono::Utc::now();
+                            update_ws_runtime_stats(|stats| {
+                                stats.ping_messages_received_total =
+                                    stats.ping_messages_received_total.saturating_add(1);
+                                stats.last_message_at = Some(now);
+                                stats.last_message_kind = Some("ping_frame".to_string());
+                            });
                             write.send(Message::Pong(data)).await?;
                         }
                         Ok(Message::Pong(_)) => {
+                            let now = chrono::Utc::now();
+                            update_ws_runtime_stats(|stats| {
+                                stats.pong_messages_received_total =
+                                    stats.pong_messages_received_total.saturating_add(1);
+                                stats.last_message_at = Some(now);
+                                stats.last_message_kind = Some("pong_frame".to_string());
+                            });
                             debug!("Received websocket pong");
                         }
                         Ok(Message::Close(_)) => {
+                            update_ws_runtime_stats(|stats| {
+                                stats.last_message_at = Some(chrono::Utc::now());
+                                stats.last_message_kind = Some("close_frame".to_string());
+                            });
                             info!("WebSocket closed by server");
                             return Ok(());
                         }
@@ -826,18 +977,25 @@ struct WsPriceChange {
     side: String,
 }
 
-fn parse_ws_updates(
-    text: &str,
-    book_state: &mut HashMap<String, OrderBook>,
-) -> Vec<OrderBookUpdate> {
+fn parse_ws_message(text: &str, book_state: &mut HashMap<String, OrderBook>) -> ParsedWsMessage {
     let trimmed = text.trim();
 
     if trimmed.eq_ignore_ascii_case("PONG") || trimmed.eq_ignore_ascii_case("PING") {
-        return Vec::new();
+        return ParsedWsMessage {
+            updates: Vec::new(),
+            kind: if trimmed.eq_ignore_ascii_case("PING") {
+                WsParseKind::ControlPing
+            } else {
+                WsParseKind::ControlPong
+            },
+        };
     }
     if trimmed.eq_ignore_ascii_case("INVALID OPERATION") {
         warn!("Received INVALID OPERATION from CLOB websocket");
-        return Vec::new();
+        return ParsedWsMessage {
+            updates: Vec::new(),
+            kind: WsParseKind::InvalidOperation,
+        };
     }
 
     let value = match serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -847,31 +1005,57 @@ fn parse_ws_updates(
                 "Failed to parse websocket JSON message: {} - {}",
                 e, trimmed
             );
-            return Vec::new();
+            return ParsedWsMessage {
+                updates: Vec::new(),
+                kind: WsParseKind::InvalidJson,
+            };
         }
     };
 
     match value {
-        serde_json::Value::Array(items) => items
-            .into_iter()
-            .filter_map(parse_ws_book_from_value)
-            .inspect(|update| {
-                book_state.insert(update.asset_id.clone(), update_to_orderbook(update));
-            })
-            .collect(),
+        serde_json::Value::Array(items) => {
+            let updates: Vec<OrderBookUpdate> = items
+                .into_iter()
+                .filter_map(parse_ws_book_from_value)
+                .inspect(|update| {
+                    book_state.insert(update.asset_id.clone(), update_to_orderbook(update));
+                })
+                .collect();
+            let kind = if updates.is_empty() {
+                WsParseKind::UnsupportedArray
+            } else {
+                WsParseKind::Snapshot
+            };
+            ParsedWsMessage { updates, kind }
+        }
         serde_json::Value::Object(_) => {
             if let Some(update) = parse_ws_book_from_value(value.clone()) {
                 book_state.insert(update.asset_id.clone(), update_to_orderbook(&update));
-                return vec![update];
+                return ParsedWsMessage {
+                    updates: vec![update],
+                    kind: WsParseKind::Snapshot,
+                };
             }
 
             if let Ok(event) = serde_json::from_value::<WsPriceChangeEvent>(value) {
-                return apply_price_changes(event, book_state);
+                let updates = apply_price_changes(event, book_state);
+                let kind = if updates.is_empty() {
+                    WsParseKind::EmptyPriceChange
+                } else {
+                    WsParseKind::PriceChange
+                };
+                return ParsedWsMessage { updates, kind };
             }
 
-            Vec::new()
+            ParsedWsMessage {
+                updates: Vec::new(),
+                kind: WsParseKind::UnsupportedObject,
+            }
         }
-        _ => Vec::new(),
+        _ => ParsedWsMessage {
+            updates: Vec::new(),
+            kind: WsParseKind::UnsupportedValue,
+        },
     }
 }
 

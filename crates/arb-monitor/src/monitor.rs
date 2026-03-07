@@ -5,6 +5,7 @@ use crate::signals::{channels, RuntimeMarketInsight, RuntimeStats, SignalPublish
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use polymarket_core::api::clob::websocket_runtime_stats_snapshot;
 use polymarket_core::api::clob::OrderBookUpdate;
 use polymarket_core::api::ClobClient;
 use polymarket_core::config::Config;
@@ -452,6 +453,7 @@ impl ArbMonitor {
         let mut resets_since_tick = 0u64;
         let mut arb_telemetry = ArbTelemetryCounters::default();
         let mut resubscribe_requested = false;
+        let mut ws_runtime_prev = websocket_runtime_stats_snapshot();
 
         const MAX_RESUBSCRIBE_RETRIES: u32 = 10;
         const RESUBSCRIBE_BASE_DELAY_SECS: u64 = 3;
@@ -520,11 +522,32 @@ impl ArbMonitor {
                 }
                 _ = stats_tick.tick() => {
                     let arb_runtime = arb_telemetry.as_runtime_stats();
+                    let ws_runtime = websocket_runtime_stats_snapshot();
                     let monitored_assets = self.active_subscription_asset_count() as f64;
                     let stats = RuntimeStats {
                         updates_per_minute: updates_since_tick as f64,
                         stalls_last_minute: stalls_since_tick as f64,
                         resets_last_minute: resets_since_tick as f64,
+                        ws_text_messages_per_minute: ws_runtime
+                            .text_messages_received_total
+                            .saturating_sub(ws_runtime_prev.text_messages_received_total)
+                            as f64,
+                        ws_orderbook_updates_per_minute: ws_runtime
+                            .orderbook_updates_emitted_total
+                            .saturating_sub(ws_runtime_prev.orderbook_updates_emitted_total)
+                            as f64,
+                        ws_parse_misses_per_minute: ws_runtime
+                            .parse_misses_total
+                            .saturating_sub(ws_runtime_prev.parse_misses_total)
+                            as f64,
+                        ws_snapshot_messages_per_minute: ws_runtime
+                            .snapshot_messages_total
+                            .saturating_sub(ws_runtime_prev.snapshot_messages_total)
+                            as f64,
+                        ws_price_change_messages_per_minute: ws_runtime
+                            .price_change_messages_total
+                            .saturating_sub(ws_runtime_prev.price_change_messages_total)
+                            as f64,
                         monitored_markets: self.eligible_markets.len() as f64,
                         monitored_assets,
                         evaluated_books_per_minute: arb_runtime.evaluated_books_per_minute,
@@ -539,6 +562,11 @@ impl ArbMonitor {
                         exploration_markets: self.exploration_market_count as f64,
                         last_rerank_at: self.last_rerank_at,
                         last_resubscribe_at: self.last_resubscribe_at,
+                        ws_last_message_at: ws_runtime.last_message_at,
+                        ws_last_orderbook_update_at: ws_runtime.last_orderbook_update_at,
+                        ws_last_parse_miss_at: ws_runtime.last_parse_miss_at,
+                        ws_last_parse_miss_kind: ws_runtime.last_parse_miss_kind.clone(),
+                        ws_last_message_kind: ws_runtime.last_message_kind.clone(),
                         selected_markets: self.selection_snapshot.clone(),
                     };
                     if let Err(e) = self.signal_publisher.publish_runtime_stats(&stats).await {
@@ -558,10 +586,21 @@ impl ArbMonitor {
                         filtered_by_depth = arb_telemetry.filtered_by_depth,
                         filtered_by_cooldown = arb_telemetry.filtered_by_cooldown,
                         entry_signals = arb_telemetry.entry_signals,
+                        ws_text_messages = stats.ws_text_messages_per_minute as u64,
+                        ws_orderbook_updates = stats.ws_orderbook_updates_per_minute as u64,
+                        ws_parse_misses = stats.ws_parse_misses_per_minute as u64,
+                        ws_snapshot_messages = stats.ws_snapshot_messages_per_minute as u64,
+                        ws_price_change_messages = stats.ws_price_change_messages_per_minute as u64,
+                        ws_last_message_at = ?stats.ws_last_message_at,
+                        ws_last_orderbook_update_at = ?stats.ws_last_orderbook_update_at,
+                        ws_last_parse_miss_at = ?stats.ws_last_parse_miss_at,
+                        ws_last_parse_miss_kind = ?stats.ws_last_parse_miss_kind,
+                        ws_last_message_kind = ?stats.ws_last_message_kind,
                         stalls = stalls_since_tick,
                         resets = resets_since_tick,
                         "Arb monitor minute telemetry"
                     );
+                    ws_runtime_prev = ws_runtime;
                     updates_since_tick = 0;
                     stalls_since_tick = 0;
                     resets_since_tick = 0;
