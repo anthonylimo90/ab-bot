@@ -36,7 +36,7 @@ impl PositionTracker {
 
     /// Load active positions from database into cache.
     pub async fn load_active_positions(&mut self) -> Result<()> {
-        let positions = self.repo.get_active().await?;
+        let positions = self.repo.get_active_for_arb_monitor().await?;
         self.active_positions.clear();
 
         for position in positions {
@@ -451,8 +451,8 @@ impl PositionTracker {
         let mut result = ReconciliationResult::default();
 
         // Load all positions (including failed/stalled ones)
-        let all_positions = self.repo.get_active().await?;
-        let needing_recovery = self.repo.get_needing_recovery().await?;
+        let all_positions = self.repo.get_active_for_arb_monitor().await?;
+        let needing_recovery = self.repo.get_needing_recovery_for_arb_monitor().await?;
 
         result.total_positions = all_positions.len();
         result.needing_recovery = needing_recovery.len();

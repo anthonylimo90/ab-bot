@@ -21,6 +21,9 @@ pub struct ExitCandidate {
     pub source: i16,
 }
 
+const SOURCE_COPY_TRADE: i16 = 2;
+const SOURCE_RECOMMENDATION: i16 = 3;
+
 impl PositionRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -230,6 +233,34 @@ impl PositionRepository {
         Ok(rows.iter().map(Self::row_to_position).collect())
     }
 
+    /// Get active positions managed by the arb monitor.
+    ///
+    /// Excludes recommendation and legacy copy-trade rows because their
+    /// lifecycle is owned elsewhere and the arb monitor's stale watchdog
+    /// should not mutate them.
+    pub async fn get_active_for_arb_monitor(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+            FROM positions
+            WHERE state NOT IN (4, 5)
+              AND COALESCE(source, 0) NOT IN ($1, $2)
+            ORDER BY entry_timestamp DESC
+            "#,
+        )
+        .bind(SOURCE_COPY_TRADE)
+        .bind(SOURCE_RECOMMENDATION)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
     /// Get positions that need recovery (ExitFailed or Stalled).
     pub async fn get_needing_recovery(&self) -> Result<Vec<Position>> {
         let rows = sqlx::query(
@@ -245,6 +276,30 @@ impl PositionRepository {
             ORDER BY last_updated ASC
             "#,
         )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
+    /// Get arb-monitor-managed positions that need recovery.
+    pub async fn get_needing_recovery_for_arb_monitor(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+            FROM positions
+            WHERE state IN (6, 7)
+              AND COALESCE(source, 0) NOT IN ($1, $2)
+            ORDER BY last_updated ASC
+            "#,
+        )
+        .bind(SOURCE_COPY_TRADE)
+        .bind(SOURCE_RECOMMENDATION)
         .fetch_all(&self.pool)
         .await?;
 

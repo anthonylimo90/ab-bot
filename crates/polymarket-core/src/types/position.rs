@@ -231,6 +231,7 @@ impl Position {
                 };
             }
         }
+        self.last_updated = Utc::now();
     }
 
     /// Mark position as open (both sides purchased).
@@ -882,6 +883,24 @@ mod tests {
         let recovered = pos.attempt_stalled_recovery();
         assert_eq!(recovered, Some(PositionState::Pending));
         assert_eq!(pos.state, PositionState::Pending);
+    }
+
+    #[test]
+    fn test_update_pnl_refreshes_last_updated() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+        pos.mark_open().unwrap();
+        let old_last_updated = Utc::now() - chrono::Duration::minutes(10);
+        pos.last_updated = old_last_updated;
+
+        pos.update_pnl(Decimal::new(50, 2), Decimal::new(50, 2), Decimal::new(2, 2));
+
+        assert!(pos.last_updated > old_last_updated);
     }
 
     #[test]
