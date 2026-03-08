@@ -106,42 +106,57 @@ async fn compute_cycle(
         // - Counts unique buyers and sellers
         let rows = sqlx::query_as::<_, FlowFeatureRow>(
             r#"
+            WITH latest_bot_scores AS (
+                SELECT DISTINCT ON (address)
+                    address,
+                    total_score
+                FROM bot_scores
+                ORDER BY address, computed_at DESC
+            ),
+            recent_trades AS (
+                SELECT
+                    condition_id,
+                    wallet_address,
+                    side,
+                    value
+                FROM wallet_trades
+                WHERE condition_id IS NOT NULL
+                  AND timestamp >= $4
+                  AND timestamp <= $1
+            )
             SELECT
-                wt.condition_id,
+                rt.condition_id,
                 $1::timestamptz AS window_end,
                 $2::int AS window_minutes,
-                COALESCE(SUM(CASE WHEN wt.side = 'BUY' THEN wt.value ELSE 0 END), 0) AS buy_volume,
-                COALESCE(SUM(CASE WHEN wt.side = 'SELL' THEN wt.value ELSE 0 END), 0) AS sell_volume,
+                COALESCE(SUM(CASE WHEN rt.side = 'BUY' THEN rt.value ELSE 0 END), 0) AS buy_volume,
+                COALESCE(SUM(CASE WHEN rt.side = 'SELL' THEN rt.value ELSE 0 END), 0) AS sell_volume,
                 COALESCE(
-                    SUM(CASE WHEN wt.side = 'BUY' THEN wt.value ELSE -wt.value END),
+                    SUM(CASE WHEN rt.side = 'BUY' THEN rt.value ELSE -rt.value END),
                     0
                 ) AS net_flow,
                 CASE
-                    WHEN COALESCE(SUM(wt.value), 0) = 0 THEN 0
+                    WHEN COALESCE(SUM(rt.value), 0) = 0 THEN 0
                     ELSE COALESCE(
-                        SUM(CASE WHEN wt.side = 'BUY' THEN wt.value ELSE -wt.value END),
+                        SUM(CASE WHEN rt.side = 'BUY' THEN rt.value ELSE -rt.value END),
                         0
-                    )::numeric / SUM(wt.value)
+                    )::numeric / SUM(rt.value)
                 END AS imbalance_ratio,
-                COUNT(DISTINCT CASE WHEN wt.side = 'BUY' THEN wt.wallet_address END)::int AS unique_buyers,
-                COUNT(DISTINCT CASE WHEN wt.side = 'SELL' THEN wt.wallet_address END)::int AS unique_sellers,
+                COUNT(DISTINCT CASE WHEN rt.side = 'BUY' THEN rt.wallet_address END)::int AS unique_buyers,
+                COUNT(DISTINCT CASE WHEN rt.side = 'SELL' THEN rt.wallet_address END)::int AS unique_sellers,
                 COALESCE(
                     SUM(
                         CASE
                             WHEN bs.total_score IS NULL OR bs.total_score < $3
-                            THEN CASE WHEN wt.side = 'BUY' THEN wt.value ELSE -wt.value END
+                            THEN CASE WHEN rt.side = 'BUY' THEN rt.value ELSE -rt.value END
                             ELSE 0
                         END
                     ),
                     0
                 ) AS smart_money_flow,
                 COUNT(*)::int AS trade_count
-            FROM wallet_trades wt
-            LEFT JOIN bot_scores bs ON bs.address = wt.wallet_address
-            WHERE wt.condition_id IS NOT NULL
-              AND wt.timestamp >= $4
-              AND wt.timestamp <= $1
-            GROUP BY wt.condition_id
+            FROM recent_trades rt
+            LEFT JOIN latest_bot_scores bs ON bs.address = rt.wallet_address
+            GROUP BY rt.condition_id
             HAVING COUNT(*) >= 2
             "#,
         )

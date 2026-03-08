@@ -44,11 +44,11 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                is_open
+                is_open, opened_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17
+                $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -72,6 +72,7 @@ impl PositionRepository {
             position.state,
             PositionState::Closed | PositionState::EntryFailed
         ))
+        .bind(position.entry_timestamp)
         .execute(&self.pool)
         .await?;
 

@@ -5,7 +5,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, QueryBuilder};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -193,7 +193,7 @@ pub async fn list_positions(
 ) -> ApiResult<Json<Vec<PositionResponse>>> {
     let status_filter = validate_status_filter(&query.status)?;
 
-    let rows: Vec<PositionRow> = sqlx::query_as(
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         r#"
         SELECT id, market_id,
                COALESCE(outcome, 'both') AS outcome,
@@ -207,25 +207,42 @@ pub async fn list_positions(
                COALESCE(opened_at, entry_timestamp) AS opened_at,
                COALESCE(updated_at, entry_timestamp) AS updated_at
         FROM positions
-        WHERE ($1::text IS NULL OR market_id = $1)
-          AND ($2::text IS NULL OR COALESCE(outcome, 'both') = $2)
-          AND (
-                $3::text = 'all'
-                OR ($3::text = 'open' AND state NOT IN (4, 5))
-                OR ($3::text = 'closed' AND state IN (4, 5))
-              )
-        ORDER BY COALESCE(opened_at, entry_timestamp) DESC
-        LIMIT $4 OFFSET $5
+        WHERE 1 = 1
         "#,
-    )
-    .bind(&query.market_id)
-    .bind(&query.outcome)
-    .bind(status_filter)
-    .bind(query.limit)
-    .bind(query.offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    );
+
+    if let Some(market_id) = &query.market_id {
+        qb.push(" AND market_id = ");
+        qb.push_bind(market_id);
+    }
+
+    if let Some(outcome) = &query.outcome {
+        qb.push(" AND COALESCE(outcome, 'both') = ");
+        qb.push_bind(outcome);
+    }
+
+    match status_filter {
+        "open" => {
+            qb.push(" AND is_open = TRUE");
+        }
+        "closed" => {
+            qb.push(" AND is_open = FALSE");
+        }
+        "all" => {}
+        _ => unreachable!("status_filter already validated"),
+    }
+
+    qb.push(" ORDER BY COALESCE(opened_at, entry_timestamp) DESC");
+    qb.push(" LIMIT ");
+    qb.push_bind(query.limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(query.offset);
+
+    let rows: Vec<PositionRow> = qb
+        .build_query_as()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let positions: Vec<PositionResponse> = rows
         .into_iter()
