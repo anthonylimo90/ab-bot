@@ -3,8 +3,8 @@
 import { useMemo } from "react";
 import Link from "next/link";
 import {
-  useOpenPositions,
   usePositionsQuery,
+  usePositionsSummaryQuery,
 } from "@/hooks/queries/usePositionsQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -66,10 +66,13 @@ const activityLabels: Record<string, string> = {
 
 export function DashboardHome() {
   const { currentWorkspace } = useWorkspaceStore();
-  const { openPositions, totalUnrealizedPnl } = useOpenPositions();
+  const { data: positionsSummary } = usePositionsSummaryQuery();
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
-  const { data: closedPositions = [] } = usePositionsQuery({ status: "closed" });
+  const { data: closedPositions = [] } = usePositionsQuery({
+    status: "closed",
+    limit: 500,
+  });
   const isTradingManuallyPaused =
     Boolean(currentWorkspace) &&
     !currentWorkspace?.live_trading_enabled &&
@@ -99,26 +102,21 @@ export function DashboardHome() {
             "Automated trading is enabled and the safety stop is not currently blocking trading.",
         };
   const stats = useMemo(() => {
-    const totalValue = openPositions.reduce(
-      (sum, p) => sum + p.quantity * p.current_price,
-      0,
-    );
-    const closedCount = closedPositions.length;
-    const winCount = closedPositions.filter(
-      (p) => (p.realized_pnl ?? 0) > 0,
-    ).length;
+    const totalValue = positionsSummary?.portfolio_value ?? 0;
+    const totalUnrealizedPnl = positionsSummary?.unrealized_pnl ?? 0;
     return {
       total_value: totalValue,
       total_pnl_percent: totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
+      total_unrealized_pnl: totalUnrealizedPnl,
       today_pnl: riskStatus?.circuit_breaker?.daily_pnl ?? 0,
       today_pnl_percent:
         totalValue > 0
           ? ((riskStatus?.circuit_breaker?.daily_pnl ?? 0) / totalValue) * 100
           : 0,
-      active_positions: openPositions.length,
-      win_rate: closedCount > 0 ? (winCount / closedCount) * 100 : 0,
+      active_positions: positionsSummary?.open_positions ?? 0,
+      win_rate: positionsSummary?.win_rate ?? 0,
     };
-  }, [openPositions, totalUnrealizedPnl, closedPositions, riskStatus]);
+  }, [positionsSummary, riskStatus]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
   // Derive equity curve from closed positions (accumulated realized P&L)
@@ -229,8 +227,14 @@ export function DashboardHome() {
         />
         <MetricCard
           title="Unrealized P&L"
-          value={formatCurrency(totalUnrealizedPnl, { showSign: true })}
-          trend={totalUnrealizedPnl > 0 ? "up" : totalUnrealizedPnl < 0 ? "down" : "neutral"}
+          value={formatCurrency(stats.total_unrealized_pnl, { showSign: true })}
+          trend={
+            stats.total_unrealized_pnl > 0
+              ? "up"
+              : stats.total_unrealized_pnl < 0
+                ? "down"
+                : "neutral"
+          }
         />
         <MetricCard
           title="Open Positions"

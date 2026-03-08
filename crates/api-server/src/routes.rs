@@ -349,6 +349,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Position endpoints (read-only)
         .route("/api/v1/positions", get(positions::list_positions))
         .route(
+            "/api/v1/positions/summary",
+            get(positions::get_positions_summary),
+        )
+        .route(
             "/api/v1/positions/:position_id",
             get(positions::get_position),
         )

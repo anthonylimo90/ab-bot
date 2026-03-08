@@ -44,10 +44,41 @@ pub struct PositionResponse {
     /// Realized P&L (for closed positions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realized_pnl: Option<Decimal>,
+    /// Full lifecycle state.
+    pub state: String,
     /// Position opened timestamp.
     pub opened_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Summary response for dashboard/overview metrics.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct PositionsSummaryResponse {
+    /// Deduplicated active position count (latest row per market/source).
+    pub open_positions: i64,
+    /// Distinct active markets after deduplication.
+    pub open_markets: i64,
+    /// Active markets with duplicate rows before deduplication.
+    pub duplicate_open_markets: i64,
+    /// Deduplicated portfolio value.
+    pub portfolio_value: Decimal,
+    /// Deduplicated unrealized P&L.
+    pub unrealized_pnl: Decimal,
+    /// Raw active row count before deduplication.
+    pub raw_open_positions: i64,
+    /// Raw portfolio value before deduplication.
+    pub raw_portfolio_value: Decimal,
+    /// Raw unrealized P&L before deduplication.
+    pub raw_unrealized_pnl: Decimal,
+    /// Closed positions used for win-rate calculations.
+    pub closed_positions: i64,
+    /// Count of winning closed positions.
+    pub wins: i64,
+    /// Count of losing/non-winning closed positions.
+    pub losses: i64,
+    /// Win rate based on closed positions only.
+    pub win_rate: Decimal,
 }
 
 /// Request to close a position.
@@ -100,10 +131,49 @@ struct PositionRow {
     stop_loss: Option<Decimal>,
     take_profit: Option<Decimal>,
     realized_pnl: Option<Decimal>,
+    state: i16,
     opened_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    #[allow(dead_code)]
-    is_open: bool,
+}
+
+#[derive(Debug, FromRow)]
+struct PositionSummaryRow {
+    open_positions: i64,
+    open_markets: i64,
+    duplicate_open_markets: i64,
+    portfolio_value: Decimal,
+    unrealized_pnl: Decimal,
+    raw_open_positions: i64,
+    raw_portfolio_value: Decimal,
+    raw_unrealized_pnl: Decimal,
+    closed_positions: i64,
+    wins: i64,
+    losses: i64,
+    win_rate: Decimal,
+}
+
+fn position_state_name(state: i16) -> &'static str {
+    match state {
+        0 => "pending",
+        1 => "open",
+        2 => "exit_ready",
+        3 => "closing",
+        4 => "closed",
+        5 => "entry_failed",
+        6 => "exit_failed",
+        7 => "stalled",
+        _ => "closed",
+    }
+}
+
+fn validate_status_filter(status: &str) -> ApiResult<&str> {
+    match status {
+        "open" | "closed" | "all" => Ok(status),
+        _ => Err(ApiError::BadRequest(format!(
+            "Invalid status '{}'. Expected open, closed, or all",
+            status
+        ))),
+    }
 }
 
 /// List positions.
@@ -121,11 +191,7 @@ pub async fn list_positions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListPositionsQuery>,
 ) -> ApiResult<Json<Vec<PositionResponse>>> {
-    let status_filter = match query.status.as_str() {
-        "open" => Some(true),
-        "closed" => Some(false),
-        _ => None,
-    };
+    let status_filter = validate_status_filter(&query.status)?;
 
     let rows: Vec<PositionRow> = sqlx::query_as(
         r#"
@@ -137,13 +203,17 @@ pub async fn list_positions(
                COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
                unrealized_pnl, stop_loss, take_profit,
                realized_pnl,
+               state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(updated_at, entry_timestamp) AS updated_at,
-               is_open
+               COALESCE(updated_at, entry_timestamp) AS updated_at
         FROM positions
         WHERE ($1::text IS NULL OR market_id = $1)
           AND ($2::text IS NULL OR COALESCE(outcome, 'both') = $2)
-          AND ($3::bool IS NULL OR is_open = $3)
+          AND (
+                $3::text = 'all'
+                OR ($3::text = 'open' AND state NOT IN (4, 5))
+                OR ($3::text = 'closed' AND state IN (4, 5))
+              )
         ORDER BY COALESCE(opened_at, entry_timestamp) DESC
         LIMIT $4 OFFSET $5
         "#,
@@ -181,6 +251,7 @@ pub async fn list_positions(
                 stop_loss: row.stop_loss,
                 take_profit: row.take_profit,
                 realized_pnl: row.realized_pnl,
+                state: position_state_name(row.state).to_string(),
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
             }
@@ -188,6 +259,103 @@ pub async fn list_positions(
         .collect();
 
     Ok(Json(positions))
+}
+
+/// Get aggregate position metrics for dashboards.
+#[utoipa::path(
+    get,
+    path = "/api/v1/positions/summary",
+    tag = "positions",
+    responses(
+        (status = 200, description = "Aggregate position metrics", body = PositionsSummaryResponse),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn get_positions_summary(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<PositionsSummaryResponse>> {
+    let row: PositionSummaryRow = sqlx::query_as(
+        r#"
+        WITH active_positions AS (
+            SELECT
+                id,
+                market_id,
+                COALESCE(source, 0) AS source,
+                quantity,
+                COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+                unrealized_pnl,
+                COALESCE(updated_at, entry_timestamp) AS sort_updated
+            FROM positions
+            WHERE state NOT IN (4, 5)
+        ),
+        ranked_active AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY market_id, source
+                    ORDER BY sort_updated DESC, id DESC
+                ) AS rn
+            FROM active_positions
+        ),
+        effective_active AS (
+            SELECT *
+            FROM ranked_active
+            WHERE rn = 1
+        ),
+        duplicate_active_markets AS (
+            SELECT COUNT(*)::bigint AS duplicate_open_markets
+            FROM (
+                SELECT market_id, source
+                FROM active_positions
+                GROUP BY market_id, source
+                HAVING COUNT(*) > 1
+            ) dup
+        ),
+        closed_stats AS (
+            SELECT
+                COUNT(*) FILTER (WHERE state = 4)::bigint AS closed_positions,
+                COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) > 0)::bigint AS wins,
+                COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) <= 0)::bigint AS losses
+            FROM positions
+        )
+        SELECT
+            COALESCE((SELECT COUNT(*) FROM effective_active), 0)::bigint AS open_positions,
+            COALESCE((SELECT COUNT(DISTINCT market_id) FROM effective_active), 0)::bigint AS open_markets,
+            COALESCE((SELECT duplicate_open_markets FROM duplicate_active_markets), 0)::bigint AS duplicate_open_markets,
+            COALESCE((SELECT SUM(quantity * current_price) FROM effective_active), 0) AS portfolio_value,
+            COALESCE((SELECT SUM(unrealized_pnl) FROM effective_active), 0) AS unrealized_pnl,
+            COALESCE((SELECT COUNT(*) FROM active_positions), 0)::bigint AS raw_open_positions,
+            COALESCE((SELECT SUM(quantity * current_price) FROM active_positions), 0) AS raw_portfolio_value,
+            COALESCE((SELECT SUM(unrealized_pnl) FROM active_positions), 0) AS raw_unrealized_pnl,
+            closed_positions,
+            wins,
+            losses,
+            CASE
+                WHEN closed_positions > 0
+                    THEN (wins::numeric / closed_positions::numeric) * 100
+                ELSE 0
+            END AS win_rate
+        FROM closed_stats
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(PositionsSummaryResponse {
+        open_positions: row.open_positions,
+        open_markets: row.open_markets,
+        duplicate_open_markets: row.duplicate_open_markets,
+        portfolio_value: row.portfolio_value,
+        unrealized_pnl: row.unrealized_pnl,
+        raw_open_positions: row.raw_open_positions,
+        raw_portfolio_value: row.raw_portfolio_value,
+        raw_unrealized_pnl: row.raw_unrealized_pnl,
+        closed_positions: row.closed_positions,
+        wins: row.wins,
+        losses: row.losses,
+        win_rate: row.win_rate,
+    }))
 }
 
 /// Get a specific position.
@@ -217,9 +385,9 @@ pub async fn get_position(
                COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
                unrealized_pnl, stop_loss, take_profit,
                realized_pnl,
+               state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(updated_at, entry_timestamp) AS updated_at,
-               is_open
+               COALESCE(updated_at, entry_timestamp) AS updated_at
         FROM positions
         WHERE id = $1
         "#,
@@ -252,6 +420,7 @@ pub async fn get_position(
                 stop_loss: row.stop_loss,
                 take_profit: row.take_profit,
                 realized_pnl: row.realized_pnl,
+                state: position_state_name(row.state).to_string(),
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
             }))
@@ -294,11 +463,12 @@ pub async fn close_position(
                COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
                unrealized_pnl, stop_loss, take_profit,
                realized_pnl,
+               state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(updated_at, entry_timestamp) AS updated_at,
-               is_open
+               COALESCE(updated_at, entry_timestamp) AS updated_at
         FROM positions
-        WHERE id = $1 AND is_open = true
+        WHERE id = $1
+          AND state NOT IN (4, 5)
         "#,
     )
     .bind(position_id)
@@ -327,16 +497,28 @@ pub async fn close_position(
     // Update the position in the database
     let remaining = row.quantity - close_quantity;
     let is_fully_closed = remaining == Decimal::ZERO;
+    let updated_unrealized_pnl = if is_fully_closed {
+        Decimal::ZERO
+    } else {
+        row.unrealized_pnl * (remaining / row.quantity)
+    };
 
     sqlx::query(
         r#"
         UPDATE positions
-        SET quantity = $1, is_open = $2, updated_at = NOW()
-        WHERE id = $3
+        SET quantity = $1,
+            is_open = $2,
+            state = $3,
+            unrealized_pnl = $4,
+            exit_timestamp = CASE WHEN $2 = false THEN NOW() ELSE exit_timestamp END,
+            updated_at = NOW()
+        WHERE id = $5
         "#,
     )
     .bind(remaining)
     .bind(!is_fully_closed)
+    .bind(if is_fully_closed { 4_i16 } else { row.state })
+    .bind(updated_unrealized_pnl)
     .bind(position_id)
     .execute(&state.pool)
     .await
@@ -353,7 +535,7 @@ pub async fn close_position(
         },
         quantity: remaining,
         current_price: row.current_price,
-        unrealized_pnl: row.unrealized_pnl,
+        unrealized_pnl: updated_unrealized_pnl,
         timestamp: Utc::now(),
     };
     let _ = state.publish_position(update);
@@ -374,11 +556,12 @@ pub async fn close_position(
         quantity: remaining,
         entry_price: row.entry_price,
         current_price: row.current_price,
-        unrealized_pnl: row.unrealized_pnl * (remaining / row.quantity),
+        unrealized_pnl: updated_unrealized_pnl,
         unrealized_pnl_pct: pnl_pct,
         stop_loss: row.stop_loss,
         take_profit: row.take_profit,
         realized_pnl: row.realized_pnl,
+        state: position_state_name(if is_fully_closed { 4 } else { row.state }).to_string(),
         opened_at: row.opened_at,
         updated_at: Utc::now(),
     }))
@@ -403,6 +586,7 @@ mod tests {
             stop_loss: Some(Decimal::new(45, 2)),
             take_profit: None,
             realized_pnl: None,
+            state: "open".to_string(),
             opened_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -423,5 +607,20 @@ mod tests {
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("50"));
+    }
+
+    #[test]
+    fn test_position_state_name() {
+        assert_eq!(position_state_name(1), "open");
+        assert_eq!(position_state_name(4), "closed");
+        assert_eq!(position_state_name(5), "entry_failed");
+    }
+
+    #[test]
+    fn test_validate_status_filter() {
+        assert!(validate_status_filter("open").is_ok());
+        assert!(validate_status_filter("closed").is_ok());
+        assert!(validate_status_filter("all").is_ok());
+        assert!(validate_status_filter("bad").is_err());
     }
 }

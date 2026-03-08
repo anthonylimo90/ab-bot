@@ -36,6 +36,7 @@ import type {
   RiskStatus,
   CircuitBreakerStatus,
   CircuitBreakerConfig,
+  PositionsSummary,
   MarketRegimeResponse,
   FlowFeatureResponse,
   RecentSignalResponse,
@@ -92,6 +93,17 @@ function parsePosition(raw: Position): Position {
     take_profit: raw.take_profit != null ? Number(raw.take_profit) : undefined,
     realized_pnl:
       raw.realized_pnl != null ? Number(raw.realized_pnl) : undefined,
+  };
+}
+
+function parsePositionsSummary(raw: PositionsSummary): PositionsSummary {
+  return {
+    ...raw,
+    portfolio_value: Number(raw.portfolio_value),
+    unrealized_pnl: Number(raw.unrealized_pnl),
+    raw_portfolio_value: Number(raw.raw_portfolio_value),
+    raw_unrealized_pnl: Number(raw.raw_unrealized_pnl),
+    win_rate: Number(raw.win_rate),
   };
 }
 
@@ -343,6 +355,11 @@ class ApiClient {
       `/api/v1/positions/${positionId}`,
     );
     return parsePosition(raw);
+  }
+
+  async getPositionsSummary(): Promise<PositionsSummary> {
+    const raw = await this.request<PositionsSummary>("/api/v1/positions/summary");
+    return parsePositionsSummary(raw);
   }
 
   async closePosition(

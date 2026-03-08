@@ -24,6 +24,7 @@ import { PageIntro } from "@/components/shared/PageIntro";
 import {
   useOpenPositions,
   usePositionsQuery,
+  usePositionsSummaryQuery,
   useClosePositionMutation,
 } from "@/hooks/queries/usePositionsQuery";
 import {
@@ -112,10 +113,11 @@ export default function PositionsPage() {
   // Open positions data
   const { openPositions, totalUnrealizedPnl, isLoading: openLoading } =
     useOpenPositions();
+  const { data: positionsSummary } = usePositionsSummaryQuery();
 
   // Closed positions data (paginated)
   const { data: closedPositions = [], isLoading: closedLoading } =
-    usePositionsQuery({ status: "closed" });
+    usePositionsQuery({ status: "closed", limit: 500 });
 
   const closeMutation = useClosePositionMutation();
   const queryClient = useQueryClient();
@@ -136,7 +138,7 @@ export default function PositionsPage() {
       // For price updates, optimistically update the cache
       if (acc.updates.size > 0) {
         queryClient.setQueryData<Position[]>(
-          queryKeys.positions.list({ status: "open" }),
+          queryKeys.positions.list({ status: "open", limit: 500 }),
           (old) => {
             if (!old) return old;
             return old.map((pos) => {
@@ -176,18 +178,25 @@ export default function PositionsPage() {
   });
 
   // Derived stats
-  const closedCount = closedPositions.length;
-  const winCount = closedPositions.filter(
-    (p) => (p.realized_pnl ?? 0) > 0,
-  ).length;
-  const winRate = closedCount > 0 ? (winCount / closedCount) * 100 : 0;
+  const loadedClosedCount = closedPositions.length;
+  const closedCount = positionsSummary?.closed_positions ?? loadedClosedCount;
+  const winCount =
+    positionsSummary?.wins ??
+    closedPositions.filter((p) => (p.realized_pnl ?? 0) > 0).length;
+  const winRate =
+    positionsSummary?.win_rate ??
+    (closedCount > 0 ? (winCount / closedCount) * 100 : 0);
+  const summaryUnrealizedPnl =
+    positionsSummary?.unrealized_pnl ?? totalUnrealizedPnl;
+  const summaryOpenPositions =
+    positionsSummary?.open_positions ?? openPositions.length;
 
   // Paginated closed positions
   const paginatedClosed = useMemo(() => {
     const start = closedPage * PAGE_SIZE;
     return closedPositions.slice(start, start + PAGE_SIZE);
   }, [closedPositions, closedPage]);
-  const totalClosedPages = Math.max(1, Math.ceil(closedCount / PAGE_SIZE));
+  const totalClosedPages = Math.max(1, Math.ceil(loadedClosedCount / PAGE_SIZE));
 
   const isLoading = activeTab === "open" ? openLoading : closedLoading;
   const positions = activeTab === "open" ? openPositions : paginatedClosed;
@@ -225,18 +234,18 @@ export default function PositionsPage() {
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <MetricCard
             title="Unrealized P&L"
-            value={formatCurrency(totalUnrealizedPnl, { showSign: true })}
+            value={formatCurrency(summaryUnrealizedPnl, { showSign: true })}
             trend={
-              totalUnrealizedPnl > 0
+              summaryUnrealizedPnl > 0
                 ? "up"
-                : totalUnrealizedPnl < 0
+                : summaryUnrealizedPnl < 0
                   ? "down"
                   : "neutral"
             }
           />
           <MetricCard
             title="Open Positions"
-            value={String(openPositions.length)}
+            value={String(summaryOpenPositions)}
             trend="neutral"
           />
           <MetricCard

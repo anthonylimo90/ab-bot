@@ -26,8 +26,14 @@ export const queryKeys = {
   // Positions
   positions: {
     all: () => ["positions"] as const,
-    list: (filters?: { status?: string; market?: string }) =>
+    list: (filters?: {
+      status?: string;
+      market?: string;
+      limit?: number;
+      offset?: number;
+    }) =>
       [...queryKeys.positions.all(), "list", filters] as const,
+    summary: () => [...queryKeys.positions.all(), "summary"] as const,
     detail: (id: string) =>
       [...queryKeys.positions.all(), "detail", id] as const,
   },

@@ -39,11 +39,12 @@ impl PositionRepository {
                 id, market_id, yes_entry_price, no_entry_price, quantity,
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                is_open
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16
+                $13, $14, $15, $16, $17
             )
             "#,
         )
@@ -63,6 +64,10 @@ impl PositionRepository {
         .bind(position.resolution_payout_per_share)
         .bind(position.yes_entry_fee_shares)
         .bind(position.no_entry_fee_shares)
+        .bind(!matches!(
+            position.state,
+            PositionState::Closed | PositionState::EntryFailed
+        ))
         .execute(&self.pool)
         .await?;
 
@@ -91,7 +96,8 @@ impl PositionRepository {
                 fee_model = $11,
                 resolution_payout_per_share = $12,
                 yes_entry_fee_shares = $13,
-                no_entry_fee_shares = $14
+                no_entry_fee_shares = $14,
+                is_open = $15
             WHERE id = $1
             "#,
         )
@@ -109,6 +115,10 @@ impl PositionRepository {
         .bind(position.resolution_payout_per_share)
         .bind(position.yes_entry_fee_shares)
         .bind(position.no_entry_fee_shares)
+        .bind(!matches!(
+            position.state,
+            PositionState::Closed | PositionState::EntryFailed
+        ))
         .execute(&self.pool)
         .await?;
 

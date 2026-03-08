@@ -3,11 +3,13 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
-import type { Position, PositionStatus } from "@/types/api";
+import type { Position, PositionStatus, PositionsSummary } from "@/types/api";
 
 interface PositionFilters {
   status?: PositionStatus;
   market?: string;
+  limit?: number;
+  offset?: number;
 }
 
 export function usePositionsQuery(filters?: PositionFilters) {
@@ -17,8 +19,19 @@ export function usePositionsQuery(filters?: PositionFilters) {
       api.getPositions({
         status: filters?.status,
         market_id: filters?.market,
+        limit: filters?.limit,
+        offset: filters?.offset,
       }),
     staleTime: 30 * 1000,
+    refetchInterval: 30 * 1000,
+  });
+}
+
+export function usePositionsSummaryQuery() {
+  return useQuery<PositionsSummary>({
+    queryKey: queryKeys.positions.summary(),
+    queryFn: () => api.getPositionsSummary(),
+    staleTime: 15 * 1000,
     refetchInterval: 30 * 1000,
   });
 }
@@ -60,7 +73,7 @@ export function useClosePositionMutation() {
 
 // Derived hooks for common use cases
 export function useOpenPositions() {
-  const query = usePositionsQuery({ status: "open" });
+  const query = usePositionsQuery({ status: "open", limit: 500 });
 
   const openPositions = query.data ?? [];
   const totalUnrealizedPnl = openPositions.reduce(
@@ -74,4 +87,3 @@ export function useOpenPositions() {
     totalUnrealizedPnl,
   };
 }
-

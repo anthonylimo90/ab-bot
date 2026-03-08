@@ -108,6 +108,21 @@ export interface Position {
   exit_fees?: number;
 }
 
+export interface PositionsSummary {
+  open_positions: number;
+  open_markets: number;
+  duplicate_open_markets: number;
+  portfolio_value: number;
+  unrealized_pnl: number;
+  raw_open_positions: number;
+  raw_portfolio_value: number;
+  raw_unrealized_pnl: number;
+  closed_positions: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+}
+
 // Market types
 export interface Market {
   id: string;
