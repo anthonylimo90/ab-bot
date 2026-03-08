@@ -327,7 +327,7 @@ async fn load_arb_market_scorecard_rows(
                 AVG(p.observed_edge) AS avg_observed_edge,
                 AVG(p.realized_pnl) FILTER (WHERE p.closed_at IS NOT NULL) AS avg_realized_pnl,
                 COALESCE(SUM(p.expected_edge) FILTER (WHERE p.closed_at IS NOT NULL), 0) AS closed_expected_edge,
-                AVG(EXTRACT(EPOCH FROM (p.closed_at - p.opened_at)) / 3600.0)
+                AVG((EXTRACT(EPOCH FROM (p.closed_at - p.opened_at)) / 3600.0)::double precision)
                     FILTER (WHERE p.closed_at IS NOT NULL AND p.opened_at IS NOT NULL) AS avg_hold_hours,
                 AVG(p.filled_size_usd) AS avg_filled_size_usd,
                 MAX(COALESCE(p.closed_at, p.traded_at, p.opened_at)) AS last_traded_at
@@ -485,7 +485,7 @@ async fn load_trade_event_summary_rows(
             SELECT
                 strategy,
                 source,
-                AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600.0) AS avg_hold_hours
+                AVG((EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600.0)::double precision) AS avg_hold_hours
             FROM (
                 SELECT
                     te.position_id,
@@ -616,7 +616,7 @@ async fn load_derived_summary_rows(
             COUNT(*) FILTER (WHERE p.state = 5)::bigint AS entry_failed_positions,
             COUNT(*) FILTER (WHERE p.state = 6)::bigint AS exit_failed_positions,
             COALESCE(SUM(p.realized_pnl) FILTER (WHERE p.state = 4), 0) AS net_pnl,
-            AVG(EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0)
+            AVG((EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0)::double precision)
                 FILTER (WHERE p.state = 4 AND p.exit_timestamp IS NOT NULL) AS avg_hold_hours
         FROM quant_signals qs
         LEFT JOIN positions p ON p.id = qs.position_id
@@ -669,7 +669,7 @@ async fn load_derived_summary_rows(
                 COUNT(*) FILTER (WHERE state = 5)::bigint AS entry_failed_positions,
                 COUNT(*) FILTER (WHERE state = 6)::bigint AS exit_failed_positions,
                 COALESCE(SUM(realized_pnl) FILTER (WHERE state = 4), 0) AS net_pnl,
-                AVG(EXTRACT(EPOCH FROM (exit_timestamp - entry_timestamp)) / 3600.0)
+                AVG((EXTRACT(EPOCH FROM (exit_timestamp - entry_timestamp)) / 3600.0)::double precision)
                     FILTER (WHERE state = 4 AND exit_timestamp IS NOT NULL) AS avg_hold_hours
             FROM positions
             WHERE source = 1
@@ -814,7 +814,7 @@ async fn load_trade_event_journeys(
             l.unrealized_pnl,
             CASE
                 WHEN a.opened_at IS NULL THEN NULL
-                ELSE EXTRACT(EPOCH FROM (COALESCE(a.closed_at, $2) - a.opened_at)) / 3600.0
+                ELSE (EXTRACT(EPOCH FROM (COALESCE(a.closed_at, $2) - a.opened_at)) / 3600.0)::double precision
             END AS hold_hours,
             FALSE AS synthetic_history
         FROM aggregates a
@@ -919,7 +919,7 @@ async fn load_derived_journeys(
             p.exit_timestamp AS closed_at,
             p.realized_pnl,
             p.unrealized_pnl,
-            EXTRACT(EPOCH FROM (COALESCE(p.exit_timestamp, NOW()) - p.entry_timestamp)) / 3600.0 AS hold_hours,
+            (EXTRACT(EPOCH FROM (COALESCE(p.exit_timestamp, NOW()) - p.entry_timestamp)) / 3600.0)::double precision AS hold_hours,
             FALSE AS synthetic_history
         FROM quant_signals qs
         LEFT JOIN positions p ON p.id = qs.position_id
@@ -1002,7 +1002,7 @@ async fn load_derived_journeys(
                 exit_timestamp AS closed_at,
                 realized_pnl,
                 unrealized_pnl,
-                EXTRACT(EPOCH FROM (COALESCE(exit_timestamp, NOW()) - entry_timestamp)) / 3600.0 AS hold_hours,
+                (EXTRACT(EPOCH FROM (COALESCE(exit_timestamp, NOW()) - entry_timestamp)) / 3600.0)::double precision AS hold_hours,
                 TRUE AS synthetic_history
             FROM positions
             WHERE source = 1
