@@ -26,6 +26,12 @@ use trading_engine::OrderExecutor;
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
+enum ExitBidStatus {
+    Available(Decimal, Decimal),
+    Resolved,
+    Unavailable,
+}
+
 /// Configuration for the exit handler (env-var driven).
 #[derive(Debug, Clone)]
 pub struct ExitHandlerConfig {
@@ -381,14 +387,24 @@ impl ExitHandler {
 
         let fee = Decimal::new(2, 2);
         for candidate in &mut candidates {
-            let Some((yes_bid, no_bid)) = self.current_exit_bids(&candidate.position).await? else {
-                continue;
+            let quant_ctx = quant_contexts.get(&candidate.position.id);
+            let (yes_bid, no_bid) = match self.current_exit_bids(&candidate.position).await? {
+                ExitBidStatus::Available(yes_bid, no_bid) => (yes_bid, no_bid),
+                ExitBidStatus::Resolved => {
+                    self.close_open_position_via_resolution(
+                        &mut candidate.position,
+                        candidate.source,
+                        quant_ctx,
+                    )
+                    .await?;
+                    continue;
+                }
+                ExitBidStatus::Unavailable => continue,
             };
 
             candidate.position.update_pnl(yes_bid, no_bid, fee);
             self.position_repo.update(&candidate.position).await?;
 
-            let quant_ctx = quant_contexts.get(&candidate.position.id);
             if self
                 .should_mark_exit_ready(
                     &candidate.position,
@@ -614,29 +630,21 @@ impl ExitHandler {
         Ok(())
     }
 
-    async fn current_exit_bids(
-        &self,
-        position: &Position,
-    ) -> anyhow::Result<Option<(Decimal, Decimal)>> {
+    async fn current_exit_bids(&self, position: &Position) -> anyhow::Result<ExitBidStatus> {
         let market_id = position.market_id.as_str();
         let Some((yes_token_id, no_token_id)) = self.resolve_market_tokens(market_id).await? else {
             warn!(market_id = %market_id, "No token IDs for exit price evaluation");
-            return Ok(None);
+            return Ok(ExitBidStatus::Unavailable);
         };
 
         let (has_yes, has_no) = held_outcomes(position);
         let yes_bid = if has_yes {
             match self
-                .order_executor
-                .clob_client()
-                .get_order_book(&yes_token_id)
-                .await
+                .load_exit_best_bid(market_id, &yes_token_id, "YES")
+                .await?
             {
-                Ok(book) => book.best_bid().unwrap_or(Decimal::ZERO),
-                Err(e) => {
-                    warn!(market_id = %market_id, error = %e, "Failed loading YES orderbook for exit evaluation");
-                    return Ok(None);
-                }
+                Some(bid) => bid,
+                None => return self.exit_bid_fallback_status(market_id).await,
             }
         } else {
             Decimal::ZERO
@@ -644,22 +652,148 @@ impl ExitHandler {
 
         let no_bid = if has_no {
             match self
-                .order_executor
-                .clob_client()
-                .get_order_book(&no_token_id)
-                .await
+                .load_exit_best_bid(market_id, &no_token_id, "NO")
+                .await?
             {
-                Ok(book) => book.best_bid().unwrap_or(Decimal::ZERO),
-                Err(e) => {
-                    warn!(market_id = %market_id, error = %e, "Failed loading NO orderbook for exit evaluation");
-                    return Ok(None);
-                }
+                Some(bid) => bid,
+                None => return self.exit_bid_fallback_status(market_id).await,
             }
         } else {
             Decimal::ZERO
         };
 
-        Ok(Some((yes_bid, no_bid)))
+        Ok(ExitBidStatus::Available(yes_bid, no_bid))
+    }
+
+    async fn load_exit_best_bid(
+        &self,
+        market_id: &str,
+        token_id: &str,
+        side: &str,
+    ) -> anyhow::Result<Option<Decimal>> {
+        match self
+            .order_executor
+            .clob_client()
+            .get_order_book(token_id)
+            .await
+        {
+            Ok(book) => Ok(Some(book.best_bid().unwrap_or(Decimal::ZERO))),
+            Err(polymarket_core::error::Error::Api {
+                status: Some(404), ..
+            }) => {
+                warn!(
+                    market_id = %market_id,
+                    token_id = %token_id,
+                    side = side,
+                    "Exit evaluation token returned 404"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    market_id = %market_id,
+                    token_id = %token_id,
+                    side = side,
+                    error = %error,
+                    "Failed loading orderbook for exit evaluation"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn exit_bid_fallback_status(&self, market_id: &str) -> anyhow::Result<ExitBidStatus> {
+        match self.clob_client.get_market_by_id(market_id).await {
+            Ok(market) if market.resolved => Ok(ExitBidStatus::Resolved),
+            Ok(_) => Ok(ExitBidStatus::Unavailable),
+            Err(error) => {
+                warn!(
+                    market_id = %market_id,
+                    error = %error,
+                    "Failed to fetch market after exit-orderbook miss"
+                );
+                Ok(ExitBidStatus::Unavailable)
+            }
+        }
+    }
+
+    async fn close_open_position_via_resolution(
+        &self,
+        position: &mut Position,
+        source: i16,
+        quant_ctx: Option<&QuantExitContext>,
+    ) -> anyhow::Result<()> {
+        let market_id = position.market_id.clone();
+        let fee = Decimal::new(2, 2);
+
+        if let Err(error) = position.close_via_resolution(fee) {
+            warn!(
+                position_id = %position.id,
+                market_id = %market_id,
+                error = %error,
+                "Cannot close open position via resolution fallback"
+            );
+            return Ok(());
+        }
+
+        self.position_repo.update(position).await?;
+
+        let realized_pnl = position.realized_pnl.unwrap_or_default();
+        let is_win = realized_pnl > Decimal::ZERO;
+        if let Err(error) = self
+            .circuit_breaker
+            .record_trade(realized_pnl, is_win)
+            .await
+        {
+            warn!(
+                error = %error,
+                "Failed to record resolution fallback trade with circuit breaker"
+            );
+        }
+
+        self.arb_dedup.write().await.remove(&market_id);
+
+        let execution_mode = self.current_execution_mode().await;
+        self.trade_event_recorder
+            .record_warn(
+                trade_event_for_position(
+                    position,
+                    source,
+                    quant_ctx,
+                    &execution_mode,
+                    "closed_via_resolution",
+                    Some("open"),
+                    Some("closed"),
+                )
+                .with_realized_pnl(realized_pnl)
+                .with_unrealized_pnl(position.unrealized_pnl),
+            )
+            .await;
+
+        let signal = SignalUpdate {
+            signal_id: uuid::Uuid::new_v4(),
+            signal_type: SignalType::Arbitrage,
+            market_id: market_id.clone(),
+            outcome_id: "both".to_string(),
+            action: "closed_via_resolution".to_string(),
+            confidence: 1.0,
+            timestamp: Utc::now(),
+            metadata: serde_json::json!({
+                "position_id": position.id.to_string(),
+                "realized_pnl": realized_pnl.to_string(),
+                "source": source,
+            }),
+        };
+        let _ = self.signal_tx.send(signal);
+
+        info!(
+            market_id = %market_id,
+            position_id = %position.id,
+            realized_pnl = %realized_pnl,
+            "Position closed via resolution fallback"
+        );
+
+        Ok(())
     }
 
     async fn resolve_market_tokens(
