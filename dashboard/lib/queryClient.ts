@@ -38,6 +38,16 @@ export const queryKeys = {
       [...queryKeys.positions.all(), "detail", id] as const,
   },
 
+  account: {
+    all: () => ["account"] as const,
+    summary: (workspaceId: string) =>
+      [...queryKeys.account.all(), "summary", workspaceId] as const,
+    history: (workspaceId: string, params?: { hours?: number; limit?: number }) =>
+      [...queryKeys.account.all(), "history", workspaceId, params] as const,
+    cashFlows: (workspaceId: string, params?: { limit?: number }) =>
+      [...queryKeys.account.all(), "cash-flows", workspaceId, params] as const,
+  },
+
   // Wallets
   wallets: {
     all: () => ["wallets"] as const,

@@ -128,6 +128,64 @@ export interface PositionsSummary {
   win_rate: number;
 }
 
+export interface AccountSummary {
+  workspace_id: string;
+  snapshot_time: string;
+  wallet_address?: string;
+  cash_balance: number;
+  position_value: number;
+  total_equity: number;
+  unrealized_pnl: number;
+  realized_pnl_24h: number;
+  net_cash_flows_24h: number;
+  open_positions: number;
+  open_markets: number;
+  unpriced_open_positions: number;
+  unpriced_position_cost_basis: number;
+}
+
+export interface AccountEquityPoint {
+  snapshot_time: string;
+  cash_balance: number;
+  position_value: number;
+  total_equity: number;
+  unrealized_pnl: number;
+  realized_pnl_24h: number;
+  net_cash_flows_24h: number;
+}
+
+export interface CashFlowEvent {
+  id: string;
+  event_type: string;
+  amount: number;
+  currency: string;
+  note?: string;
+  occurred_at: string;
+  created_at: string;
+}
+
+export interface AccountTradeEvent {
+  id: string;
+  occurred_at: string;
+  strategy: string;
+  source: string;
+  event_type: string;
+  execution_mode: string;
+  market_id: string;
+  position_id?: string;
+  reason?: string;
+  realized_pnl?: number;
+  unrealized_pnl?: number;
+}
+
+export interface AccountHistoryResponse {
+  summary: AccountSummary;
+  equity_curve: AccountEquityPoint[];
+  cash_flows: CashFlowEvent[];
+  recent_trade_events: AccountTradeEvent[];
+  snapshot_started_at?: string;
+}
+
 // Market types
 export interface Market {
   id: string;

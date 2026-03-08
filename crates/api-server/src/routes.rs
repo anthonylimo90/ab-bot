@@ -11,9 +11,9 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    activity, admin_workspaces, auth, backtest, discover, health, markets, order_signing,
-    positions, recommendations, risk, signals, strategy_health, trade_flow, trading, users, vault,
-    wallet_auth, wallets, workspaces,
+    accounting, activity, admin_workspaces, auth, backtest, discover, health, markets,
+    order_signing, positions, recommendations, risk, signals, strategy_health, trade_flow, trading,
+    users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -107,6 +107,10 @@ use crate::websocket;
         order_signing::submit_order,
         // Activity
         activity::list_activity,
+        accounting::get_account_summary,
+        accounting::get_account_history,
+        accounting::list_cash_flows,
+        accounting::create_cash_flow,
         // Trade flow
         trade_flow::get_trade_flow_summary,
         trade_flow::get_trade_flow_journeys,
@@ -225,6 +229,12 @@ use crate::websocket;
             order_signing::OrderSummary,
             // Activity
             activity::ActivityResponse,
+            accounting::AccountSummaryResponse,
+            accounting::AccountEquityPointResponse,
+            accounting::CashFlowEventResponse,
+            accounting::AccountTradeEventResponse,
+            accounting::AccountHistoryResponse,
+            accounting::CreateCashFlowRequest,
             trade_flow::TradeFlowSummaryResponse,
             trade_flow::TradeFlowStrategySummary,
             trade_flow::TradeJourneyResponse,
@@ -468,6 +478,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Activity feed (read-only for all members)
         .route("/api/v1/activity", get(activity::list_activity))
+        .route(
+            "/api/v1/workspaces/:workspace_id/account/summary",
+            get(accounting::get_account_summary),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/account/history",
+            get(accounting::get_account_history),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/account/cash-flows",
+            get(accounting::list_cash_flows).post(accounting::create_cash_flow),
+        )
         // Trade flow analytics (read-only for all members)
         .route(
             "/api/v1/trade-flow/summary",

@@ -3,10 +3,9 @@
 import { useMemo } from "react";
 import Link from "next/link";
 import {
-  usePositionsQuery,
   usePositionsSummaryQuery,
 } from "@/hooks/queries/usePositionsQuery";
-import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
+import { useAccountHistoryQuery, useAccountSummaryQuery } from "@/hooks/queries/useAccountQuery";
 import { useTradeFlowSummaryQuery } from "@/hooks/queries/useTradeFlowQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
@@ -69,16 +68,14 @@ const activityLabels: Record<string, string> = {
 export function DashboardHome() {
   const { currentWorkspace } = useWorkspaceStore();
   const { data: positionsSummary } = usePositionsSummaryQuery();
-  const { data: walletBalance } = useWalletBalanceQuery(
-    currentWorkspace?.trading_wallet_address ?? null,
-  );
+  const { data: accountSummary } = useAccountSummaryQuery(currentWorkspace?.id);
+  const { data: accountHistory } = useAccountHistoryQuery(currentWorkspace?.id, {
+    hours: 24,
+    limit: 288,
+  });
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
   const { data: tradeFlowSummary } = useTradeFlowSummaryQuery({ limit: 100 });
-  const { data: closedPositions = [] } = usePositionsQuery({
-    status: "closed",
-    limit: 500,
-  });
   const isTradingManuallyPaused =
     Boolean(currentWorkspace) &&
     !currentWorkspace?.live_trading_enabled &&
@@ -108,21 +105,17 @@ export function DashboardHome() {
             "Automated trading is enabled and the safety stop is not currently blocking trading.",
         };
   const stats = useMemo(() => {
-    const markedPositionValue = positionsSummary?.portfolio_value ?? 0;
-    const cashBalance =
-      typeof walletBalance?.usdc_balance === "number"
-        ? walletBalance.usdc_balance
-        : Number(walletBalance?.usdc_balance ?? 0);
-    const normalizedCashBalance = Number.isFinite(cashBalance) ? cashBalance : 0;
-    const totalValue = markedPositionValue + normalizedCashBalance;
-    const totalUnrealizedPnl = positionsSummary?.unrealized_pnl ?? 0;
+    const totalValue = accountSummary?.total_equity ?? 0;
+    const totalUnrealizedPnl = accountSummary?.unrealized_pnl ?? 0;
     return {
       total_value: totalValue,
-      cash_balance: normalizedCashBalance,
-      marked_position_value: markedPositionValue,
-      unpriced_open_positions: positionsSummary?.unpriced_open_positions ?? 0,
+      cash_balance: accountSummary?.cash_balance ?? 0,
+      marked_position_value: accountSummary?.position_value ?? 0,
+      net_cash_flows_24h: accountSummary?.net_cash_flows_24h ?? 0,
+      realized_pnl_24h: accountSummary?.realized_pnl_24h ?? 0,
+      unpriced_open_positions: accountSummary?.unpriced_open_positions ?? 0,
       unpriced_position_cost_basis:
-        positionsSummary?.unpriced_position_cost_basis ?? 0,
+        accountSummary?.unpriced_position_cost_basis ?? 0,
       total_pnl_percent: totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
       total_unrealized_pnl: totalUnrealizedPnl,
       today_pnl: riskStatus?.circuit_breaker?.daily_pnl ?? 0,
@@ -130,30 +123,22 @@ export function DashboardHome() {
         totalValue > 0
           ? ((riskStatus?.circuit_breaker?.daily_pnl ?? 0) / totalValue) * 100
           : 0,
-      active_positions: positionsSummary?.open_positions ?? 0,
+      active_positions: accountSummary?.open_positions ?? positionsSummary?.open_positions ?? 0,
       win_rate: positionsSummary?.win_rate ?? 0,
     };
-  }, [positionsSummary, riskStatus, walletBalance]);
+  }, [accountSummary, positionsSummary, riskStatus]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
-  // Derive equity curve from closed positions (accumulated realized P&L)
   const equityCurve = useMemo(() => {
-    if (closedPositions.length === 0) return [];
-    const sorted = [...closedPositions]
-      .filter((p) => p.updated_at)
-      .sort(
-        (a, b) =>
-          new Date(a.updated_at!).getTime() - new Date(b.updated_at!).getTime(),
-      );
-    let cumulative = 0;
-    return sorted.map((p) => {
-      cumulative += p.realized_pnl ?? 0;
+    const points = accountHistory?.equity_curve ?? [];
+    return points.map((point) => {
+      const label = new Date(point.snapshot_time).toISOString();
       return {
-        time: new Date(p.updated_at!).toISOString().slice(0, 10),
-        value: cumulative,
+        time: label,
+        value: point.total_equity,
       };
     });
-  }, [closedPositions]);
+  }, [accountHistory]);
 
   return (
     <div className="space-y-5 sm:space-y-6">
@@ -279,16 +264,15 @@ export function DashboardHome() {
           change={stats.total_pnl_percent}
           changeLabel={
             stats.unpriced_open_positions > 0
-              ? `Cash ${formatCurrency(stats.cash_balance)} + open positions ${formatCurrency(stats.marked_position_value)}. ${stats.unpriced_open_positions} position${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis plus unrealized P&L because no direct mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
-              : `Cash ${formatCurrency(stats.cash_balance)} + marked positions ${formatCurrency(stats.marked_position_value)}`
+              ? `Cash ${formatCurrency(stats.cash_balance)} + open positions ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}. ${stats.unpriced_open_positions} position${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis plus unrealized P&L because no direct mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
+              : `Cash ${formatCurrency(stats.cash_balance)} + open positions ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}`
           }
           trend={stats.total_pnl_percent >= 0 ? "up" : "down"}
         />
         <MetricCard
-          title="Today's P&L"
-          value={formatCurrency(stats.today_pnl, { showSign: true })}
-          change={stats.today_pnl_percent}
-          trend={stats.today_pnl >= 0 ? "up" : "down"}
+          title="Realized P&L 24h"
+          value={formatCurrency(stats.realized_pnl_24h, { showSign: true })}
+          trend={stats.realized_pnl_24h >= 0 ? "up" : "down"}
         />
         <MetricCard
           title="Unrealized P&L"
@@ -411,7 +395,7 @@ export function DashboardHome() {
               <PortfolioChart data={equityCurve} height={320} />
             ) : (
               <div className="flex items-center justify-center h-[320px] text-sm text-muted-foreground">
-                Close positions to see your equity curve
+                Account snapshots will appear here as the ledger builds
               </div>
             )}
           </CardContent>

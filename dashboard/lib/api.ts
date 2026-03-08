@@ -37,6 +37,11 @@ import type {
   CircuitBreakerStatus,
   CircuitBreakerConfig,
   PositionsSummary,
+  AccountSummary,
+  AccountEquityPoint,
+  CashFlowEvent,
+  AccountTradeEvent,
+  AccountHistoryResponse,
   MarketRegimeResponse,
   FlowFeatureResponse,
   RecentSignalResponse,
@@ -112,6 +117,48 @@ function parsePositionsSummary(raw: PositionsSummary): PositionsSummary {
     raw_unpriced_position_cost_basis: Number(raw.raw_unpriced_position_cost_basis),
     raw_unrealized_pnl: Number(raw.raw_unrealized_pnl),
     win_rate: Number(raw.win_rate),
+  };
+}
+
+function parseAccountSummary(raw: AccountSummary): AccountSummary {
+  return {
+    ...raw,
+    cash_balance: Number(raw.cash_balance),
+    position_value: Number(raw.position_value),
+    total_equity: Number(raw.total_equity),
+    unrealized_pnl: Number(raw.unrealized_pnl),
+    realized_pnl_24h: Number(raw.realized_pnl_24h),
+    net_cash_flows_24h: Number(raw.net_cash_flows_24h),
+    unpriced_position_cost_basis: Number(raw.unpriced_position_cost_basis),
+  };
+}
+
+function parseAccountEquityPoint(raw: AccountEquityPoint): AccountEquityPoint {
+  return {
+    ...raw,
+    cash_balance: Number(raw.cash_balance),
+    position_value: Number(raw.position_value),
+    total_equity: Number(raw.total_equity),
+    unrealized_pnl: Number(raw.unrealized_pnl),
+    realized_pnl_24h: Number(raw.realized_pnl_24h),
+    net_cash_flows_24h: Number(raw.net_cash_flows_24h),
+  };
+}
+
+function parseCashFlowEvent(raw: CashFlowEvent): CashFlowEvent {
+  return {
+    ...raw,
+    amount: Number(raw.amount),
+  };
+}
+
+function parseAccountTradeEvent(raw: AccountTradeEvent): AccountTradeEvent {
+  return {
+    ...raw,
+    realized_pnl:
+      raw.realized_pnl != null ? Number(raw.realized_pnl) : undefined,
+    unrealized_pnl:
+      raw.unrealized_pnl != null ? Number(raw.unrealized_pnl) : undefined,
   };
 }
 
@@ -794,6 +841,65 @@ class ApiClient {
     return this.request<Activity[]>(
       `/api/v1/activity${query ? `?${query}` : ""}`,
     );
+  }
+
+  async getAccountSummary(workspaceId: string): Promise<AccountSummary> {
+    const raw = await this.request<AccountSummary>(
+      `/api/v1/workspaces/${workspaceId}/account/summary`,
+    );
+    return parseAccountSummary(raw);
+  }
+
+  async getAccountHistory(
+    workspaceId: string,
+    params?: { hours?: number; limit?: number },
+  ): Promise<AccountHistoryResponse> {
+    const sp = new URLSearchParams();
+    if (params?.hours) sp.set("hours", String(params.hours));
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<AccountHistoryResponse>(
+      `/api/v1/workspaces/${workspaceId}/account/history${q ? `?${q}` : ""}`,
+    );
+    return {
+      ...raw,
+      summary: parseAccountSummary(raw.summary),
+      equity_curve: raw.equity_curve.map(parseAccountEquityPoint),
+      cash_flows: raw.cash_flows.map(parseCashFlowEvent),
+      recent_trade_events: raw.recent_trade_events.map(parseAccountTradeEvent),
+    };
+  }
+
+  async getCashFlows(
+    workspaceId: string,
+    params?: { limit?: number },
+  ): Promise<CashFlowEvent[]> {
+    const sp = new URLSearchParams();
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<CashFlowEvent[]>(
+      `/api/v1/workspaces/${workspaceId}/account/cash-flows${q ? `?${q}` : ""}`,
+    );
+    return raw.map(parseCashFlowEvent);
+  }
+
+  async createCashFlow(
+    workspaceId: string,
+    params: {
+      event_type: string;
+      amount: number;
+      note?: string;
+      occurred_at?: string;
+    },
+  ): Promise<CashFlowEvent> {
+    const raw = await this.request<CashFlowEvent>(
+      `/api/v1/workspaces/${workspaceId}/account/cash-flows`,
+      {
+        method: "POST",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseCashFlowEvent(raw);
   }
 
   async getTradeFlowSummary(params?: {

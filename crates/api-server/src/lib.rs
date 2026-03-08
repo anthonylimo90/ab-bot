@@ -19,6 +19,7 @@
 //! server.run().await?;
 //! ```
 
+pub mod accounting_ledger;
 pub mod arb_executor;
 pub mod backtest_automation;
 pub mod crypto;
@@ -45,6 +46,7 @@ pub mod trade_events;
 pub mod wallet_harvester;
 pub mod websocket;
 
+pub use accounting_ledger::{spawn_account_snapshot_calculator, AccountSnapshotConfig};
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
 pub use backtest_automation::{spawn_backtest_automation, BacktestAutomationConfig};
 pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
@@ -399,6 +401,10 @@ impl ApiServer {
         // Spawn strategy health calculator (6h, summarizes edge capture + failures)
         let health_config = StrategyHealthConfig::from_env();
         spawn_strategy_health_calculator(health_config, state.pool.clone());
+
+        // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
+        let account_snapshot_config = AccountSnapshotConfig::from_env();
+        spawn_account_snapshot_calculator(account_snapshot_config, state.clone());
 
         // Spawn automated backtest scheduler (polls due schedules and reuses the backtest runner)
         let backtest_automation_config = BacktestAutomationConfig::from_env();

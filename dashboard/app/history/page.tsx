@@ -3,190 +3,103 @@
 import { useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
+import { PageIntro } from "@/components/shared/PageIntro";
 import { PositionTableSkeleton } from "@/components/shared/Skeletons";
+import { PortfolioChart } from "@/components/charts/PortfolioChart";
+import { useDynamicConfigHistoryQuery } from "@/hooks/queries/useHistoryQuery";
 import {
-  useActivityHistoryQuery,
-  useDynamicConfigHistoryQuery,
-} from "@/hooks/queries/useHistoryQuery";
-import {
-  isArbitrageActivity,
-  isFailedActivity,
-  isRiskActivity,
-} from "@/lib/activity";
+  useAccountHistoryQuery,
+  useCreateCashFlowMutation,
+} from "@/hooks/queries/useAccountQuery";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { formatCurrency, formatTimeAgo, cn, formatDynamicKey, formatDynamicConfigValue } from "@/lib/utils";
-import { Badge } from "@/components/ui/badge";
+import { useToastStore } from "@/stores/toast-store";
 import {
-  History,
-  ChevronLeft,
-  ChevronRight,
-  XCircle,
-  Activity as ActivityIcon,
-  SlidersHorizontal,
-  TrendingDown,
-  TrendingUp,
-  Zap,
-  DollarSign,
-  CheckCircle2,
-  ShieldAlert,
-} from "lucide-react";
+  formatCurrency,
+  formatTimeAgo,
+  formatDynamicKey,
+  formatDynamicConfigValue,
+} from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import { History, LineChart, Landmark, TrendingUp, Wallet, SlidersHorizontal } from "lucide-react";
 
-const PAGE_SIZE = 50;
+type HistoryTab = "equity" | "trades" | "cash_flows" | "dynamic";
 
-type ActivityFilter = "all" | "arb" | "risk";
-type HistoryTab = "activity" | "dynamic";
-
-const activityMeta = {
-  POSITION_OPENED: {
-    label: "Opened",
-    icon: <DollarSign className="h-4 w-4 text-green-500" />,
-    badgeClass: "bg-green-500/10 text-green-600",
-  },
-  POSITION_CLOSED: {
-    label: "Closed",
-    icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
-    badgeClass: "bg-blue-500/10 text-blue-600",
-  },
-  TRADE_EXECUTED: {
-    label: "Trade Executed",
-    icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
-    badgeClass: "bg-blue-500/10 text-blue-600",
-  },
-  TRADE_FAILED: {
-    label: "Trade Failed",
-    icon: <XCircle className="h-4 w-4 text-red-500" />,
-    badgeClass: "bg-red-500/10 text-red-600",
-  },
-  TRADE_PENDING: {
-    label: "Trade Pending",
-    icon: <ActivityIcon className="h-4 w-4 text-muted-foreground" />,
-    badgeClass: "bg-muted text-muted-foreground",
-  },
-  ARBITRAGE_DETECTED: {
-    label: "Arb Detected",
-    icon: <Zap className="h-4 w-4 text-yellow-500" />,
-    badgeClass: "bg-yellow-500/10 text-yellow-600",
-  },
-  ARB_POSITION_OPENED: {
-    label: "Arb Opened",
-    icon: <DollarSign className="h-4 w-4 text-green-500" />,
-    badgeClass: "bg-green-500/10 text-green-600",
-  },
-  ARB_POSITION_CLOSED: {
-    label: "Arb Closed",
-    icon: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
-    badgeClass: "bg-blue-500/10 text-blue-600",
-  },
-  ARB_EXECUTION_FAILED: {
-    label: "Arb Failed",
-    icon: <XCircle className="h-4 w-4 text-red-500" />,
-    badgeClass: "bg-red-500/10 text-red-600",
-  },
-  ARB_EXIT_FAILED: {
-    label: "Exit Failed",
-    icon: <ShieldAlert className="h-4 w-4 text-red-400" />,
-    badgeClass: "bg-red-500/10 text-red-600",
-  },
-  STOP_LOSS_TRIGGERED: {
-    label: "Stop Loss",
-    icon: <TrendingDown className="h-4 w-4 text-orange-500" />,
-    badgeClass: "bg-orange-500/10 text-orange-600",
-  },
-  TAKE_PROFIT_TRIGGERED: {
-    label: "Take Profit",
-    icon: <TrendingUp className="h-4 w-4 text-green-500" />,
-    badgeClass: "bg-green-500/10 text-green-600",
-  },
-} as const;
-
-function matchesFilter(
-  item: { type: string; details?: Record<string, unknown> },
-  filter: ActivityFilter,
-): boolean {
-  if (filter === "all") return true;
-  if (filter === "arb") return isArbitrageActivity(item);
-  if (filter === "risk") return isRiskActivity(item);
-  return true;
-}
-
-function metricValue(metrics: Record<string, unknown> | null | undefined, key: string): string {
-  if (!metrics) return "-";
-  const raw = metrics[key];
-  if (typeof raw !== "number") return "-";
-  return raw.toFixed(4);
-}
-
-function dynamicActionClass(action: string): string {
-  if (action === "manual_update") return "bg-blue-500/10 text-blue-600 border-blue-500/20";
-  if (action === "rollback") return "bg-yellow-500/10 text-yellow-700 border-yellow-500/20";
-  if (action === "applied") return "bg-green-500/10 text-green-700 border-green-500/20";
-  if (action === "recommended") return "bg-purple-500/10 text-purple-700 border-purple-500/20";
-  if (action === "watchdog") return "bg-orange-500/10 text-orange-700 border-orange-500/20";
-  if (action === "frozen") return "bg-red-500/10 text-red-700 border-red-500/20";
-  if (action === "evaluation" || action === "skipped") return "bg-muted/50 text-muted-foreground border-border";
-  return "border-border";
+function cashFlowLabel(type: string) {
+  return type.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 export default function HistoryPage() {
   const { currentWorkspace } = useWorkspaceStore();
   const workspaceId = currentWorkspace?.id;
+  const toast = useToastStore();
+  const canManageCashFlows =
+    currentWorkspace?.my_role === "owner" || currentWorkspace?.my_role === "admin";
 
-  const [historyTab, setHistoryTab] = useState<HistoryTab>("activity");
-  const [activityFilter, setActivityFilter] = useState<ActivityFilter>("all");
-  const [activityPage, setActivityPage] = useState(0);
-  const [dynamicPage, setDynamicPage] = useState(0);
+  const [historyTab, setHistoryTab] = useState<HistoryTab>("equity");
+  const [cashFlowType, setCashFlowType] = useState("deposit");
+  const [cashFlowAmount, setCashFlowAmount] = useState("");
+  const [cashFlowNote, setCashFlowNote] = useState("");
+  const [cashFlowOccurredAt, setCashFlowOccurredAt] = useState("");
 
   const {
-    data: activity = [],
-    isLoading,
-    error,
-  } = useActivityHistoryQuery({
-    limit: PAGE_SIZE,
-    offset: activityPage * PAGE_SIZE,
-  });
+    data: accountHistory,
+    isLoading: accountLoading,
+    error: accountError,
+  } = useAccountHistoryQuery(workspaceId, { hours: 24, limit: 100 });
 
   const {
     data: dynamicHistory = [],
-    isLoading: isDynamicLoading,
+    isLoading: dynamicLoading,
     error: dynamicError,
   } = useDynamicConfigHistoryQuery({
     workspaceId,
-    limit: PAGE_SIZE,
-    offset: dynamicPage * PAGE_SIZE,
+    limit: 50,
+    offset: 0,
   });
 
-  const filteredActivity = useMemo(
-    () => activity.filter((item) => matchesFilter(item, activityFilter)),
-    [activity, activityFilter],
+  const createCashFlowMutation = useCreateCashFlowMutation(workspaceId);
+
+  const summary = accountHistory?.summary;
+  const equityCurve = useMemo(
+    () =>
+      (accountHistory?.equity_curve ?? []).map((point) => ({
+        time: new Date(point.snapshot_time).toISOString(),
+        value: point.total_equity,
+      })),
+    [accountHistory],
   );
 
-  const arbCount = useMemo(
-    () => filteredActivity.filter((item) => isArbitrageActivity(item)).length,
-    [filteredActivity],
-  );
-  const riskCount = useMemo(
-    () => filteredActivity.filter((item) => isRiskActivity(item)).length,
-    [filteredActivity],
-  );
-  const failedCount = useMemo(
-    () => filteredActivity.filter((item) => isFailedActivity(item)).length,
-    [filteredActivity],
-  );
-  const netPnl = useMemo(
-    () =>
-      filteredActivity.reduce((sum, item) => sum + Number(item.pnl ?? 0), 0),
-    [filteredActivity],
-  );
+  const handleCreateCashFlow = async () => {
+    const amount = Number(cashFlowAmount);
+    if (!Number.isFinite(amount) || amount === 0) {
+      toast.error("Invalid amount", "Enter a non-zero cash flow amount");
+      return;
+    }
+
+    try {
+      await createCashFlowMutation.mutateAsync({
+        event_type: cashFlowType,
+        amount,
+        note: cashFlowNote || undefined,
+        occurred_at: cashFlowOccurredAt
+          ? new Date(cashFlowOccurredAt).toISOString()
+          : undefined,
+      });
+      setCashFlowAmount("");
+      setCashFlowNote("");
+      setCashFlowOccurredAt("");
+      toast.success("Cash flow recorded", "The account ledger has been updated");
+    } catch (error) {
+      toast.error(
+        "Failed to record cash flow",
+        error instanceof Error ? error.message : "Unknown error",
+      );
+    }
+  };
 
   return (
     <ErrorBoundary>
@@ -197,261 +110,163 @@ export default function HistoryPage() {
             History
           </h1>
           <p className="text-muted-foreground">
-            Trading outcomes and dynamic runtime tuning changes
+            Canonical account snapshots, trade lifecycle events, and cash flows
           </p>
         </div>
 
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <MetricCard
-            title="Net P&L"
-            value={formatCurrency(netPnl, { showSign: true })}
-            trend={netPnl >= 0 ? "up" : "down"}
-          />
-          <MetricCard title="Arb Events" value={String(arbCount)} trend="neutral" />
-          <MetricCard title="Risk Events" value={String(riskCount)} trend="neutral" />
-          <MetricCard
-            title="Failed"
-            value={String(failedCount)}
-            trend={failedCount > 0 ? "down" : "neutral"}
-          />
-        </div>
+        <PageIntro
+          title="What this history uses"
+          description="This page now reads from the account ledger instead of the old activity feed. Equity comes from periodic snapshots, trade activity comes from trade events, and deposits or withdrawals are tracked separately as cash flows."
+          bullets={[
+            "Account Equity = wallet cash + open-position value.",
+            "Trade history is sourced from canonical trade events, not execution-report messages.",
+            "Cash flows are recorded separately so top-ups and withdrawals do not look like trading P&L.",
+          ]}
+        />
 
-        <Tabs
-          value={historyTab}
-          onValueChange={(value) => setHistoryTab(value as HistoryTab)}
-        >
-          <div className="overflow-x-auto pb-1">
-            <TabsList className="grid w-full min-w-[20rem] grid-cols-2 sm:max-w-md">
-              <TabsTrigger value="activity">Trading Activity</TabsTrigger>
-              <TabsTrigger value="dynamic">Dynamic Config</TabsTrigger>
-            </TabsList>
-          </div>
-
-          <TabsContent value="activity" className="mt-4 space-y-4">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Select
-                value={activityFilter}
-                onValueChange={(value) => {
-                  setActivityFilter(value as ActivityFilter);
-                  setActivityPage(0);
-                }}
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue placeholder="Activity Type" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All Activity</SelectItem>
-                  <SelectItem value="arb">Arbitrage</SelectItem>
-                  <SelectItem value="risk">Risk Events</SelectItem>
-                </SelectContent>
-              </Select>
+        {accountLoading ? (
+          <PositionTableSkeleton rows={6} />
+        ) : accountError || !summary ? (
+          <Card>
+            <CardContent className="p-12 text-center">
+              <p className="text-destructive">
+                Failed to load account history.
+              </p>
+            </CardContent>
+          </Card>
+        ) : (
+          <>
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+              <MetricCard
+                title="Account Equity"
+                value={formatCurrency(summary.total_equity)}
+                trend={summary.total_equity >= 0 ? "up" : "neutral"}
+              />
+              <MetricCard
+                title="Cash Balance"
+                value={formatCurrency(summary.cash_balance)}
+                trend="neutral"
+              />
+              <MetricCard
+                title="Open Exposure"
+                value={formatCurrency(summary.position_value)}
+                trend="neutral"
+                changeLabel={`${summary.open_positions} open positions`}
+              />
+              <MetricCard
+                title="Realized P&L 24h"
+                value={formatCurrency(summary.realized_pnl_24h, { showSign: true })}
+                trend={summary.realized_pnl_24h >= 0 ? "up" : "down"}
+                changeLabel={`Cash flows 24h ${formatCurrency(summary.net_cash_flows_24h, { showSign: true })}`}
+              />
             </div>
 
-            {isLoading ? (
-              <PositionTableSkeleton rows={10} />
-            ) : error ? (
-              <Card>
-                <CardContent className="p-12 text-center">
-                  <p className="text-destructive">Failed to load history.</p>
-                </CardContent>
-              </Card>
-            ) : filteredActivity.length === 0 ? (
-              <Card>
-                <CardContent className="p-12 text-center">
-                  <History className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
-                  <h3 className="text-lg font-medium mb-2">No activity</h3>
-                  <p className="text-muted-foreground">
-                    Activity will appear here as trades are processed.
-                  </p>
-                </CardContent>
-              </Card>
-            ) : (
-              <>
+            <Tabs
+              value={historyTab}
+              onValueChange={(value) => setHistoryTab(value as HistoryTab)}
+            >
+              <div className="overflow-x-auto pb-1">
+                <TabsList className="grid w-full min-w-[28rem] grid-cols-4">
+                  <TabsTrigger value="equity">Equity</TabsTrigger>
+                  <TabsTrigger value="trades">Trade Events</TabsTrigger>
+                  <TabsTrigger value="cash_flows">Cash Flows</TabsTrigger>
+                  <TabsTrigger value="dynamic">Dynamic Config</TabsTrigger>
+                </TabsList>
+              </div>
+
+              <TabsContent value="equity" className="mt-4 space-y-4">
                 <Card>
                   <CardHeader>
-                    <CardTitle>Activity Log</CardTitle>
+                    <CardTitle>Equity Curve</CardTitle>
                   </CardHeader>
-                  <CardContent>
-                    <div className="overflow-x-auto pb-1">
-                      <table className="w-full min-w-[680px]">
-                        <thead className="border-b bg-muted/50">
-                          <tr>
-                            <th className="text-left p-4 font-medium">Type</th>
-                            <th className="text-left p-4 font-medium">Message</th>
-                            <th className="text-right p-4 font-medium">P&amp;L</th>
-                            <th className="text-right p-4 font-medium">Time</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {filteredActivity.map((item) => {
-                            const meta =
-                              activityMeta[
-                                item.type as keyof typeof activityMeta
-                              ];
+                  <CardContent className="space-y-4">
+                    {equityCurve.length > 1 ? (
+                      <PortfolioChart data={equityCurve} height={360} />
+                    ) : (
+                      <div className="flex h-[360px] items-center justify-center text-sm text-muted-foreground">
+                        Snapshots are still building. The current ledger started at{" "}
+                        {accountHistory.snapshot_started_at
+                          ? formatTimeAgo(accountHistory.snapshot_started_at)
+                          : "the latest refresh"}
+                        .
+                      </div>
+                    )}
 
-                            return (
-                              <tr key={item.id} className="border-b hover:bg-muted/30">
-                                <td className="p-4">
-                                  <span
-                                    className={cn(
-                                      "inline-flex items-center gap-2 rounded px-2 py-1 text-xs font-medium",
-                                      meta?.badgeClass ?? "bg-muted text-foreground",
-                                    )}
-                                  >
-                                    {meta?.icon ?? <ActivityIcon className="h-4 w-4" />}
-                                    {meta?.label ?? item.type}
-                                  </span>
-                                </td>
-                                <td className="p-4 text-sm">
-                                  <p className="break-words">{item.message}</p>
-                                  {item.error_message && (
-                                    <div className="mt-1 flex flex-wrap gap-1">
-                                      {item.error_message && (
-                                        <span className="rounded bg-red-500/10 px-1.5 py-0.5 text-xs text-red-700">
-                                          error: {item.error_message}
-                                        </span>
-                                      )}
-                                    </div>
-                                  )}
-                                </td>
-                                <td className="p-4 text-right">
-                                  {item.pnl === undefined ? (
-                                    <span className="text-muted-foreground">-</span>
-                                  ) : (
-                                    <span
-                                      className={cn(
-                                        "tabular-nums font-medium",
-                                        item.pnl >= 0 ? "text-profit" : "text-loss",
-                                      )}
-                                    >
-                                      {formatCurrency(item.pnl, { showSign: true })}
-                                    </span>
-                                  )}
-                                </td>
-                                <td className="p-4 text-right text-muted-foreground text-sm">
-                                  <div>{new Date(item.created_at).toLocaleString()}</div>
-                                  <div>{formatTimeAgo(item.created_at)}</div>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      <div className="rounded-lg border p-4">
+                        <p className="text-xs text-muted-foreground">Last Snapshot</p>
+                        <p className="mt-1 text-sm font-medium">
+                          {formatTimeAgo(summary.snapshot_time)}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border p-4">
+                        <p className="text-xs text-muted-foreground">Unpriced Open Positions</p>
+                        <p className="mt-1 text-sm font-medium">
+                          {summary.unpriced_open_positions}
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Cost basis {formatCurrency(summary.unpriced_position_cost_basis)}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border p-4">
+                        <p className="text-xs text-muted-foreground">Unrealized P&amp;L</p>
+                        <p className="mt-1 text-sm font-medium">
+                          {formatCurrency(summary.unrealized_pnl, { showSign: true })}
+                        </p>
+                      </div>
                     </div>
                   </CardContent>
                 </Card>
+              </TabsContent>
 
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-sm text-muted-foreground">
-                    Page {activityPage + 1} &middot; {filteredActivity.length} records
-                  </p>
-                  <div className="flex gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={activityPage === 0}
-                      onClick={() => setActivityPage((page) => page - 1)}
-                    >
-                      <ChevronLeft className="h-4 w-4 mr-1" />
-                      Prev
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={activity.length < PAGE_SIZE}
-                      onClick={() => setActivityPage((page) => page + 1)}
-                    >
-                      Next
-                      <ChevronRight className="h-4 w-4 ml-1" />
-                    </Button>
-                  </div>
-                </div>
-              </>
-            )}
-          </TabsContent>
-
-          <TabsContent value="dynamic" className="mt-4 space-y-4">
-            {!workspaceId ? (
-              <Card>
-                <CardContent className="p-6 text-sm text-muted-foreground">
-                  Select a workspace to view dynamic tuning history.
-                </CardContent>
-              </Card>
-            ) : isDynamicLoading ? (
-              <PositionTableSkeleton rows={8} />
-            ) : dynamicError ? (
-              <Card>
-                <CardContent className="p-6 text-destructive">
-                  Failed to load dynamic config history.
-                </CardContent>
-              </Card>
-            ) : dynamicHistory.length === 0 ? (
-              <Card>
-                <CardContent className="p-10 text-center text-muted-foreground">
-                  No dynamic tuner history yet.
-                </CardContent>
-              </Card>
-            ) : (
-              <>
+              <TabsContent value="trades" className="mt-4">
                 <Card>
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                      <SlidersHorizontal className="h-4 w-4" />
-                      Dynamic Config Changes
+                      <LineChart className="h-5 w-5" />
+                      Recent Trade Events
                     </CardTitle>
                   </CardHeader>
                   <CardContent>
-                    <div className="overflow-x-auto pb-1">
-                      <table className="w-full min-w-[920px]">
-                        <thead className="border-b bg-muted/50">
-                          <tr>
-                            <th className="p-3 text-left text-xs font-medium">Key</th>
-                            <th className="p-3 text-left text-xs font-medium">Action</th>
-                            <th className="p-3 text-left text-xs font-medium">Old → New</th>
-                            <th className="p-3 text-left text-xs font-medium">Reason</th>
-                            <th className="p-3 text-left text-xs font-medium">Snapshot</th>
-                            <th className="p-3 text-left text-xs font-medium">Outcome</th>
-                            <th className="p-3 text-right text-xs font-medium">Time</th>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left">
+                        <thead>
+                          <tr className="border-b text-xs text-muted-foreground">
+                            <th className="px-3 py-2">Time</th>
+                            <th className="px-3 py-2">Strategy</th>
+                            <th className="px-3 py-2">Event</th>
+                            <th className="px-3 py-2">Market</th>
+                            <th className="px-3 py-2">Reason</th>
+                            <th className="px-3 py-2 text-right">P&amp;L</th>
                           </tr>
                         </thead>
                         <tbody>
-                          {dynamicHistory.map((entry) => (
-                            <tr key={entry.id} className="border-b align-top hover:bg-muted/20">
-                              <td className="p-3 font-mono text-xs">
-                                {formatDynamicKey(entry.config_key)}
+                          {accountHistory.recent_trade_events.map((event) => (
+                            <tr key={event.id} className="border-b last:border-b-0">
+                              <td className="px-3 py-3 text-sm text-muted-foreground">
+                                {formatTimeAgo(event.occurred_at)}
                               </td>
-                              <td className="p-3">
-                                <span
-                                  className={cn(
-                                    "rounded border px-2 py-0.5 text-xs",
-                                    dynamicActionClass(entry.action),
-                                  )}
-                                >
-                                  {entry.action}
-                                </span>
+                              <td className="px-3 py-3 text-sm">
+                                <div className="font-medium">{event.strategy}</div>
+                                <div className="text-xs text-muted-foreground">
+                                  {event.source} · {event.execution_mode}
+                                </div>
                               </td>
-                              <td className="p-3 text-xs tabular-nums">
-                                {formatDynamicConfigValue(entry.config_key, entry.old_value)} →{" "}
-                                {formatDynamicConfigValue(entry.config_key, entry.new_value)}
+                              <td className="px-3 py-3 text-sm">
+                                <Badge variant="outline">{event.event_type}</Badge>
                               </td>
-                              <td className="max-w-[280px] p-3 text-xs break-words">{entry.reason}</td>
-                              <td className="p-3 text-xs text-muted-foreground">
-                                fill={metricValue(entry.metrics_snapshot, "successful_fill_rate")}
-                                <br />
-                                slip_p90={metricValue(entry.metrics_snapshot, "realized_slippage_p90")}
-                                <br />
-                                pnl={metricValue(entry.metrics_snapshot, "recent_pnl")}
+                              <td className="px-3 py-3 text-sm font-mono text-xs">
+                                {event.market_id.slice(0, 16)}...
                               </td>
-                              <td className="p-3 text-xs text-muted-foreground">
-                                fill={metricValue(entry.outcome_metrics, "successful_fill_rate")}
-                                <br />
-                                pnl={metricValue(entry.outcome_metrics, "recent_pnl")}
-                                <br />
-                                dd={metricValue(entry.outcome_metrics, "recent_drawdown")}
+                              <td className="px-3 py-3 text-sm text-muted-foreground">
+                                {event.reason ?? "—"}
                               </td>
-                              <td className="p-3 text-right text-xs text-muted-foreground">
-                                <div>{new Date(entry.created_at).toLocaleString()}</div>
-                                <div>{formatTimeAgo(entry.created_at)}</div>
+                              <td className="px-3 py-3 text-right text-sm tabular-nums">
+                                {event.realized_pnl != null
+                                  ? formatCurrency(event.realized_pnl, { showSign: true })
+                                  : event.unrealized_pnl != null
+                                    ? formatCurrency(event.unrealized_pnl, { showSign: true })
+                                    : "—"}
                               </td>
                             </tr>
                           ))}
@@ -460,36 +275,165 @@ export default function HistoryPage() {
                     </div>
                   </CardContent>
                 </Card>
+              </TabsContent>
 
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-sm text-muted-foreground">
-                    Page {dynamicPage + 1} &middot; {dynamicHistory.length} records
-                  </p>
-                  <div className="flex gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={dynamicPage === 0}
-                      onClick={() => setDynamicPage((page) => page - 1)}
-                    >
-                      <ChevronLeft className="h-4 w-4 mr-1" />
-                      Prev
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={dynamicHistory.length < PAGE_SIZE}
-                      onClick={() => setDynamicPage((page) => page + 1)}
-                    >
-                      Next
-                      <ChevronRight className="h-4 w-4 ml-1" />
-                    </Button>
-                  </div>
-                </div>
-              </>
-            )}
-          </TabsContent>
-        </Tabs>
+              <TabsContent value="cash_flows" className="mt-4 space-y-4">
+                {canManageCashFlows && (
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center gap-2">
+                        <Wallet className="h-5 w-5" />
+                        Record Cash Flow
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="grid gap-3 md:grid-cols-2">
+                      <label className="space-y-2 text-sm">
+                        <span className="font-medium">Type</span>
+                        <select
+                          value={cashFlowType}
+                          onChange={(e) => setCashFlowType(e.target.value)}
+                          className="w-full rounded border bg-background px-3 py-2"
+                        >
+                          <option value="deposit">Deposit</option>
+                          <option value="withdrawal">Withdrawal</option>
+                          <option value="transfer">Transfer</option>
+                          <option value="fee">Fee</option>
+                          <option value="adjustment">Adjustment</option>
+                        </select>
+                      </label>
+                      <label className="space-y-2 text-sm">
+                        <span className="font-medium">Amount</span>
+                        <Input
+                          value={cashFlowAmount}
+                          onChange={(e) => setCashFlowAmount(e.target.value)}
+                          placeholder="100 or -25"
+                        />
+                      </label>
+                      <label className="space-y-2 text-sm">
+                        <span className="font-medium">Occurred At</span>
+                        <Input
+                          type="datetime-local"
+                          value={cashFlowOccurredAt}
+                          onChange={(e) => setCashFlowOccurredAt(e.target.value)}
+                        />
+                      </label>
+                      <label className="space-y-2 text-sm">
+                        <span className="font-medium">Note</span>
+                        <Input
+                          value={cashFlowNote}
+                          onChange={(e) => setCashFlowNote(e.target.value)}
+                          placeholder="Top-up, manual withdrawal, fee adjustment..."
+                        />
+                      </label>
+                      <div className="md:col-span-2">
+                        <Button
+                          onClick={handleCreateCashFlow}
+                          disabled={createCashFlowMutation.isPending}
+                        >
+                          {createCashFlowMutation.isPending
+                            ? "Recording..."
+                            : "Record Cash Flow"}
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                      <Landmark className="h-5 w-5" />
+                      Cash Flow Ledger
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left">
+                        <thead>
+                          <tr className="border-b text-xs text-muted-foreground">
+                            <th className="px-3 py-2">Time</th>
+                            <th className="px-3 py-2">Type</th>
+                            <th className="px-3 py-2">Note</th>
+                            <th className="px-3 py-2 text-right">Amount</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {accountHistory.cash_flows.map((flow) => (
+                            <tr key={flow.id} className="border-b last:border-b-0">
+                              <td className="px-3 py-3 text-sm text-muted-foreground">
+                                {formatTimeAgo(flow.occurred_at)}
+                              </td>
+                              <td className="px-3 py-3 text-sm font-medium">
+                                {cashFlowLabel(flow.event_type)}
+                              </td>
+                              <td className="px-3 py-3 text-sm text-muted-foreground">
+                                {flow.note ?? "—"}
+                              </td>
+                              <td className="px-3 py-3 text-right text-sm tabular-nums">
+                                {formatCurrency(flow.amount, { showSign: true })}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+
+              <TabsContent value="dynamic" className="mt-4">
+                {dynamicLoading ? (
+                  <PositionTableSkeleton rows={8} />
+                ) : dynamicError ? (
+                  <Card>
+                    <CardContent className="p-12 text-center">
+                      <p className="text-destructive">Failed to load dynamic config history.</p>
+                    </CardContent>
+                  </Card>
+                ) : (
+                  <Card>
+                    <CardHeader>
+                      <CardTitle className="flex items-center gap-2">
+                        <SlidersHorizontal className="h-5 w-5" />
+                        Dynamic Config History
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="space-y-3">
+                        {dynamicHistory.map((entry) => (
+                          <div key={entry.id} className="rounded-lg border p-4">
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <Badge variant="outline">{entry.action}</Badge>
+                                  <span className="text-sm text-muted-foreground">
+                                    {formatTimeAgo(entry.created_at)}
+                                  </span>
+                                </div>
+                                <p className="mt-2 text-sm font-medium">
+                                  {formatDynamicKey(entry.config_key)}
+                                </p>
+                                <p className="text-sm text-muted-foreground">
+                                  {formatDynamicConfigValue(entry.config_key, entry.old_value)} →{" "}
+                                  {formatDynamicConfigValue(entry.config_key, entry.new_value)}
+                                </p>
+                                {entry.reason && (
+                                  <p className="mt-2 text-xs text-muted-foreground">
+                                    {entry.reason}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
+              </TabsContent>
+            </Tabs>
+          </>
+        )}
       </div>
     </ErrorBoundary>
   );
