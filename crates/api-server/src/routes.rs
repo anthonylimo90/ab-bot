@@ -107,6 +107,7 @@ use crate::websocket;
         trade_flow::get_trade_flow_summary,
         trade_flow::get_trade_flow_journeys,
         trade_flow::get_market_trade_flow,
+        trade_flow::get_arb_market_scorecard,
         // Risk monitoring
         risk::get_risk_status,
         risk::manual_trip_circuit_breaker,
@@ -220,6 +221,8 @@ use crate::websocket;
             trade_flow::TradeFlowStrategySummary,
             trade_flow::TradeJourneyResponse,
             trade_flow::TradeFlowMarketResponse,
+            trade_flow::ArbMarketScorecardResponse,
+            trade_flow::ArbMarketScorecardItem,
             // Risk monitoring
             risk::RiskStatusResponse,
             risk::CircuitBreakerResponse,
@@ -459,6 +462,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/trade-flow/markets/:market_id",
             get(trade_flow::get_market_trade_flow),
+        )
+        .route(
+            "/api/v1/trade-flow/strategies/arb/scorecard",
+            get(trade_flow::get_arb_market_scorecard),
         )
         // Risk monitoring (read-only for all members)
         .route(

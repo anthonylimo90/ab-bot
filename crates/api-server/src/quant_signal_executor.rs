@@ -1195,6 +1195,7 @@ impl TradeEventBuilderExt for NewTradeEvent {
         self.signal_id = Some(signal.id);
         self.direction = Some(signal.direction.as_str().to_string());
         self.confidence = Some(signal.confidence);
+        self.expected_edge = expected_edge_from_signal(signal);
         self
     }
 
@@ -1238,6 +1239,14 @@ impl TradeEventBuilderExt for NewTradeEvent {
         self.metadata = metadata;
         self
     }
+}
+
+fn expected_edge_from_signal(signal: &QuantSignal) -> Option<Decimal> {
+    signal
+        .metadata
+        .get("expected_edge_bps")
+        .and_then(|value| value.as_f64())
+        .and_then(Decimal::from_f64_retain)
 }
 
 #[cfg(test)]
@@ -1316,5 +1325,45 @@ mod tests {
             + config.mean_reversion_allocation_pct
             + config.resolution_allocation_pct;
         assert!((total - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_expected_edge_from_signal_metadata() {
+        let signal = QuantSignal::new(
+            QuantSignalKind::Flow,
+            "0x1234".to_string(),
+            SignalDirection::BuyYes,
+            0.82,
+            Decimal::new(30, 0),
+            Utc::now() + chrono::Duration::minutes(15),
+        )
+        .with_metadata(serde_json::json!({
+            "expected_edge_bps": 67.5
+        }));
+
+        assert_eq!(
+            expected_edge_from_signal(&signal),
+            Decimal::from_f64_retain(67.5)
+        );
+    }
+
+    #[test]
+    fn test_with_signal_sets_expected_edge() {
+        let signal = QuantSignal::new(
+            QuantSignalKind::Flow,
+            "0x1234".to_string(),
+            SignalDirection::BuyYes,
+            0.82,
+            Decimal::new(30, 0),
+            Utc::now() + chrono::Duration::minutes(15),
+        )
+        .with_metadata(serde_json::json!({
+            "expected_edge_bps": 52.0
+        }));
+
+        let event = NewTradeEvent::new("flow", "paper", "quant", "0x1234", "signal_generated")
+            .with_signal(&signal);
+
+        assert_eq!(event.expected_edge, Decimal::from_f64_retain(52.0));
     }
 }

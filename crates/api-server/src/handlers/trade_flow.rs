@@ -101,6 +101,43 @@ pub struct TradeFlowMarketResponse {
     pub journeys: Vec<TradeJourneyResponse>,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbMarketScorecardItem {
+    pub market_id: String,
+    pub signals_generated: i64,
+    pub signals_skipped: i64,
+    pub executed_positions: i64,
+    pub entry_failed_positions: i64,
+    pub closed_positions: i64,
+    pub wins: i64,
+    pub losses: i64,
+    pub win_rate: Decimal,
+    pub total_expected_edge: Decimal,
+    pub total_observed_edge: Decimal,
+    pub total_realized_pnl: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_expected_edge: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_observed_edge: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_realized_pnl: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_capture_ratio: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_hold_hours: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_filled_size_usd: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_traded_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbMarketScorecardResponse {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub markets: Vec<ArbMarketScorecardItem>,
+}
+
 #[derive(Debug, FromRow)]
 struct StrategySummaryRow {
     strategy: String,
@@ -142,11 +179,224 @@ struct TradeJourneyRow {
     synthetic_history: bool,
 }
 
+#[derive(Debug, FromRow)]
+struct ArbMarketScorecardRow {
+    market_id: String,
+    signals_generated: i64,
+    signals_skipped: i64,
+    executed_positions: i64,
+    entry_failed_positions: i64,
+    closed_positions: i64,
+    wins: i64,
+    losses: i64,
+    win_rate: Decimal,
+    total_expected_edge: Decimal,
+    total_observed_edge: Decimal,
+    total_realized_pnl: Decimal,
+    avg_expected_edge: Option<Decimal>,
+    avg_observed_edge: Option<Decimal>,
+    avg_realized_pnl: Option<Decimal>,
+    edge_capture_ratio: Option<Decimal>,
+    avg_hold_hours: Option<f64>,
+    avg_filled_size_usd: Option<Decimal>,
+    last_traded_at: Option<DateTime<Utc>>,
+}
+
 fn effective_window(query: &TradeFlowQuery) -> (DateTime<Utc>, DateTime<Utc>, i64) {
     let to = query.to.unwrap_or_else(Utc::now);
     let from = query.from.unwrap_or_else(|| to - Duration::days(7));
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     (from, to, limit)
+}
+
+async fn load_arb_market_scorecard_rows(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    market_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ArbMarketScorecardItem>, sqlx::Error> {
+    let rows: Vec<ArbMarketScorecardRow> = sqlx::query_as(
+        r#"
+        WITH filtered AS (
+            SELECT *
+            FROM trade_events
+            WHERE strategy = 'arb'
+              AND occurred_at >= $1
+              AND occurred_at <= $2
+              AND ($3::text IS NULL OR market_id = $3)
+        ),
+        markets AS (
+            SELECT DISTINCT market_id
+            FROM filtered
+            WHERE market_id IS NOT NULL
+        ),
+        entry_events AS (
+            SELECT
+                market_id,
+                position_id,
+                MAX(expected_edge) FILTER (WHERE expected_edge IS NOT NULL) AS expected_edge,
+                MAX(observed_edge) FILTER (WHERE observed_edge IS NOT NULL) AS observed_edge,
+                MAX(filled_size_usd) FILTER (WHERE filled_size_usd IS NOT NULL) AS filled_size_usd,
+                MAX(occurred_at) FILTER (
+                    WHERE event_type IN ('entry_filled', 'position_open')
+                       OR state_to = 'open'
+                ) AS traded_at
+            FROM filtered
+            WHERE position_id IS NOT NULL
+            GROUP BY market_id, position_id
+        ),
+        close_events AS (
+            SELECT DISTINCT ON (position_id)
+                market_id,
+                position_id,
+                realized_pnl,
+                occurred_at AS closed_at
+            FROM filtered
+            WHERE position_id IS NOT NULL
+              AND (
+                    event_type IN ('position_closed', 'closed_via_resolution')
+                    OR state_to = 'closed'
+                  )
+            ORDER BY position_id, occurred_at DESC
+        ),
+        open_events AS (
+            SELECT
+                market_id,
+                position_id,
+                MIN(occurred_at) AS opened_at
+            FROM filtered
+            WHERE position_id IS NOT NULL
+              AND (event_type = 'position_open' OR state_to = 'open')
+            GROUP BY market_id, position_id
+        ),
+        skipped AS (
+            SELECT market_id, COUNT(*)::bigint AS signals_skipped
+            FROM filtered
+            WHERE event_type = 'signal_skipped'
+            GROUP BY market_id
+        ),
+        generated AS (
+            SELECT market_id, COUNT(*)::bigint AS signals_generated
+            FROM filtered
+            WHERE event_type = 'signal_generated'
+            GROUP BY market_id
+        ),
+        failures AS (
+            SELECT market_id, COUNT(DISTINCT position_id)::bigint AS entry_failed_positions
+            FROM filtered
+            WHERE event_type = 'position_failed'
+              AND position_id IS NOT NULL
+            GROUP BY market_id
+        ),
+        per_position AS (
+            SELECT
+                e.market_id,
+                e.position_id,
+                e.expected_edge,
+                e.observed_edge,
+                e.filled_size_usd,
+                e.traded_at,
+                c.realized_pnl,
+                c.closed_at,
+                o.opened_at
+            FROM entry_events e
+            LEFT JOIN close_events c
+                ON c.position_id = e.position_id
+            LEFT JOIN open_events o
+                ON o.position_id = e.position_id
+        ),
+        positions_agg AS (
+            SELECT
+                p.market_id,
+                COUNT(DISTINCT p.position_id)::bigint AS executed_positions,
+                COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL)::bigint AS closed_positions,
+                COUNT(DISTINCT p.position_id) FILTER (WHERE p.realized_pnl > 0)::bigint AS wins,
+                COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL AND COALESCE(p.realized_pnl, 0) <= 0)::bigint AS losses,
+                CASE
+                    WHEN COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL) = 0 THEN 0
+                    ELSE (
+                        COUNT(DISTINCT p.position_id) FILTER (WHERE p.realized_pnl > 0)::numeric /
+                        COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL)::numeric
+                    )
+                END AS win_rate,
+                COALESCE(SUM(p.expected_edge), 0) AS total_expected_edge,
+                COALESCE(SUM(p.observed_edge), 0) AS total_observed_edge,
+                COALESCE(SUM(p.realized_pnl), 0) AS total_realized_pnl,
+                AVG(p.expected_edge) AS avg_expected_edge,
+                AVG(p.observed_edge) AS avg_observed_edge,
+                AVG(p.realized_pnl) FILTER (WHERE p.closed_at IS NOT NULL) AS avg_realized_pnl,
+                COALESCE(SUM(p.expected_edge) FILTER (WHERE p.closed_at IS NOT NULL), 0) AS closed_expected_edge,
+                AVG(EXTRACT(EPOCH FROM (p.closed_at - p.opened_at)) / 3600.0)
+                    FILTER (WHERE p.closed_at IS NOT NULL AND p.opened_at IS NOT NULL) AS avg_hold_hours,
+                AVG(p.filled_size_usd) AS avg_filled_size_usd,
+                MAX(COALESCE(p.closed_at, p.traded_at, p.opened_at)) AS last_traded_at
+            FROM per_position p
+            GROUP BY p.market_id
+        )
+        SELECT
+            m.market_id,
+            COALESCE(g.signals_generated, 0) AS signals_generated,
+            COALESCE(s.signals_skipped, 0) AS signals_skipped,
+            COALESCE(pa.executed_positions, 0) AS executed_positions,
+            COALESCE(f.entry_failed_positions, 0) AS entry_failed_positions,
+            COALESCE(pa.closed_positions, 0) AS closed_positions,
+            COALESCE(pa.wins, 0) AS wins,
+            COALESCE(pa.losses, 0) AS losses,
+            COALESCE(pa.win_rate, 0) AS win_rate,
+            COALESCE(pa.total_expected_edge, 0) AS total_expected_edge,
+            COALESCE(pa.total_observed_edge, 0) AS total_observed_edge,
+            COALESCE(pa.total_realized_pnl, 0) AS total_realized_pnl,
+            pa.avg_expected_edge,
+            pa.avg_observed_edge,
+            pa.avg_realized_pnl,
+            CASE
+                WHEN COALESCE(pa.closed_expected_edge, 0) = 0 THEN NULL
+                ELSE COALESCE(pa.total_realized_pnl, 0) / NULLIF(pa.closed_expected_edge, 0)
+            END AS edge_capture_ratio,
+            pa.avg_hold_hours,
+            pa.avg_filled_size_usd,
+            pa.last_traded_at
+        FROM markets m
+        LEFT JOIN positions_agg pa ON pa.market_id = m.market_id
+        LEFT JOIN generated g ON g.market_id = m.market_id
+        LEFT JOIN skipped s ON s.market_id = m.market_id
+        LEFT JOIN failures f ON f.market_id = m.market_id
+        ORDER BY COALESCE(pa.total_realized_pnl, 0) DESC, m.market_id
+        LIMIT $4
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .bind(market_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbMarketScorecardItem {
+            market_id: row.market_id,
+            signals_generated: row.signals_generated,
+            signals_skipped: row.signals_skipped,
+            executed_positions: row.executed_positions,
+            entry_failed_positions: row.entry_failed_positions,
+            closed_positions: row.closed_positions,
+            wins: row.wins,
+            losses: row.losses,
+            win_rate: row.win_rate,
+            total_expected_edge: row.total_expected_edge,
+            total_observed_edge: row.total_observed_edge,
+            total_realized_pnl: row.total_realized_pnl,
+            avg_expected_edge: row.avg_expected_edge,
+            avg_observed_edge: row.avg_observed_edge,
+            avg_realized_pnl: row.avg_realized_pnl,
+            edge_capture_ratio: row.edge_capture_ratio,
+            avg_hold_hours: row.avg_hold_hours,
+            avg_filled_size_usd: row.avg_filled_size_usd,
+            last_traded_at: row.last_traded_at,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1063,6 +1313,35 @@ pub async fn get_market_trade_flow(
         ),
         journeys: merge_journeys(canonical_journeys, fallback_journeys, from, limit),
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/trade-flow/strategies/arb/scorecard",
+    params(TradeFlowQuery),
+    responses(
+        (status = 200, description = "Arbitrage market scorecard", body = ArbMarketScorecardResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "trade_flow"
+)]
+pub async fn get_arb_market_scorecard(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TradeFlowQuery>,
+) -> ApiResult<Json<ArbMarketScorecardResponse>> {
+    let (from, to, limit) = effective_window(&query);
+    if matches!(query.strategy.as_deref(), Some(strategy) if strategy != "arb") {
+        return Ok(Json(ArbMarketScorecardResponse {
+            from,
+            to,
+            markets: Vec::new(),
+        }));
+    }
+    let markets = load_arb_market_scorecard_rows(&state.pool, from, to, None, limit)
+        .await
+        .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
+
+    Ok(Json(ArbMarketScorecardResponse { from, to, markets }))
 }
 
 #[cfg(test)]

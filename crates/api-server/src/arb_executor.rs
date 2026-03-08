@@ -1004,6 +1004,12 @@ impl ArbAutoExecutor {
             return Ok(());
         }
 
+        let actual_fill_cost = yes_report.total_value() + no_report.total_value();
+        let modeled_fill_cost = arb.total_cost * quantity;
+        let actual_resolution_payout = position.resolution_payout_per_share * quantity;
+        let observed_net = actual_resolution_payout - actual_fill_cost;
+        let execution_slippage = actual_fill_cost - modeled_fill_cost;
+
         self.trade_event_recorder
             .record_warn(
                 NewTradeEvent::new(
@@ -1016,8 +1022,9 @@ impl ArbAutoExecutor {
                 .with_position(position.id)
                 .with_state(Some("pending"), Some("pending"))
                 .with_expected_edge(expected_net)
+                .with_observed_edge(observed_net)
                 .with_requested_size(position_size)
-                .with_filled_size(yes_report.total_value() + no_report.total_value())
+                .with_filled_size(actual_fill_cost)
                 .with_fill_price(
                     (yes_report.average_price + no_report.average_price) / Decimal::new(2, 0),
                 )
@@ -1025,6 +1032,9 @@ impl ArbAutoExecutor {
                     "yes_fill_price": yes_report.average_price.to_string(),
                     "no_fill_price": no_report.average_price.to_string(),
                     "quantity": quantity.to_string(),
+                    "modeled_fill_cost": modeled_fill_cost.to_string(),
+                    "actual_fill_cost": actual_fill_cost.to_string(),
+                    "execution_slippage": execution_slippage.to_string(),
                 })),
             )
             .await;
@@ -1049,11 +1059,15 @@ impl ArbAutoExecutor {
                 .with_position(position.id)
                 .with_state(Some("pending"), Some("open"))
                 .with_expected_edge(expected_net)
+                .with_observed_edge(observed_net)
                 .with_requested_size(position_size)
-                .with_filled_size(yes_report.total_value() + no_report.total_value())
+                .with_filled_size(actual_fill_cost)
                 .with_metadata(serde_json::json!({
                     "quantity": quantity.to_string(),
                     "total_cost": arb.total_cost.to_string(),
+                    "modeled_fill_cost": modeled_fill_cost.to_string(),
+                    "actual_fill_cost": actual_fill_cost.to_string(),
+                    "execution_slippage": execution_slippage.to_string(),
                 })),
             )
             .await;
