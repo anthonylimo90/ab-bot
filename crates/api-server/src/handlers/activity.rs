@@ -49,7 +49,7 @@ fn source_label(source: i16) -> &'static str {
     match source {
         1 => "arbitrage",
         2 => "legacy",
-        3 => "stop_loss",
+        3 => "quant",
         _ => "manual",
     }
 }
@@ -74,7 +74,13 @@ fn classify_activity_type(source: i16, status: i16, side: i16) -> &'static str {
             _ => "ARBITRAGE_DETECTED",
         },
         3 => match status {
-            3 => "STOP_LOSS_TRIGGERED",
+            3 => {
+                if side == 0 {
+                    "POSITION_OPENED"
+                } else {
+                    "POSITION_CLOSED"
+                }
+            }
             4..=6 => "TRADE_FAILED",
             _ => "TRADE_PENDING",
         },
@@ -136,18 +142,27 @@ fn build_activity_message(
             _ => format!("Arbitrage activity on {}", market_short),
         },
         3 => match status {
-            3 => format!(
-                "Risk exit executed on {} qty={} @ ${}",
-                market_short, filled_quantity, average_price
-            ),
+            3 => {
+                if side == 0 {
+                    format!(
+                        "Quant position opened on {} qty={} @ ${}",
+                        market_short, filled_quantity, average_price
+                    )
+                } else {
+                    format!(
+                        "Quant position closed on {} qty={} @ ${}",
+                        market_short, filled_quantity, average_price
+                    )
+                }
+            }
             4..=6 => format!(
-                "Risk exit failed on {}{}",
+                "Quant trade failed on {}{}",
                 market_short,
                 error_message
                     .map(|error| format!(": {error}"))
                     .unwrap_or_default(),
             ),
-            _ => format!("Risk exit pending on {}", market_short),
+            _ => format!("Quant trade pending on {}", market_short),
         },
         _ => match status {
             3 => format!(

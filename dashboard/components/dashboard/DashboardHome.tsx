@@ -6,6 +6,7 @@ import {
   usePositionsQuery,
   usePositionsSummaryQuery,
 } from "@/hooks/queries/usePositionsQuery";
+import { useTradeFlowSummaryQuery } from "@/hooks/queries/useTradeFlowQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useRiskStatusQuery, useDynamicTunerQuery } from "@/hooks/queries/useRiskQuery";
@@ -69,6 +70,7 @@ export function DashboardHome() {
   const { data: positionsSummary } = usePositionsSummaryQuery();
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
+  const { data: tradeFlowSummary } = useTradeFlowSummaryQuery({ limit: 100 });
   const { data: closedPositions = [] } = usePositionsQuery({
     status: "closed",
     limit: 500,
@@ -206,6 +208,49 @@ export function DashboardHome() {
                   </span>
                 </div>
               )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {tradeFlowSummary && (
+        <Card>
+          <CardContent className="p-4">
+            <div className="grid gap-3 md:grid-cols-4">
+              <div>
+                <p className="text-xs text-muted-foreground">Trade Flow Conversion</p>
+                <p className="text-lg font-semibold tabular-nums">
+                  {tradeFlowSummary.total_generated_signals > 0
+                    ? `${((tradeFlowSummary.total_executed_signals / tradeFlowSummary.total_generated_signals) * 100).toFixed(1)}%`
+                    : "—"}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Exit Ready</p>
+                <p className="text-lg font-semibold tabular-nums">
+                  {tradeFlowSummary.total_exit_ready_positions}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Failed Positions</p>
+                <p className="text-lg font-semibold tabular-nums">
+                  {tradeFlowSummary.total_entry_failed_positions +
+                    tradeFlowSummary.total_exit_failed_positions}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Realized P&L Window</p>
+                <p
+                  className={cn(
+                    "text-lg font-semibold tabular-nums",
+                    tradeFlowSummary.total_realized_pnl >= 0 ? "text-profit" : "text-loss",
+                  )}
+                >
+                  {formatCurrency(tradeFlowSummary.total_realized_pnl, {
+                    showSign: true,
+                  })}
+                </p>
+              </div>
             </div>
           </CardContent>
         </Card>

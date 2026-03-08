@@ -37,7 +37,9 @@ pub mod runtime_sync;
 pub mod schema;
 pub mod signals;
 pub mod state;
+pub mod strategy_modes;
 pub mod strategy_pnl_calculator;
+pub mod trade_events;
 pub mod wallet_harvester;
 pub mod websocket;
 
@@ -141,6 +143,7 @@ impl ApiServer {
         let (orderbook_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (position_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
+        let (trade_event_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (arb_entry_tx, _) = broadcast::channel(config.ws_channel_capacity);
         let (quant_signal_tx, _) = broadcast::channel(config.ws_channel_capacity);
 
@@ -151,6 +154,7 @@ impl ApiServer {
             orderbook_tx,
             position_tx,
             signal_tx,
+            trade_event_tx,
             arb_entry_tx,
             quant_signal_tx,
         )
@@ -204,6 +208,9 @@ impl ApiServer {
         }
         let exit_config_arc = Arc::new(RwLock::new(exit_config_pre));
         self.state.exit_handler_config = Some(exit_config_arc.clone());
+
+        let quant_config = Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env()));
+        self.state.quant_executor_config = Some(quant_config.clone());
 
         // ── Wrap state in Arc and build router ──
         let state = Arc::new(self.state);
@@ -267,6 +274,7 @@ impl ApiServer {
             arb_config_arc.clone(),
             state.subscribe_arb_entry(),
             state.signal_tx.clone(),
+            state.trade_event_tx.clone(),
             state.order_executor.clone(),
             state.circuit_breaker.clone(),
             state.clob_client.clone(),
@@ -287,13 +295,11 @@ impl ApiServer {
             state.circuit_breaker.clone(),
             state.clob_client.clone(),
             state.signal_tx.clone(),
+            state.trade_event_tx.clone(),
             state.pool.clone(),
             arb_dedup.clone(),
             state.exit_handler_heartbeat.clone(),
         );
-
-        // Quant executor config is shared with the dynamic config subscriber.
-        let quant_config = Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env()));
 
         // Subscribe local runtime to dynamic updates (arb executor config knobs)
         let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
@@ -338,6 +344,7 @@ impl ApiServer {
             quant_config,
             state.quant_signal_tx.subscribe(),
             state.signal_tx.clone(),
+            state.trade_event_tx.clone(),
             state.order_executor.clone(),
             state.circuit_breaker.clone(),
             state.clob_client.clone(),

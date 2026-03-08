@@ -19,8 +19,7 @@ export function isArbitrageActivity(activity: ActivityLike) {
 export function isRiskActivity(activity: ActivityLike) {
   return (
     activity.type === "STOP_LOSS_TRIGGERED" ||
-    activity.type === "TAKE_PROFIT_TRIGGERED" ||
-    sourceOf(activity) === "stop_loss"
+    activity.type === "TAKE_PROFIT_TRIGGERED"
   );
 }
 

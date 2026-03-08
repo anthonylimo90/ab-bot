@@ -22,6 +22,7 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
+use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
 /// Configuration for the arb auto-executor (env-var driven).
@@ -378,6 +379,7 @@ pub struct ArbAutoExecutor {
     pool: PgPool,
     position_repo: PositionRepository,
     token_cache: OutcomeTokenCache,
+    trade_event_recorder: TradeEventRecorder,
     /// Set of market IDs with active positions (for deduplication).
     /// Shared with ExitHandler so closed positions unblock their markets.
     active_markets: Arc<RwLock<HashSet<String>>>,
@@ -394,6 +396,7 @@ impl ArbAutoExecutor {
         config: Arc<RwLock<ArbExecutorConfig>>,
         arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
         clob_client: Arc<ClobClient>,
@@ -411,7 +414,9 @@ impl ArbAutoExecutor {
             circuit_breaker,
             pool: pool.clone(),
             position_repo: PositionRepository::new(pool.clone()),
-            token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool),
+            token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets)
+                .with_pool(pool.clone()),
+            trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             active_markets,
             heartbeat,
             runtime_status,
@@ -596,6 +601,7 @@ impl ArbAutoExecutor {
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
         let cfg = self.snapshot_config().await;
         let live_ready = self.order_executor.is_live_ready().await;
+        let execution_mode = if live_ready { "live" } else { "paper" };
         {
             let mut runtime = self.runtime_status.write().await;
             runtime.enabled = cfg.enabled;
@@ -626,11 +632,34 @@ impl ArbAutoExecutor {
             .await;
         });
 
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode,
+                    "arb",
+                    arb.market_id.clone(),
+                    "signal_generated",
+                )
+                .with_expected_edge(arb.net_profit)
+                .with_observed_edge(arb.gross_profit)
+                .with_metadata(serde_json::json!({
+                    "yes_ask": arb.yes_ask.to_string(),
+                    "no_ask": arb.no_ask.to_string(),
+                    "total_cost": arb.total_cost.to_string(),
+                    "gross_profit": arb.gross_profit.to_string(),
+                    "net_profit": arb.net_profit.to_string(),
+                })),
+            )
+            .await;
+
         // Per-signal guard: skip processing when disabled at runtime
         if !cfg.enabled {
             let mut runtime = self.runtime_status.write().await;
             runtime.disabled_skips = runtime.disabled_skips.saturating_add(1);
             runtime.record_decision(&arb.market_id, "skipped: executor disabled");
+            self.record_skip_event(&arb, execution_mode, "executor_disabled")
+                .await;
             return Ok(());
         }
 
@@ -656,6 +685,8 @@ impl ArbAutoExecutor {
                 max = cfg.max_signal_age_secs,
                 "Arb signal too stale, skipping"
             );
+            self.record_skip_event(&arb, execution_mode, "too_stale")
+                .await;
             return Ok(());
         }
 
@@ -676,6 +707,8 @@ impl ArbAutoExecutor {
                 min = %cfg.min_net_profit,
                 "Arb signal below min profit threshold, skipping"
             );
+            self.record_skip_event(&arb, execution_mode, "below_min_profit")
+                .await;
             return Ok(());
         }
 
@@ -687,6 +720,8 @@ impl ArbAutoExecutor {
                 runtime.active_position_skips = runtime.active_position_skips.saturating_add(1);
                 runtime.record_decision(market_id, "skipped: active position exists");
                 info!(market_id = %market_id, "Active position exists, skipping");
+                self.record_skip_event(&arb, execution_mode, "active_position_exists")
+                    .await;
                 return Ok(());
             }
         }
@@ -697,6 +732,8 @@ impl ArbAutoExecutor {
             runtime.circuit_breaker_skips = runtime.circuit_breaker_skips.saturating_add(1);
             runtime.record_decision(market_id, "skipped: circuit breaker tripped");
             warn!(market_id = %market_id, "Circuit breaker tripped, skipping arb trade");
+            self.record_skip_event(&arb, execution_mode, "circuit_breaker")
+                .await;
             return Ok(());
         }
 
@@ -718,6 +755,8 @@ impl ArbAutoExecutor {
                             "skipped: token lookup failed after single-market hydration",
                         );
                         warn!(market_id = %market_id, "Market not found after single-market hydration, skipping");
+                        self.record_skip_event(&arb, execution_mode, "token_lookup_failed")
+                            .await;
                         return Ok(());
                     }
                     Err(e) => {
@@ -728,6 +767,8 @@ impl ArbAutoExecutor {
                             format!("skipped: token cache hydration failed: {e}"),
                         );
                         warn!(market_id = %market_id, error = %e, "Token cache hydration failed");
+                        self.record_skip_event(&arb, execution_mode, "token_lookup_failed")
+                            .await;
                         return Ok(());
                     }
                 }
@@ -768,6 +809,8 @@ impl ArbAutoExecutor {
                         min_depth = %cfg.min_book_depth,
                         "Arb signal insufficient orderbook depth, skipping"
                     );
+                    self.record_skip_event(&arb, execution_mode, "insufficient_depth")
+                        .await;
                     return Ok(());
                 }
             }
@@ -806,6 +849,8 @@ impl ArbAutoExecutor {
             runtime.zero_cost_skips = runtime.zero_cost_skips.saturating_add(1);
             runtime.record_decision(market_id, "skipped: zero total cost");
             warn!(market_id = %market_id, "Zero total_cost, skipping");
+            self.record_skip_event(&arb, execution_mode, "zero_total_cost")
+                .await;
             return Ok(());
         }
         let quantity = position_size / arb.total_cost;
@@ -845,6 +890,28 @@ impl ArbAutoExecutor {
             return Err(anyhow::anyhow!("Failed to persist position: {e}"));
         }
 
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode,
+                    "arb",
+                    market_id.clone(),
+                    "entry_requested",
+                )
+                .with_position(position.id)
+                .with_state(None, Some("pending"))
+                .with_expected_edge(expected_net)
+                .with_requested_size(position_size)
+                .with_metadata(serde_json::json!({
+                    "quantity": quantity.to_string(),
+                    "yes_price": arb.yes_ask.to_string(),
+                    "no_price": arb.no_ask.to_string(),
+                    "total_cost": arb.total_cost.to_string(),
+                })),
+            )
+            .await;
+
         // 9. Execute YES market order
         let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity);
 
@@ -862,6 +929,8 @@ impl ArbAutoExecutor {
                     message: format!("YES order error: {e}"),
                 });
                 let _ = self.position_repo.update(&position).await;
+                self.record_failure_event(execution_mode, market_id, &position, "yes_order_error")
+                    .await;
                 self.publish_failure_signal(market_id, "YES order execution error");
                 return Ok(());
             }
@@ -881,6 +950,8 @@ impl ArbAutoExecutor {
             warn!(market_id = %market_id, reason = %msg, "YES order failed");
             position.mark_entry_failed(FailureReason::OrderRejected { message: msg });
             let _ = self.position_repo.update(&position).await;
+            self.record_failure_event(execution_mode, market_id, &position, "yes_order_rejected")
+                .await;
             self.publish_failure_signal(market_id, "YES order rejected");
             return Ok(());
         }
@@ -900,6 +971,8 @@ impl ArbAutoExecutor {
                     message: format!("NO order error (one-legged, YES filled): {e}"),
                 });
                 let _ = self.position_repo.update(&position).await;
+                self.record_failure_event(execution_mode, market_id, &position, "no_order_error")
+                    .await;
                 self.publish_failure_signal(market_id, "NO order error (one-legged)");
                 return Ok(());
             }
@@ -925,9 +998,36 @@ impl ArbAutoExecutor {
                 message: format!("One-legged: YES filled but NO failed: {msg}"),
             });
             let _ = self.position_repo.update(&position).await;
+            self.record_failure_event(execution_mode, market_id, &position, "no_order_rejected")
+                .await;
             self.publish_failure_signal(market_id, "One-legged position (NO failed)");
             return Ok(());
         }
+
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode,
+                    "arb",
+                    market_id.clone(),
+                    "entry_filled",
+                )
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("pending"))
+                .with_expected_edge(expected_net)
+                .with_requested_size(position_size)
+                .with_filled_size(yes_report.total_value() + no_report.total_value())
+                .with_fill_price(
+                    (yes_report.average_price + no_report.average_price) / Decimal::new(2, 0),
+                )
+                .with_metadata(serde_json::json!({
+                    "yes_fill_price": yes_report.average_price.to_string(),
+                    "no_fill_price": no_report.average_price.to_string(),
+                    "quantity": quantity.to_string(),
+                })),
+            )
+            .await;
 
         // 13. Both filled → mark position OPEN
         if let Err(e) = position.mark_open() {
@@ -936,6 +1036,27 @@ impl ArbAutoExecutor {
         if let Err(e) = self.position_repo.update(&position).await {
             error!(error = %e, "Failed to update position to OPEN");
         }
+
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode,
+                    "arb",
+                    market_id.clone(),
+                    "position_open",
+                )
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("open"))
+                .with_expected_edge(expected_net)
+                .with_requested_size(position_size)
+                .with_filled_size(yes_report.total_value() + no_report.total_value())
+                .with_metadata(serde_json::json!({
+                    "quantity": quantity.to_string(),
+                    "total_cost": arb.total_cost.to_string(),
+                })),
+            )
+            .await;
 
         // Add to dedup set
         self.active_markets.write().await.insert(market_id.clone());
@@ -1001,6 +1122,53 @@ impl ArbAutoExecutor {
         };
         let _ = self.signal_tx.send(signal);
     }
+
+    async fn record_skip_event(&self, arb: &ArbOpportunity, execution_mode: &str, reason: &str) {
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode.to_string(),
+                    "arb",
+                    arb.market_id.clone(),
+                    "signal_skipped",
+                )
+                .with_reason(Some(reason))
+                .with_expected_edge(arb.net_profit)
+                .with_observed_edge(arb.gross_profit)
+                .with_metadata(serde_json::json!({
+                    "yes_ask": arb.yes_ask.to_string(),
+                    "no_ask": arb.no_ask.to_string(),
+                    "total_cost": arb.total_cost.to_string(),
+                })),
+            )
+            .await;
+    }
+
+    async fn record_failure_event(
+        &self,
+        execution_mode: &str,
+        market_id: &str,
+        position: &Position,
+        reason: &str,
+    ) {
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode.to_string(),
+                    "arb",
+                    market_id.to_string(),
+                    "position_failed",
+                )
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("entry_failed"))
+                .with_reason(Some(reason))
+                .with_unrealized_pnl(position.unrealized_pnl)
+                .with_metadata(serde_json::json!({})),
+            )
+            .await;
+    }
 }
 
 /// Spawn the arb auto-executor as a background task.
@@ -1009,6 +1177,7 @@ pub fn spawn_arb_auto_executor(
     config: Arc<RwLock<ArbExecutorConfig>>,
     arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
     clob_client: Arc<ClobClient>,
@@ -1022,6 +1191,7 @@ pub fn spawn_arb_auto_executor(
         config,
         arb_entry_rx,
         signal_tx,
+        trade_event_tx,
         order_executor,
         circuit_breaker,
         clob_client,
@@ -1039,6 +1209,72 @@ pub fn spawn_arb_auto_executor(
     });
 
     info!("Arb auto-executor spawned as background task");
+}
+
+trait ArbTradeEventExt {
+    fn with_position(self, position_id: uuid::Uuid) -> Self;
+    fn with_state(self, from: Option<&str>, to: Option<&str>) -> Self;
+    fn with_reason(self, reason: Option<&str>) -> Self;
+    fn with_expected_edge(self, edge: Decimal) -> Self;
+    fn with_observed_edge(self, edge: Decimal) -> Self;
+    fn with_requested_size(self, size: Decimal) -> Self;
+    fn with_filled_size(self, size: Decimal) -> Self;
+    fn with_fill_price(self, price: Decimal) -> Self;
+    fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
+    fn with_metadata(self, metadata: serde_json::Value) -> Self;
+}
+
+impl ArbTradeEventExt for NewTradeEvent {
+    fn with_position(mut self, position_id: uuid::Uuid) -> Self {
+        self.position_id = Some(position_id);
+        self
+    }
+
+    fn with_state(mut self, from: Option<&str>, to: Option<&str>) -> Self {
+        self.state_from = from.map(str::to_string);
+        self.state_to = to.map(str::to_string);
+        self
+    }
+
+    fn with_reason(mut self, reason: Option<&str>) -> Self {
+        self.reason = reason.map(str::to_string);
+        self
+    }
+
+    fn with_expected_edge(mut self, edge: Decimal) -> Self {
+        self.expected_edge = Some(edge);
+        self
+    }
+
+    fn with_observed_edge(mut self, edge: Decimal) -> Self {
+        self.observed_edge = Some(edge);
+        self
+    }
+
+    fn with_requested_size(mut self, size: Decimal) -> Self {
+        self.requested_size_usd = Some(size);
+        self
+    }
+
+    fn with_filled_size(mut self, size: Decimal) -> Self {
+        self.filled_size_usd = Some(size);
+        self
+    }
+
+    fn with_fill_price(mut self, price: Decimal) -> Self {
+        self.fill_price = Some(price);
+        self
+    }
+
+    fn with_unrealized_pnl(mut self, pnl: Decimal) -> Self {
+        self.unrealized_pnl = Some(pnl);
+        self
+    }
+
+    fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use wallet_tracker::discovery::WalletDiscovery;
 use wallet_tracker::MarketRegime;
 
 use crate::email::{EmailClient, EmailConfig};
+use crate::trade_events::TradeEventUpdate;
 use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 
 async fn resolve_startup_wallet_address(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
@@ -73,6 +74,8 @@ pub struct AppState {
     pub position_tx: broadcast::Sender<PositionUpdate>,
     /// Broadcast channel for trading signals.
     pub signal_tx: broadcast::Sender<SignalUpdate>,
+    /// Broadcast channel for canonical trade lifecycle events.
+    pub trade_event_tx: broadcast::Sender<TradeEventUpdate>,
     /// Broadcast channel for arb entry signals (feeds ArbAutoExecutor).
     pub arb_entry_tx: broadcast::Sender<ArbOpportunity>,
     /// Broadcast channel for quant signals (feeds QuantSignalExecutor).
@@ -93,6 +96,9 @@ pub struct AppState {
     pub arb_executor_status: Arc<RwLock<crate::arb_executor::ArbExecutorRuntimeStatus>>,
     /// Shared exit handler config for runtime hot-swap (None if exit handler disabled).
     pub exit_handler_config: Option<Arc<RwLock<crate::exit_handler::ExitHandlerConfig>>>,
+    /// Shared quant executor config for runtime inspection.
+    pub quant_executor_config:
+        Option<Arc<RwLock<crate::quant_signal_executor::QuantSignalExecutorConfig>>>,
     /// Heartbeat timestamp (epoch secs) from arb executor loop — 0 means never updated.
     pub arb_executor_heartbeat: Arc<AtomicI64>,
     /// Heartbeat timestamp (epoch secs) from exit handler loop — 0 means never updated.
@@ -109,6 +115,7 @@ impl AppState {
         orderbook_tx: broadcast::Sender<OrderbookUpdate>,
         position_tx: broadcast::Sender<PositionUpdate>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        trade_event_tx: broadcast::Sender<TradeEventUpdate>,
         arb_entry_tx: broadcast::Sender<ArbOpportunity>,
         quant_signal_tx: broadcast::Sender<QuantSignal>,
     ) -> anyhow::Result<Self> {
@@ -486,6 +493,7 @@ impl AppState {
             orderbook_tx,
             position_tx,
             signal_tx,
+            trade_event_tx,
             arb_entry_tx,
             quant_signal_tx,
             wallet_discovery,
@@ -498,6 +506,7 @@ impl AppState {
                 crate::arb_executor::ArbExecutorRuntimeStatus::default(),
             )),
             exit_handler_config: None,
+            quant_executor_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
@@ -517,6 +526,11 @@ impl AppState {
     /// Subscribe to signal updates.
     pub fn subscribe_signals(&self) -> broadcast::Receiver<SignalUpdate> {
         self.signal_tx.subscribe()
+    }
+
+    /// Subscribe to canonical trade lifecycle events.
+    pub fn subscribe_trade_events(&self) -> broadcast::Receiver<TradeEventUpdate> {
+        self.trade_event_tx.subscribe()
     }
 
     /// Publish an orderbook update.

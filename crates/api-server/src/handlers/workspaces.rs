@@ -27,6 +27,7 @@ use auth::{AuditAction, Claims, UserRole};
 use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::strategy_modes::{resolve_strategy_modes, StrategyModeInputs, StrategyModeStatus};
 
 /// Workspace list item for user.
 #[derive(Debug, Serialize, ToSchema)]
@@ -1700,6 +1701,7 @@ pub struct ServiceStatusResponse {
     pub arb_executor: ServiceStatusItem,
     pub exit_handler: ServiceStatusItem,
     pub live_trading: ServiceStatusItem,
+    pub strategy_modes: Vec<StrategyModeStatus>,
 }
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
@@ -2161,6 +2163,33 @@ pub async fn get_service_status(
     let live_mode = state.order_executor.is_live();
     let live_ready = state.order_executor.is_live_ready().await;
     let live_running = flags.live_trading_enabled && live_mode && live_ready;
+    let quant_executor_enabled = if let Some(ref quant_config) = state.quant_executor_config {
+        quant_config.read().await.enabled
+    } else {
+        std::env::var("QUANT_EXECUTOR_ENABLED")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    };
+    let strategy_modes = resolve_strategy_modes(&StrategyModeInputs {
+        arb_enabled: arb_runtime_enabled,
+        workspace_arb_enabled: flags.arb_auto_execute,
+        workspace_live_enabled: flags.live_trading_enabled,
+        live_executor: live_mode,
+        live_ready,
+        quant_executor_enabled,
+        flow_signal_enabled: std::env::var("FLOW_SIGNAL_ENABLED")
+            .map(|v| v == "true")
+            .unwrap_or(true),
+        mean_reversion_signal_enabled: std::env::var("MEAN_REVERSION_SIGNAL_ENABLED")
+            .map(|v| v == "true")
+            .unwrap_or(true),
+        cross_market_signal_enabled: std::env::var("CROSS_MARKET_SIGNAL_ENABLED")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+        resolution_signal_enabled: std::env::var("RESOLUTION_SIGNAL_ENABLED")
+            .map(|v| v == "true")
+            .unwrap_or(true),
+    });
 
     Ok(Json(ServiceStatusResponse {
         harvester: ServiceStatusItem {
@@ -2211,6 +2240,7 @@ pub async fn get_service_status(
                 None
             },
         },
+        strategy_modes,
     }))
 }
 

@@ -79,6 +79,18 @@ export const queryKeys = {
       [...queryKeys.dynamicTuning.all(), "history", workspaceId, params] as const,
   },
 
+  tradeFlow: {
+    all: () => ["trade-flow"] as const,
+    summary: (params?: { from?: string; to?: string; strategy?: string; limit?: number }) =>
+      [...queryKeys.tradeFlow.all(), "summary", params] as const,
+    journeys: (params?: { from?: string; to?: string; strategy?: string; limit?: number }) =>
+      [...queryKeys.tradeFlow.all(), "journeys", params] as const,
+    market: (
+      marketId: string,
+      params?: { from?: string; to?: string; strategy?: string; limit?: number },
+    ) => [...queryKeys.tradeFlow.all(), "market", marketId, params] as const,
+  },
+
   // Orders
   orders: {
     all: () => ["orders"] as const,

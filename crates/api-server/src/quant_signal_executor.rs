@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
 use crate::arb_executor::OutcomeTokenCache;
+use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
 /// Configuration for the quant signal executor.
@@ -203,6 +204,7 @@ struct QuantSignalExecutor {
     position_repo: PositionRepository,
     pool: PgPool,
     token_cache: OutcomeTokenCache,
+    trade_event_recorder: TradeEventRecorder,
     /// Per-strategy risk state (daily P&L, consecutive losses).
     strategy_states: HashMap<QuantSignalKind, StrategyState>,
     /// Closed quant positions that have already been folded into strategy state.
@@ -216,6 +218,7 @@ impl QuantSignalExecutor {
         config: Arc<RwLock<QuantSignalExecutorConfig>>,
         signal_rx: broadcast::Receiver<QuantSignal>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
         clob_client: Arc<polymarket_core::api::ClobClient>,
@@ -226,6 +229,7 @@ impl QuantSignalExecutor {
         let position_repo = PositionRepository::new(pool.clone());
         let token_cache =
             OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone());
+        let trade_event_recorder = TradeEventRecorder::new(pool.clone(), trade_event_tx);
 
         let mut strategy_states = HashMap::new();
         strategy_states.insert(QuantSignalKind::Flow, StrategyState::new());
@@ -242,6 +246,7 @@ impl QuantSignalExecutor {
             position_repo,
             pool,
             token_cache,
+            trade_event_recorder,
             strategy_states,
             processed_strategy_outcomes: HashSet::new(),
             heartbeat,
@@ -375,6 +380,7 @@ impl QuantSignalExecutor {
     /// Process a single quant signal through the 15-step pipeline.
     async fn process_signal(&mut self, signal: QuantSignal) -> anyhow::Result<()> {
         let cfg = self.snapshot_config().await;
+        let execution_mode = self.execution_mode(&cfg).await.to_string();
 
         // ── Fire-and-forget: persist signal to quant_signals ──
         let pool = self.pool.clone();
@@ -416,6 +422,21 @@ impl QuantSignalExecutor {
             }
         });
 
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    signal.kind.as_str(),
+                    execution_mode.clone(),
+                    "quant",
+                    signal.condition_id.clone(),
+                    "signal_generated",
+                )
+                .with_signal(&signal)
+                .with_metadata(signal.metadata.clone())
+                .with_requested_size(signal.suggested_size_usd),
+            )
+            .await;
+
         // Step 1: Check enabled
         if !cfg.enabled {
             debug!(
@@ -423,6 +444,13 @@ impl QuantSignalExecutor {
                 kind = signal.kind.as_str(),
                 "Quant executor disabled, signal recorded but not executed"
             );
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("executor_disabled"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -438,6 +466,13 @@ impl QuantSignalExecutor {
             );
             self.update_signal_status(signal.id, "skipped", Some("too_stale"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("too_stale"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -446,6 +481,13 @@ impl QuantSignalExecutor {
             debug!(signal_id = %signal.id, "Signal expired, skipping");
             self.update_signal_status(signal.id, "skipped", Some("expired"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_expired",
+                Some("expired"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -459,6 +501,13 @@ impl QuantSignalExecutor {
             );
             self.update_signal_status(signal.id, "skipped", Some("below_confidence"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("below_confidence"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -476,6 +525,13 @@ impl QuantSignalExecutor {
                 );
                 self.update_signal_status(signal.id, "skipped", Some("duplicate"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("duplicate"),
+                )
+                .await;
                 return Ok(());
             }
             Ok(false) => {}
@@ -487,6 +543,13 @@ impl QuantSignalExecutor {
                 );
                 self.update_signal_status(signal.id, "skipped", Some("dedup_check_failed"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("dedup_check_failed"),
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -496,6 +559,13 @@ impl QuantSignalExecutor {
             debug!(signal_id = %signal.id, "Circuit breaker tripped, skipping");
             self.update_signal_status(signal.id, "skipped", Some("circuit_breaker"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("circuit_breaker"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -510,6 +580,13 @@ impl QuantSignalExecutor {
                 );
                 self.update_signal_status(signal.id, "skipped", Some("strategy_halted"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("strategy_halted"),
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -530,6 +607,13 @@ impl QuantSignalExecutor {
                         );
                         self.update_signal_status(signal.id, "skipped", Some("market_cache_empty"))
                             .await;
+                        self.record_signal_outcome_event(
+                            &signal,
+                            &execution_mode,
+                            "signal_skipped",
+                            Some("market_cache_empty"),
+                        )
+                        .await;
                         return Ok(());
                     }
                 }
@@ -558,6 +642,13 @@ impl QuantSignalExecutor {
                 );
                 self.update_signal_status(signal.id, "skipped", Some("orderbook_error"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("orderbook_error"),
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -568,6 +659,13 @@ impl QuantSignalExecutor {
                 debug!(signal_id = %signal.id, "No asks in orderbook, skipping");
                 self.update_signal_status(signal.id, "skipped", Some("no_liquidity"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("no_liquidity"),
+                )
+                .await;
                 return Ok(());
             }
         };
@@ -582,6 +680,13 @@ impl QuantSignalExecutor {
             );
             self.update_signal_status(signal.id, "skipped", Some("insufficient_depth"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("insufficient_depth"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -602,6 +707,13 @@ impl QuantSignalExecutor {
             );
             self.update_signal_status(signal.id, "skipped", Some("size_too_small"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("size_too_small"),
+            )
+            .await;
             return Ok(());
         }
 
@@ -611,6 +723,13 @@ impl QuantSignalExecutor {
         } else {
             self.update_signal_status(signal.id, "skipped", Some("zero_price"))
                 .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("zero_price"),
+            )
+            .await;
             return Ok(());
         };
 
@@ -625,6 +744,13 @@ impl QuantSignalExecutor {
                 );
                 self.update_signal_status(signal.id, "skipped", Some("max_positions_reached"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("max_positions_reached"),
+                )
+                .await;
                 return Ok(());
             }
             Ok(_) => {}
@@ -636,6 +762,13 @@ impl QuantSignalExecutor {
                 );
                 self.update_signal_status(signal.id, "skipped", Some("position_count_failed"))
                     .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("position_count_failed"),
+                )
+                .await;
                 return Ok(());
             }
         }
@@ -654,6 +787,24 @@ impl QuantSignalExecutor {
             ExitStrategy::ExitOnCorrection,
         );
         self.position_repo.insert(&position).await?;
+
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    signal.kind.as_str(),
+                    execution_mode.clone(),
+                    "quant",
+                    signal.condition_id.clone(),
+                    "entry_requested",
+                )
+                .with_signal(&signal)
+                .with_position(position.id)
+                .with_state(None, Some("pending"))
+                .with_requested_size(position_size_usd)
+                .with_fill_price(best_ask)
+                .with_metadata(signal.metadata.clone()),
+            )
+            .await;
 
         // Tag this position as quant-originated (source=3=recommendation)
         // so P&L attribution and dynamic tuner queries can distinguish it.
@@ -702,6 +853,13 @@ impl QuantSignalExecutor {
                 let _ = self.position_repo.update(&position).await;
                 self.update_signal_status(signal.id, "failed", Some("execution_error"))
                     .await;
+                self.record_position_failure_event(
+                    &signal,
+                    &execution_mode,
+                    &position,
+                    "execution_error",
+                )
+                .await;
                 self.publish_failure_signal(&signal.condition_id, &format!("Order failed: {e}"));
                 return Ok(());
             }
@@ -719,9 +877,35 @@ impl QuantSignalExecutor {
             let _ = self.position_repo.update(&position).await;
             self.update_signal_status(signal.id, "failed", Some("order_rejected"))
                 .await;
+            self.record_position_failure_event(
+                &signal,
+                &execution_mode,
+                &position,
+                "order_rejected",
+            )
+            .await;
             self.publish_failure_signal(&signal.condition_id, "Order rejected by exchange");
             return Ok(());
         }
+
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    signal.kind.as_str(),
+                    execution_mode.clone(),
+                    "quant",
+                    signal.condition_id.clone(),
+                    "entry_filled",
+                )
+                .with_signal(&signal)
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("pending"))
+                .with_requested_size(position_size_usd)
+                .with_filled_size(report.total_value())
+                .with_fill_price(report.average_price)
+                .with_metadata(signal.metadata.clone()),
+            )
+            .await;
 
         // Step 14: Mark position OPEN
         if let Err(e) = position.mark_open() {
@@ -731,6 +915,25 @@ impl QuantSignalExecutor {
 
         // Link signal to position
         self.link_signal_to_position(signal.id, position.id).await;
+
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    signal.kind.as_str(),
+                    execution_mode.clone(),
+                    "quant",
+                    signal.condition_id.clone(),
+                    "position_open",
+                )
+                .with_signal(&signal)
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("open"))
+                .with_requested_size(position_size_usd)
+                .with_filled_size(report.total_value())
+                .with_fill_price(report.average_price)
+                .with_metadata(signal.metadata.clone()),
+            )
+            .await;
 
         // Step 15: Publish WebSocket SignalUpdate
         let ws_signal = SignalUpdate {
@@ -860,6 +1063,64 @@ impl QuantSignalExecutor {
         };
         let _ = self.signal_tx.send(signal);
     }
+
+    async fn execution_mode(&self, cfg: &QuantSignalExecutorConfig) -> &'static str {
+        if cfg.enabled && self.order_executor.is_live_ready().await {
+            "live"
+        } else {
+            "paper"
+        }
+    }
+
+    async fn record_signal_outcome_event(
+        &self,
+        signal: &QuantSignal,
+        execution_mode: &str,
+        event_type: &str,
+        reason: Option<&str>,
+    ) {
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    signal.kind.as_str(),
+                    execution_mode.to_string(),
+                    "quant",
+                    signal.condition_id.clone(),
+                    event_type,
+                )
+                .with_signal(signal)
+                .with_reason(reason)
+                .with_requested_size(signal.suggested_size_usd)
+                .with_metadata(signal.metadata.clone()),
+            )
+            .await;
+    }
+
+    async fn record_position_failure_event(
+        &self,
+        signal: &QuantSignal,
+        execution_mode: &str,
+        position: &Position,
+        reason: &str,
+    ) {
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    signal.kind.as_str(),
+                    execution_mode.to_string(),
+                    "quant",
+                    signal.condition_id.clone(),
+                    "position_failed",
+                )
+                .with_signal(signal)
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("entry_failed"))
+                .with_reason(Some(reason))
+                .with_unrealized_pnl(position.unrealized_pnl)
+                .with_metadata(signal.metadata.clone()),
+            )
+            .await;
+    }
 }
 
 fn parse_quant_signal_kind(kind: &str) -> Option<QuantSignalKind> {
@@ -878,6 +1139,7 @@ pub fn spawn_quant_signal_executor(
     config: Arc<RwLock<QuantSignalExecutorConfig>>,
     signal_rx: broadcast::Receiver<QuantSignal>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
     clob_client: Arc<polymarket_core::api::ClobClient>,
@@ -889,6 +1151,7 @@ pub fn spawn_quant_signal_executor(
         config,
         signal_rx,
         signal_tx,
+        trade_event_tx,
         order_executor,
         circuit_breaker,
         clob_client,
@@ -903,6 +1166,68 @@ pub fn spawn_quant_signal_executor(
     });
 
     info!("Quant signal executor spawned");
+}
+
+trait TradeEventBuilderExt {
+    fn with_signal(self, signal: &QuantSignal) -> Self;
+    fn with_position(self, position_id: uuid::Uuid) -> Self;
+    fn with_state(self, from: Option<&str>, to: Option<&str>) -> Self;
+    fn with_reason(self, reason: Option<&str>) -> Self;
+    fn with_requested_size(self, size: Decimal) -> Self;
+    fn with_filled_size(self, size: Decimal) -> Self;
+    fn with_fill_price(self, price: Decimal) -> Self;
+    fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
+    fn with_metadata(self, metadata: serde_json::Value) -> Self;
+}
+
+impl TradeEventBuilderExt for NewTradeEvent {
+    fn with_signal(mut self, signal: &QuantSignal) -> Self {
+        self.signal_id = Some(signal.id);
+        self.direction = Some(signal.direction.as_str().to_string());
+        self.confidence = Some(signal.confidence);
+        self
+    }
+
+    fn with_position(mut self, position_id: uuid::Uuid) -> Self {
+        self.position_id = Some(position_id);
+        self
+    }
+
+    fn with_state(mut self, from: Option<&str>, to: Option<&str>) -> Self {
+        self.state_from = from.map(str::to_string);
+        self.state_to = to.map(str::to_string);
+        self
+    }
+
+    fn with_reason(mut self, reason: Option<&str>) -> Self {
+        self.reason = reason.map(str::to_string);
+        self
+    }
+
+    fn with_requested_size(mut self, size: Decimal) -> Self {
+        self.requested_size_usd = Some(size);
+        self
+    }
+
+    fn with_filled_size(mut self, size: Decimal) -> Self {
+        self.filled_size_usd = Some(size);
+        self
+    }
+
+    fn with_fill_price(mut self, price: Decimal) -> Self {
+        self.fill_price = Some(price);
+        self
+    }
+
+    fn with_unrealized_pnl(mut self, pnl: Decimal) -> Self {
+        self.unrealized_pnl = Some(pnl);
+        self
+    }
+
+    fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 #[cfg(test)]

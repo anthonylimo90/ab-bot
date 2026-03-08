@@ -42,6 +42,9 @@ import type {
   RecentSignalResponse,
   StrategyPerformanceResponse,
   MarketMetadataResponse,
+  TradeFlowSummary,
+  TradeJourney,
+  TradeFlowMarketResponse,
 } from "@/types/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
@@ -119,6 +122,34 @@ function parseFlowFeature(raw: FlowFeatureResponse): FlowFeatureResponse {
     net_flow: Number(raw.net_flow),
     imbalance_ratio: Number(raw.imbalance_ratio),
     smart_money_flow: Number(raw.smart_money_flow),
+  };
+}
+
+function parseTradeFlowStrategySummary(
+  raw: TradeFlowSummary["strategies"][number],
+): TradeFlowSummary["strategies"][number] {
+  return {
+    ...raw,
+    net_pnl: Number(raw.net_pnl),
+  };
+}
+
+function parseTradeFlowSummary(raw: TradeFlowSummary): TradeFlowSummary {
+  return {
+    ...raw,
+    total_realized_pnl: Number(raw.total_realized_pnl),
+    strategies: raw.strategies.map(parseTradeFlowStrategySummary),
+  };
+}
+
+function parseTradeJourney(raw: TradeJourney): TradeJourney {
+  return {
+    ...raw,
+    realized_pnl:
+      raw.realized_pnl != null ? Number(raw.realized_pnl) : raw.realized_pnl,
+    unrealized_pnl:
+      raw.unrealized_pnl != null ? Number(raw.unrealized_pnl) : raw.unrealized_pnl,
+    hold_hours: raw.hold_hours != null ? Number(raw.hold_hours) : raw.hold_hours,
   };
 }
 
@@ -758,6 +789,67 @@ class ApiClient {
     return this.request<Activity[]>(
       `/api/v1/activity${query ? `?${query}` : ""}`,
     );
+  }
+
+  async getTradeFlowSummary(params?: {
+    from?: string;
+    to?: string;
+    strategy?: string;
+    limit?: number;
+  }): Promise<TradeFlowSummary> {
+    const sp = new URLSearchParams();
+    if (params?.from) sp.set("from", params.from);
+    if (params?.to) sp.set("to", params.to);
+    if (params?.strategy) sp.set("strategy", params.strategy);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<TradeFlowSummary>(
+      `/api/v1/trade-flow/summary${q ? `?${q}` : ""}`,
+    );
+    return parseTradeFlowSummary(raw);
+  }
+
+  async getTradeFlowJourneys(params?: {
+    from?: string;
+    to?: string;
+    strategy?: string;
+    limit?: number;
+  }): Promise<TradeJourney[]> {
+    const sp = new URLSearchParams();
+    if (params?.from) sp.set("from", params.from);
+    if (params?.to) sp.set("to", params.to);
+    if (params?.strategy) sp.set("strategy", params.strategy);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<TradeJourney[]>(
+      `/api/v1/trade-flow/journeys${q ? `?${q}` : ""}`,
+    );
+    return raw.map(parseTradeJourney);
+  }
+
+  async getMarketTradeFlow(
+    marketId: string,
+    params?: {
+      from?: string;
+      to?: string;
+      strategy?: string;
+      limit?: number;
+    },
+  ): Promise<TradeFlowMarketResponse> {
+    const sp = new URLSearchParams();
+    if (params?.from) sp.set("from", params.from);
+    if (params?.to) sp.set("to", params.to);
+    if (params?.strategy) sp.set("strategy", params.strategy);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<TradeFlowMarketResponse>(
+      `/api/v1/trade-flow/markets/${marketId}${q ? `?${q}` : ""}`,
+    );
+    return {
+      ...raw,
+      summary: parseTradeFlowSummary(raw.summary),
+      journeys: raw.journeys.map(parseTradeJourney),
+    };
   }
 
   // Quant Signals

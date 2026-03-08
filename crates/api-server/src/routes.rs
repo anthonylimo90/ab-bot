@@ -12,8 +12,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     activity, admin_workspaces, auth, backtest, discover, health, markets, order_signing,
-    positions, recommendations, risk, signals, trading, users, vault, wallet_auth, wallets,
-    workspaces,
+    positions, recommendations, risk, signals, trade_flow, trading, users, vault, wallet_auth,
+    wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -103,6 +103,10 @@ use crate::websocket;
         order_signing::submit_order,
         // Activity
         activity::list_activity,
+        // Trade flow
+        trade_flow::get_trade_flow_summary,
+        trade_flow::get_trade_flow_journeys,
+        trade_flow::get_market_trade_flow,
         // Risk monitoring
         risk::get_risk_status,
         risk::manual_trip_circuit_breaker,
@@ -138,6 +142,7 @@ use crate::websocket;
             crate::websocket::OrderbookUpdate,
             crate::websocket::PositionUpdate,
             crate::websocket::SignalUpdate,
+            crate::trade_events::TradeEventUpdate,
             crate::websocket::PositionUpdateType,
             crate::websocket::SignalType,
             health::HealthResponse,
@@ -192,6 +197,8 @@ use crate::websocket;
             workspaces::UpdateMemberRoleRequest,
             workspaces::ServiceStatusResponse,
             workspaces::ServiceStatusItem,
+            crate::strategy_modes::StrategyModeStatus,
+            crate::strategy_modes::ResolvedStrategyMode,
             workspaces::DynamicTunerStatusResponse,
             workspaces::DynamicSignalThresholdsResponse,
             workspaces::DynamicConfigItemResponse,
@@ -209,6 +216,10 @@ use crate::websocket;
             order_signing::OrderSummary,
             // Activity
             activity::ActivityResponse,
+            trade_flow::TradeFlowSummaryResponse,
+            trade_flow::TradeFlowStrategySummary,
+            trade_flow::TradeJourneyResponse,
+            trade_flow::TradeFlowMarketResponse,
             // Risk monitoring
             risk::RiskStatusResponse,
             risk::CircuitBreakerResponse,
@@ -242,6 +253,7 @@ use crate::websocket;
         (name = "workspaces", description = "User workspace operations"),
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "activity", description = "Activity feed from execution reports"),
+        (name = "trade_flow", description = "Derived trade lifecycle and conversion analytics"),
         (name = "risk", description = "Risk monitoring and circuit breaker management"),
         (name = "signals", description = "Quant signal system: flow features, performance, and recent signals"),
         (name = "websocket", description = "Real-time WebSocket endpoints"),
@@ -329,6 +341,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))
         .route("/ws/signals", get(websocket::ws_signals_handler))
+        .route("/ws/trade-flow", get(websocket::ws_trade_flow_handler))
         .route("/ws/all", get(websocket::ws_all_handler));
 
     // Protected read-only routes - require authentication (any role)
@@ -434,6 +447,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Activity feed (read-only for all members)
         .route("/api/v1/activity", get(activity::list_activity))
+        // Trade flow analytics (read-only for all members)
+        .route(
+            "/api/v1/trade-flow/summary",
+            get(trade_flow::get_trade_flow_summary),
+        )
+        .route(
+            "/api/v1/trade-flow/journeys",
+            get(trade_flow::get_trade_flow_journeys),
+        )
+        .route(
+            "/api/v1/trade-flow/markets/:market_id",
+            get(trade_flow::get_market_trade_flow),
+        )
         // Risk monitoring (read-only for all members)
         .route(
             "/api/v1/workspaces/:workspace_id/risk/status",

@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::state::AppState;
+use crate::trade_events::TradeEventUpdate;
 
 /// Orderbook update message.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -102,6 +103,8 @@ pub enum WsMessage {
     Position(PositionUpdate),
     /// Trading signal.
     Signal(SignalUpdate),
+    /// Canonical trade lifecycle event.
+    TradeFlow(TradeEventUpdate),
     /// Subscription confirmation.
     Subscribed {
         channel: String,
@@ -160,6 +163,14 @@ pub async fn ws_signals_handler(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     ws.on_upgrade(move |socket| handle_signals_socket(socket, state))
+}
+
+/// WebSocket upgrade handler for canonical trade-flow events.
+pub async fn ws_trade_flow_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_trade_flow_socket(socket, state))
 }
 
 /// WebSocket upgrade handler for all updates (multiplexed).
@@ -359,6 +370,7 @@ async fn handle_all_socket(socket: WebSocket, state: Arc<AppState>) {
     let mut orderbook_rx = state.subscribe_orderbook();
     let mut position_rx = state.subscribe_positions();
     let mut signal_rx = state.subscribe_signals();
+    let mut trade_flow_rx = state.subscribe_trade_events();
 
     info!("WebSocket client connected to all channels");
 
@@ -455,10 +467,92 @@ async fn handle_all_socket(socket: WebSocket, state: Arc<AppState>) {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            result = trade_flow_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::TradeFlow(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("All-channel WebSocket client lagged by {n} trade-flow messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} trade-flow updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 
     info!("WebSocket client disconnected from all channels");
+}
+
+async fn handle_trade_flow_socket(socket: WebSocket, state: Arc<AppState>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut trade_flow_rx = state.subscribe_trade_events();
+
+    info!("WebSocket client connected to trade-flow channel");
+
+    let msg = WsMessage::Subscribed {
+        channel: "trade-flow".to_string(),
+    };
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = sender.send(Message::Text(json)).await;
+    }
+
+    loop {
+        tokio::select! {
+            Some(msg) = receiver.next() => {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        if let Ok(WsRequest::Ping) = serde_json::from_str(&text) {
+                            let pong = WsMessage::Pong;
+                            if let Ok(json) = serde_json::to_string(&pong) {
+                                let _ = sender.send(Message::Text(json)).await;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            result = trade_flow_rx.recv() => {
+                match result {
+                    Ok(update) => {
+                        let msg = WsMessage::TradeFlow(update);
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Trade-flow WebSocket client lagged by {n} messages, resuming");
+                        let err_msg = WsMessage::Error {
+                            code: "LAGGED".to_string(),
+                            message: format!("Missed {n} trade-flow updates"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&err_msg) {
+                            let _ = sender.send(Message::Text(json)).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+
+    info!("WebSocket client disconnected from trade-flow channel");
 }
 
 #[cfg(test)]
@@ -512,5 +606,38 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("Position"));
         assert!(json.contains("opened"));
+    }
+
+    #[test]
+    fn test_trade_flow_update_serialization() {
+        let update = TradeEventUpdate {
+            id: uuid::Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            strategy: "flow".to_string(),
+            execution_mode: "paper".to_string(),
+            source: "quant".to_string(),
+            market_id: "market1".to_string(),
+            position_id: None,
+            signal_id: None,
+            event_type: "signal_generated".to_string(),
+            state_from: None,
+            state_to: Some("pending".to_string()),
+            reason: None,
+            direction: Some("buy_yes".to_string()),
+            confidence: Some(0.7),
+            expected_edge: None,
+            observed_edge: None,
+            requested_size_usd: None,
+            filled_size_usd: None,
+            fill_price: None,
+            realized_pnl: None,
+            unrealized_pnl: None,
+            metadata: serde_json::json!({}),
+        };
+
+        let msg = WsMessage::TradeFlow(update);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("TradeFlow"));
+        assert!(json.contains("signal_generated"));
     }
 }

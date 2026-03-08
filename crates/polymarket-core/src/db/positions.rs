@@ -19,6 +19,7 @@ pub struct PositionRepository {
 pub struct ExitCandidate {
     pub position: Position,
     pub source: i16,
+    pub source_signal_id: Option<Uuid>,
 }
 
 const SOURCE_COPY_TRADE: i16 = 2;
@@ -358,7 +359,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                source
+                source, source_signal_id
             FROM positions
             WHERE exit_strategy = 1 AND state = 1
             ORDER BY entry_timestamp ASC
@@ -372,6 +373,7 @@ impl PositionRepository {
             .map(|row| ExitCandidate {
                 position: Self::row_to_position(row),
                 source: row.get::<Option<i16>, _>("source").unwrap_or(0),
+                source_signal_id: row.get("source_signal_id"),
             })
             .collect())
     }

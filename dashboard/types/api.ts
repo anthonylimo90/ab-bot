@@ -349,6 +349,82 @@ export interface Activity {
   created_at: string;
 }
 
+export type TradeFlowStrategy =
+  | "arb"
+  | "flow"
+  | "mean_reversion"
+  | "cross_market"
+  | "resolution_proximity";
+
+export interface TradeFlowStrategySummary {
+  strategy: string;
+  source: string;
+  supports_signal_history: boolean;
+  generated_signals: number;
+  executed_signals: number;
+  skipped_signals: number;
+  expired_signals: number;
+  open_positions: number;
+  exit_ready_positions: number;
+  closed_positions: number;
+  entry_failed_positions: number;
+  exit_failed_positions: number;
+  net_pnl: number;
+  avg_hold_hours: number | null;
+}
+
+export interface TradeFlowSummary {
+  from: string;
+  to: string;
+  total_generated_signals: number;
+  total_executed_signals: number;
+  total_skipped_signals: number;
+  total_expired_signals: number;
+  total_open_positions: number;
+  total_exit_ready_positions: number;
+  total_closed_positions: number;
+  total_entry_failed_positions: number;
+  total_exit_failed_positions: number;
+  total_realized_pnl: number;
+  strategies: TradeFlowStrategySummary[];
+}
+
+export interface TradeJourney {
+  strategy: string;
+  source: string;
+  supports_signal_history: boolean;
+  lifecycle_stage: string;
+  execution_status?: string | null;
+  position_state?: string | null;
+  market_id: string;
+  signal_id?: string | null;
+  position_id?: string | null;
+  direction?: string | null;
+  confidence?: number | null;
+  skip_reason?: string | null;
+  signal_generated_at?: string | null;
+  opened_at?: string | null;
+  closed_at?: string | null;
+  realized_pnl?: number | null;
+  unrealized_pnl?: number | null;
+  hold_hours?: number | null;
+  synthetic_history: boolean;
+}
+
+export interface TradeFlowMarketResponse {
+  market_id: string;
+  summary: TradeFlowSummary;
+  journeys: TradeJourney[];
+}
+
+export type StrategyMode = "disabled" | "paper" | "live";
+
+export interface StrategyModeStatus {
+  strategy: string;
+  mode: StrategyMode;
+  reason?: string;
+}
+
 // Vault types (connected user wallets for live trading)
 export interface ConnectedWallet {
   id: string;
@@ -429,10 +505,36 @@ export interface SignalUpdate {
   metadata: Record<string, unknown>;
 }
 
+export interface TradeFlowEvent {
+  id: string;
+  occurred_at: string;
+  strategy: string;
+  execution_mode: "paper" | "live" | string;
+  source: string;
+  market_id: string;
+  position_id?: string | null;
+  signal_id?: string | null;
+  event_type: string;
+  state_from?: string | null;
+  state_to?: string | null;
+  reason?: string | null;
+  direction?: string | null;
+  confidence?: number | null;
+  expected_edge?: number | null;
+  observed_edge?: number | null;
+  requested_size_usd?: number | null;
+  filled_size_usd?: number | null;
+  fill_price?: number | null;
+  realized_pnl?: number | null;
+  unrealized_pnl?: number | null;
+  metadata: Record<string, unknown>;
+}
+
 export type WebSocketMessage =
   | { type: "Orderbook"; data: OrderbookUpdate }
   | { type: "Position"; data: PositionUpdate }
   | { type: "Signal"; data: SignalUpdate }
+  | { type: "TradeFlow"; data: TradeFlowEvent }
   | { type: "Subscribed"; channel: string }
   | { type: "Unsubscribed"; channel: string }
   | { type: "Error"; code: string; message: string }
@@ -677,6 +779,7 @@ export interface ServiceStatus {
   arb_executor: ServiceStatusItem;
   exit_handler: ServiceStatusItem;
   live_trading: ServiceStatusItem;
+  strategy_modes: StrategyModeStatus[];
 }
 
 export interface DynamicConfigItem {

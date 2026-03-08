@@ -11,7 +11,12 @@ export type ConnectionStatus =
 
 const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001';
 
-export type WebSocketChannel = 'orderbook' | 'positions' | 'signals' | 'all';
+export type WebSocketChannel =
+  | 'orderbook'
+  | 'positions'
+  | 'signals'
+  | 'trade-flow'
+  | 'all';
 
 interface WebSocketOptions {
   channel: WebSocketChannel;

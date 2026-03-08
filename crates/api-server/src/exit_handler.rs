@@ -11,6 +11,7 @@
 use chrono::Utc;
 use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
 use polymarket_core::types::{FailureReason, MarketOrder, OrderSide, Position};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
@@ -22,6 +23,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
+use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
 /// Configuration for the exit handler (env-var driven).
@@ -141,6 +143,7 @@ impl OutcomeTokenCache {
 pub struct ExitHandler {
     config: Arc<RwLock<ExitHandlerConfig>>,
     position_repo: PositionRepository,
+    pool: PgPool,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
     clob_client: Arc<ClobClient>,
@@ -148,8 +151,17 @@ pub struct ExitHandler {
     token_cache: OutcomeTokenCache,
     /// Shared dedup set with ArbAutoExecutor.
     arb_dedup: Arc<RwLock<HashSet<String>>>,
+    trade_event_recorder: TradeEventRecorder,
     /// Heartbeat timestamp (epoch secs) — updated every tick to prove liveness.
     heartbeat: Arc<AtomicI64>,
+}
+
+#[derive(Debug, Clone)]
+struct QuantExitContext {
+    signal_id: uuid::Uuid,
+    kind: QuantSignalKind,
+    direction: SignalDirection,
+    metadata: serde_json::Value,
 }
 
 impl ExitHandler {
@@ -160,19 +172,22 @@ impl ExitHandler {
         circuit_breaker: Arc<CircuitBreaker>,
         clob_client: Arc<ClobClient>,
         signal_tx: broadcast::Sender<SignalUpdate>,
+        trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
         pool: PgPool,
         arb_dedup: Arc<RwLock<HashSet<String>>>,
         heartbeat: Arc<AtomicI64>,
     ) -> Self {
         Self {
             config,
-            position_repo: PositionRepository::new(pool),
+            position_repo: PositionRepository::new(pool.clone()),
+            pool: pool.clone(),
             order_executor,
             circuit_breaker,
             clob_client: clob_client.clone(),
             signal_tx,
             token_cache: OutcomeTokenCache::new(),
             arb_dedup,
+            trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             heartbeat,
         }
     }
@@ -258,6 +273,8 @@ impl ExitHandler {
             return Ok(());
         }
 
+        let quant_contexts = self.load_quant_exit_contexts(&candidates).await?;
+
         debug!(count = candidates.len(), "Evaluating open exit candidates");
 
         let fee = Decimal::new(2, 2);
@@ -269,7 +286,18 @@ impl ExitHandler {
             candidate.position.update_pnl(yes_bid, no_bid, fee);
             self.position_repo.update(&candidate.position).await?;
 
-            if self.should_mark_exit_ready(&candidate.position, candidate.source, cfg) {
+            let quant_ctx = quant_contexts.get(&candidate.position.id);
+            if self
+                .should_mark_exit_ready(
+                    &candidate.position,
+                    candidate.source,
+                    quant_ctx,
+                    yes_bid,
+                    no_bid,
+                    cfg,
+                )
+                .await?
+            {
                 if let Err(e) = candidate.position.mark_exit_ready() {
                     warn!(
                         position_id = %candidate.position.id,
@@ -279,6 +307,8 @@ impl ExitHandler {
                     continue;
                 }
                 self.position_repo.update(&candidate.position).await?;
+                self.record_exit_ready_event(&candidate.position, candidate.source, quant_ctx)
+                    .await;
             }
         }
 
@@ -311,12 +341,27 @@ impl ExitHandler {
     /// Execute the sell orders for a single ExitReady position.
     async fn execute_exit(&self, position: &mut Position) -> anyhow::Result<()> {
         let market_id = position.market_id.clone();
+        let execution_mode = if self.order_executor.is_live_ready().await {
+            "live"
+        } else {
+            "paper"
+        };
+        let quant_ctx = if position.yes_entry_price.is_zero() || position.no_entry_price.is_zero() {
+            self.load_quant_exit_context(position.id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
 
         // Mark Closing
         if let Err(e) = position.mark_closing() {
             anyhow::bail!("Cannot mark position closing: {}", e);
         }
         let _ = self.position_repo.update(position).await;
+        self.record_exit_requested_event(position, execution_mode, quant_ctx.as_ref())
+            .await;
 
         // Resolve token IDs
         let (yes_token_id, no_token_id) = match self.token_cache.get(&market_id).await {
@@ -438,6 +483,14 @@ impl ExitHandler {
         // Remove from dedup
         self.arb_dedup.write().await.remove(&market_id);
 
+        self.record_position_closed_event(
+            position,
+            execution_mode,
+            quant_ctx.as_ref(),
+            "closed_via_exit",
+        )
+        .await;
+
         // Publish success signal
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
@@ -523,29 +576,281 @@ impl ExitHandler {
         Ok(Some((yes_bid, no_bid)))
     }
 
-    fn should_mark_exit_ready(
+    async fn load_quant_exit_contexts(
+        &self,
+        candidates: &[polymarket_core::db::positions::ExitCandidate],
+    ) -> anyhow::Result<HashMap<uuid::Uuid, QuantExitContext>> {
+        let position_ids: Vec<uuid::Uuid> = candidates
+            .iter()
+            .filter(|candidate| candidate.source == 3)
+            .map(|candidate| candidate.position.id)
+            .collect();
+
+        if position_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct QuantContextRow {
+            position_id: uuid::Uuid,
+            signal_id: uuid::Uuid,
+            kind: String,
+            direction: String,
+            metadata: serde_json::Value,
+        }
+
+        let rows: Vec<QuantContextRow> = sqlx::query_as(
+            r#"
+            SELECT
+                p.id AS position_id,
+                qs.id AS signal_id,
+                qs.kind,
+                qs.direction,
+                COALESCE(qs.metadata, '{}'::jsonb) AS metadata
+            FROM positions p
+            JOIN quant_signals qs
+              ON qs.id = p.source_signal_id
+            WHERE p.id = ANY($1)
+            "#,
+        )
+        .bind(&position_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map = HashMap::new();
+        for row in rows {
+            let Some(kind) = parse_quant_kind(&row.kind) else {
+                continue;
+            };
+            let Some(direction) = parse_signal_direction(&row.direction) else {
+                continue;
+            };
+            map.insert(
+                row.position_id,
+                QuantExitContext {
+                    signal_id: row.signal_id,
+                    kind,
+                    direction,
+                    metadata: row.metadata,
+                },
+            );
+        }
+
+        Ok(map)
+    }
+
+    async fn load_quant_exit_context(
+        &self,
+        position_id: uuid::Uuid,
+    ) -> anyhow::Result<Option<QuantExitContext>> {
+        #[derive(sqlx::FromRow)]
+        struct QuantContextRow {
+            signal_id: uuid::Uuid,
+            kind: String,
+            direction: String,
+            metadata: serde_json::Value,
+        }
+
+        let row: Option<QuantContextRow> = sqlx::query_as(
+            r#"
+            SELECT
+                qs.id AS signal_id,
+                qs.kind,
+                qs.direction,
+                COALESCE(qs.metadata, '{}'::jsonb) AS metadata
+            FROM positions p
+            JOIN quant_signals qs
+              ON qs.id = p.source_signal_id
+            WHERE p.id = $1
+            "#,
+        )
+        .bind(position_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|row| {
+            Some(QuantExitContext {
+                signal_id: row.signal_id,
+                kind: parse_quant_kind(&row.kind)?,
+                direction: parse_signal_direction(&row.direction)?,
+                metadata: row.metadata,
+            })
+        }))
+    }
+
+    fn generic_quant_exit(&self, position: &Position, cfg: &ExitHandlerConfig) -> bool {
+        let entry_cost = position.entry_cost();
+        let pnl_pct = if entry_cost > Decimal::ZERO {
+            (position.unrealized_pnl / entry_cost) * Decimal::new(100, 0)
+        } else {
+            Decimal::ZERO
+        };
+        let held_hours = Utc::now()
+            .signed_duration_since(position.entry_timestamp)
+            .num_hours();
+
+        pnl_pct >= cfg.quant_take_profit_pct
+            || pnl_pct <= -cfg.quant_stop_loss_pct
+            || held_hours >= cfg.quant_max_hold_hours
+    }
+
+    async fn flow_strategy_exit(
+        &self,
+        position: &Position,
+        quant_ctx: &QuantExitContext,
+        _cfg: &ExitHandlerConfig,
+    ) -> anyhow::Result<bool> {
+        let window_minutes = quant_ctx
+            .metadata
+            .get("window_minutes")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(60) as i32;
+        let entry_imbalance =
+            json_decimal_abs(&quant_ctx.metadata, "imbalance_ratio").unwrap_or(Decimal::ZERO);
+
+        let latest_row: Option<(Decimal,)> = sqlx::query_as(
+            r#"
+            SELECT imbalance_ratio
+            FROM market_flow_features
+            WHERE condition_id = $1
+              AND window_minutes = $2
+            ORDER BY window_end DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&position.market_id)
+        .bind(window_minutes)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((imbalance_ratio,)) = latest_row else {
+            return Ok(false);
+        };
+
+        let original_sign = direction_sign(quant_ctx.direction);
+        let current_sign = if imbalance_ratio > Decimal::ZERO {
+            1
+        } else if imbalance_ratio < Decimal::ZERO {
+            -1
+        } else {
+            0
+        };
+        let min_supported_imbalance = entry_imbalance
+            .checked_div(Decimal::new(2, 0))
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::new(15, 2));
+
+        Ok((current_sign != 0 && current_sign != original_sign)
+            || imbalance_ratio.abs() < min_supported_imbalance)
+    }
+
+    async fn record_exit_ready_event(
         &self,
         position: &Position,
         source: i16,
-        cfg: &ExitHandlerConfig,
-    ) -> bool {
-        if source == 3 {
-            let entry_cost = position.entry_cost();
-            let pnl_pct = if entry_cost > Decimal::ZERO {
-                (position.unrealized_pnl / entry_cost) * Decimal::new(100, 0)
-            } else {
-                Decimal::ZERO
-            };
-            let held_hours = Utc::now()
-                .signed_duration_since(position.entry_timestamp)
-                .num_hours();
+        quant_ctx: Option<&QuantExitContext>,
+    ) {
+        let execution_mode = self.current_execution_mode().await;
+        self.trade_event_recorder
+            .record_warn(
+                trade_event_for_position(
+                    position,
+                    source,
+                    quant_ctx,
+                    &execution_mode,
+                    "exit_marked_ready",
+                    Some("open"),
+                    Some("exit_ready"),
+                )
+                .with_unrealized_pnl(position.unrealized_pnl),
+            )
+            .await;
+    }
 
-            pnl_pct >= cfg.quant_take_profit_pct
-                || pnl_pct <= -cfg.quant_stop_loss_pct
-                || held_hours >= cfg.quant_max_hold_hours
-        } else {
-            position.unrealized_pnl > Decimal::ZERO
+    async fn record_exit_requested_event(
+        &self,
+        position: &Position,
+        execution_mode: &str,
+        quant_ctx: Option<&QuantExitContext>,
+    ) {
+        self.trade_event_recorder
+            .record_warn(
+                trade_event_for_position(
+                    position,
+                    if quant_ctx.is_some() { 3 } else { 1 },
+                    quant_ctx,
+                    execution_mode,
+                    "exit_requested",
+                    Some("exit_ready"),
+                    Some("closing"),
+                )
+                .with_unrealized_pnl(position.unrealized_pnl),
+            )
+            .await;
+    }
+
+    async fn record_position_closed_event(
+        &self,
+        position: &Position,
+        execution_mode: &str,
+        quant_ctx: Option<&QuantExitContext>,
+        event_type: &str,
+    ) {
+        self.trade_event_recorder
+            .record_warn(
+                trade_event_for_position(
+                    position,
+                    if quant_ctx.is_some() { 3 } else { 1 },
+                    quant_ctx,
+                    execution_mode,
+                    event_type,
+                    Some("closing"),
+                    Some("closed"),
+                )
+                .with_realized_pnl(position.realized_pnl.unwrap_or_default())
+                .with_unrealized_pnl(position.unrealized_pnl),
+            )
+            .await;
+    }
+
+    async fn should_mark_exit_ready(
+        &self,
+        position: &Position,
+        source: i16,
+        quant_ctx: Option<&QuantExitContext>,
+        yes_bid: Decimal,
+        no_bid: Decimal,
+        cfg: &ExitHandlerConfig,
+    ) -> anyhow::Result<bool> {
+        if source != 3 {
+            return Ok(position.unrealized_pnl > Decimal::ZERO);
         }
+
+        let generic_exit = self.generic_quant_exit(position, cfg);
+        if generic_exit {
+            return Ok(true);
+        }
+
+        let Some(quant_ctx) = quant_ctx else {
+            return Ok(false);
+        };
+
+        let current_yes = infer_yes_price(yes_bid, no_bid);
+        let current_no = infer_no_price(yes_bid, no_bid);
+
+        let strategy_exit = match quant_ctx.kind {
+            QuantSignalKind::Flow => self
+                .flow_strategy_exit(position, quant_ctx, cfg)
+                .await
+                .unwrap_or(false),
+            QuantSignalKind::MeanReversion => {
+                mean_reversion_target_hit(quant_ctx, current_yes, current_no)
+            }
+            QuantSignalKind::CrossMarket => cross_market_target_hit(quant_ctx, current_yes),
+            QuantSignalKind::ResolutionProximity => resolution_lean_decay(quant_ctx, current_yes),
+        };
+
+        Ok(strategy_exit)
     }
 
     /// Check for HoldToResolution positions whose markets have resolved.
@@ -612,6 +917,15 @@ impl ExitHandler {
             // Remove from dedup
             self.arb_dedup.write().await.remove(&market_id);
 
+            let execution_mode = self.current_execution_mode().await;
+            self.record_position_closed_event(
+                &position,
+                &execution_mode,
+                None,
+                "closed_via_resolution",
+            )
+            .await;
+
             // Publish signal
             let signal = SignalUpdate {
                 signal_id: uuid::Uuid::new_v4(),
@@ -637,6 +951,14 @@ impl ExitHandler {
         }
 
         Ok(())
+    }
+
+    async fn current_execution_mode(&self) -> String {
+        if self.order_executor.is_live_ready().await {
+            "live".to_string()
+        } else {
+            "paper".to_string()
+        }
     }
 
     /// Process one-legged entry failures: attempt to buy the missing NO leg.
@@ -794,6 +1116,183 @@ impl ExitHandler {
     }
 }
 
+fn trade_event_for_position(
+    position: &Position,
+    source: i16,
+    quant_ctx: Option<&QuantExitContext>,
+    execution_mode: &str,
+    event_type: &str,
+    state_from: Option<&str>,
+    state_to: Option<&str>,
+) -> NewTradeEvent {
+    let (strategy, source_label, signal_id, direction) = if let Some(ctx) = quant_ctx {
+        (
+            ctx.kind.as_str().to_string(),
+            "quant".to_string(),
+            Some(ctx.signal_id),
+            Some(ctx.direction.as_str().to_string()),
+        )
+    } else if source == 3 {
+        ("quant".to_string(), "quant".to_string(), None, None)
+    } else {
+        ("arb".to_string(), "arb".to_string(), None, None)
+    };
+
+    let mut event = NewTradeEvent::new(
+        strategy,
+        execution_mode,
+        source_label,
+        position.market_id.clone(),
+        event_type,
+    );
+    event.position_id = Some(position.id);
+    event.signal_id = signal_id;
+    event.direction = direction;
+    event.state_from = state_from.map(str::to_string);
+    event.state_to = state_to.map(str::to_string);
+    event.metadata = serde_json::json!({});
+    event
+}
+
+fn parse_quant_kind(kind: &str) -> Option<QuantSignalKind> {
+    match kind {
+        "flow" => Some(QuantSignalKind::Flow),
+        "mean_reversion" => Some(QuantSignalKind::MeanReversion),
+        "cross_market" => Some(QuantSignalKind::CrossMarket),
+        "resolution_proximity" => Some(QuantSignalKind::ResolutionProximity),
+        _ => None,
+    }
+}
+
+fn parse_signal_direction(direction: &str) -> Option<SignalDirection> {
+    match direction {
+        "buy_yes" => Some(SignalDirection::BuyYes),
+        "buy_no" => Some(SignalDirection::BuyNo),
+        _ => None,
+    }
+}
+
+fn infer_yes_price(yes_bid: Decimal, no_bid: Decimal) -> Decimal {
+    if yes_bid > Decimal::ZERO {
+        yes_bid
+    } else if no_bid > Decimal::ZERO {
+        (Decimal::ONE - no_bid).max(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    }
+}
+
+fn infer_no_price(yes_bid: Decimal, no_bid: Decimal) -> Decimal {
+    if no_bid > Decimal::ZERO {
+        no_bid
+    } else if yes_bid > Decimal::ZERO {
+        (Decimal::ONE - yes_bid).max(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    }
+}
+
+fn direction_sign(direction: SignalDirection) -> i32 {
+    match direction {
+        SignalDirection::BuyYes => 1,
+        SignalDirection::BuyNo => -1,
+    }
+}
+
+fn json_decimal_abs(metadata: &serde_json::Value, key: &str) -> Option<Decimal> {
+    let value = metadata.get(key)?;
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<Decimal>().ok().map(|v| v.abs());
+    }
+    if let Some(raw) = value.as_f64() {
+        return Decimal::try_from(raw).ok().map(|v| v.abs());
+    }
+    None
+}
+
+fn json_decimal(metadata: &serde_json::Value, key: &str) -> Option<Decimal> {
+    let value = metadata.get(key)?;
+    if let Some(raw) = value.as_str() {
+        return raw.parse::<Decimal>().ok();
+    }
+    if let Some(raw) = value.as_f64() {
+        return Decimal::try_from(raw).ok();
+    }
+    None
+}
+
+fn mean_reversion_target_hit(
+    quant_ctx: &QuantExitContext,
+    current_yes: Decimal,
+    current_no: Decimal,
+) -> bool {
+    let Some(current_price) = json_decimal(&quant_ctx.metadata, "current_price") else {
+        return false;
+    };
+    let Some(previous_price) = json_decimal(&quant_ctx.metadata, "previous_price") else {
+        return false;
+    };
+    let target_yes = (current_price + previous_price) / Decimal::new(2, 0);
+    match quant_ctx.direction {
+        SignalDirection::BuyYes => current_yes >= target_yes,
+        SignalDirection::BuyNo => current_no >= (Decimal::ONE - target_yes).max(Decimal::ZERO),
+    }
+}
+
+fn cross_market_target_hit(quant_ctx: &QuantExitContext, current_yes: Decimal) -> bool {
+    let Some(lag_current_price) = json_decimal(&quant_ctx.metadata, "lag_current_price") else {
+        return false;
+    };
+    let lead_change = quant_ctx
+        .metadata
+        .get("lead_change")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .abs();
+    let lag_change = quant_ctx
+        .metadata
+        .get("lag_change")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .abs();
+    let divergence_gap = ((lead_change - lag_change) / 2.0).max(0.0);
+    let Ok(divergence_gap) = Decimal::try_from(divergence_gap) else {
+        return false;
+    };
+
+    match quant_ctx.direction {
+        SignalDirection::BuyYes => current_yes >= lag_current_price + divergence_gap,
+        SignalDirection::BuyNo => {
+            current_yes <= (lag_current_price - divergence_gap).max(Decimal::ZERO)
+        }
+    }
+}
+
+fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> bool {
+    let Some(entry_deviation) = json_decimal_abs(&quant_ctx.metadata, "deviation") else {
+        return false;
+    };
+    let current_deviation = (current_yes - Decimal::new(50, 2)).abs();
+    current_deviation <= entry_deviation / Decimal::new(2, 0)
+}
+
+trait ExitTradeEventExt {
+    fn with_realized_pnl(self, pnl: Decimal) -> Self;
+    fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
+}
+
+impl ExitTradeEventExt for NewTradeEvent {
+    fn with_realized_pnl(mut self, pnl: Decimal) -> Self {
+        self.realized_pnl = Some(pnl);
+        self
+    }
+
+    fn with_unrealized_pnl(mut self, pnl: Decimal) -> Self {
+        self.unrealized_pnl = Some(pnl);
+        self
+    }
+}
+
 /// Spawn the exit handler as a background task.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_exit_handler(
@@ -802,6 +1301,7 @@ pub fn spawn_exit_handler(
     circuit_breaker: Arc<CircuitBreaker>,
     clob_client: Arc<ClobClient>,
     signal_tx: broadcast::Sender<SignalUpdate>,
+    trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
     pool: PgPool,
     arb_dedup: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
@@ -812,6 +1312,7 @@ pub fn spawn_exit_handler(
         circuit_breaker,
         clob_client,
         signal_tx,
+        trade_event_tx,
         pool,
         arb_dedup,
         heartbeat,
@@ -824,6 +1325,78 @@ pub fn spawn_exit_handler(
     });
 
     info!("Exit handler spawned as background task");
+}
+
+#[cfg(test)]
+mod strategy_exit_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn quant_ctx(
+        kind: QuantSignalKind,
+        direction: SignalDirection,
+        metadata: serde_json::Value,
+    ) -> QuantExitContext {
+        QuantExitContext {
+            signal_id: uuid::Uuid::new_v4(),
+            kind,
+            direction,
+            metadata,
+        }
+    }
+
+    #[test]
+    fn mean_reversion_exit_hits_midpoint_target_for_yes() {
+        let ctx = quant_ctx(
+            QuantSignalKind::MeanReversion,
+            SignalDirection::BuyYes,
+            json!({
+                "current_price": "0.40",
+                "previous_price": "0.60"
+            }),
+        );
+
+        assert!(mean_reversion_target_hit(
+            &ctx,
+            Decimal::new(50, 2),
+            Decimal::new(50, 2)
+        ));
+        assert!(!mean_reversion_target_hit(
+            &ctx,
+            Decimal::new(45, 2),
+            Decimal::new(55, 2)
+        ));
+    }
+
+    #[test]
+    fn cross_market_exit_requires_divergence_compression() {
+        let ctx = quant_ctx(
+            QuantSignalKind::CrossMarket,
+            SignalDirection::BuyYes,
+            json!({
+                "lag_current_price": "0.40",
+                "lead_change": 0.20,
+                "lag_change": 0.04
+            }),
+        );
+
+        assert!(cross_market_target_hit(&ctx, Decimal::new(48, 2)));
+        assert!(!cross_market_target_hit(&ctx, Decimal::new(45, 2)));
+    }
+
+    #[test]
+    fn resolution_exit_triggers_when_lean_decays_by_half() {
+        let ctx = quant_ctx(
+            QuantSignalKind::ResolutionProximity,
+            SignalDirection::BuyYes,
+            json!({
+                "deviation": "0.20"
+            }),
+        );
+
+        assert!(resolution_lean_decay(&ctx, Decimal::new(58, 2)));
+        assert!(!resolution_lean_decay(&ctx, Decimal::new(70, 2)));
+    }
 }
 
 #[cfg(test)]
