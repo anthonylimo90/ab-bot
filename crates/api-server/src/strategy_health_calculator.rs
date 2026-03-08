@@ -32,7 +32,7 @@ impl StrategyHealthConfig {
     }
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 struct StrategyHealthAggRow {
     strategy: String,
     generated_signals: i64,
@@ -195,7 +195,7 @@ async fn load_strategy_health(
     from: chrono::DateTime<Utc>,
     to: chrono::DateTime<Utc>,
 ) -> Result<Vec<StrategyHealthAggRow>, sqlx::Error> {
-    sqlx::query_as(
+    let canonical: Vec<StrategyHealthAggRow> = sqlx::query_as(
         r#"
         WITH filtered AS (
             SELECT *
@@ -306,6 +306,51 @@ async fn load_strategy_health(
     .bind(from)
     .bind(to)
     .fetch_all(pool)
+    .await?;
+
+    let derived = load_derived_strategy_health(pool, from, to).await?;
+    Ok(merge_strategy_health_rows(canonical, derived))
+}
+
+async fn load_derived_strategy_health(
+    pool: &PgPool,
+    from: chrono::DateTime<Utc>,
+    to: chrono::DateTime<Utc>,
+) -> Result<Vec<StrategyHealthAggRow>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            qs.kind AS strategy,
+            COUNT(*)::bigint AS generated_signals,
+            COUNT(*) FILTER (WHERE qs.execution_status = 'executed')::bigint AS executed_signals,
+            COUNT(*) FILTER (WHERE qs.execution_status = 'skipped')::bigint AS skipped_signals,
+            COUNT(*) FILTER (WHERE qs.execution_status = 'expired')::bigint AS expired_signals,
+            COUNT(*) FILTER (WHERE p.state = 1)::bigint AS open_positions,
+            COUNT(*) FILTER (WHERE p.state = 2)::bigint AS exit_ready_positions,
+            COUNT(*) FILTER (WHERE p.state = 4)::bigint AS closed_positions,
+            COUNT(*) FILTER (WHERE p.state = 5)::bigint AS entry_failed_positions,
+            COUNT(*) FILTER (WHERE p.state = 6)::bigint AS exit_failed_positions,
+            COALESCE(
+                SUM(NULLIF(qs.metadata ->> 'expected_edge_bps', '')::numeric)
+                    FILTER (WHERE qs.execution_status = 'executed'),
+                0
+            ) AS total_expected_edge,
+            0::numeric AS total_observed_edge,
+            COALESCE(SUM(p.realized_pnl) FILTER (WHERE p.state = 4), 0) AS total_realized_pnl,
+            AVG((EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0)::double precision)
+                FILTER (WHERE p.state = 4 AND p.exit_timestamp IS NOT NULL) AS avg_hold_hours
+        FROM quant_signals qs
+        LEFT JOIN positions p
+          ON p.id = qs.position_id
+        WHERE qs.generated_at >= $1
+          AND qs.generated_at <= $2
+        GROUP BY qs.kind
+        ORDER BY qs.kind ASC
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
     .await
 }
 
@@ -339,11 +384,10 @@ async fn load_latest_backtests(pool: &PgPool) -> Result<Vec<LatestBacktestRow>, 
 }
 
 fn skip_rate(row: &StrategyHealthAggRow) -> Option<f64> {
-    let total = row.generated_signals + row.skipped_signals + row.expired_signals;
-    if total <= 0 {
+    if row.generated_signals <= 0 {
         return None;
     }
-    Some(row.skipped_signals as f64 / total as f64)
+    Some(row.skipped_signals as f64 / row.generated_signals as f64)
 }
 
 fn failure_rate(row: &StrategyHealthAggRow) -> Option<f64> {
@@ -359,6 +403,63 @@ fn edge_capture_ratio(row: &StrategyHealthAggRow) -> Option<Decimal> {
         return None;
     }
     Some(row.total_realized_pnl / row.total_expected_edge)
+}
+
+fn merge_strategy_health_rows(
+    canonical: Vec<StrategyHealthAggRow>,
+    derived: Vec<StrategyHealthAggRow>,
+) -> Vec<StrategyHealthAggRow> {
+    let mut derived_by_strategy: std::collections::HashMap<String, StrategyHealthAggRow> = derived
+        .into_iter()
+        .map(|row| (row.strategy.clone(), row))
+        .collect();
+
+    let mut merged: Vec<StrategyHealthAggRow> = canonical
+        .into_iter()
+        .map(|canonical_row| {
+            if let Some(derived_row) = derived_by_strategy.remove(&canonical_row.strategy) {
+                hydrate_strategy_health_row(canonical_row, derived_row)
+            } else {
+                canonical_row
+            }
+        })
+        .collect();
+
+    merged.extend(derived_by_strategy.into_values());
+    merged.sort_by(|a, b| a.strategy.cmp(&b.strategy));
+    merged
+}
+
+fn hydrate_strategy_health_row(
+    mut canonical: StrategyHealthAggRow,
+    derived: StrategyHealthAggRow,
+) -> StrategyHealthAggRow {
+    canonical.generated_signals = canonical.generated_signals.max(derived.generated_signals);
+    canonical.executed_signals = canonical.executed_signals.max(derived.executed_signals);
+    canonical.skipped_signals = canonical.skipped_signals.max(derived.skipped_signals);
+    canonical.expired_signals = canonical.expired_signals.max(derived.expired_signals);
+    canonical.open_positions = canonical.open_positions.max(derived.open_positions);
+    canonical.exit_ready_positions = canonical
+        .exit_ready_positions
+        .max(derived.exit_ready_positions);
+    canonical.closed_positions = canonical.closed_positions.max(derived.closed_positions);
+    canonical.entry_failed_positions = canonical
+        .entry_failed_positions
+        .max(derived.entry_failed_positions);
+    canonical.exit_failed_positions = canonical
+        .exit_failed_positions
+        .max(derived.exit_failed_positions);
+    if canonical.total_expected_edge.is_zero() && !derived.total_expected_edge.is_zero() {
+        canonical.total_expected_edge = derived.total_expected_edge;
+    }
+    if canonical.total_observed_edge.is_zero() && !derived.total_observed_edge.is_zero() {
+        canonical.total_observed_edge = derived.total_observed_edge;
+    }
+    if canonical.total_realized_pnl.is_zero() && !derived.total_realized_pnl.is_zero() {
+        canonical.total_realized_pnl = derived.total_realized_pnl;
+    }
+    canonical.avg_hold_hours = canonical.avg_hold_hours.or(derived.avg_hold_hours);
+    canonical
 }
 
 struct Recommendation {
@@ -442,5 +543,60 @@ mod tests {
         row.total_realized_pnl = Decimal::new(-10, 0);
         let rec = recommend(&row);
         assert_eq!(rec.label, "reduce");
+    }
+
+    #[test]
+    fn test_skip_rate_uses_generated_signals_as_denominator() {
+        let row = StrategyHealthAggRow {
+            generated_signals: 2237,
+            skipped_signals: 2237,
+            expired_signals: 0,
+            ..sample_row("flow")
+        };
+
+        assert_eq!(skip_rate(&row), Some(1.0));
+    }
+
+    #[test]
+    fn test_merge_strategy_health_rows_hydrates_missing_execution_counts() {
+        let merged = merge_strategy_health_rows(
+            vec![StrategyHealthAggRow {
+                strategy: "flow".to_string(),
+                generated_signals: 10,
+                executed_signals: 0,
+                skipped_signals: 10,
+                expired_signals: 0,
+                open_positions: 0,
+                exit_ready_positions: 0,
+                closed_positions: 2,
+                entry_failed_positions: 0,
+                exit_failed_positions: 0,
+                total_expected_edge: Decimal::ZERO,
+                total_observed_edge: Decimal::ZERO,
+                total_realized_pnl: Decimal::new(-5, 0),
+                avg_hold_hours: None,
+            }],
+            vec![StrategyHealthAggRow {
+                strategy: "flow".to_string(),
+                generated_signals: 10,
+                executed_signals: 3,
+                skipped_signals: 10,
+                expired_signals: 0,
+                open_positions: 0,
+                exit_ready_positions: 0,
+                closed_positions: 2,
+                entry_failed_positions: 0,
+                exit_failed_positions: 0,
+                total_expected_edge: Decimal::new(120, 0),
+                total_observed_edge: Decimal::ZERO,
+                total_realized_pnl: Decimal::new(-5, 0),
+                avg_hold_hours: Some(4.0),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].executed_signals, 3);
+        assert_eq!(merged[0].total_expected_edge, Decimal::new(120, 0));
+        assert_eq!(merged[0].avg_hold_hours, Some(4.0));
     }
 }

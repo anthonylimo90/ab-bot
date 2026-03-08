@@ -9,7 +9,7 @@
 //!   - trade_count >= 5
 //!
 //! Direction: positive imbalance → BuyYes, negative → BuyNo
-//! Confidence: EV-style score using imbalance, smart-money share, participant
+//! Confidence: heuristic score using imbalance, smart-money share, participant
 //! breadth, liquidity, and price regime
 //! Expiry: 30 minutes from generation
 
@@ -40,6 +40,10 @@ pub struct FlowSignalConfig {
     pub min_expected_edge_bps: f64,
     /// Minimum fraction of net flow attributable to smart money.
     pub min_smart_money_share: f64,
+    /// Minimum share of recent trades that have a known bot score.
+    pub min_bot_score_coverage: f64,
+    /// Require a recent yes-price mark before scoring the market.
+    pub require_yes_price: bool,
     /// Maximum signals to emit per scan.
     pub max_signals_per_cycle: i64,
     /// Window size to scan (minutes).
@@ -48,6 +52,12 @@ pub struct FlowSignalConfig {
     pub base_position_size_usd: Decimal,
     /// Signal expiry in minutes.
     pub expiry_minutes: i64,
+    /// Lookback window for realized calibration.
+    pub calibration_lookback_days: i64,
+    /// Minimum recent closed trades required to use calibrated edges.
+    pub calibration_min_closed_trades: i64,
+    /// Whether to suppress signals until calibration data exists.
+    pub require_calibration: bool,
 }
 
 impl FlowSignalConfig {
@@ -84,6 +94,13 @@ impl FlowSignalConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.35),
+            min_bot_score_coverage: std::env::var("FLOW_MIN_BOT_SCORE_COVERAGE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.50),
+            require_yes_price: std::env::var("FLOW_REQUIRE_YES_PRICE")
+                .map(|v| v == "true")
+                .unwrap_or(true),
             max_signals_per_cycle: std::env::var("FLOW_MAX_SIGNALS_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -97,6 +114,17 @@ impl FlowSignalConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(Decimal::new(30, 0)),
             expiry_minutes: 30,
+            calibration_lookback_days: std::env::var("FLOW_CALIBRATION_LOOKBACK_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(14),
+            calibration_min_closed_trades: std::env::var("FLOW_CALIBRATION_MIN_CLOSED_TRADES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
+            require_calibration: std::env::var("FLOW_REQUIRE_CALIBRATION")
+                .map(|v| v == "true")
+                .unwrap_or(true),
         }
     }
 }
@@ -116,6 +144,60 @@ struct FlowFeatureRow {
     liquidity: Decimal,
     market_volume: Decimal,
     yes_price: Option<f64>,
+    bot_score_coverage: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FlowCalibrationStats {
+    closed_trades: i64,
+    win_rate: f64,
+    avg_realized_return_bps: f64,
+    edge_capture_ratio: f64,
+}
+
+impl FlowCalibrationStats {
+    fn usable(self, min_closed_trades: i64) -> bool {
+        self.closed_trades >= min_closed_trades && self.edge_capture_ratio.is_finite()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FlowCalibrationSnapshot {
+    overall: Option<FlowCalibrationStats>,
+    buy_yes: Option<FlowCalibrationStats>,
+    buy_no: Option<FlowCalibrationStats>,
+}
+
+impl FlowCalibrationSnapshot {
+    fn usable_for(
+        &self,
+        direction: SignalDirection,
+        min_closed_trades: i64,
+    ) -> Option<FlowCalibrationStats> {
+        let directional = match direction {
+            SignalDirection::BuyYes => self.buy_yes,
+            SignalDirection::BuyNo => self.buy_no,
+        };
+
+        directional
+            .filter(|stats| stats.usable(min_closed_trades))
+            .or_else(|| self.overall.filter(|stats| stats.usable(min_closed_trades)))
+    }
+
+    fn has_usable_data(&self, min_closed_trades: i64) -> bool {
+        self.overall
+            .map(|stats| stats.usable(min_closed_trades))
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct FlowCalibrationRow {
+    direction: Option<String>,
+    closed_trades: i64,
+    win_rate: Option<f64>,
+    avg_realized_return_bps: Option<f64>,
+    edge_capture_ratio: Option<f64>,
 }
 
 /// Spawn the flow signal generator background task.
@@ -137,8 +219,13 @@ pub fn spawn_flow_signal_generator(
         min_score = config.min_score,
         min_expected_edge_bps = config.min_expected_edge_bps,
         min_smart_money_share = config.min_smart_money_share,
+        min_bot_score_coverage = config.min_bot_score_coverage,
+        require_yes_price = config.require_yes_price,
         max_signals_per_cycle = config.max_signals_per_cycle,
         window_minutes = config.window_minutes,
+        calibration_lookback_days = config.calibration_lookback_days,
+        calibration_min_closed_trades = config.calibration_min_closed_trades,
+        require_calibration = config.require_calibration,
         "Spawning flow signal generator"
     );
 
@@ -179,6 +266,20 @@ async fn scan_and_emit(
     signal_tx: &broadcast::Sender<QuantSignal>,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let now = Utc::now();
+    let window_start = now - Duration::minutes(config.window_minutes as i64);
+    let calibration =
+        load_flow_calibration(pool, now - Duration::days(config.calibration_lookback_days)).await?;
+
+    if config.require_calibration
+        && !calibration.has_usable_data(config.calibration_min_closed_trades)
+    {
+        warn!(
+            lookback_days = config.calibration_lookback_days,
+            min_closed_trades = config.calibration_min_closed_trades,
+            "Flow calibration unavailable, suppressing signal emission"
+        );
+        return Ok(0);
+    }
 
     // Query the most recent flow features for the configured window size
     // that meet our minimum thresholds.
@@ -203,6 +304,45 @@ async fn scan_and_emit(
               AND ABS(mff.smart_money_flow) >= $4
               AND mff.trade_count >= $5
             ORDER BY mff.condition_id, mff.window_end DESC
+        ),
+        recent_window_trades AS (
+            SELECT
+                condition_id,
+                wallet_address
+            FROM wallet_trades
+            WHERE condition_id IS NOT NULL
+              AND timestamp >= $6
+              AND timestamp <= $2
+              AND condition_id IN (SELECT condition_id FROM latest_features)
+        ),
+        recent_wallets AS (
+            SELECT DISTINCT wallet_address
+            FROM recent_window_trades
+        ),
+        latest_bot_scores AS (
+            SELECT
+                rw.wallet_address AS address,
+                (
+                    SELECT bs.total_score
+                    FROM bot_scores bs
+                    WHERE bs.address = rw.wallet_address
+                    ORDER BY bs.computed_at DESC
+                    LIMIT 1
+                ) AS total_score
+            FROM recent_wallets rw
+        ),
+        score_coverage AS (
+            SELECT
+                rwt.condition_id,
+                CASE
+                    WHEN COUNT(*) = 0 THEN 0::double precision
+                    ELSE COUNT(*) FILTER (WHERE lbs.total_score IS NOT NULL)::double precision
+                        / COUNT(*)::double precision
+                END AS bot_score_coverage
+            FROM recent_window_trades rwt
+            LEFT JOIN latest_bot_scores lbs
+              ON lbs.address = rwt.wallet_address
+            GROUP BY rwt.condition_id
         )
         SELECT
             lf.condition_id,
@@ -216,7 +356,8 @@ async fn scan_and_emit(
             lf.net_flow,
             COALESCE(mm.liquidity, 0) AS liquidity,
             COALESCE(mm.volume, 0) AS market_volume,
-            ob.yes_price
+            ob.yes_price,
+            COALESCE(sc.bot_score_coverage, 0) AS bot_score_coverage
         FROM latest_features lf
         LEFT JOIN market_metadata mm
           ON mm.condition_id = lf.condition_id
@@ -227,6 +368,8 @@ async fn scan_and_emit(
             ORDER BY bucket DESC
             LIMIT 1
         ) ob ON true
+        LEFT JOIN score_coverage sc
+          ON sc.condition_id = lf.condition_id
         WHERE COALESCE(mm.active, true) = true
         ORDER BY ABS(lf.smart_money_flow) DESC, ABS(lf.imbalance_ratio) DESC
         LIMIT 100
@@ -237,6 +380,7 @@ async fn scan_and_emit(
     .bind(Decimal::try_from(config.min_imbalance).unwrap_or(Decimal::new(25, 2)))
     .bind(config.min_smart_money_flow)
     .bind(config.min_trade_count)
+    .bind(window_start)
     .fetch_all(pool)
     .await?;
 
@@ -245,6 +389,14 @@ async fn scan_and_emit(
         Vec::new();
 
     for row in &rows {
+        if config.require_yes_price && row.yes_price.is_none() {
+            continue;
+        }
+
+        if row.bot_score_coverage < config.min_bot_score_coverage {
+            continue;
+        }
+
         let imbalance_abs = decimal_to_f64(row.imbalance_ratio.abs());
         let smart_money_abs = decimal_to_f64(row.smart_money_flow.abs());
         let total_flow_abs = decimal_to_f64(row.buy_volume + row.sell_volume).max(1.0);
@@ -320,6 +472,23 @@ async fn scan_and_emit(
             SignalDirection::BuyNo
         };
 
+        let Some(calibration_stats) = calibration
+            .usable_for(direction, config.calibration_min_closed_trades)
+            .or_else(|| (!config.require_calibration).then_some(FlowCalibrationStats::default()))
+        else {
+            continue;
+        };
+
+        let calibrated_expected_edge_bps = if config.require_calibration {
+            calibrate_expected_edge_bps(expected_edge_bps, calibration_stats)
+        } else {
+            expected_edge_bps
+        };
+
+        if calibrated_expected_edge_bps < config.min_expected_edge_bps {
+            continue;
+        }
+
         let confidence = score.clamp(0.0, 0.95);
 
         let expiry = now + Duration::minutes(config.expiry_minutes);
@@ -345,13 +514,19 @@ async fn scan_and_emit(
             "market_volume": decimal_to_f64(row.market_volume),
             "yes_price": row.yes_price,
             "score": score,
-            "expected_edge_bps": expected_edge_bps,
+            "raw_expected_edge_bps": expected_edge_bps,
+            "expected_edge_bps": calibrated_expected_edge_bps,
             "smart_money_share": smart_money_share,
             "smart_money_intensity": smart_money_intensity,
             "breadth_score": breadth_score,
             "liquidity_score": liquidity_score,
             "volume_score": volume_score,
             "price_regime_score": price_score,
+            "bot_score_coverage": row.bot_score_coverage,
+            "calibration_closed_trades": calibration_stats.closed_trades,
+            "calibration_win_rate": calibration_stats.win_rate,
+            "calibration_avg_realized_return_bps": calibration_stats.avg_realized_return_bps,
+            "calibration_edge_capture_ratio": calibration_stats.edge_capture_ratio,
             "window_minutes": config.window_minutes,
         }));
 
@@ -361,7 +536,9 @@ async fn scan_and_emit(
             confidence = signal.confidence,
             imbalance = imbalance_abs,
             smart_money = smart_money_abs,
-            expected_edge_bps = expected_edge_bps,
+            raw_expected_edge_bps = expected_edge_bps,
+            calibrated_expected_edge_bps = calibrated_expected_edge_bps,
+            bot_score_coverage = row.bot_score_coverage,
             "Flow signal generated"
         );
 
@@ -382,6 +559,16 @@ fn price_regime_score(yes_price: Option<f64>) -> f64 {
     yes_price
         .map(|price| 1.0 - ((price - 0.5).abs() / 0.45).clamp(0.0, 1.0))
         .unwrap_or(0.5)
+}
+
+fn calibrate_expected_edge_bps(raw_expected_edge_bps: f64, stats: FlowCalibrationStats) -> f64 {
+    let win_rate_centered = ((stats.win_rate - 0.5) * 2.0).clamp(-1.0, 1.0);
+    let realized_return_scale = (stats.avg_realized_return_bps / 100.0).clamp(-1.0, 1.0);
+    let capture_scale = stats.edge_capture_ratio.clamp(-1.5, 1.5);
+    let scale =
+        (capture_scale * 0.60) + (win_rate_centered * 0.30) + (realized_return_scale * 0.10);
+
+    raw_expected_edge_bps * scale.clamp(-1.5, 1.5)
 }
 
 fn flow_score_components(
@@ -413,6 +600,81 @@ fn flow_score_components(
     (score, expected_edge_bps)
 }
 
+async fn load_flow_calibration(
+    pool: &PgPool,
+    lookback_start: chrono::DateTime<Utc>,
+) -> Result<FlowCalibrationSnapshot, sqlx::Error> {
+    let rows: Vec<FlowCalibrationRow> = sqlx::query_as(
+        r#"
+        WITH closed_flow AS (
+            SELECT
+                qs.direction,
+                qs.size_usd,
+                p.realized_pnl,
+                NULLIF(qs.metadata ->> 'expected_edge_bps', '')::double precision AS predicted_edge_bps
+            FROM quant_signals qs
+            JOIN positions p
+              ON p.id = qs.position_id
+            WHERE qs.kind = 'flow'
+              AND qs.execution_status = 'executed'
+              AND p.state = 4
+              AND qs.generated_at >= $1
+        ),
+        grouped AS (
+            SELECT direction, size_usd, realized_pnl, predicted_edge_bps
+            FROM closed_flow
+            UNION ALL
+            SELECT NULL::text AS direction, size_usd, realized_pnl, predicted_edge_bps
+            FROM closed_flow
+        )
+        SELECT
+            direction,
+            COUNT(*)::bigint AS closed_trades,
+            AVG(CASE WHEN realized_pnl > 0 THEN 1.0 ELSE 0.0 END)::double precision AS win_rate,
+            AVG(
+                CASE
+                    WHEN size_usd IS NOT NULL AND size_usd > 0
+                    THEN (realized_pnl::double precision / size_usd::double precision) * 10000.0
+                    ELSE NULL
+                END
+            ) AS avg_realized_return_bps,
+            CASE
+                WHEN COALESCE(SUM(ABS(predicted_edge_bps)), 0) = 0 THEN NULL
+                ELSE SUM(
+                    CASE
+                        WHEN size_usd IS NOT NULL AND size_usd > 0
+                        THEN (realized_pnl::double precision / size_usd::double precision) * 10000.0
+                        ELSE 0
+                    END
+                ) / SUM(ABS(predicted_edge_bps))
+            END AS edge_capture_ratio
+        FROM grouped
+        GROUP BY direction
+        "#,
+    )
+    .bind(lookback_start)
+    .fetch_all(pool)
+    .await?;
+
+    let mut snapshot = FlowCalibrationSnapshot::default();
+    for row in rows {
+        let stats = FlowCalibrationStats {
+            closed_trades: row.closed_trades,
+            win_rate: row.win_rate.unwrap_or(0.0),
+            avg_realized_return_bps: row.avg_realized_return_bps.unwrap_or(0.0),
+            edge_capture_ratio: row.edge_capture_ratio.unwrap_or(0.0),
+        };
+
+        match row.direction.as_deref() {
+            Some("buy_yes") => snapshot.buy_yes = Some(stats),
+            Some("buy_no") => snapshot.buy_no = Some(stats),
+            _ => snapshot.overall = Some(stats),
+        }
+    }
+
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +689,9 @@ mod tests {
         assert_eq!(config.min_trade_count, 5);
         assert!(config.min_score > 0.0);
         assert!(config.min_expected_edge_bps > 0.0);
+        assert!(config.require_yes_price);
+        assert!(config.require_calibration);
+        assert!(config.min_bot_score_coverage > 0.0);
         assert_eq!(config.window_minutes, 60);
     }
 
@@ -453,5 +718,35 @@ mod tests {
     fn test_price_regime_penalizes_extremes() {
         assert!(price_regime_score(Some(0.50)) > price_regime_score(Some(0.92)));
         assert!(price_regime_score(Some(0.50)) > price_regime_score(Some(0.08)));
+    }
+
+    #[test]
+    fn test_calibrated_edge_turns_negative_after_bad_realized_outcomes() {
+        let stats = FlowCalibrationStats {
+            closed_trades: 18,
+            win_rate: 0.0,
+            avg_realized_return_bps: -35.0,
+            edge_capture_ratio: -0.30,
+        };
+
+        let calibrated = calibrate_expected_edge_bps(120.0, stats);
+        assert!(calibrated < 0.0);
+    }
+
+    #[test]
+    fn test_directional_calibration_falls_back_to_overall() {
+        let snapshot = FlowCalibrationSnapshot {
+            overall: Some(FlowCalibrationStats {
+                closed_trades: 10,
+                win_rate: 0.55,
+                avg_realized_return_bps: 12.0,
+                edge_capture_ratio: 0.45,
+            }),
+            buy_yes: None,
+            buy_no: None,
+        };
+
+        assert!(snapshot.usable_for(SignalDirection::BuyYes, 8).is_some());
+        assert!(snapshot.usable_for(SignalDirection::BuyNo, 8).is_some());
     }
 }

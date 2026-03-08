@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -558,33 +558,6 @@ fn state_name(state: i16) -> &'static str {
     }
 }
 
-async fn load_canonical_event_strategies(
-    pool: &sqlx::PgPool,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-    strategy: Option<&str>,
-    market_id: Option<&str>,
-) -> Result<HashSet<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        r#"
-        SELECT DISTINCT strategy
-        FROM trade_events
-        WHERE occurred_at >= $1
-          AND occurred_at <= $2
-          AND ($3::text IS NULL OR strategy = $3)
-          AND ($4::text IS NULL OR market_id = $4)
-        "#,
-    )
-    .bind(from)
-    .bind(to)
-    .bind(strategy)
-    .bind(market_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows.into_iter().map(|(strategy,)| strategy).collect())
-}
-
 async fn load_trade_event_summary_rows(
     pool: &sqlx::PgPool,
     from: DateTime<Utc>,
@@ -1084,44 +1057,173 @@ fn merge_strategy_summaries(
     canonical: Vec<TradeFlowStrategySummary>,
     fallback: Vec<TradeFlowStrategySummary>,
 ) -> Vec<TradeFlowStrategySummary> {
-    let mut covered: HashSet<String> = canonical.iter().map(|row| row.strategy.clone()).collect();
-    let mut merged = canonical;
-    for row in fallback {
-        if covered.insert(row.strategy.clone()) {
-            merged.push(row);
-        }
-    }
+    let mut fallback_by_strategy: HashMap<String, TradeFlowStrategySummary> = fallback
+        .into_iter()
+        .map(|row| (row.strategy.clone(), row))
+        .collect();
+
+    let mut merged: Vec<TradeFlowStrategySummary> = canonical
+        .into_iter()
+        .map(|canonical_row| {
+            if let Some(fallback_row) = fallback_by_strategy.remove(&canonical_row.strategy) {
+                hydrate_strategy_summary(canonical_row, fallback_row)
+            } else {
+                canonical_row
+            }
+        })
+        .collect();
+
+    merged.extend(fallback_by_strategy.into_values());
     merged.sort_by(|a, b| a.strategy.cmp(&b.strategy));
     merged
 }
 
+fn hydrate_strategy_summary(
+    mut canonical: TradeFlowStrategySummary,
+    fallback: TradeFlowStrategySummary,
+) -> TradeFlowStrategySummary {
+    canonical.supports_signal_history |= fallback.supports_signal_history;
+    canonical.generated_signals = canonical.generated_signals.max(fallback.generated_signals);
+    canonical.executed_signals = canonical.executed_signals.max(fallback.executed_signals);
+    canonical.skipped_signals = canonical.skipped_signals.max(fallback.skipped_signals);
+    canonical.expired_signals = canonical.expired_signals.max(fallback.expired_signals);
+    canonical.open_positions = canonical.open_positions.max(fallback.open_positions);
+    canonical.exit_ready_positions = canonical
+        .exit_ready_positions
+        .max(fallback.exit_ready_positions);
+    canonical.closed_positions = canonical.closed_positions.max(fallback.closed_positions);
+    canonical.entry_failed_positions = canonical
+        .entry_failed_positions
+        .max(fallback.entry_failed_positions);
+    canonical.exit_failed_positions = canonical
+        .exit_failed_positions
+        .max(fallback.exit_failed_positions);
+    if canonical.net_pnl.is_zero() && !fallback.net_pnl.is_zero() {
+        canonical.net_pnl = fallback.net_pnl;
+    }
+    canonical.avg_hold_hours = canonical.avg_hold_hours.or(fallback.avg_hold_hours);
+    canonical
+}
+
+fn journey_timestamp(row: &TradeJourneyResponse, from: DateTime<Utc>) -> DateTime<Utc> {
+    row.signal_generated_at
+        .or(row.opened_at)
+        .or(row.closed_at)
+        .unwrap_or(from)
+}
+
+fn journey_key(row: &TradeJourneyResponse, from: DateTime<Utc>) -> String {
+    if let Some(signal_id) = row.signal_id {
+        return format!("signal:{signal_id}");
+    }
+
+    if let Some(position_id) = row.position_id {
+        return format!("position:{position_id}");
+    }
+
+    format!(
+        "synthetic:{}:{}:{}:{}",
+        row.strategy,
+        row.market_id,
+        row.lifecycle_stage,
+        journey_timestamp(row, from).timestamp_millis(),
+    )
+}
+
+fn journey_completeness(row: &TradeJourneyResponse) -> usize {
+    usize::from(row.execution_status.is_some())
+        + usize::from(row.position_state.is_some())
+        + usize::from(row.signal_id.is_some())
+        + usize::from(row.position_id.is_some())
+        + usize::from(row.direction.is_some())
+        + usize::from(row.confidence.is_some())
+        + usize::from(row.skip_reason.is_some())
+        + usize::from(row.signal_generated_at.is_some())
+        + usize::from(row.opened_at.is_some())
+        + usize::from(row.closed_at.is_some())
+        + usize::from(row.realized_pnl.is_some())
+        + usize::from(row.unrealized_pnl.is_some())
+        + usize::from(row.hold_hours.is_some())
+        + usize::from(!row.synthetic_history)
+}
+
+fn hydrate_journey(
+    mut primary: TradeJourneyResponse,
+    secondary: TradeJourneyResponse,
+) -> TradeJourneyResponse {
+    primary.supports_signal_history |= secondary.supports_signal_history;
+    if primary.execution_status.is_none() {
+        primary.execution_status = secondary.execution_status;
+    }
+    if primary.position_state.is_none() {
+        primary.position_state = secondary.position_state;
+    }
+    if primary.signal_id.is_none() {
+        primary.signal_id = secondary.signal_id;
+    }
+    if primary.position_id.is_none() {
+        primary.position_id = secondary.position_id;
+    }
+    if primary.direction.is_none() {
+        primary.direction = secondary.direction;
+    }
+    if primary.confidence.is_none() {
+        primary.confidence = secondary.confidence;
+    }
+    if primary.skip_reason.is_none() {
+        primary.skip_reason = secondary.skip_reason;
+    }
+    if primary.signal_generated_at.is_none() {
+        primary.signal_generated_at = secondary.signal_generated_at;
+    }
+    if primary.opened_at.is_none() {
+        primary.opened_at = secondary.opened_at;
+    }
+    if primary.closed_at.is_none() {
+        primary.closed_at = secondary.closed_at;
+    }
+    if primary.realized_pnl.is_none() {
+        primary.realized_pnl = secondary.realized_pnl;
+    }
+    if primary.unrealized_pnl.is_none() {
+        primary.unrealized_pnl = secondary.unrealized_pnl;
+    }
+    if primary.hold_hours.is_none() {
+        primary.hold_hours = secondary.hold_hours;
+    }
+    primary.synthetic_history &= secondary.synthetic_history;
+    primary
+}
+
 fn merge_journeys(
-    mut canonical: Vec<TradeJourneyResponse>,
+    canonical: Vec<TradeJourneyResponse>,
     fallback: Vec<TradeJourneyResponse>,
     from: DateTime<Utc>,
     limit: i64,
 ) -> Vec<TradeJourneyResponse> {
-    let covered: HashSet<String> = canonical.iter().map(|row| row.strategy.clone()).collect();
-    canonical.extend(
-        fallback
-            .into_iter()
-            .filter(|row| !covered.contains(&row.strategy)),
-    );
-    canonical.sort_by(|a, b| {
-        let a_ts = a
-            .signal_generated_at
-            .or(a.opened_at)
-            .or(a.closed_at)
-            .unwrap_or(from);
-        let b_ts = b
-            .signal_generated_at
-            .or(b.opened_at)
-            .or(b.closed_at)
-            .unwrap_or(from);
-        b_ts.cmp(&a_ts)
-    });
-    canonical.truncate(limit as usize);
-    canonical
+    let mut merged: HashMap<String, TradeJourneyResponse> = HashMap::new();
+
+    for row in canonical.into_iter().chain(fallback.into_iter()) {
+        let key = journey_key(&row, from);
+        match merged.remove(&key) {
+            Some(existing) => {
+                let merged_row = if journey_completeness(&row) > journey_completeness(&existing) {
+                    hydrate_journey(row, existing)
+                } else {
+                    hydrate_journey(existing, row)
+                };
+                merged.insert(key, merged_row);
+            }
+            None => {
+                merged.insert(key, row);
+            }
+        }
+    }
+
+    let mut rows: Vec<TradeJourneyResponse> = merged.into_values().collect();
+    rows.sort_by(|a, b| journey_timestamp(b, from).cmp(&journey_timestamp(a, from)));
+    rows.truncate(limit as usize);
+    rows
 }
 
 fn build_summary(
@@ -1163,29 +1265,14 @@ pub async fn get_trade_flow_summary(
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<TradeFlowSummaryResponse>> {
     let (from, to, _) = effective_window(&query);
-    let canonical_strategies =
-        load_canonical_event_strategies(&state.pool, from, to, query.strategy.as_deref(), None)
-            .await
-            .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
-    let canonical = if canonical_strategies.is_empty() {
-        Vec::new()
-    } else {
+    let canonical =
         load_trade_event_summary_rows(&state.pool, from, to, query.strategy.as_deref(), None)
             .await
-            .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?
-    };
-    let fallback = if query
-        .strategy
-        .as_deref()
-        .map(|strategy| !canonical_strategies.contains(strategy))
-        .unwrap_or(true)
-    {
+            .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
+    let fallback =
         load_derived_summary_rows(&state.pool, from, to, query.strategy.as_deref(), None)
             .await
-            .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?
-    } else {
-        Vec::new()
-    };
+            .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
     Ok(Json(build_summary(
         from,
@@ -1219,27 +1306,16 @@ pub async fn get_trade_flow_journeys(
     )
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
-    let canonical_strategies: HashSet<String> =
-        canonical.iter().map(|row| row.strategy.clone()).collect();
-    let fallback = if query
-        .strategy
-        .as_deref()
-        .map(|strategy| !canonical_strategies.contains(strategy))
-        .unwrap_or(true)
-    {
-        load_derived_journeys(
-            &state.pool,
-            from,
-            to,
-            query.strategy.as_deref(),
-            None,
-            limit,
-        )
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?
-    } else {
-        Vec::new()
-    };
+    let fallback = load_derived_journeys(
+        &state.pool,
+        from,
+        to,
+        query.strategy.as_deref(),
+        None,
+        limit,
+    )
+    .await
+    .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
     Ok(Json(merge_journeys(canonical, fallback, from, limit)))
 }
@@ -1263,7 +1339,7 @@ pub async fn get_market_trade_flow(
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<TradeFlowMarketResponse>> {
     let (from, to, limit) = effective_window(&query);
-    let canonical_summary_strategies = load_canonical_event_strategies(
+    let canonical_summary = load_trade_event_summary_rows(
         &state.pool,
         from,
         to,
@@ -1272,37 +1348,15 @@ pub async fn get_market_trade_flow(
     )
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
-    let canonical_summary = if canonical_summary_strategies.is_empty() {
-        Vec::new()
-    } else {
-        load_trade_event_summary_rows(
-            &state.pool,
-            from,
-            to,
-            query.strategy.as_deref(),
-            Some(&market_id),
-        )
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?
-    };
-    let fallback_summary = if query
-        .strategy
-        .as_deref()
-        .map(|strategy| !canonical_summary_strategies.contains(strategy))
-        .unwrap_or(true)
-    {
-        load_derived_summary_rows(
-            &state.pool,
-            from,
-            to,
-            query.strategy.as_deref(),
-            Some(&market_id),
-        )
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?
-    } else {
-        Vec::new()
-    };
+    let fallback_summary = load_derived_summary_rows(
+        &state.pool,
+        from,
+        to,
+        query.strategy.as_deref(),
+        Some(&market_id),
+    )
+    .await
+    .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
     let canonical_journeys = load_trade_event_journeys(
         &state.pool,
@@ -1314,29 +1368,16 @@ pub async fn get_market_trade_flow(
     )
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
-    let canonical_journey_strategies: HashSet<String> = canonical_journeys
-        .iter()
-        .map(|row| row.strategy.clone())
-        .collect();
-    let fallback_journeys = if query
-        .strategy
-        .as_deref()
-        .map(|strategy| !canonical_journey_strategies.contains(strategy))
-        .unwrap_or(true)
-    {
-        load_derived_journeys(
-            &state.pool,
-            from,
-            to,
-            query.strategy.as_deref(),
-            Some(&market_id),
-            limit,
-        )
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?
-    } else {
-        Vec::new()
-    };
+    let fallback_journeys = load_derived_journeys(
+        &state.pool,
+        from,
+        to,
+        query.strategy.as_deref(),
+        Some(&market_id),
+        limit,
+    )
+    .await
+    .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
     Ok(Json(TradeFlowMarketResponse {
         market_id,
@@ -1397,7 +1438,7 @@ mod tests {
                 source: "quant".to_string(),
                 supports_signal_history: true,
                 generated_signals: 4,
-                executed_signals: 3,
+                executed_signals: 0,
                 skipped_signals: 1,
                 expired_signals: 0,
                 open_positions: 1,
@@ -1413,17 +1454,17 @@ mod tests {
                     strategy: "flow".to_string(),
                     source: "quant".to_string(),
                     supports_signal_history: true,
-                    generated_signals: 99,
-                    executed_signals: 99,
-                    skipped_signals: 0,
+                    generated_signals: 4,
+                    executed_signals: 3,
+                    skipped_signals: 1,
                     expired_signals: 0,
-                    open_positions: 0,
+                    open_positions: 1,
                     exit_ready_positions: 0,
-                    closed_positions: 0,
+                    closed_positions: 2,
                     entry_failed_positions: 0,
                     exit_failed_positions: 0,
-                    net_pnl: Decimal::ZERO,
-                    avg_hold_hours: None,
+                    net_pnl: Decimal::new(12, 0),
+                    avg_hold_hours: Some(1.25),
                 },
                 TradeFlowStrategySummary {
                     strategy: "arb".to_string(),
@@ -1447,6 +1488,64 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[1].strategy, "flow");
         assert_eq!(merged[1].generated_signals, 4);
+        assert_eq!(merged[1].executed_signals, 3);
+        assert_eq!(merged[1].avg_hold_hours, Some(1.5));
+    }
+
+    #[test]
+    fn merge_journeys_hydrates_missing_fields_from_fallback() {
+        let signal_id = Uuid::new_v4();
+        let merged = merge_journeys(
+            vec![TradeJourneyResponse {
+                strategy: "flow".to_string(),
+                source: "quant".to_string(),
+                supports_signal_history: true,
+                lifecycle_stage: "closed".to_string(),
+                execution_status: Some("closed_via_resolution".to_string()),
+                position_state: Some("closed".to_string()),
+                market_id: "market-1".to_string(),
+                signal_id: Some(signal_id),
+                position_id: None,
+                direction: Some("buy_yes".to_string()),
+                confidence: None,
+                skip_reason: None,
+                signal_generated_at: None,
+                opened_at: None,
+                closed_at: Some(Utc::now()),
+                realized_pnl: Some(Decimal::new(-3, 1)),
+                unrealized_pnl: None,
+                hold_hours: None,
+                synthetic_history: false,
+            }],
+            vec![TradeJourneyResponse {
+                strategy: "flow".to_string(),
+                source: "quant".to_string(),
+                supports_signal_history: true,
+                lifecycle_stage: "closed".to_string(),
+                execution_status: Some("executed".to_string()),
+                position_state: Some("closed".to_string()),
+                market_id: "market-1".to_string(),
+                signal_id: Some(signal_id),
+                position_id: Some(Uuid::new_v4()),
+                direction: Some("buy_yes".to_string()),
+                confidence: Some(0.84),
+                skip_reason: None,
+                signal_generated_at: Some(Utc::now() - Duration::minutes(30)),
+                opened_at: Some(Utc::now() - Duration::minutes(25)),
+                closed_at: Some(Utc::now()),
+                realized_pnl: Some(Decimal::new(-3, 1)),
+                unrealized_pnl: Some(Decimal::ZERO),
+                hold_hours: Some(0.5),
+                synthetic_history: false,
+            }],
+            Utc::now() - Duration::days(1),
+            50,
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].confidence, Some(0.84));
+        assert!(merged[0].signal_generated_at.is_some());
+        assert!(merged[0].position_id.is_some());
     }
 
     #[test]
