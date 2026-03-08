@@ -33,8 +33,7 @@ import {
   LineChart,
   BarChart2,
 } from "lucide-react";
-import { formatCurrency } from "@/lib/utils";
-import { cn } from "@/lib/utils";
+import { cn, formatCurrency, formatWinRatePercent } from "@/lib/utils";
 import { TimeAgo } from "@/components/shared/TimeAgo";
 
 const activityIcons: Record<string, React.ReactNode> = {
@@ -288,7 +287,7 @@ export function DashboardHome() {
         <MetricCard
           title="Open Positions"
           value={stats.active_positions.toString()}
-          changeLabel={`Win rate: ${(stats.win_rate || 0).toFixed(0)}%`}
+          changeLabel={`Win rate: ${formatWinRatePercent(stats.win_rate, { input: "percent" })}`}
           trend="neutral"
         />
       </div>

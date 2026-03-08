@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/table";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useStrategyPerformanceQuery } from "@/hooks/queries/useSignalsQuery";
-import { cn } from "@/lib/utils";
+import { cn, formatWinRatePercent } from "@/lib/utils";
 
 const STRATEGY_STYLES: Record<string, { label: string; className: string }> = {
   flow: {
@@ -50,7 +50,7 @@ export function StrategyPerformanceTable() {
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle className="flex items-center gap-2">
           <span>Strategy Performance</span>
-          <InfoTooltip content="This compares how each signal type has been performing. Net P&L is total profit or loss, win rate is the share of profitable trades, and max drawdown shows the worst pullback during the period." />
+          <InfoTooltip content="This compares how each signal type has been performing. Net P&L is total profit or loss, win rate is the share of profitable resolved trades, and max drawdown shows the worst pullback during the period." />
         </CardTitle>
         <div className="flex gap-1">
           {[7, 30].map((d) => (
@@ -122,7 +122,7 @@ export function StrategyPerformanceTable() {
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {s.win_rate != null
-                          ? `${(s.win_rate * 100).toFixed(0)}%`
+                          ? formatWinRatePercent(s.win_rate, { input: "ratio" })
                           : "\u2014"}
                       </TableCell>
                       <TableCell

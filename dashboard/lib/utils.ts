@@ -36,6 +36,32 @@ export function formatPercent(
   return value < 0 ? `-${formatted}` : formatted;
 }
 
+export function formatWinRatePercent(
+  value: number | null | undefined,
+  options?: { input?: "percent" | "ratio" },
+): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "\u2014";
+  }
+
+  const percent = options?.input === "ratio" ? value * 100 : value;
+  const abs = Math.abs(percent);
+
+  if (abs === 0) {
+    return "0%";
+  }
+  if (abs < 0.01) {
+    return "<0.01%";
+  }
+  if (abs < 1) {
+    return `${percent.toFixed(2)}%`;
+  }
+  if (abs < 10) {
+    return `${percent.toFixed(1)}%`;
+  }
+  return `${percent.toFixed(0)}%`;
+}
+
 // Normalizes values that may be stored as either ratio (0.55) or percent (55).
 export function ratioOrPercentToPercent(
   value: number | null | undefined,

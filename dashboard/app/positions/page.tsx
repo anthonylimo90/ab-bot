@@ -33,7 +33,7 @@ import {
 } from "@/hooks/useWebSocket";
 import { useQueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryClient";
-import { formatCurrency, formatPercent, cn } from "@/lib/utils";
+import { cn, formatCurrency, formatWinRatePercent } from "@/lib/utils";
 import {
   Layers,
   ChevronLeft,
@@ -183,9 +183,15 @@ export default function PositionsPage() {
   const winCount =
     positionsSummary?.wins ??
     closedPositions.filter((p) => (p.realized_pnl ?? 0) > 0).length;
+  const lossCount =
+    positionsSummary?.losses ??
+    closedPositions.filter((p) => (p.realized_pnl ?? 0) < 0).length;
+  const flatCloseCount =
+    positionsSummary?.flat_closes ??
+    closedPositions.filter((p) => (p.realized_pnl ?? 0) === 0).length;
   const winRate =
     positionsSummary?.win_rate ??
-    (closedCount > 0 ? (winCount / closedCount) * 100 : 0);
+    (winCount + lossCount > 0 ? (winCount / (winCount + lossCount)) * 100 : 0);
   const summaryUnrealizedPnl =
     positionsSummary?.unrealized_pnl ?? totalUnrealizedPnl;
   const summaryOpenPositions =
@@ -255,9 +261,9 @@ export default function PositionsPage() {
           />
           <MetricCard
             title="Win Rate"
-            value={formatPercent(winRate)}
+            value={formatWinRatePercent(winRate, { input: "percent" })}
             trend={winRate >= 50 ? "up" : winRate > 0 ? "down" : "neutral"}
-            changeLabel={`${winCount}W / ${closedCount - winCount}L`}
+            changeLabel={`${winCount}W / ${lossCount}L${flatCloseCount > 0 ? ` / ${flatCloseCount} flat` : ""}`}
           />
         </div>
 

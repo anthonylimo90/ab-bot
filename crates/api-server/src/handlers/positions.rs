@@ -81,13 +81,15 @@ pub struct PositionsSummaryResponse {
     pub raw_unpriced_position_cost_basis: Decimal,
     /// Raw unrealized P&L before deduplication.
     pub raw_unrealized_pnl: Decimal,
-    /// Closed positions used for win-rate calculations.
+    /// All closed positions, including flat closes.
     pub closed_positions: i64,
     /// Count of winning closed positions.
     pub wins: i64,
-    /// Count of losing/non-winning closed positions.
+    /// Count of losing closed positions.
     pub losses: i64,
-    /// Win rate based on closed positions only.
+    /// Count of closed positions with zero realized P&L.
+    pub flat_closes: i64,
+    /// Win rate based on resolved non-flat closes only.
     pub win_rate: Decimal,
 }
 
@@ -164,6 +166,7 @@ struct PositionSummaryRow {
     closed_positions: i64,
     wins: i64,
     losses: i64,
+    flat_closes: i64,
     win_rate: Decimal,
 }
 
@@ -349,7 +352,8 @@ pub async fn get_positions_summary(
             SELECT
                 COUNT(*) FILTER (WHERE state = 4)::bigint AS closed_positions,
                 COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) > 0)::bigint AS wins,
-                COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) <= 0)::bigint AS losses
+                COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) < 0)::bigint AS losses,
+                COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) = 0)::bigint AS flat_closes
             FROM positions
         )
         SELECT
@@ -375,9 +379,10 @@ pub async fn get_positions_summary(
             closed_positions,
             wins,
             losses,
+            flat_closes,
             CASE
-                WHEN closed_positions > 0
-                    THEN (wins::numeric / closed_positions::numeric) * 100
+                WHEN (wins + losses) > 0
+                    THEN (wins::numeric / (wins + losses)::numeric) * 100
                 ELSE 0
             END AS win_rate
         FROM closed_stats
@@ -404,6 +409,7 @@ pub async fn get_positions_summary(
         closed_positions: row.closed_positions,
         wins: row.wins,
         losses: row.losses,
+        flat_closes: row.flat_closes,
         win_rate: row.win_rate,
     }))
 }

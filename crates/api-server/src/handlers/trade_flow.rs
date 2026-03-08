@@ -311,13 +311,23 @@ async fn load_arb_market_scorecard_rows(
                 p.market_id,
                 COUNT(DISTINCT p.position_id)::bigint AS executed_positions,
                 COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL)::bigint AS closed_positions,
-                COUNT(DISTINCT p.position_id) FILTER (WHERE p.realized_pnl > 0)::bigint AS wins,
-                COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL AND COALESCE(p.realized_pnl, 0) <= 0)::bigint AS losses,
+                COUNT(DISTINCT p.position_id) FILTER (
+                    WHERE p.closed_at IS NOT NULL AND p.realized_pnl > 0
+                )::bigint AS wins,
+                COUNT(DISTINCT p.position_id) FILTER (
+                    WHERE p.closed_at IS NOT NULL AND COALESCE(p.realized_pnl, 0) < 0
+                )::bigint AS losses,
                 CASE
-                    WHEN COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL) = 0 THEN 0
+                    WHEN COUNT(DISTINCT p.position_id) FILTER (
+                        WHERE p.closed_at IS NOT NULL AND COALESCE(p.realized_pnl, 0) <> 0
+                    ) = 0 THEN 0
                     ELSE (
-                        COUNT(DISTINCT p.position_id) FILTER (WHERE p.realized_pnl > 0)::numeric /
-                        COUNT(DISTINCT p.position_id) FILTER (WHERE p.closed_at IS NOT NULL)::numeric
+                        COUNT(DISTINCT p.position_id) FILTER (
+                            WHERE p.closed_at IS NOT NULL AND p.realized_pnl > 0
+                        )::numeric /
+                        COUNT(DISTINCT p.position_id) FILTER (
+                            WHERE p.closed_at IS NOT NULL AND COALESCE(p.realized_pnl, 0) <> 0
+                        )::numeric
                     )
                 END AS win_rate,
                 COALESCE(SUM(p.expected_edge), 0) AS total_expected_edge,

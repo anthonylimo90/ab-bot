@@ -125,6 +125,7 @@ export interface PositionsSummary {
   closed_positions: number;
   wins: number;
   losses: number;
+  flat_closes?: number;
   win_rate: number;
 }
 

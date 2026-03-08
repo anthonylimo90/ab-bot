@@ -224,7 +224,7 @@ async fn load_strategy_health(
         hold_metrics AS (
             SELECT
                 strategy,
-                AVG(EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600.0) AS avg_hold_hours
+                AVG((EXTRACT(EPOCH FROM (closed_at - opened_at)) / 3600.0)::double precision) AS avg_hold_hours
             FROM (
                 SELECT
                     strategy,

@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
@@ -33,6 +33,8 @@ pub struct QuantSignalExecutorConfig {
     pub min_confidence: f64,
     /// Maximum signal age in seconds before discarding.
     pub max_signal_age_secs: i64,
+    /// How often to refresh the outcome token cache in the background.
+    pub cache_refresh_secs: u64,
     /// Maximum simultaneous quant positions.
     pub max_quant_positions: usize,
     /// Strategy allocation weights (should sum to ~1.0).
@@ -66,6 +68,10 @@ impl QuantSignalExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            cache_refresh_secs: std::env::var("QUANT_CACHE_REFRESH_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
             max_quant_positions: std::env::var("QUANT_MAX_POSITIONS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -203,7 +209,7 @@ struct QuantSignalExecutor {
     circuit_breaker: Arc<CircuitBreaker>,
     position_repo: PositionRepository,
     pool: PgPool,
-    token_cache: OutcomeTokenCache,
+    token_cache: Arc<OutcomeTokenCache>,
     trade_event_recorder: TradeEventRecorder,
     /// Per-strategy risk state (daily P&L, consecutive losses).
     strategy_states: HashMap<QuantSignalKind, StrategyState>,
@@ -227,8 +233,9 @@ impl QuantSignalExecutor {
         heartbeat: Arc<AtomicI64>,
     ) -> Self {
         let position_repo = PositionRepository::new(pool.clone());
-        let token_cache =
-            OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone());
+        let token_cache = Arc::new(
+            OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
+        );
         let trade_event_recorder = TradeEventRecorder::new(pool.clone(), trade_event_tx);
 
         let mut strategy_states = HashMap::new();
@@ -258,6 +265,33 @@ impl QuantSignalExecutor {
         self.config.read().await.clone()
     }
 
+    fn spawn_cache_refresh(
+        &self,
+        result_tx: mpsc::UnboundedSender<anyhow::Result<(usize, usize)>>,
+    ) {
+        let token_cache = self.token_cache.clone();
+        let heartbeat = self.heartbeat.clone();
+
+        tokio::spawn(async move {
+            // Full Gamma refresh can take minutes. Keep the executor heartbeat
+            // alive while this runs so monitoring doesn't mistake it for a dead task.
+            let keeper = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                loop {
+                    tick.tick().await;
+                    heartbeat.store(Utc::now().timestamp(), Ordering::Relaxed);
+                }
+            });
+
+            let result = token_cache.refresh().await;
+            keeper.abort();
+
+            if result_tx.send(result).is_err() {
+                debug!("Quant token cache refresh result receiver dropped");
+            }
+        });
+    }
+
     /// Main executor loop.
     async fn run(mut self) {
         let cfg = self.snapshot_config().await;
@@ -265,20 +299,24 @@ impl QuantSignalExecutor {
             enabled = cfg.enabled,
             base_size = %cfg.base_position_size_usd,
             min_confidence = cfg.min_confidence,
+            cache_refresh_secs = cfg.cache_refresh_secs,
             max_positions = cfg.max_quant_positions,
             "Quant signal executor started"
         );
 
-        // Initial cache load
-        if let Err(e) = self.token_cache.refresh().await {
-            warn!(error = %e, "Initial token cache refresh failed");
-        }
+        self.heartbeat
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
 
         // Rebuild today's per-strategy realized outcomes on startup.
         self.sync_strategy_outcomes().await;
 
-        let mut cache_ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+        let mut cache_ticker =
+            tokio::time::interval(std::time::Duration::from_secs(cfg.cache_refresh_secs));
         cache_ticker.tick().await; // skip first tick (just loaded)
+        let (cache_refresh_tx, mut cache_refresh_rx) =
+            mpsc::unbounded_channel::<anyhow::Result<(usize, usize)>>();
+        let mut cache_refresh_in_flight = true;
+        self.spawn_cache_refresh(cache_refresh_tx.clone());
 
         let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut outcome_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -305,9 +343,23 @@ impl QuantSignalExecutor {
                         }
                     }
                 }
+                Some(result) = cache_refresh_rx.recv() => {
+                    cache_refresh_in_flight = false;
+                    match result {
+                        Ok((markets, active_set_size)) => {
+                            debug!(markets, active_set_size, "Quant token cache refreshed");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Quant token cache refresh failed");
+                        }
+                    }
+                }
                 _ = cache_ticker.tick() => {
-                    if let Err(e) = self.token_cache.refresh().await {
-                        warn!(error = %e, "Token cache refresh failed");
+                    if cache_refresh_in_flight {
+                        debug!("Quant token cache refresh still in flight, skipping tick");
+                    } else {
+                        self.spawn_cache_refresh(cache_refresh_tx.clone());
+                        cache_refresh_in_flight = true;
                     }
                 }
                 _ = outcome_ticker.tick() => {
@@ -377,7 +429,7 @@ impl QuantSignalExecutor {
         }
     }
 
-    /// Process a single quant signal through the 15-step pipeline.
+    /// Process a single quant signal through the execution pipeline.
     async fn process_signal(&mut self, signal: QuantSignal) -> anyhow::Result<()> {
         let cfg = self.snapshot_config().await;
         let execution_mode = self.execution_mode(&cfg).await.to_string();
@@ -491,7 +543,29 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        // Step 4: Confidence threshold
+        // Step 4: Per-strategy circuit breaker
+        if let Some(state) = self.strategy_states.get(&signal.kind) {
+            if state.halted {
+                debug!(
+                    signal_id = %signal.id,
+                    kind = signal.kind.as_str(),
+                    reason = state.halt_reason.as_deref().unwrap_or("unknown"),
+                    "Strategy halted by per-strategy circuit breaker, skipping"
+                );
+                self.update_signal_status(signal.id, "skipped", Some("strategy_halted"))
+                    .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("strategy_halted"),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
+        // Step 5: Confidence threshold
         if !signal.meets_confidence(cfg.min_confidence) {
             debug!(
                 signal_id = %signal.id,
@@ -511,7 +585,7 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        // Step 5: Dedup — skip if open position in same condition_id
+        // Step 6: Dedup — skip if open position in same condition_id
         match self
             .position_repo
             .active_quant_executor_position_exists_for_market(&signal.condition_id)
@@ -554,7 +628,7 @@ impl QuantSignalExecutor {
             }
         }
 
-        // Step 6: Circuit breaker
+        // Step 7: Circuit breaker
         if !self.circuit_breaker.can_trade().await {
             debug!(signal_id = %signal.id, "Circuit breaker tripped, skipping");
             self.update_signal_status(signal.id, "skipped", Some("circuit_breaker"))
@@ -569,41 +643,22 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        // Step 6b: Per-strategy circuit breaker
-        if let Some(state) = self.strategy_states.get(&signal.kind) {
-            if state.halted {
-                debug!(
-                    signal_id = %signal.id,
-                    kind = signal.kind.as_str(),
-                    reason = state.halt_reason.as_deref().unwrap_or("unknown"),
-                    "Strategy halted by per-strategy circuit breaker, skipping"
-                );
-                self.update_signal_status(signal.id, "skipped", Some("strategy_halted"))
-                    .await;
-                self.record_signal_outcome_event(
-                    &signal,
-                    &execution_mode,
-                    "signal_skipped",
-                    Some("strategy_halted"),
-                )
-                .await;
-                return Ok(());
-            }
-        }
-
-        // Step 7: Resolve token IDs from OutcomeTokenCache
+        // Step 8: Resolve token IDs from OutcomeTokenCache
         let (yes_token_id, no_token_id) = match self.token_cache.get(&signal.condition_id).await {
             Some(tokens) => tokens,
             None => {
-                // Try one refresh and retry
-                let _ = self.token_cache.refresh().await;
-                match self.token_cache.get(&signal.condition_id).await {
-                    Some(tokens) => tokens,
-                    None => {
+                debug!(
+                    signal_id = %signal.id,
+                    condition_id = &signal.condition_id,
+                    "Market not in token cache, attempting single-market hydration"
+                );
+                match self.token_cache.hydrate_market(&signal.condition_id).await {
+                    Ok(Some(tokens)) => tokens,
+                    Ok(None) => {
                         debug!(
                             signal_id = %signal.id,
                             condition_id = &signal.condition_id,
-                            "Market not in token cache, skipping"
+                            "Market missing after single-market hydration, skipping"
                         );
                         self.update_signal_status(signal.id, "skipped", Some("market_cache_empty"))
                             .await;
@@ -616,17 +671,35 @@ impl QuantSignalExecutor {
                         .await;
                         return Ok(());
                     }
+                    Err(e) => {
+                        warn!(
+                            signal_id = %signal.id,
+                            condition_id = &signal.condition_id,
+                            error = %e,
+                            "Single-market token cache hydration failed"
+                        );
+                        self.update_signal_status(signal.id, "skipped", Some("market_cache_error"))
+                            .await;
+                        self.record_signal_outcome_event(
+                            &signal,
+                            &execution_mode,
+                            "signal_skipped",
+                            Some("market_cache_error"),
+                        )
+                        .await;
+                        return Ok(());
+                    }
                 }
             }
         };
 
-        // Step 8: Determine which token to buy based on direction
+        // Step 9: Determine which token to buy based on direction
         let (target_token_id, outcome_name) = match signal.direction {
             SignalDirection::BuyYes => (yes_token_id, "Yes"),
             SignalDirection::BuyNo => (no_token_id, "No"),
         };
 
-        // Step 9: Orderbook depth check on target side
+        // Step 10: Orderbook depth check on target side
         let book = match self
             .order_executor
             .clob_client()
@@ -690,7 +763,7 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        // Step 10: Confidence-weighted sizing
+        // Step 11: Confidence-weighted sizing
         let allocation_weight = cfg.allocation_for(signal.kind);
         let confidence_decimal =
             Decimal::try_from(signal.confidence).unwrap_or(Decimal::new(65, 2));
@@ -733,7 +806,7 @@ impl QuantSignalExecutor {
             return Ok(());
         };
 
-        // Step 11: Portfolio check — max open quant positions
+        // Step 12: Portfolio check — max open quant positions
         match self
             .position_repo
             .count_active_quant_executor_positions()
@@ -783,7 +856,7 @@ impl QuantSignalExecutor {
             }
         }
 
-        // Step 12: Create PENDING position and persist to DB
+        // Step 13: Create PENDING position and persist to DB
         // For single-leg quant trades, the "other side" price is set to zero.
         let (yes_price, no_price) = match signal.direction {
             SignalDirection::BuyYes => (best_ask, Decimal::ZERO),
@@ -838,7 +911,7 @@ impl QuantSignalExecutor {
             "Executing quant signal"
         );
 
-        // Step 13: Execute single-leg FOK market order
+        // Step 14: Execute single-leg FOK market order
         let order = MarketOrder::new(
             signal.condition_id.clone(),
             target_token_id.clone(),
@@ -917,7 +990,7 @@ impl QuantSignalExecutor {
             )
             .await;
 
-        // Step 14: Mark position OPEN
+        // Step 15: Mark position OPEN
         if let Err(e) = position.mark_open() {
             error!(error = %e, "Failed to transition position to OPEN");
         }
@@ -945,7 +1018,7 @@ impl QuantSignalExecutor {
             )
             .await;
 
-        // Step 15: Publish WebSocket SignalUpdate
+        // Step 16: Publish WebSocket SignalUpdate
         let ws_signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
             signal_type: SignalType::Arbitrage, // reuse existing type for now
@@ -1259,6 +1332,7 @@ mod tests {
         assert!(!config.enabled); // default disabled (paper first)
         assert_eq!(config.base_position_size_usd, Decimal::new(30, 0));
         assert_eq!(config.min_confidence, 0.65);
+        assert_eq!(config.cache_refresh_secs, 300);
         assert_eq!(config.max_quant_positions, 20);
     }
 

@@ -131,7 +131,7 @@ async fn compute_cycle(
                 )::bigint AS wins,
                 COUNT(*) FILTER (
                     WHERE qs.execution_status = 'executed'
-                      AND p.realized_pnl <= 0
+                      AND p.realized_pnl < 0
                       AND p.state = 4
                 )::bigint AS losses,
                 SUM(p.realized_pnl) FILTER (
@@ -143,7 +143,7 @@ async fn compute_cycle(
                       AND p.state = 4
                 ) AS avg_pnl,
                 AVG(
-                    EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0
+                    (EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0)::double precision
                 ) FILTER (
                     WHERE qs.execution_status = 'executed'
                       AND p.state = 4
@@ -167,11 +167,11 @@ async fn compute_cycle(
             SELECT
                 COUNT(*)::bigint AS total_positions,
                 COUNT(*) FILTER (WHERE realized_pnl > 0 AND state = 4)::bigint AS wins,
-                COUNT(*) FILTER (WHERE realized_pnl <= 0 AND state = 4)::bigint AS losses,
+                COUNT(*) FILTER (WHERE realized_pnl < 0 AND state = 4)::bigint AS losses,
                 SUM(realized_pnl) FILTER (WHERE state = 4) AS net_pnl,
                 AVG(realized_pnl) FILTER (WHERE state = 4) AS avg_pnl,
                 AVG(
-                    EXTRACT(EPOCH FROM (exit_timestamp - entry_timestamp)) / 3600.0
+                    (EXTRACT(EPOCH FROM (exit_timestamp - entry_timestamp)) / 3600.0)::double precision
                 ) FILTER (
                     WHERE state = 4
                       AND exit_timestamp IS NOT NULL
@@ -192,8 +192,9 @@ async fn compute_cycle(
 
         // Upsert quant strategy snapshots
         for row in &quant_rows {
-            let win_rate = if row.executed > 0 {
-                Some(row.wins as f64 / row.executed as f64)
+            let resolved_positions = row.wins + row.losses;
+            let win_rate = if resolved_positions > 0 {
+                Some(row.wins as f64 / resolved_positions as f64)
             } else {
                 None
             };

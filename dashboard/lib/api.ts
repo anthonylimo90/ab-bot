@@ -116,6 +116,7 @@ function parsePositionsSummary(raw: PositionsSummary): PositionsSummary {
     raw_unpriced_open_positions: Number(raw.raw_unpriced_open_positions),
     raw_unpriced_position_cost_basis: Number(raw.raw_unpriced_position_cost_basis),
     raw_unrealized_pnl: Number(raw.raw_unrealized_pnl),
+    flat_closes: raw.flat_closes != null ? Number(raw.flat_closes) : 0,
     win_rate: Number(raw.win_rate),
   };
 }
