@@ -77,7 +77,8 @@ async fn run_scheduler(config: BacktestAutomationConfig, pool: PgPool) {
         match claim_due_schedules(&pool, config.claim_limit).await {
             Ok(rows) => {
                 for row in rows {
-                    if let Err(error) = enqueue_claimed_schedule(&pool, row).await {
+                    if let Err(error) = enqueue_claimed_schedule(&pool, &row).await {
+                        let _ = mark_enqueue_failure(&pool, row.id, &error.to_string()).await;
                         warn!(error = %error, "Automated backtest enqueue failed");
                     }
                 }
@@ -123,11 +124,11 @@ async fn claim_due_schedules(
 
 async fn enqueue_claimed_schedule(
     pool: &PgPool,
-    row: ClaimedScheduleRow,
+    row: &ClaimedScheduleRow,
 ) -> Result<(), crate::error::ApiError> {
-    let strategy: StrategyConfig = serde_json::from_value(row.strategy)
+    let strategy: StrategyConfig = serde_json::from_value(row.strategy.clone())
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-    let slippage_model: SlippageModel = serde_json::from_value(row.slippage_model)
+    let slippage_model: SlippageModel = serde_json::from_value(row.slippage_model.clone())
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
 
     let end_date = Utc::now();
@@ -137,7 +138,7 @@ async fn enqueue_claimed_schedule(
         start_date,
         end_date,
         initial_capital: row.initial_capital,
-        markets: row.markets,
+        markets: row.markets.clone(),
         slippage_model,
         fee_pct: row.fee_pct,
     };
@@ -147,8 +148,29 @@ async fn enqueue_claimed_schedule(
         request,
         "scheduled",
         Some(row.id),
-        Some(row.name),
+        Some(row.name.clone()),
     )
+    .await?;
+
+    Ok(())
+}
+
+async fn mark_enqueue_failure(
+    pool: &PgPool,
+    schedule_id: Uuid,
+    error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE backtest_schedules
+        SET last_status = LEFT($2, 128),
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(schedule_id)
+    .bind(format!("enqueue_failed: {error}"))
+    .execute(pool)
     .await?;
 
     Ok(())

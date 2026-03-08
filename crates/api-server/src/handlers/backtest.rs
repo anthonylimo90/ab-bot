@@ -578,23 +578,57 @@ pub(crate) async fn enqueue_backtest(
         serde_json::to_value(&request.strategy).map_err(|e| ApiError::Internal(e.to_string()))?;
     let slippage_json = serde_json::to_value(&request.slippage_model)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let strategy_name = strategy_name(&request.strategy);
 
     sqlx::query(
         r#"
         INSERT INTO backtest_results
-        (id, strategy, start_date, end_date, initial_capital, slippage_model,
-         fee_pct, status, created_at, schedule_id, trigger_mode, trigger_label, markets)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', $8, $9, $10, $11, $12)
+        (id, strategy_name, strategy_params, start_time, end_time, data_points,
+         initial_capital, final_value, total_return, return_pct, annualized_return,
+         max_drawdown, sharpe_ratio, sortino_ratio, win_rate, profit_factor,
+         total_trades, winning_trades, losing_trades, total_fees, total_slippage,
+         avg_trade_duration_hours, computed_at, created_at,
+         strategy, start_date, end_date, initial_capital_api, slippage_model,
+         fee_pct, status, schedule_id, trigger_mode, trigger_label, markets)
+        VALUES ($1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                $12, $13, $14, $15, $16,
+                $17, $18, $19, $20, $21,
+                $22, $23, $24,
+                $25, $26, $27, $28, $29,
+                $30, 'running', $31, $32, $33, $34)
         "#,
     )
     .bind(result_id)
+    .bind(strategy_name)
+    .bind(&strategy_json)
+    .bind(request.start_date)
+    .bind(request.end_date)
+    .bind(0_i32)
+    .bind(request.initial_capital)
+    .bind(request.initial_capital)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(0_i32)
+    .bind(0_i32)
+    .bind(0_i32)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(Decimal::ZERO)
+    .bind(now)
+    .bind(now)
     .bind(&strategy_json)
     .bind(request.start_date)
     .bind(request.end_date)
     .bind(request.initial_capital)
     .bind(&slippage_json)
     .bind(request.fee_pct)
-    .bind(now)
     .bind(schedule_id)
     .bind(trigger_mode)
     .bind(&trigger_label)
@@ -670,6 +704,15 @@ pub(crate) async fn enqueue_backtest(
         avg_trade_duration_hours: None,
         trade_log: None,
     })
+}
+
+fn strategy_name(strategy: &StrategyConfig) -> &'static str {
+    match strategy {
+        StrategyConfig::Arbitrage { .. } => "arb",
+        StrategyConfig::Momentum { .. } => "momentum",
+        StrategyConfig::MeanReversion { .. } => "mean_reversion",
+        StrategyConfig::Grid { .. } => "grid",
+    }
 }
 
 fn validate_backtest_request(request: &RunBacktestRequest) -> ApiResult<()> {
