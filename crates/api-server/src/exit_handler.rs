@@ -187,6 +187,58 @@ impl OutcomeTokenCache {
             .insert(market_id.to_string(), (yes_id.clone(), no_id.clone()));
         Ok(Some((yes_id, no_id)))
     }
+
+    async fn hydrate_clob_market(
+        &self,
+        clob_client: &ClobClient,
+        market_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        if let Some(ids) = self.get(market_id).await {
+            return Ok(Some(ids));
+        }
+
+        let market = match clob_client.get_market_by_id(market_id).await {
+            Ok(market) => market,
+            Err(error) => {
+                warn!(
+                    market_id = %market_id,
+                    error = %error,
+                    "Failed to fetch CLOB market for exit token cache hydration"
+                );
+                return Ok(None);
+            }
+        };
+
+        if market.outcomes.len() != 2 {
+            return Ok(None);
+        }
+
+        let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
+            (
+                market.outcomes[0].token_id.clone(),
+                market.outcomes[1].token_id.clone(),
+            )
+        } else {
+            (
+                market.outcomes[1].token_id.clone(),
+                market.outcomes[0].token_id.clone(),
+            )
+        };
+
+        let mut tokens = self.tokens.write().await;
+        tokens.insert(market.id.clone(), (yes_id.clone(), no_id.clone()));
+        if market.id != market_id {
+            tokens.insert(market_id.to_string(), (yes_id.clone(), no_id.clone()));
+        }
+        Ok(Some((yes_id, no_id)))
+    }
+
+    async fn alias(&self, alias: &str, ids: &(String, String)) {
+        self.tokens
+            .write()
+            .await
+            .insert(alias.to_string(), ids.clone());
+    }
 }
 
 /// Exit handler service — closes positions via sell orders or resolution detection.
@@ -630,7 +682,55 @@ impl ExitHandler {
             return Ok(Some(ids));
         }
 
+        if let Some(ids) = self
+            .token_cache
+            .hydrate_clob_market(self.clob_client.as_ref(), market_id)
+            .await?
+        {
+            return Ok(Some(ids));
+        }
+
+        if let Some(condition_id) = self.lookup_condition_id_for_token(market_id).await? {
+            if let Some(ids) = self.token_cache.get(&condition_id).await {
+                self.token_cache.alias(market_id, &ids).await;
+                return Ok(Some(ids));
+            }
+
+            if let Some(ids) = self
+                .token_cache
+                .hydrate_clob_market(self.clob_client.as_ref(), &condition_id)
+                .await?
+            {
+                self.token_cache.alias(market_id, &ids).await;
+                return Ok(Some(ids));
+            }
+
+            if let Some(ids) = self.token_cache.hydrate_market(&condition_id).await? {
+                self.token_cache.alias(market_id, &ids).await;
+                return Ok(Some(ids));
+            }
+        }
+
         self.token_cache.hydrate_market(market_id).await
+    }
+
+    async fn lookup_condition_id_for_token(
+        &self,
+        token_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let condition_id: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT condition_id
+            FROM token_condition_cache
+            WHERE token_id = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(token_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(condition_id)
     }
 
     async fn load_quant_exit_contexts(

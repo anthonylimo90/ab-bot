@@ -502,7 +502,8 @@ impl PositionRepository {
     /// Returns true when the quant executor already has an active position in a market.
     ///
     /// This excludes legacy recommendation rows that share `source = 3` but were
-    /// not opened by the quant executor itself.
+    /// not opened by the quant executor itself. Recovery states do not count as
+    /// open inventory for entry dedup because they are handled by the exit path.
     pub async fn active_quant_executor_position_exists_for_market(
         &self,
         market_id: &str,
@@ -516,7 +517,7 @@ impl PositionRepository {
                   AND source = $2
                   AND source_signal_id IS NOT NULL
                   AND exit_strategy = 1
-                  AND state NOT IN (4, 5)
+                  AND state IN (0, 1, 2, 3)
             )
             "#,
         )
@@ -530,8 +531,8 @@ impl PositionRepository {
 
     /// Count active positions currently owned by the quant executor.
     ///
-    /// This excludes older advisory/recommendation rows with `source = 3` so
-    /// quant capacity is based on live executor inventory, not historical labels.
+    /// This excludes older advisory/recommendation rows with `source = 3`, and
+    /// only counts positions still occupying an execution slot.
     pub async fn count_active_quant_executor_positions(&self) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
             r#"
@@ -540,7 +541,7 @@ impl PositionRepository {
             WHERE source = $1
               AND source_signal_id IS NOT NULL
               AND exit_strategy = 1
-              AND state NOT IN (4, 5)
+              AND state IN (0, 1, 2, 3)
             "#,
         )
         .bind(SOURCE_RECOMMENDATION)
@@ -548,5 +549,29 @@ impl PositionRepository {
         .await?;
 
         Ok(count)
+    }
+
+    /// State breakdown for executor-owned quant positions that still occupy capacity.
+    pub async fn active_quant_executor_position_state_counts(&self) -> Result<Vec<(i16, i64)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT state, COUNT(*) AS count
+            FROM positions
+            WHERE source = $1
+              AND source_signal_id IS NOT NULL
+              AND exit_strategy = 1
+              AND state IN (0, 1, 2, 3)
+            GROUP BY state
+            ORDER BY state
+            "#,
+        )
+        .bind(SOURCE_RECOMMENDATION)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<i16, _>("state"), row.get::<i64, _>("count")))
+            .collect())
     }
 }

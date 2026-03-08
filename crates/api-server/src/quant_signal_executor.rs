@@ -740,10 +740,16 @@ impl QuantSignalExecutor {
             .await
         {
             Ok(open_count) if open_count as usize >= cfg.max_quant_positions => {
+                let state_counts = self
+                    .position_repo
+                    .active_quant_executor_position_state_counts()
+                    .await
+                    .unwrap_or_default();
                 debug!(
                     signal_id = %signal.id,
                     open = open_count,
                     max = cfg.max_quant_positions,
+                    ?state_counts,
                     "Max quant positions reached, skipping"
                 );
                 self.update_signal_status(signal.id, "skipped", Some("max_positions_reached"))
