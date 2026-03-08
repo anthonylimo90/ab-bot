@@ -12,8 +12,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     activity, admin_workspaces, auth, backtest, discover, health, markets, order_signing,
-    positions, recommendations, risk, signals, trade_flow, trading, users, vault, wallet_auth,
-    wallets, workspaces,
+    positions, recommendations, risk, signals, strategy_health, trade_flow, trading, users, vault,
+    wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -55,6 +55,10 @@ use crate::websocket;
         backtest::run_backtest,
         backtest::list_backtest_results,
         backtest::get_backtest_result,
+        backtest::list_backtest_schedules,
+        backtest::create_backtest_schedule,
+        backtest::update_backtest_schedule,
+        backtest::delete_backtest_schedule,
         discover::get_live_trades,
         discover::discover_wallets,
         discover::get_discovered_wallet,
@@ -120,6 +124,7 @@ use crate::websocket;
         signals::get_market_metadata,
         signals::get_recent_signals,
         signals::get_strategy_performance,
+        strategy_health::get_strategy_health,
     ),
     components(
         schemas(
@@ -162,6 +167,9 @@ use crate::websocket;
             trading::OrderStatus,
             backtest::RunBacktestRequest,
             backtest::BacktestResultResponse,
+            backtest::BacktestScheduleResponse,
+            backtest::CreateBacktestScheduleRequest,
+            backtest::UpdateBacktestScheduleRequest,
             backtest::StrategyConfig,
             backtest::SlippageModel,
             backtest::EquityPoint,
@@ -238,6 +246,8 @@ use crate::websocket;
             signals::MarketMetadataResponse,
             signals::RecentSignalResponse,
             signals::StrategyPerformanceResponse,
+            strategy_health::StrategyHealthResponse,
+            strategy_health::StrategyHealthItemResponse,
         )
     ),
     tags(
@@ -399,6 +409,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/backtest/results/:result_id",
             get(backtest::get_backtest_result),
         )
+        .route(
+            "/api/v1/backtest/schedules",
+            get(backtest::list_backtest_schedules),
+        )
         // Workspace endpoints (read-only for all members)
         .route("/api/v1/workspaces", get(workspaces::list_workspaces))
         .route(
@@ -448,6 +462,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/signals/performance",
             get(signals::get_strategy_performance),
         )
+        .route(
+            "/api/v1/signals/health",
+            get(strategy_health::get_strategy_health),
+        )
         // Activity feed (read-only for all members)
         .route("/api/v1/activity", get(activity::list_activity))
         // Trade flow analytics (read-only for all members)
@@ -496,6 +514,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Backtest operations
         .route("/api/v1/backtest", post(backtest::run_backtest))
+        .route(
+            "/api/v1/backtest/schedules",
+            post(backtest::create_backtest_schedule),
+        )
+        .route(
+            "/api/v1/backtest/schedules/:schedule_id",
+            patch(backtest::update_backtest_schedule),
+        )
+        .route(
+            "/api/v1/backtest/schedules/:schedule_id",
+            delete(backtest::delete_backtest_schedule),
+        )
         // Vault operations (write)
         .route("/api/v1/vault/wallets", post(vault::store_wallet))
         .route(

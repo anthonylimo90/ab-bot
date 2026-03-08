@@ -21,7 +21,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// Request to run a backtest.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RunBacktestRequest {
     /// Strategy to backtest.
     pub strategy: StrategyConfig,
@@ -156,6 +156,17 @@ pub struct BacktestResultResponse {
     pub created_at: DateTime<Utc>,
     /// Status (pending, running, completed, failed).
     pub status: String,
+    /// Whether the run was triggered manually or by automation.
+    pub trigger_mode: String,
+    /// Backtest schedule identifier for automated runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<Uuid>,
+    /// Human-readable trigger label for scheduled runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_label: Option<String>,
+    /// Optional market filter applied to this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markets: Option<Vec<String>>,
     /// Error message (if failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -258,6 +269,81 @@ fn default_limit() -> i64 {
     20
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ListBacktestScheduleQuery {
+    /// Include disabled schedules.
+    pub include_disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BacktestScheduleResponse {
+    pub id: Uuid,
+    pub name: String,
+    pub enabled: bool,
+    pub strategy: StrategyConfig,
+    pub lookback_days: i32,
+    pub initial_capital: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markets: Option<Vec<String>>,
+    pub slippage_model: SlippageModel,
+    pub fee_pct: Decimal,
+    pub interval_hours: i32,
+    pub next_run_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_result_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateBacktestScheduleRequest {
+    pub name: String,
+    pub strategy: StrategyConfig,
+    pub lookback_days: i32,
+    pub initial_capital: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markets: Option<Vec<String>>,
+    #[serde(default)]
+    pub slippage_model: SlippageModel,
+    #[serde(default = "default_fee")]
+    pub fee_pct: Decimal,
+    pub interval_hours: i32,
+    #[serde(default = "default_schedule_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct UpdateBacktestScheduleRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<StrategyConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookback_days: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_capital: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markets: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slippage_model: Option<SlippageModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_pct: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_hours: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+}
+
+fn default_schedule_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, FromRow)]
 struct BacktestRow {
     id: Uuid,
@@ -265,6 +351,7 @@ struct BacktestRow {
     start_date: DateTime<Utc>,
     end_date: DateTime<Utc>,
     initial_capital: Decimal,
+    markets: Option<Vec<String>>,
     final_value: Option<Decimal>,
     total_return: Option<Decimal>,
     total_return_pct: Option<Decimal>,
@@ -292,6 +379,9 @@ struct BacktestRow {
     max_consecutive_losses: Option<i32>,
     avg_trade_duration_hours: Option<Decimal>,
     status: String,
+    trigger_mode: Option<String>,
+    schedule_id: Option<Uuid>,
+    trigger_label: Option<String>,
     error: Option<String>,
     created_at: DateTime<Utc>,
 }
@@ -303,6 +393,7 @@ struct BacktestRowWithCurve {
     start_date: DateTime<Utc>,
     end_date: DateTime<Utc>,
     initial_capital: Decimal,
+    markets: Option<Vec<String>>,
     final_value: Option<Decimal>,
     total_return: Option<Decimal>,
     total_return_pct: Option<Decimal>,
@@ -330,10 +421,33 @@ struct BacktestRowWithCurve {
     max_consecutive_losses: Option<i32>,
     avg_trade_duration_hours: Option<Decimal>,
     status: String,
+    trigger_mode: Option<String>,
+    schedule_id: Option<Uuid>,
+    trigger_label: Option<String>,
     error: Option<String>,
     equity_curve: Option<serde_json::Value>,
     trade_log: Option<serde_json::Value>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct BacktestScheduleRow {
+    id: Uuid,
+    name: String,
+    enabled: bool,
+    strategy: serde_json::Value,
+    lookback_days: i32,
+    initial_capital: Decimal,
+    markets: Option<Vec<String>>,
+    slippage_model: serde_json::Value,
+    fee_pct: Decimal,
+    interval_hours: i32,
+    next_run_at: DateTime<Utc>,
+    last_run_at: Option<DateTime<Utc>>,
+    last_result_id: Option<Uuid>,
+    last_status: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 fn dec(val: f64) -> Decimal {
@@ -371,6 +485,10 @@ fn row_to_response(row: BacktestRow) -> BacktestResultResponse {
         total_fees: row.total_fees.unwrap_or(Decimal::ZERO),
         created_at: row.created_at,
         status: row.status,
+        trigger_mode: row.trigger_mode.unwrap_or_else(|| "manual".to_string()),
+        schedule_id: row.schedule_id,
+        trigger_label: row.trigger_label,
+        markets: row.markets,
         error: row.error,
         equity_curve: None,
         expectancy: row.expectancy,
@@ -384,6 +502,35 @@ fn row_to_response(row: BacktestRow) -> BacktestResultResponse {
         max_consecutive_losses: row.max_consecutive_losses.map(|v| v as i64),
         avg_trade_duration_hours: row.avg_trade_duration_hours,
         trade_log: None,
+    }
+}
+
+fn schedule_row_to_response(row: BacktestScheduleRow) -> BacktestScheduleResponse {
+    let strategy: StrategyConfig =
+        serde_json::from_value(row.strategy).unwrap_or(StrategyConfig::Arbitrage {
+            min_spread: Decimal::new(2, 2),
+            max_position: Decimal::new(1000, 0),
+        });
+    let slippage_model: SlippageModel =
+        serde_json::from_value(row.slippage_model).unwrap_or_default();
+
+    BacktestScheduleResponse {
+        id: row.id,
+        name: row.name,
+        enabled: row.enabled,
+        strategy,
+        lookback_days: row.lookback_days,
+        initial_capital: row.initial_capital,
+        markets: row.markets,
+        slippage_model,
+        fee_pct: row.fee_pct,
+        interval_hours: row.interval_hours,
+        next_run_at: row.next_run_at,
+        last_run_at: row.last_run_at,
+        last_result_id: row.last_result_id,
+        last_status: row.last_status,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
     }
 }
 
@@ -403,35 +550,41 @@ pub async fn run_backtest(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RunBacktestRequest>,
 ) -> ApiResult<Json<BacktestResultResponse>> {
-    // Validate request
-    if request.end_date <= request.start_date {
-        return Err(ApiError::BadRequest(
-            "End date must be after start date".to_string(),
-        ));
-    }
+    let response = enqueue_backtest(
+        state.pool.clone(),
+        request,
+        "manual",
+        None,
+        Some("manual".to_string()),
+    )
+    .await?;
 
-    if request.initial_capital <= Decimal::ZERO {
-        return Err(ApiError::BadRequest(
-            "Initial capital must be positive".to_string(),
-        ));
-    }
+    Ok(Json(response))
+}
+
+pub(crate) async fn enqueue_backtest(
+    pool: PgPool,
+    request: RunBacktestRequest,
+    trigger_mode: &str,
+    schedule_id: Option<Uuid>,
+    trigger_label: Option<String>,
+) -> ApiResult<BacktestResultResponse> {
+    validate_backtest_request(&request)?;
 
     let result_id = Uuid::new_v4();
     let now = Utc::now();
 
-    // Serialize strategy config
     let strategy_json =
         serde_json::to_value(&request.strategy).map_err(|e| ApiError::Internal(e.to_string()))?;
     let slippage_json = serde_json::to_value(&request.slippage_model)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Insert backtest record with 'running' status
     sqlx::query(
         r#"
         INSERT INTO backtest_results
         (id, strategy, start_date, end_date, initial_capital, slippage_model,
-         fee_pct, status, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', $8)
+         fee_pct, status, created_at, schedule_id, trigger_mode, trigger_label, markets)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', $8, $9, $10, $11, $12)
         "#,
     )
     .bind(result_id)
@@ -442,36 +595,40 @@ pub async fn run_backtest(
     .bind(&slippage_json)
     .bind(request.fee_pct)
     .bind(now)
-    .execute(&state.pool)
+    .bind(schedule_id)
+    .bind(trigger_mode)
+    .bind(&trigger_label)
+    .bind(request.markets.clone())
+    .execute(&pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Spawn background task to run the backtest
-    let pool = state.pool.clone();
-    let strategy_config = request.strategy.clone();
-    let start_date = request.start_date;
-    let end_date = request.end_date;
-    let initial_capital = request.initial_capital;
-    let fee_pct = request.fee_pct;
-    let slippage_model = request.slippage_model.clone();
-
-    tokio::spawn(async move {
-        run_backtest_task(
-            pool,
-            result_id,
-            strategy_config,
-            start_date,
-            end_date,
-            initial_capital,
-            fee_pct,
-            slippage_model,
+    if let Some(schedule_id) = schedule_id {
+        sqlx::query(
+            r#"
+            UPDATE backtest_schedules
+            SET last_result_id = $2,
+                last_status = 'running',
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
         )
-        .await;
+        .bind(schedule_id)
+        .bind(result_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
+    let task_request = request.clone();
+    let task_pool = pool.clone();
+    tokio::spawn(async move {
+        run_backtest_task(task_pool, result_id, task_request, schedule_id).await;
     });
 
-    info!(backtest_id = %result_id, "Backtest task spawned");
+    info!(backtest_id = %result_id, trigger_mode, schedule_id = ?schedule_id, "Backtest task spawned");
 
-    Ok(Json(BacktestResultResponse {
+    Ok(BacktestResultResponse {
         id: result_id,
         strategy: request.strategy,
         start_date: request.start_date,
@@ -495,6 +652,10 @@ pub async fn run_backtest(
         total_fees: Decimal::ZERO,
         created_at: now,
         status: "running".to_string(),
+        trigger_mode: trigger_mode.to_string(),
+        schedule_id,
+        trigger_label,
+        markets: request.markets,
         error: None,
         equity_curve: None,
         expectancy: None,
@@ -508,20 +669,32 @@ pub async fn run_backtest(
         max_consecutive_losses: None,
         avg_trade_duration_hours: None,
         trade_log: None,
-    }))
+    })
+}
+
+fn validate_backtest_request(request: &RunBacktestRequest) -> ApiResult<()> {
+    if request.end_date <= request.start_date {
+        return Err(ApiError::BadRequest(
+            "End date must be after start date".to_string(),
+        ));
+    }
+
+    if request.initial_capital <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "Initial capital must be positive".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Background task to run the backtest.
 #[allow(clippy::too_many_arguments)]
-async fn run_backtest_task(
+pub(crate) async fn run_backtest_task(
     pool: PgPool,
     result_id: Uuid,
-    strategy_config: StrategyConfig,
-    start_date: DateTime<Utc>,
-    end_date: DateTime<Utc>,
-    initial_capital: Decimal,
-    fee_pct: Decimal,
-    slippage_model: SlippageModel,
+    request: RunBacktestRequest,
+    schedule_id: Option<Uuid>,
 ) {
     info!(backtest_id = %result_id, "Starting backtest execution");
 
@@ -529,7 +702,7 @@ async fn run_backtest_task(
     let data_store = HistoricalDataStore::new(pool.clone());
 
     // Convert slippage model
-    let backtester_slippage = match slippage_model {
+    let backtester_slippage = match request.slippage_model.clone() {
         SlippageModel::None => BacktesterSlippageModel::None,
         SlippageModel::Fixed { pct } => BacktesterSlippageModel::Fixed(pct),
         SlippageModel::VolumeBased {
@@ -543,23 +716,30 @@ async fn run_backtest_task(
 
     // Configure simulator
     let simulator_config = SimulatorConfig {
-        initial_capital,
+        initial_capital: request.initial_capital,
         slippage_model: backtester_slippage,
-        fee_model: backtester::simulator::FeeModel::Fixed(fee_pct),
+        fee_model: backtester::simulator::FeeModel::Fixed(request.fee_pct),
         ..Default::default()
     };
 
     let simulator = BacktestSimulator::new(data_store, simulator_config);
 
     // Create strategy from config
-    let result = match strategy_config {
+    let result = match request.strategy.clone() {
         StrategyConfig::Arbitrage {
             min_spread,
             max_position,
         } => {
             let mut strategy =
-                ArbitrageStrategy::new(min_spread, max_position, 10).with_fee(fee_pct);
-            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+                ArbitrageStrategy::new(min_spread, max_position, 10).with_fee(request.fee_pct);
+            run_strategy(
+                &simulator,
+                &mut strategy,
+                request.start_date,
+                request.end_date,
+                request.markets.clone(),
+            )
+            .await
         }
         StrategyConfig::Momentum {
             lookback_hours,
@@ -568,7 +748,14 @@ async fn run_backtest_task(
         } => {
             let mut strategy =
                 MomentumStrategy::new(lookback_hours as usize, threshold, position_size);
-            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+            run_strategy(
+                &simulator,
+                &mut strategy,
+                request.start_date,
+                request.end_date,
+                request.markets.clone(),
+            )
+            .await
         }
         StrategyConfig::MeanReversion {
             window_hours,
@@ -580,7 +767,14 @@ async fn run_backtest_task(
                 std_threshold.to_string().parse().unwrap_or(2.0),
                 position_size,
             );
-            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+            run_strategy(
+                &simulator,
+                &mut strategy,
+                request.start_date,
+                request.end_date,
+                request.markets.clone(),
+            )
+            .await
         }
         StrategyConfig::Grid {
             grid_levels,
@@ -588,7 +782,14 @@ async fn run_backtest_task(
             order_size,
         } => {
             let mut strategy = GridStrategy::new(grid_levels, grid_spacing_pct, order_size);
-            run_strategy(&simulator, &mut strategy, start_date, end_date).await
+            run_strategy(
+                &simulator,
+                &mut strategy,
+                request.start_date,
+                request.end_date,
+                request.markets.clone(),
+            )
+            .await
         }
     };
 
@@ -706,6 +907,22 @@ async fn run_backtest_task(
             .execute(&pool)
             .await;
 
+            if let Some(schedule_id) = schedule_id {
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE backtest_schedules
+                    SET last_status = 'completed',
+                        last_result_id = $2,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(schedule_id)
+                .bind(result_id)
+                .execute(&pool)
+                .await;
+            }
+
             match update_result {
                 Ok(_) => {
                     info!(
@@ -734,6 +951,22 @@ async fn run_backtest_task(
                 error!(backtest_id = %result_id, error = %db_err, "Failed to update backtest error");
             }
 
+            if let Some(schedule_id) = schedule_id {
+                let _ = sqlx::query(
+                    r#"
+                    UPDATE backtest_schedules
+                    SET last_status = 'failed',
+                        last_result_id = $2,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(schedule_id)
+                .bind(result_id)
+                .execute(&pool)
+                .await;
+            }
+
             error!(backtest_id = %result_id, error = %error_msg, "Backtest failed");
         }
     }
@@ -745,26 +978,33 @@ async fn run_strategy<S: Strategy>(
     strategy: &mut S,
     start_date: DateTime<Utc>,
     end_date: DateTime<Utc>,
+    markets: Option<Vec<String>>,
 ) -> anyhow::Result<backtester::BacktestResult> {
-    let query = DataQuery::range(start_date, end_date);
+    let query = match markets {
+        Some(markets) if !markets.is_empty() => {
+            DataQuery::range(start_date, end_date).markets(markets)
+        }
+        _ => DataQuery::range(start_date, end_date),
+    };
     simulator.run(strategy, query).await
 }
 
 const LIST_QUERY: &str = r#"
-    SELECT id, strategy, start_date, end_date, initial_capital,
+    SELECT id, strategy, start_date, end_date, initial_capital, markets,
            final_value, total_return, total_return_pct, annualized_return,
            sharpe_ratio, sortino_ratio, max_drawdown, max_drawdown_pct,
            total_trades, winning_trades, losing_trades, win_rate,
            avg_win, avg_loss, profit_factor, total_fees,
            expectancy, calmar_ratio, var_95, cvar_95,
            recovery_factor, best_trade_return, worst_trade_return,
-           max_consecutive_wins, max_consecutive_losses,
+            max_consecutive_wins, max_consecutive_losses,
            avg_trade_duration_hours,
-           status, error, created_at
+           status, trigger_mode, schedule_id, trigger_label, error, created_at
     FROM backtest_results
     WHERE ($1::text IS NULL OR status = $1)
+      AND ($2::text IS NULL OR strategy->>'type' = $2)
     ORDER BY created_at DESC
-    LIMIT $2 OFFSET $3
+    LIMIT $3 OFFSET $4
 "#;
 
 /// List backtest results.
@@ -784,6 +1024,7 @@ pub async fn list_backtest_results(
 ) -> ApiResult<Json<Vec<BacktestResultResponse>>> {
     let rows: Vec<BacktestRow> = sqlx::query_as(LIST_QUERY)
         .bind(&query.status)
+        .bind(&query.strategy_type)
         .bind(query.limit)
         .bind(query.offset)
         .fetch_all(&state.pool)
@@ -814,7 +1055,7 @@ pub async fn get_backtest_result(
 ) -> ApiResult<Json<BacktestResultResponse>> {
     let row: Option<BacktestRowWithCurve> = sqlx::query_as(
         r#"
-        SELECT id, strategy, start_date, end_date, initial_capital,
+        SELECT id, strategy, start_date, end_date, initial_capital, markets,
                final_value, total_return, total_return_pct, annualized_return,
                sharpe_ratio, sortino_ratio, max_drawdown, max_drawdown_pct,
                total_trades, winning_trades, losing_trades, win_rate,
@@ -822,8 +1063,8 @@ pub async fn get_backtest_result(
                expectancy, calmar_ratio, var_95, cvar_95,
                recovery_factor, best_trade_return, worst_trade_return,
                max_consecutive_wins, max_consecutive_losses,
-               avg_trade_duration_hours,
-               status, error, equity_curve, trade_log, created_at
+                avg_trade_duration_hours,
+               status, trigger_mode, schedule_id, trigger_label, error, equity_curve, trade_log, created_at
         FROM backtest_results
         WHERE id = $1
         "#,
@@ -872,6 +1113,10 @@ pub async fn get_backtest_result(
                 total_fees: row.total_fees.unwrap_or(Decimal::ZERO),
                 created_at: row.created_at,
                 status: row.status,
+                trigger_mode: row.trigger_mode.unwrap_or_else(|| "manual".to_string()),
+                schedule_id: row.schedule_id,
+                trigger_label: row.trigger_label,
+                markets: row.markets,
                 error: row.error,
                 equity_curve,
                 expectancy: row.expectancy,
@@ -892,6 +1137,249 @@ pub async fn get_backtest_result(
             result_id
         ))),
     }
+}
+
+/// List automated backtest schedules.
+#[utoipa::path(
+    get,
+    path = "/api/v1/backtest/schedules",
+    tag = "backtest",
+    params(ListBacktestScheduleQuery),
+    responses(
+        (status = 200, description = "Backtest schedules", body = Vec<BacktestScheduleResponse>)
+    )
+)]
+pub async fn list_backtest_schedules(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListBacktestScheduleQuery>,
+) -> ApiResult<Json<Vec<BacktestScheduleResponse>>> {
+    let include_disabled = query.include_disabled.unwrap_or(false);
+    let rows: Vec<BacktestScheduleRow> = sqlx::query_as(
+        r#"
+        SELECT id, name, enabled, strategy, lookback_days, initial_capital,
+               markets, slippage_model, fee_pct, interval_hours, next_run_at,
+               last_run_at, last_result_id, last_status, created_at, updated_at
+        FROM backtest_schedules
+        WHERE ($1::bool = true OR enabled = true)
+        ORDER BY enabled DESC, next_run_at ASC, name ASC
+        "#,
+    )
+    .bind(include_disabled)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(
+        rows.into_iter().map(schedule_row_to_response).collect(),
+    ))
+}
+
+/// Create an automated backtest schedule.
+#[utoipa::path(
+    post,
+    path = "/api/v1/backtest/schedules",
+    tag = "backtest",
+    request_body = CreateBacktestScheduleRequest,
+    responses(
+        (status = 201, description = "Backtest schedule created", body = BacktestScheduleResponse)
+    )
+)]
+pub async fn create_backtest_schedule(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateBacktestScheduleRequest>,
+) -> ApiResult<(axum::http::StatusCode, Json<BacktestScheduleResponse>)> {
+    validate_schedule_request(
+        request.lookback_days,
+        request.initial_capital,
+        request.interval_hours,
+    )?;
+
+    let strategy_json =
+        serde_json::to_value(&request.strategy).map_err(|e| ApiError::Internal(e.to_string()))?;
+    let slippage_json = serde_json::to_value(&request.slippage_model)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let row: BacktestScheduleRow = sqlx::query_as(
+        r#"
+        INSERT INTO backtest_schedules (
+            name, enabled, strategy, lookback_days, initial_capital, markets,
+            slippage_model, fee_pct, interval_hours, next_run_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        RETURNING id, name, enabled, strategy, lookback_days, initial_capital,
+                  markets, slippage_model, fee_pct, interval_hours, next_run_at,
+                  last_run_at, last_result_id, last_status, created_at, updated_at
+        "#,
+    )
+    .bind(&request.name)
+    .bind(request.enabled)
+    .bind(strategy_json)
+    .bind(request.lookback_days)
+    .bind(request.initial_capital)
+    .bind(request.markets.clone())
+    .bind(slippage_json)
+    .bind(request.fee_pct)
+    .bind(request.interval_hours)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(schedule_row_to_response(row)),
+    ))
+}
+
+/// Update an automated backtest schedule.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/backtest/schedules/{schedule_id}",
+    tag = "backtest",
+    request_body = UpdateBacktestScheduleRequest,
+    params(
+        ("schedule_id" = Uuid, Path, description = "Backtest schedule identifier")
+    ),
+    responses(
+        (status = 200, description = "Backtest schedule updated", body = BacktestScheduleResponse),
+        (status = 404, description = "Backtest schedule not found")
+    )
+)]
+pub async fn update_backtest_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(schedule_id): Path<Uuid>,
+    Json(request): Json<UpdateBacktestScheduleRequest>,
+) -> ApiResult<Json<BacktestScheduleResponse>> {
+    if let Some(lookback_days) = request.lookback_days {
+        validate_schedule_request(
+            lookback_days,
+            request.initial_capital.unwrap_or(Decimal::ONE),
+            request.interval_hours.unwrap_or(1),
+        )?;
+    } else if let Some(interval_hours) = request.interval_hours {
+        validate_schedule_request(
+            1,
+            request.initial_capital.unwrap_or(Decimal::ONE),
+            interval_hours,
+        )?;
+    } else if let Some(initial_capital) = request.initial_capital {
+        validate_schedule_request(1, initial_capital, 1)?;
+    }
+
+    let strategy_json = request
+        .strategy
+        .map(|strategy| serde_json::to_value(strategy))
+        .transpose()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let slippage_json = request
+        .slippage_model
+        .map(|slippage| serde_json::to_value(slippage))
+        .transpose()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let row: Option<BacktestScheduleRow> = sqlx::query_as(
+        r#"
+        UPDATE backtest_schedules
+        SET name = COALESCE($2, name),
+            enabled = COALESCE($3, enabled),
+            strategy = COALESCE($4, strategy),
+            lookback_days = COALESCE($5, lookback_days),
+            initial_capital = COALESCE($6, initial_capital),
+            markets = COALESCE($7, markets),
+            slippage_model = COALESCE($8, slippage_model),
+            fee_pct = COALESCE($9, fee_pct),
+            interval_hours = COALESCE($10, interval_hours),
+            next_run_at = COALESCE($11, next_run_at),
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name, enabled, strategy, lookback_days, initial_capital,
+                  markets, slippage_model, fee_pct, interval_hours, next_run_at,
+                  last_run_at, last_result_id, last_status, created_at, updated_at
+        "#,
+    )
+    .bind(schedule_id)
+    .bind(request.name)
+    .bind(request.enabled)
+    .bind(strategy_json)
+    .bind(request.lookback_days)
+    .bind(request.initial_capital)
+    .bind(request.markets)
+    .bind(slippage_json)
+    .bind(request.fee_pct)
+    .bind(request.interval_hours)
+    .bind(request.next_run_at)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    match row {
+        Some(row) => Ok(Json(schedule_row_to_response(row))),
+        None => Err(ApiError::NotFound(format!(
+            "Backtest schedule {} not found",
+            schedule_id
+        ))),
+    }
+}
+
+/// Delete an automated backtest schedule.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/backtest/schedules/{schedule_id}",
+    tag = "backtest",
+    params(
+        ("schedule_id" = Uuid, Path, description = "Backtest schedule identifier")
+    ),
+    responses(
+        (status = 204, description = "Backtest schedule deleted"),
+        (status = 404, description = "Backtest schedule not found")
+    )
+)]
+pub async fn delete_backtest_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(schedule_id): Path<Uuid>,
+) -> ApiResult<axum::http::StatusCode> {
+    let deleted = sqlx::query(
+        r#"
+        DELETE FROM backtest_schedules
+        WHERE id = $1
+        "#,
+    )
+    .bind(schedule_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .rows_affected();
+
+    if deleted == 0 {
+        return Err(ApiError::NotFound(format!(
+            "Backtest schedule {} not found",
+            schedule_id
+        )));
+    }
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+fn validate_schedule_request(
+    lookback_days: i32,
+    initial_capital: Decimal,
+    interval_hours: i32,
+) -> ApiResult<()> {
+    if lookback_days <= 0 {
+        return Err(ApiError::BadRequest(
+            "Lookback days must be positive".to_string(),
+        ));
+    }
+    if initial_capital <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "Initial capital must be positive".to_string(),
+        ));
+    }
+    if interval_hours <= 0 {
+        return Err(ApiError::BadRequest(
+            "Interval hours must be positive".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -969,6 +1457,10 @@ mod tests {
             total_fees: Decimal::new(25, 0),
             created_at: Utc::now(),
             status: "completed".to_string(),
+            trigger_mode: "manual".to_string(),
+            schedule_id: None,
+            trigger_label: None,
+            markets: None,
             error: None,
             equity_curve: Some(vec![
                 EquityPoint {

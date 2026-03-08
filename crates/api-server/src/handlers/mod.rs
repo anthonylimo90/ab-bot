@@ -13,6 +13,7 @@ pub mod positions;
 pub mod recommendations;
 pub mod risk;
 pub mod signals;
+pub mod strategy_health;
 pub mod trade_flow;
 pub mod trading;
 pub mod users;

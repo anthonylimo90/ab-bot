@@ -20,6 +20,7 @@
 //! ```
 
 pub mod arb_executor;
+pub mod backtest_automation;
 pub mod crypto;
 pub mod dynamic_tuner;
 pub mod email;
@@ -37,6 +38,7 @@ pub mod runtime_sync;
 pub mod schema;
 pub mod signals;
 pub mod state;
+pub mod strategy_health_calculator;
 pub mod strategy_modes;
 pub mod strategy_pnl_calculator;
 pub mod trade_events;
@@ -44,6 +46,7 @@ pub mod wallet_harvester;
 pub mod websocket;
 
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
+pub use backtest_automation::{spawn_backtest_automation, BacktestAutomationConfig};
 pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
 pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
@@ -58,6 +61,7 @@ pub use signals::{
     spawn_mean_reversion_signal_generator, spawn_resolution_signal_generator,
 };
 pub use state::AppState;
+pub use strategy_health_calculator::{spawn_strategy_health_calculator, StrategyHealthConfig};
 pub use strategy_pnl_calculator::{spawn_strategy_pnl_calculator, StrategyPnlConfig};
 pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
 
@@ -391,6 +395,14 @@ impl ApiServer {
         // Spawn strategy P&L calculator (6h, computes per-strategy performance snapshots)
         let pnl_config = StrategyPnlConfig::from_env();
         spawn_strategy_pnl_calculator(pnl_config, state.pool.clone(), db_semaphore.clone());
+
+        // Spawn strategy health calculator (6h, summarizes edge capture + failures)
+        let health_config = StrategyHealthConfig::from_env();
+        spawn_strategy_health_calculator(health_config, state.pool.clone());
+
+        // Spawn automated backtest scheduler (polls due schedules and reuses the backtest runner)
+        let backtest_automation_config = BacktestAutomationConfig::from_env();
+        spawn_backtest_automation(backtest_automation_config, state.pool.clone());
 
         // Spawn metrics calculator (populates wallet_success_metrics + market regime)
         let metrics_config = MetricsCalculatorConfig::from_env();
