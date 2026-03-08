@@ -179,10 +179,18 @@ struct TradeJourneyRow {
     synthetic_history: bool,
 }
 
+const JOURNEY_SOURCE_EXPR: &str =
+    "(ARRAY_AGG(source ORDER BY occurred_at DESC) FILTER (WHERE source IS NOT NULL))[1]";
+const JOURNEY_MARKET_ID_EXPR: &str =
+    "(ARRAY_AGG(market_id ORDER BY occurred_at DESC) FILTER (WHERE market_id IS NOT NULL))[1]";
 const JOURNEY_SIGNAL_ID_EXPR: &str =
-    "(ARRAY_AGG(signal_id) FILTER (WHERE signal_id IS NOT NULL))[1]";
+    "(ARRAY_AGG(signal_id ORDER BY occurred_at DESC) FILTER (WHERE signal_id IS NOT NULL))[1]";
 const JOURNEY_POSITION_ID_EXPR: &str =
-    "(ARRAY_AGG(position_id) FILTER (WHERE position_id IS NOT NULL))[1]";
+    "(ARRAY_AGG(position_id ORDER BY occurred_at DESC) FILTER (WHERE position_id IS NOT NULL))[1]";
+const JOURNEY_DIRECTION_EXPR: &str =
+    "(ARRAY_AGG(direction ORDER BY occurred_at DESC) FILTER (WHERE direction IS NOT NULL))[1]";
+const JOURNEY_CONFIDENCE_EXPR: &str =
+    "(ARRAY_AGG(confidence ORDER BY occurred_at DESC) FILTER (WHERE confidence IS NOT NULL))[1]";
 
 fn canonical_trade_event_journeys_query() -> String {
     format!(
@@ -230,12 +238,12 @@ fn canonical_trade_event_journeys_query() -> String {
             SELECT
                 strategy,
                 journey_key,
-                MAX(source) AS source,
-                MAX(market_id) AS market_id,
+                {journey_source_expr} AS source,
+                {journey_market_id_expr} AS market_id,
                 {journey_signal_id_expr} AS signal_id,
                 {journey_position_id_expr} AS position_id,
-                MAX(direction) FILTER (WHERE direction IS NOT NULL) AS direction,
-                MAX(confidence) FILTER (WHERE confidence IS NOT NULL) AS confidence,
+                {journey_direction_expr} AS direction,
+                {journey_confidence_expr} AS confidence,
                 MIN(occurred_at) FILTER (WHERE event_type = 'signal_generated') AS signal_generated_at,
                 MIN(occurred_at) FILTER (
                     WHERE state_to = 'open' OR event_type = 'position_open'
@@ -296,8 +304,12 @@ fn canonical_trade_event_journeys_query() -> String {
         ORDER BY COALESCE(a.signal_generated_at, a.opened_at, a.closed_at) DESC NULLS LAST
         LIMIT $5
         "#,
+        journey_source_expr = JOURNEY_SOURCE_EXPR,
+        journey_market_id_expr = JOURNEY_MARKET_ID_EXPR,
         journey_signal_id_expr = JOURNEY_SIGNAL_ID_EXPR,
         journey_position_id_expr = JOURNEY_POSITION_ID_EXPR,
+        journey_direction_expr = JOURNEY_DIRECTION_EXPR,
+        journey_confidence_expr = JOURNEY_CONFIDENCE_EXPR,
     )
 }
 
@@ -1442,12 +1454,19 @@ mod tests {
         let query = canonical_trade_event_journeys_query();
 
         assert!(query.contains(
-            "(ARRAY_AGG(signal_id) FILTER (WHERE signal_id IS NOT NULL))[1] AS signal_id"
+            "(ARRAY_AGG(market_id ORDER BY occurred_at DESC) FILTER (WHERE market_id IS NOT NULL))[1] AS market_id"
         ));
         assert!(query.contains(
-            "(ARRAY_AGG(position_id) FILTER (WHERE position_id IS NOT NULL))[1] AS position_id"
+            "(ARRAY_AGG(signal_id ORDER BY occurred_at DESC) FILTER (WHERE signal_id IS NOT NULL))[1] AS signal_id"
         ));
+        assert!(query.contains(
+            "(ARRAY_AGG(position_id ORDER BY occurred_at DESC) FILTER (WHERE position_id IS NOT NULL))[1] AS position_id"
+        ));
+        assert!(!query.contains("MAX(source)"));
+        assert!(!query.contains("MAX(market_id)"));
         assert!(!query.contains("MAX(signal_id)"));
         assert!(!query.contains("MAX(position_id)"));
+        assert!(!query.contains("MAX(direction)"));
+        assert!(!query.contains("MAX(confidence)"));
     }
 }
