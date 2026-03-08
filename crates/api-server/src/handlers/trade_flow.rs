@@ -179,6 +179,128 @@ struct TradeJourneyRow {
     synthetic_history: bool,
 }
 
+const JOURNEY_SIGNAL_ID_EXPR: &str =
+    "(ARRAY_AGG(signal_id) FILTER (WHERE signal_id IS NOT NULL))[1]";
+const JOURNEY_POSITION_ID_EXPR: &str =
+    "(ARRAY_AGG(position_id) FILTER (WHERE position_id IS NOT NULL))[1]";
+
+fn canonical_trade_event_journeys_query() -> String {
+    format!(
+        r#"
+        WITH scope AS (
+            SELECT DISTINCT
+                strategy,
+                COALESCE(signal_id::text, position_id::text) AS journey_key
+            FROM trade_events
+            WHERE occurred_at >= $1
+              AND occurred_at <= $2
+              AND ($3::text IS NULL OR strategy = $3)
+              AND ($4::text IS NULL OR market_id = $4)
+              AND (signal_id IS NOT NULL OR position_id IS NOT NULL)
+        ),
+        history AS (
+            SELECT
+                te.*,
+                COALESCE(te.signal_id::text, te.position_id::text) AS journey_key
+            FROM trade_events te
+            JOIN scope s
+              ON s.strategy = te.strategy
+             AND s.journey_key = COALESCE(te.signal_id::text, te.position_id::text)
+            WHERE te.occurred_at <= $2
+        ),
+        latest AS (
+            SELECT DISTINCT ON (strategy, journey_key)
+                strategy,
+                journey_key,
+                source,
+                market_id,
+                signal_id,
+                position_id,
+                event_type,
+                state_to,
+                reason,
+                direction,
+                confidence,
+                realized_pnl,
+                unrealized_pnl
+            FROM history
+            ORDER BY strategy, journey_key, occurred_at DESC
+        ),
+        aggregates AS (
+            SELECT
+                strategy,
+                journey_key,
+                MAX(source) AS source,
+                MAX(market_id) AS market_id,
+                {journey_signal_id_expr} AS signal_id,
+                {journey_position_id_expr} AS position_id,
+                MAX(direction) FILTER (WHERE direction IS NOT NULL) AS direction,
+                MAX(confidence) FILTER (WHERE confidence IS NOT NULL) AS confidence,
+                MIN(occurred_at) FILTER (WHERE event_type = 'signal_generated') AS signal_generated_at,
+                MIN(occurred_at) FILTER (
+                    WHERE state_to = 'open' OR event_type = 'position_open'
+                ) AS opened_at,
+                MIN(occurred_at) FILTER (
+                    WHERE state_to = 'closed'
+                       OR event_type IN ('position_closed', 'closed_via_resolution')
+                ) AS closed_at
+            FROM history
+            GROUP BY strategy, journey_key
+        )
+        SELECT
+            a.strategy,
+            a.source,
+            (a.strategy <> 'arb') AS supports_signal_history,
+            COALESCE(
+                l.state_to,
+                CASE
+                    WHEN l.event_type = 'signal_skipped' THEN 'skipped'
+                    WHEN l.event_type = 'signal_expired' THEN 'expired'
+                    WHEN l.event_type = 'position_failed' THEN 'entry_failed'
+                    WHEN l.event_type IN ('position_closed', 'closed_via_resolution') THEN 'closed'
+                    ELSE l.event_type
+                END
+            ) AS lifecycle_stage,
+            l.event_type AS execution_status,
+            CASE
+                WHEN a.position_id IS NULL THEN NULL
+                ELSE COALESCE(
+                    l.state_to,
+                    CASE
+                        WHEN l.event_type = 'position_failed' THEN 'entry_failed'
+                        WHEN l.event_type IN ('position_closed', 'closed_via_resolution') THEN 'closed'
+                        ELSE NULL
+                    END
+                )
+            END AS position_state,
+            a.market_id,
+            a.signal_id,
+            a.position_id,
+            a.direction,
+            a.confidence,
+            l.reason AS skip_reason,
+            a.signal_generated_at,
+            a.opened_at,
+            a.closed_at,
+            l.realized_pnl,
+            l.unrealized_pnl,
+            CASE
+                WHEN a.opened_at IS NULL THEN NULL
+                ELSE (EXTRACT(EPOCH FROM (COALESCE(a.closed_at, $2) - a.opened_at)) / 3600.0)::double precision
+            END AS hold_hours,
+            FALSE AS synthetic_history
+        FROM aggregates a
+        JOIN latest l
+          ON l.strategy = a.strategy
+         AND l.journey_key = a.journey_key
+        ORDER BY COALESCE(a.signal_generated_at, a.opened_at, a.closed_at) DESC NULLS LAST
+        LIMIT $5
+        "#,
+        journey_signal_id_expr = JOURNEY_SIGNAL_ID_EXPR,
+        journey_position_id_expr = JOURNEY_POSITION_ID_EXPR,
+    )
+}
+
 #[derive(Debug, FromRow)]
 struct ArbMarketScorecardRow {
     market_id: String,
@@ -723,125 +845,15 @@ async fn load_trade_event_journeys(
     market_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<TradeJourneyResponse>, sqlx::Error> {
-    let rows: Vec<TradeJourneyRow> = sqlx::query_as(
-        r#"
-        WITH scope AS (
-            SELECT DISTINCT
-                strategy,
-                COALESCE(signal_id::text, position_id::text) AS journey_key
-            FROM trade_events
-            WHERE occurred_at >= $1
-              AND occurred_at <= $2
-              AND ($3::text IS NULL OR strategy = $3)
-              AND ($4::text IS NULL OR market_id = $4)
-              AND (signal_id IS NOT NULL OR position_id IS NOT NULL)
-        ),
-        history AS (
-            SELECT
-                te.*,
-                COALESCE(te.signal_id::text, te.position_id::text) AS journey_key
-            FROM trade_events te
-            JOIN scope s
-              ON s.strategy = te.strategy
-             AND s.journey_key = COALESCE(te.signal_id::text, te.position_id::text)
-            WHERE te.occurred_at <= $2
-        ),
-        latest AS (
-            SELECT DISTINCT ON (strategy, journey_key)
-                strategy,
-                journey_key,
-                source,
-                market_id,
-                signal_id,
-                position_id,
-                event_type,
-                state_to,
-                reason,
-                direction,
-                confidence,
-                realized_pnl,
-                unrealized_pnl
-            FROM history
-            ORDER BY strategy, journey_key, occurred_at DESC
-        ),
-        aggregates AS (
-            SELECT
-                strategy,
-                journey_key,
-                MAX(source) AS source,
-                MAX(market_id) AS market_id,
-                MAX(signal_id) AS signal_id,
-                MAX(position_id) AS position_id,
-                MAX(direction) FILTER (WHERE direction IS NOT NULL) AS direction,
-                MAX(confidence) FILTER (WHERE confidence IS NOT NULL) AS confidence,
-                MIN(occurred_at) FILTER (WHERE event_type = 'signal_generated') AS signal_generated_at,
-                MIN(occurred_at) FILTER (
-                    WHERE state_to = 'open' OR event_type = 'position_open'
-                ) AS opened_at,
-                MIN(occurred_at) FILTER (
-                    WHERE state_to = 'closed'
-                       OR event_type IN ('position_closed', 'closed_via_resolution')
-                ) AS closed_at
-            FROM history
-            GROUP BY strategy, journey_key
-        )
-        SELECT
-            a.strategy,
-            a.source,
-            (a.strategy <> 'arb') AS supports_signal_history,
-            COALESCE(
-                l.state_to,
-                CASE
-                    WHEN l.event_type = 'signal_skipped' THEN 'skipped'
-                    WHEN l.event_type = 'signal_expired' THEN 'expired'
-                    WHEN l.event_type = 'position_failed' THEN 'entry_failed'
-                    WHEN l.event_type IN ('position_closed', 'closed_via_resolution') THEN 'closed'
-                    ELSE l.event_type
-                END
-            ) AS lifecycle_stage,
-            l.event_type AS execution_status,
-            CASE
-                WHEN a.position_id IS NULL THEN NULL
-                ELSE COALESCE(
-                    l.state_to,
-                    CASE
-                        WHEN l.event_type = 'position_failed' THEN 'entry_failed'
-                        WHEN l.event_type IN ('position_closed', 'closed_via_resolution') THEN 'closed'
-                        ELSE NULL
-                    END
-                )
-            END AS position_state,
-            a.market_id,
-            a.signal_id,
-            a.position_id,
-            a.direction,
-            a.confidence,
-            l.reason AS skip_reason,
-            a.signal_generated_at,
-            a.opened_at,
-            a.closed_at,
-            l.realized_pnl,
-            l.unrealized_pnl,
-            CASE
-                WHEN a.opened_at IS NULL THEN NULL
-                ELSE (EXTRACT(EPOCH FROM (COALESCE(a.closed_at, $2) - a.opened_at)) / 3600.0)::double precision
-            END AS hold_hours,
-            FALSE AS synthetic_history
-        FROM aggregates a
-        JOIN latest l
-          ON l.strategy = a.strategy
-         AND l.journey_key = a.journey_key
-        ORDER BY COALESCE(a.signal_generated_at, a.opened_at, a.closed_at) DESC NULLS LAST
-        LIMIT $5
-        "#,
-    )
-    .bind(from)
-    .bind(to)
-    .bind(strategy)
-    .bind(market_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+    let query = canonical_trade_event_journeys_query();
+    let rows: Vec<TradeJourneyRow> = sqlx::query_as(&query)
+        .bind(from)
+        .bind(to)
+        .bind(strategy)
+        .bind(market_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -1423,5 +1435,19 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[1].strategy, "flow");
         assert_eq!(merged[1].generated_signals, 4);
+    }
+
+    #[test]
+    fn canonical_journey_query_uses_uuid_safe_aggregates() {
+        let query = canonical_trade_event_journeys_query();
+
+        assert!(query.contains(
+            "(ARRAY_AGG(signal_id) FILTER (WHERE signal_id IS NOT NULL))[1] AS signal_id"
+        ));
+        assert!(query.contains(
+            "(ARRAY_AGG(position_id) FILTER (WHERE position_id IS NOT NULL))[1] AS position_id"
+        ));
+        assert!(!query.contains("MAX(signal_id)"));
+        assert!(!query.contains("MAX(position_id)"));
     }
 }
