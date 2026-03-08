@@ -53,6 +53,9 @@ export default function SettingsPage() {
   const [arbAutoExecute, setArbAutoExecute] = useState(false);
   const [liveTradingEnabled, setLiveTradingEnabled] = useState(false);
   const [exitHandlerEnabled, setExitHandlerEnabled] = useState(false);
+  const [arbAutoExecuteDirty, setArbAutoExecuteDirty] = useState(false);
+  const [liveTradingEnabledDirty, setLiveTradingEnabledDirty] = useState(false);
+  const [exitHandlerEnabledDirty, setExitHandlerEnabledDirty] = useState(false);
 
   // Risk management form state (backed by API, not localStorage)
   const [isSavingRisk, setIsSavingRisk] = useState(false);
@@ -136,6 +139,9 @@ export default function SettingsPage() {
       setArbAutoExecute(currentWorkspace.arb_auto_execute ?? false);
       setLiveTradingEnabled(currentWorkspace.live_trading_enabled ?? false);
       setExitHandlerEnabled(currentWorkspace.exit_handler_enabled ?? false);
+      setArbAutoExecuteDirty(false);
+      setLiveTradingEnabledDirty(false);
+      setExitHandlerEnabledDirty(false);
     }
   }, [currentWorkspace]);
 
@@ -178,13 +184,16 @@ export default function SettingsPage() {
     if (!currentWorkspace) return;
     setIsSavingTradingConfig(true);
     try {
-      const updates: Record<string, unknown> = {
-        arb_auto_execute: arbAutoExecute,
-        live_trading_enabled: liveTradingEnabled,
-        exit_handler_enabled: exitHandlerEnabled,
-      };
+      const updates: Record<string, unknown> = {};
+      if (arbAutoExecuteDirty) updates.arb_auto_execute = arbAutoExecute;
+      if (liveTradingEnabledDirty) updates.live_trading_enabled = liveTradingEnabled;
+      if (exitHandlerEnabledDirty) updates.exit_handler_enabled = exitHandlerEnabled;
       if (polygonRpcUrl) updates.polygon_rpc_url = polygonRpcUrl;
       if (alchemyApiKey) updates.alchemy_api_key = alchemyApiKey;
+      if (Object.keys(updates).length === 0) {
+        toast.warning('No changes to save', 'Trading settings already match the current workspace');
+        return;
+      }
       const updatedWorkspace = await api.updateWorkspace(currentWorkspace.id, updates);
       setCurrentWorkspace(updatedWorkspace);
       toast.success('Trading config saved', 'Your trading configuration has been updated');
@@ -553,7 +562,10 @@ export default function SettingsPage() {
               </div>
               <Switch
                 checked={arbAutoExecute}
-                onCheckedChange={setArbAutoExecute}
+                onCheckedChange={(checked) => {
+                  setArbAutoExecute(checked);
+                  setArbAutoExecuteDirty(true);
+                }}
               />
             </div>
 
@@ -567,7 +579,10 @@ export default function SettingsPage() {
               </div>
               <Switch
                 checked={exitHandlerEnabled}
-                onCheckedChange={setExitHandlerEnabled}
+                onCheckedChange={(checked) => {
+                  setExitHandlerEnabled(checked);
+                  setExitHandlerEnabledDirty(true);
+                }}
               />
             </div>
 
@@ -581,7 +596,10 @@ export default function SettingsPage() {
               </div>
               <Switch
                 checked={liveTradingEnabled}
-                onCheckedChange={setLiveTradingEnabled}
+                onCheckedChange={(checked) => {
+                  setLiveTradingEnabled(checked);
+                  setLiveTradingEnabledDirty(true);
+                }}
               />
             </div>
             {liveTradingEnabled && (

@@ -103,8 +103,13 @@ function parsePositionsSummary(raw: PositionsSummary): PositionsSummary {
   return {
     ...raw,
     portfolio_value: Number(raw.portfolio_value),
+    priced_open_positions: Number(raw.priced_open_positions),
+    unpriced_open_positions: Number(raw.unpriced_open_positions),
+    unpriced_position_cost_basis: Number(raw.unpriced_position_cost_basis),
     unrealized_pnl: Number(raw.unrealized_pnl),
     raw_portfolio_value: Number(raw.raw_portfolio_value),
+    raw_unpriced_open_positions: Number(raw.raw_unpriced_open_positions),
+    raw_unpriced_position_cost_basis: Number(raw.raw_unpriced_position_cost_basis),
     raw_unrealized_pnl: Number(raw.raw_unrealized_pnl),
     win_rate: Number(raw.win_rate),
   };

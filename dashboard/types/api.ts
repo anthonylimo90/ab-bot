@@ -113,9 +113,14 @@ export interface PositionsSummary {
   open_markets: number;
   duplicate_open_markets: number;
   portfolio_value: number;
+  priced_open_positions: number;
+  unpriced_open_positions: number;
+  unpriced_position_cost_basis: number;
   unrealized_pnl: number;
   raw_open_positions: number;
   raw_portfolio_value: number;
+  raw_unpriced_open_positions: number;
+  raw_unpriced_position_cost_basis: number;
   raw_unrealized_pnl: number;
   closed_positions: number;
   wins: number;

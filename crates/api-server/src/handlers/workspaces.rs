@@ -29,6 +29,27 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::strategy_modes::{resolve_strategy_modes, StrategyModeInputs, StrategyModeStatus};
 
+#[derive(Debug, sqlx::FromRow)]
+struct WorkspaceAuditSnapshot {
+    name: String,
+    description: Option<String>,
+    setup_mode: String,
+    total_budget: Decimal,
+    reserved_cash_pct: Decimal,
+    auto_optimize_enabled: bool,
+    optimization_interval_hours: i32,
+    min_roi_30d: Option<Decimal>,
+    min_sharpe: Option<Decimal>,
+    min_win_rate: Option<Decimal>,
+    min_trades_30d: Option<i32>,
+    walletconnect_project_id: Option<String>,
+    polygon_rpc_url: Option<String>,
+    arb_auto_execute: bool,
+    live_trading_enabled: bool,
+    exit_handler_enabled: bool,
+    inactivity_days: i32,
+}
+
 /// Workspace list item for user.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WorkspaceListItem {
@@ -503,6 +524,34 @@ pub async fn update_workspace(
         ));
     }
 
+    let before_update: WorkspaceAuditSnapshot = sqlx::query_as(
+        r#"
+        SELECT
+            name,
+            description,
+            setup_mode,
+            total_budget,
+            reserved_cash_pct,
+            COALESCE(auto_optimize_enabled, false) AS auto_optimize_enabled,
+            optimization_interval_hours,
+            min_roi_30d,
+            min_sharpe,
+            min_win_rate,
+            min_trades_30d,
+            walletconnect_project_id,
+            polygon_rpc_url,
+            COALESCE(arb_auto_execute, false) AS arb_auto_execute,
+            COALESCE(live_trading_enabled, false) AS live_trading_enabled,
+            COALESCE(exit_handler_enabled, false) AS exit_handler_enabled,
+            inactivity_days
+        FROM workspaces
+        WHERE id = $1
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_one(&state.pool)
+    .await?;
+
     // Validate WalletConnect project ID format if provided
     if let Some(ref project_id) = req.walletconnect_project_id {
         if !project_id.is_empty() && !is_valid_walletconnect_project_id(project_id) {
@@ -670,11 +719,78 @@ pub async fn update_workspace(
     }
 
     // Audit log
+    let mut change_details = serde_json::Map::new();
+
+    macro_rules! log_change {
+        ($field:ident) => {
+            if let Some(to) = req.$field {
+                change_details.insert(
+                    stringify!($field).to_string(),
+                    serde_json::json!({
+                        "from": before_update.$field,
+                        "to": to,
+                    }),
+                );
+            }
+        };
+    }
+
+    macro_rules! log_change_ref {
+        ($field:ident) => {
+            if let Some(ref to) = req.$field {
+                change_details.insert(
+                    stringify!($field).to_string(),
+                    serde_json::json!({
+                        "from": before_update.$field,
+                        "to": to,
+                    }),
+                );
+            }
+        };
+    }
+
+    log_change_ref!(name);
+    log_change_ref!(description);
+    log_change_ref!(setup_mode);
+    log_change!(total_budget);
+    log_change!(reserved_cash_pct);
+    log_change!(auto_optimize_enabled);
+    log_change!(optimization_interval_hours);
+    log_change!(min_roi_30d);
+    log_change!(min_sharpe);
+    log_change!(min_win_rate);
+    log_change!(min_trades_30d);
+    log_change_ref!(walletconnect_project_id);
+    if req.polygon_rpc_url.is_some() {
+        change_details.insert(
+            "polygon_rpc_url".to_string(),
+            serde_json::json!({
+                "from": before_update.polygon_rpc_url,
+                "changed": true,
+            }),
+        );
+    }
+    if req.alchemy_api_key.is_some() {
+        change_details.insert(
+            "alchemy_api_key".to_string(),
+            serde_json::json!({
+                "changed": true,
+            }),
+        );
+    }
+    log_change!(arb_auto_execute);
+    log_change!(live_trading_enabled);
+    log_change!(exit_handler_enabled);
+    log_change!(inactivity_days);
+
     state.audit_logger.log_user_action(
         &claims.sub,
         AuditAction::Custom("workspace_updated".to_string()),
         &workspace_id.to_string(),
-        serde_json::json!({ "updated_by": &claims.sub }),
+        serde_json::json!({
+            "updated_by": &claims.sub,
+            "changes": change_details,
+        }),
     );
 
     get_workspace(

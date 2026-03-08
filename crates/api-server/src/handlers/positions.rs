@@ -61,14 +61,24 @@ pub struct PositionsSummaryResponse {
     pub open_markets: i64,
     /// Active markets with duplicate rows before deduplication.
     pub duplicate_open_markets: i64,
-    /// Deduplicated portfolio value.
+    /// Deduplicated marked position value based on current prices only.
     pub portfolio_value: Decimal,
+    /// Deduplicated position count with a current mark.
+    pub priced_open_positions: i64,
+    /// Deduplicated position count missing a current mark.
+    pub unpriced_open_positions: i64,
+    /// Deduplicated cost basis for positions missing a current mark.
+    pub unpriced_position_cost_basis: Decimal,
     /// Deduplicated unrealized P&L.
     pub unrealized_pnl: Decimal,
     /// Raw active row count before deduplication.
     pub raw_open_positions: i64,
-    /// Raw portfolio value before deduplication.
+    /// Raw marked position value before deduplication.
     pub raw_portfolio_value: Decimal,
+    /// Raw active row count missing a current mark before deduplication.
+    pub raw_unpriced_open_positions: i64,
+    /// Raw cost basis for positions missing a current mark before deduplication.
+    pub raw_unpriced_position_cost_basis: Decimal,
     /// Raw unrealized P&L before deduplication.
     pub raw_unrealized_pnl: Decimal,
     /// Closed positions used for win-rate calculations.
@@ -142,9 +152,14 @@ struct PositionSummaryRow {
     open_markets: i64,
     duplicate_open_markets: i64,
     portfolio_value: Decimal,
+    priced_open_positions: i64,
+    unpriced_open_positions: i64,
+    unpriced_position_cost_basis: Decimal,
     unrealized_pnl: Decimal,
     raw_open_positions: i64,
     raw_portfolio_value: Decimal,
+    raw_unpriced_open_positions: i64,
+    raw_unpriced_position_cost_basis: Decimal,
     raw_unrealized_pnl: Decimal,
     closed_positions: i64,
     wins: i64,
@@ -299,11 +314,12 @@ pub async fn get_positions_summary(
                 market_id,
                 COALESCE(source, 0) AS source,
                 quantity,
-                COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+                current_price,
+                COALESCE(entry_price, (yes_entry_price + no_entry_price), 0) AS entry_price,
                 unrealized_pnl,
                 COALESCE(updated_at, entry_timestamp) AS sort_updated
             FROM positions
-            WHERE state NOT IN (4, 5)
+            WHERE is_open = TRUE
         ),
         ranked_active AS (
             SELECT
@@ -339,10 +355,15 @@ pub async fn get_positions_summary(
             COALESCE((SELECT COUNT(*) FROM effective_active), 0)::bigint AS open_positions,
             COALESCE((SELECT COUNT(DISTINCT market_id) FROM effective_active), 0)::bigint AS open_markets,
             COALESCE((SELECT duplicate_open_markets FROM duplicate_active_markets), 0)::bigint AS duplicate_open_markets,
-            COALESCE((SELECT SUM(quantity * current_price) FROM effective_active), 0) AS portfolio_value,
+            COALESCE((SELECT SUM(quantity * current_price) FROM effective_active WHERE current_price IS NOT NULL), 0) AS portfolio_value,
+            COALESCE((SELECT COUNT(*) FROM effective_active WHERE current_price IS NOT NULL), 0)::bigint AS priced_open_positions,
+            COALESCE((SELECT COUNT(*) FROM effective_active WHERE current_price IS NULL), 0)::bigint AS unpriced_open_positions,
+            COALESCE((SELECT SUM(quantity * entry_price) FROM effective_active WHERE current_price IS NULL), 0) AS unpriced_position_cost_basis,
             COALESCE((SELECT SUM(unrealized_pnl) FROM effective_active), 0) AS unrealized_pnl,
             COALESCE((SELECT COUNT(*) FROM active_positions), 0)::bigint AS raw_open_positions,
-            COALESCE((SELECT SUM(quantity * current_price) FROM active_positions), 0) AS raw_portfolio_value,
+            COALESCE((SELECT SUM(quantity * current_price) FROM active_positions WHERE current_price IS NOT NULL), 0) AS raw_portfolio_value,
+            COALESCE((SELECT COUNT(*) FROM active_positions WHERE current_price IS NULL), 0)::bigint AS raw_unpriced_open_positions,
+            COALESCE((SELECT SUM(quantity * entry_price) FROM active_positions WHERE current_price IS NULL), 0) AS raw_unpriced_position_cost_basis,
             COALESCE((SELECT SUM(unrealized_pnl) FROM active_positions), 0) AS raw_unrealized_pnl,
             closed_positions,
             wins,
@@ -364,9 +385,14 @@ pub async fn get_positions_summary(
         open_markets: row.open_markets,
         duplicate_open_markets: row.duplicate_open_markets,
         portfolio_value: row.portfolio_value,
+        priced_open_positions: row.priced_open_positions,
+        unpriced_open_positions: row.unpriced_open_positions,
+        unpriced_position_cost_basis: row.unpriced_position_cost_basis,
         unrealized_pnl: row.unrealized_pnl,
         raw_open_positions: row.raw_open_positions,
         raw_portfolio_value: row.raw_portfolio_value,
+        raw_unpriced_open_positions: row.raw_unpriced_open_positions,
+        raw_unpriced_position_cost_basis: row.raw_unpriced_position_cost_basis,
         raw_unrealized_pnl: row.raw_unrealized_pnl,
         closed_positions: row.closed_positions,
         wins: row.wins,
