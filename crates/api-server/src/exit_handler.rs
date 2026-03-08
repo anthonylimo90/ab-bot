@@ -137,6 +137,56 @@ impl OutcomeTokenCache {
     async fn get(&self, market_id: &str) -> Option<(String, String)> {
         self.tokens.read().await.get(market_id).cloned()
     }
+
+    async fn hydrate_market(&self, market_id: &str) -> anyhow::Result<Option<(String, String)>> {
+        if let Some(ids) = self.get(market_id).await {
+            return Ok(Some(ids));
+        }
+
+        let market = match self.gamma_client.get_market(market_id).await {
+            Ok(market) => market,
+            Err(error) => {
+                warn!(
+                    market_id = %market_id,
+                    error = %error,
+                    "Failed to fetch market for exit token cache hydration"
+                );
+                return Ok(None);
+            }
+        };
+
+        let outcome_names = market
+            .outcomes
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
+        let token_ids = market
+            .clob_token_ids
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
+
+        let Some(outcome_names) = outcome_names else {
+            return Ok(None);
+        };
+        let Some(token_ids) = token_ids else {
+            return Ok(None);
+        };
+
+        if outcome_names.len() != 2 || token_ids.len() != 2 {
+            return Ok(None);
+        }
+
+        let (yes_id, no_id) = if outcome_names[0].to_lowercase().contains("yes") {
+            (token_ids[0].clone(), token_ids[1].clone())
+        } else {
+            (token_ids[1].clone(), token_ids[0].clone())
+        };
+
+        self.tokens
+            .write()
+            .await
+            .insert(market_id.to_string(), (yes_id.clone(), no_id.clone()));
+        Ok(Some((yes_id, no_id)))
+    }
 }
 
 /// Exit handler service — closes positions via sell orders or resolution detection.
@@ -364,22 +414,15 @@ impl ExitHandler {
             .await;
 
         // Resolve token IDs
-        let (yes_token_id, no_token_id) = match self.token_cache.get(&market_id).await {
+        let (yes_token_id, no_token_id) = match self.resolve_market_tokens(&market_id).await? {
             Some(ids) => ids,
             None => {
-                // Attempt refresh
-                let _ = self.token_cache.refresh().await;
-                match self.token_cache.get(&market_id).await {
-                    Some(ids) => ids,
-                    None => {
-                        position.mark_exit_failed(FailureReason::ConnectivityError {
-                            message: "No token IDs for market".to_string(),
-                        });
-                        let _ = self.position_repo.update(position).await;
-                        self.publish_alert(&market_id, "exit_failed", "No token IDs for market");
-                        return Ok(());
-                    }
-                }
+                position.mark_exit_failed(FailureReason::ConnectivityError {
+                    message: "No token IDs for market".to_string(),
+                });
+                let _ = self.position_repo.update(position).await;
+                self.publish_alert(&market_id, "exit_failed", "No token IDs for market");
+                return Ok(());
             }
         };
 
@@ -524,18 +567,9 @@ impl ExitHandler {
         position: &Position,
     ) -> anyhow::Result<Option<(Decimal, Decimal)>> {
         let market_id = position.market_id.as_str();
-        let (yes_token_id, no_token_id) = match self.token_cache.get(market_id).await {
-            Some(ids) => ids,
-            None => {
-                let _ = self.token_cache.refresh().await;
-                match self.token_cache.get(market_id).await {
-                    Some(ids) => ids,
-                    None => {
-                        warn!(market_id = %market_id, "No token IDs for exit price evaluation");
-                        return Ok(None);
-                    }
-                }
-            }
+        let Some((yes_token_id, no_token_id)) = self.resolve_market_tokens(market_id).await? else {
+            warn!(market_id = %market_id, "No token IDs for exit price evaluation");
+            return Ok(None);
         };
 
         let (has_yes, has_no) = held_outcomes(position);
@@ -574,6 +608,29 @@ impl ExitHandler {
         };
 
         Ok(Some((yes_bid, no_bid)))
+    }
+
+    async fn resolve_market_tokens(
+        &self,
+        market_id: &str,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        if let Some(ids) = self.token_cache.get(market_id).await {
+            return Ok(Some(ids));
+        }
+
+        if let Err(error) = self.token_cache.refresh().await {
+            warn!(
+                market_id = %market_id,
+                error = %error,
+                "Failed to refresh exit token cache before retry"
+            );
+        }
+
+        if let Some(ids) = self.token_cache.get(market_id).await {
+            return Ok(Some(ids));
+        }
+
+        self.token_cache.hydrate_market(market_id).await
     }
 
     async fn load_quant_exit_contexts(
@@ -977,21 +1034,15 @@ impl ExitHandler {
             let market_id = position.market_id.clone();
 
             // Resolve NO token ID
-            let (_yes_token_id, no_token_id) = match self.token_cache.get(&market_id).await {
+            let (_yes_token_id, no_token_id) = match self.resolve_market_tokens(&market_id).await? {
                 Some(ids) => ids,
                 None => {
-                    let _ = self.token_cache.refresh().await;
-                    match self.token_cache.get(&market_id).await {
-                        Some(ids) => ids,
-                        None => {
-                            warn!(
-                                market_id = %market_id,
-                                position_id = %position.id,
-                                "Cannot recover one-legged: no token IDs for market"
-                            );
-                            continue;
-                        }
-                    }
+                    warn!(
+                        market_id = %market_id,
+                        position_id = %position.id,
+                        "Cannot recover one-legged: no token IDs for market"
+                    );
+                    continue;
                 }
             };
 

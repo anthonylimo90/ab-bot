@@ -498,4 +498,55 @@ impl PositionRepository {
 
         Ok(count)
     }
+
+    /// Returns true when the quant executor already has an active position in a market.
+    ///
+    /// This excludes legacy recommendation rows that share `source = 3` but were
+    /// not opened by the quant executor itself.
+    pub async fn active_quant_executor_position_exists_for_market(
+        &self,
+        market_id: &str,
+    ) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM positions
+                WHERE market_id = $1
+                  AND source = $2
+                  AND source_signal_id IS NOT NULL
+                  AND exit_strategy = 1
+                  AND state NOT IN (4, 5)
+            )
+            "#,
+        )
+        .bind(market_id)
+        .bind(SOURCE_RECOMMENDATION)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(exists)
+    }
+
+    /// Count active positions currently owned by the quant executor.
+    ///
+    /// This excludes older advisory/recommendation rows with `source = 3` so
+    /// quant capacity is based on live executor inventory, not historical labels.
+    pub async fn count_active_quant_executor_positions(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM positions
+            WHERE source = $1
+              AND source_signal_id IS NOT NULL
+              AND exit_strategy = 1
+              AND state NOT IN (4, 5)
+            "#,
+        )
+        .bind(SOURCE_RECOMMENDATION)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
 }

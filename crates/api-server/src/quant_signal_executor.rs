@@ -514,7 +514,7 @@ impl QuantSignalExecutor {
         // Step 5: Dedup — skip if open position in same condition_id
         match self
             .position_repo
-            .active_position_exists_for_market_source(&signal.condition_id, 3)
+            .active_quant_executor_position_exists_for_market(&signal.condition_id)
             .await
         {
             Ok(true) => {
@@ -734,7 +734,11 @@ impl QuantSignalExecutor {
         };
 
         // Step 11: Portfolio check — max open quant positions
-        match self.position_repo.count_active_by_source(3).await {
+        match self
+            .position_repo
+            .count_active_quant_executor_positions()
+            .await
+        {
             Ok(open_count) if open_count as usize >= cfg.max_quant_positions => {
                 debug!(
                     signal_id = %signal.id,
