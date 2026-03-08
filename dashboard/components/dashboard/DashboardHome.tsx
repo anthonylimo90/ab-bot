@@ -279,7 +279,7 @@ export function DashboardHome() {
           change={stats.total_pnl_percent}
           changeLabel={
             stats.unpriced_open_positions > 0
-              ? `Cash ${formatCurrency(stats.cash_balance)} + marked positions ${formatCurrency(stats.marked_position_value)}. ${stats.unpriced_open_positions} open position${stats.unpriced_open_positions === 1 ? "" : "s"} currently unpriced (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
+              ? `Cash ${formatCurrency(stats.cash_balance)} + open positions ${formatCurrency(stats.marked_position_value)}. ${stats.unpriced_open_positions} position${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis plus unrealized P&L because no direct mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
               : `Cash ${formatCurrency(stats.cash_balance)} + marked positions ${formatCurrency(stats.marked_position_value)}`
           }
           trend={stats.total_pnl_percent >= 0 ? "up" : "down"}

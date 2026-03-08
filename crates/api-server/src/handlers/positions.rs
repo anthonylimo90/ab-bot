@@ -316,6 +316,7 @@ pub async fn get_positions_summary(
                 quantity,
                 current_price,
                 COALESCE(entry_price, (yes_entry_price + no_entry_price), 0) AS entry_price,
+                (quantity * COALESCE(entry_price, (yes_entry_price + no_entry_price), 0)) AS entry_value,
                 unrealized_pnl,
                 COALESCE(updated_at, entry_timestamp) AS sort_updated
             FROM positions
@@ -355,13 +356,19 @@ pub async fn get_positions_summary(
             COALESCE((SELECT COUNT(*) FROM effective_active), 0)::bigint AS open_positions,
             COALESCE((SELECT COUNT(DISTINCT market_id) FROM effective_active), 0)::bigint AS open_markets,
             COALESCE((SELECT duplicate_open_markets FROM duplicate_active_markets), 0)::bigint AS duplicate_open_markets,
-            COALESCE((SELECT SUM(quantity * current_price) FROM effective_active WHERE current_price IS NOT NULL), 0) AS portfolio_value,
+            COALESCE((SELECT SUM(CASE
+                WHEN current_price IS NOT NULL THEN quantity * current_price
+                ELSE GREATEST(entry_value + COALESCE(unrealized_pnl, 0), 0)
+            END) FROM effective_active), 0) AS portfolio_value,
             COALESCE((SELECT COUNT(*) FROM effective_active WHERE current_price IS NOT NULL), 0)::bigint AS priced_open_positions,
             COALESCE((SELECT COUNT(*) FROM effective_active WHERE current_price IS NULL), 0)::bigint AS unpriced_open_positions,
             COALESCE((SELECT SUM(quantity * entry_price) FROM effective_active WHERE current_price IS NULL), 0) AS unpriced_position_cost_basis,
             COALESCE((SELECT SUM(unrealized_pnl) FROM effective_active), 0) AS unrealized_pnl,
             COALESCE((SELECT COUNT(*) FROM active_positions), 0)::bigint AS raw_open_positions,
-            COALESCE((SELECT SUM(quantity * current_price) FROM active_positions WHERE current_price IS NOT NULL), 0) AS raw_portfolio_value,
+            COALESCE((SELECT SUM(CASE
+                WHEN current_price IS NOT NULL THEN quantity * current_price
+                ELSE GREATEST(entry_value + COALESCE(unrealized_pnl, 0), 0)
+            END) FROM active_positions), 0) AS raw_portfolio_value,
             COALESCE((SELECT COUNT(*) FROM active_positions WHERE current_price IS NULL), 0)::bigint AS raw_unpriced_open_positions,
             COALESCE((SELECT SUM(quantity * entry_price) FROM active_positions WHERE current_price IS NULL), 0) AS raw_unpriced_position_cost_basis,
             COALESCE((SELECT SUM(unrealized_pnl) FROM active_positions), 0) AS raw_unrealized_pnl,
