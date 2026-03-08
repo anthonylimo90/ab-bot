@@ -48,6 +48,8 @@ pub struct QuantSignalExecutorConfig {
     pub strategy_max_daily_loss_usd: Decimal,
     /// Per-strategy maximum consecutive losses before halting.
     pub strategy_max_consecutive_losses: u32,
+    /// Cooldown before a consecutive-loss halt is allowed to resume.
+    pub strategy_halt_cooldown_secs: u64,
 }
 
 impl QuantSignalExecutorConfig {
@@ -104,6 +106,10 @@ impl QuantSignalExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5),
+            strategy_halt_cooldown_secs: std::env::var("QUANT_STRATEGY_HALT_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3600),
         }
     }
 
@@ -135,6 +141,8 @@ struct StrategyState {
     halted: bool,
     /// Reason for halting.
     halt_reason: Option<String>,
+    /// When the current halt was entered.
+    halted_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl StrategyState {
@@ -145,6 +153,55 @@ impl StrategyState {
             consecutive_losses: 0,
             halted: false,
             halt_reason: None,
+            halted_at: None,
+        }
+    }
+
+    fn refresh(&mut self, now: chrono::DateTime<Utc>, halt_cooldown_secs: u64) {
+        let today = now.date_naive();
+
+        // Reset the breaker cleanly at the start of a new UTC day even if the
+        // strategy stayed halted overnight and no new outcomes have arrived yet.
+        if today != self.daily_pnl_date {
+            self.daily_pnl = Decimal::ZERO;
+            self.daily_pnl_date = today;
+            self.consecutive_losses = 0;
+            if self.halted {
+                info!("Strategy day rolled over, clearing per-strategy halt");
+            }
+            self.halted = false;
+            self.halt_reason = None;
+            self.halted_at = None;
+            return;
+        }
+
+        if !self.halted || halt_cooldown_secs == 0 {
+            return;
+        }
+
+        let cooldown_elapsed = self
+            .halted_at
+            .map(|halted_at| {
+                now.signed_duration_since(halted_at).num_seconds() >= halt_cooldown_secs as i64
+            })
+            .unwrap_or(false);
+
+        if cooldown_elapsed
+            && self
+                .halt_reason
+                .as_deref()
+                .map(|reason| reason.starts_with("consecutive_losses:"))
+                .unwrap_or(false)
+        {
+            info!(
+                cooldown_secs = halt_cooldown_secs,
+                consecutive_losses = self.consecutive_losses,
+                "Per-strategy consecutive-loss cooldown elapsed, clearing halt"
+            );
+            self.halted = false;
+            self.halt_reason = None;
+            self.halted_at = None;
+            self.consecutive_losses = 0;
         }
     }
 
@@ -155,19 +212,8 @@ impl StrategyState {
         max_daily_loss: Decimal,
         max_consecutive_losses: u32,
     ) -> bool {
-        let today = Utc::now().date_naive();
-
-        // Reset daily P&L at midnight UTC
-        if today != self.daily_pnl_date {
-            self.daily_pnl = Decimal::ZERO;
-            self.daily_pnl_date = today;
-            // Also un-halt if the halt was daily-loss-based
-            if self.halted {
-                info!("Strategy daily loss reset, un-halting");
-                self.halted = false;
-                self.halt_reason = None;
-            }
-        }
+        let now = Utc::now();
+        self.refresh(now, 0);
 
         self.daily_pnl += pnl;
 
@@ -184,6 +230,7 @@ impl StrategyState {
                 "daily_loss_exceeded: {} < -{}",
                 self.daily_pnl, max_daily_loss
             ));
+            self.halted_at = Some(now);
             return true;
         }
 
@@ -193,6 +240,7 @@ impl StrategyState {
                 "consecutive_losses: {} >= {}",
                 self.consecutive_losses, max_consecutive_losses
             ));
+            self.halted_at = Some(now);
             return true;
         }
 
@@ -544,7 +592,8 @@ impl QuantSignalExecutor {
         }
 
         // Step 4: Per-strategy circuit breaker
-        if let Some(state) = self.strategy_states.get(&signal.kind) {
+        if let Some(state) = self.strategy_states.get_mut(&signal.kind) {
+            state.refresh(Utc::now(), cfg.strategy_halt_cooldown_secs);
             if state.halted {
                 debug!(
                     signal_id = %signal.id,
@@ -1380,6 +1429,41 @@ mod tests {
         // Win resets consecutive losses
         state.record_outcome(Decimal::new(10, 0), max_loss, max_consec);
         assert_eq!(state.consecutive_losses, 0);
+    }
+
+    #[test]
+    fn test_strategy_state_new_day_resets_halt_and_losses() {
+        let mut state = StrategyState::new();
+        state.daily_pnl = Decimal::new(-25, 0);
+        state.daily_pnl_date = (Utc::now() - chrono::Duration::days(1)).date_naive();
+        state.consecutive_losses = 4;
+        state.halted = true;
+        state.halt_reason = Some("consecutive_losses: 4 >= 4".to_string());
+        state.halted_at = Some(Utc::now() - chrono::Duration::hours(2));
+
+        state.refresh(Utc::now(), 3600);
+
+        assert_eq!(state.daily_pnl, Decimal::ZERO);
+        assert_eq!(state.consecutive_losses, 0);
+        assert!(!state.halted);
+        assert!(state.halt_reason.is_none());
+        assert!(state.halted_at.is_none());
+    }
+
+    #[test]
+    fn test_strategy_state_cooldown_clears_consecutive_loss_halt() {
+        let mut state = StrategyState::new();
+        state.consecutive_losses = 5;
+        state.halted = true;
+        state.halt_reason = Some("consecutive_losses: 5 >= 5".to_string());
+        state.halted_at = Some(Utc::now() - chrono::Duration::hours(2));
+
+        state.refresh(Utc::now(), 3600);
+
+        assert_eq!(state.consecutive_losses, 0);
+        assert!(!state.halted);
+        assert!(state.halt_reason.is_none());
+        assert!(state.halted_at.is_none());
     }
 
     #[test]

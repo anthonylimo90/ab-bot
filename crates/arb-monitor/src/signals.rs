@@ -140,17 +140,28 @@ impl SignalPublisher {
     }
 
     /// Publish an entry signal for an arbitrage opportunity.
-    pub async fn publish_entry_signal(&mut self, arb: &ArbOpportunity) -> Result<()> {
-        let payload = serde_json::to_string(arb)?;
+    pub async fn publish_entry_signal(
+        &mut self,
+        arb: &ArbOpportunity,
+        observed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut entry_signal = arb.clone();
+        // Freshness in the executor should reflect when we decided to trade,
+        // not the upstream order book event time carried by the last leg update.
+        entry_signal.timestamp = observed_at;
+        let payload = serde_json::to_string(&entry_signal)?;
 
         // Publish to Redis
         let _: () = self.redis.publish(channels::ENTRY, &payload).await?;
-        debug!("Published entry signal to Redis: {}", arb.market_id);
+        debug!(
+            "Published entry signal to Redis: {}",
+            entry_signal.market_id
+        );
 
         // Send external alerts if configured
         self.send_alerts(&format!(
             "ARB ENTRY: {} | Cost: {:.4} | Profit: {:.4}",
-            arb.market_id, arb.total_cost, arb.net_profit
+            entry_signal.market_id, entry_signal.total_cost, entry_signal.net_profit
         ))
         .await?;
 

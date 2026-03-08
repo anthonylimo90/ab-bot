@@ -25,6 +25,17 @@ use tracing::{debug, info, warn};
 const COLLATERAL_DECIMALS: u32 = 6;
 const MARKET_ORDER_SIZE_SCALE: u32 = 2;
 
+fn allowance_needs_refresh(allowance: &str) -> bool {
+    let trimmed = allowance.trim();
+    trimmed.is_empty()
+        || trimmed == "0"
+        || trimmed == "0.0"
+        || trimmed
+            .parse::<Decimal>()
+            .map(|value| value <= Decimal::ZERO)
+            .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WebSocketRuntimeStatsSnapshot {
     pub subscribed_assets: usize,
@@ -292,38 +303,19 @@ impl ClobClient {
     ///
     /// Note: Switched from CLOB API to Data API because CLOB /trades endpoint
     /// now requires authentication.
-    /// Fetch recent trades from the Data API with offset-based pagination.
-    ///
-    /// Returns the trades and the next offset for pagination (current offset + trade count).
-    /// Pass `None` for the first page, then feed the returned offset back for subsequent pages.
-    pub async fn get_recent_trades(
-        &self,
-        limit: u32,
-        cursor: Option<u64>,
-    ) -> Result<(Vec<ClobTrade>, Option<u64>)> {
+    /// The public Data API no longer offers reliable offset pagination for this endpoint,
+    /// so callers should treat this as a latest-trades snapshot.
+    pub async fn get_recent_trades(&self, limit: u32) -> Result<Vec<ClobTrade>> {
         // Use Data API instead of CLOB API - it's public and doesn't require auth
         let data_api_url = "https://data-api.polymarket.com";
-        let mut url = format!("{}/trades?limit={}", data_api_url, limit);
-        if let Some(offset) = cursor {
-            url.push_str(&format!("&offset={}", offset));
-        }
+        let url = format!("{}/trades?limit={}", data_api_url, limit);
 
         let response = self.get_with_retry(&url).await?;
         let text = response.text().await?;
 
         // Data API returns trades as a top-level array
         match serde_json::from_str::<Vec<ClobTrade>>(&text) {
-            Ok(trades) => {
-                let count = trades.len() as u64;
-                let next_offset = if count >= limit as u64 {
-                    // More pages likely available
-                    Some(cursor.unwrap_or(0) + count)
-                } else {
-                    // Last page — fewer results than requested
-                    None
-                };
-                Ok((trades, next_offset))
-            }
+            Ok(trades) => Ok(trades),
             Err(e) => {
                 let preview = if text.len() > 500 {
                     &text[..500]
@@ -1727,20 +1719,7 @@ impl AuthenticatedClobClient {
         size: Decimal,
         order_type: OrderType,
     ) -> Result<SignedOrder> {
-        // Diagnostic: check CLOB's view of our balance before placing order
-        match self.get_balance_allowance(None, "COLLATERAL").await {
-            Ok(ba) => {
-                info!(
-                    balance = %ba.balance,
-                    allowance = %ba.allowance,
-                    maker = %self.address(),
-                    "CLOB USDC balance/allowance check"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to check CLOB balance/allowance (continuing)");
-            }
-        }
+        self.log_and_refresh_collateral_allowance().await;
 
         // Determine which exchange contract to use for signing
         let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
@@ -1811,19 +1790,7 @@ impl AuthenticatedClobClient {
         amount: Decimal,
         order_type: OrderType,
     ) -> Result<SignedOrder> {
-        match self.get_balance_allowance(None, "COLLATERAL").await {
-            Ok(ba) => {
-                info!(
-                    balance = %ba.balance,
-                    allowance = %ba.allowance,
-                    maker = %self.address(),
-                    "CLOB USDC balance/allowance check"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to check CLOB balance/allowance (continuing)");
-            }
-        }
+        self.log_and_refresh_collateral_allowance().await;
 
         if amount <= Decimal::ZERO {
             return Err(Error::Order {
@@ -1884,6 +1851,47 @@ impl AuthenticatedClobClient {
         signer.sign_order(&order).await.map_err(|e| Error::Signing {
             message: format!("Failed to sign order: {e}"),
         })
+    }
+
+    async fn log_and_refresh_collateral_allowance(&self) {
+        match self.get_balance_allowance(None, "COLLATERAL").await {
+            Ok(ba) => {
+                info!(
+                    balance = %ba.balance,
+                    allowance = %ba.allowance,
+                    maker = %self.address(),
+                    "CLOB USDC balance/allowance check"
+                );
+
+                if allowance_needs_refresh(&ba.allowance) {
+                    warn!(
+                        maker = %self.address(),
+                        allowance = %ba.allowance,
+                        "CLOB collateral allowance is empty or zero; refreshing server-side allowance cache"
+                    );
+                    if let Err(error) = self.update_balance_allowance("COLLATERAL").await {
+                        warn!(error = %error, "Failed to refresh CLOB collateral allowance cache");
+                        return;
+                    }
+
+                    match self.get_balance_allowance(None, "COLLATERAL").await {
+                        Ok(refreshed) => info!(
+                            balance = %refreshed.balance,
+                            allowance = %refreshed.allowance,
+                            maker = %self.address(),
+                            "CLOB USDC balance/allowance after refresh"
+                        ),
+                        Err(error) => warn!(
+                            error = %error,
+                            "Failed to re-check CLOB balance/allowance after refresh"
+                        ),
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to check CLOB balance/allowance (continuing)");
+            }
+        }
     }
 
     /// Post a signed order to the CLOB.
@@ -2336,6 +2344,40 @@ mod authenticated_tests {
         let debug_str = format!("{:?}", auth_client);
         assert!(!debug_str.contains("secret-key"));
         assert!(!debug_str.contains("secret-pass"));
+    }
+
+    #[test]
+    fn test_allowance_needs_refresh_handles_blank_and_zero() {
+        assert!(allowance_needs_refresh(""));
+        assert!(allowance_needs_refresh("0"));
+        assert!(allowance_needs_refresh("0.0"));
+        assert!(!allowance_needs_refresh("1000"));
+    }
+
+    #[test]
+    fn test_activity_entry_uses_id_when_transaction_hash_missing() {
+        let entry = ActivityEntry {
+            transaction_hash: None,
+            id: Some("activity-id".to_string()),
+            proxy_wallet: Some("0xabc".to_string()),
+            side: Some("BUY".to_string()),
+            asset: Some("asset-id".to_string()),
+            condition_id: Some("condition-id".to_string()),
+            usdc_size: None,
+            size: Some(12.0),
+            price: Some(0.45),
+            timestamp: Some(1_700_000_000),
+            created_at: None,
+            activity_type: Some("TRADE".to_string()),
+            title: Some("Title".to_string()),
+            slug: Some("slug".to_string()),
+            outcome: Some("Yes".to_string()),
+        };
+
+        let trade = entry.into_clob_trade().expect("trade");
+        assert_eq!(trade.transaction_hash, "activity-id");
+        assert_eq!(trade.wallet_address, "0xabc");
+        assert_eq!(trade.condition_id.as_deref(), Some("condition-id"));
     }
 
     #[test]

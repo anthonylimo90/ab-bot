@@ -1306,7 +1306,8 @@ impl ArbMonitor {
                                     self.track_market_signal(&arb.market_id, observed_at);
                                     arb_telemetry.entry_signals =
                                         arb_telemetry.entry_signals.saturating_add(1);
-                                    self.handle_arb_opportunity(&arb, &binary_book).await?;
+                                    self.handle_arb_opportunity(&arb, &binary_book, observed_at)
+                                        .await?;
                                 } else {
                                     arb_telemetry.filtered_by_cooldown =
                                         arb_telemetry.filtered_by_cooldown.saturating_add(1);
@@ -1331,6 +1332,7 @@ impl ArbMonitor {
         &mut self,
         arb: &ArbOpportunity,
         book: &BinaryMarketBook,
+        observed_at: chrono::DateTime<Utc>,
     ) -> Result<()> {
         info!(
             "ARB DETECTED: market={} cost={:.4} profit={:.4}",
@@ -1338,7 +1340,9 @@ impl ArbMonitor {
         );
 
         // Publish entry signal
-        self.signal_publisher.publish_entry_signal(arb).await?;
+        self.signal_publisher
+            .publish_entry_signal(arb, observed_at)
+            .await?;
 
         // Check for exit opportunities on open positions
         self.position_tracker

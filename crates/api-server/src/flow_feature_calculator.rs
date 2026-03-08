@@ -96,24 +96,22 @@ async fn compute_cycle(
 
     for &window_minutes in &config.windows {
         let window_start = now - chrono::Duration::minutes(window_minutes as i64);
+        let _permit = db_semaphore.acquire().await.expect("semaphore closed");
+        debug!(
+            window_minutes = window_minutes,
+            "Flow feature calculator acquired DB semaphore permit"
+        );
 
-        // Step 1: Aggregate wallet_trades for this window (read — no semaphore)
+        // Step 1: Aggregate wallet_trades for this window.
         //
         // This query:
         // - Groups trades by condition_id within the time window
         // - Computes buy/sell volumes, net flow, imbalance ratio
-        // - Left-joins bot_scores to compute smart money flow (bot_score < threshold)
+        // - Looks up latest bot scores only for wallets active in this window
         // - Counts unique buyers and sellers
         let rows = sqlx::query_as::<_, FlowFeatureRow>(
             r#"
-            WITH latest_bot_scores AS (
-                SELECT DISTINCT ON (address)
-                    address,
-                    total_score
-                FROM bot_scores
-                ORDER BY address, computed_at DESC
-            ),
-            recent_trades AS (
+            WITH recent_trades AS (
                 SELECT
                     condition_id,
                     wallet_address,
@@ -123,6 +121,22 @@ async fn compute_cycle(
                 WHERE condition_id IS NOT NULL
                   AND timestamp >= $4
                   AND timestamp <= $1
+            ),
+            recent_wallets AS (
+                SELECT DISTINCT wallet_address
+                FROM recent_trades
+            ),
+            latest_bot_scores AS (
+                SELECT
+                    rw.wallet_address AS address,
+                    (
+                        SELECT bs.total_score
+                        FROM bot_scores bs
+                        WHERE bs.address = rw.wallet_address
+                        ORDER BY bs.computed_at DESC
+                        LIMIT 1
+                    ) AS total_score
+                FROM recent_wallets rw
             )
             SELECT
                 rt.condition_id,
@@ -172,11 +186,8 @@ async fn compute_cycle(
             continue;
         }
 
-        // Step 2: Acquire semaphore for DB writes
-        let _permit = db_semaphore.acquire().await.expect("semaphore closed");
-
-        // Step 3: Batch UPSERT into market_flow_features
-        const BATCH_SIZE: usize = 50;
+        // Step 2: Batch UPSERT into market_flow_features
+        const BATCH_SIZE: usize = 100;
         for chunk in rows.chunks(BATCH_SIZE) {
             let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO market_flow_features \
@@ -228,6 +239,10 @@ async fn compute_cycle(
         }
 
         drop(_permit);
+        debug!(
+            window_minutes = window_minutes,
+            "Flow feature calculator released DB semaphore permit"
+        );
 
         debug!(
             window_minutes = window_minutes,

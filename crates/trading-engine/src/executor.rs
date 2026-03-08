@@ -14,6 +14,8 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+const BALANCE_ALLOWANCE_RETRY_MARKER: &str = "refreshable_balance_allowance";
+
 /// Metrics for order execution performance.
 #[derive(Debug, Default)]
 pub struct ExecutionMetrics {
@@ -95,7 +97,16 @@ fn is_retryable_error(error: &str) -> bool {
     ];
 
     let error_lower = error.to_lowercase();
-    retryable_patterns.iter().any(|p| error_lower.contains(p))
+    error_lower.contains(BALANCE_ALLOWANCE_RETRY_MARKER)
+        || retryable_patterns.iter().any(|p| error_lower.contains(p))
+}
+
+fn is_balance_allowance_error(error: &str) -> bool {
+    let error_lower = error.to_lowercase();
+    error_lower.contains("not enough balance / allowance")
+        || error_lower.contains("insufficient balance")
+        || error_lower.contains("insufficient allowance")
+        || (error_lower.contains("balance") && error_lower.contains("allowance"))
 }
 
 /// Low-latency order executor for Polymarket CLOB.
@@ -249,9 +260,7 @@ impl OrderExecutor {
         let client = slot
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No authenticated client"))?;
-        // Update both COLLATERAL (USDC.e) and CONDITIONAL (CTF tokens)
-        let _ = client.update_balance_allowance("COLLATERAL").await;
-        let _ = client.update_balance_allowance("CONDITIONAL").await;
+        Self::refresh_clob_allowance_cache_for_client(client).await;
         Ok(())
     }
 
@@ -533,6 +542,15 @@ impl OrderExecutor {
 
     // Private methods
 
+    async fn refresh_clob_allowance_cache_for_client(client: &AuthenticatedClobClient) {
+        if let Err(error) = client.update_balance_allowance("COLLATERAL").await {
+            warn!(error = %error, "Failed to refresh CLOB collateral allowance cache");
+        }
+        if let Err(error) = client.update_balance_allowance("CONDITIONAL").await {
+            warn!(error = %error, "Failed to refresh CLOB conditional allowance cache");
+        }
+    }
+
     async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
         let client_guard = self.auth_client.read().await;
@@ -674,10 +692,27 @@ impl OrderExecutor {
             .map_err(|e| anyhow::anyhow!("Failed to create market order: {}", e))?;
 
         // Post the order (FOK for market orders)
-        let response = client
-            .post_order(signed_order, OrderType::Fok)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to post order: {}", e))?;
+        let response = match client.post_order(signed_order, OrderType::Fok).await {
+            Ok(response) => response,
+            Err(error) => {
+                let error_text = error.to_string();
+                if is_balance_allowance_error(&error_text) {
+                    warn!(
+                        order_id = %order.id,
+                        error = %error_text,
+                        "Live market order rejected due to balance/allowance; refreshing CLOB cache before retry"
+                    );
+                    Self::refresh_clob_allowance_cache_for_client(client).await;
+                    return Err(anyhow::anyhow!(
+                        "{}: Failed to post order: {}",
+                        BALANCE_ALLOWANCE_RETRY_MARKER,
+                        error_text
+                    ));
+                }
+
+                return Err(anyhow::anyhow!("Failed to post order: {}", error_text));
+            }
+        };
 
         info!(
             order_id = %order.id,
@@ -758,10 +793,27 @@ impl OrderExecutor {
             .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
 
         // Post the order (GTC for limit orders)
-        let response = client
-            .post_order(signed_order, OrderType::Gtc)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to post order: {}", e))?;
+        let response = match client.post_order(signed_order, OrderType::Gtc).await {
+            Ok(response) => response,
+            Err(error) => {
+                let error_text = error.to_string();
+                if is_balance_allowance_error(&error_text) {
+                    warn!(
+                        order_id = %order.id,
+                        error = %error_text,
+                        "Live limit order rejected due to balance/allowance; refreshing CLOB cache before retry"
+                    );
+                    Self::refresh_clob_allowance_cache_for_client(client).await;
+                    return Err(anyhow::anyhow!(
+                        "{}: Failed to post order: {}",
+                        BALANCE_ALLOWANCE_RETRY_MARKER,
+                        error_text
+                    ));
+                }
+
+                return Err(anyhow::anyhow!("Failed to post order: {}", error_text));
+            }
+        };
 
         info!(
             order_id = %order.id,
@@ -921,12 +973,25 @@ mod tests {
         assert!(is_retryable_error("502 Bad Gateway"));
         assert!(is_retryable_error("ETIMEDOUT"));
         assert!(is_retryable_error("ECONNRESET"));
+        assert!(is_retryable_error(
+            "refreshable_balance_allowance: Failed to post order: not enough balance / allowance"
+        ));
 
         // Non-retryable errors
         assert!(!is_retryable_error("invalid order"));
         assert!(!is_retryable_error("insufficient funds"));
         assert!(!is_retryable_error("market closed"));
         assert!(!is_retryable_error("unauthorized"));
+    }
+
+    #[test]
+    fn test_is_balance_allowance_error() {
+        assert!(is_balance_allowance_error("not enough balance / allowance"));
+        assert!(is_balance_allowance_error("insufficient allowance"));
+        assert!(is_balance_allowance_error(
+            "Balance and allowance are stale"
+        ));
+        assert!(!is_balance_allowance_error("invalid order"));
     }
 
     #[test]

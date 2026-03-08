@@ -230,10 +230,10 @@ pub async fn get_live_trades(
     // Fetch real trades from Data API
     match state
         .clob_client
-        .get_recent_trades(query.limit as u32, None)
+        .get_recent_trades(query.limit as u32)
         .await
     {
-        Ok((clob_trades, _next_offset)) => {
+        Ok(clob_trades) => {
             let min_val = query.min_value.unwrap_or(Decimal::ZERO);
             let trades: Vec<LiveTrade> = clob_trades
                 .into_iter()
