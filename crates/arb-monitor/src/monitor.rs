@@ -512,7 +512,20 @@ impl ArbMonitor {
             let score_b = baseline_profile_score(self.market_profiles.get(b));
             compare_f64_desc(score_a, score_b)
         });
-        self.position_tracker.load_active_positions().await?;
+        let reconciliation = self.position_tracker.reconcile_on_startup().await?;
+        if reconciliation.has_issues() {
+            warn!(
+                total_positions = reconciliation.total_positions,
+                healthy = reconciliation.healthy,
+                pending_active = reconciliation.pending_active,
+                stale_pending = reconciliation.stale_pending,
+                interrupted_closing = reconciliation.interrupted_closing,
+                already_failed = reconciliation.already_failed,
+                stalled = reconciliation.stalled,
+                auto_recovered = reconciliation.auto_recovered,
+                "Position reconciliation found recoverable issues"
+            );
+        }
         let _ = self.rebuild_eligible_markets(SelectionRebuildReason::Startup);
 
         info!(

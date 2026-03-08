@@ -109,6 +109,7 @@ impl PositionTracker {
         for position in positions.iter_mut() {
             if position.is_active() {
                 position.update_pnl(yes_bid, no_bid, ArbOpportunity::DEFAULT_FEE);
+                position.touch();
                 debug!(
                     "Position {} unrealized P&L: {}",
                     position.id, position.unrealized_pnl
