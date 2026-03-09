@@ -50,6 +50,22 @@ import type {
   TradeFlowSummary,
   TradeJourney,
   TradeFlowMarketResponse,
+  ArbExecutionTelemetryResponse,
+  ArbExecutionTelemetrySummary,
+  ArbExecutionLatencyMetric,
+  ArbExecutionOutcomeBreakdown,
+  ArbExecutionAttempt,
+  LearningOverviewResponse,
+  LearningDatasetReadiness,
+  LearningModelSummary,
+  CreateLearningModelRequest,
+  UpdateLearningModelRequest,
+  LearningOfflineEvaluation,
+  LearningRolloutDetailResponse,
+  LearningRolloutObservation,
+  LearningRolloutStatus,
+  CreateLearningRolloutRequest,
+  UpdateLearningRolloutRequest,
 } from "@/types/api";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
@@ -203,6 +219,147 @@ function parseTradeJourney(raw: TradeJourney): TradeJourney {
     unrealized_pnl:
       raw.unrealized_pnl != null ? Number(raw.unrealized_pnl) : raw.unrealized_pnl,
     hold_hours: raw.hold_hours != null ? Number(raw.hold_hours) : raw.hold_hours,
+  };
+}
+
+function parseArbExecutionTelemetrySummary(
+  raw: ArbExecutionTelemetrySummary,
+): ArbExecutionTelemetrySummary {
+  return {
+    ...raw,
+    avg_expected_edge:
+      raw.avg_expected_edge != null ? Number(raw.avg_expected_edge) : null,
+    avg_observed_edge:
+      raw.avg_observed_edge != null ? Number(raw.avg_observed_edge) : null,
+    avg_execution_slippage_bps:
+      raw.avg_execution_slippage_bps != null
+        ? Number(raw.avg_execution_slippage_bps)
+        : null,
+    median_total_time_ms:
+      raw.median_total_time_ms != null ? Number(raw.median_total_time_ms) : null,
+    p90_total_time_ms:
+      raw.p90_total_time_ms != null ? Number(raw.p90_total_time_ms) : null,
+    median_yes_order_ms:
+      raw.median_yes_order_ms != null ? Number(raw.median_yes_order_ms) : null,
+    median_no_order_ms:
+      raw.median_no_order_ms != null ? Number(raw.median_no_order_ms) : null,
+  };
+}
+
+function parseArbExecutionLatencyMetric(
+  raw: ArbExecutionLatencyMetric,
+): ArbExecutionLatencyMetric {
+  return {
+    ...raw,
+    avg_ms: raw.avg_ms != null ? Number(raw.avg_ms) : null,
+    p50_ms: raw.p50_ms != null ? Number(raw.p50_ms) : null,
+    p90_ms: raw.p90_ms != null ? Number(raw.p90_ms) : null,
+    max_ms: raw.max_ms != null ? Number(raw.max_ms) : null,
+  };
+}
+
+function parseArbExecutionOutcomeBreakdown(
+  raw: ArbExecutionOutcomeBreakdown,
+): ArbExecutionOutcomeBreakdown {
+  return {
+    ...raw,
+    count: Number(raw.count),
+  };
+}
+
+function parseArbExecutionAttempt(raw: ArbExecutionAttempt): ArbExecutionAttempt {
+  return {
+    ...raw,
+    signal_age_ms: raw.signal_age_ms != null ? Number(raw.signal_age_ms) : null,
+    token_lookup_ms:
+      raw.token_lookup_ms != null ? Number(raw.token_lookup_ms) : null,
+    depth_check_ms: raw.depth_check_ms != null ? Number(raw.depth_check_ms) : null,
+    preflight_ms: raw.preflight_ms != null ? Number(raw.preflight_ms) : null,
+    yes_order_ms: raw.yes_order_ms != null ? Number(raw.yes_order_ms) : null,
+    no_order_ms: raw.no_order_ms != null ? Number(raw.no_order_ms) : null,
+    inter_leg_gap_ms:
+      raw.inter_leg_gap_ms != null ? Number(raw.inter_leg_gap_ms) : null,
+    request_to_fill_ms:
+      raw.request_to_fill_ms != null ? Number(raw.request_to_fill_ms) : null,
+    request_to_open_ms:
+      raw.request_to_open_ms != null ? Number(raw.request_to_open_ms) : null,
+    total_time_ms: raw.total_time_ms != null ? Number(raw.total_time_ms) : null,
+    expected_edge: raw.expected_edge != null ? Number(raw.expected_edge) : null,
+    observed_edge: raw.observed_edge != null ? Number(raw.observed_edge) : null,
+    execution_slippage_bps:
+      raw.execution_slippage_bps != null
+        ? Number(raw.execution_slippage_bps)
+        : null,
+  };
+}
+
+function parseLearningDatasetReadiness(
+  raw: LearningDatasetReadiness,
+): LearningDatasetReadiness {
+  return {
+    ...raw,
+    arb_attempts: Number(raw.arb_attempts),
+    arb_realized_outcomes: Number(raw.arb_realized_outcomes),
+    arb_one_legged_failures: Number(raw.arb_one_legged_failures),
+    quant_decisions: Number(raw.quant_decisions),
+    quant_realized_outcomes: Number(raw.quant_realized_outcomes),
+    quant_executed_decisions: Number(raw.quant_executed_decisions),
+    shadow_predictions: Number(raw.shadow_predictions),
+    active_rollouts: Number(raw.active_rollouts),
+  };
+}
+
+function parseLearningModelSummary(raw: LearningModelSummary): LearningModelSummary {
+  return {
+    ...raw,
+    shadow_predictions: Number(raw.shadow_predictions),
+  };
+}
+
+function parseLearningOfflineEvaluation(
+  raw: LearningOfflineEvaluation,
+): LearningOfflineEvaluation {
+  return raw;
+}
+
+function parseLearningRolloutStatus(
+  raw: LearningRolloutStatus,
+): LearningRolloutStatus {
+  return {
+    ...raw,
+    baseline_window_hours: Number(raw.baseline_window_hours),
+    latest_failure_rate:
+      raw.latest_failure_rate != null ? Number(raw.latest_failure_rate) : null,
+    latest_one_legged_rate:
+      raw.latest_one_legged_rate != null
+        ? Number(raw.latest_one_legged_rate)
+        : null,
+    latest_drawdown_pct:
+      raw.latest_drawdown_pct != null ? Number(raw.latest_drawdown_pct) : null,
+    latest_latency_p90_ms:
+      raw.latest_latency_p90_ms != null
+        ? Number(raw.latest_latency_p90_ms)
+        : null,
+    latest_edge_capture_ratio:
+      raw.latest_edge_capture_ratio != null
+        ? Number(raw.latest_edge_capture_ratio)
+        : null,
+  };
+}
+
+function parseLearningRolloutObservation(
+  raw: LearningRolloutObservation,
+): LearningRolloutObservation {
+  return {
+    ...raw,
+    failure_rate: raw.failure_rate != null ? Number(raw.failure_rate) : null,
+    one_legged_rate:
+      raw.one_legged_rate != null ? Number(raw.one_legged_rate) : null,
+    drawdown_pct: raw.drawdown_pct != null ? Number(raw.drawdown_pct) : null,
+    latency_p90_ms:
+      raw.latency_p90_ms != null ? Number(raw.latency_p90_ms) : null,
+    edge_capture_ratio:
+      raw.edge_capture_ratio != null ? Number(raw.edge_capture_ratio) : null,
   };
 }
 
@@ -620,6 +777,54 @@ class ApiClient {
     });
   }
 
+  async adminCreateLearningModel(
+    params: CreateLearningModelRequest,
+  ): Promise<LearningModelSummary> {
+    const raw = await this.request<LearningModelSummary>("/api/v1/admin/learning/models", {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+    return parseLearningModelSummary(raw);
+  }
+
+  async adminUpdateLearningModel(
+    modelId: string,
+    params: UpdateLearningModelRequest,
+  ): Promise<LearningModelSummary> {
+    const raw = await this.request<LearningModelSummary>(
+      `/api/v1/admin/learning/models/${modelId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseLearningModelSummary(raw);
+  }
+
+  async adminActivateLearningModel(modelId: string): Promise<LearningModelSummary> {
+    const raw = await this.request<LearningModelSummary>(
+      `/api/v1/admin/learning/models/${modelId}/activate`,
+      { method: "POST" },
+    );
+    return parseLearningModelSummary(raw);
+  }
+
+  async adminDisableLearningModel(modelId: string): Promise<LearningModelSummary> {
+    const raw = await this.request<LearningModelSummary>(
+      `/api/v1/admin/learning/models/${modelId}/disable`,
+      { method: "POST" },
+    );
+    return parseLearningModelSummary(raw);
+  }
+
+  async adminRetireLearningModel(modelId: string): Promise<LearningModelSummary> {
+    const raw = await this.request<LearningModelSummary>(
+      `/api/v1/admin/learning/models/${modelId}/retire`,
+      { method: "POST" },
+    );
+    return parseLearningModelSummary(raw);
+  }
+
   // User Workspaces
   async listWorkspaces(): Promise<WorkspaceListItem[]> {
     return this.request<WorkspaceListItem[]>("/api/v1/workspaces");
@@ -962,6 +1167,119 @@ class ApiClient {
       summary: parseTradeFlowSummary(raw.summary),
       journeys: raw.journeys.map(parseTradeJourney),
     };
+  }
+
+  async getArbExecutionTelemetry(params?: {
+    from?: string;
+    to?: string;
+    limit?: number;
+  }): Promise<ArbExecutionTelemetryResponse> {
+    const sp = new URLSearchParams();
+    if (params?.from) sp.set("from", params.from);
+    if (params?.to) sp.set("to", params.to);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<ArbExecutionTelemetryResponse>(
+      `/api/v1/trade-flow/strategies/arb/execution-telemetry${q ? `?${q}` : ""}`,
+    );
+    return {
+      ...raw,
+      summary: parseArbExecutionTelemetrySummary(raw.summary),
+      latency_breakdown: raw.latency_breakdown.map(parseArbExecutionLatencyMetric),
+      outcome_breakdown: raw.outcome_breakdown.map(parseArbExecutionOutcomeBreakdown),
+      recent_attempts: raw.recent_attempts.map(parseArbExecutionAttempt),
+    };
+  }
+
+  async getLearningOverview(params?: {
+    from?: string;
+    to?: string;
+    limit?: number;
+  }): Promise<LearningOverviewResponse> {
+    const sp = new URLSearchParams();
+    if (params?.from) sp.set("from", params.from);
+    if (params?.to) sp.set("to", params.to);
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<LearningOverviewResponse>(
+      `/api/v1/trade-flow/learning/overview${q ? `?${q}` : ""}`,
+    );
+    return {
+      ...raw,
+      datasets: parseLearningDatasetReadiness(raw.datasets),
+      models: raw.models.map(parseLearningModelSummary),
+      offline_evaluations: raw.offline_evaluations.map(
+        parseLearningOfflineEvaluation,
+      ),
+      rollouts: raw.rollouts.map(parseLearningRolloutStatus),
+    };
+  }
+
+  async getLearningRolloutDetail(
+    rolloutId: string,
+    params?: { limit?: number },
+  ): Promise<LearningRolloutDetailResponse> {
+    const sp = new URLSearchParams();
+    if (params?.limit) sp.set("limit", String(params.limit));
+    const q = sp.toString();
+    const raw = await this.request<LearningRolloutDetailResponse>(
+      `/api/v1/trade-flow/learning/rollouts/${rolloutId}${q ? `?${q}` : ""}`,
+    );
+    return {
+      rollout: parseLearningRolloutStatus(raw.rollout),
+      observations: raw.observations.map(parseLearningRolloutObservation),
+    };
+  }
+
+  async adminCreateLearningRollout(
+    params: CreateLearningRolloutRequest,
+  ): Promise<LearningRolloutStatus> {
+    const raw = await this.request<LearningRolloutStatus>(
+      "/api/v1/admin/learning/rollouts",
+      {
+        method: "POST",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseLearningRolloutStatus(raw);
+  }
+
+  async adminUpdateLearningRollout(
+    rolloutId: string,
+    params: UpdateLearningRolloutRequest,
+  ): Promise<LearningRolloutStatus> {
+    const raw = await this.request<LearningRolloutStatus>(
+      `/api/v1/admin/learning/rollouts/${rolloutId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseLearningRolloutStatus(raw);
+  }
+
+  async adminPauseLearningRollout(rolloutId: string): Promise<LearningRolloutStatus> {
+    const raw = await this.request<LearningRolloutStatus>(
+      `/api/v1/admin/learning/rollouts/${rolloutId}/pause`,
+      { method: "POST" },
+    );
+    return parseLearningRolloutStatus(raw);
+  }
+
+  async adminResumeLearningRollout(rolloutId: string): Promise<LearningRolloutStatus> {
+    const raw = await this.request<LearningRolloutStatus>(
+      `/api/v1/admin/learning/rollouts/${rolloutId}/resume`,
+      { method: "POST" },
+    );
+    return parseLearningRolloutStatus(raw);
+  }
+
+  async adminCompleteLearningRollout(rolloutId: string): Promise<LearningRolloutStatus> {
+    const raw = await this.request<LearningRolloutStatus>(
+      `/api/v1/admin/learning/rollouts/${rolloutId}/complete`,
+      { method: "POST" },
+    );
+    return parseLearningRolloutStatus(raw);
   }
 
   // Quant Signals

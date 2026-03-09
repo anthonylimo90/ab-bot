@@ -95,6 +95,12 @@ export const queryKeys = {
       [...queryKeys.tradeFlow.all(), "summary", params] as const,
     journeys: (params?: { from?: string; to?: string; strategy?: string; limit?: number }) =>
       [...queryKeys.tradeFlow.all(), "journeys", params] as const,
+    arbExecutionTelemetry: (params?: { from?: string; to?: string; limit?: number }) =>
+      [...queryKeys.tradeFlow.all(), "arb-execution-telemetry", params] as const,
+    learningOverview: (params?: { from?: string; to?: string; limit?: number }) =>
+      [...queryKeys.tradeFlow.all(), "learning-overview", params] as const,
+    learningRolloutDetail: (rolloutId: string, params?: { limit?: number }) =>
+      [...queryKeys.tradeFlow.all(), "learning-rollout-detail", rolloutId, params] as const,
     market: (
       marketId: string,
       params?: { from?: string; to?: string; strategy?: string; limit?: number },

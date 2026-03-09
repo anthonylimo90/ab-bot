@@ -481,6 +481,212 @@ export interface TradeFlowMarketResponse {
   journeys: TradeJourney[];
 }
 
+export interface ArbExecutionTelemetrySummary {
+  entry_requests: number;
+  positions_opened: number;
+  position_failures: number;
+  signal_skipped: number;
+  one_legged_failures: number;
+  success_rate: number | null;
+  failure_rate: number | null;
+  skip_rate: number | null;
+  avg_expected_edge: number | null;
+  avg_observed_edge: number | null;
+  avg_execution_slippage_bps: number | null;
+  median_total_time_ms: number | null;
+  p90_total_time_ms: number | null;
+  median_yes_order_ms: number | null;
+  median_no_order_ms: number | null;
+}
+
+export interface ArbExecutionLatencyMetric {
+  stage: string;
+  sample_size: number;
+  avg_ms: number | null;
+  p50_ms: number | null;
+  p90_ms: number | null;
+  max_ms: number | null;
+}
+
+export interface ArbExecutionOutcomeBreakdown {
+  outcome: string;
+  reason: string;
+  count: number;
+}
+
+export interface ArbExecutionAttempt {
+  occurred_at: string;
+  market_id: string;
+  position_id?: string | null;
+  outcome: string;
+  reason?: string | null;
+  execution_mode: string;
+  token_source?: string | null;
+  signal_age_ms?: number | null;
+  token_lookup_ms?: number | null;
+  depth_check_ms?: number | null;
+  preflight_ms?: number | null;
+  yes_order_ms?: number | null;
+  no_order_ms?: number | null;
+  inter_leg_gap_ms?: number | null;
+  request_to_fill_ms?: number | null;
+  request_to_open_ms?: number | null;
+  total_time_ms?: number | null;
+  expected_edge?: number | null;
+  observed_edge?: number | null;
+  execution_slippage_bps?: number | null;
+  one_legged: boolean;
+}
+
+export interface ArbExecutionTelemetryResponse {
+  from: string;
+  to: string;
+  summary: ArbExecutionTelemetrySummary;
+  latency_breakdown: ArbExecutionLatencyMetric[];
+  outcome_breakdown: ArbExecutionOutcomeBreakdown[];
+  recent_attempts: ArbExecutionAttempt[];
+}
+
+export interface LearningDatasetReadiness {
+  arb_attempts: number;
+  arb_realized_outcomes: number;
+  arb_one_legged_failures: number;
+  quant_decisions: number;
+  quant_realized_outcomes: number;
+  quant_executed_decisions: number;
+  shadow_predictions: number;
+  active_rollouts: number;
+}
+
+export interface LearningModelSummary {
+  model_id: string;
+  model_key: string;
+  strategy_scope: string;
+  target: string;
+  model_type: string;
+  version: string;
+  status: string;
+  feature_view: string;
+  created_at: string;
+  activated_at?: string | null;
+  artifact_uri?: string | null;
+  training_window_start?: string | null;
+  training_window_end?: string | null;
+  validation_window_start?: string | null;
+  validation_window_end?: string | null;
+  metrics: Record<string, unknown>;
+  shadow_predictions: number;
+}
+
+export interface CreateLearningModelRequest {
+  model_key: string;
+  strategy_scope: string;
+  target: string;
+  model_type: string;
+  version: string;
+  status: string;
+  feature_view: string;
+  artifact_uri?: string;
+  training_window_start?: string;
+  training_window_end?: string;
+  validation_window_start?: string;
+  validation_window_end?: string;
+  metrics?: Record<string, unknown>;
+}
+
+export interface UpdateLearningModelRequest {
+  model_key?: string;
+  strategy_scope?: string;
+  target?: string;
+  model_type?: string;
+  version?: string;
+  status?: string;
+  feature_view?: string;
+  artifact_uri?: string;
+  training_window_start?: string;
+  training_window_end?: string;
+  validation_window_start?: string;
+  validation_window_end?: string;
+  metrics?: Record<string, unknown>;
+}
+
+export interface LearningOfflineEvaluation {
+  id: string;
+  model_id: string;
+  model_key: string;
+  evaluation_scope: string;
+  dataset_name: string;
+  created_at: string;
+  metrics: Record<string, unknown>;
+  decision_policy: Record<string, unknown>;
+}
+
+export interface LearningRolloutStatus {
+  id: string;
+  model_id: string;
+  model_key: string;
+  strategy_scope: string;
+  rollout_mode: string;
+  authority_level: string;
+  status: string;
+  baseline_window_hours: number;
+  started_at: string;
+  ended_at?: string | null;
+  rollback_reason?: string | null;
+  bounds: Record<string, unknown>;
+  guardrails: Record<string, unknown>;
+  latest_observed_at?: string | null;
+  latest_guardrail_state?: string | null;
+  latest_failure_rate?: number | null;
+  latest_one_legged_rate?: number | null;
+  latest_drawdown_pct?: number | null;
+  latest_latency_p90_ms?: number | null;
+  latest_edge_capture_ratio?: number | null;
+}
+
+export interface LearningRolloutObservation {
+  id: string;
+  observed_at: string;
+  failure_rate?: number | null;
+  one_legged_rate?: number | null;
+  drawdown_pct?: number | null;
+  latency_p90_ms?: number | null;
+  edge_capture_ratio?: number | null;
+  guardrail_state: string;
+  notes: Record<string, unknown>;
+}
+
+export interface LearningRolloutDetailResponse {
+  rollout: LearningRolloutStatus;
+  observations: LearningRolloutObservation[];
+}
+
+export interface CreateLearningRolloutRequest {
+  model_id: string;
+  rollout_mode: string;
+  authority_level: string;
+  baseline_window_hours?: number;
+  bounds?: Record<string, unknown>;
+  guardrails?: Record<string, unknown>;
+}
+
+export interface UpdateLearningRolloutRequest {
+  rollout_mode?: string;
+  authority_level?: string;
+  baseline_window_hours?: number;
+  bounds?: Record<string, unknown>;
+  guardrails?: Record<string, unknown>;
+}
+
+export interface LearningOverviewResponse {
+  from: string;
+  to: string;
+  datasets: LearningDatasetReadiness;
+  models: LearningModelSummary[];
+  offline_evaluations: LearningOfflineEvaluation[];
+  rollouts: LearningRolloutStatus[];
+}
+
 export type StrategyMode = "disabled" | "paper" | "live";
 
 export interface StrategyModeStatus {

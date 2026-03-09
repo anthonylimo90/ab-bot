@@ -19,6 +19,8 @@ use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
 use crate::arb_executor::OutcomeTokenCache;
+use crate::learning::{QuantShadowPredictionInput, ShadowPredictionRecorder};
+use crate::learning_rollouts::LearningRolloutController;
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
@@ -259,6 +261,8 @@ struct QuantSignalExecutor {
     pool: PgPool,
     token_cache: Arc<OutcomeTokenCache>,
     trade_event_recorder: TradeEventRecorder,
+    shadow_prediction_recorder: ShadowPredictionRecorder,
+    rollout_controller: LearningRolloutController,
     /// Per-strategy risk state (daily P&L, consecutive losses).
     strategy_states: HashMap<QuantSignalKind, StrategyState>,
     /// Closed quant positions that have already been folded into strategy state.
@@ -285,6 +289,8 @@ impl QuantSignalExecutor {
             OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
         );
         let trade_event_recorder = TradeEventRecorder::new(pool.clone(), trade_event_tx);
+        let shadow_prediction_recorder = ShadowPredictionRecorder::new(pool.clone());
+        let rollout_controller = LearningRolloutController::new(pool.clone());
 
         let mut strategy_states = HashMap::new();
         strategy_states.insert(QuantSignalKind::Flow, StrategyState::new());
@@ -302,6 +308,8 @@ impl QuantSignalExecutor {
             pool,
             token_cache,
             trade_event_recorder,
+            shadow_prediction_recorder,
+            rollout_controller,
             strategy_states,
             processed_strategy_outcomes: HashSet::new(),
             heartbeat,
@@ -536,6 +544,28 @@ impl QuantSignalExecutor {
                 .with_requested_size(signal.suggested_size_usd),
             )
             .await;
+
+        let shadow_prediction_recorder = self.shadow_prediction_recorder.clone();
+        let shadow_input = QuantShadowPredictionInput {
+            decision_id: signal.id,
+            kind: signal.kind,
+            condition_id: signal.condition_id.clone(),
+            direction: signal.direction,
+            confidence: signal.confidence,
+            suggested_size_usd: signal.suggested_size_usd,
+            generated_at: signal.generated_at,
+            expiry: signal.expiry,
+            execution_mode: execution_mode.clone(),
+            metadata: signal.metadata.clone(),
+            min_confidence: cfg.min_confidence,
+            max_signal_age_secs: cfg.max_signal_age_secs,
+        };
+        let shadow_record_input = shadow_input.clone();
+        tokio::spawn(async move {
+            shadow_prediction_recorder
+                .record_quant_decision_baselines(shadow_record_input)
+                .await;
+        });
 
         // Step 1: Check enabled
         if !cfg.enabled {
@@ -818,8 +848,29 @@ impl QuantSignalExecutor {
             Decimal::try_from(signal.confidence).unwrap_or(Decimal::new(65, 2));
         let allocation_decimal =
             Decimal::try_from(allocation_weight).unwrap_or(Decimal::new(40, 2));
-        let position_size_usd =
+        let mut position_size_usd =
             cfg.base_position_size_usd * confidence_decimal * allocation_decimal;
+
+        let rollout_decision = self
+            .rollout_controller
+            .evaluate_quant(&shadow_input, &execution_mode)
+            .await;
+        if let Some(reason) = rollout_decision.skip_reason.as_deref() {
+            self.update_signal_status(signal.id, "skipped", Some(reason))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some(reason),
+            )
+            .await;
+            return Ok(());
+        }
+
+        if rollout_decision.size_multiplier < Decimal::ONE {
+            position_size_usd *= rollout_decision.size_multiplier;
+        }
 
         if position_size_usd < Decimal::new(1, 0) {
             debug!(

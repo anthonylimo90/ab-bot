@@ -135,6 +135,10 @@ fn bench_signal_serialization(c: &mut Criterion) {
         total_cost: Decimal::new(94, 2),
         gross_profit: Decimal::new(6, 2),
         net_profit: Decimal::new(4, 2),
+        fee_drag: Decimal::new(2, 2),
+        worst_case_payout: Decimal::new(98, 2),
+        yes_fee_shares: Decimal::ZERO,
+        no_fee_shares: Decimal::ZERO,
     };
 
     group.throughput(Throughput::Elements(1));

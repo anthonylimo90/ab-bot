@@ -21,7 +21,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
+use uuid::Uuid;
 
+use crate::learning::{ArbShadowPredictionInput, ShadowPredictionRecorder};
+use crate::learning_rollouts::LearningRolloutController;
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
@@ -369,6 +372,105 @@ impl ArbExecutorRuntimeStatus {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct ArbExecutionTelemetry {
+    attempt_id: Uuid,
+    signal_age_ms: i64,
+    token_lookup_ms: Option<i64>,
+    depth_check_ms: Option<i64>,
+    preflight_ms: Option<i64>,
+    yes_order_ms: Option<i64>,
+    no_order_ms: Option<i64>,
+    inter_leg_gap_ms: Option<i64>,
+    request_to_fill_ms: Option<i64>,
+    request_to_open_ms: Option<i64>,
+    total_time_ms: Option<i64>,
+    token_source: Option<String>,
+    failure_stage: Option<String>,
+    one_legged: bool,
+}
+
+impl ArbExecutionTelemetry {
+    fn new(attempt_id: Uuid, signal_age_ms: i64) -> Self {
+        Self {
+            attempt_id,
+            signal_age_ms,
+            ..Self::default()
+        }
+    }
+
+    fn finish_total(&mut self, started_at: &std::time::Instant) {
+        self.total_time_ms = Some(started_at.elapsed().as_millis() as i64);
+    }
+
+    fn to_metadata(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("telemetry_version".to_string(), serde_json::json!(2));
+        map.insert("attempt_id".to_string(), serde_json::json!(self.attempt_id));
+        map.insert(
+            "signal_age_ms".to_string(),
+            serde_json::json!(self.signal_age_ms),
+        );
+
+        if let Some(value) = self.token_lookup_ms {
+            map.insert("token_lookup_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.depth_check_ms {
+            map.insert("depth_check_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.preflight_ms {
+            map.insert("preflight_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.yes_order_ms {
+            map.insert("yes_order_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.no_order_ms {
+            map.insert("no_order_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.inter_leg_gap_ms {
+            map.insert("inter_leg_gap_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.request_to_fill_ms {
+            map.insert("request_to_fill_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.request_to_open_ms {
+            map.insert("request_to_open_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = self.total_time_ms {
+            map.insert("total_time_ms".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = &self.token_source {
+            map.insert("token_source".to_string(), serde_json::json!(value));
+        }
+        if let Some(value) = &self.failure_stage {
+            map.insert("failure_stage".to_string(), serde_json::json!(value));
+        }
+        if self.one_legged {
+            map.insert("one_legged".to_string(), serde_json::json!(true));
+        }
+
+        serde_json::Value::Object(map)
+    }
+}
+
+fn merge_metadata(
+    metadata: serde_json::Value,
+    telemetry: &ArbExecutionTelemetry,
+) -> serde_json::Value {
+    let mut base = match metadata {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+
+    if let serde_json::Value::Object(telemetry_map) = telemetry.to_metadata() {
+        for (key, value) in telemetry_map {
+            base.insert(key, value);
+        }
+    }
+
+    serde_json::Value::Object(base)
+}
+
 /// Arb auto-executor service.
 pub struct ArbAutoExecutor {
     config: Arc<RwLock<ArbExecutorConfig>>,
@@ -380,6 +482,8 @@ pub struct ArbAutoExecutor {
     position_repo: PositionRepository,
     token_cache: OutcomeTokenCache,
     trade_event_recorder: TradeEventRecorder,
+    shadow_prediction_recorder: ShadowPredictionRecorder,
+    rollout_controller: LearningRolloutController,
     /// Set of market IDs with active positions (for deduplication).
     /// Shared with ExitHandler so closed positions unblock their markets.
     active_markets: Arc<RwLock<HashSet<String>>>,
@@ -417,6 +521,8 @@ impl ArbAutoExecutor {
             token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets)
                 .with_pool(pool.clone()),
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
+            shadow_prediction_recorder: ShadowPredictionRecorder::new(pool.clone()),
+            rollout_controller: LearningRolloutController::new(pool.clone()),
             active_markets,
             heartbeat,
             runtime_status,
@@ -599,6 +705,7 @@ impl ArbAutoExecutor {
 
     /// Process a single arb signal through validation → execution → tracking.
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
+        let process_started_at = std::time::Instant::now();
         let cfg = self.snapshot_config().await;
         let live_ready = self.order_executor.is_live_ready().await;
         let execution_mode = if live_ready { "live" } else { "paper" };
@@ -632,6 +739,13 @@ impl ArbAutoExecutor {
             .await;
         });
 
+        let signal_age_ms = Utc::now()
+            .signed_duration_since(arb.timestamp)
+            .num_milliseconds()
+            .max(0);
+        let attempt_id = Uuid::new_v4();
+        let mut telemetry = ArbExecutionTelemetry::new(attempt_id, signal_age_ms);
+
         self.trade_event_recorder
             .record_warn(
                 NewTradeEvent::new(
@@ -643,22 +757,46 @@ impl ArbAutoExecutor {
                 )
                 .with_expected_edge(arb.net_profit)
                 .with_observed_edge(arb.gross_profit)
-                .with_metadata(serde_json::json!({
-                    "yes_ask": arb.yes_ask.to_string(),
-                    "no_ask": arb.no_ask.to_string(),
-                    "total_cost": arb.total_cost.to_string(),
-                    "gross_profit": arb.gross_profit.to_string(),
-                    "net_profit": arb.net_profit.to_string(),
-                })),
+                .with_metadata(merge_metadata(
+                    serde_json::json!({
+                        "yes_ask": arb.yes_ask.to_string(),
+                        "no_ask": arb.no_ask.to_string(),
+                        "total_cost": arb.total_cost.to_string(),
+                        "gross_profit": arb.gross_profit.to_string(),
+                        "net_profit": arb.net_profit.to_string(),
+                    }),
+                    &telemetry,
+                )),
             )
             .await;
+
+        let shadow_prediction_recorder = self.shadow_prediction_recorder.clone();
+        let shadow_input = ArbShadowPredictionInput {
+            attempt_id,
+            market_id: arb.market_id.clone(),
+            execution_mode: execution_mode.to_string(),
+            signal_age_ms,
+            yes_ask: arb.yes_ask,
+            no_ask: arb.no_ask,
+            total_cost: arb.total_cost,
+            gross_profit: arb.gross_profit,
+            net_profit: arb.net_profit,
+            live_ready,
+        };
+        let shadow_record_input = shadow_input.clone();
+        tokio::spawn(async move {
+            shadow_prediction_recorder
+                .record_arb_attempt_baselines(shadow_record_input)
+                .await;
+        });
 
         // Per-signal guard: skip processing when disabled at runtime
         if !cfg.enabled {
             let mut runtime = self.runtime_status.write().await;
             runtime.disabled_skips = runtime.disabled_skips.saturating_add(1);
             runtime.record_decision(&arb.market_id, "skipped: executor disabled");
-            self.record_skip_event(&arb, execution_mode, "executor_disabled")
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "executor_disabled", &telemetry)
                 .await;
             return Ok(());
         }
@@ -666,9 +804,7 @@ impl ArbAutoExecutor {
         let market_id = &arb.market_id;
 
         // 1. Validate signal freshness
-        let age_secs = Utc::now()
-            .signed_duration_since(arb.timestamp)
-            .num_seconds();
+        let age_secs = signal_age_ms / 1000;
         if age_secs > cfg.max_signal_age_secs {
             let mut runtime = self.runtime_status.write().await;
             runtime.stale_skips = runtime.stale_skips.saturating_add(1);
@@ -685,7 +821,8 @@ impl ArbAutoExecutor {
                 max = cfg.max_signal_age_secs,
                 "Arb signal too stale, skipping"
             );
-            self.record_skip_event(&arb, execution_mode, "too_stale")
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "too_stale", &telemetry)
                 .await;
             return Ok(());
         }
@@ -707,7 +844,8 @@ impl ArbAutoExecutor {
                 min = %cfg.min_net_profit,
                 "Arb signal below min profit threshold, skipping"
             );
-            self.record_skip_event(&arb, execution_mode, "below_min_profit")
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "below_min_profit", &telemetry)
                 .await;
             return Ok(());
         }
@@ -720,7 +858,8 @@ impl ArbAutoExecutor {
                 runtime.active_position_skips = runtime.active_position_skips.saturating_add(1);
                 runtime.record_decision(market_id, "skipped: active position exists");
                 info!(market_id = %market_id, "Active position exists, skipping");
-                self.record_skip_event(&arb, execution_mode, "active_position_exists")
+                telemetry.finish_total(&process_started_at);
+                self.record_skip_event(&arb, execution_mode, "active_position_exists", &telemetry)
                     .await;
                 return Ok(());
             }
@@ -732,22 +871,33 @@ impl ArbAutoExecutor {
             runtime.circuit_breaker_skips = runtime.circuit_breaker_skips.saturating_add(1);
             runtime.record_decision(market_id, "skipped: circuit breaker tripped");
             warn!(market_id = %market_id, "Circuit breaker tripped, skipping arb trade");
-            self.record_skip_event(&arb, execution_mode, "circuit_breaker")
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "circuit_breaker", &telemetry)
                 .await;
             return Ok(());
         }
 
         // 5. Resolve outcome token IDs from cache
+        let token_lookup_started_at = std::time::Instant::now();
         let (yes_token_id, no_token_id) = match self.token_cache.get(market_id).await {
-            Some(ids) => ids,
+            Some(ids) => {
+                telemetry.token_source = Some("cache".to_string());
+                ids
+            }
             None => {
                 warn!(
                     market_id = %market_id,
                     "No token IDs cached for market, attempting single-market hydration"
                 );
                 match self.token_cache.hydrate_market(market_id).await {
-                    Ok(Some(ids)) => ids,
+                    Ok(Some(ids)) => {
+                        telemetry.token_source = Some("single_market_hydration".to_string());
+                        ids
+                    }
                     Ok(None) => {
+                        telemetry.token_lookup_ms =
+                            Some(token_lookup_started_at.elapsed().as_millis() as i64);
+                        telemetry.finish_total(&process_started_at);
                         let mut runtime = self.runtime_status.write().await;
                         runtime.token_lookup_skips = runtime.token_lookup_skips.saturating_add(1);
                         runtime.record_decision(
@@ -755,11 +905,19 @@ impl ArbAutoExecutor {
                             "skipped: token lookup failed after single-market hydration",
                         );
                         warn!(market_id = %market_id, "Market not found after single-market hydration, skipping");
-                        self.record_skip_event(&arb, execution_mode, "token_lookup_failed")
-                            .await;
+                        self.record_skip_event(
+                            &arb,
+                            execution_mode,
+                            "token_lookup_failed",
+                            &telemetry,
+                        )
+                        .await;
                         return Ok(());
                     }
                     Err(e) => {
+                        telemetry.token_lookup_ms =
+                            Some(token_lookup_started_at.elapsed().as_millis() as i64);
+                        telemetry.finish_total(&process_started_at);
                         let mut runtime = self.runtime_status.write().await;
                         runtime.token_lookup_skips = runtime.token_lookup_skips.saturating_add(1);
                         runtime.record_decision(
@@ -767,15 +925,22 @@ impl ArbAutoExecutor {
                             format!("skipped: token cache hydration failed: {e}"),
                         );
                         warn!(market_id = %market_id, error = %e, "Token cache hydration failed");
-                        self.record_skip_event(&arb, execution_mode, "token_lookup_failed")
-                            .await;
+                        self.record_skip_event(
+                            &arb,
+                            execution_mode,
+                            "token_lookup_failed",
+                            &telemetry,
+                        )
+                        .await;
                         return Ok(());
                     }
                 }
             }
         };
+        telemetry.token_lookup_ms = Some(token_lookup_started_at.elapsed().as_millis() as i64);
 
         // 6. Market quality check — verify orderbook depth on both sides
+        let depth_check_started_at = std::time::Instant::now();
         {
             let yes_book = self
                 .order_executor
@@ -809,15 +974,33 @@ impl ArbAutoExecutor {
                         min_depth = %cfg.min_book_depth,
                         "Arb signal insufficient orderbook depth, skipping"
                     );
-                    self.record_skip_event(&arb, execution_mode, "insufficient_depth")
+                    telemetry.depth_check_ms =
+                        Some(depth_check_started_at.elapsed().as_millis() as i64);
+                    telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+                    telemetry.finish_total(&process_started_at);
+                    self.record_skip_event(&arb, execution_mode, "insufficient_depth", &telemetry)
                         .await;
                     return Ok(());
                 }
             }
         }
+        telemetry.depth_check_ms = Some(depth_check_started_at.elapsed().as_millis() as i64);
+
+        let rollout_decision = self
+            .rollout_controller
+            .evaluate_arb(&shadow_input, execution_mode)
+            .await;
+        if let Some(reason) = rollout_decision.skip_reason.as_deref() {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.record_decision(market_id, format!("skipped: {reason}"));
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, reason, &telemetry)
+                .await;
+            return Ok(());
+        }
 
         // 7. Dynamic position sizing based on spread width
-        let position_size = if cfg.dynamic_sizing {
+        let mut position_size = if cfg.dynamic_sizing {
             // Linear interpolation between min and max position size
             // based on where net_profit falls in the [min_net_profit, 0.05] range.
             // min_net_profit (e.g. 0.001) → min_position_size ($25)
@@ -844,16 +1027,31 @@ impl ArbAutoExecutor {
             cfg.position_size
         };
 
+        if rollout_decision.size_multiplier < Decimal::ONE {
+            position_size *= rollout_decision.size_multiplier;
+            let mut runtime = self.runtime_status.write().await;
+            runtime.record_decision(
+                market_id,
+                format!(
+                    "rollout size adjusted by {}",
+                    rollout_decision.size_multiplier
+                ),
+            );
+        }
+
         if arb.total_cost.is_zero() {
             let mut runtime = self.runtime_status.write().await;
             runtime.zero_cost_skips = runtime.zero_cost_skips.saturating_add(1);
             runtime.record_decision(market_id, "skipped: zero total cost");
             warn!(market_id = %market_id, "Zero total_cost, skipping");
-            self.record_skip_event(&arb, execution_mode, "zero_total_cost")
+            telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "zero_total_cost", &telemetry)
                 .await;
             return Ok(());
         }
         let quantity = position_size / arb.total_cost;
+        telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
 
         // Fee drag tracking: `fee_drag` is the worst-case reduction in resolution payout per pair.
         let expected_fees = quantity * arb.fee_drag;
@@ -891,7 +1089,16 @@ impl ArbAutoExecutor {
         }
 
         self.trade_event_recorder
-            .record_warn(
+            .record_warn({
+                let metadata = merge_metadata(
+                    serde_json::json!({
+                        "quantity": quantity.to_string(),
+                        "yes_price": arb.yes_ask.to_string(),
+                        "no_price": arb.no_ask.to_string(),
+                        "total_cost": arb.total_cost.to_string(),
+                    }),
+                    &telemetry,
+                );
                 NewTradeEvent::new(
                     "arb",
                     execution_mode,
@@ -903,21 +1110,20 @@ impl ArbAutoExecutor {
                 .with_state(None, Some("pending"))
                 .with_expected_edge(expected_net)
                 .with_requested_size(position_size)
-                .with_metadata(serde_json::json!({
-                    "quantity": quantity.to_string(),
-                    "yes_price": arb.yes_ask.to_string(),
-                    "no_price": arb.no_ask.to_string(),
-                    "total_cost": arb.total_cost.to_string(),
-                })),
-            )
+                .with_metadata(metadata)
+            })
             .await;
 
         // 9. Execute YES market order
         let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity);
-
-        let yes_report = match self.order_executor.execute_market_order(yes_order).await {
+        let yes_order_started_at = std::time::Instant::now();
+        let yes_result = self.order_executor.execute_market_order(yes_order).await;
+        telemetry.yes_order_ms = Some(yes_order_started_at.elapsed().as_millis() as i64);
+        let yes_report = match yes_result {
             Ok(report) => report,
             Err(e) => {
+                telemetry.failure_stage = Some("yes_order_error".to_string());
+                telemetry.finish_total(&process_started_at);
                 let mut runtime = self.runtime_status.write().await;
                 runtime.execution_failures = runtime.execution_failures.saturating_add(1);
                 runtime.record_decision(
@@ -929,8 +1135,14 @@ impl ArbAutoExecutor {
                     message: format!("YES order error: {e}"),
                 });
                 let _ = self.position_repo.update(&position).await;
-                self.record_failure_event(execution_mode, market_id, &position, "yes_order_error")
-                    .await;
+                self.record_failure_event(
+                    execution_mode,
+                    market_id,
+                    &position,
+                    "yes_order_error",
+                    &telemetry,
+                )
+                .await;
                 self.publish_failure_signal(market_id, "YES order execution error");
                 return Ok(());
             }
@@ -941,6 +1153,8 @@ impl ArbAutoExecutor {
             let msg = yes_report
                 .error_message
                 .unwrap_or_else(|| "YES order not filled".to_string());
+            telemetry.failure_stage = Some("yes_order_rejected".to_string());
+            telemetry.finish_total(&process_started_at);
             let mut runtime = self.runtime_status.write().await;
             runtime.execution_failures = runtime.execution_failures.saturating_add(1);
             runtime.record_decision(
@@ -950,18 +1164,35 @@ impl ArbAutoExecutor {
             warn!(market_id = %market_id, reason = %msg, "YES order failed");
             position.mark_entry_failed(FailureReason::OrderRejected { message: msg });
             let _ = self.position_repo.update(&position).await;
-            self.record_failure_event(execution_mode, market_id, &position, "yes_order_rejected")
-                .await;
+            self.record_failure_event(
+                execution_mode,
+                market_id,
+                &position,
+                "yes_order_rejected",
+                &telemetry,
+            )
+            .await;
             self.publish_failure_signal(market_id, "YES order rejected");
             return Ok(());
         }
+        let yes_order_finished_at = std::time::Instant::now();
 
         // 11. Execute NO market order
         let no_order = MarketOrder::new(market_id.clone(), no_token_id, OrderSide::Buy, quantity);
-
-        let no_report = match self.order_executor.execute_market_order(no_order).await {
+        let no_order_started_at = std::time::Instant::now();
+        telemetry.inter_leg_gap_ms = Some(
+            no_order_started_at
+                .duration_since(yes_order_finished_at)
+                .as_millis() as i64,
+        );
+        let no_result = self.order_executor.execute_market_order(no_order).await;
+        telemetry.no_order_ms = Some(no_order_started_at.elapsed().as_millis() as i64);
+        let no_report = match no_result {
             Ok(report) => report,
             Err(e) => {
+                telemetry.failure_stage = Some("no_order_error".to_string());
+                telemetry.one_legged = true;
+                telemetry.finish_total(&process_started_at);
                 let mut runtime = self.runtime_status.write().await;
                 runtime.execution_failures = runtime.execution_failures.saturating_add(1);
                 runtime
@@ -971,8 +1202,14 @@ impl ArbAutoExecutor {
                     message: format!("NO order error (one-legged, YES filled): {e}"),
                 });
                 let _ = self.position_repo.update(&position).await;
-                self.record_failure_event(execution_mode, market_id, &position, "no_order_error")
-                    .await;
+                self.record_failure_event(
+                    execution_mode,
+                    market_id,
+                    &position,
+                    "no_order_error",
+                    &telemetry,
+                )
+                .await;
                 self.publish_failure_signal(market_id, "NO order error (one-legged)");
                 return Ok(());
             }
@@ -983,6 +1220,9 @@ impl ArbAutoExecutor {
             let msg = no_report
                 .error_message
                 .unwrap_or_else(|| "NO order not filled".to_string());
+            telemetry.failure_stage = Some("no_order_rejected".to_string());
+            telemetry.one_legged = true;
+            telemetry.finish_total(&process_started_at);
             let mut runtime = self.runtime_status.write().await;
             runtime.execution_failures = runtime.execution_failures.saturating_add(1);
             runtime.record_decision(
@@ -998,8 +1238,14 @@ impl ArbAutoExecutor {
                 message: format!("One-legged: YES filled but NO failed: {msg}"),
             });
             let _ = self.position_repo.update(&position).await;
-            self.record_failure_event(execution_mode, market_id, &position, "no_order_rejected")
-                .await;
+            self.record_failure_event(
+                execution_mode,
+                market_id,
+                &position,
+                "no_order_rejected",
+                &telemetry,
+            )
+            .await;
             self.publish_failure_signal(market_id, "One-legged position (NO failed)");
             return Ok(());
         }
@@ -1009,9 +1255,27 @@ impl ArbAutoExecutor {
         let actual_resolution_payout = position.resolution_payout_per_share * quantity;
         let observed_net = actual_resolution_payout - actual_fill_cost;
         let execution_slippage = actual_fill_cost - modeled_fill_cost;
+        let execution_slippage_bps = if modeled_fill_cost.is_zero() {
+            Decimal::ZERO
+        } else {
+            (execution_slippage / modeled_fill_cost) * Decimal::new(10_000, 0)
+        };
+        telemetry.request_to_fill_ms = Some(process_started_at.elapsed().as_millis() as i64);
 
         self.trade_event_recorder
-            .record_warn(
+            .record_warn({
+                let metadata = merge_metadata(
+                    serde_json::json!({
+                        "yes_fill_price": yes_report.average_price.to_string(),
+                        "no_fill_price": no_report.average_price.to_string(),
+                        "quantity": quantity.to_string(),
+                        "modeled_fill_cost": modeled_fill_cost.to_string(),
+                        "actual_fill_cost": actual_fill_cost.to_string(),
+                        "execution_slippage": execution_slippage.to_string(),
+                        "execution_slippage_bps": execution_slippage_bps.to_string(),
+                    }),
+                    &telemetry,
+                );
                 NewTradeEvent::new(
                     "arb",
                     execution_mode,
@@ -1028,15 +1292,8 @@ impl ArbAutoExecutor {
                 .with_fill_price(
                     (yes_report.average_price + no_report.average_price) / Decimal::new(2, 0),
                 )
-                .with_metadata(serde_json::json!({
-                    "yes_fill_price": yes_report.average_price.to_string(),
-                    "no_fill_price": no_report.average_price.to_string(),
-                    "quantity": quantity.to_string(),
-                    "modeled_fill_cost": modeled_fill_cost.to_string(),
-                    "actual_fill_cost": actual_fill_cost.to_string(),
-                    "execution_slippage": execution_slippage.to_string(),
-                })),
-            )
+                .with_metadata(metadata)
+            })
             .await;
 
         // 13. Both filled → mark position OPEN
@@ -1046,9 +1303,22 @@ impl ArbAutoExecutor {
         if let Err(e) = self.position_repo.update(&position).await {
             error!(error = %e, "Failed to update position to OPEN");
         }
+        telemetry.request_to_open_ms = Some(process_started_at.elapsed().as_millis() as i64);
+        telemetry.finish_total(&process_started_at);
 
         self.trade_event_recorder
-            .record_warn(
+            .record_warn({
+                let metadata = merge_metadata(
+                    serde_json::json!({
+                        "quantity": quantity.to_string(),
+                        "total_cost": arb.total_cost.to_string(),
+                        "modeled_fill_cost": modeled_fill_cost.to_string(),
+                        "actual_fill_cost": actual_fill_cost.to_string(),
+                        "execution_slippage": execution_slippage.to_string(),
+                        "execution_slippage_bps": execution_slippage_bps.to_string(),
+                    }),
+                    &telemetry,
+                );
                 NewTradeEvent::new(
                     "arb",
                     execution_mode,
@@ -1062,14 +1332,8 @@ impl ArbAutoExecutor {
                 .with_observed_edge(observed_net)
                 .with_requested_size(position_size)
                 .with_filled_size(actual_fill_cost)
-                .with_metadata(serde_json::json!({
-                    "quantity": quantity.to_string(),
-                    "total_cost": arb.total_cost.to_string(),
-                    "modeled_fill_cost": modeled_fill_cost.to_string(),
-                    "actual_fill_cost": actual_fill_cost.to_string(),
-                    "execution_slippage": execution_slippage.to_string(),
-                })),
-            )
+                .with_metadata(metadata)
+            })
             .await;
 
         // Add to dedup set
@@ -1137,7 +1401,13 @@ impl ArbAutoExecutor {
         let _ = self.signal_tx.send(signal);
     }
 
-    async fn record_skip_event(&self, arb: &ArbOpportunity, execution_mode: &str, reason: &str) {
+    async fn record_skip_event(
+        &self,
+        arb: &ArbOpportunity,
+        execution_mode: &str,
+        reason: &str,
+        telemetry: &ArbExecutionTelemetry,
+    ) {
         self.trade_event_recorder
             .record_warn(
                 NewTradeEvent::new(
@@ -1150,11 +1420,14 @@ impl ArbAutoExecutor {
                 .with_reason(Some(reason))
                 .with_expected_edge(arb.net_profit)
                 .with_observed_edge(arb.gross_profit)
-                .with_metadata(serde_json::json!({
-                    "yes_ask": arb.yes_ask.to_string(),
-                    "no_ask": arb.no_ask.to_string(),
-                    "total_cost": arb.total_cost.to_string(),
-                })),
+                .with_metadata(merge_metadata(
+                    serde_json::json!({
+                        "yes_ask": arb.yes_ask.to_string(),
+                        "no_ask": arb.no_ask.to_string(),
+                        "total_cost": arb.total_cost.to_string(),
+                    }),
+                    telemetry,
+                )),
             )
             .await;
     }
@@ -1165,6 +1438,7 @@ impl ArbAutoExecutor {
         market_id: &str,
         position: &Position,
         reason: &str,
+        telemetry: &ArbExecutionTelemetry,
     ) {
         self.trade_event_recorder
             .record_warn(
@@ -1179,7 +1453,7 @@ impl ArbAutoExecutor {
                 .with_state(Some("pending"), Some("entry_failed"))
                 .with_reason(Some(reason))
                 .with_unrealized_pnl(position.unrealized_pnl)
-                .with_metadata(serde_json::json!({})),
+                .with_metadata(merge_metadata(serde_json::json!({}), telemetry)),
             )
             .await;
     }

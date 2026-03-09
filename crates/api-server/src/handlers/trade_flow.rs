@@ -2,6 +2,8 @@
 //! with explicit fallback to derived history for older windows.
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
@@ -12,7 +14,9 @@ use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::error::ApiResult;
+use auth::{AuditAction, Claims};
+
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -136,6 +140,303 @@ pub struct ArbMarketScorecardResponse {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
     pub markets: Vec<ArbMarketScorecardItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbExecutionTelemetrySummary {
+    pub entry_requests: i64,
+    pub positions_opened: i64,
+    pub position_failures: i64,
+    pub signal_skipped: i64,
+    pub one_legged_failures: i64,
+    pub success_rate: Option<f64>,
+    pub failure_rate: Option<f64>,
+    pub skip_rate: Option<f64>,
+    pub avg_expected_edge: Option<Decimal>,
+    pub avg_observed_edge: Option<Decimal>,
+    pub avg_execution_slippage_bps: Option<f64>,
+    pub median_total_time_ms: Option<f64>,
+    pub p90_total_time_ms: Option<f64>,
+    pub median_yes_order_ms: Option<f64>,
+    pub median_no_order_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbExecutionLatencyMetric {
+    pub stage: String,
+    pub sample_size: i64,
+    pub avg_ms: Option<f64>,
+    pub p50_ms: Option<f64>,
+    pub p90_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbExecutionOutcomeBreakdown {
+    pub outcome: String,
+    pub reason: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbExecutionAttempt {
+    pub occurred_at: DateTime<Utc>,
+    pub market_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_id: Option<Uuid>,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub execution_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_age_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_lookup_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth_check_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yes_order_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_order_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inter_leg_gap_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_to_fill_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_to_open_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_time_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_edge: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_edge: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_slippage_bps: Option<f64>,
+    pub one_legged: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ArbExecutionTelemetryResponse {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub summary: ArbExecutionTelemetrySummary,
+    pub latency_breakdown: Vec<ArbExecutionLatencyMetric>,
+    pub outcome_breakdown: Vec<ArbExecutionOutcomeBreakdown>,
+    pub recent_attempts: Vec<ArbExecutionAttempt>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningDatasetReadiness {
+    pub arb_attempts: i64,
+    pub arb_realized_outcomes: i64,
+    pub arb_one_legged_failures: i64,
+    pub quant_decisions: i64,
+    pub quant_realized_outcomes: i64,
+    pub quant_executed_decisions: i64,
+    pub shadow_predictions: i64,
+    pub active_rollouts: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningModelSummary {
+    pub model_id: Uuid,
+    pub model_key: String,
+    pub strategy_scope: String,
+    pub target: String,
+    pub model_type: String,
+    pub version: String,
+    pub status: String,
+    pub feature_view: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training_window_start: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub training_window_end: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_window_start: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_window_end: Option<DateTime<Utc>>,
+    #[schema(value_type = Object)]
+    pub metrics: serde_json::Value,
+    pub shadow_predictions: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateLearningModelRequest {
+    pub model_key: String,
+    pub strategy_scope: String,
+    pub target: String,
+    pub model_type: String,
+    pub version: String,
+    pub status: String,
+    pub feature_view: String,
+    #[serde(default)]
+    pub artifact_uri: Option<String>,
+    #[serde(default)]
+    pub training_window_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub training_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub validation_window_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub validation_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub metrics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateLearningModelRequest {
+    #[serde(default)]
+    pub model_key: Option<String>,
+    #[serde(default)]
+    pub strategy_scope: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub feature_view: Option<String>,
+    #[serde(default)]
+    pub artifact_uri: Option<String>,
+    #[serde(default)]
+    pub training_window_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub training_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub validation_window_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub validation_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub metrics: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningOfflineEvaluation {
+    pub id: Uuid,
+    pub model_id: Uuid,
+    pub model_key: String,
+    pub evaluation_scope: String,
+    pub dataset_name: String,
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = Object)]
+    pub metrics: serde_json::Value,
+    #[schema(value_type = Object)]
+    pub decision_policy: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningRolloutStatus {
+    pub id: Uuid,
+    pub model_id: Uuid,
+    pub model_key: String,
+    pub strategy_scope: String,
+    pub rollout_mode: String,
+    pub authority_level: String,
+    pub status: String,
+    pub baseline_window_hours: i32,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_reason: Option<String>,
+    #[schema(value_type = Object)]
+    pub bounds: serde_json::Value,
+    #[schema(value_type = Object)]
+    pub guardrails: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_observed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_guardrail_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_failure_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_one_legged_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_drawdown_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_latency_p90_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_edge_capture_ratio: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningRolloutObservation {
+    pub id: Uuid,
+    pub observed_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub one_legged_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drawdown_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_p90_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_capture_ratio: Option<Decimal>,
+    pub guardrail_state: String,
+    #[schema(value_type = Object)]
+    pub notes: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningRolloutDetailResponse {
+    pub rollout: LearningRolloutStatus,
+    pub observations: Vec<LearningRolloutObservation>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateLearningRolloutRequest {
+    pub model_id: Uuid,
+    pub rollout_mode: String,
+    pub authority_level: String,
+    #[serde(default)]
+    pub baseline_window_hours: Option<i32>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub bounds: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub guardrails: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateLearningRolloutRequest {
+    #[serde(default)]
+    pub rollout_mode: Option<String>,
+    #[serde(default)]
+    pub authority_level: Option<String>,
+    #[serde(default)]
+    pub baseline_window_hours: Option<i32>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub bounds: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub guardrails: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LearningOverviewResponse {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub datasets: LearningDatasetReadiness,
+    pub models: Vec<LearningModelSummary>,
+    pub offline_evaluations: Vec<LearningOfflineEvaluation>,
+    pub rollouts: Vec<LearningRolloutStatus>,
 }
 
 #[derive(Debug, FromRow)]
@@ -336,11 +637,1133 @@ struct ArbMarketScorecardRow {
     last_traded_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, FromRow)]
+struct ArbExecutionTelemetrySummaryRow {
+    entry_requests: i64,
+    positions_opened: i64,
+    position_failures: i64,
+    signal_skipped: i64,
+    one_legged_failures: i64,
+    success_rate: Option<f64>,
+    failure_rate: Option<f64>,
+    skip_rate: Option<f64>,
+    avg_expected_edge: Option<Decimal>,
+    avg_observed_edge: Option<Decimal>,
+    avg_execution_slippage_bps: Option<f64>,
+    median_total_time_ms: Option<f64>,
+    p90_total_time_ms: Option<f64>,
+    median_yes_order_ms: Option<f64>,
+    median_no_order_ms: Option<f64>,
+}
+
+#[derive(Debug, FromRow)]
+struct ArbExecutionLatencyMetricRow {
+    stage: String,
+    sample_size: i64,
+    avg_ms: Option<f64>,
+    p50_ms: Option<f64>,
+    p90_ms: Option<f64>,
+    max_ms: Option<f64>,
+}
+
+#[derive(Debug, FromRow)]
+struct ArbExecutionOutcomeBreakdownRow {
+    outcome: String,
+    reason: String,
+    count: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct ArbExecutionAttemptRow {
+    occurred_at: DateTime<Utc>,
+    market_id: String,
+    position_id: Option<Uuid>,
+    outcome: String,
+    reason: Option<String>,
+    execution_mode: String,
+    token_source: Option<String>,
+    signal_age_ms: Option<f64>,
+    token_lookup_ms: Option<f64>,
+    depth_check_ms: Option<f64>,
+    preflight_ms: Option<f64>,
+    yes_order_ms: Option<f64>,
+    no_order_ms: Option<f64>,
+    inter_leg_gap_ms: Option<f64>,
+    request_to_fill_ms: Option<f64>,
+    request_to_open_ms: Option<f64>,
+    total_time_ms: Option<f64>,
+    expected_edge: Option<Decimal>,
+    observed_edge: Option<Decimal>,
+    execution_slippage_bps: Option<f64>,
+    one_legged: bool,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningDatasetReadinessRow {
+    arb_attempts: i64,
+    arb_realized_outcomes: i64,
+    arb_one_legged_failures: i64,
+    quant_decisions: i64,
+    quant_realized_outcomes: i64,
+    quant_executed_decisions: i64,
+    shadow_predictions: i64,
+    active_rollouts: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningModelSummaryRow {
+    model_id: Uuid,
+    model_key: String,
+    strategy_scope: String,
+    target: String,
+    model_type: String,
+    version: String,
+    status: String,
+    feature_view: String,
+    created_at: DateTime<Utc>,
+    activated_at: Option<DateTime<Utc>>,
+    artifact_uri: Option<String>,
+    training_window_start: Option<DateTime<Utc>>,
+    training_window_end: Option<DateTime<Utc>>,
+    validation_window_start: Option<DateTime<Utc>>,
+    validation_window_end: Option<DateTime<Utc>>,
+    metrics: serde_json::Value,
+    shadow_predictions: i64,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningModelMutableRow {
+    model_key: String,
+    strategy_scope: String,
+    target: String,
+    model_type: String,
+    version: String,
+    status: String,
+    feature_view: String,
+    artifact_uri: Option<String>,
+    training_window_start: Option<DateTime<Utc>>,
+    training_window_end: Option<DateTime<Utc>>,
+    validation_window_start: Option<DateTime<Utc>>,
+    validation_window_end: Option<DateTime<Utc>>,
+    metrics: serde_json::Value,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningOfflineEvaluationRow {
+    id: Uuid,
+    model_id: Uuid,
+    model_key: String,
+    evaluation_scope: String,
+    dataset_name: String,
+    created_at: DateTime<Utc>,
+    metrics: serde_json::Value,
+    decision_policy: serde_json::Value,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningRolloutStatusRow {
+    id: Uuid,
+    model_id: Uuid,
+    model_key: String,
+    strategy_scope: String,
+    rollout_mode: String,
+    authority_level: String,
+    status: String,
+    baseline_window_hours: i32,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    rollback_reason: Option<String>,
+    bounds: serde_json::Value,
+    guardrails: serde_json::Value,
+    latest_observed_at: Option<DateTime<Utc>>,
+    latest_guardrail_state: Option<String>,
+    latest_failure_rate: Option<f64>,
+    latest_one_legged_rate: Option<f64>,
+    latest_drawdown_pct: Option<f64>,
+    latest_latency_p90_ms: Option<f64>,
+    latest_edge_capture_ratio: Option<Decimal>,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningRolloutObservationRow {
+    id: Uuid,
+    observed_at: DateTime<Utc>,
+    failure_rate: Option<f64>,
+    one_legged_rate: Option<f64>,
+    drawdown_pct: Option<f64>,
+    latency_p90_ms: Option<f64>,
+    edge_capture_ratio: Option<Decimal>,
+    guardrail_state: String,
+    notes: serde_json::Value,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningModelTargetRow {
+    strategy_scope: String,
+    status: String,
+}
+
+#[derive(Debug, FromRow)]
+struct LearningRolloutMutableRow {
+    model_id: Uuid,
+    strategy_scope: String,
+    rollout_mode: String,
+    authority_level: String,
+    status: String,
+    baseline_window_hours: i32,
+    bounds: serde_json::Value,
+    guardrails: serde_json::Value,
+}
+
+fn map_learning_rollout_status(row: LearningRolloutStatusRow) -> LearningRolloutStatus {
+    LearningRolloutStatus {
+        id: row.id,
+        model_id: row.model_id,
+        model_key: row.model_key,
+        strategy_scope: row.strategy_scope,
+        rollout_mode: row.rollout_mode,
+        authority_level: row.authority_level,
+        status: row.status,
+        baseline_window_hours: row.baseline_window_hours,
+        started_at: row.started_at,
+        ended_at: row.ended_at,
+        rollback_reason: row.rollback_reason,
+        bounds: row.bounds,
+        guardrails: row.guardrails,
+        latest_observed_at: row.latest_observed_at,
+        latest_guardrail_state: row.latest_guardrail_state,
+        latest_failure_rate: row.latest_failure_rate,
+        latest_one_legged_rate: row.latest_one_legged_rate,
+        latest_drawdown_pct: row.latest_drawdown_pct,
+        latest_latency_p90_ms: row.latest_latency_p90_ms,
+        latest_edge_capture_ratio: row.latest_edge_capture_ratio,
+    }
+}
+
+fn validate_json_object(
+    value: Option<serde_json::Value>,
+    field_name: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let value = value.unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        return Err(ApiError::BadRequest(format!(
+            "{field_name} must be a JSON object"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_rollout_mode(rollout_mode: &str) -> Result<(), ApiError> {
+    if ["shadow", "canary", "bounded", "full"].contains(&rollout_mode) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "rollout_mode must be one of: shadow, canary, bounded, full".into(),
+        ))
+    }
+}
+
+fn validate_authority_level(authority_level: &str) -> Result<(), ApiError> {
+    if [
+        "observe",
+        "tail_reject",
+        "size_adjust",
+        "priority_only",
+        "full",
+    ]
+    .contains(&authority_level)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "authority_level must be one of: observe, tail_reject, size_adjust, priority_only, full"
+                .into(),
+        ))
+    }
+}
+
+fn validate_rollout_authority_combo(
+    rollout_mode: &str,
+    authority_level: &str,
+) -> Result<(), ApiError> {
+    if rollout_mode == "shadow" && authority_level != "observe" {
+        return Err(ApiError::BadRequest(
+            "shadow rollouts may only use observe authority".into(),
+        ));
+    }
+    if rollout_mode != "full" && authority_level == "full" {
+        return Err(ApiError::BadRequest(
+            "full authority is only valid for full rollouts".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_baseline_window_hours(value: Option<i32>) -> Result<i32, ApiError> {
+    let hours = value.unwrap_or(24);
+    if (1..=24 * 14).contains(&hours) {
+        Ok(hours)
+    } else {
+        Err(ApiError::BadRequest(
+            "baseline_window_hours must be between 1 and 336".into(),
+        ))
+    }
+}
+
+fn validate_strategy_scope(strategy_scope: &str) -> Result<(), ApiError> {
+    if matches!(strategy_scope, "arb" | "quant") {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "strategy_scope must be either 'arb' or 'quant'".into(),
+        ))
+    }
+}
+
+fn validate_model_status(status: &str) -> Result<(), ApiError> {
+    if ["draft", "shadow", "canary", "active", "retired", "disabled"].contains(&status) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "status must be one of: draft, shadow, canary, active, retired, disabled".into(),
+        ))
+    }
+}
+
+fn validate_model_type(model_type: &str) -> Result<(), ApiError> {
+    if [
+        "heuristic_shadow_baseline",
+        "trained_linear_probability_v1",
+        "trained_linear_regression_v1",
+    ]
+    .contains(&model_type)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "model_type must be one of: heuristic_shadow_baseline, trained_linear_probability_v1, trained_linear_regression_v1"
+                .into(),
+        ))
+    }
+}
+
+fn validate_target(strategy_scope: &str, target: &str) -> Result<(), ApiError> {
+    let valid = match strategy_scope {
+        "arb" => [
+            "open_success_probability",
+            "one_legged_risk",
+            "realized_edge_capture",
+        ]
+        .contains(&target),
+        "quant" => [
+            "execute_success_probability",
+            "realized_pnl_sign",
+            "realized_edge_capture",
+        ]
+        .contains(&target),
+        _ => false,
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "target '{target}' is not valid for strategy_scope '{strategy_scope}'"
+        )))
+    }
+}
+
+fn validate_model_key(model_key: &str) -> Result<(), ApiError> {
+    let trimmed = model_key.trim();
+    if trimmed.is_empty() || trimmed.len() > 120 {
+        return Err(ApiError::BadRequest(
+            "model_key must be between 1 and 120 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_feature_view(feature_view: &str) -> Result<(), ApiError> {
+    if feature_view.trim().is_empty() {
+        Err(ApiError::BadRequest("feature_view cannot be empty".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_model_dates(
+    training_window_start: Option<DateTime<Utc>>,
+    training_window_end: Option<DateTime<Utc>>,
+    validation_window_start: Option<DateTime<Utc>>,
+    validation_window_end: Option<DateTime<Utc>>,
+) -> Result<(), ApiError> {
+    if let (Some(start), Some(end)) = (training_window_start, training_window_end) {
+        if start > end {
+            return Err(ApiError::BadRequest(
+                "training_window_start must be before training_window_end".into(),
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (validation_window_start, validation_window_end) {
+        if start > end {
+            return Err(ApiError::BadRequest(
+                "validation_window_start must be before validation_window_end".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_model_payload(
+    model_key: &str,
+    strategy_scope: &str,
+    target: &str,
+    model_type: &str,
+    status: &str,
+    feature_view: &str,
+    artifact_uri: Option<&str>,
+    metrics: &serde_json::Value,
+    training_window_start: Option<DateTime<Utc>>,
+    training_window_end: Option<DateTime<Utc>>,
+    validation_window_start: Option<DateTime<Utc>>,
+    validation_window_end: Option<DateTime<Utc>>,
+) -> Result<(), ApiError> {
+    validate_model_key(model_key)?;
+    validate_strategy_scope(strategy_scope)?;
+    validate_target(strategy_scope, target)?;
+    validate_model_type(model_type)?;
+    validate_model_status(status)?;
+    validate_feature_view(feature_view)?;
+    validate_model_dates(
+        training_window_start,
+        training_window_end,
+        validation_window_start,
+        validation_window_end,
+    )?;
+    if !metrics.is_object() {
+        return Err(ApiError::BadRequest("metrics must be a JSON object".into()));
+    }
+    if model_type != "heuristic_shadow_baseline"
+        && artifact_uri.is_none()
+        && metrics.get("artifact").is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "trained models require artifact_uri or metrics.artifact".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn effective_window(query: &TradeFlowQuery) -> (DateTime<Utc>, DateTime<Utc>, i64) {
     let to = query.to.unwrap_or_else(Utc::now);
     let from = query.from.unwrap_or_else(|| to - Duration::days(7));
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     (from, to, limit)
+}
+
+async fn load_arb_execution_telemetry_summary(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<ArbExecutionTelemetrySummary, sqlx::Error> {
+    let row: ArbExecutionTelemetrySummaryRow = sqlx::query_as(
+        r#"
+        WITH filtered AS (
+            SELECT *
+            FROM trade_events
+            WHERE strategy = 'arb'
+              AND occurred_at >= $1
+              AND occurred_at <= $2
+        ),
+        attempts AS (
+            SELECT *
+            FROM filtered
+            WHERE event_type IN ('position_open', 'position_failed', 'signal_skipped')
+        )
+        SELECT
+            COUNT(*) FILTER (WHERE event_type = 'entry_requested')::bigint AS entry_requests,
+            COUNT(*) FILTER (WHERE event_type = 'position_open')::bigint AS positions_opened,
+            COUNT(*) FILTER (WHERE event_type = 'position_failed')::bigint AS position_failures,
+            COUNT(*) FILTER (WHERE event_type = 'signal_skipped')::bigint AS signal_skipped,
+            COUNT(*) FILTER (
+                WHERE event_type = 'position_failed'
+                  AND COALESCE((metadata ->> 'one_legged')::boolean, FALSE)
+            )::bigint AS one_legged_failures,
+            CASE
+                WHEN COUNT(*) FILTER (WHERE event_type = 'entry_requested') = 0 THEN NULL
+                ELSE COUNT(*) FILTER (WHERE event_type = 'position_open')::double precision
+                    / COUNT(*) FILTER (WHERE event_type = 'entry_requested')::double precision
+            END AS success_rate,
+            CASE
+                WHEN COUNT(*) FILTER (WHERE event_type = 'entry_requested') = 0 THEN NULL
+                ELSE COUNT(*) FILTER (WHERE event_type = 'position_failed')::double precision
+                    / COUNT(*) FILTER (WHERE event_type = 'entry_requested')::double precision
+            END AS failure_rate,
+            CASE
+                WHEN (
+                    COUNT(*) FILTER (WHERE event_type = 'entry_requested')
+                    + COUNT(*) FILTER (WHERE event_type = 'signal_skipped')
+                ) = 0 THEN NULL
+                ELSE COUNT(*) FILTER (WHERE event_type = 'signal_skipped')::double precision
+                    / (
+                        COUNT(*) FILTER (WHERE event_type = 'entry_requested')
+                        + COUNT(*) FILTER (WHERE event_type = 'signal_skipped')
+                    )::double precision
+            END AS skip_rate,
+            AVG(expected_edge) FILTER (WHERE event_type = 'position_open') AS avg_expected_edge,
+            AVG(observed_edge) FILTER (WHERE event_type = 'position_open') AS avg_observed_edge,
+            AVG(NULLIF(metadata ->> 'execution_slippage_bps', '')::double precision)
+                FILTER (WHERE event_type = 'position_open') AS avg_execution_slippage_bps,
+            percentile_cont(0.5) WITHIN GROUP (
+                ORDER BY NULLIF(metadata ->> 'total_time_ms', '')::double precision
+            ) FILTER (WHERE NULLIF(metadata ->> 'total_time_ms', '') IS NOT NULL) AS median_total_time_ms,
+            percentile_cont(0.9) WITHIN GROUP (
+                ORDER BY NULLIF(metadata ->> 'total_time_ms', '')::double precision
+            ) FILTER (WHERE NULLIF(metadata ->> 'total_time_ms', '') IS NOT NULL) AS p90_total_time_ms,
+            percentile_cont(0.5) WITHIN GROUP (
+                ORDER BY NULLIF(metadata ->> 'yes_order_ms', '')::double precision
+            ) FILTER (WHERE NULLIF(metadata ->> 'yes_order_ms', '') IS NOT NULL) AS median_yes_order_ms,
+            percentile_cont(0.5) WITHIN GROUP (
+                ORDER BY NULLIF(metadata ->> 'no_order_ms', '')::double precision
+            ) FILTER (WHERE NULLIF(metadata ->> 'no_order_ms', '') IS NOT NULL) AS median_no_order_ms
+        FROM filtered
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ArbExecutionTelemetrySummary {
+        entry_requests: row.entry_requests,
+        positions_opened: row.positions_opened,
+        position_failures: row.position_failures,
+        signal_skipped: row.signal_skipped,
+        one_legged_failures: row.one_legged_failures,
+        success_rate: row.success_rate,
+        failure_rate: row.failure_rate,
+        skip_rate: row.skip_rate,
+        avg_expected_edge: row.avg_expected_edge,
+        avg_observed_edge: row.avg_observed_edge,
+        avg_execution_slippage_bps: row.avg_execution_slippage_bps,
+        median_total_time_ms: row.median_total_time_ms,
+        p90_total_time_ms: row.p90_total_time_ms,
+        median_yes_order_ms: row.median_yes_order_ms,
+        median_no_order_ms: row.median_no_order_ms,
+    })
+}
+
+async fn load_arb_execution_latency_breakdown(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<ArbExecutionLatencyMetric>, sqlx::Error> {
+    let rows: Vec<ArbExecutionLatencyMetricRow> = sqlx::query_as(
+        r#"
+        WITH attempts AS (
+            SELECT metadata
+            FROM trade_events
+            WHERE strategy = 'arb'
+              AND occurred_at >= $1
+              AND occurred_at <= $2
+              AND event_type IN ('position_open', 'position_failed', 'signal_skipped')
+        ),
+        stage_values AS (
+            SELECT 'signal_age_ms' AS stage, NULLIF(metadata ->> 'signal_age_ms', '')::double precision AS value FROM attempts
+            UNION ALL
+            SELECT 'token_lookup_ms', NULLIF(metadata ->> 'token_lookup_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'depth_check_ms', NULLIF(metadata ->> 'depth_check_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'preflight_ms', NULLIF(metadata ->> 'preflight_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'yes_order_ms', NULLIF(metadata ->> 'yes_order_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'no_order_ms', NULLIF(metadata ->> 'no_order_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'inter_leg_gap_ms', NULLIF(metadata ->> 'inter_leg_gap_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'request_to_fill_ms', NULLIF(metadata ->> 'request_to_fill_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'request_to_open_ms', NULLIF(metadata ->> 'request_to_open_ms', '')::double precision FROM attempts
+            UNION ALL
+            SELECT 'total_time_ms', NULLIF(metadata ->> 'total_time_ms', '')::double precision FROM attempts
+        )
+        SELECT
+            stage,
+            COUNT(*) FILTER (WHERE value IS NOT NULL)::bigint AS sample_size,
+            AVG(value) AS avg_ms,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY value) AS p50_ms,
+            percentile_cont(0.9) WITHIN GROUP (ORDER BY value) AS p90_ms,
+            MAX(value) AS max_ms
+        FROM stage_values
+        WHERE value IS NOT NULL
+        GROUP BY stage
+        ORDER BY stage
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbExecutionLatencyMetric {
+            stage: row.stage,
+            sample_size: row.sample_size,
+            avg_ms: row.avg_ms,
+            p50_ms: row.p50_ms,
+            p90_ms: row.p90_ms,
+            max_ms: row.max_ms,
+        })
+        .collect())
+}
+
+async fn load_arb_execution_outcome_breakdown(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<ArbExecutionOutcomeBreakdown>, sqlx::Error> {
+    let rows: Vec<ArbExecutionOutcomeBreakdownRow> = sqlx::query_as(
+        r#"
+        WITH attempts AS (
+            SELECT
+                CASE
+                    WHEN event_type = 'position_open' THEN 'opened'
+                    WHEN event_type = 'position_failed' THEN 'failed'
+                    ELSE 'skipped'
+                END AS outcome,
+                COALESCE(
+                    reason,
+                    NULLIF(metadata ->> 'failure_stage', ''),
+                    'unknown'
+                ) AS reason
+            FROM trade_events
+            WHERE strategy = 'arb'
+              AND occurred_at >= $1
+              AND occurred_at <= $2
+              AND event_type IN ('position_open', 'position_failed', 'signal_skipped')
+        )
+        SELECT outcome, reason, COUNT(*)::bigint AS count
+        FROM attempts
+        GROUP BY outcome, reason
+        ORDER BY count DESC, outcome, reason
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbExecutionOutcomeBreakdown {
+            outcome: row.outcome,
+            reason: row.reason,
+            count: row.count,
+        })
+        .collect())
+}
+
+async fn load_arb_execution_recent_attempts(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<ArbExecutionAttempt>, sqlx::Error> {
+    let rows: Vec<ArbExecutionAttemptRow> = sqlx::query_as(
+        r#"
+        SELECT
+            occurred_at,
+            market_id,
+            position_id,
+            CASE
+                WHEN event_type = 'position_open' THEN 'opened'
+                WHEN event_type = 'position_failed' THEN 'failed'
+                ELSE 'skipped'
+            END AS outcome,
+            COALESCE(reason, NULLIF(metadata ->> 'failure_stage', '')) AS reason,
+            execution_mode,
+            NULLIF(metadata ->> 'token_source', '') AS token_source,
+            NULLIF(metadata ->> 'signal_age_ms', '')::double precision AS signal_age_ms,
+            NULLIF(metadata ->> 'token_lookup_ms', '')::double precision AS token_lookup_ms,
+            NULLIF(metadata ->> 'depth_check_ms', '')::double precision AS depth_check_ms,
+            NULLIF(metadata ->> 'preflight_ms', '')::double precision AS preflight_ms,
+            NULLIF(metadata ->> 'yes_order_ms', '')::double precision AS yes_order_ms,
+            NULLIF(metadata ->> 'no_order_ms', '')::double precision AS no_order_ms,
+            NULLIF(metadata ->> 'inter_leg_gap_ms', '')::double precision AS inter_leg_gap_ms,
+            NULLIF(metadata ->> 'request_to_fill_ms', '')::double precision AS request_to_fill_ms,
+            NULLIF(metadata ->> 'request_to_open_ms', '')::double precision AS request_to_open_ms,
+            NULLIF(metadata ->> 'total_time_ms', '')::double precision AS total_time_ms,
+            expected_edge,
+            observed_edge,
+            NULLIF(metadata ->> 'execution_slippage_bps', '')::double precision AS execution_slippage_bps,
+            COALESCE((metadata ->> 'one_legged')::boolean, FALSE) AS one_legged
+        FROM trade_events
+        WHERE strategy = 'arb'
+          AND occurred_at >= $1
+          AND occurred_at <= $2
+          AND event_type IN ('position_open', 'position_failed', 'signal_skipped')
+        ORDER BY occurred_at DESC, id DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbExecutionAttempt {
+            occurred_at: row.occurred_at,
+            market_id: row.market_id,
+            position_id: row.position_id,
+            outcome: row.outcome,
+            reason: row.reason,
+            execution_mode: row.execution_mode,
+            token_source: row.token_source,
+            signal_age_ms: row.signal_age_ms,
+            token_lookup_ms: row.token_lookup_ms,
+            depth_check_ms: row.depth_check_ms,
+            preflight_ms: row.preflight_ms,
+            yes_order_ms: row.yes_order_ms,
+            no_order_ms: row.no_order_ms,
+            inter_leg_gap_ms: row.inter_leg_gap_ms,
+            request_to_fill_ms: row.request_to_fill_ms,
+            request_to_open_ms: row.request_to_open_ms,
+            total_time_ms: row.total_time_ms,
+            expected_edge: row.expected_edge,
+            observed_edge: row.observed_edge,
+            execution_slippage_bps: row.execution_slippage_bps,
+            one_legged: row.one_legged,
+        })
+        .collect())
+}
+
+async fn load_learning_dataset_readiness(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<LearningDatasetReadiness, sqlx::Error> {
+    let row: LearningDatasetReadinessRow = sqlx::query_as(
+        r#"
+        SELECT
+            (SELECT COUNT(*)::bigint
+             FROM canonical_arb_learning_attempts
+             WHERE attempt_time >= $1 AND attempt_time <= $2) AS arb_attempts,
+            (SELECT COUNT(*)::bigint
+             FROM canonical_arb_learning_attempts
+             WHERE attempt_time >= $1
+               AND attempt_time <= $2
+               AND realized_pnl IS NOT NULL) AS arb_realized_outcomes,
+            (SELECT COUNT(*)::bigint
+             FROM canonical_arb_learning_attempts
+             WHERE attempt_time >= $1
+               AND attempt_time <= $2
+               AND outcome = 'failed'
+               AND one_legged = TRUE) AS arb_one_legged_failures,
+            (SELECT COUNT(*)::bigint
+             FROM canonical_quant_learning_decisions
+             WHERE decision_time >= $1 AND decision_time <= $2) AS quant_decisions,
+            (SELECT COUNT(*)::bigint
+             FROM canonical_quant_learning_decisions
+             WHERE decision_time >= $1
+               AND decision_time <= $2
+               AND realized_pnl IS NOT NULL) AS quant_realized_outcomes,
+            (SELECT COUNT(*)::bigint
+             FROM canonical_quant_learning_decisions
+             WHERE decision_time >= $1
+               AND decision_time <= $2
+               AND execution_status = 'executed') AS quant_executed_decisions,
+            (SELECT COUNT(*)::bigint
+             FROM learning_shadow_predictions
+             WHERE predicted_at >= $1 AND predicted_at <= $2) AS shadow_predictions,
+            (SELECT COUNT(*)::bigint
+             FROM learning_model_rollouts
+             WHERE status = 'active'
+               AND started_at <= $2
+               AND (ended_at IS NULL OR ended_at >= $1)) AS active_rollouts
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(LearningDatasetReadiness {
+        arb_attempts: row.arb_attempts,
+        arb_realized_outcomes: row.arb_realized_outcomes,
+        arb_one_legged_failures: row.arb_one_legged_failures,
+        quant_decisions: row.quant_decisions,
+        quant_realized_outcomes: row.quant_realized_outcomes,
+        quant_executed_decisions: row.quant_executed_decisions,
+        shadow_predictions: row.shadow_predictions,
+        active_rollouts: row.active_rollouts,
+    })
+}
+
+async fn load_learning_model_summaries(
+    pool: &sqlx::PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<LearningModelSummary>, sqlx::Error> {
+    let rows: Vec<LearningModelSummaryRow> = sqlx::query_as(
+        r#"
+        SELECT
+            r.id AS model_id,
+            r.model_key,
+            r.strategy_scope,
+            r.target,
+            r.model_type,
+            r.version,
+            r.status,
+            r.feature_view,
+            r.created_at,
+            r.activated_at,
+            r.artifact_uri,
+            r.training_window_start,
+            r.training_window_end,
+            r.validation_window_start,
+            r.validation_window_end,
+            r.metrics,
+            COUNT(sp.id)::bigint AS shadow_predictions
+        FROM learning_model_registry r
+        LEFT JOIN learning_shadow_predictions sp
+          ON sp.model_id = r.id
+         AND sp.predicted_at >= $1
+         AND sp.predicted_at <= $2
+        GROUP BY
+            r.id,
+            r.model_key,
+            r.strategy_scope,
+            r.target,
+            r.model_type,
+            r.version,
+            r.status,
+            r.feature_view,
+            r.created_at,
+            r.activated_at,
+            r.metrics
+        ORDER BY
+            CASE r.status
+                WHEN 'active' THEN 0
+                WHEN 'canary' THEN 1
+                WHEN 'shadow' THEN 2
+                WHEN 'draft' THEN 3
+                ELSE 4
+            END,
+            r.created_at DESC
+        LIMIT $3
+        "#,
+    )
+    .bind(from)
+    .bind(to)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| LearningModelSummary {
+            model_id: row.model_id,
+            model_key: row.model_key,
+            strategy_scope: row.strategy_scope,
+            target: row.target,
+            model_type: row.model_type,
+            version: row.version,
+            status: row.status,
+            feature_view: row.feature_view,
+            created_at: row.created_at,
+            activated_at: row.activated_at,
+            artifact_uri: row.artifact_uri,
+            training_window_start: row.training_window_start,
+            training_window_end: row.training_window_end,
+            validation_window_start: row.validation_window_start,
+            validation_window_end: row.validation_window_end,
+            metrics: row.metrics,
+            shadow_predictions: row.shadow_predictions,
+        })
+        .collect())
+}
+
+async fn load_learning_offline_evaluations(
+    pool: &sqlx::PgPool,
+    limit: i64,
+) -> Result<Vec<LearningOfflineEvaluation>, sqlx::Error> {
+    let rows: Vec<LearningOfflineEvaluationRow> = sqlx::query_as(
+        r#"
+        SELECT
+            e.id,
+            e.model_id,
+            r.model_key,
+            e.evaluation_scope,
+            e.dataset_name,
+            e.created_at,
+            e.metrics,
+            e.decision_policy
+        FROM learning_offline_evaluations e
+        INNER JOIN learning_model_registry r
+            ON r.id = e.model_id
+        ORDER BY e.created_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| LearningOfflineEvaluation {
+            id: row.id,
+            model_id: row.model_id,
+            model_key: row.model_key,
+            evaluation_scope: row.evaluation_scope,
+            dataset_name: row.dataset_name,
+            created_at: row.created_at,
+            metrics: row.metrics,
+            decision_policy: row.decision_policy,
+        })
+        .collect())
+}
+
+async fn load_learning_model_summary_by_id(
+    pool: &sqlx::PgPool,
+    model_id: Uuid,
+) -> Result<Option<LearningModelSummary>, sqlx::Error> {
+    let row: Option<LearningModelSummaryRow> = sqlx::query_as(
+        r#"
+        SELECT
+            r.id AS model_id,
+            r.model_key,
+            r.strategy_scope,
+            r.target,
+            r.model_type,
+            r.version,
+            r.status,
+            r.feature_view,
+            r.created_at,
+            r.activated_at,
+            r.artifact_uri,
+            r.training_window_start,
+            r.training_window_end,
+            r.validation_window_start,
+            r.validation_window_end,
+            r.metrics,
+            COUNT(sp.id)::bigint AS shadow_predictions
+        FROM learning_model_registry r
+        LEFT JOIN learning_shadow_predictions sp
+            ON sp.model_id = r.id
+        WHERE r.id = $1
+        GROUP BY
+            r.id,
+            r.model_key,
+            r.strategy_scope,
+            r.target,
+            r.model_type,
+            r.version,
+            r.status,
+            r.feature_view,
+            r.created_at,
+            r.activated_at,
+            r.artifact_uri,
+            r.training_window_start,
+            r.training_window_end,
+            r.validation_window_start,
+            r.validation_window_end,
+            r.metrics
+        "#,
+    )
+    .bind(model_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| LearningModelSummary {
+        model_id: row.model_id,
+        model_key: row.model_key,
+        strategy_scope: row.strategy_scope,
+        target: row.target,
+        model_type: row.model_type,
+        version: row.version,
+        status: row.status,
+        feature_view: row.feature_view,
+        created_at: row.created_at,
+        activated_at: row.activated_at,
+        artifact_uri: row.artifact_uri,
+        training_window_start: row.training_window_start,
+        training_window_end: row.training_window_end,
+        validation_window_start: row.validation_window_start,
+        validation_window_end: row.validation_window_end,
+        metrics: row.metrics,
+        shadow_predictions: row.shadow_predictions,
+    }))
+}
+
+async fn load_learning_rollouts(
+    pool: &sqlx::PgPool,
+    limit: i64,
+) -> Result<Vec<LearningRolloutStatus>, sqlx::Error> {
+    let rows: Vec<LearningRolloutStatusRow> = sqlx::query_as(
+        r#"
+        WITH latest_observations AS (
+            SELECT DISTINCT ON (rollout_id)
+                rollout_id,
+                observed_at AS latest_observed_at,
+                guardrail_state AS latest_guardrail_state,
+                failure_rate AS latest_failure_rate,
+                one_legged_rate AS latest_one_legged_rate,
+                drawdown_pct AS latest_drawdown_pct,
+                latency_p90_ms AS latest_latency_p90_ms,
+                edge_capture_ratio AS latest_edge_capture_ratio
+            FROM learning_rollout_observations
+            ORDER BY rollout_id, observed_at DESC
+        )
+        SELECT
+            ro.id,
+            ro.model_id,
+            mr.model_key,
+            ro.strategy_scope,
+            ro.rollout_mode,
+            ro.authority_level,
+            ro.status,
+            ro.baseline_window_hours,
+            ro.started_at,
+            ro.ended_at,
+            ro.rollback_reason,
+            ro.bounds,
+            ro.guardrails,
+            lo.latest_observed_at,
+            lo.latest_guardrail_state,
+            lo.latest_failure_rate,
+            lo.latest_one_legged_rate,
+            lo.latest_drawdown_pct,
+            lo.latest_latency_p90_ms,
+            lo.latest_edge_capture_ratio
+        FROM learning_model_rollouts ro
+        INNER JOIN learning_model_registry mr
+            ON mr.id = ro.model_id
+        LEFT JOIN latest_observations lo
+            ON lo.rollout_id = ro.id
+        ORDER BY
+            CASE ro.status
+                WHEN 'active' THEN 0
+                WHEN 'paused' THEN 1
+                WHEN 'rolled_back' THEN 2
+                ELSE 3
+            END,
+            ro.started_at DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(map_learning_rollout_status).collect())
+}
+
+async fn load_learning_rollout_status(
+    pool: &sqlx::PgPool,
+    rollout_id: Uuid,
+) -> Result<Option<LearningRolloutStatus>, sqlx::Error> {
+    let row: Option<LearningRolloutStatusRow> = sqlx::query_as(
+        r#"
+        WITH latest_observations AS (
+            SELECT DISTINCT ON (rollout_id)
+                rollout_id,
+                observed_at AS latest_observed_at,
+                guardrail_state AS latest_guardrail_state,
+                failure_rate AS latest_failure_rate,
+                one_legged_rate AS latest_one_legged_rate,
+                drawdown_pct AS latest_drawdown_pct,
+                latency_p90_ms AS latest_latency_p90_ms,
+                edge_capture_ratio AS latest_edge_capture_ratio
+            FROM learning_rollout_observations
+            WHERE rollout_id = $1
+            ORDER BY rollout_id, observed_at DESC
+        )
+        SELECT
+            ro.id,
+            ro.model_id,
+            mr.model_key,
+            ro.strategy_scope,
+            ro.rollout_mode,
+            ro.authority_level,
+            ro.status,
+            ro.baseline_window_hours,
+            ro.started_at,
+            ro.ended_at,
+            ro.rollback_reason,
+            ro.bounds,
+            ro.guardrails,
+            lo.latest_observed_at,
+            lo.latest_guardrail_state,
+            lo.latest_failure_rate,
+            lo.latest_one_legged_rate,
+            lo.latest_drawdown_pct,
+            lo.latest_latency_p90_ms,
+            lo.latest_edge_capture_ratio
+        FROM learning_model_rollouts ro
+        INNER JOIN learning_model_registry mr
+            ON mr.id = ro.model_id
+        LEFT JOIN latest_observations lo
+            ON lo.rollout_id = ro.id
+        WHERE ro.id = $1
+        "#,
+    )
+    .bind(rollout_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(map_learning_rollout_status))
+}
+
+async fn load_learning_rollout_observations(
+    pool: &sqlx::PgPool,
+    rollout_id: Uuid,
+    limit: i64,
+) -> Result<Vec<LearningRolloutObservation>, sqlx::Error> {
+    let rows: Vec<LearningRolloutObservationRow> = sqlx::query_as(
+        r#"
+        SELECT
+            id,
+            observed_at,
+            failure_rate,
+            one_legged_rate,
+            drawdown_pct,
+            latency_p90_ms,
+            edge_capture_ratio,
+            guardrail_state,
+            notes
+        FROM learning_rollout_observations
+        WHERE rollout_id = $1
+        ORDER BY observed_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(rollout_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| LearningRolloutObservation {
+            id: row.id,
+            observed_at: row.observed_at,
+            failure_rate: row.failure_rate,
+            one_legged_rate: row.one_legged_rate,
+            drawdown_pct: row.drawdown_pct,
+            latency_p90_ms: row.latency_p90_ms,
+            edge_capture_ratio: row.edge_capture_ratio,
+            guardrail_state: row.guardrail_state,
+            notes: row.notes,
+        })
+        .collect())
 }
 
 async fn load_arb_market_scorecard_rows(
@@ -1417,6 +2840,872 @@ pub async fn get_arb_market_scorecard(
         .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
     Ok(Json(ArbMarketScorecardResponse { from, to, markets }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/trade-flow/strategies/arb/execution-telemetry",
+    params(TradeFlowQuery),
+    responses(
+        (status = 200, description = "Arbitrage execution telemetry", body = ArbExecutionTelemetryResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "trade_flow"
+)]
+pub async fn get_arb_execution_telemetry(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TradeFlowQuery>,
+) -> ApiResult<Json<ArbExecutionTelemetryResponse>> {
+    let (from, to, limit) = effective_window(&query);
+    if matches!(query.strategy.as_deref(), Some(strategy) if strategy != "arb") {
+        return Ok(Json(ArbExecutionTelemetryResponse {
+            from,
+            to,
+            summary: ArbExecutionTelemetrySummary {
+                entry_requests: 0,
+                positions_opened: 0,
+                position_failures: 0,
+                signal_skipped: 0,
+                one_legged_failures: 0,
+                success_rate: None,
+                failure_rate: None,
+                skip_rate: None,
+                avg_expected_edge: None,
+                avg_observed_edge: None,
+                avg_execution_slippage_bps: None,
+                median_total_time_ms: None,
+                p90_total_time_ms: None,
+                median_yes_order_ms: None,
+                median_no_order_ms: None,
+            },
+            latency_breakdown: Vec::new(),
+            outcome_breakdown: Vec::new(),
+            recent_attempts: Vec::new(),
+        }));
+    }
+
+    let (summary, latency_breakdown, outcome_breakdown, recent_attempts) = tokio::try_join!(
+        load_arb_execution_telemetry_summary(&state.pool, from, to),
+        load_arb_execution_latency_breakdown(&state.pool, from, to),
+        load_arb_execution_outcome_breakdown(&state.pool, from, to),
+        load_arb_execution_recent_attempts(&state.pool, from, to, limit),
+    )
+    .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
+
+    Ok(Json(ArbExecutionTelemetryResponse {
+        from,
+        to,
+        summary,
+        latency_breakdown,
+        outcome_breakdown,
+        recent_attempts,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/trade-flow/learning/overview",
+    params(TradeFlowQuery),
+    responses(
+        (status = 200, description = "Learning loop overview", body = LearningOverviewResponse),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "trade_flow"
+)]
+pub async fn get_learning_overview(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TradeFlowQuery>,
+) -> ApiResult<Json<LearningOverviewResponse>> {
+    let (from, to, limit) = effective_window(&query);
+    let (datasets, models, offline_evaluations, rollouts) = tokio::try_join!(
+        load_learning_dataset_readiness(&state.pool, from, to),
+        load_learning_model_summaries(&state.pool, from, to, limit),
+        load_learning_offline_evaluations(&state.pool, limit),
+        load_learning_rollouts(&state.pool, limit),
+    )
+    .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
+
+    Ok(Json(LearningOverviewResponse {
+        from,
+        to,
+        datasets,
+        models,
+        offline_evaluations,
+        rollouts,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/trade-flow/learning/rollouts/{rollout_id}",
+    params(
+        ("rollout_id" = Uuid, Path, description = "Rollout identifier"),
+        TradeFlowQuery
+    ),
+    responses(
+        (status = 200, description = "Learning rollout detail", body = LearningRolloutDetailResponse),
+        (status = 404, description = "Rollout not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "trade_flow"
+)]
+pub async fn get_learning_rollout_detail(
+    State(state): State<Arc<AppState>>,
+    Path(rollout_id): Path<Uuid>,
+    Query(query): Query<TradeFlowQuery>,
+) -> ApiResult<Json<LearningRolloutDetailResponse>> {
+    let limit = query.limit.unwrap_or(24).clamp(1, 200);
+    let rollout = load_learning_rollout_status(&state.pool, rollout_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound("Learning rollout not found".into()))?;
+    let observations = load_learning_rollout_observations(&state.pool, rollout_id, limit)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?;
+
+    Ok(Json(LearningRolloutDetailResponse {
+        rollout,
+        observations,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/models",
+    request_body = CreateLearningModelRequest,
+    responses(
+        (status = 201, description = "Learning model created", body = LearningModelSummary),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 409, description = "Model key already exists"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn create_learning_model(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<CreateLearningModelRequest>,
+) -> ApiResult<(StatusCode, Json<LearningModelSummary>)> {
+    let metrics = validate_json_object(req.metrics, "metrics")?;
+    validate_model_payload(
+        &req.model_key,
+        &req.strategy_scope,
+        &req.target,
+        &req.model_type,
+        &req.status,
+        &req.feature_view,
+        req.artifact_uri.as_deref(),
+        &metrics,
+        req.training_window_start,
+        req.training_window_end,
+        req.validation_window_start,
+        req.validation_window_end,
+    )?;
+
+    let created_id: (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO learning_model_registry (
+            model_key,
+            strategy_scope,
+            target,
+            model_type,
+            version,
+            status,
+            feature_view,
+            metrics,
+            artifact_uri,
+            training_window_start,
+            training_window_end,
+            validation_window_start,
+            validation_window_end,
+            activated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+            CASE WHEN $6 IN ('active', 'canary') THEN NOW() ELSE NULL END)
+        RETURNING id
+        "#,
+    )
+    .bind(&req.model_key)
+    .bind(&req.strategy_scope)
+    .bind(&req.target)
+    .bind(&req.model_type)
+    .bind(&req.version)
+    .bind(&req.status)
+    .bind(&req.feature_view)
+    .bind(metrics)
+    .bind(req.artifact_uri)
+    .bind(req.training_window_start)
+    .bind(req.training_window_end)
+    .bind(req.validation_window_start)
+    .bind(req.validation_window_end)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let model = load_learning_model_summary_by_id(&state.pool, created_id.0)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("Created model could not be reloaded".into()))?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("learning_model_created".to_string()),
+        "learning_model_registry",
+        serde_json::json!({
+            "model_id": model.model_id,
+            "model_key": model.model_key,
+            "status": model.status,
+            "model_type": model.model_type
+        }),
+    );
+
+    Ok((StatusCode::CREATED, Json(model)))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/admin/learning/models/{model_id}",
+    params(("model_id" = Uuid, Path, description = "Model identifier")),
+    request_body = UpdateLearningModelRequest,
+    responses(
+        (status = 200, description = "Learning model updated", body = LearningModelSummary),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Model not found"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn update_learning_model(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(model_id): Path<Uuid>,
+    Json(req): Json<UpdateLearningModelRequest>,
+) -> ApiResult<Json<LearningModelSummary>> {
+    let current: LearningModelMutableRow = sqlx::query_as(
+        r#"
+        SELECT
+            model_key,
+            strategy_scope,
+            target,
+            model_type,
+            version,
+            status,
+            feature_view,
+            artifact_uri,
+            training_window_start,
+            training_window_end,
+            validation_window_start,
+            validation_window_end,
+            metrics
+        FROM learning_model_registry
+        WHERE id = $1
+        "#,
+    )
+    .bind(model_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Learning model not found".into()))?;
+
+    let model_key = req.model_key.unwrap_or(current.model_key);
+    let strategy_scope = req.strategy_scope.unwrap_or(current.strategy_scope);
+    let target = req.target.unwrap_or(current.target);
+    let model_type = req.model_type.unwrap_or(current.model_type);
+    let version = req.version.unwrap_or(current.version);
+    let status = req.status.unwrap_or(current.status);
+    let feature_view = req.feature_view.unwrap_or(current.feature_view);
+    let artifact_uri = req.artifact_uri.or(current.artifact_uri);
+    let training_window_start = req.training_window_start.or(current.training_window_start);
+    let training_window_end = req.training_window_end.or(current.training_window_end);
+    let validation_window_start = req
+        .validation_window_start
+        .or(current.validation_window_start);
+    let validation_window_end = req.validation_window_end.or(current.validation_window_end);
+    let metrics = validate_json_object(req.metrics.or(Some(current.metrics)), "metrics")?;
+
+    validate_model_payload(
+        &model_key,
+        &strategy_scope,
+        &target,
+        &model_type,
+        &status,
+        &feature_view,
+        artifact_uri.as_deref(),
+        &metrics,
+        training_window_start,
+        training_window_end,
+        validation_window_start,
+        validation_window_end,
+    )?;
+
+    sqlx::query(
+        r#"
+        UPDATE learning_model_registry
+        SET model_key = $2,
+            strategy_scope = $3,
+            target = $4,
+            model_type = $5,
+            version = $6,
+            status = $7,
+            feature_view = $8,
+            artifact_uri = $9,
+            training_window_start = $10,
+            training_window_end = $11,
+            validation_window_start = $12,
+            validation_window_end = $13,
+            metrics = $14,
+            activated_at = CASE
+                WHEN $7 IN ('active', 'canary') THEN COALESCE(activated_at, NOW())
+                ELSE activated_at
+            END
+        WHERE id = $1
+        "#,
+    )
+    .bind(model_id)
+    .bind(&model_key)
+    .bind(&strategy_scope)
+    .bind(&target)
+    .bind(&model_type)
+    .bind(&version)
+    .bind(&status)
+    .bind(&feature_view)
+    .bind(artifact_uri)
+    .bind(training_window_start)
+    .bind(training_window_end)
+    .bind(validation_window_start)
+    .bind(validation_window_end)
+    .bind(metrics)
+    .execute(&state.pool)
+    .await?;
+
+    let model = load_learning_model_summary_by_id(&state.pool, model_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("Updated model could not be reloaded".into()))?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("learning_model_updated".to_string()),
+        "learning_model_registry",
+        serde_json::json!({
+            "model_id": model.model_id,
+            "model_key": model.model_key,
+            "status": model.status
+        }),
+    );
+
+    Ok(Json(model))
+}
+
+async fn change_learning_model_status(
+    state: Arc<AppState>,
+    claims: Claims,
+    model_id: Uuid,
+    next_status: &'static str,
+    audit_action: &'static str,
+) -> ApiResult<Json<LearningModelSummary>> {
+    validate_model_status(next_status)?;
+
+    let current: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM learning_model_registry WHERE id = $1")
+            .bind(model_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((current_status,)) = current else {
+        return Err(ApiError::NotFound("Learning model not found".into()));
+    };
+
+    if current_status == next_status {
+        return Err(ApiError::Conflict(format!(
+            "Model is already {next_status}"
+        )));
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE learning_model_registry
+        SET status = $2,
+            activated_at = CASE
+                WHEN $2 IN ('active', 'canary') THEN COALESCE(activated_at, NOW())
+                ELSE activated_at
+            END
+        WHERE id = $1
+        "#,
+    )
+    .bind(model_id)
+    .bind(next_status)
+    .execute(&state.pool)
+    .await?;
+
+    let model = load_learning_model_summary_by_id(&state.pool, model_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("Updated model could not be reloaded".into()))?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom(audit_action.to_string()),
+        "learning_model_registry",
+        serde_json::json!({
+            "model_id": model.model_id,
+            "model_key": model.model_key,
+            "status": model.status
+        }),
+    );
+
+    Ok(Json(model))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/models/{model_id}/activate",
+    params(("model_id" = Uuid, Path, description = "Model identifier")),
+    responses((status = 200, description = "Learning model activated", body = LearningModelSummary)),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn activate_learning_model(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(model_id): Path<Uuid>,
+) -> ApiResult<Json<LearningModelSummary>> {
+    change_learning_model_status(
+        state,
+        claims,
+        model_id,
+        "active",
+        "learning_model_activated",
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/models/{model_id}/disable",
+    params(("model_id" = Uuid, Path, description = "Model identifier")),
+    responses((status = 200, description = "Learning model disabled", body = LearningModelSummary)),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn disable_learning_model(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(model_id): Path<Uuid>,
+) -> ApiResult<Json<LearningModelSummary>> {
+    change_learning_model_status(
+        state,
+        claims,
+        model_id,
+        "disabled",
+        "learning_model_disabled",
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/models/{model_id}/retire",
+    params(("model_id" = Uuid, Path, description = "Model identifier")),
+    responses((status = 200, description = "Learning model retired", body = LearningModelSummary)),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn retire_learning_model(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(model_id): Path<Uuid>,
+) -> ApiResult<Json<LearningModelSummary>> {
+    change_learning_model_status(state, claims, model_id, "retired", "learning_model_retired").await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/rollouts",
+    request_body = CreateLearningRolloutRequest,
+    responses(
+        (status = 201, description = "Learning rollout created", body = LearningRolloutStatus),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Model not found"),
+        (status = 409, description = "Conflicting rollout already exists"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn create_learning_rollout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<CreateLearningRolloutRequest>,
+) -> ApiResult<(StatusCode, Json<LearningRolloutStatus>)> {
+    validate_rollout_mode(&req.rollout_mode)?;
+    validate_authority_level(&req.authority_level)?;
+    validate_rollout_authority_combo(&req.rollout_mode, &req.authority_level)?;
+    let baseline_window_hours = validate_baseline_window_hours(req.baseline_window_hours)?;
+    let bounds = validate_json_object(req.bounds, "bounds")?;
+    let guardrails = validate_json_object(req.guardrails, "guardrails")?;
+
+    let mut tx = state.pool.begin().await?;
+    let model: LearningModelTargetRow = sqlx::query_as(
+        r#"
+        SELECT strategy_scope, status
+        FROM learning_model_registry
+        WHERE id = $1
+        "#,
+    )
+    .bind(req.model_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Learning model not found".into()))?;
+
+    if ["disabled", "retired"].contains(&model.status.as_str()) {
+        return Err(ApiError::Conflict(
+            "Disabled or retired models cannot be rolled out".into(),
+        ));
+    }
+
+    let existing_active: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id
+        FROM learning_model_rollouts
+        WHERE model_id = $1
+          AND status IN ('active', 'paused')
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(req.model_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if existing_active.is_some() {
+        return Err(ApiError::Conflict(
+            "This model already has an active or paused rollout".into(),
+        ));
+    }
+
+    let created_id: (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO learning_model_rollouts (
+            model_id,
+            strategy_scope,
+            rollout_mode,
+            authority_level,
+            bounds,
+            guardrails,
+            baseline_window_hours
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+        "#,
+    )
+    .bind(req.model_id)
+    .bind(&model.strategy_scope)
+    .bind(&req.rollout_mode)
+    .bind(&req.authority_level)
+    .bind(bounds)
+    .bind(guardrails)
+    .bind(baseline_window_hours)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let rollout = load_learning_rollout_status(&state.pool, created_id.0)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("Created rollout could not be reloaded".into()))?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("learning_rollout_created".to_string()),
+        "learning_model_rollouts",
+        serde_json::json!({
+            "rollout_id": rollout.id,
+            "model_id": rollout.model_id,
+            "rollout_mode": rollout.rollout_mode,
+            "authority_level": rollout.authority_level
+        }),
+    );
+
+    Ok((StatusCode::CREATED, Json(rollout)))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/admin/learning/rollouts/{rollout_id}",
+    params(("rollout_id" = Uuid, Path, description = "Rollout identifier")),
+    request_body = UpdateLearningRolloutRequest,
+    responses(
+        (status = 200, description = "Learning rollout updated", body = LearningRolloutStatus),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Rollout not found"),
+        (status = 409, description = "Rollout cannot be edited in its current state"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn update_learning_rollout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(rollout_id): Path<Uuid>,
+    Json(req): Json<UpdateLearningRolloutRequest>,
+) -> ApiResult<Json<LearningRolloutStatus>> {
+    let mut tx = state.pool.begin().await?;
+    let current: LearningRolloutMutableRow = sqlx::query_as(
+        r#"
+        SELECT
+            model_id,
+            strategy_scope,
+            rollout_mode,
+            authority_level,
+            status,
+            baseline_window_hours,
+            bounds,
+            guardrails
+        FROM learning_model_rollouts
+        WHERE id = $1
+        "#,
+    )
+    .bind(rollout_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Learning rollout not found".into()))?;
+
+    if matches!(current.status.as_str(), "rolled_back" | "completed") {
+        return Err(ApiError::Conflict(
+            "Completed or rolled back rollouts are immutable".into(),
+        ));
+    }
+
+    let rollout_mode = req
+        .rollout_mode
+        .as_deref()
+        .unwrap_or(&current.rollout_mode)
+        .to_string();
+    let authority_level = req
+        .authority_level
+        .as_deref()
+        .unwrap_or(&current.authority_level)
+        .to_string();
+    validate_rollout_mode(&rollout_mode)?;
+    validate_authority_level(&authority_level)?;
+    validate_rollout_authority_combo(&rollout_mode, &authority_level)?;
+    let baseline_window_hours = validate_baseline_window_hours(
+        req.baseline_window_hours
+            .or(Some(current.baseline_window_hours)),
+    )?;
+    let bounds = validate_json_object(req.bounds.or(Some(current.bounds)), "bounds")?;
+    let guardrails =
+        validate_json_object(req.guardrails.or(Some(current.guardrails)), "guardrails")?;
+
+    sqlx::query(
+        r#"
+        UPDATE learning_model_rollouts
+        SET rollout_mode = $2,
+            authority_level = $3,
+            baseline_window_hours = $4,
+            bounds = $5,
+            guardrails = $6
+        WHERE id = $1
+        "#,
+    )
+    .bind(rollout_id)
+    .bind(&rollout_mode)
+    .bind(&authority_level)
+    .bind(baseline_window_hours)
+    .bind(bounds)
+    .bind(guardrails)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let rollout = load_learning_rollout_status(&state.pool, rollout_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("Updated rollout could not be reloaded".into()))?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom("learning_rollout_updated".to_string()),
+        "learning_model_rollouts",
+        serde_json::json!({
+            "rollout_id": rollout.id,
+            "model_id": current.model_id,
+            "strategy_scope": current.strategy_scope,
+            "rollout_mode": rollout.rollout_mode,
+            "authority_level": rollout.authority_level
+        }),
+    );
+
+    Ok(Json(rollout))
+}
+
+async fn change_learning_rollout_status(
+    state: Arc<AppState>,
+    claims: Claims,
+    rollout_id: Uuid,
+    next_status: &'static str,
+    audit_action: &'static str,
+) -> ApiResult<Json<LearningRolloutStatus>> {
+    let mut tx = state.pool.begin().await?;
+    let current: LearningRolloutMutableRow = sqlx::query_as(
+        r#"
+        SELECT
+            model_id,
+            strategy_scope,
+            rollout_mode,
+            authority_level,
+            status,
+            baseline_window_hours,
+            bounds,
+            guardrails
+        FROM learning_model_rollouts
+        WHERE id = $1
+        "#,
+    )
+    .bind(rollout_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Learning rollout not found".into()))?;
+
+    match (current.status.as_str(), next_status) {
+        ("active", "paused")
+        | ("paused", "active")
+        | ("active", "completed")
+        | ("paused", "completed") => {}
+        _ if current.status == next_status => {
+            return Err(ApiError::Conflict(format!(
+                "Rollout is already {next_status}"
+            )))
+        }
+        _ => {
+            return Err(ApiError::Conflict(format!(
+                "Cannot transition rollout from {} to {next_status}",
+                current.status
+            )))
+        }
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE learning_model_rollouts
+        SET status = $2,
+            ended_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE ended_at END
+        WHERE id = $1
+        "#,
+    )
+    .bind(rollout_id)
+    .bind(next_status)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let rollout = load_learning_rollout_status(&state.pool, rollout_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| ApiError::Internal("Rollout could not be reloaded".into()))?;
+
+    state.audit_logger.log_user_action(
+        &claims.sub,
+        AuditAction::Custom(audit_action.to_string()),
+        "learning_model_rollouts",
+        serde_json::json!({
+            "rollout_id": rollout.id,
+            "model_id": current.model_id,
+            "strategy_scope": current.strategy_scope,
+            "new_status": rollout.status
+        }),
+    );
+
+    Ok(Json(rollout))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/rollouts/{rollout_id}/pause",
+    params(("rollout_id" = Uuid, Path, description = "Rollout identifier")),
+    responses(
+        (status = 200, description = "Learning rollout paused", body = LearningRolloutStatus),
+        (status = 404, description = "Rollout not found"),
+        (status = 409, description = "Invalid rollout state transition"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn pause_learning_rollout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(rollout_id): Path<Uuid>,
+) -> ApiResult<Json<LearningRolloutStatus>> {
+    change_learning_rollout_status(
+        state,
+        claims,
+        rollout_id,
+        "paused",
+        "learning_rollout_paused",
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/rollouts/{rollout_id}/resume",
+    params(("rollout_id" = Uuid, Path, description = "Rollout identifier")),
+    responses(
+        (status = 200, description = "Learning rollout resumed", body = LearningRolloutStatus),
+        (status = 404, description = "Rollout not found"),
+        (status = 409, description = "Invalid rollout state transition"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn resume_learning_rollout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(rollout_id): Path<Uuid>,
+) -> ApiResult<Json<LearningRolloutStatus>> {
+    change_learning_rollout_status(
+        state,
+        claims,
+        rollout_id,
+        "active",
+        "learning_rollout_resumed",
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/learning/rollouts/{rollout_id}/complete",
+    params(("rollout_id" = Uuid, Path, description = "Rollout identifier")),
+    responses(
+        (status = 200, description = "Learning rollout completed", body = LearningRolloutStatus),
+        (status = 404, description = "Rollout not found"),
+        (status = 409, description = "Invalid rollout state transition"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "trade_flow"
+)]
+pub async fn complete_learning_rollout(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(rollout_id): Path<Uuid>,
+) -> ApiResult<Json<LearningRolloutStatus>> {
+    change_learning_rollout_status(
+        state,
+        claims,
+        rollout_id,
+        "completed",
+        "learning_rollout_completed",
+    )
+    .await
 }
 
 #[cfg(test)]

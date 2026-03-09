@@ -8,8 +8,10 @@ import {
   Zap,
   Activity,
   GitBranch,
+  Gauge,
   Layers,
   SlidersHorizontal,
+  BrainCircuit,
   type LucideIcon,
 } from "lucide-react";
 
@@ -36,6 +38,8 @@ export const primaryNavSections: NavSection[] = [
       { href: "/positions", label: "Positions", icon: Layers },
       { href: "/signals", label: "Quant Signals", icon: Zap },
       { href: "/trade-flow", label: "Trade Flow", icon: GitBranch },
+      { href: "/arb-telemetry", label: "Arb Telemetry", icon: Gauge },
+      { href: "/learning-loop", label: "Learning Loop", icon: BrainCircuit },
       { href: "/activity", label: "Activity", icon: Activity },
       { href: "/backtest", label: "Backtest", icon: LineChart },
       { href: "/history", label: "History", icon: History },

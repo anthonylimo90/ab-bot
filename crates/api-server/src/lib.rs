@@ -30,6 +30,10 @@ pub mod exit_handler;
 pub mod flow_feature_calculator;
 pub mod gamma_syncer;
 pub mod handlers;
+pub mod learning;
+pub mod learning_evaluator;
+pub mod learning_models;
+pub mod learning_rollouts;
 pub mod metrics_calculator;
 pub mod middleware;
 pub mod quant_signal_executor;
@@ -54,6 +58,10 @@ pub use error::ApiError;
 pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
 pub use flow_feature_calculator::{spawn_flow_feature_calculator, FlowFeatureConfig};
 pub use gamma_syncer::{spawn_gamma_syncer, GammaSyncerConfig};
+pub use learning_evaluator::{spawn_learning_evaluator, LearningEvaluatorConfig};
+pub use learning_rollouts::{
+    spawn_learning_rollout_observer, LearningRolloutController, LearningRolloutObserverConfig,
+};
 pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
 pub use quant_signal_executor::{spawn_quant_signal_executor, QuantSignalExecutorConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
@@ -401,6 +409,14 @@ impl ApiServer {
         // Spawn strategy health calculator (6h, summarizes edge capture + failures)
         let health_config = StrategyHealthConfig::from_env();
         spawn_strategy_health_calculator(health_config, state.pool.clone());
+
+        // Spawn learning evaluator (replays shadow predictions against realized outcomes)
+        let learning_evaluator_config = LearningEvaluatorConfig::from_env();
+        spawn_learning_evaluator(learning_evaluator_config, state.pool.clone());
+
+        // Spawn rollout observer (persists guardrail observations and auto-rollbacks)
+        let learning_rollout_observer_config = LearningRolloutObserverConfig::from_env();
+        spawn_learning_rollout_observer(learning_rollout_observer_config, state.pool.clone());
 
         // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
         let account_snapshot_config = AccountSnapshotConfig::from_env();

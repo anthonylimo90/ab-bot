@@ -280,6 +280,10 @@ fn bench_signal_batch_serialization(c: &mut Criterion) {
                     total_cost: yes_ask + no_ask,
                     gross_profit: Decimal::ONE - (yes_ask + no_ask),
                     net_profit: Decimal::ONE - (yes_ask + no_ask) - Decimal::new(2, 2),
+                    fee_drag: Decimal::new(2, 2),
+                    worst_case_payout: Decimal::new(98, 2),
+                    yes_fee_shares: Decimal::ZERO,
+                    no_fee_shares: Decimal::ZERO,
                 }
             })
             .collect();

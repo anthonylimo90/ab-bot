@@ -116,6 +116,19 @@ use crate::websocket;
         trade_flow::get_trade_flow_journeys,
         trade_flow::get_market_trade_flow,
         trade_flow::get_arb_market_scorecard,
+        trade_flow::get_arb_execution_telemetry,
+        trade_flow::get_learning_overview,
+        trade_flow::get_learning_rollout_detail,
+        trade_flow::create_learning_model,
+        trade_flow::update_learning_model,
+        trade_flow::activate_learning_model,
+        trade_flow::disable_learning_model,
+        trade_flow::retire_learning_model,
+        trade_flow::create_learning_rollout,
+        trade_flow::update_learning_rollout,
+        trade_flow::pause_learning_rollout,
+        trade_flow::resume_learning_rollout,
+        trade_flow::complete_learning_rollout,
         // Risk monitoring
         risk::get_risk_status,
         risk::manual_trip_circuit_breaker,
@@ -241,6 +254,22 @@ use crate::websocket;
             trade_flow::TradeFlowMarketResponse,
             trade_flow::ArbMarketScorecardResponse,
             trade_flow::ArbMarketScorecardItem,
+            trade_flow::ArbExecutionTelemetryResponse,
+            trade_flow::ArbExecutionTelemetrySummary,
+            trade_flow::ArbExecutionLatencyMetric,
+            trade_flow::ArbExecutionOutcomeBreakdown,
+            trade_flow::ArbExecutionAttempt,
+            trade_flow::LearningOverviewResponse,
+            trade_flow::LearningDatasetReadiness,
+            trade_flow::LearningModelSummary,
+            trade_flow::CreateLearningModelRequest,
+            trade_flow::UpdateLearningModelRequest,
+            trade_flow::LearningOfflineEvaluation,
+            trade_flow::LearningRolloutStatus,
+            trade_flow::LearningRolloutObservation,
+            trade_flow::LearningRolloutDetailResponse,
+            trade_flow::CreateLearningRolloutRequest,
+            trade_flow::UpdateLearningRolloutRequest,
             // Risk monitoring
             risk::RiskStatusResponse,
             risk::CircuitBreakerResponse,
@@ -507,6 +536,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/trade-flow/strategies/arb/scorecard",
             get(trade_flow::get_arb_market_scorecard),
         )
+        .route(
+            "/api/v1/trade-flow/strategies/arb/execution-telemetry",
+            get(trade_flow::get_arb_execution_telemetry),
+        )
+        .route(
+            "/api/v1/trade-flow/learning/overview",
+            get(trade_flow::get_learning_overview),
+        )
+        .route(
+            "/api/v1/trade-flow/learning/rollouts/:rollout_id",
+            get(trade_flow::get_learning_rollout_detail),
+        )
         // Risk monitoring (read-only for all members)
         .route(
             "/api/v1/workspaces/:workspace_id/risk/status",
@@ -619,6 +660,46 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/admin/workspaces/:workspace_id",
             delete(admin_workspaces::delete_workspace),
+        )
+        .route(
+            "/api/v1/admin/learning/rollouts",
+            post(trade_flow::create_learning_rollout),
+        )
+        .route(
+            "/api/v1/admin/learning/models",
+            post(trade_flow::create_learning_model),
+        )
+        .route(
+            "/api/v1/admin/learning/models/:model_id",
+            put(trade_flow::update_learning_model),
+        )
+        .route(
+            "/api/v1/admin/learning/models/:model_id/activate",
+            post(trade_flow::activate_learning_model),
+        )
+        .route(
+            "/api/v1/admin/learning/models/:model_id/disable",
+            post(trade_flow::disable_learning_model),
+        )
+        .route(
+            "/api/v1/admin/learning/models/:model_id/retire",
+            post(trade_flow::retire_learning_model),
+        )
+        .route(
+            "/api/v1/admin/learning/rollouts/:rollout_id",
+            put(trade_flow::update_learning_rollout),
+        )
+        .route(
+            "/api/v1/admin/learning/rollouts/:rollout_id/pause",
+            post(trade_flow::pause_learning_rollout),
+        )
+        .route(
+            "/api/v1/admin/learning/rollouts/:rollout_id/resume",
+            post(trade_flow::resume_learning_rollout),
+        )
+        .route(
+            "/api/v1/admin/learning/rollouts/:rollout_id/complete",
+            post(trade_flow::complete_learning_rollout),
         )
         // Apply rate limiting first (outermost layer runs last)
         .layer(GovernorLayer {
