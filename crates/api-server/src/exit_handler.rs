@@ -12,7 +12,7 @@ use chrono::Utc;
 use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::PositionRepository;
 use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
-use polymarket_core::types::{FailureReason, MarketOrder, OrderSide, Position};
+use polymarket_core::types::{FailureReason, MarketOrder, OrderSide, Position, PositionState};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -47,6 +47,8 @@ pub struct ExitHandlerConfig {
     pub quant_stop_loss_pct: Decimal,
     /// Maximum holding period for generic quant exits.
     pub quant_max_hold_hours: i64,
+    /// Minimum cooldown before retrying an ExitFailed position.
+    pub failed_exit_retry_backoff_secs: u64,
 }
 
 impl Default for ExitHandlerConfig {
@@ -58,6 +60,7 @@ impl Default for ExitHandlerConfig {
             quant_take_profit_pct: Decimal::new(15, 2),
             quant_stop_loss_pct: Decimal::new(10, 2),
             quant_max_hold_hours: 24,
+            failed_exit_retry_backoff_secs: 300,
         }
     }
 }
@@ -89,6 +92,10 @@ impl ExitHandlerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(24),
+            failed_exit_retry_backoff_secs: std::env::var("EXIT_FAILED_RETRY_BACKOFF_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
         }
     }
 }
@@ -316,6 +323,7 @@ impl ExitHandler {
             quant_take_profit_pct = %startup_cfg.quant_take_profit_pct,
             quant_stop_loss_pct = %startup_cfg.quant_stop_loss_pct,
             quant_max_hold_hours = startup_cfg.quant_max_hold_hours,
+            failed_exit_retry_backoff_secs = startup_cfg.failed_exit_retry_backoff_secs,
             "Starting exit handler (always-on, per-tick guard)"
         );
 
@@ -351,11 +359,11 @@ impl ExitHandler {
                     if let Err(e) = self.evaluate_open_positions(&cfg).await {
                         error!(error = %e, "Failed to evaluate open positions for exit");
                     }
+                    if let Err(e) = self.process_failed_exits(&cfg).await {
+                        error!(error = %e, "Failed to process failed exits");
+                    }
                     if let Err(e) = self.process_exit_ready().await {
                         error!(error = %e, "Failed to process exit-ready positions");
-                    }
-                    if let Err(e) = self.process_failed_exits().await {
-                        error!(error = %e, "Failed to process failed exits");
                     }
                     if let Err(e) = self.process_one_legged_recovery().await {
                         error!(error = %e, "Failed to process one-legged recovery");
@@ -495,7 +503,7 @@ impl ExitHandler {
         };
 
         let (has_yes, has_no) = held_outcomes(position);
-        let yes_price = if has_yes {
+        if has_yes {
             let yes_order = MarketOrder::new(
                 market_id.clone(),
                 yes_token_id,
@@ -528,12 +536,28 @@ impl ExitHandler {
                 return Ok(());
             }
 
-            yes_report.average_price
-        } else {
-            Decimal::ZERO
-        };
+            if let Err(error) = position.record_yes_exit_fill(yes_report.average_price) {
+                warn!(
+                    position_id = %position.id,
+                    market_id = %market_id,
+                    error = %error,
+                    "Failed to record YES exit fill"
+                );
+                position.mark_exit_failed(FailureReason::Unknown {
+                    message: format!("failed to record YES exit fill: {error}"),
+                });
+                let _ = self.position_repo.update(position).await;
+                self.publish_alert(
+                    &market_id,
+                    "exit_failed",
+                    "YES exit fill bookkeeping failed",
+                );
+                return Ok(());
+            }
+            let _ = self.position_repo.update(position).await;
+        }
 
-        let no_price = if has_no {
+        if has_no {
             let no_order = MarketOrder::new(
                 market_id.clone(),
                 no_token_id,
@@ -566,19 +590,34 @@ impl ExitHandler {
                 return Ok(());
             }
 
-            no_report.average_price
-        } else {
-            Decimal::ZERO
-        };
+            if let Err(error) = position.record_no_exit_fill(no_report.average_price) {
+                warn!(
+                    position_id = %position.id,
+                    market_id = %market_id,
+                    error = %error,
+                    "Failed to record NO exit fill"
+                );
+                position.mark_exit_failed(FailureReason::Unknown {
+                    message: format!("failed to record NO exit fill: {error}"),
+                });
+                let _ = self.position_repo.update(position).await;
+                self.publish_alert(&market_id, "exit_failed", "NO exit fill bookkeeping failed");
+                return Ok(());
+            }
+            let _ = self.position_repo.update(position).await;
+        }
 
         let fee = Decimal::new(2, 2); // 2%
 
         // Close position
-        if let Err(e) = position.close_via_exit(yes_price, no_price, fee) {
+        if let Err(e) = position.close_via_recorded_exit(fee) {
             warn!(position_id = %position.id, error = %e, "Cannot close position via exit");
             return Ok(());
         }
         let _ = self.position_repo.update(position).await;
+
+        let yes_price = position.yes_exit_price.unwrap_or(Decimal::ZERO);
+        let no_price = position.no_exit_price.unwrap_or(Decimal::ZERO);
 
         // Record with circuit breaker
         let realized_pnl = position.realized_pnl.unwrap_or_default();
@@ -1353,8 +1392,8 @@ impl ExitHandler {
         Ok(())
     }
 
-    /// Process ExitFailed positions eligible for retry.
-    async fn process_failed_exits(&self) -> anyhow::Result<()> {
+    /// Process ExitFailed positions that have cooled down enough for requeue.
+    async fn process_failed_exits(&self, cfg: &ExitHandlerConfig) -> anyhow::Result<()> {
         let positions = self.position_repo.get_failed_exits().await?;
         if positions.is_empty() {
             return Ok(());
@@ -1363,20 +1402,41 @@ impl ExitHandler {
         debug!(count = positions.len(), "Processing failed exits for retry");
 
         for mut position in positions {
-            if position.attempt_exit_recovery() {
-                if let Err(e) = self.position_repo.update(&position).await {
-                    warn!(
-                        position_id = %position.id,
-                        error = %e,
-                        "Failed to persist exit recovery"
-                    );
-                } else {
-                    debug!(
-                        position_id = %position.id,
-                        retry_count = position.retry_count,
-                        "Position moved back to ExitReady for retry"
-                    );
-                }
+            let age_secs = position.age_secs();
+            if age_secs < cfg.failed_exit_retry_backoff_secs {
+                continue;
+            }
+
+            let exhausted_hot_retries = !position.can_retry();
+            position.state = PositionState::ExitReady;
+            position.failure_reason = None;
+            position.last_updated = Utc::now();
+
+            if let Err(e) = self.position_repo.update(&position).await {
+                warn!(
+                    position_id = %position.id,
+                    error = %e,
+                    "Failed to persist exit recovery"
+                );
+                continue;
+            }
+
+            if exhausted_hot_retries {
+                warn!(
+                    position_id = %position.id,
+                    market_id = %position.market_id,
+                    retry_count = position.retry_count,
+                    age_secs,
+                    backoff_secs = cfg.failed_exit_retry_backoff_secs,
+                    "Reopened exhausted exit failure for reconciliation after cooldown"
+                );
+            } else {
+                debug!(
+                    position_id = %position.id,
+                    retry_count = position.retry_count,
+                    age_secs,
+                    "Position moved back to ExitReady for retry"
+                );
             }
         }
 
@@ -1694,6 +1754,7 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.exit_poll_interval_secs, 30);
         assert_eq!(config.resolution_check_secs, 300);
+        assert_eq!(config.failed_exit_retry_backoff_secs, 300);
     }
 
     #[test]
@@ -1703,6 +1764,7 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.exit_poll_interval_secs, 30);
         assert_eq!(config.resolution_check_secs, 300);
+        assert_eq!(config.failed_exit_retry_backoff_secs, 300);
     }
 
     #[test]
@@ -1725,10 +1787,31 @@ mod tests {
         );
         assert_eq!(held_outcomes(&no_only), (false, true));
     }
+
+    #[test]
+    fn test_held_outcomes_ignore_legs_already_recorded_as_exited() {
+        let mut both_legs = Position::new(
+            "m1".to_string(),
+            Decimal::new(55, 2),
+            Decimal::new(45, 2),
+            Decimal::ONE,
+            polymarket_core::types::ExitStrategy::ExitOnCorrection,
+        );
+        both_legs.mark_open().unwrap();
+        both_legs.mark_exit_ready().unwrap();
+        both_legs.mark_closing().unwrap();
+        both_legs.record_yes_exit_fill(Decimal::new(54, 2)).unwrap();
+
+        assert_eq!(held_outcomes(&both_legs), (false, true));
+    }
 }
 
 fn held_outcomes(position: &Position) -> (bool, bool) {
-    let has_yes = position.yes_entry_price > Decimal::ZERO;
-    let has_no = position.no_entry_price > Decimal::ZERO;
+    if position.state == PositionState::Closed {
+        return (false, false);
+    }
+
+    let has_yes = position.yes_entry_price > Decimal::ZERO && position.yes_exit_price.is_none();
+    let has_no = position.no_entry_price > Decimal::ZERO && position.no_exit_price.is_none();
     (has_yes, has_no)
 }

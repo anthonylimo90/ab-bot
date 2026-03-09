@@ -276,14 +276,72 @@ impl Position {
         Ok(())
     }
 
-    /// Close the position via market exit (selling both sides).
-    /// `fee` is only used for legacy flat-fee positions.
-    pub fn close_via_exit(
+    /// Record the realized exit fill for the YES leg while the position is still active.
+    pub fn record_yes_exit_fill(
         &mut self,
         yes_exit_price: Decimal,
-        no_exit_price: Decimal,
-        fee: Decimal,
     ) -> std::result::Result<(), String> {
+        if self.yes_entry_price <= Decimal::ZERO {
+            return Err("Position does not hold a YES leg".to_string());
+        }
+        if self.yes_exit_price.is_some() {
+            return Err("YES leg is already recorded as exited".to_string());
+        }
+        if self.state == PositionState::Closed {
+            return Err("Cannot record an exit fill on a closed position".to_string());
+        }
+        if self.state == PositionState::EntryFailed {
+            return Err("Cannot record an exit fill on an entry-failed position".to_string());
+        }
+
+        self.yes_exit_price = Some(yes_exit_price);
+        self.last_updated = Utc::now();
+        Ok(())
+    }
+
+    /// Record the realized exit fill for the NO leg while the position is still active.
+    pub fn record_no_exit_fill(
+        &mut self,
+        no_exit_price: Decimal,
+    ) -> std::result::Result<(), String> {
+        if self.no_entry_price <= Decimal::ZERO {
+            return Err("Position does not hold a NO leg".to_string());
+        }
+        if self.no_exit_price.is_some() {
+            return Err("NO leg is already recorded as exited".to_string());
+        }
+        if self.state == PositionState::Closed {
+            return Err("Cannot record an exit fill on a closed position".to_string());
+        }
+        if self.state == PositionState::EntryFailed {
+            return Err("Cannot record an exit fill on an entry-failed position".to_string());
+        }
+
+        self.no_exit_price = Some(no_exit_price);
+        self.last_updated = Utc::now();
+        Ok(())
+    }
+
+    fn resolved_exit_prices(&self) -> std::result::Result<(Decimal, Decimal), String> {
+        let yes_exit_price = if self.yes_entry_price > Decimal::ZERO {
+            self.yes_exit_price
+                .ok_or_else(|| "YES leg has not been exited yet".to_string())?
+        } else {
+            Decimal::ZERO
+        };
+        let no_exit_price = if self.no_entry_price > Decimal::ZERO {
+            self.no_exit_price
+                .ok_or_else(|| "NO leg has not been exited yet".to_string())?
+        } else {
+            Decimal::ZERO
+        };
+
+        Ok((yes_exit_price, no_exit_price))
+    }
+
+    /// Close the position using any previously recorded per-leg exit fills.
+    /// `fee` is only used for legacy flat-fee positions.
+    pub fn close_via_recorded_exit(&mut self, fee: Decimal) -> std::result::Result<(), String> {
         if self.state == PositionState::Closed {
             return Err("Position is already closed".to_string());
         }
@@ -291,8 +349,8 @@ impl Position {
             return Err("Cannot close a position that failed to enter".to_string());
         }
 
-        self.yes_exit_price = Some(yes_exit_price);
-        self.no_exit_price = Some(no_exit_price);
+        let (yes_exit_price, no_exit_price) = self.resolved_exit_prices()?;
+
         self.exit_timestamp = Some(Utc::now());
         self.state = PositionState::Closed;
 
@@ -312,6 +370,31 @@ impl Position {
         });
         self.unrealized_pnl = Decimal::ZERO;
         Ok(())
+    }
+
+    /// Close the position via market exit (selling both sides).
+    /// `fee` is only used for legacy flat-fee positions.
+    pub fn close_via_exit(
+        &mut self,
+        yes_exit_price: Decimal,
+        no_exit_price: Decimal,
+        fee: Decimal,
+    ) -> std::result::Result<(), String> {
+        if self.state == PositionState::Closed {
+            return Err("Position is already closed".to_string());
+        }
+        if self.state == PositionState::EntryFailed {
+            return Err("Cannot close a position that failed to enter".to_string());
+        }
+
+        if self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none() {
+            self.yes_exit_price = Some(yes_exit_price);
+        }
+        if self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none() {
+            self.no_exit_price = Some(no_exit_price);
+        }
+
+        self.close_via_recorded_exit(fee)
     }
 
     /// Close the position via market resolution (guaranteed $1.00 per share).
@@ -792,6 +875,39 @@ mod tests {
         // Max retries reached
         assert!(!pos.can_retry());
         assert!(!pos.attempt_exit_recovery());
+    }
+
+    #[test]
+    fn test_partial_exit_recovery_preserves_recorded_leg_fill() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+        let fee = Decimal::new(2, 2);
+
+        pos.mark_open().unwrap();
+        pos.mark_exit_ready().unwrap();
+        pos.mark_closing().unwrap();
+        pos.record_yes_exit_fill(Decimal::new(52, 2)).unwrap();
+        pos.mark_exit_failed(FailureReason::ConnectivityError {
+            message: "NO sell error".to_string(),
+        });
+
+        assert_eq!(pos.yes_exit_price, Some(Decimal::new(52, 2)));
+        assert_eq!(pos.no_exit_price, None);
+
+        assert!(pos.attempt_exit_recovery());
+        pos.mark_closing().unwrap();
+        pos.record_no_exit_fill(Decimal::new(49, 2)).unwrap();
+        pos.close_via_recorded_exit(fee).unwrap();
+
+        assert_eq!(pos.state, PositionState::Closed);
+        assert_eq!(pos.yes_exit_price, Some(Decimal::new(52, 2)));
+        assert_eq!(pos.no_exit_price, Some(Decimal::new(49, 2)));
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(310, 2)));
     }
 
     #[test]

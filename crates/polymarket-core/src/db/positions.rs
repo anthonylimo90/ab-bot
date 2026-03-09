@@ -379,7 +379,7 @@ impl PositionRepository {
             .collect())
     }
 
-    /// Get ExitFailed positions eligible for retry (retry_count < 3).
+    /// Get ExitFailed positions that still need reconciliation.
     pub async fn get_failed_exits(&self) -> Result<Vec<Position>> {
         let rows = sqlx::query(
             r#"
@@ -390,7 +390,7 @@ impl PositionRepository {
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
             FROM positions
-            WHERE state = 6 AND retry_count < 3
+            WHERE state = 6
             ORDER BY last_updated ASC
             "#,
         )
@@ -503,8 +503,9 @@ impl PositionRepository {
     /// Returns true when the quant executor already has an active position in a market.
     ///
     /// This excludes legacy recommendation rows that share `source = 3` but were
-    /// not opened by the quant executor itself. Recovery states do not count as
-    /// open inventory for entry dedup because they are handled by the exit path.
+    /// not opened by the quant executor itself. Recovery states still count as
+    /// occupied inventory because the wallet remains exposed until the exit path
+    /// actually closes the position.
     pub async fn active_quant_executor_position_exists_for_market(
         &self,
         market_id: &str,
@@ -518,7 +519,7 @@ impl PositionRepository {
                   AND source = $2
                   AND source_signal_id IS NOT NULL
                   AND exit_strategy = 1
-                  AND state IN (0, 1, 2, 3)
+                  AND state IN (0, 1, 2, 3, 6, 7)
             )
             "#,
         )
@@ -533,7 +534,8 @@ impl PositionRepository {
     /// Count active positions currently owned by the quant executor.
     ///
     /// This excludes older advisory/recommendation rows with `source = 3`, and
-    /// only counts positions still occupying an execution slot.
+    /// only counts positions still occupying an execution slot, including
+    /// recovery states where inventory is still held by the wallet.
     pub async fn count_active_quant_executor_positions(&self) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
             r#"
@@ -542,7 +544,7 @@ impl PositionRepository {
             WHERE source = $1
               AND source_signal_id IS NOT NULL
               AND exit_strategy = 1
-              AND state IN (0, 1, 2, 3)
+              AND state IN (0, 1, 2, 3, 6, 7)
             "#,
         )
         .bind(SOURCE_RECOMMENDATION)
@@ -561,7 +563,7 @@ impl PositionRepository {
             WHERE source = $1
               AND source_signal_id IS NOT NULL
               AND exit_strategy = 1
-              AND state IN (0, 1, 2, 3)
+              AND state IN (0, 1, 2, 3, 6, 7)
             GROUP BY state
             ORDER BY state
             "#,
