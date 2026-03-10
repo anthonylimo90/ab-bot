@@ -36,6 +36,7 @@ pub mod learning_models;
 pub mod learning_rollouts;
 pub mod metrics_calculator;
 pub mod middleware;
+pub mod position_reconciler;
 pub mod quant_signal_executor;
 pub mod redis_forwarder;
 pub mod routes;
@@ -63,6 +64,7 @@ pub use learning_rollouts::{
     spawn_learning_rollout_observer, LearningRolloutController, LearningRolloutObserverConfig,
 };
 pub use metrics_calculator::{MetricsCalculator, MetricsCalculatorConfig};
+pub use position_reconciler::{spawn_position_reconciler, PositionReconcilerConfig};
 pub use quant_signal_executor::{spawn_quant_signal_executor, QuantSignalExecutorConfig};
 pub use redis_forwarder::{spawn_redis_forwarder, RedisForwarderConfig};
 pub use routes::create_router;
@@ -417,6 +419,10 @@ impl ApiServer {
         // Spawn rollout observer (persists guardrail observations and auto-rollbacks)
         let learning_rollout_observer_config = LearningRolloutObserverConfig::from_env();
         spawn_learning_rollout_observer(learning_rollout_observer_config, state.pool.clone());
+
+        // Reconcile open-position marks and expose legacy one-legged rows to recovery.
+        let position_reconciler_config = PositionReconcilerConfig::from_env();
+        spawn_position_reconciler(position_reconciler_config, state.pool.clone());
 
         // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
         let account_snapshot_config = AccountSnapshotConfig::from_env();

@@ -68,10 +68,7 @@ impl PositionRepository {
         .bind(position.resolution_payout_per_share)
         .bind(position.yes_entry_fee_shares)
         .bind(position.no_entry_fee_shares)
-        .bind(!matches!(
-            position.state,
-            PositionState::Closed | PositionState::EntryFailed
-        ))
+        .bind(position.should_persist_as_open())
         .bind(position.entry_timestamp)
         .execute(&self.pool)
         .await?;
@@ -98,6 +95,7 @@ impl PositionRepository {
                 failure_reason = $8,
                 retry_count = $9,
                 last_updated = $10,
+                updated_at = $10,
                 fee_model = $11,
                 resolution_payout_per_share = $12,
                 yes_entry_fee_shares = $13,
@@ -120,10 +118,7 @@ impl PositionRepository {
         .bind(position.resolution_payout_per_share)
         .bind(position.yes_entry_fee_shares)
         .bind(position.no_entry_fee_shares)
-        .bind(!matches!(
-            position.state,
-            PositionState::Closed | PositionState::EntryFailed
-        ))
+        .bind(position.should_persist_as_open())
         .execute(&self.pool)
         .await?;
 

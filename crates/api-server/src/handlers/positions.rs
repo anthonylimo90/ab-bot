@@ -223,7 +223,7 @@ pub async fn list_positions(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
         FROM positions
         WHERE 1 = 1
         "#,
@@ -321,7 +321,7 @@ pub async fn get_positions_summary(
                 COALESCE(entry_price, (yes_entry_price + no_entry_price), 0) AS entry_price,
                 (quantity * COALESCE(entry_price, (yes_entry_price + no_entry_price), 0)) AS entry_value,
                 unrealized_pnl,
-                COALESCE(updated_at, entry_timestamp) AS sort_updated
+                COALESCE(last_updated, updated_at, entry_timestamp) AS sort_updated
             FROM positions
             WHERE is_open = TRUE
         ),
@@ -443,7 +443,7 @@ pub async fn get_position(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
         FROM positions
         WHERE id = $1
         "#,
@@ -521,7 +521,7 @@ pub async fn close_position(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
         FROM positions
         WHERE id = $1
           AND state NOT IN (4, 5)

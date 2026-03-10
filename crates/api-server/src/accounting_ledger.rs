@@ -271,7 +271,7 @@ async fn load_account_valuation(pool: &PgPool) -> anyhow::Result<AccountValuatio
                 COALESCE(entry_price, (yes_entry_price + no_entry_price), 0) AS entry_price,
                 (quantity * COALESCE(entry_price, (yes_entry_price + no_entry_price), 0)) AS entry_value,
                 unrealized_pnl,
-                COALESCE(updated_at, entry_timestamp) AS sort_updated
+                COALESCE(last_updated, updated_at, entry_timestamp) AS sort_updated
             FROM positions
             WHERE is_open = TRUE
         ),

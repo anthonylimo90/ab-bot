@@ -441,6 +441,19 @@ impl Position {
         )
     }
 
+    /// Whether this row should stay visible as an open position in the API.
+    ///
+    /// Most non-closed states remain open. The one exception is `EntryFailed`,
+    /// which is normally terminal unless it represents a one-legged arb entry
+    /// that still holds live market exposure.
+    pub fn should_persist_as_open(&self) -> bool {
+        match self.state {
+            PositionState::Closed => false,
+            PositionState::EntryFailed => self.is_one_legged_entry_fail(),
+            _ => true,
+        }
+    }
+
     /// Check if position can be retried.
     pub fn can_retry(&self) -> bool {
         self.retry_count < MAX_RETRY_ATTEMPTS
