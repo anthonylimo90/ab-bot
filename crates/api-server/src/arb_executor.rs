@@ -33,6 +33,8 @@ use crate::websocket::{SignalType, SignalUpdate};
 pub struct ArbExecutorConfig {
     /// Whether auto-execution is enabled.
     pub enabled: bool,
+    /// Require an explicit operator acknowledgement before live arb orders can post.
+    pub allow_live_execution: bool,
     /// Base dollar amount per position (used when dynamic sizing is off).
     pub position_size: Decimal,
     /// Minimum net profit to consider a signal worth executing.
@@ -57,6 +59,7 @@ impl Default for ArbExecutorConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            allow_live_execution: false,
             position_size: Decimal::new(50, 0), // $50 base
             min_net_profit: Decimal::new(1, 3), // 0.001
             max_signal_age_secs: 30,
@@ -76,6 +79,9 @@ impl ArbExecutorConfig {
         Self {
             enabled: std::env::var("ARB_AUTO_EXECUTE")
                 .map(|v| v == "true")
+                .unwrap_or(false),
+            allow_live_execution: std::env::var("ARB_ALLOW_LIVE_EXECUTION")
+                .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             position_size: std::env::var("ARB_POSITION_SIZE")
                 .ok()
@@ -558,6 +564,7 @@ impl ArbAutoExecutor {
         }
         info!(
             enabled = startup_cfg.enabled,
+            allow_live_execution = startup_cfg.allow_live_execution,
             live_ready,
             position_size = %startup_cfg.position_size,
             min_position_size = %startup_cfg.min_position_size,
@@ -576,6 +583,11 @@ impl ArbAutoExecutor {
         }
         if !startup_cfg.enabled {
             warn!("ARB_AUTO_EXECUTE is disabled — signals will be logged but not executed.");
+        }
+        if live_ready && !startup_cfg.allow_live_execution {
+            warn!(
+                "Live arb execution is blocked until ARB_ALLOW_LIVE_EXECUTION=true is set explicitly."
+            );
         }
 
         // Mark liveness immediately so the dashboard doesn't flag a stale heartbeat
@@ -852,6 +864,23 @@ impl ArbAutoExecutor {
                 .await;
             return Ok(());
         }
+        if live_ready && !cfg.allow_live_execution {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.disabled_skips = runtime.disabled_skips.saturating_add(1);
+            runtime.record_decision(
+                &arb.market_id,
+                "skipped: live arb execution not acknowledged",
+            );
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(
+                &arb,
+                execution_mode,
+                "live_execution_not_acknowledged",
+                &telemetry,
+            )
+            .await;
+            return Ok(());
+        }
 
         let market_id = &arb.market_id;
 
@@ -970,43 +999,56 @@ impl ArbAutoExecutor {
 
         // 6. Market quality check — verify orderbook depth on both sides
         let depth_check_started_at = std::time::Instant::now();
-        {
-            let clob_client = self.order_executor.clob_client();
-            let (yes_book, no_book) = tokio::join!(
-                clob_client.get_order_book(&yes_token_id),
-                clob_client.get_order_book(&no_token_id)
-            );
-
-            if let (Ok(yb), Ok(nb)) = (&yes_book, &no_book) {
-                let yes_depth: Decimal = yb.asks.iter().map(|l| l.price * l.size).sum();
-                let no_depth: Decimal = nb.asks.iter().map(|l| l.price * l.size).sum();
-
-                if yes_depth < cfg.min_book_depth || no_depth < cfg.min_book_depth {
-                    let mut runtime = self.runtime_status.write().await;
-                    runtime.depth_skips = runtime.depth_skips.saturating_add(1);
-                    runtime.record_decision(
-                        market_id,
-                        format!(
-                            "skipped: insufficient depth yes={} no={} min={}",
-                            yes_depth, no_depth, cfg.min_book_depth
-                        ),
-                    );
-                    info!(
-                        market_id = %market_id,
-                        yes_depth = %yes_depth,
-                        no_depth = %no_depth,
-                        min_depth = %cfg.min_book_depth,
-                        "Arb signal insufficient orderbook depth, skipping"
-                    );
-                    telemetry.depth_check_ms =
-                        Some(depth_check_started_at.elapsed().as_millis() as i64);
-                    telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
-                    telemetry.finish_total(&process_started_at);
-                    self.record_skip_event(&arb, execution_mode, "insufficient_depth", &telemetry)
-                        .await;
-                    return Ok(());
-                }
+        let clob_client = self.order_executor.clob_client();
+        let (yes_book, no_book) = tokio::join!(
+            clob_client.get_order_book(&yes_token_id),
+            clob_client.get_order_book(&no_token_id)
+        );
+        let (yes_book, no_book) = match (yes_book, no_book) {
+            (Ok(yes_book), Ok(no_book)) => (yes_book, no_book),
+            (Err(error), _) | (_, Err(error)) => {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.depth_skips = runtime.depth_skips.saturating_add(1);
+                runtime.record_decision(
+                    market_id,
+                    format!("skipped: orderbook unavailable during preflight: {error}"),
+                );
+                telemetry.depth_check_ms =
+                    Some(depth_check_started_at.elapsed().as_millis() as i64);
+                telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+                telemetry.finish_total(&process_started_at);
+                self.record_skip_event(&arb, execution_mode, "orderbook_unavailable", &telemetry)
+                    .await;
+                return Ok(());
             }
+        };
+
+        let yes_depth: Decimal = yes_book.asks.iter().map(|l| l.price * l.size).sum();
+        let no_depth: Decimal = no_book.asks.iter().map(|l| l.price * l.size).sum();
+
+        if yes_depth < cfg.min_book_depth || no_depth < cfg.min_book_depth {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.depth_skips = runtime.depth_skips.saturating_add(1);
+            runtime.record_decision(
+                market_id,
+                format!(
+                    "skipped: insufficient depth yes={} no={} min={}",
+                    yes_depth, no_depth, cfg.min_book_depth
+                ),
+            );
+            info!(
+                market_id = %market_id,
+                yes_depth = %yes_depth,
+                no_depth = %no_depth,
+                min_depth = %cfg.min_book_depth,
+                "Arb signal insufficient orderbook depth, skipping"
+            );
+            telemetry.depth_check_ms = Some(depth_check_started_at.elapsed().as_millis() as i64);
+            telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "insufficient_depth", &telemetry)
+                .await;
+            return Ok(());
         }
         telemetry.depth_check_ms = Some(depth_check_started_at.elapsed().as_millis() as i64);
 
@@ -1075,6 +1117,56 @@ impl ArbAutoExecutor {
             return Ok(());
         }
         let quantity = position_size / arb.total_cost;
+        if live_ready {
+            let Some(yes_best_ask) = yes_book.best_ask() else {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.depth_skips = runtime.depth_skips.saturating_add(1);
+                runtime.record_decision(market_id, "skipped: YES best ask missing");
+                telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+                telemetry.finish_total(&process_started_at);
+                self.record_skip_event(&arb, execution_mode, "yes_best_ask_missing", &telemetry)
+                    .await;
+                return Ok(());
+            };
+            let Some(no_best_ask) = no_book.best_ask() else {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.depth_skips = runtime.depth_skips.saturating_add(1);
+                runtime.record_decision(market_id, "skipped: NO best ask missing");
+                telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+                telemetry.finish_total(&process_started_at);
+                self.record_skip_event(&arb, execution_mode, "no_best_ask_missing", &telemetry)
+                    .await;
+                return Ok(());
+            };
+
+            let required_collateral = quantity * (yes_best_ask + no_best_ask);
+            if let Err(error) = self
+                .order_executor
+                .ensure_live_buying_power(required_collateral)
+                .await
+            {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+                runtime.record_decision(
+                    market_id,
+                    format!(
+                        "skipped: insufficient pair buying power required={} error={error}",
+                        required_collateral
+                    ),
+                );
+                telemetry.failure_stage = Some("pair_capacity_preflight".to_string());
+                telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+                telemetry.finish_total(&process_started_at);
+                self.record_skip_event(
+                    &arb,
+                    execution_mode,
+                    "insufficient_pair_buying_power",
+                    &telemetry,
+                )
+                .await;
+                return Ok(());
+            }
+        }
         telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
 
         // Fee drag tracking: `fee_drag` is the worst-case reduction in resolution payout per pair.
@@ -1200,6 +1292,8 @@ impl ArbAutoExecutor {
             return Ok(());
         }
         let yes_order_finished_at = std::time::Instant::now();
+        position.quantity = yes_report.filled_quantity;
+        position.yes_entry_price = yes_report.average_price;
 
         // 11. Execute NO market order
         let no_order = MarketOrder::new(market_id.clone(), no_token_id, OrderSide::Buy, quantity);
@@ -1222,19 +1316,16 @@ impl ArbAutoExecutor {
                 runtime
                     .record_decision(market_id, format!("execution failure: NO order error: {e}"));
                 error!(error = %e, market_id = %market_id, "NO order execution error (one-legged)");
-                position.mark_entry_failed(FailureReason::ConnectivityError {
-                    message: format!("NO order error (one-legged, YES filled): {e}"),
-                });
-                let _ = self.position_repo.update(&position).await;
-                self.record_failure_event(
-                    execution_mode,
+                self.transition_one_legged_to_exit_ready(
+                    &mut position,
                     market_id,
-                    &position,
-                    "no_order_error",
+                    yes_report.average_price,
                     &telemetry,
+                    execution_mode,
+                    format!("NO order error after YES fill: {e}"),
                 )
                 .await;
-                self.publish_failure_signal(market_id, "NO order error (one-legged)");
+                self.publish_failure_signal(market_id, "One-legged position moved to exit queue");
                 return Ok(());
             }
         };
@@ -1256,23 +1347,21 @@ impl ArbAutoExecutor {
             warn!(
                 market_id = %market_id,
                 reason = %msg,
-                "NO order failed (one-legged, YES filled — flagged for review)"
+                "NO order failed after YES fill; moving position to exit queue"
             );
-            position.mark_entry_failed(FailureReason::OrderRejected {
-                message: format!("One-legged: YES filled but NO failed: {msg}"),
-            });
-            let _ = self.position_repo.update(&position).await;
-            self.record_failure_event(
-                execution_mode,
+            self.transition_one_legged_to_exit_ready(
+                &mut position,
                 market_id,
-                &position,
-                "no_order_rejected",
+                yes_report.average_price,
                 &telemetry,
+                execution_mode,
+                format!("NO order rejected after YES fill: {msg}"),
             )
             .await;
-            self.publish_failure_signal(market_id, "One-legged position (NO failed)");
+            self.publish_failure_signal(market_id, "One-legged position moved to exit queue");
             return Ok(());
         }
+        position.no_entry_price = no_report.average_price;
 
         let actual_fill_cost = yes_report.total_value() + no_report.total_value();
         let modeled_fill_cost = arb.total_cost * quantity;
@@ -1423,6 +1512,109 @@ impl ArbAutoExecutor {
             }),
         };
         let _ = self.signal_tx.send(signal);
+    }
+
+    async fn transition_one_legged_to_exit_ready(
+        &self,
+        position: &mut Position,
+        market_id: &str,
+        yes_fill_price: Decimal,
+        telemetry: &ArbExecutionTelemetry,
+        execution_mode: &str,
+        reason: String,
+    ) {
+        position.yes_entry_price = yes_fill_price;
+        position.no_entry_price = Decimal::ZERO;
+
+        if let Err(error) = position.mark_open() {
+            error!(
+                position_id = %position.id,
+                market_id = %market_id,
+                error = %error,
+                "Failed to transition one-legged position to Open"
+            );
+            position.mark_entry_failed(FailureReason::OrderRejected { message: reason });
+            let _ = self.position_repo.update(position).await;
+            self.record_failure_event(
+                execution_mode,
+                market_id,
+                position,
+                "one_legged_transition_open_failed",
+                telemetry,
+            )
+            .await;
+            return;
+        }
+
+        if let Err(error) = position.mark_exit_ready() {
+            error!(
+                position_id = %position.id,
+                market_id = %market_id,
+                error = %error,
+                "Failed to transition one-legged position to ExitReady"
+            );
+            position.mark_entry_failed(FailureReason::OrderRejected { message: reason });
+            let _ = self.position_repo.update(position).await;
+            self.record_failure_event(
+                execution_mode,
+                market_id,
+                position,
+                "one_legged_transition_exit_ready_failed",
+                telemetry,
+            )
+            .await;
+            return;
+        }
+
+        position.failure_reason = Some(FailureReason::OrderRejected {
+            message: reason.clone(),
+        });
+        position.last_updated = Utc::now();
+
+        if let Err(error) = self.position_repo.update(position).await {
+            error!(
+                position_id = %position.id,
+                market_id = %market_id,
+                error = %error,
+                "Failed to persist one-legged position queued for exit"
+            );
+            return;
+        }
+
+        self.active_markets
+            .write()
+            .await
+            .insert(market_id.to_string());
+
+        self.trade_event_recorder
+            .record_warn(
+                NewTradeEvent::new(
+                    "arb",
+                    execution_mode.to_string(),
+                    "arb",
+                    market_id.to_string(),
+                    "one_legged_exit_ready",
+                )
+                .with_position(position.id)
+                .with_state(Some("pending"), Some("exit_ready"))
+                .with_reason(Some("one_legged_position"))
+                .with_metadata(merge_metadata(
+                    serde_json::json!({
+                        "reason": reason,
+                        "quantity": position.quantity.to_string(),
+                        "yes_entry_price": position.yes_entry_price.to_string(),
+                    }),
+                    telemetry,
+                )),
+            )
+            .await;
+
+        warn!(
+            position_id = %position.id,
+            market_id = %market_id,
+            quantity = %position.quantity,
+            "Queued one-legged position for exit handling"
+        );
     }
 
     async fn record_skip_event(
@@ -1597,6 +1789,7 @@ mod tests {
     fn test_config_default() {
         let config = ArbExecutorConfig::default();
         assert!(!config.enabled);
+        assert!(!config.allow_live_execution);
         assert_eq!(config.position_size, Decimal::new(50, 0));
         assert_eq!(config.min_net_profit, Decimal::new(1, 3));
         assert_eq!(config.max_signal_age_secs, 30);

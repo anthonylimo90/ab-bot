@@ -544,6 +544,30 @@ impl OrderExecutor {
         &self.clob_client
     }
 
+    /// Verify that the live wallet has enough collateral balance and allowance
+    /// for a multi-leg buy before any leg is submitted.
+    pub async fn ensure_live_buying_power(&self, required_collateral: Decimal) -> Result<()> {
+        if required_collateral <= Decimal::ZERO || !self.is_live_ready().await {
+            return Ok(());
+        }
+
+        let client_guard = self.auth_client.read().await;
+        let Some(client) = client_guard.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "Live trading wallet is not initialized for collateral preflight"
+            ));
+        };
+
+        Self::ensure_live_order_capacity(
+            client,
+            Uuid::new_v4(),
+            OrderSide::Buy,
+            "collateral",
+            required_collateral,
+        )
+        .await
+    }
+
     // Private methods
 
     async fn refresh_clob_allowance_cache_for_client(client: &AuthenticatedClobClient) {
@@ -842,8 +866,32 @@ impl OrderExecutor {
             "Live market order submitted"
         );
 
-        // Verify FOK fill status — don't blindly assume success
-        if response.is_unfilled() {
+        let clob_status = response.status.to_lowercase();
+
+        // Verify FOK fill status — only a confirmed match is treated as filled.
+        if response.is_unfilled() || clob_status != "matched" {
+            if clob_status != "matched" {
+                match client.cancel_order(&response.order_id).await {
+                    Ok(()) => {
+                        warn!(
+                            order_id = %order.id,
+                            clob_order_id = %response.order_id,
+                            clob_status = %response.status,
+                            "Cancelled non-matched FOK order before treating it as rejected"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            order_id = %order.id,
+                            clob_order_id = %response.order_id,
+                            clob_status = %response.status,
+                            error = %error,
+                            "Failed to cancel non-matched FOK order"
+                        );
+                    }
+                }
+            }
+
             warn!(
                 order_id = %order.id,
                 clob_status = %response.status,
@@ -854,7 +902,10 @@ impl OrderExecutor {
                 order.market_id.clone(),
                 order.outcome_id.clone(),
                 order.side,
-                format!("FOK order unfilled: status={}", response.status),
+                format!(
+                    "FOK order did not confirm a match: status={}",
+                    response.status
+                ),
             ));
         }
 

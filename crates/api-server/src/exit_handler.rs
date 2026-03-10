@@ -11,6 +11,7 @@
 use chrono::Utc;
 use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::error::Error as PolymarketError;
 use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
 use polymarket_core::types::{FailureReason, MarketOrder, OrderSide, Position, PositionState};
 use risk_manager::circuit_breaker::CircuitBreaker;
@@ -504,16 +505,24 @@ impl ExitHandler {
 
         let (has_yes, has_no) = held_outcomes(position);
         if has_yes {
-            let yes_order = MarketOrder::new(
-                market_id.clone(),
-                yes_token_id,
-                OrderSide::Sell,
-                position.quantity,
-            );
-
-            let yes_report = match self.order_executor.execute_market_order(yes_order).await {
+            let yes_report = match self
+                .execute_sell_order_with_refresh(
+                    &market_id,
+                    "YES",
+                    &yes_token_id,
+                    OrderSide::Sell,
+                    position.quantity,
+                )
+                .await
+            {
                 Ok(report) => report,
                 Err(e) => {
+                    if self
+                        .close_via_resolution_if_market_resolved(position, quant_ctx.as_ref())
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     error!(error = %e, market_id = %market_id, "YES sell order error");
                     position.mark_exit_failed(FailureReason::ConnectivityError {
                         message: format!("YES sell error: {e}"),
@@ -558,16 +567,24 @@ impl ExitHandler {
         }
 
         if has_no {
-            let no_order = MarketOrder::new(
-                market_id.clone(),
-                no_token_id,
-                OrderSide::Sell,
-                position.quantity,
-            );
-
-            let no_report = match self.order_executor.execute_market_order(no_order).await {
+            let no_report = match self
+                .execute_sell_order_with_refresh(
+                    &market_id,
+                    "NO",
+                    &no_token_id,
+                    OrderSide::Sell,
+                    position.quantity,
+                )
+                .await
+            {
                 Ok(report) => report,
                 Err(e) => {
+                    if self
+                        .close_via_resolution_if_market_resolved(position, quant_ctx.as_ref())
+                        .await?
+                    {
+                        return Ok(());
+                    }
                     error!(error = %e, market_id = %market_id, "NO sell order error");
                     position.mark_exit_failed(FailureReason::ConnectivityError {
                         message: format!("NO sell error: {e}"),
@@ -1291,7 +1308,85 @@ impl ExitHandler {
         }
     }
 
-    /// Process one-legged entry failures: attempt to buy the missing NO leg.
+    async fn execute_sell_order_with_refresh(
+        &self,
+        market_id: &str,
+        leg: &str,
+        token_id: &str,
+        side: OrderSide,
+        quantity: Decimal,
+    ) -> anyhow::Result<polymarket_core::types::ExecutionReport> {
+        let order = MarketOrder::new(market_id.to_string(), token_id.to_string(), side, quantity);
+
+        match self.order_executor.execute_market_order(order).await {
+            Ok(report) => Ok(report),
+            Err(error) if is_not_found_error(&error) => {
+                warn!(
+                    market_id = %market_id,
+                    token_id = %token_id,
+                    error = %error,
+                    "Sell leg hit 404; refreshing token cache and retrying once"
+                );
+
+                if let Err(refresh_error) = self.token_cache.refresh().await {
+                    warn!(
+                        market_id = %market_id,
+                        error = %refresh_error,
+                        "Failed to refresh exit token cache after sell-side 404"
+                    );
+                }
+
+                let Some((yes_token_id, no_token_id)) =
+                    self.resolve_market_tokens(market_id).await?
+                else {
+                    return Err(error);
+                };
+                let refreshed_token_id = if leg == "YES" {
+                    yes_token_id
+                } else {
+                    no_token_id
+                };
+
+                if refreshed_token_id == token_id {
+                    return Err(error);
+                }
+
+                let retry_order =
+                    MarketOrder::new(market_id.to_string(), refreshed_token_id, side, quantity);
+                self.order_executor.execute_market_order(retry_order).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn close_via_resolution_if_market_resolved(
+        &self,
+        position: &mut Position,
+        quant_ctx: Option<&QuantExitContext>,
+    ) -> anyhow::Result<bool> {
+        let market = match self.clob_client.get_market_by_id(&position.market_id).await {
+            Ok(market) => market,
+            Err(error) => {
+                warn!(
+                    market_id = %position.market_id,
+                    error = %error,
+                    "Failed to check market resolution after sell failure"
+                );
+                return Ok(false);
+            }
+        };
+
+        if !market.resolved {
+            return Ok(false);
+        }
+
+        let source = if quant_ctx.is_some() { 3 } else { 1 };
+        self.close_open_position_via_resolution(position, source, quant_ctx)
+            .await?;
+        Ok(true)
+    }
+
+    /// Process one-legged entry failures by flattening the filled YES leg.
     async fn process_one_legged_recovery(&self) -> anyhow::Result<()> {
         let positions = self.position_repo.get_one_legged_entry_failed().await?;
         if positions.is_empty() {
@@ -1305,87 +1400,45 @@ impl ExitHandler {
 
         for mut position in positions {
             let market_id = position.market_id.clone();
-
-            // Resolve NO token ID
-            let (_yes_token_id, no_token_id) = match self.resolve_market_tokens(&market_id).await? {
-                Some(ids) => ids,
-                None => {
-                    warn!(
-                        market_id = %market_id,
-                        position_id = %position.id,
-                        "Cannot recover one-legged: no token IDs for market"
-                    );
-                    continue;
-                }
-            };
-
-            // Attempt to buy the NO leg
-            let no_order = MarketOrder::new(
-                market_id.clone(),
-                no_token_id,
-                OrderSide::Buy,
-                position.quantity,
-            );
-
-            let no_report = match self.order_executor.execute_market_order(no_order).await {
-                Ok(report) => report,
-                Err(e) => {
-                    warn!(
-                        market_id = %market_id,
-                        position_id = %position.id,
-                        error = %e,
-                        "One-legged recovery: NO order execution error"
-                    );
-                    // Increment retry count to avoid infinite loops
-                    position.retry_count += 1;
-                    position.last_updated = Utc::now();
-                    let _ = self.position_repo.update(&position).await;
-                    continue;
-                }
-            };
-
-            if !no_report.is_success() {
-                let msg = no_report
-                    .error_message
-                    .unwrap_or_else(|| "NO order not filled".to_string());
+            if position.yes_entry_price <= Decimal::ZERO {
                 warn!(
                     market_id = %market_id,
                     position_id = %position.id,
-                    reason = %msg,
-                    "One-legged recovery: NO order failed"
+                    "Cannot flatten one-legged position without a recorded YES entry price"
                 );
-                position.retry_count += 1;
-                position.last_updated = Utc::now();
-                let _ = self.position_repo.update(&position).await;
                 continue;
             }
 
-            // NO leg filled — transition to Open
-            match position.recover_one_legged_to_open() {
-                Ok(()) => {
-                    let _ = self.position_repo.update(&position).await;
-                    // Add to dedup set since position is now active
-                    self.arb_dedup.write().await.insert(market_id.clone());
+            position.no_entry_price = Decimal::ZERO;
+            position.state = PositionState::ExitReady;
+            position.retry_count += 1;
+            position.last_updated = Utc::now();
 
-                    self.publish_alert(
-                        &market_id,
-                        "one_legged_recovered",
-                        "NO leg placed, position now Open",
-                    );
-                    info!(
-                        market_id = %market_id,
-                        position_id = %position.id,
-                        "One-legged position recovered to Open"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        market_id = %market_id,
-                        position_id = %position.id,
-                        error = %e,
-                        "One-legged recovery: state transition failed"
-                    );
-                }
+            if let Err(error) = self.position_repo.update(&position).await {
+                warn!(
+                    market_id = %market_id,
+                    position_id = %position.id,
+                    error = %error,
+                    "Failed to persist one-legged position for flattening"
+                );
+                continue;
+            }
+
+            self.arb_dedup.write().await.insert(market_id.clone());
+
+            if let Err(error) = self.execute_exit(&mut position).await {
+                warn!(
+                    market_id = %market_id,
+                    position_id = %position.id,
+                    error = %error,
+                    "One-legged flattening attempt failed"
+                );
+            } else {
+                info!(
+                    market_id = %market_id,
+                    position_id = %position.id,
+                    "One-legged position sent through exit flow for flattening"
+                );
             }
         }
 
@@ -1507,6 +1560,27 @@ fn parse_quant_kind(kind: &str) -> Option<QuantSignalKind> {
         "resolution_proximity" => Some(QuantSignalKind::ResolutionProximity),
         _ => None,
     }
+}
+
+fn is_not_found_error(error: &anyhow::Error) -> bool {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<PolymarketError>()
+            .is_some_and(|source| {
+                matches!(
+                    source,
+                    PolymarketError::Api {
+                        status: Some(404),
+                        ..
+                    }
+                )
+            })
+    }) {
+        return true;
+    }
+
+    let lower = error.to_string().to_lowercase();
+    lower.contains("404") || lower.contains("not found")
 }
 
 fn parse_signal_direction(direction: &str) -> Option<SignalDirection> {
