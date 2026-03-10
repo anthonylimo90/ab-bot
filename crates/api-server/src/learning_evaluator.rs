@@ -259,12 +259,12 @@ async fn evaluate_arb_binary_model(
         )
         SELECT
             COUNT(*)::bigint AS sample_size,
-            AVG(predicted_score) AS avg_predicted,
-            AVG(actual) AS avg_actual,
-            AVG(POWER(predicted_score - actual, 2)) AS brier_score,
-            AVG(threshold) AS avg_threshold,
+            AVG(predicted_score)::double precision AS avg_predicted,
+            AVG(actual)::double precision AS avg_actual,
+            AVG(POWER(predicted_score - actual, 2))::double precision AS brier_score,
+            AVG(threshold)::double precision AS avg_threshold,
             COUNT(*) FILTER (WHERE recommended_action = 'execute')::bigint AS execute_count,
-            AVG(actual) FILTER (WHERE recommended_action = 'execute') AS execute_actual_rate
+            AVG(actual) FILTER (WHERE recommended_action = 'execute')::double precision AS execute_actual_rate
         FROM matched
         "#,
     );
@@ -335,13 +335,13 @@ async fn evaluate_arb_regression_model(
         )
         SELECT
             COUNT(*)::bigint AS sample_size,
-            AVG(predicted_score) AS avg_predicted,
-            AVG(actual) AS avg_actual,
-            AVG(ABS(predicted_score - actual)) AS mae,
-            SQRT(AVG(POWER(predicted_score - actual, 2))) AS rmse,
-            AVG(threshold) AS avg_threshold,
+            AVG(predicted_score)::double precision AS avg_predicted,
+            AVG(actual)::double precision AS avg_actual,
+            AVG(ABS(predicted_score - actual))::double precision AS mae,
+            SQRT(AVG(POWER(predicted_score - actual, 2)))::double precision AS rmse,
+            AVG(threshold)::double precision AS avg_threshold,
             COUNT(*) FILTER (WHERE recommended_action = 'execute')::bigint AS execute_count,
-            AVG(actual) FILTER (WHERE recommended_action = 'execute') AS execute_actual_average
+            AVG(actual) FILTER (WHERE recommended_action = 'execute')::double precision AS execute_actual_average
         FROM matched
         "#,
     );
@@ -419,12 +419,12 @@ async fn evaluate_quant_binary_model(
         )
         SELECT
             COUNT(*)::bigint AS sample_size,
-            AVG(predicted_score) AS avg_predicted,
-            AVG(actual) AS avg_actual,
-            AVG(POWER(predicted_score - actual, 2)) AS brier_score,
-            AVG(threshold) AS avg_threshold,
+            AVG(predicted_score)::double precision AS avg_predicted,
+            AVG(actual)::double precision AS avg_actual,
+            AVG(POWER(predicted_score - actual, 2))::double precision AS brier_score,
+            AVG(threshold)::double precision AS avg_threshold,
             COUNT(*) FILTER (WHERE recommended_action = 'execute')::bigint AS execute_count,
-            AVG(actual) FILTER (WHERE recommended_action = 'execute') AS execute_actual_rate
+            AVG(actual) FILTER (WHERE recommended_action = 'execute')::double precision AS execute_actual_rate
         FROM matched
         "#,
     );
@@ -500,13 +500,13 @@ async fn evaluate_quant_regression_model(
         )
         SELECT
             COUNT(*)::bigint AS sample_size,
-            AVG(predicted_score) AS avg_predicted,
-            AVG(actual) AS avg_actual,
-            AVG(ABS(predicted_score - actual)) AS mae,
-            SQRT(AVG(POWER(predicted_score - actual, 2))) AS rmse,
-            AVG(threshold) AS avg_threshold,
+            AVG(predicted_score)::double precision AS avg_predicted,
+            AVG(actual)::double precision AS avg_actual,
+            AVG(ABS(predicted_score - actual))::double precision AS mae,
+            SQRT(AVG(POWER(predicted_score - actual, 2)))::double precision AS rmse,
+            AVG(threshold)::double precision AS avg_threshold,
             COUNT(*) FILTER (WHERE recommended_action = 'execute')::bigint AS execute_count,
-            AVG(actual) FILTER (WHERE recommended_action = 'execute') AS execute_actual_average
+            AVG(actual) FILTER (WHERE recommended_action = 'execute')::double precision AS execute_actual_average
         FROM matched
         "#,
     );

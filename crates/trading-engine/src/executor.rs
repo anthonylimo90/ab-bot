@@ -3,7 +3,7 @@
 use anyhow::Result;
 use auth::TradingWallet;
 use dashmap::DashMap;
-use polymarket_core::api::clob::{AuthenticatedClobClient, OrderType};
+use polymarket_core::api::clob::{AuthenticatedClobClient, BalanceAllowanceResponse, OrderType};
 use polymarket_core::api::ClobClient;
 use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
 use polymarket_core::types::{ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus};
@@ -107,6 +107,10 @@ fn is_balance_allowance_error(error: &str) -> bool {
         || error_lower.contains("insufficient balance")
         || error_lower.contains("insufficient allowance")
         || (error_lower.contains("balance") && error_lower.contains("allowance"))
+}
+
+fn parse_decimal_value(raw: &str) -> Option<Decimal> {
+    raw.trim().parse::<Decimal>().ok()
 }
 
 /// Low-latency order executor for Polymarket CLOB.
@@ -551,6 +555,114 @@ impl OrderExecutor {
         }
     }
 
+    async fn get_balance_allowance_snapshot(
+        client: &AuthenticatedClobClient,
+        asset_type: &str,
+        token_id: Option<&str>,
+    ) -> Option<BalanceAllowanceResponse> {
+        match client.get_balance_allowance(token_id, asset_type).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    asset_type,
+                    token_id,
+                    "Failed to query CLOB balance/allowance snapshot"
+                );
+                None
+            }
+        }
+    }
+
+    async fn ensure_live_order_capacity(
+        client: &AuthenticatedClobClient,
+        order_id: Uuid,
+        side: OrderSide,
+        token_id: &str,
+        required_amount: Decimal,
+    ) -> Result<()> {
+        if required_amount <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        let (asset_type, balance_token_id, asset_label) = match side {
+            OrderSide::Buy => ("COLLATERAL", None, "collateral"),
+            OrderSide::Sell => ("CONDITIONAL", Some(token_id), "conditional"),
+        };
+
+        let mut snapshot = match Self::get_balance_allowance_snapshot(
+            client,
+            asset_type,
+            balance_token_id,
+        )
+        .await
+        {
+            Some(snapshot) => snapshot,
+            None => return Ok(()),
+        };
+
+        let mut balance = parse_decimal_value(&snapshot.balance);
+        let mut allowance = parse_decimal_value(&snapshot.allowance);
+
+        let balance_short = balance.is_some_and(|value| value < required_amount);
+        let allowance_short = allowance.is_some_and(|value| value < required_amount);
+
+        if balance_short || allowance_short {
+            warn!(
+                order_id = %order_id,
+                asset_type,
+                token_id,
+                balance = %snapshot.balance,
+                allowance = %snapshot.allowance,
+                required_amount = %required_amount,
+                "CLOB balance/allowance preflight indicates insufficient capacity; refreshing before submit"
+            );
+
+            if let Err(error) = client.update_balance_allowance(asset_type).await {
+                warn!(
+                    error = %error,
+                    order_id = %order_id,
+                    asset_type,
+                    "Failed to refresh CLOB balance/allowance before live submit"
+                );
+            }
+
+            snapshot =
+                match Self::get_balance_allowance_snapshot(client, asset_type, balance_token_id)
+                    .await
+                {
+                    Some(snapshot) => snapshot,
+                    None => return Ok(()),
+                };
+            balance = parse_decimal_value(&snapshot.balance);
+            allowance = parse_decimal_value(&snapshot.allowance);
+        }
+
+        if let Some(value) = balance {
+            if value < required_amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient {} balance for live order: available {}, required {}",
+                    asset_label,
+                    value,
+                    required_amount
+                ));
+            }
+        }
+
+        if let Some(value) = allowance {
+            if value < required_amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient {} allowance for live order: available {}, required {}",
+                    asset_label,
+                    value,
+                    required_amount
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
         let client_guard = self.auth_client.read().await;
@@ -679,6 +791,15 @@ impl OrderExecutor {
             OrderSide::Sell => order.quantity,
         };
 
+        Self::ensure_live_order_capacity(
+            client,
+            order.id,
+            order.side,
+            &order.outcome_id,
+            market_amount,
+        )
+        .await?;
+
         // Create signed order (FOK for market orders, expiration=0)
         let signed_order = client
             .create_market_order(
@@ -779,6 +900,20 @@ impl OrderExecutor {
                 "Live trading not initialized - call initialize_live_trading() first"
             ));
         }
+
+        let required_amount = match order.side {
+            OrderSide::Buy => order.quantity * order.price,
+            OrderSide::Sell => order.quantity,
+        };
+
+        Self::ensure_live_order_capacity(
+            client,
+            order.id,
+            order.side,
+            &order.outcome_id,
+            required_amount,
+        )
+        .await?;
 
         // Create signed order (GTC for limit orders, expiration=0)
         let signed_order = client
@@ -992,6 +1127,14 @@ mod tests {
             "Balance and allowance are stale"
         ));
         assert!(!is_balance_allowance_error("invalid order"));
+    }
+
+    #[test]
+    fn test_parse_decimal_value() {
+        assert_eq!(parse_decimal_value("12.34"), Some(Decimal::new(1234, 2)));
+        assert_eq!(parse_decimal_value(" 0 "), Some(Decimal::ZERO));
+        assert_eq!(parse_decimal_value(""), None);
+        assert_eq!(parse_decimal_value("abc"), None);
     }
 
     #[test]
