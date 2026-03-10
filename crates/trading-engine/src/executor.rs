@@ -550,9 +550,6 @@ impl OrderExecutor {
         if let Err(error) = client.update_balance_allowance("COLLATERAL").await {
             warn!(error = %error, "Failed to refresh CLOB collateral allowance cache");
         }
-        if let Err(error) = client.update_balance_allowance("CONDITIONAL").await {
-            warn!(error = %error, "Failed to refresh CLOB conditional allowance cache");
-        }
     }
 
     async fn get_balance_allowance_snapshot(
@@ -618,7 +615,10 @@ impl OrderExecutor {
                 "CLOB balance/allowance preflight indicates insufficient capacity; refreshing before submit"
             );
 
-            if let Err(error) = client.update_balance_allowance(asset_type).await {
+            if let Err(error) = client
+                .update_balance_allowance_for_token(asset_type, balance_token_id)
+                .await
+            {
                 warn!(
                     error = %error,
                     order_id = %order_id,

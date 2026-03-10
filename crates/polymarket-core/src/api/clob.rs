@@ -1663,16 +1663,24 @@ impl AuthenticatedClobClient {
     /// Tell the CLOB server to re-read on-chain balance/allowance state.
     ///
     /// Must be called after setting on-chain approvals so the CLOB picks up the
-    /// new allowance values. `signature_type` is 0 for EOA wallets.
-    pub async fn update_balance_allowance(&self, asset_type: &str) -> Result<()> {
+    /// new allowance values. `signature_type` is 0 for EOA wallets. Conditional
+    /// asset refreshes require a token id.
+    pub async fn update_balance_allowance_for_token(
+        &self,
+        asset_type: &str,
+        token_id: Option<&str>,
+    ) -> Result<()> {
         let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
             message: "API credentials not set".to_string(),
         })?;
 
-        let url = format!(
+        let mut url = format!(
             "{}/balance-allowance/update?asset_type={}&signature_type=0",
             self.client.base_url, asset_type
         );
+        if let Some(tid) = token_id {
+            url.push_str(&format!("&token_id={}", tid));
+        }
 
         let timestamp = current_timestamp().to_string();
         let method = "GET";
@@ -1698,13 +1706,20 @@ impl AuthenticatedClobClient {
                 status,
                 response = %text,
                 asset_type,
+                token_id,
                 "Failed to update CLOB balance-allowance cache"
             );
         } else {
-            info!(asset_type, "CLOB balance-allowance cache updated");
+            info!(asset_type, token_id, "CLOB balance-allowance cache updated");
         }
 
         Ok(())
+    }
+
+    /// Refresh collateral balance/allowance state without a token-specific scope.
+    pub async fn update_balance_allowance(&self, asset_type: &str) -> Result<()> {
+        self.update_balance_allowance_for_token(asset_type, None)
+            .await
     }
 
     /// Create and sign an order.
