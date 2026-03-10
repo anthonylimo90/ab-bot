@@ -79,6 +79,7 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 p.no_entry_price,
                 p.yes_exit_price,
                 p.no_exit_price,
+                p.failure_reason,
                 CASE
                     WHEN p.state = 5
                         AND (
@@ -88,6 +89,21 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                     THEN TRUE
                     ELSE FALSE
                 END AS one_legged_entry_failed,
+                CASE
+                    WHEN p.state = 6
+                        AND (
+                            p.failure_reason ILIKE '%one-legged%'
+                            OR p.failure_reason ILIKE '%one_legged%'
+                            OR p.failure_reason ILIKE '%sell%'
+                            OR p.failure_reason ILIKE '%exit%'
+                            OR p.failure_reason ILIKE '%token id%'
+                        )
+                    THEN TRUE
+                    WHEN p.state = 6
+                        AND (p.yes_exit_price IS NOT NULL OR p.no_exit_price IS NOT NULL)
+                    THEN TRUE
+                    ELSE FALSE
+                END AS exit_failure_with_live_exposure,
                 m.yes_price,
                 m.no_price
             FROM positions p
@@ -107,14 +123,18 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 no_entry_price,
                 CASE
                     WHEN one_legged_entry_failed THEN TRUE
+                    WHEN state = 6 AND NOT exit_failure_with_live_exposure THEN FALSE
                     ELSE yes_entry_price > 0 AND yes_exit_price IS NULL
                 END AS holds_yes,
                 CASE
                     WHEN one_legged_entry_failed THEN FALSE
+                    WHEN state = 6 AND NOT exit_failure_with_live_exposure THEN FALSE
                     ELSE no_entry_price > 0 AND no_exit_price IS NULL
                 END AS holds_no,
                 yes_price,
-                no_price
+                no_price,
+                one_legged_entry_failed,
+                exit_failure_with_live_exposure
             FROM candidate_positions
         ),
         candidate_updates AS (
@@ -126,12 +146,16 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 unrealized_pnl,
                 (
                     CASE
-                        WHEN holds_yes THEN COALESCE(yes_price, yes_entry_price)
-                        ELSE 0::numeric
-                    END +
-                    CASE
-                        WHEN holds_no THEN COALESCE(no_price, no_entry_price)
-                        ELSE 0::numeric
+                        WHEN holds_yes OR holds_no THEN
+                            CASE
+                                WHEN holds_yes THEN COALESCE(yes_price, yes_entry_price)
+                                ELSE 0::numeric
+                            END +
+                            CASE
+                                WHEN holds_no THEN COALESCE(no_price, no_entry_price)
+                                ELSE 0::numeric
+                            END
+                        ELSE current_price
                     END
                 ) AS effective_current_price,
                 CASE
@@ -150,15 +174,18 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                             CASE WHEN holds_no THEN no_entry_price ELSE 0::numeric END
                         )
                     )
-                    ELSE 0::numeric
+                    WHEN state = 5 THEN 0::numeric
+                    ELSE unrealized_pnl
                 END AS effective_unrealized_pnl,
                 CASE
-                    WHEN state = 5 THEN holds_yes OR holds_no
+                    WHEN state = 5 THEN one_legged_entry_failed
+                    WHEN state = 6 AND NOT exit_failure_with_live_exposure THEN FALSE
                     WHEN state = 4 THEN FALSE
                     ELSE TRUE
                 END AS effective_is_open,
                 CASE
-                    WHEN state = 5 AND (holds_yes OR holds_no) THEN 6
+                    WHEN state = 5 AND one_legged_entry_failed THEN 6
+                    WHEN state = 6 AND NOT exit_failure_with_live_exposure THEN 5
                     ELSE state
                 END AS effective_state
             FROM derived_marks
