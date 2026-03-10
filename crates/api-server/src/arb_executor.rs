@@ -16,7 +16,7 @@ use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -480,7 +480,7 @@ pub struct ArbAutoExecutor {
     circuit_breaker: Arc<CircuitBreaker>,
     pool: PgPool,
     position_repo: PositionRepository,
-    token_cache: OutcomeTokenCache,
+    token_cache: Arc<OutcomeTokenCache>,
     trade_event_recorder: TradeEventRecorder,
     shadow_prediction_recorder: ShadowPredictionRecorder,
     rollout_controller: LearningRolloutController,
@@ -518,8 +518,9 @@ impl ArbAutoExecutor {
             circuit_breaker,
             pool: pool.clone(),
             position_repo: PositionRepository::new(pool.clone()),
-            token_cache: OutcomeTokenCache::new(clob_client, active_clob_markets)
-                .with_pool(pool.clone()),
+            token_cache: Arc::new(
+                OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
+            ),
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             shadow_prediction_recorder: ShadowPredictionRecorder::new(pool.clone()),
             rollout_controller: LearningRolloutController::new(pool.clone()),
@@ -648,6 +649,7 @@ impl ArbAutoExecutor {
         let mut cache_ticker = tokio::time::interval(cache_interval);
         // Skip the first immediate tick (we already loaded above)
         cache_ticker.tick().await;
+        let cache_refresh_inflight = Arc::new(AtomicBool::new(false));
 
         // Heartbeat ticker keeps the liveness stamp fresh even when no signals arrive.
         // Must be well under the 120s staleness threshold checked by the status endpoint.
@@ -682,15 +684,37 @@ impl ArbAutoExecutor {
                     }
                 }
                 _ = cache_ticker.tick() => {
-                    match self.token_cache.refresh().await {
-                        Ok((count, active_set_size)) => debug!(markets = count, active_set_size, "Token cache refreshed"),
-                        Err(e) => {
-                            let mut runtime = self.runtime_status.write().await;
-                            runtime.cache_refresh_failures =
-                                runtime.cache_refresh_failures.saturating_add(1);
-                            runtime.record_decision("cache", format!("refresh failed: {e}"));
-                            warn!(error = %e, "Token cache refresh failed");
-                        }
+                    if cache_refresh_inflight
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        let token_cache = Arc::clone(&self.token_cache);
+                        let runtime_status = Arc::clone(&self.runtime_status);
+                        let cache_refresh_inflight = Arc::clone(&cache_refresh_inflight);
+                        tokio::spawn(async move {
+                            match token_cache.refresh().await {
+                                Ok((count, active_set_size)) => {
+                                    debug!(
+                                        markets = count,
+                                        active_set_size,
+                                        "Token cache refreshed"
+                                    );
+                                }
+                                Err(e) => {
+                                    let mut runtime = runtime_status.write().await;
+                                    runtime.cache_refresh_failures =
+                                        runtime.cache_refresh_failures.saturating_add(1);
+                                    runtime.record_decision(
+                                        "cache",
+                                        format!("refresh failed: {e}"),
+                                    );
+                                    warn!(error = %e, "Token cache refresh failed");
+                                }
+                            }
+                            cache_refresh_inflight.store(false, Ordering::SeqCst);
+                        });
+                    } else {
+                        debug!("Token cache refresh still in progress, skipping scheduled tick");
                     }
                 }
                 _ = heartbeat_ticker.tick() => {
@@ -707,13 +731,48 @@ impl ArbAutoExecutor {
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
         let process_started_at = std::time::Instant::now();
         let cfg = self.snapshot_config().await;
+        let signal_age_ms = Utc::now()
+            .signed_duration_since(arb.timestamp)
+            .num_milliseconds()
+            .max(0);
+        let age_secs = signal_age_ms / 1000;
+        let attempt_id = Uuid::new_v4();
+        let mut telemetry = ArbExecutionTelemetry::new(attempt_id, signal_age_ms);
+
+        {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.enabled = cfg.enabled;
+            runtime.record_signal(&arb.market_id);
+        }
+
+        // Fast-fail stale signals before any DB writes or shadow bookkeeping.
+        if age_secs > cfg.max_signal_age_secs {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.stale_skips = runtime.stale_skips.saturating_add(1);
+            runtime.record_decision(
+                &arb.market_id,
+                format!(
+                    "skipped: stale signal age={} max={}",
+                    age_secs, cfg.max_signal_age_secs
+                ),
+            );
+            info!(
+                market_id = %arb.market_id,
+                age_secs = age_secs,
+                max = cfg.max_signal_age_secs,
+                "Arb signal too stale, skipping"
+            );
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, "unknown", "too_stale", &telemetry)
+                .await;
+            return Ok(());
+        }
+
         let live_ready = self.order_executor.is_live_ready().await;
         let execution_mode = if live_ready { "live" } else { "paper" };
         {
             let mut runtime = self.runtime_status.write().await;
-            runtime.enabled = cfg.enabled;
             runtime.live_ready = live_ready;
-            runtime.record_signal(&arb.market_id);
         }
 
         // Persist every arb signal to arb_opportunities for the DynamicTuner's
@@ -738,13 +797,6 @@ impl ArbAutoExecutor {
             .execute(&pool_ref)
             .await;
         });
-
-        let signal_age_ms = Utc::now()
-            .signed_duration_since(arb.timestamp)
-            .num_milliseconds()
-            .max(0);
-        let attempt_id = Uuid::new_v4();
-        let mut telemetry = ArbExecutionTelemetry::new(attempt_id, signal_age_ms);
 
         self.trade_event_recorder
             .record_warn(
@@ -804,29 +856,6 @@ impl ArbAutoExecutor {
         let market_id = &arb.market_id;
 
         // 1. Validate signal freshness
-        let age_secs = signal_age_ms / 1000;
-        if age_secs > cfg.max_signal_age_secs {
-            let mut runtime = self.runtime_status.write().await;
-            runtime.stale_skips = runtime.stale_skips.saturating_add(1);
-            runtime.record_decision(
-                market_id,
-                format!(
-                    "skipped: stale signal age={} max={}",
-                    age_secs, cfg.max_signal_age_secs
-                ),
-            );
-            info!(
-                market_id = %market_id,
-                age_secs = age_secs,
-                max = cfg.max_signal_age_secs,
-                "Arb signal too stale, skipping"
-            );
-            telemetry.finish_total(&process_started_at);
-            self.record_skip_event(&arb, execution_mode, "too_stale", &telemetry)
-                .await;
-            return Ok(());
-        }
-
         // 2. Check minimum profit threshold
         if arb.net_profit < cfg.min_net_profit {
             let mut runtime = self.runtime_status.write().await;
@@ -942,16 +971,11 @@ impl ArbAutoExecutor {
         // 6. Market quality check — verify orderbook depth on both sides
         let depth_check_started_at = std::time::Instant::now();
         {
-            let yes_book = self
-                .order_executor
-                .clob_client()
-                .get_order_book(&yes_token_id)
-                .await;
-            let no_book = self
-                .order_executor
-                .clob_client()
-                .get_order_book(&no_token_id)
-                .await;
+            let clob_client = self.order_executor.clob_client();
+            let (yes_book, no_book) = tokio::join!(
+                clob_client.get_order_book(&yes_token_id),
+                clob_client.get_order_book(&no_token_id)
+            );
 
             if let (Ok(yb), Ok(nb)) = (&yes_book, &no_book) {
                 let yes_depth: Decimal = yb.asks.iter().map(|l| l.price * l.size).sum();

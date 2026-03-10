@@ -122,21 +122,17 @@ async fn compute_cycle(
                   AND timestamp >= $4
                   AND timestamp <= $1
             ),
-            recent_wallets AS (
-                SELECT DISTINCT wallet_address
-                FROM recent_trades
-            ),
             latest_bot_scores AS (
-                SELECT
-                    rw.wallet_address AS address,
-                    (
-                        SELECT bs.total_score
-                        FROM bot_scores bs
-                        WHERE bs.address = rw.wallet_address
-                        ORDER BY bs.computed_at DESC
-                        LIMIT 1
-                    ) AS total_score
-                FROM recent_wallets rw
+                SELECT DISTINCT ON (bs.address)
+                    bs.address,
+                    bs.total_score
+                FROM bot_scores bs
+                INNER JOIN (
+                    SELECT DISTINCT wallet_address
+                    FROM recent_trades
+                ) rw
+                  ON rw.wallet_address = bs.address
+                ORDER BY bs.address, bs.computed_at DESC
             )
             SELECT
                 rt.condition_id,

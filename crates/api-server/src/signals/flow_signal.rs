@@ -307,29 +307,26 @@ async fn scan_and_emit(
         ),
         recent_window_trades AS (
             SELECT
-                condition_id,
-                wallet_address
-            FROM wallet_trades
-            WHERE condition_id IS NOT NULL
-              AND timestamp >= $6
-              AND timestamp <= $2
-              AND condition_id IN (SELECT condition_id FROM latest_features)
-        ),
-        recent_wallets AS (
-            SELECT DISTINCT wallet_address
-            FROM recent_window_trades
+                wt.condition_id,
+                wt.wallet_address
+            FROM wallet_trades wt
+            INNER JOIN latest_features lf
+              ON lf.condition_id = wt.condition_id
+            WHERE wt.condition_id IS NOT NULL
+              AND wt.timestamp >= $6
+              AND wt.timestamp <= $2
         ),
         latest_bot_scores AS (
-            SELECT
-                rw.wallet_address AS address,
-                (
-                    SELECT bs.total_score
-                    FROM bot_scores bs
-                    WHERE bs.address = rw.wallet_address
-                    ORDER BY bs.computed_at DESC
-                    LIMIT 1
-                ) AS total_score
-            FROM recent_wallets rw
+            SELECT DISTINCT ON (bs.address)
+                bs.address,
+                bs.total_score
+            FROM bot_scores bs
+            INNER JOIN (
+                SELECT DISTINCT wallet_address
+                FROM recent_window_trades
+            ) rw
+              ON rw.wallet_address = bs.address
+            ORDER BY bs.address, bs.computed_at DESC
         ),
         score_coverage AS (
             SELECT
@@ -343,6 +340,15 @@ async fn scan_and_emit(
             LEFT JOIN latest_bot_scores lbs
               ON lbs.address = rwt.wallet_address
             GROUP BY rwt.condition_id
+        ),
+        latest_orderbook_prices AS (
+            SELECT DISTINCT ON (oh.market_id)
+                oh.market_id,
+                oh.close AS yes_price
+            FROM orderbook_hourly oh
+            INNER JOIN latest_features lf
+              ON lf.condition_id = oh.market_id
+            ORDER BY oh.market_id, oh.bucket DESC
         )
         SELECT
             lf.condition_id,
@@ -361,13 +367,8 @@ async fn scan_and_emit(
         FROM latest_features lf
         LEFT JOIN market_metadata mm
           ON mm.condition_id = lf.condition_id
-        LEFT JOIN LATERAL (
-            SELECT close AS yes_price
-            FROM orderbook_hourly
-            WHERE market_id = lf.condition_id
-            ORDER BY bucket DESC
-            LIMIT 1
-        ) ob ON true
+        LEFT JOIN latest_orderbook_prices ob
+          ON ob.market_id = lf.condition_id
         LEFT JOIN score_coverage sc
           ON sc.condition_id = lf.condition_id
         WHERE COALESCE(mm.active, true) = true
