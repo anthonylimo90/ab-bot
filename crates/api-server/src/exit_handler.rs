@@ -313,6 +313,11 @@ impl ExitHandler {
         self.config.read().await.clone()
     }
 
+    fn touch_heartbeat(&self) {
+        self.heartbeat
+            .store(Utc::now().timestamp(), Ordering::Relaxed);
+    }
+
     /// Main run loop with two tickers.
     pub async fn run(self) -> anyhow::Result<()> {
         let startup_cfg = self.snapshot_config().await;
@@ -327,6 +332,9 @@ impl ExitHandler {
             failed_exit_retry_backoff_secs = startup_cfg.failed_exit_retry_backoff_secs,
             "Starting exit handler (always-on, per-tick guard)"
         );
+
+        // Mark liveness before the initial cache load, which can block on network I/O.
+        self.touch_heartbeat();
 
         // Initial token cache load
         match self.token_cache.refresh().await {
@@ -347,8 +355,7 @@ impl ExitHandler {
 
         loop {
             // Update heartbeat to prove liveness
-            self.heartbeat
-                .store(Utc::now().timestamp(), Ordering::Relaxed);
+            self.touch_heartbeat();
 
             tokio::select! {
                 _ = exit_ticker.tick() => {
@@ -396,6 +403,7 @@ impl ExitHandler {
 
         let fee = Decimal::new(2, 2);
         for candidate in &mut candidates {
+            self.touch_heartbeat();
             let quant_ctx = quant_contexts.get(&candidate.position.id);
             let (yes_bid, no_bid) = match self.current_exit_bids(&candidate.position).await? {
                 ExitBidStatus::Available(yes_bid, no_bid) => (yes_bid, no_bid),
@@ -452,6 +460,7 @@ impl ExitHandler {
         debug!(count = positions.len(), "Processing exit-ready positions");
 
         for mut position in positions {
+            self.touch_heartbeat();
             if let Err(e) = self.execute_exit(&mut position).await {
                 warn!(
                     position_id = %position.id,
@@ -468,6 +477,7 @@ impl ExitHandler {
     /// Execute the sell orders for a single ExitReady position.
     async fn execute_exit(&self, position: &mut Position) -> anyhow::Result<()> {
         let market_id = position.market_id.clone();
+        self.touch_heartbeat();
         let execution_mode = if self.order_executor.is_live_ready().await {
             "live"
         } else {
@@ -860,6 +870,7 @@ impl ExitHandler {
             return Ok(Some(ids));
         }
 
+        self.touch_heartbeat();
         if let Err(error) = self.token_cache.refresh().await {
             warn!(
                 market_id = %market_id,
@@ -1214,6 +1225,7 @@ impl ExitHandler {
         let market_ids: HashSet<String> = positions.iter().map(|p| p.market_id.clone()).collect();
         let mut resolved_market_ids = HashSet::new();
         for market_id in &market_ids {
+            self.touch_heartbeat();
             match self.clob_client.get_market_by_id(market_id).await {
                 Ok(market) if market.resolved => {
                     resolved_market_ids.insert(market_id.clone());
@@ -1238,6 +1250,7 @@ impl ExitHandler {
         let fee = Decimal::new(2, 2); // 2%
 
         for mut position in positions {
+            self.touch_heartbeat();
             if !resolved_market_ids.contains(&position.market_id) {
                 continue;
             }
@@ -1328,6 +1341,7 @@ impl ExitHandler {
                     "Sell leg hit 404; refreshing token cache and retrying once"
                 );
 
+                self.touch_heartbeat();
                 if let Err(refresh_error) = self.token_cache.refresh().await {
                     warn!(
                         market_id = %market_id,
@@ -1399,6 +1413,7 @@ impl ExitHandler {
         );
 
         for mut position in positions {
+            self.touch_heartbeat();
             let market_id = position.market_id.clone();
             if position.yes_entry_price <= Decimal::ZERO {
                 warn!(
@@ -1455,6 +1470,7 @@ impl ExitHandler {
         debug!(count = positions.len(), "Processing failed exits for retry");
 
         for mut position in positions {
+            self.touch_heartbeat();
             let age_secs = position.age_secs();
             if age_secs < cfg.failed_exit_retry_backoff_secs {
                 continue;
