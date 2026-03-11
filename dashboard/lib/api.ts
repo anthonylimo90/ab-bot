@@ -42,6 +42,9 @@ import type {
   CashFlowEvent,
   AccountTradeEvent,
   AccountHistoryResponse,
+  RecoveryBucketSummary,
+  RecoveryPreviewResponse,
+  RecoveryRunResponse,
   MarketRegimeResponse,
   FlowFeatureResponse,
   RecentSignalResponse,
@@ -176,6 +179,30 @@ function parseAccountTradeEvent(raw: AccountTradeEvent): AccountTradeEvent {
       raw.realized_pnl != null ? Number(raw.realized_pnl) : undefined,
     unrealized_pnl:
       raw.unrealized_pnl != null ? Number(raw.unrealized_pnl) : undefined,
+  };
+}
+
+function parseRecoveryBucket(
+  raw: RecoveryBucketSummary,
+): RecoveryBucketSummary {
+  return {
+    ...raw,
+    marked_value: Number(raw.marked_value),
+  };
+}
+
+function parseRecoveryPreview(
+  raw: RecoveryPreviewResponse,
+): RecoveryPreviewResponse {
+  return {
+    ...raw,
+    safe_recovery: parseRecoveryBucket(raw.safe_recovery),
+    recoverable_now: parseRecoveryBucket(raw.recoverable_now),
+    liquidity_blocked: parseRecoveryBucket(raw.liquidity_blocked),
+    stalled: parseRecoveryBucket(raw.stalled),
+    suspect_inventory: parseRecoveryBucket(raw.suspect_inventory),
+    open_monitoring: parseRecoveryBucket(raw.open_monitoring),
+    other_blocked: parseRecoveryBucket(raw.other_blocked),
   };
 }
 
@@ -887,6 +914,32 @@ class ApiClient {
     return this.request<ServiceStatus>(
       `/api/v1/workspaces/${workspaceId}/service-status`,
     );
+  }
+
+  async getRecoveryPreview(
+    workspaceId: string,
+  ): Promise<RecoveryPreviewResponse> {
+    const raw = await this.request<RecoveryPreviewResponse>(
+      `/api/v1/workspaces/${workspaceId}/recovery/preview`,
+      {
+        method: "POST",
+      },
+    );
+    return parseRecoveryPreview(raw);
+  }
+
+  async runRecovery(workspaceId: string): Promise<RecoveryRunResponse> {
+    const raw = await this.request<RecoveryRunResponse>(
+      `/api/v1/workspaces/${workspaceId}/recovery/run`,
+      {
+        method: "POST",
+      },
+    );
+    return {
+      ...raw,
+      safe_exit_failures_requeued: Number(raw.safe_exit_failures_requeued),
+      stalled_positions_reopened: Number(raw.stalled_positions_reopened),
+    };
   }
 
   async getDynamicTunerStatus(workspaceId: string): Promise<DynamicTunerStatus> {

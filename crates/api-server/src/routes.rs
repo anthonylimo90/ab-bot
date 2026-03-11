@@ -12,8 +12,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     accounting, activity, admin_workspaces, auth, backtest, discover, health, markets,
-    order_signing, positions, recommendations, risk, signals, strategy_health, trade_flow, trading,
-    users, vault, wallet_auth, wallets, workspaces,
+    order_signing, positions, recovery, recommendations, risk, signals, strategy_health,
+    trade_flow, trading, users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
@@ -111,6 +111,8 @@ use crate::websocket;
         accounting::get_account_history,
         accounting::list_cash_flows,
         accounting::create_cash_flow,
+        recovery::preview_recovery,
+        recovery::run_recovery,
         // Trade flow
         trade_flow::get_trade_flow_summary,
         trade_flow::get_trade_flow_journeys,
@@ -248,6 +250,9 @@ use crate::websocket;
             accounting::AccountTradeEventResponse,
             accounting::AccountHistoryResponse,
             accounting::CreateCashFlowRequest,
+            recovery::RecoveryBucketSummary,
+            recovery::RecoveryPreviewResponse,
+            recovery::RecoveryRunResponse,
             trade_flow::TradeFlowSummaryResponse,
             trade_flow::TradeFlowStrategySummary,
             trade_flow::TradeJourneyResponse,
@@ -732,6 +737,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/arb-executor",
             put(workspaces::update_arb_executor_config),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/recovery/preview",
+            post(recovery::preview_recovery),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/recovery/run",
+            post(recovery::run_recovery),
         )
         .layer(GovernorLayer {
             config: Arc::new(config_rate_limit_config),

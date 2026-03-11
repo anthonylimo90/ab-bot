@@ -3342,57 +3342,7 @@ fn decimal_to_f64(value: Decimal) -> f64 {
 }
 
 async fn reconcile_runtime_service_toggles(state: &AppState) {
-    match crate::runtime_sync::any_workspace_arb_enabled(&state.pool).await {
-        Ok(enabled) => {
-            if let Some(ref arb_config) = state.arb_executor_config {
-                arb_config.write().await.enabled = enabled;
-                tracing::info!(
-                    arb_auto_execute = enabled,
-                    "Reconciled arb executor runtime state"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to reconcile arb executor runtime state"
-            );
-        }
-    }
-
-    match crate::runtime_sync::any_workspace_exit_handler_enabled(&state.pool).await {
-        Ok(enabled) => {
-            if let Some(ref eh_config) = state.exit_handler_config {
-                eh_config.write().await.enabled = enabled;
-                tracing::info!(
-                    exit_handler_enabled = enabled,
-                    "Reconciled exit handler runtime state"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to reconcile exit handler runtime state"
-            );
-        }
-    }
-
-    match crate::runtime_sync::any_workspace_live_enabled(&state.pool).await {
-        Ok(enabled) => {
-            state.order_executor.set_live_mode(enabled);
-            tracing::info!(
-                live_trading_enabled = enabled,
-                "Reconciled live trading runtime state"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to reconcile live trading runtime state"
-            );
-        }
-    }
+    crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
 }
 
 /// Validate WalletConnect project ID format.

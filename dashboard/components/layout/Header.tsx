@@ -32,6 +32,7 @@ import { useActivity } from "@/hooks/useActivity";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
+import { RecoveryDialog } from "@/components/wallet/RecoveryDialog";
 import { useToastStore } from "@/stores/toast-store";
 import { MobileNavDrawer } from "@/components/layout/MobileNavDrawer";
 import api from "@/lib/api";
@@ -299,72 +300,79 @@ export function Header() {
           {/* Wallet Balance & Info */}
           {hasWallet && primaryWallet ? (
             <>
-              <div
-                className={cn(
-                  "hidden max-w-[20rem] items-center gap-2 rounded-full border px-3 py-1.5 md:flex",
-                  isWalletBalanceError
-                    ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
-                    : "border-border/60 bg-card/70",
-                )}
-                title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
-                aria-live="polite"
-              >
-                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted">
+              <div className="hidden items-center gap-2 md:flex">
+                <div
+                  className={cn(
+                    "max-w-[20rem] items-center gap-2 rounded-full border px-3 py-1.5",
+                    isWalletBalanceError
+                      ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
+                      : "border-border/60 bg-card/70",
+                    "flex",
+                  )}
+                  title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
+                  aria-live="polite"
+                >
+                  <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted">
+                    {isWalletBalancePending ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                    ) : (
+                      <Wallet className="h-4 w-4 text-muted-foreground" />
+                    )}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                      Available USDC.e
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {hasUsdcBalance ? (
+                        <span className="text-sm font-semibold tabular-nums">
+                          {usdFormatter.format(usdcBalance)}
+                        </span>
+                      ) : isWalletBalancePending ? (
+                        <span className="text-xs text-muted-foreground">
+                          Loading balance
+                        </span>
+                      ) : (
+                        <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                          Balance unavailable
+                        </span>
+                      )}
+                      {isWalletBalanceFetching && hasUsdcBalance && (
+                        <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                      )}
+                      <span className="hidden max-w-[8.5rem] truncate text-xs text-muted-foreground lg:inline">
+                        {walletLabel}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <RecoveryDialog workspaceId={currentWorkspace?.id} />
+              </div>
+              <div className="flex items-center gap-1.5 md:hidden">
+                <div
+                  className={cn(
+                    "flex items-center gap-1.5 rounded-full border px-2 py-1.5",
+                    isWalletBalanceError
+                      ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
+                      : "border-border/60 bg-card/70",
+                  )}
+                  title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
+                  aria-live="polite"
+                >
                   {isWalletBalancePending ? (
-                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
                   ) : (
-                    <Wallet className="h-4 w-4 text-muted-foreground" />
+                    <Wallet className="h-3.5 w-3.5 text-muted-foreground" />
+                  )}
+                  {hasUsdcBalance ? (
+                    <span className="text-xs font-semibold tabular-nums">
+                      {usdCompactFormatter.format(usdcBalance)}
+                    </span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">USDC.e</span>
                   )}
                 </div>
-                <div className="min-w-0">
-                  <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                    Available USDC.e
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {hasUsdcBalance ? (
-                      <span className="text-sm font-semibold tabular-nums">
-                        {usdFormatter.format(usdcBalance)}
-                      </span>
-                    ) : isWalletBalancePending ? (
-                      <span className="text-xs text-muted-foreground">
-                        Loading balance
-                      </span>
-                    ) : (
-                      <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
-                        Balance unavailable
-                      </span>
-                    )}
-                    {isWalletBalanceFetching && hasUsdcBalance && (
-                      <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                    )}
-                    <span className="hidden max-w-[8.5rem] truncate text-xs text-muted-foreground lg:inline">
-                      {walletLabel}
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <div
-                className={cn(
-                  "flex items-center gap-1.5 rounded-full border px-2 py-1.5 md:hidden",
-                  isWalletBalanceError
-                    ? "border-amber-300/70 bg-amber-50/70 dark:border-amber-700/60 dark:bg-amber-950/30"
-                    : "border-border/60 bg-card/70",
-                )}
-                title={isWalletBalanceError ? walletBalanceErrorMessage : undefined}
-                aria-live="polite"
-              >
-                {isWalletBalancePending ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-                ) : (
-                  <Wallet className="h-3.5 w-3.5 text-muted-foreground" />
-                )}
-                {hasUsdcBalance ? (
-                  <span className="text-xs font-semibold tabular-nums">
-                    {usdCompactFormatter.format(usdcBalance)}
-                  </span>
-                ) : (
-                  <span className="text-xs text-muted-foreground">USDC.e</span>
-                )}
+                <RecoveryDialog workspaceId={currentWorkspace?.id} compact />
               </div>
             </>
           ) : (

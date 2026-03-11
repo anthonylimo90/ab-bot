@@ -48,6 +48,12 @@ export const queryKeys = {
       [...queryKeys.account.all(), "cash-flows", workspaceId, params] as const,
   },
 
+  recovery: {
+    all: () => ["recovery"] as const,
+    preview: (workspaceId: string) =>
+      [...queryKeys.recovery.all(), "preview", workspaceId] as const,
+  },
+
   // Wallets
   wallets: {
     all: () => ["wallets"] as const,

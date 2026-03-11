@@ -187,6 +187,38 @@ export interface AccountHistoryResponse {
   snapshot_started_at?: string;
 }
 
+export interface RecoveryBucketSummary {
+  positions: number;
+  marked_value: number;
+}
+
+export interface RecoveryPreviewResponse {
+  workspace_id: string;
+  generated_at: string;
+  safe_recovery: RecoveryBucketSummary;
+  recoverable_now: RecoveryBucketSummary;
+  liquidity_blocked: RecoveryBucketSummary;
+  stalled: RecoveryBucketSummary;
+  suspect_inventory: RecoveryBucketSummary;
+  open_monitoring: RecoveryBucketSummary;
+  other_blocked: RecoveryBucketSummary;
+  live_running: boolean;
+  live_ready: boolean;
+  exit_handler_running: boolean;
+}
+
+export interface RecoveryRunResponse {
+  workspace_id: string;
+  triggered_at: string;
+  live_running: boolean;
+  live_ready: boolean;
+  exit_handler_running: boolean;
+  allowance_cache_refreshed: boolean;
+  safe_exit_failures_requeued: number;
+  stalled_positions_reopened: number;
+  warnings: string[];
+}
+
 // Market types
 export interface Market {
   id: string;

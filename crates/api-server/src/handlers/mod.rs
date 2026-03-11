@@ -11,6 +11,7 @@ pub mod health;
 pub mod markets;
 pub mod order_signing;
 pub mod positions;
+pub mod recovery;
 pub mod recommendations;
 pub mod risk;
 pub mod signals;
