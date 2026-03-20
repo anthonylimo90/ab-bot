@@ -90,37 +90,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ==========================================================================
--- 4. TUNE POSTGRESQL MEMORY VIA ALTER SYSTEM
---    These write to postgresql.auto.conf which takes precedence over
---    timescaledb-tune's modifications to postgresql.conf.
---    shared_buffers change requires a server restart to take effect.
+-- 4. POSTGRESQL MEMORY TUNING
+--    ALTER SYSTEM cannot run inside a transaction (sqlx wraps migrations
+--    in transactions), so memory tuning is applied separately via:
+--      migrations/055_alter_system.sh  (run manually or via Railway deploy hook)
+--    See that script for: shared_buffers=512MB, work_mem=4MB, etc.
 -- ==========================================================================
-
--- shared_buffers: from ~7.4GB (auto-tuned) to 512MB
--- Plenty for this workload (~30 connections, small trading bot)
-ALTER SYSTEM SET shared_buffers = '512MB';
-
--- work_mem: per-sort/hash memory; 4MB default is fine for 30 connections
-ALTER SYSTEM SET work_mem = '4MB';
-
--- maintenance_work_mem: for VACUUM, CREATE INDEX, etc.
-ALTER SYSTEM SET maintenance_work_mem = '128MB';
-
--- effective_cache_size: hint to planner about OS page cache
-ALTER SYSTEM SET effective_cache_size = '1536MB';
-
--- WAL configuration: reduce checkpoint pressure
-ALTER SYSTEM SET wal_buffers = '16MB';
-ALTER SYSTEM SET checkpoint_completion_target = '0.9';
-ALTER SYSTEM SET max_wal_size = '1GB';
-ALTER SYSTEM SET min_wal_size = '256MB';
-
--- Connection limits
-ALTER SYSTEM SET max_connections = '50';
-
--- TimescaleDB background workers: reduce from default
--- 1 for orderbook_hourly refresh + compression/retention jobs
-ALTER SYSTEM SET timescaledb.max_background_workers = '4';
-
--- Reload settings that can be changed without restart
-SELECT pg_reload_conf();

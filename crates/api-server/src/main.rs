@@ -88,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
     if !skip_migrations {
         tracing::info!("Running database migrations...");
         sqlx::migrate!("../../migrations").run(&pool).await?;
+        // ALTER SYSTEM cannot run inside a transaction (sqlx wraps migrations
+        // in transactions), so we apply memory tuning here in autocommit mode.
+        apply_pg_memory_tuning(&pool).await;
     } else {
         tracing::warn!("Skipping database migrations because SKIP_MIGRATIONS is enabled");
     }
@@ -102,6 +105,37 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Apply PostgreSQL memory tuning via ALTER SYSTEM (runs outside transactions).
+///
+/// ALTER SYSTEM writes to `postgresql.auto.conf` which takes precedence over
+/// `postgresql.conf` (including timescaledb-tune's settings). Most settings
+/// take effect after `pg_reload_conf()`; `shared_buffers` and `max_connections`
+/// require a full server restart.
+///
+/// This is idempotent — safe to run on every startup.
+async fn apply_pg_memory_tuning(pool: &sqlx::PgPool) {
+    let statements = [
+        "ALTER SYSTEM SET shared_buffers = '512MB'",
+        "ALTER SYSTEM SET work_mem = '4MB'",
+        "ALTER SYSTEM SET maintenance_work_mem = '128MB'",
+        "ALTER SYSTEM SET effective_cache_size = '1536MB'",
+        "ALTER SYSTEM SET wal_buffers = '16MB'",
+        "ALTER SYSTEM SET checkpoint_completion_target = '0.9'",
+        "ALTER SYSTEM SET max_wal_size = '1GB'",
+        "ALTER SYSTEM SET min_wal_size = '256MB'",
+        "ALTER SYSTEM SET max_connections = '50'",
+        "ALTER SYSTEM SET timescaledb.max_background_workers = '4'",
+        "SELECT pg_reload_conf()",
+    ];
+
+    for stmt in &statements {
+        if let Err(e) = sqlx::query(stmt).execute(pool).await {
+            tracing::warn!(stmt, error = %e, "pg memory tuning statement failed (non-fatal)");
+        }
+    }
+    tracing::info!("PostgreSQL memory tuning applied (restart needed for shared_buffers)");
 }
 
 async fn run_server(pool: sqlx::PgPool) -> anyhow::Result<()> {
