@@ -17,7 +17,7 @@ export default function InviteAcceptPage() {
   const router = useRouter();
   const token = params.token as string;
   const { isAuthenticated, user, setAuth, logout } = useAuthStore();
-  const { switchWorkspace, fetchWorkspaces } = useWorkspaceStore();
+  const { fetchCurrentWorkspace, fetchWorkspaces } = useWorkspaceStore();
 
   const [inviteInfo, setInviteInfo] = useState<InviteInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -74,8 +74,7 @@ export default function InviteAcceptPage() {
         setAuth(response.token, response.user);
       }
 
-      // Switch to the new workspace and refresh workspaces list
-      await switchWorkspace(response.workspace_id);
+      await fetchCurrentWorkspace();
       await fetchWorkspaces();
 
       setAccepted(true);

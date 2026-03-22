@@ -40,18 +40,16 @@ export const queryKeys = {
 
   account: {
     all: () => ["account"] as const,
-    summary: (workspaceId: string) =>
-      [...queryKeys.account.all(), "summary", workspaceId] as const,
-    history: (workspaceId: string, params?: { hours?: number; limit?: number }) =>
-      [...queryKeys.account.all(), "history", workspaceId, params] as const,
-    cashFlows: (workspaceId: string, params?: { limit?: number }) =>
-      [...queryKeys.account.all(), "cash-flows", workspaceId, params] as const,
+    summary: () => [...queryKeys.account.all(), "summary"] as const,
+    history: (params?: { hours?: number; limit?: number }) =>
+      [...queryKeys.account.all(), "history", params] as const,
+    cashFlows: (params?: { limit?: number }) =>
+      [...queryKeys.account.all(), "cash-flows", params] as const,
   },
 
   recovery: {
     all: () => ["recovery"] as const,
-    preview: (workspaceId: string) =>
-      [...queryKeys.recovery.all(), "preview", workspaceId] as const,
+    preview: () => [...queryKeys.recovery.all(), "preview"] as const,
   },
 
   // Wallets
@@ -83,16 +81,19 @@ export const queryKeys = {
   // Risk monitoring
   risk: {
     all: () => ["risk"] as const,
-    status: (workspaceId: string) =>
-      [...queryKeys.risk.all(), "status", workspaceId] as const,
+    status: () => [...queryKeys.risk.all(), "status"] as const,
   },
 
   dynamicTuning: {
     all: () => ["dynamic-tuning"] as const,
-    status: (workspaceId: string) =>
-      [...queryKeys.dynamicTuning.all(), "status", workspaceId] as const,
-    history: (workspaceId: string, params?: { limit?: number; offset?: number }) =>
-      [...queryKeys.dynamicTuning.all(), "history", workspaceId, params] as const,
+    status: () => [...queryKeys.dynamicTuning.all(), "status"] as const,
+    history: (params?: { limit?: number; offset?: number }) =>
+      [...queryKeys.dynamicTuning.all(), "history", params] as const,
+  },
+
+  runtime: {
+    all: () => ["runtime"] as const,
+    serviceStatus: () => [...queryKeys.runtime.all(), "service-status"] as const,
   },
 
   tradeFlow: {

@@ -6,9 +6,7 @@ import { queryKeys } from "@/lib/queryClient";
 
 export function useAccountSummaryQuery(workspaceId?: string | null) {
   return useQuery({
-    queryKey: workspaceId
-      ? queryKeys.account.summary(workspaceId)
-      : ["account", "summary", "disabled"],
+    queryKey: workspaceId ? queryKeys.account.summary() : ["account", "summary", "disabled"],
     queryFn: () => api.getAccountSummary(workspaceId!),
     enabled: Boolean(workspaceId),
     staleTime: 15_000,
@@ -22,7 +20,7 @@ export function useAccountHistoryQuery(
 ) {
   return useQuery({
     queryKey: workspaceId
-      ? queryKeys.account.history(workspaceId, params)
+      ? queryKeys.account.history(params)
       : ["account", "history", "disabled", params],
     queryFn: () => api.getAccountHistory(workspaceId!, params),
     enabled: Boolean(workspaceId),
@@ -37,7 +35,7 @@ export function useCashFlowsQuery(
 ) {
   return useQuery({
     queryKey: workspaceId
-      ? queryKeys.account.cashFlows(workspaceId, params)
+      ? queryKeys.account.cashFlows(params)
       : ["account", "cash-flows", "disabled", params],
     queryFn: () => api.getCashFlows(workspaceId!, params),
     enabled: Boolean(workspaceId),
@@ -58,9 +56,7 @@ export function useCreateCashFlowMutation(workspaceId?: string | null) {
     }) => api.createCashFlow(workspaceId!, params),
     onSuccess: () => {
       if (!workspaceId) return;
-      queryClient.invalidateQueries({ queryKey: queryKeys.account.summary(workspaceId) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.account.history(workspaceId) });
-      queryClient.invalidateQueries({ queryKey: queryKeys.account.cashFlows(workspaceId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.account.all() });
     },
   });
 }

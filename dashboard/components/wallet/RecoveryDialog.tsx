@@ -20,7 +20,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { cn } from "@/lib/utils";
+import { cn, formatTimeAgo } from "@/lib/utils";
 import { useToastStore } from "@/stores/toast-store";
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
@@ -39,12 +39,12 @@ interface RecoveryDialogProps {
 function RecoveryMetricCard({
   title,
   value,
-  positions,
+  items,
   tone = "default",
 }: {
   title: string;
   value: number;
-  positions: number;
+  items: number;
   tone?: "default" | "warning" | "danger";
 }) {
   return (
@@ -65,7 +65,7 @@ function RecoveryMetricCard({
         {usdFormatter.format(value)}
       </div>
       <div className="mt-1 text-xs text-muted-foreground">
-        {positions} position{positions === 1 ? "" : "s"}
+        {items} item{items === 1 ? "" : "s"}
       </div>
     </div>
   );
@@ -87,11 +87,11 @@ export function RecoveryDialog({
     try {
       const result = await runMutation.mutateAsync();
       if (result.warnings.length > 0) {
-        toast.warning("Recovery initiated with warnings", result.warnings[0]);
+        toast.warning("Recovery initiated with warnings", result.warnings.join(" "));
       } else {
         toast.success(
           "Recovery initiated",
-          `Requeued ${result.safe_exit_failures_requeued} failed exits and reopened ${result.stalled_positions_reopened} stalled positions.`,
+          `Requeued ${result.safe_exit_failures_requeued} failed exits, reopened ${result.stalled_positions_reopened} stalled items, and submitted ${result.orphan_inventory_succeeded} orphan inventory exits.`,
         );
       }
     } catch (error) {
@@ -120,7 +120,7 @@ export function RecoveryDialog({
         onClick={() => setOpen(true)}
       >
         <LifeBuoy className="h-4 w-4" />
-        <span>{compact ? "Recover" : "Recover"}</span>
+        <span>Recover</span>
       </Button>
 
       <Dialog open={open} onOpenChange={setOpen}>
@@ -131,14 +131,13 @@ export function RecoveryDialog({
               Safe Recovery
             </DialogTitle>
             <DialogDescription>
-              Re-arm live exit processing and requeue non-suspect recovery buckets.
-              Inventory mismatches stay excluded.
+              Refresh reconciled inventory, re-arm canonical exit processing, and submit recoverable orphan inventory exits.
             </DialogDescription>
           </DialogHeader>
 
           {!workspaceId ? (
             <div className="rounded-xl border border-dashed px-4 py-6 text-sm text-muted-foreground">
-              Select a workspace before starting recovery.
+              The canonical trading workspace is still loading.
             </div>
           ) : previewQuery.isPending ? (
             <div className="flex min-h-40 items-center justify-center">
@@ -166,47 +165,83 @@ export function RecoveryDialog({
                 </div>
               )}
 
+              <div className="rounded-2xl border border-border/70 bg-card/70 px-4 py-3 text-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">Inventory status</span>
+                  <span
+                    className={cn(
+                      "rounded-full px-2 py-0.5 text-[11px] font-medium",
+                      preview.inventory_backfill_in_progress
+                        ? "bg-amber-100 text-amber-900"
+                        : "bg-emerald-100 text-emerald-900",
+                    )}
+                  >
+                    {preview.inventory_backfill_in_progress
+                      ? "Historical backfill in progress"
+                      : "Historical backfill complete"}
+                  </span>
+                </div>
+                <div className="mt-2 text-muted-foreground">
+                  {preview.inventory_last_synced_at
+                    ? `Last inventory sync ${formatTimeAgo(preview.inventory_last_synced_at)}.`
+                    : "Inventory sync has not completed yet."}{" "}
+                  {preview.inventory_backfill_in_progress
+                    ? preview.inventory_backfill_cursor_block != null
+                      ? `Backfill cursor is at block ${preview.inventory_backfill_cursor_block.toLocaleString()}.`
+                      : "Backfill is still warming up."
+                    : preview.inventory_backfill_completed_at
+                      ? `Backfill completed ${formatTimeAgo(preview.inventory_backfill_completed_at)}.`
+                      : "Backfill is waiting for its first completed pass."}
+                </div>
+              </div>
+
               <div className="grid gap-3 sm:grid-cols-2">
                 <RecoveryMetricCard
                   title="Safe Recovery Candidate"
                   value={preview.safe_recovery.marked_value}
-                  positions={preview.safe_recovery.positions}
+                  items={preview.safe_recovery.positions}
                 />
                 <RecoveryMetricCard
                   title="Recoverable Now"
                   value={preview.recoverable_now.marked_value}
-                  positions={preview.recoverable_now.positions}
+                  items={preview.recoverable_now.positions}
                 />
                 <RecoveryMetricCard
                   title="Liquidity Blocked"
                   value={preview.liquidity_blocked.marked_value}
-                  positions={preview.liquidity_blocked.positions}
+                  items={preview.liquidity_blocked.positions}
                   tone="warning"
                 />
                 <RecoveryMetricCard
-                  title="Suspect Inventory"
-                  value={preview.suspect_inventory.marked_value}
-                  positions={preview.suspect_inventory.positions}
-                  tone="danger"
+                  title="Orphan Inventory"
+                  value={preview.orphan_inventory.marked_value}
+                  items={preview.orphan_inventory.positions}
+                  tone={preview.orphan_inventory.positions > 0 ? "warning" : "default"}
                 />
               </div>
 
               <div className="grid gap-3 sm:grid-cols-3">
                 <RecoveryMetricCard
+                  title="Suspect Inventory"
+                  value={preview.suspect_inventory.marked_value}
+                  items={preview.suspect_inventory.positions}
+                  tone="danger"
+                />
+                <RecoveryMetricCard
                   title="Stalled"
                   value={preview.stalled.marked_value}
-                  positions={preview.stalled.positions}
+                  items={preview.stalled.positions}
                   tone="warning"
                 />
                 <RecoveryMetricCard
                   title="Open Monitoring"
                   value={preview.open_monitoring.marked_value}
-                  positions={preview.open_monitoring.positions}
+                  items={preview.open_monitoring.positions}
                 />
                 <RecoveryMetricCard
                   title="Other Blocked"
                   value={preview.other_blocked.marked_value}
-                  positions={preview.other_blocked.positions}
+                  items={preview.other_blocked.positions}
                 />
               </div>
 
@@ -217,13 +252,19 @@ export function RecoveryDialog({
                     Recovery queued
                   </div>
                   <div className="mt-1 text-emerald-900/90">
-                    Requeued {runResult.safe_exit_failures_requeued} safe exit failures and reopened{" "}
-                    {runResult.stalled_positions_reopened} stalled positions.
+                    Requeued {runResult.safe_exit_failures_requeued} safe exit failures, reopened{" "}
+                    {runResult.stalled_positions_reopened} stalled items, and submitted{" "}
+                    {runResult.orphan_inventory_succeeded} orphan inventory exits from{" "}
+                    {runResult.orphan_inventory_attempted} attempted orphan balances.
                   </div>
                   {runResult.warnings.length > 0 && (
-                    <div className="mt-2 flex items-start gap-2 text-amber-900">
-                      <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
-                      <span>{runResult.warnings[0]}</span>
+                    <div className="mt-2 space-y-2 text-amber-900">
+                      {runResult.warnings.map((warning) => (
+                        <div key={warning} className="flex items-start gap-2">
+                          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                          <span>{warning}</span>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -233,7 +274,7 @@ export function RecoveryDialog({
 
           <DialogFooter className="gap-2 sm:justify-between">
             <div className="text-xs text-muted-foreground">
-              Safe recovery excludes 404 and conditional-balance mismatches.
+              Recovery now uses reconciled inventory and canonical exit routing, so queued exits and orphan holdings are both visible here.
             </div>
             <Button
               type="button"

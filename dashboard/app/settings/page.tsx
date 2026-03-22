@@ -33,6 +33,7 @@ import { InfoTooltip } from '@/components/shared/InfoTooltip';
 import { PageIntro } from '@/components/shared/PageIntro';
 import { useWalletStore } from '@/stores/wallet-store';
 import api from '@/lib/api';
+import { queryKeys } from '@/lib/queryClient';
 import Link from 'next/link';
 import { formatCurrency } from '@/lib/utils';
 
@@ -98,7 +99,7 @@ export default function SettingsPage() {
 
   // Fetch service status
   const { data: serviceStatus } = useQuery({
-    queryKey: ['workspace', currentWorkspace?.id, 'service-status'],
+    queryKey: queryKeys.runtime.serviceStatus(),
     queryFn: () => api.getServiceStatus(currentWorkspace!.id),
     enabled: !!currentWorkspace?.id && canConfigureWalletConnect,
     refetchInterval: 30000,
@@ -106,7 +107,7 @@ export default function SettingsPage() {
 
   // Fetch risk status (real CB config from backend)
   const { data: riskStatus } = useQuery({
-    queryKey: ['risk-status', currentWorkspace?.id],
+    queryKey: queryKeys.risk.status(),
     queryFn: () => api.getRiskStatus(currentWorkspace!.id),
     enabled: !!currentWorkspace?.id,
     refetchInterval: 30000,
@@ -198,7 +199,7 @@ export default function SettingsPage() {
       setCurrentWorkspace(updatedWorkspace);
       toast.success('Trading config saved', 'Your trading configuration has been updated');
       queryClient.invalidateQueries({ queryKey: ['workspace'] });
-      queryClient.invalidateQueries({ queryKey: ['workspace', currentWorkspace.id, 'service-status'] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.runtime.serviceStatus() });
       setAlchemyApiKey(''); // Clear after save
     } catch (err) {
       toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
@@ -220,7 +221,7 @@ export default function SettingsPage() {
         enabled: riskEnabled,
       });
       toast.success('Risk settings saved', 'Circuit breaker configuration has been updated');
-      queryClient.invalidateQueries({ queryKey: ['risk-status', currentWorkspace.id] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
       toast.error('Failed to save risk settings', err instanceof Error ? err.message : 'Unknown error');
     } finally {
@@ -234,7 +235,7 @@ export default function SettingsPage() {
     try {
       await api.manualTripCircuitBreaker(currentWorkspace.id);
       toast.success('Circuit breaker tripped', 'All automated trading has been paused');
-      queryClient.invalidateQueries({ queryKey: ['risk-status', currentWorkspace.id] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
       toast.error('Failed to trip circuit breaker', err instanceof Error ? err.message : 'Unknown error');
     } finally {
@@ -248,7 +249,7 @@ export default function SettingsPage() {
     try {
       await api.resetCircuitBreaker(currentWorkspace.id);
       toast.success('Circuit breaker reset', 'Automated trading has been resumed');
-      queryClient.invalidateQueries({ queryKey: ['risk-status', currentWorkspace.id] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
       toast.error('Failed to reset circuit breaker', err instanceof Error ? err.message : 'Unknown error');
     } finally {

@@ -16,6 +16,7 @@ use auth::Claims;
 use crate::accounting_ledger::load_live_account_snapshot;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::wallet_inventory::load_canonical_inventory_summary;
 use crate::workspace_scope::resolve_canonical_workspace_membership;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -33,6 +34,13 @@ pub struct AccountSummaryResponse {
     pub open_markets: i64,
     pub unpriced_open_positions: i64,
     pub unpriced_position_cost_basis: Decimal,
+    pub orphan_positions: i64,
+    pub orphan_marked_value: Decimal,
+    pub inventory_last_synced_at: Option<DateTime<Utc>>,
+    pub inventory_last_scanned_block: Option<i64>,
+    pub inventory_backfill_cursor_block: Option<i64>,
+    pub inventory_backfill_completed_at: Option<DateTime<Utc>>,
+    pub inventory_backfill_in_progress: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -166,6 +174,17 @@ fn normalize_source_label(source: &str) -> String {
     }
 }
 
+fn inventory_backfill_in_progress(
+    summary: Option<&polymarket_core::db::inventory::WalletInventorySummary>,
+) -> bool {
+    summary
+        .map(|summary| {
+            summary.inventory_last_scanned_block.is_some()
+                && summary.inventory_backfill_completed_at.is_none()
+        })
+        .unwrap_or(false)
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{workspace_id}/account/summary",
@@ -194,6 +213,9 @@ pub async fn get_account_summary(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("Canonical workspace not found".into()))?;
+    let inventory_summary = load_canonical_inventory_summary(state.as_ref())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(Json(AccountSummaryResponse {
         workspace_id: snapshot.workspace_id.to_string(),
@@ -209,6 +231,27 @@ pub async fn get_account_summary(
         open_markets: snapshot.open_markets,
         unpriced_open_positions: snapshot.unpriced_open_positions,
         unpriced_position_cost_basis: snapshot.unpriced_position_cost_basis,
+        orphan_positions: inventory_summary
+            .as_ref()
+            .map(|summary| summary.orphan_positions)
+            .unwrap_or(0),
+        orphan_marked_value: inventory_summary
+            .as_ref()
+            .map(|summary| summary.orphan_marked_value)
+            .unwrap_or(Decimal::ZERO),
+        inventory_last_synced_at: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_last_synced_at),
+        inventory_last_scanned_block: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_last_scanned_block),
+        inventory_backfill_cursor_block: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_backfill_cursor_block),
+        inventory_backfill_completed_at: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_backfill_completed_at),
+        inventory_backfill_in_progress: inventory_backfill_in_progress(inventory_summary.as_ref()),
     }))
 }
 

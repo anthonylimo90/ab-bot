@@ -3,6 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
+import { useToastStore } from "@/stores/toast-store";
 import type { Position, PositionStatus, PositionsSummary } from "@/types/api";
 
 interface PositionFilters {
@@ -46,6 +47,7 @@ export function usePositionQuery(positionId: string) {
 
 export function useClosePositionMutation() {
   const queryClient = useQueryClient();
+  const toast = useToastStore();
 
   return useMutation({
     mutationFn: async ({
@@ -67,6 +69,10 @@ export function useClosePositionMutation() {
       queryClient.invalidateQueries({
         queryKey: queryKeys.positions.detail(positionId),
       });
+      toast.success(
+        "Exit requested",
+        "The position has been handed to the canonical exit flow and will move through exit-ready or closing states before it is fully closed.",
+      );
     },
   });
 }

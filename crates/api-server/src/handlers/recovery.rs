@@ -20,8 +20,8 @@ use crate::exit_handler::ExitHandlerConfig;
 use crate::runtime_sync;
 use crate::state::AppState;
 use crate::wallet_inventory::{
-    load_canonical_orphan_inventory, recover_canonical_orphan_inventory,
-    refresh_canonical_wallet_inventory,
+    load_canonical_inventory_summary, load_canonical_orphan_inventory,
+    recover_canonical_orphan_inventory, refresh_canonical_wallet_inventory,
 };
 use crate::workspace_scope::resolve_canonical_workspace_membership;
 
@@ -38,10 +38,16 @@ pub struct RecoveryPreviewResponse {
     pub safe_recovery: RecoveryBucketSummary,
     pub recoverable_now: RecoveryBucketSummary,
     pub liquidity_blocked: RecoveryBucketSummary,
+    pub orphan_inventory: RecoveryBucketSummary,
     pub stalled: RecoveryBucketSummary,
     pub suspect_inventory: RecoveryBucketSummary,
     pub open_monitoring: RecoveryBucketSummary,
     pub other_blocked: RecoveryBucketSummary,
+    pub inventory_last_synced_at: Option<DateTime<Utc>>,
+    pub inventory_last_scanned_block: Option<i64>,
+    pub inventory_backfill_cursor_block: Option<i64>,
+    pub inventory_backfill_completed_at: Option<DateTime<Utc>>,
+    pub inventory_backfill_in_progress: bool,
     pub live_running: bool,
     pub live_ready: bool,
     pub exit_handler_running: bool,
@@ -57,6 +63,8 @@ pub struct RecoveryRunResponse {
     pub allowance_cache_refreshed: bool,
     pub safe_exit_failures_requeued: i64,
     pub stalled_positions_reopened: i64,
+    pub orphan_inventory_attempted: i64,
+    pub orphan_inventory_succeeded: i64,
     pub warnings: Vec<String>,
 }
 
@@ -220,6 +228,8 @@ pub async fn run_recovery(
         allowance_cache_refreshed,
         safe_exit_failures_requeued,
         stalled_positions_reopened,
+        orphan_inventory_attempted: orphan_recovery.attempted as i64,
+        orphan_inventory_succeeded: orphan_recovery.succeeded as i64,
         warnings,
     }))
 }
@@ -245,8 +255,21 @@ async fn build_recovery_preview(
     }
 
     let runtime = runtime_snapshot(state, workspace_id).await?;
+    let inventory_summary = load_canonical_inventory_summary(state)
+        .await
+        .map_err(map_anyhow)?;
     let mut recoverable_now = RecoveryBucketSummary::default();
     let mut liquidity_blocked = RecoveryBucketSummary::default();
+    let orphan_inventory = RecoveryBucketSummary {
+        positions: inventory_summary
+            .as_ref()
+            .map(|summary| summary.orphan_positions)
+            .unwrap_or(0),
+        marked_value: inventory_summary
+            .as_ref()
+            .map(|summary| summary.orphan_marked_value)
+            .unwrap_or(Decimal::ZERO),
+    };
     let mut stalled = RecoveryBucketSummary::default();
     let mut suspect_inventory = RecoveryBucketSummary::default();
     let mut open_monitoring = RecoveryBucketSummary::default();
@@ -307,10 +330,30 @@ async fn build_recovery_preview(
         safe_recovery,
         recoverable_now,
         liquidity_blocked,
+        orphan_inventory,
         stalled,
         suspect_inventory,
         open_monitoring,
         other_blocked,
+        inventory_last_synced_at: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_last_synced_at),
+        inventory_last_scanned_block: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_last_scanned_block),
+        inventory_backfill_cursor_block: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_backfill_cursor_block),
+        inventory_backfill_completed_at: inventory_summary
+            .as_ref()
+            .and_then(|summary| summary.inventory_backfill_completed_at),
+        inventory_backfill_in_progress: inventory_summary
+            .as_ref()
+            .map(|summary| {
+                summary.inventory_last_scanned_block.is_some()
+                    && summary.inventory_backfill_completed_at.is_none()
+            })
+            .unwrap_or(false),
         live_running: runtime.live_running,
         live_ready: runtime.live_ready,
         exit_handler_running: runtime.exit_handler_running,

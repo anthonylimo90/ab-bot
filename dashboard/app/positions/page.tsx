@@ -228,7 +228,7 @@ export default function PositionsPage() {
 
         <PageIntro
           title="How to read positions"
-          description="Positions are trades the system has already entered. Open positions are still active, while closed positions show completed outcomes."
+          description="Positions are trades the system has already entered. Open positions are still active, and requesting an exit now queues the canonical exit flow rather than instantly marking the row closed."
           bullets={[
             "Unrealized P&L is the profit or loss if the open trade were closed right now.",
             "Win rate is based on closed trades only, so it may change as more positions finish.",
@@ -328,7 +328,7 @@ export default function PositionsPage() {
                     )}
                     {activeTab === "open" && (
                       <th className="px-4 py-3 text-center font-medium text-muted-foreground">
-                        Close
+                        Exit
                       </th>
                     )}
                   </tr>
@@ -446,18 +446,19 @@ export default function PositionsPage() {
                                     className="h-7 text-xs text-loss hover:text-loss hover:bg-loss/10"
                                     disabled={closeMutation.isPending}
                                   >
-                                    Close
+                                    Exit
                                   </Button>
                                 </AlertDialogTrigger>
                                 <AlertDialogContent>
                                   <AlertDialogHeader>
                                     <AlertDialogTitle>
-                                      Close Position?
+                                      Request Exit?
                                     </AlertDialogTitle>
                                     <AlertDialogDescription>
-                                      This will close your {pos.outcome.toUpperCase()}{" "}
-                                      position ({pos.quantity.toFixed(2)} shares) at
-                                      market price. Current P&L:{" "}
+                                      This will queue the canonical exit flow for your{" "}
+                                      {pos.outcome.toUpperCase()} position ({pos.quantity.toFixed(2)} shares).
+                                      The position will move through exit-ready or closing states before it is fully closed.
+                                      Current P&amp;L:{" "}
                                       {formatCurrency(pos.unrealized_pnl, {
                                         showSign: true,
                                       })}
@@ -473,7 +474,7 @@ export default function PositionsPage() {
                                       }
                                       className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
                                     >
-                                      Close Position
+                                      Queue Exit
                                     </AlertDialogAction>
                                   </AlertDialogFooter>
                                 </AlertDialogContent>

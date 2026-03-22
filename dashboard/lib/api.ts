@@ -150,6 +150,16 @@ function parseAccountSummary(raw: AccountSummary): AccountSummary {
     realized_pnl_24h: Number(raw.realized_pnl_24h),
     net_cash_flows_24h: Number(raw.net_cash_flows_24h),
     unpriced_position_cost_basis: Number(raw.unpriced_position_cost_basis),
+    orphan_positions: Number(raw.orphan_positions),
+    orphan_marked_value: Number(raw.orphan_marked_value),
+    inventory_last_scanned_block:
+      raw.inventory_last_scanned_block != null
+        ? Number(raw.inventory_last_scanned_block)
+        : undefined,
+    inventory_backfill_cursor_block:
+      raw.inventory_backfill_cursor_block != null
+        ? Number(raw.inventory_backfill_cursor_block)
+        : undefined,
   };
 }
 
@@ -199,10 +209,19 @@ function parseRecoveryPreview(
     safe_recovery: parseRecoveryBucket(raw.safe_recovery),
     recoverable_now: parseRecoveryBucket(raw.recoverable_now),
     liquidity_blocked: parseRecoveryBucket(raw.liquidity_blocked),
+    orphan_inventory: parseRecoveryBucket(raw.orphan_inventory),
     stalled: parseRecoveryBucket(raw.stalled),
     suspect_inventory: parseRecoveryBucket(raw.suspect_inventory),
     open_monitoring: parseRecoveryBucket(raw.open_monitoring),
     other_blocked: parseRecoveryBucket(raw.other_blocked),
+    inventory_last_scanned_block:
+      raw.inventory_last_scanned_block != null
+        ? Number(raw.inventory_last_scanned_block)
+        : undefined,
+    inventory_backfill_cursor_block:
+      raw.inventory_backfill_cursor_block != null
+        ? Number(raw.inventory_backfill_cursor_block)
+        : undefined,
   };
 }
 
@@ -939,6 +958,8 @@ class ApiClient {
       ...raw,
       safe_exit_failures_requeued: Number(raw.safe_exit_failures_requeued),
       stalled_positions_reopened: Number(raw.stalled_positions_reopened),
+      orphan_inventory_attempted: Number(raw.orphan_inventory_attempted),
+      orphan_inventory_succeeded: Number(raw.orphan_inventory_succeeded),
     };
   }
 

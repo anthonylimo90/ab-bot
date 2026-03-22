@@ -33,7 +33,7 @@ import {
   LineChart,
   BarChart2,
 } from "lucide-react";
-import { cn, formatCurrency, formatWinRatePercent } from "@/lib/utils";
+import { cn, formatCurrency, formatTimeAgo, formatWinRatePercent } from "@/lib/utils";
 import { TimeAgo } from "@/components/shared/TimeAgo";
 
 const activityIcons: Record<string, React.ReactNode> = {
@@ -161,7 +161,7 @@ export function DashboardHome() {
         description="This is your high-level system summary. It tells you whether the bot is healthy, what your open trades look like, and what the system has done most recently."
         bullets={[
           "Start with the status strip to confirm trading is safe and the scanner is active.",
-          "Portfolio metrics summarize current exposure and recent profit or loss.",
+          "Portfolio metrics summarize reconciled wallet cash and observed inventory exposure.",
           "Recent Activity gives the fastest explanation of what the system just did."
         ]}
       />
@@ -263,8 +263,8 @@ export function DashboardHome() {
           change={stats.total_pnl_percent}
           changeLabel={
             stats.unpriced_open_positions > 0
-              ? `Cash ${formatCurrency(stats.cash_balance)} + open positions ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}. ${stats.unpriced_open_positions} position${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis plus unrealized P&L because no direct mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
-              : `Cash ${formatCurrency(stats.cash_balance)} + open positions ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}`
+              ? `Cash ${formatCurrency(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}. ${stats.unpriced_open_positions} item${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis because no live mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
+              : `Cash ${formatCurrency(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}`
           }
           trend={stats.total_pnl_percent >= 0 ? "up" : "down"}
         />
@@ -285,12 +285,63 @@ export function DashboardHome() {
           }
         />
         <MetricCard
-          title="Open Positions"
+          title="Active Exposure"
           value={stats.active_positions.toString()}
           changeLabel={`Win rate: ${formatWinRatePercent(stats.win_rate, { input: "percent" })}`}
           trend="neutral"
         />
       </div>
+
+      {accountSummary && (
+        <Card>
+          <CardContent className="p-4">
+            <div className="grid gap-3 md:grid-cols-3">
+              <div>
+                <p className="text-xs text-muted-foreground">Inventory Sync</p>
+                <p className="text-sm font-semibold">
+                  {accountSummary.inventory_last_synced_at
+                    ? formatTimeAgo(accountSummary.inventory_last_synced_at)
+                    : "Pending first sync"}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Last scanned block{" "}
+                  {accountSummary.inventory_last_scanned_block != null
+                    ? accountSummary.inventory_last_scanned_block.toLocaleString()
+                    : "—"}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Historical Discovery</p>
+                <p className="text-sm font-semibold">
+                  {accountSummary.inventory_backfill_in_progress
+                    ? "Backfill in progress"
+                    : accountSummary.inventory_backfill_completed_at
+                      ? "Backfill complete"
+                      : "Awaiting scan"}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {accountSummary.inventory_backfill_in_progress &&
+                  accountSummary.inventory_backfill_cursor_block != null
+                    ? `Cursor block ${accountSummary.inventory_backfill_cursor_block.toLocaleString()}`
+                    : accountSummary.inventory_backfill_completed_at
+                      ? `Completed ${formatTimeAgo(accountSummary.inventory_backfill_completed_at)}`
+                      : "The inventory scanner is still warming up."}
+                </p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Orphan Inventory</p>
+                <p className="text-sm font-semibold">
+                  {formatCurrency(accountSummary.orphan_marked_value)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {accountSummary.orphan_positions} item
+                  {accountSummary.orphan_positions === 1 ? "" : "s"} currently need explicit tracking or recovery
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Quick Actions Row */}
       <div className="flex flex-wrap gap-2">

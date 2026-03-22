@@ -7,7 +7,7 @@ import type { UpdateOpportunitySelectionRequest } from "@/types/api";
 
 export function useRiskStatusQuery(workspaceId: string | undefined) {
   return useQuery({
-    queryKey: queryKeys.risk.status(workspaceId ?? ""),
+    queryKey: queryKeys.risk.status(),
     queryFn: () => api.getRiskStatus(workspaceId!),
     enabled: Boolean(workspaceId),
     refetchInterval: 15000,
@@ -17,7 +17,7 @@ export function useRiskStatusQuery(workspaceId: string | undefined) {
 
 export function useDynamicTunerQuery(workspaceId: string | undefined) {
   return useQuery({
-    queryKey: queryKeys.dynamicTuning.status(workspaceId ?? ""),
+    queryKey: queryKeys.dynamicTuning.status(),
     queryFn: () => api.getDynamicTunerStatus(workspaceId!),
     enabled: Boolean(workspaceId),
     refetchInterval: 30000,
@@ -27,7 +27,7 @@ export function useDynamicTunerQuery(workspaceId: string | undefined) {
 
 export function useServiceStatusQuery(workspaceId: string | undefined) {
   return useQuery({
-    queryKey: ["service-status", workspaceId],
+    queryKey: queryKeys.runtime.serviceStatus(),
     queryFn: () => api.getServiceStatus(workspaceId!),
     enabled: Boolean(workspaceId),
     refetchInterval: 30000,

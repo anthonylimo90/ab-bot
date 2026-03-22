@@ -116,9 +116,9 @@ export default function HistoryPage() {
 
         <PageIntro
           title="What this history uses"
-          description="This page now reads from the account ledger instead of the old activity feed. Equity comes from periodic snapshots, trade activity comes from trade events, and deposits or withdrawals are tracked separately as cash flows."
+          description="This page now reads from the account ledger and reconciled wallet inventory instead of the old activity feed. Equity comes from periodic snapshots, trade activity comes from trade events, and deposits or withdrawals are tracked separately as cash flows."
           bullets={[
-            "Account Equity = wallet cash + open-position value.",
+            "Account Equity = wallet cash + reconciled inventory value.",
             "Trade history is sourced from canonical trade events, not execution-report messages.",
             "Cash flows are recorded separately so top-ups and withdrawals do not look like trading P&L.",
           ]}
@@ -136,7 +136,7 @@ export default function HistoryPage() {
           </Card>
         ) : (
           <>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
               <MetricCard
                 title="Account Equity"
                 value={formatCurrency(summary.total_equity)}
@@ -151,13 +151,19 @@ export default function HistoryPage() {
                 title="Open Exposure"
                 value={formatCurrency(summary.position_value)}
                 trend="neutral"
-                changeLabel={`${summary.open_positions} open positions`}
+                changeLabel={`${summary.open_positions} active item${summary.open_positions === 1 ? '' : 's'}`}
               />
               <MetricCard
                 title="Realized P&L 24h"
                 value={formatCurrency(summary.realized_pnl_24h, { showSign: true })}
                 trend={summary.realized_pnl_24h >= 0 ? "up" : "down"}
                 changeLabel={`Cash flows 24h ${formatCurrency(summary.net_cash_flows_24h, { showSign: true })}`}
+              />
+              <MetricCard
+                title="Orphan Inventory"
+                value={formatCurrency(summary.orphan_marked_value)}
+                trend={summary.orphan_positions > 0 ? "down" : "neutral"}
+                changeLabel={`${summary.orphan_positions} orphan item${summary.orphan_positions === 1 ? '' : 's'}`}
               />
             </div>
 
@@ -192,7 +198,7 @@ export default function HistoryPage() {
                       </div>
                     )}
 
-                    <div className="grid gap-3 md:grid-cols-3">
+                    <div className="grid gap-3 md:grid-cols-4">
                       <div className="rounded-lg border p-4">
                         <p className="text-xs text-muted-foreground">Last Snapshot</p>
                         <p className="mt-1 text-sm font-medium">
@@ -200,7 +206,7 @@ export default function HistoryPage() {
                         </p>
                       </div>
                       <div className="rounded-lg border p-4">
-                        <p className="text-xs text-muted-foreground">Unpriced Open Positions</p>
+                        <p className="text-xs text-muted-foreground">Unpriced Holdings</p>
                         <p className="mt-1 text-sm font-medium">
                           {summary.unpriced_open_positions}
                         </p>
@@ -212,6 +218,21 @@ export default function HistoryPage() {
                         <p className="text-xs text-muted-foreground">Unrealized P&amp;L</p>
                         <p className="mt-1 text-sm font-medium">
                           {formatCurrency(summary.unrealized_pnl, { showSign: true })}
+                        </p>
+                      </div>
+                      <div className="rounded-lg border p-4">
+                        <p className="text-xs text-muted-foreground">Inventory Discovery</p>
+                        <p className="mt-1 text-sm font-medium">
+                          {summary.inventory_backfill_in_progress
+                            ? "Backfill in progress"
+                            : summary.inventory_backfill_completed_at
+                              ? "Backfill complete"
+                              : "Awaiting sync"}
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {summary.inventory_last_synced_at
+                            ? `Inventory sync ${formatTimeAgo(summary.inventory_last_synced_at)}`
+                            : "No inventory sync recorded yet"}
                         </p>
                       </div>
                     </div>

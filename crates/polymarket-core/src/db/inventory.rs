@@ -63,6 +63,10 @@ pub struct WalletInventorySummary {
     pub unpriced_position_cost_basis: Decimal,
     pub orphan_positions: i64,
     pub orphan_marked_value: Decimal,
+    pub inventory_last_synced_at: Option<DateTime<Utc>>,
+    pub inventory_last_scanned_block: Option<i64>,
+    pub inventory_backfill_cursor_block: Option<i64>,
+    pub inventory_backfill_completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -194,7 +198,23 @@ impl WalletInventoryRepository {
                 COUNT(*) FILTER (WHERE quantity > 0 AND current_price IS NULL)::bigint AS unpriced_open_positions,
                 COALESCE(SUM(COALESCE(cost_basis, 0)) FILTER (WHERE quantity > 0 AND current_price IS NULL), 0) AS unpriced_position_cost_basis,
                 COUNT(*) FILTER (WHERE quantity > 0 AND is_orphan = TRUE)::bigint AS orphan_positions,
-                COALESCE(SUM(COALESCE(marked_value, cost_basis, 0)) FILTER (WHERE quantity > 0 AND is_orphan = TRUE), 0) AS orphan_marked_value
+                COALESCE(SUM(COALESCE(marked_value, cost_basis, 0)) FILTER (WHERE quantity > 0 AND is_orphan = TRUE), 0) AS orphan_marked_value,
+                MAX(last_observed_at) AS inventory_last_synced_at,
+                (
+                    SELECT last_scanned_block
+                    FROM wallet_inventory_sync_state sync
+                    WHERE LOWER(sync.wallet_address) = LOWER($1)
+                ) AS inventory_last_scanned_block,
+                (
+                    SELECT backfill_cursor_block
+                    FROM wallet_inventory_sync_state sync
+                    WHERE LOWER(sync.wallet_address) = LOWER($1)
+                ) AS inventory_backfill_cursor_block,
+                (
+                    SELECT backfill_completed_at
+                    FROM wallet_inventory_sync_state sync
+                    WHERE LOWER(sync.wallet_address) = LOWER($1)
+                ) AS inventory_backfill_completed_at
             FROM wallet_inventory
             WHERE LOWER(wallet_address) = LOWER($1)
             "#,

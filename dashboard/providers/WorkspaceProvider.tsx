@@ -10,12 +10,10 @@ import { AlertTriangle, RefreshCw } from "lucide-react";
 
 interface WorkspaceContextValue {
   isInitializing: boolean;
-  needsWorkspaceSelection: boolean;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue>({
   isInitializing: true,
-  needsWorkspaceSelection: false,
 });
 
 export function useWorkspaceContext() {
@@ -43,8 +41,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   const pathname = usePathname();
   const { isAuthenticated, _hasHydrated: authHydrated, user } = useAuthStore();
   const {
-    currentWorkspace,
-    workspaces,
     isLoading,
     _hasHydrated: workspaceHydrated,
     fetchWorkspaces,
@@ -78,10 +74,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       }
 
       try {
-        // Fetch workspaces list and current workspace in parallel
-        await Promise.all([fetchWorkspaces(), fetchCurrentWorkspace()]);
-        // Fetch connected wallets so the header can show balance
-        fetchWallets().catch(() => {});
+        await fetchCurrentWorkspace();
+        Promise.allSettled([fetchWorkspaces(), fetchWallets()]).catch(() => {});
         setInitError(null);
         setHasInitialized(true);
       } catch (err) {
@@ -126,15 +120,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     (isAuthenticated && !isPlatformAdmin && !hasInitialized) ||
     isLoading;
 
-  const needsWorkspaceSelection =
-    hasInitialized &&
-    !currentWorkspace &&
-    workspaces.length > 0 &&
-    !isExemptRoute;
-
   const contextValue: WorkspaceContextValue = {
     isInitializing,
-    needsWorkspaceSelection: Boolean(needsWorkspaceSelection),
   };
 
   // Show retry UI if initialization failed

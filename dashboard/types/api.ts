@@ -143,6 +143,13 @@ export interface AccountSummary {
   open_markets: number;
   unpriced_open_positions: number;
   unpriced_position_cost_basis: number;
+  orphan_positions: number;
+  orphan_marked_value: number;
+  inventory_last_synced_at?: string;
+  inventory_last_scanned_block?: number;
+  inventory_backfill_cursor_block?: number;
+  inventory_backfill_completed_at?: string;
+  inventory_backfill_in_progress: boolean;
 }
 
 export interface AccountEquityPoint {
@@ -198,10 +205,16 @@ export interface RecoveryPreviewResponse {
   safe_recovery: RecoveryBucketSummary;
   recoverable_now: RecoveryBucketSummary;
   liquidity_blocked: RecoveryBucketSummary;
+  orphan_inventory: RecoveryBucketSummary;
   stalled: RecoveryBucketSummary;
   suspect_inventory: RecoveryBucketSummary;
   open_monitoring: RecoveryBucketSummary;
   other_blocked: RecoveryBucketSummary;
+  inventory_last_synced_at?: string;
+  inventory_last_scanned_block?: number;
+  inventory_backfill_cursor_block?: number;
+  inventory_backfill_completed_at?: string;
+  inventory_backfill_in_progress: boolean;
   live_running: boolean;
   live_ready: boolean;
   exit_handler_running: boolean;
@@ -216,6 +229,8 @@ export interface RecoveryRunResponse {
   allowance_cache_refreshed: boolean;
   safe_exit_failures_requeued: number;
   stalled_positions_reopened: number;
+  orphan_inventory_attempted: number;
+  orphan_inventory_succeeded: number;
   warnings: string[];
 }
 

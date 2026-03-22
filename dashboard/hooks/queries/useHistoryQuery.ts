@@ -61,7 +61,7 @@ export interface DynamicHistoryFilters {
 export function useDynamicConfigHistoryQuery(filters?: DynamicHistoryFilters) {
   const workspaceId = filters?.workspaceId;
   return useQuery<DynamicConfigHistoryEntry[]>({
-    queryKey: queryKeys.dynamicTuning.history(workspaceId ?? "", {
+    queryKey: queryKeys.dynamicTuning.history({
       limit: filters?.limit ?? 50,
       offset: filters?.offset ?? 0,
     }),

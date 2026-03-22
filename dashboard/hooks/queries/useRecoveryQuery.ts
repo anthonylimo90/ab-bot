@@ -10,9 +10,7 @@ export function useRecoveryPreviewQuery(
   enabled = true,
 ) {
   return useQuery({
-    queryKey: workspaceId
-      ? queryKeys.recovery.preview(workspaceId)
-      : ["recovery", "preview", "disabled"],
+    queryKey: workspaceId ? queryKeys.recovery.preview() : ["recovery", "preview", "disabled"],
     queryFn: () => api.getRecoveryPreview(workspaceId!),
     enabled: Boolean(workspaceId) && enabled,
     staleTime: 10_000,
@@ -29,19 +27,13 @@ export function useRunRecoveryMutation(workspaceId?: string | null) {
 
       await Promise.all([
         queryClient.invalidateQueries({
-          queryKey: queryKeys.recovery.preview(workspaceId),
+          queryKey: queryKeys.recovery.preview(),
         }),
         queryClient.invalidateQueries({
-          queryKey: queryKeys.account.summary(workspaceId),
+          queryKey: queryKeys.account.all(),
         }),
         queryClient.invalidateQueries({
-          queryKey: queryKeys.account.history(workspaceId),
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["service-status", workspaceId],
-        }),
-        queryClient.invalidateQueries({
-          queryKey: ["workspace", workspaceId, "service-status"],
+          queryKey: queryKeys.runtime.serviceStatus(),
         }),
       ]);
     },
