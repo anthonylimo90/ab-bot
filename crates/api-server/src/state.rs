@@ -598,6 +598,15 @@ impl AppState {
 
     /// Activate a vault wallet for live trading without restarting the server.
     pub async fn activate_trading_wallet(&self, address: &str) -> anyhow::Result<String> {
+        let wallet = self.load_wallet_from_vault(address).await?;
+        self.order_executor
+            .reload_wallet(wallet)
+            .await
+            .with_context(|| format!("Failed to activate trading wallet {}", address))
+    }
+
+    /// Load a wallet signer from the secure vault without mutating executor state.
+    pub async fn load_wallet_from_vault(&self, address: &str) -> anyhow::Result<TradingWallet> {
         let key_bytes = self
             .key_vault
             .get_wallet_key(address)
@@ -605,12 +614,8 @@ impl AppState {
             .context("Failed to load wallet key from vault")?
             .ok_or_else(|| anyhow::anyhow!("Wallet key not found in vault for {}", address))?;
         let key_hex = format!("0x{}", hex::encode(key_bytes));
-        let wallet = TradingWallet::from_private_key(&key_hex)
-            .context("Failed to parse private key from vault payload")?;
-        self.order_executor
-            .reload_wallet(wallet)
-            .await
-            .with_context(|| format!("Failed to activate trading wallet {}", address))
+        TradingWallet::from_private_key(&key_hex)
+            .context("Failed to parse private key from vault payload")
     }
 }
 

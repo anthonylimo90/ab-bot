@@ -70,6 +70,8 @@ use crate::websocket;
         vault::remove_wallet,
         vault::set_primary_wallet,
         vault::get_wallet_balance,
+        vault::list_withdrawals,
+        vault::create_withdrawal,
         recommendations::get_rotation_recommendations,
         recommendations::dismiss_recommendation,
         recommendations::accept_recommendation,
@@ -200,6 +202,8 @@ use crate::websocket;
             vault::StoreWalletRequest,
             vault::WalletInfo,
             vault::WalletBalanceResponse,
+            vault::CreateWithdrawalRequest,
+            vault::WalletWithdrawalResponse,
             recommendations::RotationRecommendation,
             recommendations::RecommendationType,
             recommendations::RecommendationReason,
@@ -442,6 +446,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/vault/wallets/:address/balance",
             get(vault::get_wallet_balance),
         )
+        .route("/api/v1/vault/withdrawals", get(vault::list_withdrawals))
         // Order endpoints (read-only)
         .route("/api/v1/orders/:order_id", get(trading::get_order_status))
         // Backtest endpoints (read-only)
@@ -604,6 +609,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/vault/wallets/:address/primary",
             put(vault::set_primary_wallet),
         )
+        .route("/api/v1/vault/withdrawals", post(vault::create_withdrawal))
         // Workspace operations (owner/admin can modify)
         // NOTE: PUT /workspaces/:id is in config_routes with stricter rate limiting
         .route(

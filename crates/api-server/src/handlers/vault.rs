@@ -1,10 +1,12 @@
-//! Vault handlers for wallet key management.
+//! Vault handlers for wallet key management and on-chain wallet withdrawals.
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -13,12 +15,15 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use auth::jwt::Claims;
+use auth::{AuditAction, AuditEvent};
 
 use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::workspace_scope::resolve_canonical_workspace_membership;
 use polymarket_core::api::PolygonClient;
+
+const POLYGONSCAN_TX_BASE_URL: &str = "https://polygonscan.com/tx/";
 
 async fn resolve_primary_wallet_address(
     pool: &PgPool,
@@ -93,6 +98,56 @@ async fn resolve_polygon_client_for_user(
     ))
 }
 
+async fn require_canonical_workspace_member(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> ApiResult<(Uuid, String)> {
+    resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|workspace| (workspace.id, workspace.role))
+        .ok_or_else(|| {
+            ApiError::Forbidden("You do not have access to the trading workspace".into())
+        })
+}
+
+fn validate_wallet_address(address: &str) -> ApiResult<String> {
+    let normalized = address.trim().to_lowercase();
+    let is_valid = normalized.len() == 42
+        && normalized.starts_with("0x")
+        && normalized
+            .bytes()
+            .skip(2)
+            .all(|byte| byte.is_ascii_hexdigit());
+
+    if !is_valid {
+        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+
+    Ok(normalized)
+}
+
+fn decimal_to_usdc_units(amount: Decimal) -> ApiResult<u128> {
+    if amount <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "Withdrawal amount must be greater than zero".into(),
+        ));
+    }
+    if amount.scale() > 6 {
+        return Err(ApiError::BadRequest(
+            "USDC withdrawals support at most 6 decimal places".into(),
+        ));
+    }
+
+    let scaled = amount * Decimal::from(1_000_000u64);
+    scaled
+        .to_u128()
+        .ok_or_else(|| ApiError::BadRequest("Withdrawal amount is too large or invalid".into()))
+}
+
+fn explorer_url_for_tx(tx_hash: &str) -> String {
+    format!("{}{}", POLYGONSCAN_TX_BASE_URL, tx_hash)
+}
+
 /// Request to store a wallet.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct StoreWalletRequest {
@@ -143,6 +198,123 @@ impl From<UserWalletRow> for WalletInfo {
     }
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateWithdrawalRequest {
+    /// Source wallet address or alias ("primary" / "active"). Defaults to the active wallet.
+    #[serde(default)]
+    pub source_address: Option<String>,
+    /// Destination Polygon wallet address.
+    pub destination_address: String,
+    /// Amount of USDC.e to transfer.
+    pub amount: Decimal,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WalletWithdrawalListQuery {
+    /// Maximum number of recent withdrawals to return.
+    #[serde(default = "default_withdrawal_limit")]
+    pub limit: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WalletWithdrawalResponse {
+    pub id: String,
+    pub wallet_address: String,
+    pub destination_address: String,
+    pub asset: String,
+    pub amount: Decimal,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explorer_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct WalletWithdrawalRow {
+    id: Uuid,
+    wallet_address: String,
+    destination_address: String,
+    asset: String,
+    amount: Decimal,
+    status: String,
+    tx_hash: Option<String>,
+    error: Option<String>,
+    requested_at: DateTime<Utc>,
+    confirmed_at: Option<DateTime<Utc>>,
+}
+
+impl From<WalletWithdrawalRow> for WalletWithdrawalResponse {
+    fn from(row: WalletWithdrawalRow) -> Self {
+        Self {
+            id: row.id.to_string(),
+            wallet_address: row.wallet_address,
+            destination_address: row.destination_address,
+            asset: row.asset,
+            amount: row.amount,
+            status: row.status,
+            explorer_url: row.tx_hash.as_ref().map(|hash| explorer_url_for_tx(hash)),
+            tx_hash: row.tx_hash,
+            error: row.error,
+            requested_at: row.requested_at,
+            confirmed_at: row.confirmed_at,
+        }
+    }
+}
+
+fn default_withdrawal_limit() -> i64 {
+    10
+}
+
+async fn resolve_user_wallet_address(
+    state: &AppState,
+    user_id: Uuid,
+    requested_address: Option<&str>,
+) -> ApiResult<String> {
+    let requested = requested_address
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("active")
+        .to_lowercase();
+
+    let address = if requested == "primary" {
+        resolve_primary_wallet_address(&state.pool, user_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("No primary wallet connected".into()))?
+    } else if requested == "active" {
+        match state.order_executor.wallet_address().await {
+            Some(address) => address.to_lowercase(),
+            None => resolve_primary_wallet_address(&state.pool, user_id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::NotFound("No active or primary wallet connected".into())
+                })?,
+        }
+    } else {
+        validate_wallet_address(&requested)?
+    };
+
+    let wallet_exists: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM user_wallets WHERE user_id = $1 AND address = $2")
+            .bind(user_id)
+            .bind(&address)
+            .fetch_optional(&state.pool)
+            .await?;
+
+    if wallet_exists.is_none() {
+        return Err(ApiError::Forbidden(
+            "The selected wallet is not connected under your account".into(),
+        ));
+    }
+
+    Ok(address)
+}
+
 /// Store a wallet's private key in the vault.
 #[utoipa::path(
     post,
@@ -168,10 +340,7 @@ pub async fn store_wallet(
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
     // Validate address format (basic check)
-    let address = req.address.to_lowercase();
-    if !address.starts_with("0x") || address.len() != 42 {
-        return Err(ApiError::BadRequest("Invalid wallet address format".into()));
-    }
+    let address = validate_wallet_address(&req.address)?;
 
     // Validate private key format
     let private_key = req.private_key.trim();
@@ -546,7 +715,7 @@ pub struct WalletBalanceResponse {
 pub async fn get_wallet_balance(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    axum::extract::Path(address): axum::extract::Path<String>,
+    Path(address): Path<String>,
 ) -> ApiResult<Json<WalletBalanceResponse>> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
@@ -599,5 +768,285 @@ pub async fn get_wallet_balance(
     Ok(Json(WalletBalanceResponse {
         address,
         usdc_balance,
+    }))
+}
+
+/// List recent on-chain withdrawals for the current user.
+#[utoipa::path(
+    get,
+    path = "/api/v1/vault/withdrawals",
+    params(
+        ("limit" = Option<i64>, Query, description = "Maximum number of recent withdrawals to return")
+    ),
+    responses(
+        (status = 200, description = "Recent wallet withdrawals", body = Vec<WalletWithdrawalResponse>),
+        (status = 401, description = "Unauthorized")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "vault"
+)]
+pub async fn list_withdrawals(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(query): Query<WalletWithdrawalListQuery>,
+) -> ApiResult<Json<Vec<WalletWithdrawalResponse>>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let limit = query.limit.clamp(1, 100);
+    let rows: Vec<WalletWithdrawalRow> = sqlx::query_as(
+        r#"
+        SELECT id, wallet_address, destination_address, asset, amount, status, tx_hash, error,
+               requested_at, confirmed_at
+        FROM wallet_withdrawals
+        WHERE user_id = $1
+        ORDER BY requested_at DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+/// Send USDC.e from a connected vault wallet to an external Polygon wallet.
+#[utoipa::path(
+    post,
+    path = "/api/v1/vault/withdrawals",
+    request_body = CreateWithdrawalRequest,
+    responses(
+        (status = 200, description = "Withdrawal confirmed", body = WalletWithdrawalResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 503, description = "Polygon RPC not configured")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "vault"
+)]
+pub async fn create_withdrawal(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<CreateWithdrawalRequest>,
+) -> ApiResult<Json<WalletWithdrawalResponse>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+    let (workspace_id, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
+    if role != "owner" && role != "admin" {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners and admins can initiate withdrawals".into(),
+        ));
+    }
+
+    let source_address =
+        resolve_user_wallet_address(state.as_ref(), user_id, req.source_address.as_deref()).await?;
+    let destination_address = validate_wallet_address(&req.destination_address)?;
+    if destination_address == source_address {
+        return Err(ApiError::BadRequest(
+            "Destination matches the source wallet. If this address is already in MetaMask, no withdrawal is needed.".into(),
+        ));
+    }
+
+    let amount_units = decimal_to_usdc_units(req.amount)?;
+    let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
+    let available_units = polygon_client
+        .get_usdc_balance_units(&source_address)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch source wallet balance: {}", e)))?;
+    if amount_units > available_units {
+        return Err(ApiError::BadRequest(format!(
+            "Insufficient USDC balance. Requested {}, available {:.6}",
+            req.amount,
+            available_units as f64 / 1_000_000.0
+        )));
+    }
+
+    let wallet = state
+        .load_wallet_from_vault(&source_address)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to load wallet signer: {}", e)))?;
+    let signer = wallet.signer();
+
+    let withdrawal_id = Uuid::new_v4();
+    let requested_at = Utc::now();
+    sqlx::query(
+        r#"
+        INSERT INTO wallet_withdrawals (
+            id, user_id, workspace_id, wallet_address, destination_address, asset, amount,
+            status, requested_at, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, 'USDC', $6, 'pending', $7, $7, $7)
+        "#,
+    )
+    .bind(withdrawal_id)
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(&source_address)
+    .bind(&destination_address)
+    .bind(req.amount)
+    .bind(requested_at)
+    .execute(&state.pool)
+    .await?;
+
+    let tx_hash = match polygon_client
+        .submit_usdc_transfer(signer, &destination_address, amount_units)
+        .await
+    {
+        Ok(tx_hash) => {
+            sqlx::query(
+                r#"
+                UPDATE wallet_withdrawals
+                SET status = 'submitted', tx_hash = $2, updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(withdrawal_id)
+            .bind(&tx_hash)
+            .execute(&state.pool)
+            .await?;
+            tx_hash
+        }
+        Err(error) => {
+            let message = error.to_string();
+            sqlx::query(
+                r#"
+                UPDATE wallet_withdrawals
+                SET status = 'failed', error = $2, updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(withdrawal_id)
+            .bind(&message)
+            .execute(&state.pool)
+            .await?;
+
+            state.audit_logger.log(
+                AuditEvent::builder(
+                    AuditAction::Custom("wallet_withdrawal".to_string()),
+                    format!("wallet/{}", source_address),
+                )
+                .user(user_id.to_string())
+                .details(serde_json::json!({
+                    "destination_address": destination_address,
+                    "amount": req.amount.to_string(),
+                    "status": "failed_pre_submission"
+                }))
+                .failure(message.clone())
+                .build(),
+            );
+
+            return Err(ApiError::Internal(format!(
+                "Failed to submit withdrawal transaction: {}",
+                message
+            )));
+        }
+    };
+
+    let receipt = match polygon_client
+        .wait_for_transaction(&tx_hash, 60, std::time::Duration::from_secs(2))
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let message = error.to_string();
+            sqlx::query(
+                r#"
+                UPDATE wallet_withdrawals
+                SET status = 'failed', error = $2, updated_at = NOW()
+                WHERE id = $1
+                "#,
+            )
+            .bind(withdrawal_id)
+            .bind(&message)
+            .execute(&state.pool)
+            .await?;
+
+            state.audit_logger.log(
+                AuditEvent::builder(
+                    AuditAction::Custom("wallet_withdrawal".to_string()),
+                    format!("wallet/{}", source_address),
+                )
+                .user(user_id.to_string())
+                .details(serde_json::json!({
+                    "destination_address": destination_address,
+                    "amount": req.amount.to_string(),
+                    "status": "failed_after_submission",
+                    "tx_hash": tx_hash
+                }))
+                .failure(message.clone())
+                .build(),
+            );
+
+            return Err(ApiError::Internal(format!(
+                "Withdrawal transaction failed after submission: {}",
+                message
+            )));
+        }
+    };
+
+    let confirmed_at = Utc::now();
+    sqlx::query(
+        r#"
+        UPDATE wallet_withdrawals
+        SET status = 'confirmed', confirmed_at = $2, updated_at = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(withdrawal_id)
+    .bind(confirmed_at)
+    .execute(&state.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO cash_flow_events (
+            id, workspace_id, event_type, amount, currency, note, occurred_at, created_by
+        )
+        VALUES ($1, $2, 'withdrawal', $3, 'USDC', $4, $5, $6)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(workspace_id)
+    .bind(-req.amount)
+    .bind(format!(
+        "On-chain wallet withdrawal to {} (tx: {})",
+        destination_address, tx_hash
+    ))
+    .bind(confirmed_at)
+    .bind(user_id)
+    .execute(&state.pool)
+    .await?;
+
+    state.audit_logger.log(
+        AuditEvent::builder(
+            AuditAction::Custom("wallet_withdrawal".to_string()),
+            format!("wallet/{}", source_address),
+        )
+        .user(user_id.to_string())
+        .details(serde_json::json!({
+            "destination_address": destination_address,
+            "amount": req.amount.to_string(),
+            "tx_hash": tx_hash,
+            "block_number": receipt.block_number,
+            "gas_used": receipt.gas_used
+        }))
+        .build(),
+    );
+
+    Ok(Json(WalletWithdrawalResponse {
+        id: withdrawal_id.to_string(),
+        wallet_address: source_address,
+        destination_address,
+        asset: "USDC".to_string(),
+        amount: req.amount,
+        status: "confirmed".to_string(),
+        tx_hash: Some(receipt.tx_hash.clone()),
+        explorer_url: Some(explorer_url_for_tx(&receipt.tx_hash)),
+        error: None,
+        requested_at,
+        confirmed_at: Some(confirmed_at),
     }))
 }

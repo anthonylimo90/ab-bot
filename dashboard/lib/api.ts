@@ -14,6 +14,8 @@ import type {
   AuthResponse,
   ConnectedWallet,
   StoreWalletRequest,
+  CreateWalletWithdrawalRequest,
+  WalletWithdrawal,
   UserListItem,
   CreateUserRequest,
   UpdateUserRequest,
@@ -222,6 +224,13 @@ function parseRecoveryPreview(
       raw.inventory_backfill_cursor_block != null
         ? Number(raw.inventory_backfill_cursor_block)
         : undefined,
+  };
+}
+
+function parseWalletWithdrawal(raw: WalletWithdrawal): WalletWithdrawal {
+  return {
+    ...raw,
+    amount: Number(raw.amount),
   };
 }
 
@@ -755,6 +764,23 @@ class ApiClient {
     return this.request<{ address: string; usdc_balance: number }>(
       `/api/v1/vault/wallets/${address}/balance`,
     );
+  }
+
+  async listWalletWithdrawals(limit = 10): Promise<WalletWithdrawal[]> {
+    const raw = await this.request<WalletWithdrawal[]>(
+      `/api/v1/vault/withdrawals?limit=${limit}`,
+    );
+    return raw.map(parseWalletWithdrawal);
+  }
+
+  async createWalletWithdrawal(
+    params: CreateWalletWithdrawalRequest,
+  ): Promise<WalletWithdrawal> {
+    const raw = await this.request<WalletWithdrawal>("/api/v1/vault/withdrawals", {
+      method: "POST",
+      body: JSON.stringify(params),
+    });
+    return parseWalletWithdrawal(raw);
   }
 
   // User Management (Admin only)

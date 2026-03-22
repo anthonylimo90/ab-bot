@@ -59,6 +59,10 @@ export const queryKeys = {
       [...queryKeys.wallets.all(), "detail", address] as const,
     metrics: (address: string) =>
       [...queryKeys.wallets.all(), "metrics", address] as const,
+    balance: (address: string | null) =>
+      [...queryKeys.wallets.all(), "balance", address] as const,
+    withdrawals: (params?: { limit?: number }) =>
+      [...queryKeys.wallets.all(), "withdrawals", params] as const,
   },
 
   // Markets

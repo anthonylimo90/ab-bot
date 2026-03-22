@@ -757,6 +757,26 @@ export interface StoreWalletRequest {
   label?: string;
 }
 
+export interface CreateWalletWithdrawalRequest {
+  source_address?: string;
+  destination_address: string;
+  amount: number;
+}
+
+export interface WalletWithdrawal {
+  id: string;
+  wallet_address: string;
+  destination_address: string;
+  asset: string;
+  amount: number;
+  status: string;
+  tx_hash?: string;
+  explorer_url?: string;
+  error?: string;
+  requested_at: string;
+  confirmed_at?: string;
+}
+
 // Health check
 export interface HealthResponse {
   status: string;

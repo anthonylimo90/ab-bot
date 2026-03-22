@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import { Input } from '@/components/ui/input';
 import { useSettingsStore, Theme } from '@/stores/settings-store';
 import { useToastStore } from '@/stores/toast-store';
 import {
@@ -23,6 +24,7 @@ import {
   Star,
   Trash2,
   Settings2,
+  ArrowUpRight,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -32,10 +34,15 @@ import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
 import { InfoTooltip } from '@/components/shared/InfoTooltip';
 import { PageIntro } from '@/components/shared/PageIntro';
 import { useWalletStore } from '@/stores/wallet-store';
+import {
+  useCreateWalletWithdrawalMutation,
+  useWalletBalanceQuery,
+  useWalletWithdrawalsQuery,
+} from '@/hooks/queries/useWalletsQuery';
 import api from '@/lib/api';
 import { queryKeys } from '@/lib/queryClient';
 import Link from 'next/link';
-import { formatCurrency } from '@/lib/utils';
+import { formatCurrency, formatTimeAgo } from '@/lib/utils';
 
 export default function SettingsPage() {
   const toast = useToastStore();
@@ -67,6 +74,8 @@ export default function SettingsPage() {
   const [riskEnabled, setRiskEnabled] = useState(true);
   const [isTrippingCb, setIsTrippingCb] = useState(false);
   const [isResettingCb, setIsResettingCb] = useState(false);
+  const [withdrawDestination, setWithdrawDestination] = useState('');
+  const [withdrawAmount, setWithdrawAmount] = useState('');
 
   const {
     connectedWallets,
@@ -82,6 +91,7 @@ export default function SettingsPage() {
   const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canManageRisk = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
+  const canManageWithdrawals = currentUserRole === 'owner' || currentUserRole === 'admin';
 
   // Fetch workspace members
   const { data: members = [], isLoading: membersLoading } = useQuery({
@@ -112,6 +122,15 @@ export default function SettingsPage() {
     enabled: !!currentWorkspace?.id,
     refetchInterval: 30000,
   });
+  const primaryConnectedWallet =
+    connectedWallets.find((wallet) => wallet.address === primaryWallet) ?? null;
+  const {
+    data: primaryWalletBalance,
+    isPending: isPrimaryWalletBalancePending,
+  } = useWalletBalanceQuery(primaryWallet ?? null);
+  const { data: recentWithdrawals = [], isLoading: withdrawalsLoading } =
+    useWalletWithdrawalsQuery(8);
+  const createWithdrawalMutation = useCreateWalletWithdrawalMutation();
 
   // Initialize risk form from API data
   useEffect(() => {
@@ -296,6 +315,47 @@ export default function SettingsPage() {
     }
   };
 
+  const handleWithdraw = async () => {
+    if (!primaryWallet) {
+      toast.error('No active wallet', 'Connect a wallet and mark it active before withdrawing.');
+      return;
+    }
+
+    const amount = Number(withdrawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      toast.error('Invalid amount', 'Enter a positive USDC amount to withdraw.');
+      return;
+    }
+
+    if (!/^0x[a-fA-F0-9]{40}$/.test(withdrawDestination.trim())) {
+      toast.error('Invalid destination', 'Enter a valid Polygon wallet address.');
+      return;
+    }
+
+    if (withdrawDestination.trim().toLowerCase() === primaryWallet.toLowerCase()) {
+      toast.error(
+        'Same wallet selected',
+        'The destination matches your active trading wallet. If this is already your MetaMask address, no transfer is needed.',
+      );
+      return;
+    }
+
+    try {
+      await createWithdrawalMutation.mutateAsync({
+        source_address: primaryWallet,
+        destination_address: withdrawDestination.trim(),
+        amount,
+      });
+      setWithdrawDestination('');
+      setWithdrawAmount('');
+    } catch (err) {
+      toast.error(
+        'Withdrawal failed',
+        err instanceof Error ? err.message : 'Unable to submit withdrawal',
+      );
+    }
+  };
+
   const shortAddress = (address: string) => `${address.slice(0, 6)}...${address.slice(-4)}`;
 
   return (
@@ -326,7 +386,7 @@ export default function SettingsPage() {
             Account
           </CardTitle>
           <CardDescription>
-            Choose which wallet the bot is allowed to use for live trading
+            Choose which wallet the bot is allowed to use for live trading and withdraw settled USDC when needed
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -335,7 +395,7 @@ export default function SettingsPage() {
               <div>
                 <p className="flex items-center gap-2 font-medium">
                   <span>Connected Wallets</span>
-                  <InfoTooltip content="These are the wallets stored for this workspace. The wallet marked Active is the one the bot will use for live trading." />
+                  <InfoTooltip content="These are the wallets connected under your account. The wallet marked Active is the one the bot will use for live trading." />
                 </p>
                 <p className="text-sm text-muted-foreground">
                   The wallet marked Active is used automatically for live trading
@@ -396,6 +456,141 @@ export default function SettingsPage() {
                     </div>
                   );
                 })}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-lg border p-4">
+            <div className="mb-4">
+              <p className="flex items-center gap-2 font-medium">
+                <span>Withdraw USDC</span>
+                <InfoTooltip content="This sends a real on-chain Polygon USDC.e transfer from the active trading wallet. It only moves free USDC, not open position inventory." />
+              </p>
+              <p className="text-sm text-muted-foreground">
+                Send settled USDC from the active trading wallet to another Polygon address, such as a different MetaMask wallet.
+              </p>
+            </div>
+
+            {!canManageWithdrawals ? (
+              <p className="text-sm text-muted-foreground">
+                Only workspace owners and admins can initiate withdrawals.
+              </p>
+            ) : !primaryWallet ? (
+              <p className="text-sm text-muted-foreground">
+                Connect and activate a wallet before withdrawing funds.
+              </p>
+            ) : (
+              <div className="space-y-4">
+                <div className="rounded-md border bg-muted/30 p-3 text-sm">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="font-medium">
+                        Source wallet: {primaryConnectedWallet?.label || shortAddress(primaryWallet)}
+                      </p>
+                      <p className="font-mono text-xs text-muted-foreground">
+                        {primaryWallet}
+                      </p>
+                    </div>
+                    <div className="text-sm font-medium">
+                      {isPrimaryWalletBalancePending
+                        ? 'Loading balance...'
+                        : primaryWalletBalance
+                          ? `${formatCurrency(primaryWalletBalance.usdc_balance)} available`
+                          : 'Balance unavailable'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="space-y-2 text-sm">
+                    <span className="font-medium">Destination Address</span>
+                    <Input
+                      value={withdrawDestination}
+                      onChange={(e) => setWithdrawDestination(e.target.value)}
+                      placeholder="0x..."
+                      className="font-mono"
+                    />
+                  </label>
+                  <label className="space-y-2 text-sm">
+                    <span className="font-medium">Amount (USDC)</span>
+                    <Input
+                      type="number"
+                      min="0"
+                      step="0.000001"
+                      value={withdrawAmount}
+                      onChange={(e) => setWithdrawAmount(e.target.value)}
+                      placeholder="25.00"
+                    />
+                  </label>
+                </div>
+
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-xs text-muted-foreground">
+                    If your MetaMask wallet already uses this same active address, the funds are already there and no withdrawal transfer is needed.
+                  </p>
+                  <Button
+                    onClick={handleWithdraw}
+                    disabled={createWithdrawalMutation.isPending || !withdrawDestination || !withdrawAmount}
+                    className="w-full sm:w-auto"
+                  >
+                    {createWithdrawalMutation.isPending ? (
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <ArrowUpRight className="h-4 w-4" />
+                    )}
+                    <span className="ml-2">Withdraw</span>
+                  </Button>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-medium">Recent Withdrawals</p>
+                    {withdrawalsLoading && (
+                      <span className="text-xs text-muted-foreground">Refreshing...</span>
+                    )}
+                  </div>
+                  {recentWithdrawals.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      No withdrawals recorded yet.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {recentWithdrawals.map((withdrawal) => (
+                        <div
+                          key={withdrawal.id}
+                          className="flex flex-col gap-2 rounded-md border p-3 sm:flex-row sm:items-center sm:justify-between"
+                        >
+                          <div className="min-w-0">
+                            <p className="font-medium">
+                              {formatCurrency(withdrawal.amount)} to {shortAddress(withdrawal.destination_address)}
+                            </p>
+                            <p className="text-xs text-muted-foreground">
+                              {formatTimeAgo(withdrawal.requested_at)} · {withdrawal.status}
+                            </p>
+                            {withdrawal.error && (
+                              <p className="mt-1 text-xs text-destructive">
+                                {withdrawal.error}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {withdrawal.tx_hash && (
+                              <a
+                                href={withdrawal.explorer_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                              >
+                                View tx
+                                <ExternalLink className="h-3 w-3" />
+                              </a>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
