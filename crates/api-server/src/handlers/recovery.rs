@@ -16,8 +16,14 @@ use uuid::Uuid;
 use auth::Claims;
 
 use crate::error::{ApiError, ApiResult};
+use crate::exit_handler::ExitHandlerConfig;
 use crate::runtime_sync;
 use crate::state::AppState;
+use crate::wallet_inventory::{
+    load_canonical_orphan_inventory, recover_canonical_orphan_inventory,
+    refresh_canonical_wallet_inventory,
+};
+use crate::workspace_scope::resolve_canonical_workspace_membership;
 
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct RecoveryBucketSummary {
@@ -67,7 +73,7 @@ struct EffectivePositionRow {
     current_price: Option<Decimal>,
     entry_value: Decimal,
     unrealized_pnl: Decimal,
-    failure_reason: Option<String>,
+    failure_reason: Option<FailureReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +109,9 @@ struct RuntimeSnapshot {
 pub async fn preview_recovery(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<RecoveryPreviewResponse>> {
-    let workspace_id = parse_and_require_member(&state.pool, &claims, &workspace_id).await?;
+    let workspace_id = parse_and_require_member(&state.pool, &claims).await?;
     let preview = build_recovery_preview(state.as_ref(), workspace_id).await?;
     Ok(Json(preview))
 }
@@ -128,11 +134,15 @@ pub async fn preview_recovery(
 pub async fn run_recovery(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<RecoveryRunResponse>> {
-    let workspace_id = parse_and_require_member(&state.pool, &claims, &workspace_id).await?;
+    let workspace_id = parse_and_require_member(&state.pool, &claims).await?;
     ensure_workspace_runtime_enabled(&state.pool, workspace_id).await?;
     runtime_sync::reconcile_runtime_service_toggles(state.as_ref()).await;
+
+    if let Err(error) = refresh_canonical_wallet_inventory(state.as_ref()).await {
+        tracing::warn!(error = %error, "Failed to refresh wallet inventory during recovery run");
+    }
 
     let allowance_cache_refreshed = if state.order_executor.is_live_ready().await {
         state
@@ -169,6 +179,19 @@ pub async fn run_recovery(
         }
     }
 
+    let orphan_retry_backoff_secs = if let Some(config) = state.exit_handler_config.as_ref() {
+        config.read().await.failed_exit_retry_backoff_secs
+    } else {
+        ExitHandlerConfig::from_env().failed_exit_retry_backoff_secs
+    };
+    let orphan_recovery =
+        recover_canonical_orphan_inventory(state.as_ref(), orphan_retry_backoff_secs)
+            .await
+            .map_err(map_anyhow)?;
+    if orphan_recovery.succeeded > 0 {
+        let _ = refresh_canonical_wallet_inventory(state.as_ref()).await;
+    }
+
     let runtime = runtime_snapshot(state.as_ref(), workspace_id).await?;
     let mut warnings = Vec::new();
     if !runtime.live_ready {
@@ -180,6 +203,12 @@ pub async fn run_recovery(
     if !allowance_cache_refreshed {
         warnings
             .push("CLOB allowance cache was not refreshed during this recovery run".to_string());
+    }
+    if orphan_recovery.attempted > 0 {
+        warnings.push(format!(
+            "Attempted orphan inventory recovery for {} token balances ({} successful submits)",
+            orphan_recovery.attempted, orphan_recovery.succeeded
+        ));
     }
 
     Ok(Json(RecoveryRunResponse {
@@ -195,37 +224,26 @@ pub async fn run_recovery(
     }))
 }
 
-async fn parse_and_require_member(
-    pool: &sqlx::PgPool,
-    claims: &Claims,
-    workspace_id: &str,
-) -> ApiResult<Uuid> {
+async fn parse_and_require_member(pool: &sqlx::PgPool, claims: &Claims) -> ApiResult<Uuid> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let member: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT role
-        FROM workspace_members
-        WHERE workspace_id = $1 AND user_id = $2
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-
-    member
-        .map(|_| workspace_id)
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))
+    resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|workspace| workspace.id)
+        .ok_or_else(|| ApiError::Forbidden("Not a member of the canonical workspace".into()))
 }
 
 async fn build_recovery_preview(
     state: &AppState,
     workspace_id: Uuid,
 ) -> ApiResult<RecoveryPreviewResponse> {
+    if let Err(error) = refresh_canonical_wallet_inventory(state).await {
+        tracing::warn!(
+            error = %error,
+            "Failed to refresh wallet inventory during recovery preview"
+        );
+    }
+
     let runtime = runtime_snapshot(state, workspace_id).await?;
     let mut recoverable_now = RecoveryBucketSummary::default();
     let mut liquidity_blocked = RecoveryBucketSummary::default();
@@ -239,7 +257,7 @@ async fn build_recovery_preview(
         match row.state {
             2 | 3 => accumulate(&mut recoverable_now, marked_value),
             7 => accumulate(&mut stalled, marked_value),
-            6 => match classify_failure_reason(row.failure_reason.as_deref()) {
+            6 => match classify_failure_reason(row.failure_reason.as_ref()) {
                 FailureBucket::SuspectInventory => accumulate(&mut suspect_inventory, marked_value),
                 FailureBucket::LiquidityBlocked => accumulate(&mut liquidity_blocked, marked_value),
                 FailureBucket::SafeRetry | FailureBucket::Other => {
@@ -248,6 +266,25 @@ async fn build_recovery_preview(
             },
             1 => accumulate(&mut open_monitoring, marked_value),
             _ => accumulate(&mut other_blocked, marked_value),
+        }
+    }
+
+    for entry in load_canonical_orphan_inventory(state)
+        .await
+        .map_err(map_anyhow)?
+    {
+        let marked_value = entry
+            .marked_value
+            .or(entry.cost_basis)
+            .unwrap_or(Decimal::ZERO);
+        match entry.last_exit_error.as_deref() {
+            Some(message) => match classify_failure_message(message) {
+                FailureBucket::SuspectInventory => accumulate(&mut suspect_inventory, marked_value),
+                FailureBucket::LiquidityBlocked => accumulate(&mut liquidity_blocked, marked_value),
+                FailureBucket::SafeRetry => accumulate(&mut recoverable_now, marked_value),
+                FailureBucket::Other => accumulate(&mut other_blocked, marked_value),
+            },
+            None => accumulate(&mut suspect_inventory, marked_value),
         }
     }
 
@@ -333,7 +370,17 @@ async fn ensure_workspace_runtime_enabled(
 }
 
 async fn load_effective_positions(pool: &sqlx::PgPool) -> ApiResult<Vec<EffectivePositionRow>> {
-    let rows = sqlx::query_as::<_, EffectivePositionRow>(
+    #[derive(Debug, FromRow)]
+    struct EffectivePositionRowDb {
+        state: i16,
+        quantity: Decimal,
+        current_price: Option<Decimal>,
+        entry_value: Decimal,
+        unrealized_pnl: Decimal,
+        failure_reason: Option<String>,
+    }
+
+    let rows = sqlx::query_as::<_, EffectivePositionRowDb>(
         r#"
         WITH active_positions AS (
             SELECT
@@ -374,7 +421,20 @@ async fn load_effective_positions(pool: &sqlx::PgPool) -> ApiResult<Vec<Effectiv
     .fetch_all(pool)
     .await?;
 
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|row| EffectivePositionRow {
+            state: row.state,
+            quantity: row.quantity,
+            current_price: row.current_price,
+            entry_value: row.entry_value,
+            unrealized_pnl: row.unrealized_pnl,
+            failure_reason: row
+                .failure_reason
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<FailureReason>(value).ok()),
+        })
+        .collect())
 }
 
 fn effective_marked_value(row: &EffectivePositionRow) -> Decimal {
@@ -389,12 +449,48 @@ fn accumulate(bucket: &mut RecoveryBucketSummary, marked_value: Decimal) {
     bucket.marked_value += marked_value;
 }
 
-fn classify_failure_reason(reason: Option<&str>) -> FailureBucket {
+fn classify_failure_reason(reason: Option<&FailureReason>) -> FailureBucket {
     let Some(reason) = reason else {
         return FailureBucket::Other;
     };
 
-    let reason = reason.to_ascii_lowercase();
+    match reason {
+        FailureReason::OrderTimeout { .. } | FailureReason::PriceSlippage { .. } => {
+            FailureBucket::SafeRetry
+        }
+        FailureReason::InsufficientBalance => FailureBucket::SuspectInventory,
+        FailureReason::MarketClosed | FailureReason::StalePosition { .. } => FailureBucket::Other,
+        FailureReason::OrderRejected { message }
+        | FailureReason::ConnectivityError { message }
+        | FailureReason::Unknown { message }
+        | FailureReason::OneLeggedEntry { message, .. } => classify_failure_message(message),
+    }
+}
+
+fn should_requeue_exit_failure(reason: Option<&FailureReason>) -> bool {
+    let Some(reason) = reason else {
+        return false;
+    };
+
+    let message = match reason {
+        FailureReason::OrderRejected { message }
+        | FailureReason::ConnectivityError { message }
+        | FailureReason::Unknown { message }
+        | FailureReason::OneLeggedEntry { message, .. } => message.as_str(),
+        FailureReason::OrderTimeout { .. } => return true,
+        FailureReason::PriceSlippage { .. } => return true,
+        FailureReason::StalePosition { .. } => return false,
+        FailureReason::InsufficientBalance | FailureReason::MarketClosed => return false,
+    };
+
+    matches!(
+        classify_failure_message(message),
+        FailureBucket::LiquidityBlocked | FailureBucket::SafeRetry
+    )
+}
+
+fn classify_failure_message(message: &str) -> FailureBucket {
+    let reason = message.to_ascii_lowercase();
     if reason.contains("404 not found") || reason.contains("insufficient conditional balance") {
         return FailureBucket::SuspectInventory;
     }
@@ -413,27 +509,6 @@ fn classify_failure_reason(reason: Option<&str>) -> FailureBucket {
     }
 
     FailureBucket::Other
-}
-
-fn should_requeue_exit_failure(reason: Option<&FailureReason>) -> bool {
-    let Some(reason) = reason else {
-        return false;
-    };
-
-    let message = match reason {
-        FailureReason::OrderRejected { message }
-        | FailureReason::ConnectivityError { message }
-        | FailureReason::Unknown { message } => message.as_str(),
-        FailureReason::OrderTimeout { .. } => return true,
-        FailureReason::PriceSlippage { .. } => return true,
-        FailureReason::StalePosition { .. } => return false,
-        FailureReason::InsufficientBalance | FailureReason::MarketClosed => return false,
-    };
-
-    matches!(
-        classify_failure_reason(Some(message)),
-        FailureBucket::LiquidityBlocked | FailureBucket::SafeRetry
-    )
 }
 
 fn map_anyhow(error: impl std::fmt::Display) -> ApiError {

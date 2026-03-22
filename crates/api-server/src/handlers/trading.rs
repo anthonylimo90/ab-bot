@@ -22,6 +22,9 @@ use polymarket_core::types::{
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::websocket::{SignalType, SignalUpdate};
+use crate::workspace_scope::{
+    load_canonical_workspace_flags, resolve_canonical_workspace_membership,
+};
 
 /// Order side.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -169,19 +172,13 @@ pub async fn place_order(
 ) -> ApiResult<Json<OrderResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-
-    let workspace_live_enabled: bool = sqlx::query_scalar(
-        r#"
-        SELECT COALESCE(w.live_trading_enabled, FALSE)
-        FROM user_settings us
-        JOIN workspaces w ON w.id = us.default_workspace_id
-        WHERE us.user_id = $1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or(false);
+    resolve_canonical_workspace_membership(&state.pool, user_id)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("Not a member of the canonical workspace".into()))?;
+    let workspace_live_enabled = load_canonical_workspace_flags(&state.pool)
+        .await?
+        .map(|flags| flags.live_trading_enabled)
+        .ok_or_else(|| ApiError::NotFound("Canonical workspace not found".into()))?;
 
     if workspace_live_enabled {
         if !state.order_executor.is_live() {

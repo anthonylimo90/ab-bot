@@ -1,5 +1,6 @@
 //! Database access layer for PostgreSQL/TimescaleDB.
 
+pub mod inventory;
 pub mod positions;
 pub mod wallets;
 

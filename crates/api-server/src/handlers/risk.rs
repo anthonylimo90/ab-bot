@@ -14,22 +14,16 @@ use auth::Claims;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::workspace_scope::resolve_canonical_workspace_membership;
 
-// Re-use the workspace membership check pattern
-async fn get_user_role(
+async fn require_canonical_workspace_member(
     pool: &sqlx::PgPool,
-    workspace_id: Uuid,
     user_id: Uuid,
-) -> Result<Option<String>, sqlx::Error> {
-    let role: Option<(String,)> = sqlx::query_as(
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-    )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(role.map(|(r,)| r))
+) -> ApiResult<(Uuid, String)> {
+    resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|workspace| (workspace.id, workspace.role))
+        .ok_or_else(|| ApiError::Forbidden("Not a member of the canonical workspace".into()))
 }
 
 fn can_manage_risk(role: &str) -> bool {
@@ -138,18 +132,11 @@ fn trip_reason_to_string(reason: &risk_manager::circuit_breaker::TripReason) -> 
 pub async fn get_risk_status(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<RiskStatusResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
-    }
+    require_canonical_workspace_member(&state.pool, user_id).await?;
 
     // Read circuit breaker state from AppState (in-memory, no DB hit)
     let cb_state = state.circuit_breaker.state().await;
@@ -225,19 +212,11 @@ pub async fn get_risk_status(
 pub async fn manual_trip_circuit_breaker(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<CircuitBreakerResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    let role = match role {
-        Some(r) => r,
-        None => return Err(ApiError::Forbidden("Not a member of this workspace".into())),
-    };
+    let (_, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
     if !can_manage_risk(&role) {
         return Err(ApiError::Forbidden(
             "Only workspace owners/admins can manage circuit breaker controls".into(),
@@ -316,20 +295,12 @@ pub struct UpdateCircuitBreakerConfigRequest {
 pub async fn update_circuit_breaker_config(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
     Json(req): Json<UpdateCircuitBreakerConfigRequest>,
 ) -> ApiResult<Json<CircuitBreakerConfigResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership + role
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    let role = match role {
-        Some(r) => r,
-        None => return Err(ApiError::Forbidden("Not a member of this workspace".into())),
-    };
+    let (workspace_id, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
     if !can_manage_risk(&role) {
         return Err(ApiError::Forbidden(
             "Only workspace owners/admins can update circuit breaker config".into(),
@@ -431,19 +402,11 @@ pub async fn update_circuit_breaker_config(
 pub async fn reset_circuit_breaker(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<CircuitBreakerResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    let role = match role {
-        Some(r) => r,
-        None => return Err(ApiError::Forbidden("Not a member of this workspace".into())),
-    };
+    let (_, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
     if !can_manage_risk(&role) {
         return Err(ApiError::Forbidden(
             "Only workspace owners/admins can manage circuit breaker controls".into(),

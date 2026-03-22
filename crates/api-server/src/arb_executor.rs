@@ -1546,7 +1546,10 @@ impl ArbAutoExecutor {
                 error = %error,
                 "Failed to transition one-legged position to Open"
             );
-            position.mark_entry_failed(FailureReason::OrderRejected { message: reason });
+            position.mark_entry_failed(FailureReason::OneLeggedEntry {
+                held_leg: "yes".to_string(),
+                message: reason,
+            });
             let _ = self.position_repo.update(position).await;
             self.record_failure_event(
                 execution_mode,
@@ -1566,7 +1569,10 @@ impl ArbAutoExecutor {
                 error = %error,
                 "Failed to transition one-legged position to ExitReady"
             );
-            position.mark_entry_failed(FailureReason::OrderRejected { message: reason });
+            position.mark_entry_failed(FailureReason::OneLeggedEntry {
+                held_leg: "yes".to_string(),
+                message: reason,
+            });
             let _ = self.position_repo.update(position).await;
             self.record_failure_event(
                 execution_mode,
@@ -1579,7 +1585,8 @@ impl ArbAutoExecutor {
             return;
         }
 
-        position.failure_reason = Some(FailureReason::OrderRejected {
+        position.failure_reason = Some(FailureReason::OneLeggedEntry {
+            held_leg: "yes".to_string(),
             message: reason.clone(),
         });
         position.last_updated = Utc::now();

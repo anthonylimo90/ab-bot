@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
+use crate::wallet_inventory::recover_wallet_orphan_inventory;
 use crate::websocket::{SignalType, SignalUpdate};
 
 enum ExitBidStatus {
@@ -377,6 +378,9 @@ impl ExitHandler {
                     }
                     if let Err(e) = self.process_one_legged_recovery().await {
                         error!(error = %e, "Failed to process one-legged recovery");
+                    }
+                    if let Err(e) = self.process_orphan_inventory_recovery(&cfg).await {
+                        error!(error = %e, "Failed to process orphan inventory recovery");
                     }
                 }
                 _ = resolution_ticker.tick() => {
@@ -1460,6 +1464,38 @@ impl ExitHandler {
                     "One-legged position sent through exit flow for flattening"
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    async fn process_orphan_inventory_recovery(
+        &self,
+        cfg: &ExitHandlerConfig,
+    ) -> anyhow::Result<()> {
+        let Some(wallet_address) = self.order_executor.wallet_address().await else {
+            return Ok(());
+        };
+
+        let result = recover_wallet_orphan_inventory(
+            &self.pool,
+            self.order_executor.as_ref(),
+            self.clob_client.as_ref(),
+            &wallet_address,
+            cfg.failed_exit_retry_backoff_secs,
+            Some(&self.trade_event_recorder),
+            Some(&self.signal_tx),
+            Some(self.circuit_breaker.as_ref()),
+        )
+        .await?;
+
+        if result.attempted > 0 {
+            debug!(
+                wallet_address = %wallet_address,
+                attempted = result.attempted,
+                succeeded = result.succeeded,
+                "Processed orphan inventory recovery candidates"
+            );
         }
 
         Ok(())

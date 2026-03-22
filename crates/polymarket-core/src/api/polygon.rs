@@ -1,7 +1,10 @@
 //! Polygon RPC client for on-chain data.
 
+use crate::signing::CTF_ADDRESS;
 use crate::{Error, Result};
+use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 
 /// USDC.e contract on Polygon (PoS bridged, 6 decimals) — used by Polymarket.
@@ -9,6 +12,10 @@ const POLYGON_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 /// Native USDC contract on Polygon (CCTP, 6 decimals) — NOT used by Polymarket.
 const POLYGON_NATIVE_USDC_ADDRESS: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
+const ERC1155_TRANSFER_SINGLE_TOPIC: &str =
+    "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
+const ERC1155_TRANSFER_BATCH_TOPIC: &str =
+    "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb";
 
 /// Polygon RPC client for querying blockchain data.
 #[derive(Clone)]
@@ -86,6 +93,83 @@ impl PolygonClient {
             message: response.error.map(|e| e.message).unwrap_or_default(),
             status: None,
         })
+    }
+
+    /// Get transaction logs for a contract with an explicit topics JSON filter.
+    pub async fn get_logs_with_topics(
+        &self,
+        contract_address: &str,
+        from_block: u64,
+        to_block: u64,
+        topics: serde_json::Value,
+    ) -> Result<Vec<Log>> {
+        let params = serde_json::json!([{
+            "address": contract_address,
+            "fromBlock": format!("0x{:x}", from_block),
+            "toBlock": format!("0x{:x}", to_block),
+            "topics": topics
+        }]);
+
+        let response: JsonRpcResponse<Vec<Log>> = self.rpc_call("eth_getLogs", params).await?;
+
+        response.result.ok_or_else(|| Error::Api {
+            message: response.error.map(|e| e.message).unwrap_or_default(),
+            status: None,
+        })
+    }
+
+    /// Discover CTF ERC-1155 token ids that have been transferred to or from a wallet.
+    pub async fn get_ctf_transfer_token_ids(
+        &self,
+        wallet_address: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<HashSet<String>> {
+        if from_block > to_block {
+            return Ok(HashSet::new());
+        }
+
+        let wallet_topic = topic_for_address(wallet_address);
+        let filters = [
+            serde_json::json!([
+                ERC1155_TRANSFER_SINGLE_TOPIC,
+                serde_json::Value::Null,
+                wallet_topic,
+                serde_json::Value::Null
+            ]),
+            serde_json::json!([
+                ERC1155_TRANSFER_SINGLE_TOPIC,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                wallet_topic
+            ]),
+            serde_json::json!([
+                ERC1155_TRANSFER_BATCH_TOPIC,
+                serde_json::Value::Null,
+                wallet_topic,
+                serde_json::Value::Null
+            ]),
+            serde_json::json!([
+                ERC1155_TRANSFER_BATCH_TOPIC,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                wallet_topic
+            ]),
+        ];
+
+        let mut token_ids = HashSet::new();
+        for filter in filters {
+            let logs = self
+                .get_logs_with_topics(CTF_ADDRESS, from_block, to_block, filter)
+                .await?;
+            for log in logs {
+                for token_id in extract_ctf_token_ids(&log)? {
+                    token_ids.insert(token_id);
+                }
+            }
+        }
+
+        Ok(token_ids)
     }
 
     /// Get transactions for a wallet address (via Alchemy enhanced API).
@@ -181,6 +265,70 @@ impl PolygonClient {
     }
 }
 
+fn topic_for_address(wallet_address: &str) -> String {
+    format!(
+        "0x{:0>64}",
+        wallet_address.trim_start_matches("0x").to_lowercase()
+    )
+}
+
+fn extract_ctf_token_ids(log: &Log) -> Result<Vec<String>> {
+    let Some(topic_0) = log.topics.first() else {
+        return Ok(Vec::new());
+    };
+
+    let data = log.data.trim_start_matches("0x");
+    match topic_0.as_str() {
+        ERC1155_TRANSFER_SINGLE_TOPIC => {
+            if data.len() < 64 {
+                return Ok(Vec::new());
+            }
+
+            let token_id = U256::from_str_radix(&data[..64], 16).map_err(|e| Error::Api {
+                message: format!("Failed to parse ERC-1155 TransferSingle token id: {e}"),
+                status: None,
+            })?;
+            Ok(vec![token_id.to_string()])
+        }
+        ERC1155_TRANSFER_BATCH_TOPIC => {
+            let ids_offset = parse_u256_word(data, 0)?;
+            let ids_offset_words = u256_to_usize(ids_offset)? / 32;
+            let ids_len = u256_to_usize(parse_u256_word(data, ids_offset_words)?)?;
+
+            let mut token_ids = Vec::with_capacity(ids_len);
+            for index in 0..ids_len {
+                let token_id = parse_u256_word(data, ids_offset_words + 1 + index)?;
+                token_ids.push(token_id.to_string());
+            }
+            Ok(token_ids)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_u256_word(data: &str, word_index: usize) -> Result<U256> {
+    let start = word_index.saturating_mul(64);
+    let end = start.saturating_add(64);
+    if end > data.len() {
+        return Err(Error::Api {
+            message: format!("ERC-1155 log data too short for word index {}", word_index),
+            status: None,
+        });
+    }
+
+    U256::from_str_radix(&data[start..end], 16).map_err(|e| Error::Api {
+        message: format!("Failed to parse ERC-1155 log word {}: {}", word_index, e),
+        status: None,
+    })
+}
+
+fn u256_to_usize(value: U256) -> Result<usize> {
+    value.to_string().parse::<usize>().map_err(|e| Error::Api {
+        message: format!("Failed to convert U256 value to usize: {}", e),
+        status: None,
+    })
+}
+
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest<'a> {
     jsonrpc: &'a str,
@@ -241,4 +389,56 @@ struct AssetTransfersResponse {
     transfers: Vec<AssetTransfer>,
     #[serde(rename = "pageKey")]
     page_key: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_ctf_token_ids, Log, ERC1155_TRANSFER_BATCH_TOPIC, ERC1155_TRANSFER_SINGLE_TOPIC,
+    };
+
+    fn hex_word(value: u64) -> String {
+        format!("{value:064x}")
+    }
+
+    #[test]
+    fn extract_ctf_token_ids_parses_transfer_single() {
+        let log = Log {
+            address: "0x0".to_string(),
+            topics: vec![ERC1155_TRANSFER_SINGLE_TOPIC.to_string()],
+            data: format!("0x{}{}", hex_word(42), hex_word(1)),
+            block_number: "0x1".to_string(),
+            transaction_hash: "0xabc".to_string(),
+            log_index: "0x0".to_string(),
+        };
+
+        let token_ids = extract_ctf_token_ids(&log).expect("single transfer should parse");
+        assert_eq!(token_ids, vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn extract_ctf_token_ids_parses_transfer_batch() {
+        let data = format!(
+            "0x{}{}{}{}{}{}{}{}",
+            hex_word(64),  // ids offset
+            hex_word(160), // values offset
+            hex_word(2),   // ids length
+            hex_word(7),   // id[0]
+            hex_word(9),   // id[1]
+            hex_word(2),   // values length
+            hex_word(1),   // value[0]
+            hex_word(1),   // value[1]
+        );
+        let log = Log {
+            address: "0x0".to_string(),
+            topics: vec![ERC1155_TRANSFER_BATCH_TOPIC.to_string()],
+            data,
+            block_number: "0x1".to_string(),
+            transaction_hash: "0xabc".to_string(),
+            log_index: "0x0".to_string(),
+        };
+
+        let token_ids = extract_ctf_token_ids(&log).expect("batch transfer should parse");
+        assert_eq!(token_ids, vec!["7".to_string(), "9".to_string()]);
+    }
 }

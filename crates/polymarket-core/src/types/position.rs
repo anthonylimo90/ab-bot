@@ -80,6 +80,8 @@ pub enum FailureReason {
     PriceSlippage { expected: Decimal, actual: Decimal },
     /// Network or API connectivity issue.
     ConnectivityError { message: String },
+    /// Entry filled only one leg and needs dedicated recovery handling.
+    OneLeggedEntry { held_leg: String, message: String },
     /// Position was stalled for too long without updates.
     StalePosition { last_update_secs: u64 },
     /// Unknown or unclassified failure.
@@ -618,6 +620,7 @@ impl Position {
             return false;
         }
         match &self.failure_reason {
+            Some(FailureReason::OneLeggedEntry { .. }) => true,
             Some(FailureReason::OrderRejected { message })
             | Some(FailureReason::ConnectivityError { message }) => {
                 let lower = message.to_lowercase();

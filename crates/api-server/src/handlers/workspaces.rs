@@ -28,6 +28,7 @@ use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::strategy_modes::{resolve_strategy_modes, StrategyModeInputs, StrategyModeStatus};
+use crate::workspace_scope::resolve_canonical_workspace_membership;
 
 #[derive(Debug, sqlx::FromRow)]
 struct WorkspaceAuditSnapshot {
@@ -304,6 +305,16 @@ async fn get_user_role(
     Ok(role.map(|(r,)| r))
 }
 
+async fn require_canonical_workspace_member(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+) -> ApiResult<(Uuid, String)> {
+    resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|workspace| (workspace.id, workspace.role))
+        .ok_or_else(|| ApiError::NotFound("No canonical workspace available".into()))
+}
+
 /// List workspaces the current user belongs to.
 #[utoipa::path(
     get,
@@ -321,36 +332,40 @@ pub async fn list_workspaces(
 ) -> ApiResult<Json<Vec<WorkspaceListItem>>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    let Ok((workspace_id, _)) = require_canonical_workspace_member(&state.pool, user_id).await
+    else {
+        return Ok(Json(Vec::new()));
+    };
 
-    let workspaces: Vec<UserWorkspaceRow> = sqlx::query_as(
+    let workspace: Option<UserWorkspaceRow> = sqlx::query_as(
         r#"
         SELECT
             w.id, w.name, w.description, wm.role, w.total_budget, w.created_at,
             (SELECT COUNT(*) FROM workspace_members WHERE workspace_id = w.id) as member_count
         FROM workspaces w
         INNER JOIN workspace_members wm ON w.id = wm.workspace_id
-        WHERE wm.user_id = $1
-        ORDER BY w.created_at DESC
+        WHERE w.id = $1 AND wm.user_id = $2
         "#,
     )
+    .bind(workspace_id)
     .bind(user_id)
-    .fetch_all(&state.pool)
+    .fetch_optional(&state.pool)
     .await?;
 
-    let response: Vec<WorkspaceListItem> = workspaces
-        .into_iter()
-        .map(|w| WorkspaceListItem {
-            id: w.id.to_string(),
-            name: w.name,
-            description: w.description,
-            my_role: w.role,
-            member_count: w.member_count,
-            setup_complete: w.total_budget > Decimal::ZERO,
-            created_at: w.created_at,
-        })
-        .collect();
-
-    Ok(Json(response))
+    Ok(Json(
+        workspace
+            .into_iter()
+            .map(|w| WorkspaceListItem {
+                id: w.id.to_string(),
+                name: w.name,
+                description: w.description,
+                my_role: w.role,
+                member_count: w.member_count,
+                setup_complete: w.total_budget > Decimal::ZERO,
+                created_at: w.created_at,
+            })
+            .collect(),
+    ))
 }
 
 /// Get current workspace (from user settings).
@@ -371,17 +386,7 @@ pub async fn get_current_workspace(
 ) -> ApiResult<Json<WorkspaceResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-
-    // Get user's default workspace
-    let settings: Option<(Option<Uuid>,)> =
-        sqlx::query_as("SELECT default_workspace_id FROM user_settings WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
-
-    let workspace_id = settings
-        .and_then(|(id,)| id)
-        .ok_or_else(|| ApiError::NotFound("No current workspace set".into()))?;
+    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
 
     get_workspace(
         State(state),
@@ -410,12 +415,11 @@ pub async fn get_current_workspace(
 pub async fn get_workspace(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
+    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
 
     let workspace: Option<WorkspaceDetailRow> = sqlx::query_as(
         r#"
@@ -820,18 +824,11 @@ pub async fn update_workspace(
 pub async fn switch_workspace(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
-    }
+    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
 
     // Update user settings
     let now = Utc::now();

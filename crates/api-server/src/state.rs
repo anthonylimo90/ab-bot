@@ -164,8 +164,10 @@ impl AppState {
         let live_trading_env = std::env::var("LIVE_TRADING")
             .map(|v| v == "true")
             .unwrap_or(false);
-        let live_trading_workspace = match crate::runtime_sync::any_workspace_live_enabled(&pool)
-            .await
+        let live_trading_workspace = match crate::runtime_sync::canonical_workspace_live_enabled(
+            &pool,
+        )
+        .await
         {
             Ok(enabled) => enabled,
             Err(e) => {
@@ -324,27 +326,36 @@ impl AppState {
                 }
             }
 
-            // Persist the loaded wallet address to all live-trading workspaces so
-            // the dashboard TradingGates panel can display it without querying the executor.
+            // Persist the loaded wallet address to the canonical trading workspace so
+            // the dashboard can display it without querying the executor.
             if let Some(addr) = order_executor.wallet_address().await {
-                match sqlx::query(
-                    "UPDATE workspaces SET trading_wallet_address = $1 WHERE live_trading_enabled = true AND (trading_wallet_address IS NULL OR trading_wallet_address != $1)",
-                )
-                .bind(&addr)
-                .execute(&pool)
-                .await
-                {
-                    Ok(result) => {
-                        if result.rows_affected() > 0 {
-                            tracing::info!(
-                                wallet = %addr,
-                                workspaces_updated = result.rows_affected(),
-                                "Persisted trading wallet address to workspace(s)"
-                            );
+                match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
+                    Ok(Some(workspace_id)) => {
+                        match sqlx::query(
+                            "UPDATE workspaces SET trading_wallet_address = $1 WHERE id = $2 AND (trading_wallet_address IS NULL OR trading_wallet_address != $1)",
+                        )
+                        .bind(&addr)
+                        .bind(workspace_id)
+                        .execute(&pool)
+                        .await
+                        {
+                            Ok(result) => {
+                                if result.rows_affected() > 0 {
+                                    tracing::info!(
+                                        wallet = %addr,
+                                        workspace_id = %workspace_id,
+                                        "Persisted trading wallet address to canonical workspace"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to persist trading wallet address to canonical workspace (non-fatal)");
+                            }
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => {
-                        tracing::warn!(error = %e, "Failed to persist trading wallet address to workspaces (non-fatal)");
+                        tracing::warn!(error = %e, "Failed to resolve canonical workspace for wallet address persistence");
                     }
                 }
             }
@@ -388,45 +399,59 @@ impl AppState {
             cb_cooldown_minutes: Option<i32>,
             cb_enabled: Option<bool>,
         }
-        match sqlx::query_as::<_, CbOverrideRow>(
-            r#"
-            SELECT cb_max_daily_loss, cb_max_drawdown_pct, cb_max_consecutive_losses,
-                   cb_cooldown_minutes, cb_enabled
-            FROM workspaces
-            WHERE cb_max_daily_loss IS NOT NULL
-               OR cb_max_drawdown_pct IS NOT NULL
-               OR cb_max_consecutive_losses IS NOT NULL
-               OR cb_cooldown_minutes IS NOT NULL
-               OR cb_enabled IS NOT NULL
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&pool)
-        .await
-        {
-            Ok(Some(row)) => {
-                if let Some(v) = row.cb_max_daily_loss {
-                    circuit_breaker_config.max_daily_loss = v;
+        match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
+            Ok(Some(workspace_id)) => {
+                match sqlx::query_as::<_, CbOverrideRow>(
+                    r#"
+                    SELECT cb_max_daily_loss, cb_max_drawdown_pct, cb_max_consecutive_losses,
+                           cb_cooldown_minutes, cb_enabled
+                    FROM workspaces
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(workspace_id)
+                .fetch_optional(&pool)
+                .await
+                {
+                    Ok(Some(row)) => {
+                        if let Some(v) = row.cb_max_daily_loss {
+                            circuit_breaker_config.max_daily_loss = v;
+                        }
+                        if let Some(v) = row.cb_max_drawdown_pct {
+                            circuit_breaker_config.max_drawdown_pct = v;
+                        }
+                        if let Some(v) = row.cb_max_consecutive_losses {
+                            circuit_breaker_config.max_consecutive_losses = v as u32;
+                        }
+                        if let Some(v) = row.cb_cooldown_minutes {
+                            circuit_breaker_config.cooldown_minutes = v as i64;
+                        }
+                        if let Some(v) = row.cb_enabled {
+                            circuit_breaker_config.enabled = v;
+                        }
+                        tracing::info!(
+                            workspace_id = %workspace_id,
+                            "Loaded circuit breaker config overrides from canonical workspace"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            workspace_id = %workspace_id,
+                            "No canonical workspace row found for circuit breaker overrides"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load canonical workspace CB overrides from DB, using env/defaults: {e}");
+                    }
                 }
-                if let Some(v) = row.cb_max_drawdown_pct {
-                    circuit_breaker_config.max_drawdown_pct = v;
-                }
-                if let Some(v) = row.cb_max_consecutive_losses {
-                    circuit_breaker_config.max_consecutive_losses = v as u32;
-                }
-                if let Some(v) = row.cb_cooldown_minutes {
-                    circuit_breaker_config.cooldown_minutes = v as i64;
-                }
-                if let Some(v) = row.cb_enabled {
-                    circuit_breaker_config.enabled = v;
-                }
-                tracing::info!("Loaded circuit breaker config overrides from workspace DB");
             }
             Ok(None) => {
-                tracing::debug!("No workspace CB overrides found, using env/default values");
+                tracing::debug!(
+                    "No canonical workspace found, using env/default circuit breaker values"
+                );
             }
             Err(e) => {
-                tracing::warn!("Failed to load CB overrides from DB, using env/defaults: {e}");
+                tracing::warn!("Failed to resolve canonical workspace for CB overrides, using env/defaults: {e}");
             }
         }
 

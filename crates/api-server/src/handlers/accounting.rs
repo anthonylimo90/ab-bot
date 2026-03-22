@@ -16,6 +16,7 @@ use auth::Claims;
 use crate::accounting_ledger::load_live_account_snapshot;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::workspace_scope::resolve_canonical_workspace_membership;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AccountSummaryResponse {
@@ -147,25 +148,14 @@ struct TradeEventRow {
     unrealized_pnl: Option<Decimal>,
 }
 
-async fn require_workspace_member(
+async fn require_canonical_workspace_member(
     pool: &sqlx::PgPool,
-    workspace_id: Uuid,
     user_id: Uuid,
-) -> ApiResult<String> {
-    let role: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT role
-        FROM workspace_members
-        WHERE workspace_id = $1 AND user_id = $2
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-
-    role.map(|(role,)| role)
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))
+) -> ApiResult<(Uuid, String)> {
+    resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|workspace| (workspace.id, workspace.role))
+        .ok_or_else(|| ApiError::Forbidden("Not a member of the canonical workspace".into()))
 }
 
 fn normalize_source_label(source: &str) -> String {
@@ -194,18 +184,16 @@ fn normalize_source_label(source: &str) -> String {
 pub async fn get_account_summary(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<AccountSummaryResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-    require_workspace_member(&state.pool, workspace_id, user_id).await?;
+    require_canonical_workspace_member(&state.pool, user_id).await?;
 
-    let snapshot = load_live_account_snapshot(state.as_ref(), workspace_id)
+    let snapshot = load_live_account_snapshot(state.as_ref())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
+        .ok_or_else(|| ApiError::NotFound("Canonical workspace not found".into()))?;
 
     Ok(Json(AccountSummaryResponse {
         workspace_id: snapshot.workspace_id.to_string(),
@@ -242,14 +230,12 @@ pub async fn get_account_summary(
 pub async fn get_account_history(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
     Query(query): Query<AccountHistoryQuery>,
 ) -> ApiResult<Json<AccountHistoryResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-    require_workspace_member(&state.pool, workspace_id, user_id).await?;
+    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
 
     let hours = query.hours.clamp(1, 24 * 30);
     let limit = query.limit.clamp(1, 500);
@@ -353,14 +339,12 @@ pub async fn get_account_history(
 pub async fn list_cash_flows(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
     Query(query): Query<CashFlowListQuery>,
 ) -> ApiResult<Json<Vec<CashFlowEventResponse>>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-    require_workspace_member(&state.pool, workspace_id, user_id).await?;
+    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
 
     let rows = load_cash_flow_events(&state.pool, workspace_id, query.limit.clamp(1, 500)).await?;
     Ok(Json(rows))
@@ -384,14 +368,12 @@ pub async fn list_cash_flows(
 pub async fn create_cash_flow(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
     Json(req): Json<CreateCashFlowRequest>,
 ) -> ApiResult<Json<CashFlowEventResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-    let role = require_workspace_member(&state.pool, workspace_id, user_id).await?;
+    let (workspace_id, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
     if role != "owner" && role != "admin" {
         return Err(ApiError::Forbidden(
             "Only workspace owners and admins can record cash flows".into(),

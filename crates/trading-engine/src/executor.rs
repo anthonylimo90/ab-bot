@@ -270,6 +270,17 @@ impl OrderExecutor {
         Ok(())
     }
 
+    /// Query the authenticated CLOB client's balance/allowance snapshot.
+    pub async fn get_live_balance_allowance(
+        &self,
+        asset_type: &str,
+        token_id: Option<&str>,
+    ) -> Option<BalanceAllowanceResponse> {
+        let slot = self.auth_client.read().await;
+        let client = slot.as_ref()?;
+        Self::get_balance_allowance_snapshot(client, asset_type, token_id).await
+    }
+
     /// Take the execution report receiver (can only be called once).
     pub fn take_report_receiver(&mut self) -> Option<mpsc::Receiver<ExecutionReport>> {
         self.report_rx.take()

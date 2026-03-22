@@ -83,7 +83,8 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 CASE
                     WHEN p.state = 5
                         AND (
-                            p.failure_reason ILIKE '%one-legged%'
+                            p.failure_reason::jsonb ? 'one_legged_entry'
+                            OR p.failure_reason ILIKE '%one-legged%'
                             OR p.failure_reason ILIKE '%one_legged%'
                         )
                     THEN TRUE
@@ -92,7 +93,8 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 CASE
                     WHEN p.state = 6
                         AND (
-                            p.failure_reason ILIKE '%one-legged%'
+                            p.failure_reason::jsonb ? 'one_legged_entry'
+                            OR p.failure_reason ILIKE '%one-legged%'
                             OR p.failure_reason ILIKE '%one_legged%'
                             OR p.failure_reason ILIKE '%sell%'
                             OR p.failure_reason ILIKE '%exit%'

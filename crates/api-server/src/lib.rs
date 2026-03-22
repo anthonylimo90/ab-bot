@@ -49,7 +49,9 @@ pub mod strategy_modes;
 pub mod strategy_pnl_calculator;
 pub mod trade_events;
 pub mod wallet_harvester;
+pub mod wallet_inventory;
 pub mod websocket;
+pub mod workspace_scope;
 
 pub use accounting_ledger::{spawn_account_snapshot_calculator, AccountSnapshotConfig};
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
@@ -76,6 +78,7 @@ pub use state::AppState;
 pub use strategy_health_calculator::{spawn_strategy_health_calculator, StrategyHealthConfig};
 pub use strategy_pnl_calculator::{spawn_strategy_pnl_calculator, StrategyPnlConfig};
 pub use wallet_harvester::{spawn_wallet_harvester, WalletHarvesterConfig};
+pub use wallet_inventory::{spawn_wallet_inventory_reconciler, WalletInventoryConfig};
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
@@ -184,11 +187,11 @@ impl ApiServer {
         // ── Pre-create arb executor config Arc (must happen before Arc-wrapping state) ──
         let mut arb_config_pre = ArbExecutorConfig::from_env();
         if !arb_config_pre.enabled {
-            match crate::runtime_sync::any_workspace_arb_enabled(&self.state.pool).await {
+            match crate::runtime_sync::canonical_workspace_arb_enabled(&self.state.pool).await {
                 Ok(true) => {
                     arb_config_pre.enabled = true;
                     info!(
-                        "Enabling arb auto-executor because at least one workspace has arb_auto_execute=true"
+                        "Enabling arb auto-executor because the canonical workspace has arb_auto_execute=true"
                     );
                 }
                 Ok(false) => {}
@@ -206,11 +209,13 @@ impl ApiServer {
         // Pre-create exit handler config Arc (must happen before Arc-wrapping state)
         let mut exit_config_pre = ExitHandlerConfig::from_env();
         if !exit_config_pre.enabled {
-            match crate::runtime_sync::any_workspace_exit_handler_enabled(&self.state.pool).await {
+            match crate::runtime_sync::canonical_workspace_exit_handler_enabled(&self.state.pool)
+                .await
+            {
                 Ok(true) => {
                     exit_config_pre.enabled = true;
                     info!(
-                        "Enabling exit handler because at least one workspace has exit_handler_enabled=true"
+                        "Enabling exit handler because the canonical workspace has exit_handler_enabled=true"
                     );
                 }
                 Ok(false) => {}
@@ -349,6 +354,9 @@ impl ApiServer {
         // Spawn Gamma API market metadata syncer (hourly, populates market_metadata)
         let gamma_config = GammaSyncerConfig::from_env();
         spawn_gamma_syncer(gamma_config, state.pool.clone(), db_semaphore.clone());
+
+        let wallet_inventory_config = WalletInventoryConfig::from_env();
+        spawn_wallet_inventory_reconciler(wallet_inventory_config, state.clone());
 
         // Spawn flow feature calculator (5 min, aggregates wallet_trades → market_flow_features)
         let flow_config = FlowFeatureConfig::from_env();

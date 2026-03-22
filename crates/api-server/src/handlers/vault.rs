@@ -17,6 +17,7 @@ use auth::jwt::Claims;
 use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::workspace_scope::resolve_canonical_workspace_membership;
 use polymarket_core::api::PolygonClient;
 
 async fn resolve_primary_wallet_address(
@@ -37,8 +38,8 @@ async fn resolve_primary_wallet_address(
 ///
 /// Fallback chain:
 ///   1. `state.polygon_client` (env-var-initialized at startup)
-///   2. User's default workspace `polygon_rpc_url`
-///   3. User's default workspace `alchemy_api_key` (decrypted)
+///   2. Canonical workspace `polygon_rpc_url`
+///   3. Canonical workspace `alchemy_api_key` (decrypted)
 ///   4. 503 ServiceUnavailable
 async fn resolve_polygon_client_for_user(
     state: &AppState,
@@ -49,22 +50,25 @@ async fn resolve_polygon_client_for_user(
         return Ok(client);
     }
 
-    // Slow path: look up the user's workspace RPC settings from DB.
+    // Slow path: look up the canonical workspace RPC settings from DB.
     warn!(
         user_id = %user_id,
-        "polygon_client not in AppState; falling back to workspace-level RPC config"
+        "polygon_client not in AppState; falling back to canonical workspace RPC config"
     );
+
+    let workspace_id = resolve_canonical_workspace_membership(&state.pool, user_id)
+        .await?
+        .map(|workspace| workspace.id);
 
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT w.polygon_rpc_url, w.alchemy_api_key
         FROM workspaces w
-        INNER JOIN user_settings us ON us.default_workspace_id = w.id
-        WHERE us.user_id = $1
+        WHERE w.id = $1
         LIMIT 1
         "#,
     )
-    .bind(user_id)
+    .bind(workspace_id)
     .fetch_optional(&state.pool)
     .await?;
 
