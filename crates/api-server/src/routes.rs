@@ -12,7 +12,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     accounting, activity, admin_workspaces, auth, backtest, discover, health, markets,
-    order_signing, positions, recovery, recommendations, risk, signals, strategy_health,
+    order_signing, positions, recommendations, recovery, risk, signals, strategy_health,
     trade_flow, trading, users, vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::{require_admin, require_auth, require_trader};

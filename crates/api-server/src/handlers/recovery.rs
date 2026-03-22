@@ -178,7 +178,8 @@ pub async fn run_recovery(
         warnings.push("Exit handler heartbeat is stale or the worker is not running".to_string());
     }
     if !allowance_cache_refreshed {
-        warnings.push("CLOB allowance cache was not refreshed during this recovery run".to_string());
+        warnings
+            .push("CLOB allowance cache was not refreshed during this recovery run".to_string());
     }
 
     Ok(Json(RecoveryRunResponse {
