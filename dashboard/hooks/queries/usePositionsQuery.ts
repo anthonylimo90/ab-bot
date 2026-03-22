@@ -64,7 +64,7 @@ export function useClosePositionMutation() {
     },
     onSuccess: (_, { positionId }) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.positions.all() });
-      queryClient.removeQueries({
+      queryClient.invalidateQueries({
         queryKey: queryKeys.positions.detail(positionId),
       });
     },

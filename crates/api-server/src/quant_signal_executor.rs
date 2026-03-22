@@ -5,7 +5,7 @@
 //! market orders. Structural copy of `arb_executor.rs` adapted for quant signals.
 
 use chrono::Utc;
-use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::db::positions::{PositionRepository, SOURCE_RECOMMENDATION};
 use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
 use polymarket_core::types::{ExitStrategy, MarketOrder, OrderSide, Position};
 use risk_manager::circuit_breaker::CircuitBreaker;
@@ -969,7 +969,9 @@ impl QuantSignalExecutor {
             quantity,
             ExitStrategy::ExitOnCorrection,
         );
-        self.position_repo.insert(&position).await?;
+        self.position_repo
+            .insert_with_source(&position, SOURCE_RECOMMENDATION, Some(signal.id))
+            .await?;
 
         self.trade_event_recorder
             .record_warn(
@@ -988,15 +990,6 @@ impl QuantSignalExecutor {
                 .with_metadata(signal.metadata.clone()),
             )
             .await;
-
-        // Tag this position as quant-originated (source=3=recommendation)
-        // so P&L attribution and dynamic tuner queries can distinguish it.
-        sqlx::query("UPDATE positions SET source = 3, source_signal_id = $1 WHERE id = $2")
-            .bind(signal.id)
-            .bind(position.id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to tag position source: {e}"))?;
 
         info!(
             signal_id = %signal.id,
@@ -1017,7 +1010,9 @@ impl QuantSignalExecutor {
             target_token_id.clone(),
             OrderSide::Buy,
             quantity,
-        );
+        )
+        .with_expected_price(best_ask)
+        .with_slippage(self.order_executor.default_slippage());
 
         let report = match self.order_executor.execute_market_order(order).await {
             Ok(report) => report,

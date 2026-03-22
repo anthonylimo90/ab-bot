@@ -173,12 +173,12 @@ pub struct ExecutionReport {
 }
 
 impl ExecutionReport {
-    pub fn success(
+    pub fn filled(
         order_id: Uuid,
         market_id: String,
         outcome_id: String,
         side: OrderSide,
-        filled_quantity: Decimal,
+        requested_quantity: Decimal,
         average_price: Decimal,
         fees_paid: Decimal,
     ) -> Self {
@@ -189,7 +189,34 @@ impl ExecutionReport {
             outcome_id,
             side,
             status: OrderStatus::Filled,
-            requested_quantity: filled_quantity,
+            requested_quantity,
+            filled_quantity: requested_quantity,
+            average_price,
+            fees_paid,
+            executed_at: Utc::now(),
+            transaction_hash: None,
+            error_message: None,
+        }
+    }
+
+    pub fn partial_fill(
+        order_id: Uuid,
+        market_id: String,
+        outcome_id: String,
+        side: OrderSide,
+        requested_quantity: Decimal,
+        filled_quantity: Decimal,
+        average_price: Decimal,
+        fees_paid: Decimal,
+    ) -> Self {
+        Self {
+            order_id,
+            exchange_order_id: None,
+            market_id,
+            outcome_id,
+            side,
+            status: OrderStatus::PartiallyFilled,
+            requested_quantity,
             filled_quantity,
             average_price,
             fees_paid,
@@ -197,6 +224,26 @@ impl ExecutionReport {
             transaction_hash: None,
             error_message: None,
         }
+    }
+
+    pub fn success(
+        order_id: Uuid,
+        market_id: String,
+        outcome_id: String,
+        side: OrderSide,
+        filled_quantity: Decimal,
+        average_price: Decimal,
+        fees_paid: Decimal,
+    ) -> Self {
+        Self::filled(
+            order_id,
+            market_id,
+            outcome_id,
+            side,
+            filled_quantity,
+            average_price,
+            fees_paid,
+        )
     }
 
     pub fn rejected(
@@ -346,5 +393,23 @@ mod tests {
         // Fees: 94 * 0.02 = 1.88
         // Net profit: 6 - 1.88 = 4.12
         assert_eq!(arb.expected_profit, Decimal::new(412, 2));
+    }
+
+    #[test]
+    fn test_partial_fill_preserves_requested_quantity() {
+        let report = ExecutionReport::partial_fill(
+            Uuid::new_v4(),
+            "market123".to_string(),
+            "yes".to_string(),
+            OrderSide::Buy,
+            Decimal::new(100, 0),
+            Decimal::new(40, 0),
+            Decimal::new(52, 2),
+            Decimal::new(416, 2),
+        );
+
+        assert_eq!(report.status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.requested_quantity, Decimal::new(100, 0));
+        assert_eq!(report.filled_quantity, Decimal::new(40, 0));
     }
 }

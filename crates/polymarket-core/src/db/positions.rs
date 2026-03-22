@@ -22,8 +22,10 @@ pub struct ExitCandidate {
     pub source_signal_id: Option<Uuid>,
 }
 
-const SOURCE_COPY_TRADE: i16 = 2;
-const SOURCE_RECOMMENDATION: i16 = 3;
+pub const SOURCE_MANUAL: i16 = 0;
+pub const SOURCE_ARBITRAGE: i16 = 1;
+pub const SOURCE_COPY_TRADE: i16 = 2;
+pub const SOURCE_RECOMMENDATION: i16 = 3;
 
 impl PositionRepository {
     pub fn new(pool: PgPool) -> Self {
@@ -32,6 +34,16 @@ impl PositionRepository {
 
     /// Insert a new position.
     pub async fn insert(&self, position: &Position) -> Result<()> {
+        self.insert_with_source(position, SOURCE_MANUAL, None).await
+    }
+
+    /// Insert a new position with explicit source attribution.
+    pub async fn insert_with_source(
+        &self,
+        position: &Position,
+        source: i16,
+        source_signal_id: Option<Uuid>,
+    ) -> Result<()> {
         let failure_reason_json = position
             .failure_reason
             .as_ref()
@@ -44,11 +56,11 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                is_open, opened_at
+                is_open, opened_at, source, source_signal_id
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18
+                $13, $14, $15, $16, $17, $18, $19, $20
             )
             "#,
         )
@@ -70,6 +82,8 @@ impl PositionRepository {
         .bind(position.no_entry_fee_shares)
         .bind(position.should_persist_as_open())
         .bind(position.entry_timestamp)
+        .bind(source)
+        .bind(source_signal_id)
         .execute(&self.pool)
         .await?;
 

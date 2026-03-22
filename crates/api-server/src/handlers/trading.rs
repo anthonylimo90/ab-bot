@@ -15,8 +15,8 @@ use uuid::Uuid;
 use auth::Claims;
 
 use polymarket_core::types::{
-    LimitOrder as CoreLimitOrder, MarketOrder as CoreMarketOrder, OrderSide as CoreOrderSide,
-    OrderStatus as CoreOrderStatus,
+    LimitOrder as CoreLimitOrder, Market, MarketOrder as CoreMarketOrder,
+    OrderSide as CoreOrderSide, OrderStatus as CoreOrderStatus,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -223,16 +223,30 @@ pub async fn place_order(
         OrderSide::Buy => CoreOrderSide::Buy,
         OrderSide::Sell => CoreOrderSide::Sell,
     };
+    let outcome_token_id = resolve_market_outcome_token_id(
+        state.clob_client.as_ref(),
+        &request.market_id,
+        &request.outcome,
+    )
+    .await?;
 
     // Execute based on order type
     let report = match request.order_type {
         OrderType::Market => {
+            let expected_price = load_expected_market_price(
+                state.clob_client.as_ref(),
+                &outcome_token_id,
+                core_side,
+            )
+            .await?;
             let order = CoreMarketOrder::new(
                 request.market_id.clone(),
-                request.outcome.clone(),
+                outcome_token_id.clone(),
                 core_side,
                 request.quantity,
-            );
+            )
+            .with_expected_price(expected_price)
+            .with_slippage(state.order_executor.default_slippage());
             state
                 .order_executor
                 .execute_market_order(order)
@@ -245,7 +259,7 @@ pub async fn place_order(
                 .ok_or(ApiError::BadRequest("Limit orders require a price".into()))?;
             let order = CoreLimitOrder::new(
                 request.market_id.clone(),
-                request.outcome.clone(),
+                outcome_token_id.clone(),
                 core_side,
                 price,
                 request.quantity,
@@ -449,6 +463,66 @@ async fn store_conditional_order(
 
 /// Maximum order quantity to prevent accidental enormous orders.
 const MAX_ORDER_QUANTITY: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0); // 1,000,000
+
+fn resolve_market_outcome_token(market: &Market, requested_outcome: &str) -> Option<String> {
+    market
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.name.eq_ignore_ascii_case(requested_outcome.trim()))
+        .map(|outcome| outcome.token_id.clone())
+}
+
+async fn resolve_market_outcome_token_id(
+    clob_client: &polymarket_core::api::ClobClient,
+    market_id: &str,
+    requested_outcome: &str,
+) -> ApiResult<String> {
+    let market = clob_client
+        .get_market_by_id(market_id)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!("Failed to load market {}: {}", market_id, error))
+        })?;
+
+    resolve_market_outcome_token(&market, requested_outcome).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "Outcome '{}' is not available for market {}",
+            requested_outcome, market_id
+        ))
+    })
+}
+
+async fn load_expected_market_price(
+    clob_client: &polymarket_core::api::ClobClient,
+    token_id: &str,
+    side: CoreOrderSide,
+) -> ApiResult<Decimal> {
+    let book = clob_client
+        .get_order_book(token_id)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Failed to load orderbook for {}: {}",
+                token_id, error
+            ))
+        })?;
+
+    let level = match side {
+        CoreOrderSide::Buy => book.asks.first(),
+        CoreOrderSide::Sell => book.bids.first(),
+    };
+
+    level.map(|price_level| price_level.price).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "No {} liquidity is currently available for outcome {}",
+            match side {
+                CoreOrderSide::Buy => "ask",
+                CoreOrderSide::Sell => "bid",
+            },
+            token_id
+        ))
+    })
+}
 
 fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
     // Validate market_id is non-empty and reasonable length
@@ -865,5 +939,49 @@ mod tests {
         assert_eq!(parse_order_status("pending"), OrderStatus::Pending);
         assert_eq!(parse_order_status("filled"), OrderStatus::Filled);
         assert_eq!(parse_order_status("cancelled"), OrderStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_resolve_market_outcome_token() {
+        let market = Market {
+            id: "market1".to_string(),
+            question: "Question".to_string(),
+            description: None,
+            outcomes: vec![
+                polymarket_core::types::Outcome {
+                    id: "yes-token".to_string(),
+                    name: "Yes".to_string(),
+                    token_id: "yes-token".to_string(),
+                    price: None,
+                    winner: None,
+                },
+                polymarket_core::types::Outcome {
+                    id: "no-token".to_string(),
+                    name: "No".to_string(),
+                    token_id: "no-token".to_string(),
+                    price: None,
+                    winner: None,
+                },
+            ],
+            volume: Decimal::ZERO,
+            liquidity: Decimal::ZERO,
+            end_date: None,
+            resolved: false,
+            resolution: None,
+            category: None,
+            tags: Vec::new(),
+            fees_enabled: false,
+            fee_type: None,
+        };
+
+        assert_eq!(
+            resolve_market_outcome_token(&market, "yes"),
+            Some("yes-token".to_string())
+        );
+        assert_eq!(
+            resolve_market_outcome_token(&market, "NO"),
+            Some("no-token".to_string())
+        );
+        assert_eq!(resolve_market_outcome_token(&market, "maybe"), None);
     }
 }

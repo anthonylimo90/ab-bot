@@ -6,7 +6,9 @@ use dashmap::DashMap;
 use polymarket_core::api::clob::{AuthenticatedClobClient, BalanceAllowanceResponse, OrderType};
 use polymarket_core::api::ClobClient;
 use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
-use polymarket_core::types::{ExecutionReport, LimitOrder, MarketOrder, OrderSide, OrderStatus};
+use polymarket_core::types::{
+    ExecutionReport, LimitOrder, MarketOrder, OrderBook, OrderSide, OrderStatus,
+};
 use rust_decimal::Decimal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -544,6 +546,11 @@ impl OrderExecutor {
         &self.clob_client
     }
 
+    /// Default slippage budget attached to market orders created by higher layers.
+    pub fn default_slippage(&self) -> Decimal {
+        self.config.default_slippage
+    }
+
     /// Verify that the live wallet has enough collateral balance and allowance
     /// for a multi-leg buy before any leg is submitted.
     pub async fn ensure_live_buying_power(&self, required_collateral: Decimal) -> Result<()> {
@@ -687,6 +694,99 @@ impl OrderExecutor {
         Ok(())
     }
 
+    fn reject_market_order(
+        &self,
+        order: &MarketOrder,
+        error: impl Into<String>,
+    ) -> ExecutionReport {
+        ExecutionReport::rejected(
+            order.id,
+            order.market_id.clone(),
+            order.outcome_id.clone(),
+            order.side,
+            error.into(),
+        )
+    }
+
+    fn best_level_for_order(
+        &self,
+        order: &MarketOrder,
+        book: &OrderBook,
+    ) -> std::result::Result<(Decimal, Decimal), ExecutionReport> {
+        match order.side {
+            OrderSide::Buy => book
+                .asks
+                .first()
+                .map(|ask| (ask.price, ask.size))
+                .ok_or_else(|| self.reject_market_order(order, "No asks available")),
+            OrderSide::Sell => book
+                .bids
+                .first()
+                .map(|bid| (bid.price, bid.size))
+                .ok_or_else(|| self.reject_market_order(order, "No bids available")),
+        }
+    }
+
+    fn validate_market_order_at_best_level(
+        &self,
+        order: &MarketOrder,
+        price: Decimal,
+        available_size: Decimal,
+    ) -> Option<ExecutionReport> {
+        let min_depth = self.config.min_book_depth;
+        let notional_at_best = available_size * price;
+        if notional_at_best < min_depth {
+            return Some(self.reject_market_order(
+                order,
+                format!(
+                    "Insufficient liquidity: ${:.2} at best level (min ${:.0})",
+                    notional_at_best, min_depth
+                ),
+            ));
+        }
+
+        if order.quantity > available_size {
+            return Some(self.reject_market_order(
+                order,
+                format!(
+                    "Order size {} exceeds available {} at best price",
+                    order.quantity, available_size
+                ),
+            ));
+        }
+
+        if let Some(max_slippage) = order.max_slippage {
+            let slippage = match order.side {
+                OrderSide::Buy => {
+                    if order.expected_price > Decimal::ZERO {
+                        (price - order.expected_price) / order.expected_price
+                    } else {
+                        Decimal::ZERO
+                    }
+                }
+                OrderSide::Sell => {
+                    if order.expected_price > Decimal::ZERO {
+                        (order.expected_price - price) / order.expected_price
+                    } else {
+                        Decimal::ZERO
+                    }
+                }
+            };
+
+            if slippage > max_slippage {
+                return Some(self.reject_market_order(
+                    order,
+                    format!(
+                        "Slippage {:.4} exceeds max {:.4} (expected={}, actual={})",
+                        slippage, max_slippage, order.expected_price, price
+                    ),
+                ));
+            }
+        }
+
+        None
+    }
+
     async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
         let client_guard = self.auth_client.read().await;
@@ -706,96 +806,13 @@ impl OrderExecutor {
 
         // Get the best price from orderbook
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
-
-        let (price, available_size) = match order.side {
-            OrderSide::Buy => {
-                if let Some(ask) = book.asks.first() {
-                    (ask.price, ask.size)
-                } else {
-                    return Ok(ExecutionReport::rejected(
-                        order.id,
-                        order.market_id.clone(),
-                        order.outcome_id.clone(),
-                        order.side,
-                        "No asks available".to_string(),
-                    ));
-                }
-            }
-            OrderSide::Sell => {
-                if let Some(bid) = book.bids.first() {
-                    (bid.price, bid.size)
-                } else {
-                    return Ok(ExecutionReport::rejected(
-                        order.id,
-                        order.market_id.clone(),
-                        order.outcome_id.clone(),
-                        order.side,
-                        "No bids available".to_string(),
-                    ));
-                }
-            }
+        let (price, available_size) = match self.best_level_for_order(order, &book) {
+            Ok(level) => level,
+            Err(report) => return Ok(report),
         };
-
-        // Check liquidity depth: reject if best level has < $100 notional
-        let min_depth = self.config.min_book_depth;
-        let notional_at_best = available_size * price;
-        if notional_at_best < min_depth {
-            return Ok(ExecutionReport::rejected(
-                order.id,
-                order.market_id.clone(),
-                order.outcome_id.clone(),
-                order.side,
-                format!(
-                    "Insufficient liquidity: ${:.2} at best level (min ${:.0})",
-                    notional_at_best, min_depth
-                ),
-            ));
-        }
-
-        // Check size availability: reject if our order is larger than available
-        if order.quantity > available_size {
-            return Ok(ExecutionReport::rejected(
-                order.id,
-                order.market_id.clone(),
-                order.outcome_id.clone(),
-                order.side,
-                format!(
-                    "Order size {} exceeds available {} at best price",
-                    order.quantity, available_size
-                ),
-            ));
-        }
-
-        // Slippage check: reject if price moved beyond tolerance
-        if let Some(max_slippage) = order.max_slippage {
-            let slippage = match order.side {
-                OrderSide::Buy => {
-                    if order.expected_price > Decimal::ZERO {
-                        (price - order.expected_price) / order.expected_price
-                    } else {
-                        Decimal::ZERO
-                    }
-                }
-                OrderSide::Sell => {
-                    if order.expected_price > Decimal::ZERO {
-                        (order.expected_price - price) / order.expected_price
-                    } else {
-                        Decimal::ZERO
-                    }
-                }
-            };
-            if slippage > max_slippage {
-                return Ok(ExecutionReport::rejected(
-                    order.id,
-                    order.market_id.clone(),
-                    order.outcome_id.clone(),
-                    order.side,
-                    format!(
-                        "Slippage {:.4} exceeds max {:.4} (expected={}, actual={})",
-                        slippage, max_slippage, order.expected_price, price
-                    ),
-                ));
-            }
+        if let Some(report) = self.validate_market_order_at_best_level(order, price, available_size)
+        {
+            return Ok(report);
         }
 
         // Convert order side to signing order side
@@ -912,7 +929,7 @@ impl OrderExecutor {
         // Calculate fees
         let fees = order.quantity * price * self.config.fee_rate;
 
-        Ok(ExecutionReport::success(
+        Ok(ExecutionReport::filled(
             order.id,
             order.market_id.clone(),
             order.outcome_id.clone(),
@@ -1013,7 +1030,7 @@ impl OrderExecutor {
         // Calculate fees
         let fees = order.quantity * order.price * self.config.fee_rate;
 
-        Ok(ExecutionReport::success(
+        Ok(ExecutionReport::filled(
             order.id,
             order.market_id.clone(),
             order.outcome_id.clone(),
@@ -1027,52 +1044,31 @@ impl OrderExecutor {
     async fn simulate_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
         // Paper trading simulation - fetch real orderbook prices
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
-
-        let (price, available) = match order.side {
-            OrderSide::Buy => {
-                if let Some(ask) = book.asks.first() {
-                    (ask.price, ask.size)
-                } else {
-                    // Simulate with a default price if no orderbook
-                    (Decimal::new(50, 2), Decimal::new(10000, 0))
-                }
-            }
-            OrderSide::Sell => {
-                if let Some(bid) = book.bids.first() {
-                    (bid.price, bid.size)
-                } else {
-                    (Decimal::new(50, 2), Decimal::new(10000, 0))
-                }
-            }
+        let (price, available_size) = match self.best_level_for_order(order, &book) {
+            Ok(level) => level,
+            Err(report) => return Ok(report),
         };
-
-        let fill_quantity = order.quantity.min(available);
-        if fill_quantity <= Decimal::ZERO {
-            return Ok(ExecutionReport::rejected(
-                order.id,
-                order.market_id.clone(),
-                order.outcome_id.clone(),
-                order.side,
-                "No available liquidity at best price".to_string(),
-            ));
+        if let Some(report) = self.validate_market_order_at_best_level(order, price, available_size)
+        {
+            return Ok(report);
         }
 
-        let fees = fill_quantity * price * self.config.fee_rate;
+        let fees = order.quantity * price * self.config.fee_rate;
 
         info!(
             order_id = %order.id,
             price = %price,
-            filled = %fill_quantity,
+            filled = %order.quantity,
             fees = %fees,
             "[PAPER] Simulated market order fill"
         );
 
-        Ok(ExecutionReport::success(
+        Ok(ExecutionReport::filled(
             order.id,
             order.market_id.clone(),
             order.outcome_id.clone(),
             order.side,
-            fill_quantity,
+            order.quantity,
             price,
             fees,
         ))
@@ -1090,7 +1086,7 @@ impl OrderExecutor {
             "[PAPER] Simulated limit order placement"
         );
 
-        Ok(ExecutionReport::success(
+        Ok(ExecutionReport::filled(
             order.id,
             order.market_id.clone(),
             order.outcome_id.clone(),

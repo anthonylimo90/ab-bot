@@ -3,6 +3,10 @@
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
+use polymarket_core::db::positions::{
+    PositionRepository, SOURCE_ARBITRAGE, SOURCE_COPY_TRADE, SOURCE_MANUAL, SOURCE_RECOMMENDATION,
+};
+use polymarket_core::types::PositionState;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Postgres, QueryBuilder};
@@ -12,6 +16,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{PositionUpdate, PositionUpdateType};
 
 /// Position response.
@@ -149,6 +154,23 @@ struct PositionRow {
 }
 
 #[derive(Debug, FromRow)]
+struct CloseablePositionRow {
+    id: Uuid,
+    market_id: String,
+    outcome: String,
+    side: String,
+    quantity: Decimal,
+    entry_price: Decimal,
+    current_price: Decimal,
+    stop_loss: Option<Decimal>,
+    take_profit: Option<Decimal>,
+    realized_pnl: Option<Decimal>,
+    source: i16,
+    source_signal_id: Option<Uuid>,
+    opened_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
 struct PositionSummaryRow {
     open_positions: i64,
     open_markets: i64,
@@ -181,6 +203,37 @@ fn position_state_name(state: i16) -> &'static str {
         6 => "exit_failed",
         7 => "stalled",
         _ => "closed",
+    }
+}
+
+fn position_state_label(state: PositionState) -> &'static str {
+    match state {
+        PositionState::Pending => "pending",
+        PositionState::Open => "open",
+        PositionState::ExitReady => "exit_ready",
+        PositionState::Closing => "closing",
+        PositionState::Closed => "closed",
+        PositionState::EntryFailed => "entry_failed",
+        PositionState::ExitFailed => "exit_failed",
+        PositionState::Stalled => "stalled",
+    }
+}
+
+fn trade_event_labels(source: i16) -> (&'static str, &'static str) {
+    match source {
+        SOURCE_ARBITRAGE => ("arb", "arb"),
+        SOURCE_COPY_TRADE => ("copy_trade", "copy_trade"),
+        SOURCE_RECOMMENDATION => ("quant", "quant"),
+        SOURCE_MANUAL => ("manual", "manual"),
+        _ => ("manual", "manual"),
+    }
+}
+
+async fn current_execution_mode(state: &AppState) -> &'static str {
+    if state.order_executor.is_live_ready().await {
+        "live"
+    } else {
+        "paper"
     }
 }
 
@@ -508,8 +561,14 @@ pub async fn close_position(
     Path(position_id): Path<Uuid>,
     Json(request): Json<ClosePositionRequest>,
 ) -> ApiResult<Json<PositionResponse>> {
+    if request.limit_price.is_some() {
+        return Err(ApiError::BadRequest(
+            "Manual close queues a market exit; limit_price is not supported".to_string(),
+        ));
+    }
+
     // First, fetch the position
-    let row: Option<PositionRow> = sqlx::query_as(
+    let row: Option<CloseablePositionRow> = sqlx::query_as(
         r#"
         SELECT id, market_id,
                COALESCE(outcome, 'both') AS outcome,
@@ -517,14 +576,14 @@ pub async fn close_position(
                quantity,
                COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
                COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
-               unrealized_pnl, stop_loss, take_profit,
+               stop_loss, take_profit,
                realized_pnl,
-               state,
-               COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
+               COALESCE(source, 0) AS source,
+               source_signal_id,
+               COALESCE(opened_at, entry_timestamp) AS opened_at
         FROM positions
         WHERE id = $1
-          AND state NOT IN (4, 5)
+          AND is_open = TRUE
         "#,
     )
     .bind(position_id)
@@ -549,55 +608,115 @@ pub async fn close_position(
             "Close quantity exceeds position size".to_string(),
         ));
     }
+    if close_quantity != row.quantity {
+        return Err(ApiError::BadRequest(
+            "Partial manual close is not supported; queueing exits is full-position only"
+                .to_string(),
+        ));
+    }
 
-    // Update the position in the database
-    let remaining = row.quantity - close_quantity;
-    let is_fully_closed = remaining == Decimal::ZERO;
-    let updated_unrealized_pnl = if is_fully_closed {
-        Decimal::ZERO
-    } else {
-        row.unrealized_pnl * (remaining / row.quantity)
-    };
+    let position_repo = PositionRepository::new(state.pool.clone());
+    let mut position = position_repo
+        .get(position_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("Open position {} not found", position_id)))?;
 
-    sqlx::query(
-        r#"
-        UPDATE positions
-        SET quantity = $1,
-            is_open = $2,
-            state = $3,
-            unrealized_pnl = $4,
-            exit_timestamp = CASE WHEN $2 = false THEN NOW() ELSE exit_timestamp END,
-            updated_at = NOW()
-        WHERE id = $5
-        "#,
-    )
-    .bind(remaining)
-    .bind(!is_fully_closed)
-    .bind(if is_fully_closed { 4_i16 } else { row.state })
-    .bind(updated_unrealized_pnl)
-    .bind(position_id)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let previous_state = position.state;
+    match position.state {
+        PositionState::Open => position.mark_exit_ready().map_err(ApiError::BadRequest)?,
+        PositionState::ExitReady | PositionState::Closing => position.touch(),
+        PositionState::ExitFailed => {
+            if !position.attempt_exit_recovery() {
+                return Err(ApiError::BadRequest(
+                    "Position has exhausted exit retries and cannot be re-queued".to_string(),
+                ));
+            }
+        }
+        PositionState::Stalled => match position.attempt_stalled_recovery() {
+            Some(PositionState::Open) => {
+                position.mark_exit_ready().map_err(ApiError::BadRequest)?
+            }
+            Some(PositionState::ExitReady | PositionState::Closing) => {}
+            Some(state) => {
+                return Err(ApiError::BadRequest(format!(
+                    "Position recovered to {} and cannot be manually closed yet",
+                    position_state_label(state)
+                )))
+            }
+            None => {
+                return Err(ApiError::BadRequest(
+                    "Position could not be recovered for manual close".to_string(),
+                ))
+            }
+        },
+        PositionState::EntryFailed if position.is_one_legged_entry_fail() => {
+            position
+                .recover_one_legged_to_open()
+                .map_err(ApiError::BadRequest)?;
+            position.mark_exit_ready().map_err(ApiError::BadRequest)?;
+        }
+        PositionState::Pending => {
+            return Err(ApiError::BadRequest(
+                "Position is still entering and cannot be manually closed yet".to_string(),
+            ))
+        }
+        PositionState::EntryFailed => {
+            return Err(ApiError::BadRequest(
+                "Position failed to enter and has no exit flow to queue".to_string(),
+            ))
+        }
+        PositionState::Closed => {
+            return Err(ApiError::NotFound(format!(
+                "Open position {} not found",
+                position_id
+            )))
+        }
+    }
+
+    position_repo
+        .update(&position)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let execution_mode = current_execution_mode(state.as_ref()).await;
+    let (strategy, source_label) = trade_event_labels(row.source);
+    let mut event = NewTradeEvent::new(
+        strategy,
+        execution_mode,
+        source_label,
+        row.market_id.clone(),
+        "manual_exit_requested",
+    );
+    event.position_id = Some(position.id);
+    event.signal_id = row.source_signal_id;
+    event.state_from = Some(position_state_label(previous_state).to_string());
+    event.state_to = Some(position_state_label(position.state).to_string());
+    event.reason = Some("manual_close_request".to_string());
+    event.unrealized_pnl = Some(position.unrealized_pnl);
+    event.metadata = serde_json::json!({
+        "requested_quantity": close_quantity.to_string(),
+        "limit_price": request.limit_price.map(|price| price.to_string()),
+        "manual_close": true,
+    });
+    TradeEventRecorder::new(state.pool.clone(), state.trade_event_tx.clone())
+        .record_warn(event)
+        .await;
 
     // Publish position update via WebSocket
     let update = PositionUpdate {
         position_id,
         market_id: row.market_id.clone(),
-        update_type: if is_fully_closed {
-            PositionUpdateType::Closed
-        } else {
-            PositionUpdateType::Updated
-        },
-        quantity: remaining,
+        update_type: PositionUpdateType::Updated,
+        quantity: row.quantity,
         current_price: row.current_price,
-        unrealized_pnl: updated_unrealized_pnl,
+        unrealized_pnl: position.unrealized_pnl,
         timestamp: Utc::now(),
     };
     let _ = state.publish_position(update);
 
-    let entry_value = row.entry_price * remaining;
-    let current_value = row.current_price * remaining;
+    let entry_value = row.entry_price * row.quantity;
+    let current_value = row.current_price * row.quantity;
     let pnl_pct = if entry_value > Decimal::ZERO {
         (current_value - entry_value) / entry_value * Decimal::new(100, 0)
     } else {
@@ -609,17 +728,17 @@ pub async fn close_position(
         market_id: row.market_id,
         outcome: row.outcome,
         side: row.side,
-        quantity: remaining,
+        quantity: row.quantity,
         entry_price: row.entry_price,
         current_price: row.current_price,
-        unrealized_pnl: updated_unrealized_pnl,
+        unrealized_pnl: position.unrealized_pnl,
         unrealized_pnl_pct: pnl_pct,
         stop_loss: row.stop_loss,
         take_profit: row.take_profit,
         realized_pnl: row.realized_pnl,
-        state: position_state_name(if is_fully_closed { 4 } else { row.state }).to_string(),
+        state: position_state_label(position.state).to_string(),
         opened_at: row.opened_at,
-        updated_at: Utc::now(),
+        updated_at: position.last_updated,
     }))
 }
 

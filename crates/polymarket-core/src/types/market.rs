@@ -35,6 +35,9 @@ pub struct Outcome {
     pub token_id: String,
     /// Current price from CLOB API (0.0–1.0 range).
     pub price: Option<Decimal>,
+    /// Winner flag for resolved markets when upstream data provides it.
+    #[serde(default)]
+    pub winner: Option<bool>,
 }
 
 /// Real-time order book data for a market outcome.

@@ -10,10 +10,12 @@
 
 use chrono::Utc;
 use polymarket_core::api::{ClobClient, GammaClient};
-use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE, SOURCE_RECOMMENDATION};
 use polymarket_core::error::Error as PolymarketError;
 use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
-use polymarket_core::types::{FailureReason, MarketOrder, OrderSide, Position, PositionState};
+use polymarket_core::types::{
+    FailureReason, Market, MarketOrder, OrderSide, Position, PositionState,
+};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -408,12 +410,13 @@ impl ExitHandler {
             let (yes_bid, no_bid) = match self.current_exit_bids(&candidate.position).await? {
                 ExitBidStatus::Available(yes_bid, no_bid) => (yes_bid, no_bid),
                 ExitBidStatus::Resolved => {
-                    self.close_open_position_via_resolution(
-                        &mut candidate.position,
-                        candidate.source,
-                        quant_ctx,
-                    )
-                    .await?;
+                    let _ = self
+                        .close_open_position_via_resolution(
+                            &mut candidate.position,
+                            candidate.source,
+                            quant_ctx,
+                        )
+                        .await?;
                     continue;
                 }
                 ExitBidStatus::Unavailable => continue,
@@ -783,23 +786,37 @@ impl ExitHandler {
         }
     }
 
-    async fn close_open_position_via_resolution(
+    async fn finalize_resolution_close(
         &self,
         position: &mut Position,
         source: i16,
         quant_ctx: Option<&QuantExitContext>,
-    ) -> anyhow::Result<()> {
+        resolved_yes_winner: Option<bool>,
+    ) -> anyhow::Result<bool> {
         let market_id = position.market_id.clone();
         let fee = Decimal::new(2, 2);
 
-        if let Err(error) = position.close_via_resolution(fee) {
+        let close_result = if let Some(yes_wins) = resolved_yes_winner {
+            position.close_via_resolution_with_winner(yes_wins, fee)
+        } else if position.has_full_pair_exposure() {
+            position.close_via_resolution(fee)
+        } else {
+            warn!(
+                position_id = %position.id,
+                market_id = %market_id,
+                "Resolved market is missing winner metadata; leaving non-paired exposure open to avoid mispricing"
+            );
+            return Ok(false);
+        };
+
+        if let Err(error) = close_result {
             warn!(
                 position_id = %position.id,
                 market_id = %market_id,
                 error = %error,
                 "Cannot close open position via resolution fallback"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         self.position_repo.update(position).await?;
@@ -859,7 +876,33 @@ impl ExitHandler {
             "Position closed via resolution fallback"
         );
 
-        Ok(())
+        Ok(true)
+    }
+
+    async fn close_open_position_via_resolution(
+        &self,
+        position: &mut Position,
+        source: i16,
+        quant_ctx: Option<&QuantExitContext>,
+    ) -> anyhow::Result<bool> {
+        let market = match self.clob_client.get_market_by_id(&position.market_id).await {
+            Ok(market) => market,
+            Err(error) => {
+                warn!(
+                    market_id = %position.market_id,
+                    error = %error,
+                    "Failed to load resolved market details for fallback close"
+                );
+                return Ok(false);
+            }
+        };
+
+        if !market.resolved {
+            return Ok(false);
+        }
+
+        self.finalize_resolution_close(position, source, quant_ctx, resolved_yes_winner(&market))
+            .await
     }
 
     async fn resolve_market_tokens(
@@ -940,7 +983,7 @@ impl ExitHandler {
     ) -> anyhow::Result<HashMap<uuid::Uuid, QuantExitContext>> {
         let position_ids: Vec<uuid::Uuid> = candidates
             .iter()
-            .filter(|candidate| candidate.source == 3)
+            .filter(|candidate| candidate.source == SOURCE_RECOMMENDATION)
             .map(|candidate| candidate.position.id)
             .collect();
 
@@ -1135,7 +1178,11 @@ impl ExitHandler {
             .record_warn(
                 trade_event_for_position(
                     position,
-                    if quant_ctx.is_some() { 3 } else { 1 },
+                    if quant_ctx.is_some() {
+                        SOURCE_RECOMMENDATION
+                    } else {
+                        SOURCE_ARBITRAGE
+                    },
                     quant_ctx,
                     execution_mode,
                     "exit_requested",
@@ -1158,7 +1205,11 @@ impl ExitHandler {
             .record_warn(
                 trade_event_for_position(
                     position,
-                    if quant_ctx.is_some() { 3 } else { 1 },
+                    if quant_ctx.is_some() {
+                        SOURCE_RECOMMENDATION
+                    } else {
+                        SOURCE_ARBITRAGE
+                    },
                     quant_ctx,
                     execution_mode,
                     event_type,
@@ -1180,7 +1231,7 @@ impl ExitHandler {
         no_bid: Decimal,
         cfg: &ExitHandlerConfig,
     ) -> anyhow::Result<bool> {
-        if source != 3 {
+        if source != SOURCE_RECOMMENDATION {
             return Ok(position.unrealized_pnl > Decimal::ZERO);
         }
 
@@ -1223,12 +1274,12 @@ impl ExitHandler {
         // Collect unique market IDs and check them individually. This avoids
         // pulling the entire CLOB market universe every resolution tick.
         let market_ids: HashSet<String> = positions.iter().map(|p| p.market_id.clone()).collect();
-        let mut resolved_market_ids = HashSet::new();
+        let mut resolved_markets = HashMap::new();
         for market_id in &market_ids {
             self.touch_heartbeat();
             match self.clob_client.get_market_by_id(market_id).await {
                 Ok(market) if market.resolved => {
-                    resolved_market_ids.insert(market_id.clone());
+                    resolved_markets.insert(market_id.clone(), resolved_yes_winner(&market));
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -1237,77 +1288,28 @@ impl ExitHandler {
             }
         }
 
-        if resolved_market_ids.is_empty() {
+        if resolved_markets.is_empty() {
             debug!("No resolved markets found for held positions");
             return Ok(());
         }
 
         info!(
-            resolved = resolved_market_ids.len(),
+            resolved = resolved_markets.len(),
             "Found resolved markets with open positions"
         );
 
-        let fee = Decimal::new(2, 2); // 2%
-
         for mut position in positions {
             self.touch_heartbeat();
-            if !resolved_market_ids.contains(&position.market_id) {
+            let Some(yes_winner) = resolved_markets.get(&position.market_id).copied() else {
                 continue;
-            }
-
-            let market_id = position.market_id.clone();
-
-            if let Err(e) = position.close_via_resolution(fee) {
-                warn!(position_id = %position.id, market_id = %market_id, error = %e, "Cannot close position via resolution");
-                continue;
-            }
-            let _ = self.position_repo.update(&position).await;
-
-            // Record with circuit breaker
-            let realized_pnl = position.realized_pnl.unwrap_or_default();
-            let is_win = realized_pnl > Decimal::ZERO;
-            if let Err(e) = self
-                .circuit_breaker
-                .record_trade(realized_pnl, is_win)
-                .await
-            {
-                warn!(error = %e, "Failed to record resolution trade with circuit breaker");
-            }
-
-            // Remove from dedup
-            self.arb_dedup.write().await.remove(&market_id);
-
-            let execution_mode = self.current_execution_mode().await;
-            self.record_position_closed_event(
-                &position,
-                &execution_mode,
-                None,
-                "closed_via_resolution",
-            )
-            .await;
-
-            // Publish signal
-            let signal = SignalUpdate {
-                signal_id: uuid::Uuid::new_v4(),
-                signal_type: SignalType::Arbitrage,
-                market_id: market_id.clone(),
-                outcome_id: "both".to_string(),
-                action: "closed_via_resolution".to_string(),
-                confidence: 1.0,
-                timestamp: Utc::now(),
-                metadata: serde_json::json!({
-                    "position_id": position.id.to_string(),
-                    "realized_pnl": realized_pnl.to_string(),
-                }),
             };
-            let _ = self.signal_tx.send(signal);
 
-            info!(
-                market_id = %market_id,
-                position_id = %position.id,
-                realized_pnl = %realized_pnl,
-                "Position closed via resolution"
-            );
+            let closed = self
+                .finalize_resolution_close(&mut position, SOURCE_ARBITRAGE, None, yes_winner)
+                .await?;
+            if !closed {
+                continue;
+            }
         }
 
         Ok(())
@@ -1394,10 +1396,13 @@ impl ExitHandler {
             return Ok(false);
         }
 
-        let source = if quant_ctx.is_some() { 3 } else { 1 };
-        self.close_open_position_via_resolution(position, source, quant_ctx)
-            .await?;
-        Ok(true)
+        let source = if quant_ctx.is_some() {
+            SOURCE_RECOMMENDATION
+        } else {
+            SOURCE_ARBITRAGE
+        };
+        self.finalize_resolution_close(position, source, quant_ctx, resolved_yes_winner(&market))
+            .await
     }
 
     /// Process one-legged entry failures by flattening the filled YES leg.
@@ -1546,7 +1551,7 @@ fn trade_event_for_position(
             Some(ctx.signal_id),
             Some(ctx.direction.as_str().to_string()),
         )
-    } else if source == 3 {
+    } else if source == SOURCE_RECOMMENDATION {
         ("quant".to_string(), "quant".to_string(), None, None)
     } else {
         ("arb".to_string(), "arb".to_string(), None, None)
@@ -1894,14 +1899,57 @@ mod tests {
 
         assert_eq!(held_outcomes(&both_legs), (false, true));
     }
+
+    #[test]
+    fn test_resolved_yes_winner_from_market_outcomes() {
+        let market = Market {
+            id: "m1".to_string(),
+            question: "Question".to_string(),
+            description: None,
+            outcomes: vec![
+                polymarket_core::types::Outcome {
+                    id: "yes".to_string(),
+                    name: "Yes".to_string(),
+                    token_id: "yes".to_string(),
+                    price: None,
+                    winner: Some(true),
+                },
+                polymarket_core::types::Outcome {
+                    id: "no".to_string(),
+                    name: "No".to_string(),
+                    token_id: "no".to_string(),
+                    price: None,
+                    winner: Some(false),
+                },
+            ],
+            volume: Decimal::ZERO,
+            liquidity: Decimal::ZERO,
+            end_date: None,
+            resolved: true,
+            resolution: None,
+            category: None,
+            tags: Vec::new(),
+            fees_enabled: false,
+            fee_type: None,
+        };
+
+        assert_eq!(resolved_yes_winner(&market), Some(true));
+    }
 }
 
 fn held_outcomes(position: &Position) -> (bool, bool) {
-    if position.state == PositionState::Closed {
-        return (false, false);
-    }
+    position.held_outcomes()
+}
 
-    let has_yes = position.yes_entry_price > Decimal::ZERO && position.yes_exit_price.is_none();
-    let has_no = position.no_entry_price > Decimal::ZERO && position.no_exit_price.is_none();
-    (has_yes, has_no)
+fn resolved_yes_winner(market: &Market) -> Option<bool> {
+    market.outcomes.iter().find_map(|outcome| {
+        let winner = outcome.winner?;
+        if outcome.name.eq_ignore_ascii_case("yes") {
+            Some(winner)
+        } else if outcome.name.eq_ignore_ascii_case("no") {
+            Some(!winner)
+        } else {
+            None
+        }
+    })
 }

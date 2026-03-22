@@ -164,6 +164,7 @@ impl GammaMarket {
                 name,
                 token_id,
                 price: prices.get(idx).copied(),
+                winner: None,
             })
             .collect();
 

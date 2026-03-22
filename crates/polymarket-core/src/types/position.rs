@@ -339,6 +339,20 @@ impl Position {
         Ok((yes_exit_price, no_exit_price))
     }
 
+    pub fn held_outcomes(&self) -> (bool, bool) {
+        if self.state == PositionState::Closed {
+            return (false, false);
+        }
+
+        let has_yes = self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none();
+        let has_no = self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none();
+        (has_yes, has_no)
+    }
+
+    pub fn has_full_pair_exposure(&self) -> bool {
+        self.held_outcomes() == (true, true)
+    }
+
     /// Close the position using any previously recorded per-leg exit fills.
     /// `fee` is only used for legacy flat-fee positions.
     pub fn close_via_recorded_exit(&mut self, fee: Decimal) -> std::result::Result<(), String> {
@@ -387,17 +401,55 @@ impl Position {
             return Err("Cannot close a position that failed to enter".to_string());
         }
 
-        if self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none() {
+        let (has_yes, has_no) = self.held_outcomes();
+
+        if has_yes {
             self.yes_exit_price = Some(yes_exit_price);
         }
-        if self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none() {
+        if has_no {
             self.no_exit_price = Some(no_exit_price);
         }
 
         self.close_via_recorded_exit(fee)
     }
 
-    /// Close the position via market resolution (guaranteed $1.00 per share).
+    /// Close the position using resolved per-leg payouts when the market winner is known.
+    /// `fee` is only used for legacy flat-fee positions.
+    pub fn close_via_resolution_with_winner(
+        &mut self,
+        yes_wins: bool,
+        fee: Decimal,
+    ) -> std::result::Result<(), String> {
+        if self.state == PositionState::Closed {
+            return Err("Position is already closed".to_string());
+        }
+        if self.state == PositionState::EntryFailed {
+            return Err("Cannot close a position that failed to enter".to_string());
+        }
+
+        if self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none() {
+            self.yes_exit_price = Some(if yes_wins {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            });
+        }
+        if self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none() {
+            self.no_exit_price = Some(if yes_wins {
+                Decimal::ZERO
+            } else {
+                Decimal::ONE
+            });
+        }
+
+        self.close_via_recorded_exit(fee)
+    }
+
+    /// Close the position via market resolution.
+    ///
+    /// This is a conservative fallback that assumes paired arb exposure and
+    /// uses the stored worst-case payout. Prefer `close_via_resolution_with_winner`
+    /// when the resolved winner is known.
     /// `fee` is only used for legacy flat-fee positions.
     pub fn close_via_resolution(&mut self, fee: Decimal) -> std::result::Result<(), String> {
         if self.state == PositionState::Closed {
@@ -783,6 +835,41 @@ mod tests {
 
         pos.close_via_resolution(Decimal::new(99, 2)).unwrap();
         assert_eq!(pos.realized_pnl, Some(Decimal::new(400, 2)));
+    }
+
+    #[test]
+    fn test_resolution_with_winner_prices_one_legged_position_correctly() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::ZERO,
+            Decimal::new(100, 0),
+            ExitStrategy::HoldToResolution,
+        );
+        pos.mark_open().unwrap();
+        pos.mark_exit_ready().unwrap();
+
+        pos.close_via_resolution_with_winner(true, Decimal::new(2, 2))
+            .unwrap();
+
+        assert_eq!(pos.yes_exit_price, Some(Decimal::ONE));
+        assert_eq!(pos.no_exit_price, None);
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(4904, 2)));
+    }
+
+    #[test]
+    fn test_held_outcomes_ignore_recorded_exit_legs() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::new(48, 2),
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::ExitOnCorrection,
+        );
+        pos.mark_open().unwrap();
+        pos.record_yes_exit_fill(Decimal::new(52, 2)).unwrap();
+
+        assert_eq!(pos.held_outcomes(), (false, true));
     }
 
     #[test]

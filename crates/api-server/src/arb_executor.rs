@@ -7,7 +7,7 @@
 
 use chrono::Utc;
 use polymarket_core::api::{ClobClient, GammaClient};
-use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE};
 use polymarket_core::types::Market;
 use polymarket_core::types::{
     ArbOpportunity, ExitStrategy, FailureReason, MarketOrder, OrderSide, Position,
@@ -1199,7 +1199,11 @@ impl ArbAutoExecutor {
         );
         position.apply_arb_fee_model(&arb);
 
-        if let Err(e) = self.position_repo.insert(&position).await {
+        if let Err(e) = self
+            .position_repo
+            .insert_with_source(&position, SOURCE_ARBITRAGE, None)
+            .await
+        {
             error!(error = %e, "Failed to persist pending position");
             return Err(anyhow::anyhow!("Failed to persist position: {e}"));
         }
@@ -1231,7 +1235,9 @@ impl ArbAutoExecutor {
             .await;
 
         // 9. Execute YES market order
-        let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity);
+        let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity)
+            .with_expected_price(arb.yes_ask)
+            .with_slippage(self.order_executor.default_slippage());
         let yes_order_started_at = std::time::Instant::now();
         let yes_result = self.order_executor.execute_market_order(yes_order).await;
         telemetry.yes_order_ms = Some(yes_order_started_at.elapsed().as_millis() as i64);
@@ -1296,7 +1302,14 @@ impl ArbAutoExecutor {
         position.yes_entry_price = yes_report.average_price;
 
         // 11. Execute NO market order
-        let no_order = MarketOrder::new(market_id.clone(), no_token_id, OrderSide::Buy, quantity);
+        let no_order = MarketOrder::new(
+            market_id.clone(),
+            no_token_id,
+            OrderSide::Buy,
+            yes_report.filled_quantity,
+        )
+        .with_expected_price(arb.no_ask)
+        .with_slippage(self.order_executor.default_slippage());
         let no_order_started_at = std::time::Instant::now();
         telemetry.inter_leg_gap_ms = Some(
             no_order_started_at

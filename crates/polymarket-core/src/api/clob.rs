@@ -900,6 +900,7 @@ impl From<ClobMarket> for Market {
                     name: t.outcome,
                     token_id: t.token_id,
                     price: t.price.and_then(Decimal::from_f64_retain),
+                    winner: t.winner,
                 })
                 .collect(),
             volume: m.volume.and_then(|v| v.parse().ok()).unwrap_or_default(),
