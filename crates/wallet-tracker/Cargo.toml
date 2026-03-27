@@ -38,7 +38,7 @@ tracing.workspace = true
 sqlx.workspace = true
 
 # Statistics
-statrs = "0.16"
+statrs = "0.18"
 
 [dev-dependencies]
 tokio-test.workspace = true
