@@ -4,7 +4,6 @@ use axum::extract::{Path, State};
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use polymarket_core::db::positions::PositionRepository;
 use polymarket_core::types::{FailureReason, PositionState};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -17,6 +16,7 @@ use auth::Claims;
 
 use crate::error::{ApiError, ApiResult};
 use crate::exit_handler::ExitHandlerConfig;
+use crate::position_service::EventContext;
 use crate::runtime_sync;
 use crate::state::AppState;
 use crate::wallet_inventory::{
@@ -162,24 +162,47 @@ pub async fn run_recovery(
         false
     };
 
-    let repo = PositionRepository::new(state.pool.clone());
+    let execution_mode = if state.order_executor.is_live_ready().await {
+        "live"
+    } else {
+        "paper"
+    };
+    let ctx = EventContext {
+        execution_mode: execution_mode.to_string(),
+        strategy: "recovery".to_string(),
+        source_label: "recovery".to_string(),
+    };
+
     let mut safe_exit_failures_requeued = 0_i64;
     let mut stalled_positions_reopened = 0_i64;
 
-    for mut position in repo.get_needing_recovery().await.map_err(map_anyhow)? {
+    for mut position in state
+        .position_service
+        .repo()
+        .get_needing_recovery()
+        .await
+        .map_err(map_anyhow)?
+    {
         match position.state {
             PositionState::ExitFailed => {
                 if should_requeue_exit_failure(position.failure_reason.as_ref()) {
-                    position.state = PositionState::ExitReady;
-                    position.failure_reason = None;
-                    position.last_updated = Utc::now();
-                    repo.update(&position).await.map_err(map_anyhow)?;
-                    safe_exit_failures_requeued += 1;
+                    let recovered = state
+                        .position_service
+                        .attempt_exit_recovery(&mut position, &ctx)
+                        .await
+                        .map_err(map_anyhow)?;
+                    if recovered {
+                        safe_exit_failures_requeued += 1;
+                    }
                 }
             }
             PositionState::Stalled => {
-                if position.attempt_stalled_recovery().is_some() {
-                    repo.update(&position).await.map_err(map_anyhow)?;
+                let recovered = state
+                    .position_service
+                    .attempt_stalled_recovery(&mut position, &ctx)
+                    .await
+                    .map_err(map_anyhow)?;
+                if recovered.is_some() {
                     stalled_positions_reopened += 1;
                 }
             }

@@ -132,6 +132,16 @@ pub struct Position {
     pub yes_entry_fee_shares: Decimal,
     /// Buy-side fee charged in NO shares at entry.
     pub no_entry_fee_shares: Decimal,
+    /// Quantity of YES tokens currently held (not yet exited).
+    pub held_yes_qty: Decimal,
+    /// Quantity of NO tokens currently held (not yet exited).
+    pub held_no_qty: Decimal,
+    /// Total YES tokens sold or resolved out.
+    pub exited_yes_qty: Decimal,
+    /// Total NO tokens sold or resolved out.
+    pub exited_no_qty: Decimal,
+    /// "yes" or "no" when the market has resolved; None while open.
+    pub resolution_winner: Option<String>,
 }
 
 /// Maximum retry attempts before giving up.
@@ -174,6 +184,11 @@ impl Position {
             resolution_payout_per_share: (Decimal::ONE - legacy_entry_fee_drag).max(Decimal::ZERO),
             yes_entry_fee_shares: Decimal::ZERO,
             no_entry_fee_shares: Decimal::ZERO,
+            held_yes_qty: Decimal::ZERO,
+            held_no_qty: Decimal::ZERO,
+            exited_yes_qty: Decimal::ZERO,
+            exited_no_qty: Decimal::ZERO,
+            resolution_winner: None,
         }
     }
 
@@ -353,6 +368,62 @@ impl Position {
 
     pub fn has_full_pair_exposure(&self) -> bool {
         self.held_outcomes() == (true, true)
+    }
+
+    // ── Per-leg exposure tracking (explicit qty fields) ─────────────
+
+    /// Record a YES leg entry fill. Increments held_yes_qty.
+    pub fn apply_yes_entry_fill(&mut self, fill_qty: Decimal) {
+        self.held_yes_qty += fill_qty;
+        self.last_updated = Utc::now();
+    }
+
+    /// Record a NO leg entry fill. Increments held_no_qty.
+    pub fn apply_no_entry_fill(&mut self, fill_qty: Decimal) {
+        self.held_no_qty += fill_qty;
+        self.last_updated = Utc::now();
+    }
+
+    /// Record a YES exit fill; moves qty from held to exited.
+    pub fn apply_yes_exit_fill(&mut self, fill_qty: Decimal) -> std::result::Result<(), String> {
+        if fill_qty > self.held_yes_qty {
+            return Err(format!(
+                "YES exit fill {} exceeds held qty {}",
+                fill_qty, self.held_yes_qty
+            ));
+        }
+        self.held_yes_qty -= fill_qty;
+        self.exited_yes_qty += fill_qty;
+        self.last_updated = Utc::now();
+        Ok(())
+    }
+
+    /// Record a NO exit fill; moves qty from held to exited.
+    pub fn apply_no_exit_fill(&mut self, fill_qty: Decimal) -> std::result::Result<(), String> {
+        if fill_qty > self.held_no_qty {
+            return Err(format!(
+                "NO exit fill {} exceeds held qty {}",
+                fill_qty, self.held_no_qty
+            ));
+        }
+        self.held_no_qty -= fill_qty;
+        self.exited_no_qty += fill_qty;
+        self.last_updated = Utc::now();
+        Ok(())
+    }
+
+    /// Returns (has_yes, has_no) from explicit qty fields.
+    /// Explicit counterpart to [`held_outcomes`] which infers from prices.
+    pub fn held_legs(&self) -> (bool, bool) {
+        (
+            self.held_yes_qty > Decimal::ZERO,
+            self.held_no_qty > Decimal::ZERO,
+        )
+    }
+
+    /// True if any exposure exists (YES or NO still held).
+    pub fn has_open_exposure(&self) -> bool {
+        self.held_yes_qty > Decimal::ZERO || self.held_no_qty > Decimal::ZERO
     }
 
     /// Close the position using any previously recorded per-leg exit fills.
@@ -858,6 +929,26 @@ mod tests {
         assert_eq!(pos.yes_exit_price, Some(Decimal::ONE));
         assert_eq!(pos.no_exit_price, None);
         assert_eq!(pos.realized_pnl, Some(Decimal::new(4904, 2)));
+    }
+
+    #[test]
+    fn test_resolution_with_winner_prices_no_only_position_correctly() {
+        let mut pos = Position::new(
+            "market123".to_string(),
+            Decimal::ZERO,
+            Decimal::new(46, 2),
+            Decimal::new(100, 0),
+            ExitStrategy::HoldToResolution,
+        );
+        pos.mark_open().unwrap();
+        pos.mark_exit_ready().unwrap();
+
+        pos.close_via_resolution_with_winner(false, Decimal::new(2, 2))
+            .unwrap();
+
+        assert_eq!(pos.yes_exit_price, None);
+        assert_eq!(pos.no_exit_price, Some(Decimal::ONE));
+        assert_eq!(pos.realized_pnl, Some(Decimal::new(5108, 2)));
     }
 
     #[test]

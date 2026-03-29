@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import {
   AlertTriangle,
   LifeBuoy,
@@ -22,6 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { cn, formatTimeAgo } from "@/lib/utils";
 import { useToastStore } from "@/stores/toast-store";
+import { useWalletStore, selectPrimaryWallet } from "@/stores/wallet-store";
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -78,8 +80,13 @@ export function RecoveryDialog({
 }: RecoveryDialogProps) {
   const [open, setOpen] = useState(false);
   const toast = useToastStore();
+  const activeWallet = useWalletStore(selectPrimaryWallet);
   const previewQuery = useRecoveryPreviewQuery(workspaceId, open);
   const runMutation = useRunRecoveryMutation(workspaceId);
+  const activeWalletLabel = activeWallet
+    ? activeWallet.label ||
+      `${activeWallet.address.slice(0, 6)}...${activeWallet.address.slice(-4)}`
+    : null;
 
   const handleRunRecovery = async () => {
     if (!workspaceId) return;
@@ -195,6 +202,34 @@ export function RecoveryDialog({
                 </div>
               </div>
 
+              <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 px-4 py-3 text-sm text-emerald-950">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <div className="font-medium">Where recovered funds land</div>
+                    <div className="mt-1 text-emerald-900/90">
+                      Recovery always settles into the active trading wallet, not a separate external address.
+                    </div>
+                    <div className="mt-2 text-emerald-900/90">
+                      {activeWallet
+                        ? `Active wallet: ${activeWalletLabel} (${activeWallet.address}). If this matches your MetaMask Polygon wallet, no withdrawal transfer is needed after recovery.`
+                        : "No active wallet is selected yet. Connect a wallet and mark it active before expecting recovered funds to appear."}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button asChild size="sm" variant="outline">
+                      <Link href="/settings#wallet-account" onClick={() => setOpen(false)}>
+                        View Wallet
+                      </Link>
+                    </Button>
+                    <Button asChild size="sm" variant="outline">
+                      <Link href="/settings#withdraw-usdc" onClick={() => setOpen(false)}>
+                        Withdraw Elsewhere
+                      </Link>
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
               <div className="grid gap-3 sm:grid-cols-2">
                 <RecoveryMetricCard
                   title="Safe Recovery Candidate"
@@ -274,7 +309,7 @@ export function RecoveryDialog({
 
           <DialogFooter className="gap-2 sm:justify-between">
             <div className="text-xs text-muted-foreground">
-              Recovery now uses reconciled inventory and canonical exit routing, so queued exits and orphan holdings are both visible here.
+              Recovery now uses reconciled inventory and canonical exit routing, and recovered funds remain in the active trading wallet unless you later send a separate withdrawal.
             </div>
             <Button
               type="button"

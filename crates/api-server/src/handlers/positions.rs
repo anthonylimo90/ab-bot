@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use polymarket_core::db::positions::{
-    PositionRepository, SOURCE_ARBITRAGE, SOURCE_COPY_TRADE, SOURCE_MANUAL, SOURCE_RECOMMENDATION,
+    SOURCE_ARBITRAGE, SOURCE_COPY_TRADE, SOURCE_MANUAL, SOURCE_RECOMMENDATION,
 };
 use polymarket_core::types::PositionState;
 use rust_decimal::Decimal;
@@ -15,8 +15,9 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::position_service::EventContext;
 use crate::state::AppState;
-use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
+
 use crate::websocket::{PositionUpdate, PositionUpdateType};
 
 /// Position response.
@@ -166,7 +167,6 @@ struct CloseablePositionRow {
     take_profit: Option<Decimal>,
     realized_pnl: Option<Decimal>,
     source: i16,
-    source_signal_id: Option<Uuid>,
     opened_at: DateTime<Utc>,
 }
 
@@ -579,7 +579,6 @@ pub async fn close_position(
                stop_loss, take_profit,
                realized_pnl,
                COALESCE(source, 0) AS source,
-               source_signal_id,
                COALESCE(opened_at, entry_timestamp) AS opened_at
         FROM positions
         WHERE id = $1
@@ -615,46 +614,89 @@ pub async fn close_position(
         ));
     }
 
-    let position_repo = PositionRepository::new(state.pool.clone());
-    let mut position = position_repo
+    let mut position = state
+        .position_service
+        .repo()
         .get(position_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Open position {} not found", position_id)))?;
 
-    let previous_state = position.state;
+    let execution_mode = current_execution_mode(state.as_ref()).await;
+    let (strategy, source_label) = trade_event_labels(row.source);
+    let ctx = EventContext {
+        execution_mode: execution_mode.to_string(),
+        strategy: strategy.to_string(),
+        source_label: source_label.to_string(),
+    };
+
     match position.state {
-        PositionState::Open => position.mark_exit_ready().map_err(ApiError::BadRequest)?,
-        PositionState::ExitReady | PositionState::Closing => position.touch(),
+        PositionState::Open => {
+            state
+                .position_service
+                .mark_exit_ready(&mut position, "manual_close_request", &ctx)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
+        PositionState::ExitReady | PositionState::Closing => {
+            // Already in exit flow — just touch the timestamp and persist
+            position.touch();
+            state
+                .position_service
+                .repo()
+                .update(&position)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
         PositionState::ExitFailed => {
-            if !position.attempt_exit_recovery() {
+            let recovered = state
+                .position_service
+                .attempt_exit_recovery(&mut position, &ctx)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if !recovered {
                 return Err(ApiError::BadRequest(
                     "Position has exhausted exit retries and cannot be re-queued".to_string(),
                 ));
             }
         }
-        PositionState::Stalled => match position.attempt_stalled_recovery() {
-            Some(PositionState::Open) => {
-                position.mark_exit_ready().map_err(ApiError::BadRequest)?
+        PositionState::Stalled => {
+            let recovered_state = state
+                .position_service
+                .attempt_stalled_recovery(&mut position, &ctx)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            match recovered_state {
+                Some(PositionState::Open) => {
+                    state
+                        .position_service
+                        .mark_exit_ready(&mut position, "manual_close_after_stall_recovery", &ctx)
+                        .await
+                        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                }
+                Some(PositionState::ExitReady | PositionState::Closing) => {}
+                Some(state) => {
+                    return Err(ApiError::BadRequest(format!(
+                        "Position recovered to {} and cannot be manually closed yet",
+                        position_state_label(state)
+                    )))
+                }
+                None => {
+                    return Err(ApiError::BadRequest(
+                        "Position could not be recovered for manual close".to_string(),
+                    ))
+                }
             }
-            Some(PositionState::ExitReady | PositionState::Closing) => {}
-            Some(state) => {
-                return Err(ApiError::BadRequest(format!(
-                    "Position recovered to {} and cannot be manually closed yet",
-                    position_state_label(state)
-                )))
-            }
-            None => {
-                return Err(ApiError::BadRequest(
-                    "Position could not be recovered for manual close".to_string(),
-                ))
-            }
-        },
+        }
         PositionState::EntryFailed if position.is_one_legged_entry_fail() => {
             position
                 .recover_one_legged_to_open()
                 .map_err(ApiError::BadRequest)?;
-            position.mark_exit_ready().map_err(ApiError::BadRequest)?;
+            state
+                .position_service
+                .mark_exit_ready(&mut position, "manual_close_one_legged", &ctx)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         }
         PositionState::Pending => {
             return Err(ApiError::BadRequest(
@@ -673,35 +715,6 @@ pub async fn close_position(
             )))
         }
     }
-
-    position_repo
-        .update(&position)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let execution_mode = current_execution_mode(state.as_ref()).await;
-    let (strategy, source_label) = trade_event_labels(row.source);
-    let mut event = NewTradeEvent::new(
-        strategy,
-        execution_mode,
-        source_label,
-        row.market_id.clone(),
-        "manual_exit_requested",
-    );
-    event.position_id = Some(position.id);
-    event.signal_id = row.source_signal_id;
-    event.state_from = Some(position_state_label(previous_state).to_string());
-    event.state_to = Some(position_state_label(position.state).to_string());
-    event.reason = Some("manual_close_request".to_string());
-    event.unrealized_pnl = Some(position.unrealized_pnl);
-    event.metadata = serde_json::json!({
-        "requested_quantity": close_quantity.to_string(),
-        "limit_price": request.limit_price.map(|price| price.to_string()),
-        "manual_close": true,
-    });
-    TradeEventRecorder::new(state.pool.clone(), state.trade_event_tx.clone())
-        .record_warn(event)
-        .await;
 
     // Publish position update via WebSocket
     let update = PositionUpdate {

@@ -146,6 +146,9 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 is_open,
                 current_price,
                 unrealized_pnl,
+                holds_yes,
+                holds_no,
+                quantity,
                 (
                     CASE
                         WHEN holds_yes OR holds_no THEN
@@ -198,6 +201,19 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 unrealized_pnl = c.effective_unrealized_pnl,
                 is_open = c.effective_is_open,
                 state = c.effective_state,
+                -- Sync per-leg qty as a floor: bump up if inferred exposure exists
+                -- but the explicit qty field is zero (pre-migration rows).
+                -- Never reduce — only PositionService exit fills do that.
+                held_yes_qty = CASE
+                    WHEN c.effective_state IN (4, 5) THEN 0
+                    WHEN c.holds_yes AND p.held_yes_qty = 0 THEN p.quantity
+                    ELSE p.held_yes_qty
+                END,
+                held_no_qty = CASE
+                    WHEN c.effective_state IN (4, 5) THEN 0
+                    WHEN c.holds_no AND p.held_no_qty = 0 THEN p.quantity
+                    ELSE p.held_no_qty
+                END,
                 last_updated = CASE
                     WHEN p.state IS DISTINCT FROM c.effective_state
                       OR p.is_open IS DISTINCT FROM c.effective_is_open
@@ -219,6 +235,9 @@ async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                  OR p.unrealized_pnl IS DISTINCT FROM c.effective_unrealized_pnl
                  OR p.is_open IS DISTINCT FROM c.effective_is_open
                  OR p.state IS DISTINCT FROM c.effective_state
+                 OR (c.holds_yes AND p.held_yes_qty = 0)
+                 OR (c.holds_no AND p.held_no_qty = 0)
+                 OR (c.effective_state IN (4, 5) AND (p.held_yes_qty > 0 OR p.held_no_qty > 0))
               )
             RETURNING 1
         )

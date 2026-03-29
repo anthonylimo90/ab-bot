@@ -26,7 +26,8 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
-use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
+use crate::position_service::{CloseMethod, EventContext, Leg};
+use crate::trade_events::TradeEventRecorder;
 use crate::wallet_inventory::recover_wallet_orphan_inventory;
 use crate::websocket::{SignalType, SignalUpdate};
 
@@ -271,12 +272,15 @@ pub struct ExitHandler {
     /// Shared dedup set with ArbAutoExecutor.
     arb_dedup: Arc<RwLock<HashSet<String>>>,
     trade_event_recorder: TradeEventRecorder,
+    /// Centralized service for position state mutations.
+    position_service: crate::position_service::PositionService,
     /// Heartbeat timestamp (epoch secs) — updated every tick to prove liveness.
     heartbeat: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
 struct QuantExitContext {
+    #[allow(dead_code)] // Kept for future trade event enrichment
     signal_id: uuid::Uuid,
     kind: QuantSignalKind,
     direction: SignalDirection,
@@ -296,6 +300,8 @@ impl ExitHandler {
         arb_dedup: Arc<RwLock<HashSet<String>>>,
         heartbeat: Arc<AtomicI64>,
     ) -> Self {
+        let position_service =
+            crate::position_service::PositionService::new(pool.clone(), trade_event_tx.clone());
         Self {
             config,
             position_repo: PositionRepository::new(pool.clone()),
@@ -307,6 +313,7 @@ impl ExitHandler {
             token_cache: OutcomeTokenCache::new(),
             arb_dedup,
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
+            position_service,
             heartbeat,
         }
     }
@@ -440,17 +447,16 @@ impl ExitHandler {
                 )
                 .await?
             {
-                if let Err(e) = candidate.position.mark_exit_ready() {
-                    warn!(
-                        position_id = %candidate.position.id,
-                        error = %e,
-                        "Cannot mark exit candidate ready"
-                    );
+                let execution_mode = self.current_execution_mode().await;
+                let ctx = Self::event_context(&execution_mode, candidate.source, quant_ctx);
+                if let Err(e) = self
+                    .position_service
+                    .mark_exit_ready(&mut candidate.position, "spread_normalized", &ctx)
+                    .await
+                {
+                    warn!(error = %e, "Failed to mark exit ready");
                     continue;
                 }
-                self.position_repo.update(&candidate.position).await?;
-                self.record_exit_ready_event(&candidate.position, candidate.source, quant_ctx)
-                    .await;
             }
         }
 
@@ -490,31 +496,40 @@ impl ExitHandler {
         } else {
             "paper"
         };
-        let quant_ctx = if position.yes_entry_price.is_zero() || position.no_entry_price.is_zero() {
-            self.load_quant_exit_context(position.id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        // Always try to load quant context — dual-leg quant positions have both
+        // prices set, so a zero-price gate would misclassify them as arb.
+        let quant_ctx = self
+            .load_quant_exit_context(position.id)
+            .await
+            .ok()
+            .flatten();
 
         // Mark Closing
-        if let Err(e) = position.mark_closing() {
-            anyhow::bail!("Cannot mark position closing: {}", e);
+        let source = if quant_ctx.is_some() {
+            SOURCE_RECOMMENDATION
+        } else {
+            SOURCE_ARBITRAGE
+        };
+        let ctx = Self::event_context(execution_mode, source, quant_ctx.as_ref());
+        if let Err(e) = self.position_service.mark_closing(position, &ctx).await {
+            warn!(error = %e, "mark_closing failed");
+            return Ok(());
         }
-        let _ = self.position_repo.update(position).await;
-        self.record_exit_requested_event(position, execution_mode, quant_ctx.as_ref())
-            .await;
 
         // Resolve token IDs
         let (yes_token_id, no_token_id) = match self.resolve_market_tokens(&market_id).await? {
             Some(ids) => ids,
             None => {
-                position.mark_exit_failed(FailureReason::ConnectivityError {
-                    message: "No token IDs for market".to_string(),
-                });
-                let _ = self.position_repo.update(position).await;
+                let _ = self
+                    .position_service
+                    .mark_exit_failed(
+                        position,
+                        FailureReason::ConnectivityError {
+                            message: "No token IDs for market".to_string(),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.publish_alert(&market_id, "exit_failed", "No token IDs for market");
                 return Ok(());
             }
@@ -541,10 +556,16 @@ impl ExitHandler {
                         return Ok(());
                     }
                     error!(error = %e, market_id = %market_id, "YES sell order error");
-                    position.mark_exit_failed(FailureReason::ConnectivityError {
-                        message: format!("YES sell error: {e}"),
-                    });
-                    let _ = self.position_repo.update(position).await;
+                    let _ = self
+                        .position_service
+                        .mark_exit_failed(
+                            position,
+                            FailureReason::ConnectivityError {
+                                message: format!("YES sell error: {e}"),
+                            },
+                            &ctx,
+                        )
+                        .await;
                     self.publish_alert(&market_id, "exit_failed", "YES sell order error");
                     return Ok(());
                 }
@@ -554,25 +575,47 @@ impl ExitHandler {
                 let msg = yes_report
                     .error_message
                     .unwrap_or_else(|| "YES sell not filled".to_string());
-                position.mark_exit_failed(FailureReason::OrderRejected {
-                    message: format!("YES sell failed: {msg}"),
-                });
-                let _ = self.position_repo.update(position).await;
+                let _ = self
+                    .position_service
+                    .mark_exit_failed(
+                        position,
+                        FailureReason::OrderRejected {
+                            message: format!("YES sell failed: {msg}"),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.publish_alert(&market_id, "exit_failed", "YES sell order rejected");
                 return Ok(());
             }
 
-            if let Err(error) = position.record_yes_exit_fill(yes_report.average_price) {
+            if let Err(error) = self
+                .position_service
+                .record_exit_fill(
+                    position,
+                    Leg::Yes,
+                    yes_report.average_price,
+                    yes_report.filled_quantity,
+                    &ctx,
+                )
+                .await
+            {
                 warn!(
                     position_id = %position.id,
                     market_id = %market_id,
                     error = %error,
                     "Failed to record YES exit fill"
                 );
-                position.mark_exit_failed(FailureReason::Unknown {
-                    message: format!("failed to record YES exit fill: {error}"),
-                });
-                let _ = self.position_repo.update(position).await;
+                let _ = self
+                    .position_service
+                    .mark_exit_failed(
+                        position,
+                        FailureReason::Unknown {
+                            message: format!("failed to record YES exit fill: {error}"),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.publish_alert(
                     &market_id,
                     "exit_failed",
@@ -580,7 +623,6 @@ impl ExitHandler {
                 );
                 return Ok(());
             }
-            let _ = self.position_repo.update(position).await;
         }
 
         if has_no {
@@ -603,10 +645,16 @@ impl ExitHandler {
                         return Ok(());
                     }
                     error!(error = %e, market_id = %market_id, "NO sell order error");
-                    position.mark_exit_failed(FailureReason::ConnectivityError {
-                        message: format!("NO sell error: {e}"),
-                    });
-                    let _ = self.position_repo.update(position).await;
+                    let _ = self
+                        .position_service
+                        .mark_exit_failed(
+                            position,
+                            FailureReason::ConnectivityError {
+                                message: format!("NO sell error: {e}"),
+                            },
+                            &ctx,
+                        )
+                        .await;
                     self.publish_alert(&market_id, "exit_failed", "NO sell order error");
                     return Ok(());
                 }
@@ -616,39 +664,63 @@ impl ExitHandler {
                 let msg = no_report
                     .error_message
                     .unwrap_or_else(|| "NO sell not filled".to_string());
-                position.mark_exit_failed(FailureReason::OrderRejected {
-                    message: format!("NO sell failed: {msg}"),
-                });
-                let _ = self.position_repo.update(position).await;
+                let _ = self
+                    .position_service
+                    .mark_exit_failed(
+                        position,
+                        FailureReason::OrderRejected {
+                            message: format!("NO sell failed: {msg}"),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.publish_alert(&market_id, "exit_failed", "NO sell order rejected");
                 return Ok(());
             }
 
-            if let Err(error) = position.record_no_exit_fill(no_report.average_price) {
+            if let Err(error) = self
+                .position_service
+                .record_exit_fill(
+                    position,
+                    Leg::No,
+                    no_report.average_price,
+                    no_report.filled_quantity,
+                    &ctx,
+                )
+                .await
+            {
                 warn!(
                     position_id = %position.id,
                     market_id = %market_id,
                     error = %error,
                     "Failed to record NO exit fill"
                 );
-                position.mark_exit_failed(FailureReason::Unknown {
-                    message: format!("failed to record NO exit fill: {error}"),
-                });
-                let _ = self.position_repo.update(position).await;
+                let _ = self
+                    .position_service
+                    .mark_exit_failed(
+                        position,
+                        FailureReason::Unknown {
+                            message: format!("failed to record NO exit fill: {error}"),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.publish_alert(&market_id, "exit_failed", "NO exit fill bookkeeping failed");
                 return Ok(());
             }
-            let _ = self.position_repo.update(position).await;
         }
 
         let fee = Decimal::new(2, 2); // 2%
 
         // Close position
-        if let Err(e) = position.close_via_recorded_exit(fee) {
-            warn!(position_id = %position.id, error = %e, "Cannot close position via exit");
+        if let Err(e) = self
+            .position_service
+            .close_position(position, CloseMethod::MarketExit { fee }, &ctx)
+            .await
+        {
+            warn!(position_id = %position.id, error = %e, "close_position failed");
             return Ok(());
         }
-        let _ = self.position_repo.update(position).await;
 
         let yes_price = position.yes_exit_price.unwrap_or(Decimal::ZERO);
         let no_price = position.no_exit_price.unwrap_or(Decimal::ZERO);
@@ -666,14 +738,6 @@ impl ExitHandler {
 
         // Remove from dedup
         self.arb_dedup.write().await.remove(&market_id);
-
-        self.record_position_closed_event(
-            position,
-            execution_mode,
-            quant_ctx.as_ref(),
-            "closed_via_exit",
-        )
-        .await;
 
         // Publish success signal
         let signal = SignalUpdate {
@@ -800,10 +864,10 @@ impl ExitHandler {
         let market_id = position.market_id.clone();
         let fee = Decimal::new(2, 2);
 
-        let close_result = if let Some(yes_wins) = resolved_yes_winner {
-            position.close_via_resolution_with_winner(yes_wins, fee)
+        let method = if let Some(yes_wins) = resolved_yes_winner {
+            CloseMethod::ResolutionWithWinner { yes_wins, fee }
         } else if position.has_full_pair_exposure() {
-            position.close_via_resolution(fee)
+            CloseMethod::ResolutionConservative { fee }
         } else {
             warn!(
                 position_id = %position.id,
@@ -813,17 +877,21 @@ impl ExitHandler {
             return Ok(false);
         };
 
-        if let Err(error) = close_result {
+        let execution_mode = self.current_execution_mode().await;
+        let ctx = Self::event_context(&execution_mode, source, quant_ctx);
+        if let Err(e) = self
+            .position_service
+            .close_position(position, method, &ctx)
+            .await
+        {
             warn!(
                 position_id = %position.id,
                 market_id = %market_id,
-                error = %error,
-                "Cannot close open position via resolution fallback"
+                error = %e,
+                "resolution close failed"
             );
             return Ok(false);
         }
-
-        self.position_repo.update(position).await?;
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
         let is_win = realized_pnl > Decimal::ZERO;
@@ -839,23 +907,6 @@ impl ExitHandler {
         }
 
         self.arb_dedup.write().await.remove(&market_id);
-
-        let execution_mode = self.current_execution_mode().await;
-        self.trade_event_recorder
-            .record_warn(
-                trade_event_for_position(
-                    position,
-                    source,
-                    quant_ctx,
-                    &execution_mode,
-                    "closed_via_resolution",
-                    Some("open"),
-                    Some("closed"),
-                )
-                .with_realized_pnl(realized_pnl)
-                .with_unrealized_pnl(position.unrealized_pnl),
-            )
-            .await;
 
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
@@ -1149,83 +1200,6 @@ impl ExitHandler {
             || imbalance_ratio.abs() < min_supported_imbalance)
     }
 
-    async fn record_exit_ready_event(
-        &self,
-        position: &Position,
-        source: i16,
-        quant_ctx: Option<&QuantExitContext>,
-    ) {
-        let execution_mode = self.current_execution_mode().await;
-        self.trade_event_recorder
-            .record_warn(
-                trade_event_for_position(
-                    position,
-                    source,
-                    quant_ctx,
-                    &execution_mode,
-                    "exit_marked_ready",
-                    Some("open"),
-                    Some("exit_ready"),
-                )
-                .with_unrealized_pnl(position.unrealized_pnl),
-            )
-            .await;
-    }
-
-    async fn record_exit_requested_event(
-        &self,
-        position: &Position,
-        execution_mode: &str,
-        quant_ctx: Option<&QuantExitContext>,
-    ) {
-        self.trade_event_recorder
-            .record_warn(
-                trade_event_for_position(
-                    position,
-                    if quant_ctx.is_some() {
-                        SOURCE_RECOMMENDATION
-                    } else {
-                        SOURCE_ARBITRAGE
-                    },
-                    quant_ctx,
-                    execution_mode,
-                    "exit_requested",
-                    Some("exit_ready"),
-                    Some("closing"),
-                )
-                .with_unrealized_pnl(position.unrealized_pnl),
-            )
-            .await;
-    }
-
-    async fn record_position_closed_event(
-        &self,
-        position: &Position,
-        execution_mode: &str,
-        quant_ctx: Option<&QuantExitContext>,
-        event_type: &str,
-    ) {
-        self.trade_event_recorder
-            .record_warn(
-                trade_event_for_position(
-                    position,
-                    if quant_ctx.is_some() {
-                        SOURCE_RECOMMENDATION
-                    } else {
-                        SOURCE_ARBITRAGE
-                    },
-                    quant_ctx,
-                    execution_mode,
-                    event_type,
-                    Some("closing"),
-                    Some("closed"),
-                )
-                .with_realized_pnl(position.realized_pnl.unwrap_or_default())
-                .with_unrealized_pnl(position.unrealized_pnl),
-            )
-            .await;
-    }
-
     async fn should_mark_exit_ready(
         &self,
         position: &Position,
@@ -1324,6 +1298,26 @@ impl ExitHandler {
             "live".to_string()
         } else {
             "paper".to_string()
+        }
+    }
+
+    /// Build an EventContext for PositionService calls from position source and quant context.
+    fn event_context(
+        execution_mode: &str,
+        source: i16,
+        quant_ctx: Option<&QuantExitContext>,
+    ) -> EventContext {
+        let (strategy, source_label) = if let Some(qctx) = quant_ctx {
+            (qctx.kind.as_str().to_string(), "quant".to_string())
+        } else if source == SOURCE_RECOMMENDATION {
+            ("quant".to_string(), "quant".to_string())
+        } else {
+            ("arb".to_string(), "arb".to_string())
+        };
+        EventContext {
+            execution_mode: execution_mode.to_string(),
+            strategy,
+            source_label,
         }
     }
 
@@ -1433,8 +1427,11 @@ impl ExitHandler {
                 continue;
             }
 
-            position.no_entry_price = Decimal::ZERO;
+            // Transition EntryFailed → ExitReady so execute_exit's mark_closing succeeds.
             position.state = PositionState::ExitReady;
+            position.no_entry_price = Decimal::ZERO;
+            position.held_no_qty = Decimal::ZERO;
+            position.failure_reason = None;
             position.retry_count += 1;
             position.last_updated = Utc::now();
 
@@ -1517,37 +1514,29 @@ impl ExitHandler {
                 continue;
             }
 
-            let exhausted_hot_retries = !position.can_retry();
-            position.state = PositionState::ExitReady;
-            position.failure_reason = None;
-            position.last_updated = Utc::now();
-
-            if let Err(e) = self.position_repo.update(&position).await {
-                warn!(
-                    position_id = %position.id,
-                    error = %e,
-                    "Failed to persist exit recovery"
-                );
-                continue;
-            }
-
-            if exhausted_hot_retries {
-                warn!(
-                    position_id = %position.id,
-                    market_id = %position.market_id,
-                    retry_count = position.retry_count,
-                    age_secs,
-                    backoff_secs = cfg.failed_exit_retry_backoff_secs,
-                    "Reopened exhausted exit failure for reconciliation after cooldown"
-                );
+            let execution_mode = self.current_execution_mode().await;
+            let quant_ctx = self
+                .load_quant_exit_context(position.id)
+                .await
+                .ok()
+                .flatten();
+            let source = if quant_ctx.is_some() {
+                SOURCE_RECOMMENDATION
             } else {
-                debug!(
-                    position_id = %position.id,
-                    retry_count = position.retry_count,
-                    age_secs,
-                    "Position moved back to ExitReady for retry"
-                );
-            }
+                SOURCE_ARBITRAGE
+            };
+            let ctx = Self::event_context(&execution_mode, source, quant_ctx.as_ref());
+            let _ = self
+                .position_service
+                .attempt_exit_recovery(&mut position, &ctx)
+                .await;
+
+            debug!(
+                position_id = %position.id,
+                retry_count = position.retry_count,
+                age_secs,
+                "Position exit recovery attempted"
+            );
         }
 
         Ok(())
@@ -1569,44 +1558,6 @@ impl ExitHandler {
         };
         let _ = self.signal_tx.send(signal);
     }
-}
-
-fn trade_event_for_position(
-    position: &Position,
-    source: i16,
-    quant_ctx: Option<&QuantExitContext>,
-    execution_mode: &str,
-    event_type: &str,
-    state_from: Option<&str>,
-    state_to: Option<&str>,
-) -> NewTradeEvent {
-    let (strategy, source_label, signal_id, direction) = if let Some(ctx) = quant_ctx {
-        (
-            ctx.kind.as_str().to_string(),
-            "quant".to_string(),
-            Some(ctx.signal_id),
-            Some(ctx.direction.as_str().to_string()),
-        )
-    } else if source == SOURCE_RECOMMENDATION {
-        ("quant".to_string(), "quant".to_string(), None, None)
-    } else {
-        ("arb".to_string(), "arb".to_string(), None, None)
-    };
-
-    let mut event = NewTradeEvent::new(
-        strategy,
-        execution_mode,
-        source_label,
-        position.market_id.clone(),
-        event_type,
-    );
-    event.position_id = Some(position.id);
-    event.signal_id = signal_id;
-    event.direction = direction;
-    event.state_from = state_from.map(str::to_string);
-    event.state_to = state_to.map(str::to_string);
-    event.metadata = serde_json::json!({});
-    event
 }
 
 fn parse_quant_kind(kind: &str) -> Option<QuantSignalKind> {
@@ -1750,23 +1701,6 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
     };
     let current_deviation = (current_yes - Decimal::new(50, 2)).abs();
     current_deviation <= entry_deviation / Decimal::new(2, 0)
-}
-
-trait ExitTradeEventExt {
-    fn with_realized_pnl(self, pnl: Decimal) -> Self;
-    fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
-}
-
-impl ExitTradeEventExt for NewTradeEvent {
-    fn with_realized_pnl(mut self, pnl: Decimal) -> Self {
-        self.realized_pnl = Some(pnl);
-        self
-    }
-
-    fn with_unrealized_pnl(mut self, pnl: Decimal) -> Self {
-        self.unrealized_pnl = Some(pnl);
-        self
-    }
 }
 
 /// Spawn the exit handler as a background task.

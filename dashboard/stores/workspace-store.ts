@@ -102,9 +102,7 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
     {
       name: "ab-bot-workspace",
       storage: createJSONStorage(() => localStorage),
-      partialize: (state) => ({
-        currentWorkspace: state.currentWorkspace,
-      }),
+      partialize: () => ({}),
       onRehydrateStorage: () => (state) => {
         state?.setHasHydrated(true);
       },

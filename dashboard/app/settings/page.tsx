@@ -127,7 +127,7 @@ export default function SettingsPage() {
   const {
     data: primaryWalletBalance,
     isPending: isPrimaryWalletBalancePending,
-  } = useWalletBalanceQuery(primaryWallet ?? null);
+  } = useWalletBalanceQuery(primaryConnectedWallet?.address ?? null);
   const { data: recentWithdrawals = [], isLoading: withdrawalsLoading } =
     useWalletWithdrawalsQuery(8);
   const createWithdrawalMutation = useCreateWalletWithdrawalMutation();
@@ -316,7 +316,8 @@ export default function SettingsPage() {
   };
 
   const handleWithdraw = async () => {
-    if (!primaryWallet) {
+    const sourceAddress = primaryConnectedWallet?.address;
+    if (!sourceAddress) {
       toast.error('No active wallet', 'Connect a wallet and mark it active before withdrawing.');
       return;
     }
@@ -332,7 +333,7 @@ export default function SettingsPage() {
       return;
     }
 
-    if (withdrawDestination.trim().toLowerCase() === primaryWallet.toLowerCase()) {
+    if (withdrawDestination.trim().toLowerCase() === sourceAddress.toLowerCase()) {
       toast.error(
         'Same wallet selected',
         'The destination matches your active trading wallet. If this is already your MetaMask address, no transfer is needed.',
@@ -342,7 +343,7 @@ export default function SettingsPage() {
 
     try {
       await createWithdrawalMutation.mutateAsync({
-        source_address: primaryWallet,
+        source_address: sourceAddress,
         destination_address: withdrawDestination.trim(),
         amount,
       });
@@ -379,7 +380,7 @@ export default function SettingsPage() {
       />
 
       {/* Account */}
-      <Card>
+      <Card id="wallet-account" className="scroll-mt-24">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Wallet className="h-5 w-5" />
@@ -460,7 +461,7 @@ export default function SettingsPage() {
             )}
           </div>
 
-          <div className="rounded-lg border p-4">
+          <div id="withdraw-usdc" className="rounded-lg border p-4 scroll-mt-24">
             <div className="mb-4">
               <p className="flex items-center gap-2 font-medium">
                 <span>Withdraw USDC</span>
@@ -475,7 +476,11 @@ export default function SettingsPage() {
               <p className="text-sm text-muted-foreground">
                 Only workspace owners and admins can initiate withdrawals.
               </p>
-            ) : !primaryWallet ? (
+            ) : walletLoading && connectedWallets.length === 0 ? (
+              <p className="text-sm text-muted-foreground">
+                Loading active wallet details...
+              </p>
+            ) : !primaryConnectedWallet ? (
               <p className="text-sm text-muted-foreground">
                 Connect and activate a wallet before withdrawing funds.
               </p>
@@ -485,10 +490,10 @@ export default function SettingsPage() {
                   <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                     <div>
                       <p className="font-medium">
-                        Source wallet: {primaryConnectedWallet?.label || shortAddress(primaryWallet)}
+                        Source wallet: {primaryConnectedWallet.label || shortAddress(primaryConnectedWallet.address)}
                       </p>
                       <p className="font-mono text-xs text-muted-foreground">
-                        {primaryWallet}
+                        {primaryConnectedWallet.address}
                       </p>
                     </div>
                     <div className="text-sm font-medium">

@@ -347,6 +347,17 @@ export function Header() {
                   </div>
                 </div>
                 <RecoveryDialog workspaceId={currentWorkspace?.id} />
+                <Link href="/settings#wallet-account">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-1.5 rounded-full"
+                  >
+                    <Wallet className="h-4 w-4" />
+                    <span>Wallet</span>
+                  </Button>
+                </Link>
               </div>
               <div className="flex items-center gap-1.5 md:hidden">
                 <div
@@ -373,6 +384,17 @@ export function Header() {
                   )}
                 </div>
                 <RecoveryDialog workspaceId={currentWorkspace?.id} compact />
+                <Link href="/settings#wallet-account">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    className="rounded-full"
+                    aria-label="Open wallet settings"
+                  >
+                    <Wallet className="h-3.5 w-3.5" />
+                  </Button>
+                </Link>
               </div>
             </>
           ) : (

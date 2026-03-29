@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::learning::{ArbShadowPredictionInput, ShadowPredictionRecorder};
 use crate::learning_rollouts::LearningRolloutController;
+use crate::position_service::{CreatePositionParams, EventContext, Leg};
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
@@ -486,6 +487,7 @@ pub struct ArbAutoExecutor {
     circuit_breaker: Arc<CircuitBreaker>,
     pool: PgPool,
     position_repo: PositionRepository,
+    position_service: crate::position_service::PositionService,
     token_cache: Arc<OutcomeTokenCache>,
     trade_event_recorder: TradeEventRecorder,
     shadow_prediction_recorder: ShadowPredictionRecorder,
@@ -524,6 +526,10 @@ impl ArbAutoExecutor {
             circuit_breaker,
             pool: pool.clone(),
             position_repo: PositionRepository::new(pool.clone()),
+            position_service: crate::position_service::PositionService::new(
+                pool.clone(),
+                trade_event_tx.clone(),
+            ),
             token_cache: Arc::new(
                 OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
             ),
@@ -1190,49 +1196,45 @@ impl ArbAutoExecutor {
         );
 
         // 8. Create position in PENDING state
-        let mut position = Position::new(
-            market_id.clone(),
-            arb.yes_ask,
-            arb.no_ask,
-            quantity,
-            ExitStrategy::HoldToResolution,
+        let ctx = EventContext {
+            execution_mode: execution_mode.to_string(),
+            strategy: "arb".to_string(),
+            source_label: "arb".to_string(),
+        };
+        let create_metadata = merge_metadata(
+            serde_json::json!({
+                "quantity": quantity.to_string(),
+                "yes_price": arb.yes_ask.to_string(),
+                "no_price": arb.no_ask.to_string(),
+                "total_cost": arb.total_cost.to_string(),
+                "expected_net": expected_net.to_string(),
+            }),
+            &telemetry,
         );
-        position.apply_arb_fee_model(&arb);
-
-        if let Err(e) = self
-            .position_repo
-            .insert_with_source(&position, SOURCE_ARBITRAGE, None)
+        let mut position = match self
+            .position_service
+            .create_position(
+                CreatePositionParams {
+                    market_id: market_id.clone(),
+                    yes_entry_price: arb.yes_ask,
+                    no_entry_price: arb.no_ask,
+                    quantity,
+                    exit_strategy: ExitStrategy::HoldToResolution,
+                    source: SOURCE_ARBITRAGE,
+                    source_signal_id: None,
+                    arb_opportunity: Some(arb.clone()),
+                },
+                &ctx,
+                create_metadata,
+            )
             .await
         {
-            error!(error = %e, "Failed to persist pending position");
-            return Err(anyhow::anyhow!("Failed to persist position: {e}"));
-        }
-
-        self.trade_event_recorder
-            .record_warn({
-                let metadata = merge_metadata(
-                    serde_json::json!({
-                        "quantity": quantity.to_string(),
-                        "yes_price": arb.yes_ask.to_string(),
-                        "no_price": arb.no_ask.to_string(),
-                        "total_cost": arb.total_cost.to_string(),
-                    }),
-                    &telemetry,
-                );
-                NewTradeEvent::new(
-                    "arb",
-                    execution_mode,
-                    "arb",
-                    market_id.clone(),
-                    "entry_requested",
-                )
-                .with_position(position.id)
-                .with_state(None, Some("pending"))
-                .with_expected_edge(expected_net)
-                .with_requested_size(position_size)
-                .with_metadata(metadata)
-            })
-            .await;
+            Ok(pos) => pos,
+            Err(e) => {
+                error!(error = %e, "Failed to persist pending position");
+                return Err(anyhow::anyhow!("Failed to persist position: {e}"));
+            }
+        };
 
         // 9. Execute YES market order
         let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity)
@@ -1253,10 +1255,16 @@ impl ArbAutoExecutor {
                     format!("execution failure: YES order error: {e}"),
                 );
                 error!(error = %e, market_id = %market_id, "YES order execution error");
-                position.mark_entry_failed(FailureReason::ConnectivityError {
-                    message: format!("YES order error: {e}"),
-                });
-                let _ = self.position_repo.update(&position).await;
+                let _ = self
+                    .position_service
+                    .mark_entry_failed(
+                        &mut position,
+                        FailureReason::ConnectivityError {
+                            message: format!("YES order error: {e}"),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.record_failure_event(
                     execution_mode,
                     market_id,
@@ -1284,8 +1292,14 @@ impl ArbAutoExecutor {
                 format!("execution failure: YES order rejected: {msg}"),
             );
             warn!(market_id = %market_id, reason = %msg, "YES order failed");
-            position.mark_entry_failed(FailureReason::OrderRejected { message: msg });
-            let _ = self.position_repo.update(&position).await;
+            let _ = self
+                .position_service
+                .mark_entry_failed(
+                    &mut position,
+                    FailureReason::OrderRejected { message: msg },
+                    &ctx,
+                )
+                .await;
             self.record_failure_event(
                 execution_mode,
                 market_id,
@@ -1298,8 +1312,18 @@ impl ArbAutoExecutor {
             return Ok(());
         }
         let yes_order_finished_at = std::time::Instant::now();
-        position.quantity = yes_report.filled_quantity;
-        position.yes_entry_price = yes_report.average_price;
+
+        // Record YES leg fill via service
+        let _ = self
+            .position_service
+            .record_entry_fill(
+                &mut position,
+                Leg::Yes,
+                yes_report.average_price,
+                yes_report.filled_quantity,
+                &ctx,
+            )
+            .await;
 
         // 11. Execute NO market order
         let no_order = MarketOrder::new(
@@ -1329,15 +1353,15 @@ impl ArbAutoExecutor {
                 runtime
                     .record_decision(market_id, format!("execution failure: NO order error: {e}"));
                 error!(error = %e, market_id = %market_id, "NO order execution error (one-legged)");
-                self.transition_one_legged_to_exit_ready(
-                    &mut position,
-                    market_id,
-                    yes_report.average_price,
-                    &telemetry,
-                    execution_mode,
-                    format!("NO order error after YES fill: {e}"),
-                )
-                .await;
+                let failure_msg = format!("NO order error after YES fill: {e}");
+                let _ = self
+                    .position_service
+                    .transition_one_legged_to_exit_ready(&mut position, "yes", &failure_msg, &ctx)
+                    .await;
+                self.active_markets
+                    .write()
+                    .await
+                    .insert(market_id.to_string());
                 self.publish_failure_signal(market_id, "One-legged position moved to exit queue");
                 return Ok(());
             }
@@ -1362,19 +1386,30 @@ impl ArbAutoExecutor {
                 reason = %msg,
                 "NO order failed after YES fill; moving position to exit queue"
             );
-            self.transition_one_legged_to_exit_ready(
-                &mut position,
-                market_id,
-                yes_report.average_price,
-                &telemetry,
-                execution_mode,
-                format!("NO order rejected after YES fill: {msg}"),
-            )
-            .await;
+            let failure_msg = format!("NO order rejected after YES fill: {msg}");
+            let _ = self
+                .position_service
+                .transition_one_legged_to_exit_ready(&mut position, "yes", &failure_msg, &ctx)
+                .await;
+            self.active_markets
+                .write()
+                .await
+                .insert(market_id.to_string());
             self.publish_failure_signal(market_id, "One-legged position moved to exit queue");
             return Ok(());
         }
-        position.no_entry_price = no_report.average_price;
+
+        // Record NO leg fill via service
+        let _ = self
+            .position_service
+            .record_entry_fill(
+                &mut position,
+                Leg::No,
+                no_report.average_price,
+                no_report.filled_quantity,
+                &ctx,
+            )
+            .await;
 
         let actual_fill_cost = yes_report.total_value() + no_report.total_value();
         let modeled_fill_cost = arb.total_cost * quantity;
@@ -1388,79 +1423,22 @@ impl ArbAutoExecutor {
         };
         telemetry.request_to_fill_ms = Some(process_started_at.elapsed().as_millis() as i64);
 
-        self.trade_event_recorder
-            .record_warn({
-                let metadata = merge_metadata(
-                    serde_json::json!({
-                        "yes_fill_price": yes_report.average_price.to_string(),
-                        "no_fill_price": no_report.average_price.to_string(),
-                        "quantity": quantity.to_string(),
-                        "modeled_fill_cost": modeled_fill_cost.to_string(),
-                        "actual_fill_cost": actual_fill_cost.to_string(),
-                        "execution_slippage": execution_slippage.to_string(),
-                        "execution_slippage_bps": execution_slippage_bps.to_string(),
-                    }),
-                    &telemetry,
-                );
-                NewTradeEvent::new(
-                    "arb",
-                    execution_mode,
-                    "arb",
-                    market_id.clone(),
-                    "entry_filled",
-                )
-                .with_position(position.id)
-                .with_state(Some("pending"), Some("pending"))
-                .with_expected_edge(expected_net)
-                .with_observed_edge(observed_net)
-                .with_requested_size(position_size)
-                .with_filled_size(actual_fill_cost)
-                .with_fill_price(
-                    (yes_report.average_price + no_report.average_price) / Decimal::new(2, 0),
-                )
-                .with_metadata(metadata)
-            })
-            .await;
+        info!(
+            market_id = %market_id,
+            actual_fill_cost = %actual_fill_cost,
+            modeled_fill_cost = %modeled_fill_cost,
+            observed_net = %observed_net,
+            execution_slippage = %execution_slippage,
+            execution_slippage_bps = %execution_slippage_bps,
+            "Both legs filled — slippage summary"
+        );
 
-        // 13. Both filled → mark position OPEN
-        if let Err(e) = position.mark_open() {
+        // 13. Both filled → mark position OPEN via service
+        if let Err(e) = self.position_service.mark_open(&mut position, &ctx).await {
             error!(error = %e, "Failed to transition position to OPEN");
-        }
-        if let Err(e) = self.position_repo.update(&position).await {
-            error!(error = %e, "Failed to update position to OPEN");
         }
         telemetry.request_to_open_ms = Some(process_started_at.elapsed().as_millis() as i64);
         telemetry.finish_total(&process_started_at);
-
-        self.trade_event_recorder
-            .record_warn({
-                let metadata = merge_metadata(
-                    serde_json::json!({
-                        "quantity": quantity.to_string(),
-                        "total_cost": arb.total_cost.to_string(),
-                        "modeled_fill_cost": modeled_fill_cost.to_string(),
-                        "actual_fill_cost": actual_fill_cost.to_string(),
-                        "execution_slippage": execution_slippage.to_string(),
-                        "execution_slippage_bps": execution_slippage_bps.to_string(),
-                    }),
-                    &telemetry,
-                );
-                NewTradeEvent::new(
-                    "arb",
-                    execution_mode,
-                    "arb",
-                    market_id.clone(),
-                    "position_open",
-                )
-                .with_position(position.id)
-                .with_state(Some("pending"), Some("open"))
-                .with_expected_edge(expected_net)
-                .with_observed_edge(observed_net)
-                .with_requested_size(position_size)
-                .with_filled_size(actual_fill_cost)
-                .with_metadata(metadata)
-            })
-            .await;
 
         // Add to dedup set
         self.active_markets.write().await.insert(market_id.clone());
@@ -1525,116 +1503,6 @@ impl ArbAutoExecutor {
             }),
         };
         let _ = self.signal_tx.send(signal);
-    }
-
-    async fn transition_one_legged_to_exit_ready(
-        &self,
-        position: &mut Position,
-        market_id: &str,
-        yes_fill_price: Decimal,
-        telemetry: &ArbExecutionTelemetry,
-        execution_mode: &str,
-        reason: String,
-    ) {
-        position.yes_entry_price = yes_fill_price;
-        position.no_entry_price = Decimal::ZERO;
-
-        if let Err(error) = position.mark_open() {
-            error!(
-                position_id = %position.id,
-                market_id = %market_id,
-                error = %error,
-                "Failed to transition one-legged position to Open"
-            );
-            position.mark_entry_failed(FailureReason::OneLeggedEntry {
-                held_leg: "yes".to_string(),
-                message: reason,
-            });
-            let _ = self.position_repo.update(position).await;
-            self.record_failure_event(
-                execution_mode,
-                market_id,
-                position,
-                "one_legged_transition_open_failed",
-                telemetry,
-            )
-            .await;
-            return;
-        }
-
-        if let Err(error) = position.mark_exit_ready() {
-            error!(
-                position_id = %position.id,
-                market_id = %market_id,
-                error = %error,
-                "Failed to transition one-legged position to ExitReady"
-            );
-            position.mark_entry_failed(FailureReason::OneLeggedEntry {
-                held_leg: "yes".to_string(),
-                message: reason,
-            });
-            let _ = self.position_repo.update(position).await;
-            self.record_failure_event(
-                execution_mode,
-                market_id,
-                position,
-                "one_legged_transition_exit_ready_failed",
-                telemetry,
-            )
-            .await;
-            return;
-        }
-
-        position.failure_reason = Some(FailureReason::OneLeggedEntry {
-            held_leg: "yes".to_string(),
-            message: reason.clone(),
-        });
-        position.last_updated = Utc::now();
-
-        if let Err(error) = self.position_repo.update(position).await {
-            error!(
-                position_id = %position.id,
-                market_id = %market_id,
-                error = %error,
-                "Failed to persist one-legged position queued for exit"
-            );
-            return;
-        }
-
-        self.active_markets
-            .write()
-            .await
-            .insert(market_id.to_string());
-
-        self.trade_event_recorder
-            .record_warn(
-                NewTradeEvent::new(
-                    "arb",
-                    execution_mode.to_string(),
-                    "arb",
-                    market_id.to_string(),
-                    "one_legged_exit_ready",
-                )
-                .with_position(position.id)
-                .with_state(Some("pending"), Some("exit_ready"))
-                .with_reason(Some("one_legged_position"))
-                .with_metadata(merge_metadata(
-                    serde_json::json!({
-                        "reason": reason,
-                        "quantity": position.quantity.to_string(),
-                        "yes_entry_price": position.yes_entry_price.to_string(),
-                    }),
-                    telemetry,
-                )),
-            )
-            .await;
-
-        warn!(
-            position_id = %position.id,
-            market_id = %market_id,
-            quantity = %position.quantity,
-            "Queued one-legged position for exit handling"
-        );
     }
 
     async fn record_skip_event(
@@ -1741,9 +1609,6 @@ trait ArbTradeEventExt {
     fn with_reason(self, reason: Option<&str>) -> Self;
     fn with_expected_edge(self, edge: Decimal) -> Self;
     fn with_observed_edge(self, edge: Decimal) -> Self;
-    fn with_requested_size(self, size: Decimal) -> Self;
-    fn with_filled_size(self, size: Decimal) -> Self;
-    fn with_fill_price(self, price: Decimal) -> Self;
     fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
     fn with_metadata(self, metadata: serde_json::Value) -> Self;
 }
@@ -1772,21 +1637,6 @@ impl ArbTradeEventExt for NewTradeEvent {
 
     fn with_observed_edge(mut self, edge: Decimal) -> Self {
         self.observed_edge = Some(edge);
-        self
-    }
-
-    fn with_requested_size(mut self, size: Decimal) -> Self {
-        self.requested_size_usd = Some(size);
-        self
-    }
-
-    fn with_filled_size(mut self, size: Decimal) -> Self {
-        self.filled_size_usd = Some(size);
-        self
-    }
-
-    fn with_fill_price(mut self, price: Decimal) -> Self {
-        self.fill_price = Some(price);
         self
     }
 
