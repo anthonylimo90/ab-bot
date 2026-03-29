@@ -299,7 +299,7 @@ impl GammaClient {
                     );
                     let backoff = StdDuration::from_millis(500 * 2u64.pow(attempt));
                     tokio::time::sleep(backoff).await;
-                    last_error = Some(Error::Http(e));
+                    last_error = Some(Error::Http(Box::new(e)));
                 }
             }
         }

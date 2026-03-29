@@ -2,6 +2,9 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { User } from '@/types/api';
 import api from '@/lib/api';
+import { queryClient } from '@/lib/queryClient';
+import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useWalletStore } from '@/stores/wallet-store';
 
 interface AuthStore {
   token: string | null;
@@ -15,6 +18,12 @@ interface AuthStore {
   checkAuth: () => Promise<void>;
   setHasHydrated: (state: boolean) => void;
   isPlatformAdmin: () => boolean;
+}
+
+function resetSessionContext() {
+  queryClient.clear();
+  useWorkspaceStore.getState().reset();
+  useWalletStore.getState().reset();
 }
 
 export const useAuthStore = create<AuthStore>()(
@@ -31,19 +40,22 @@ export const useAuthStore = create<AuthStore>()(
       },
 
       setAuth: (token, user) => {
+        resetSessionContext();
         api.setToken(token);
         set({ token, user, isAuthenticated: true, isLoading: false });
       },
 
       logout: () => {
         api.clearToken();
+        resetSessionContext();
         set({ token: null, user: null, isAuthenticated: false, isLoading: false });
       },
 
       checkAuth: async () => {
         const { token } = get();
         if (!token) {
-          set({ isLoading: false, isAuthenticated: false });
+          resetSessionContext();
+          set({ token: null, user: null, isLoading: false, isAuthenticated: false });
           return;
         }
 
@@ -58,6 +70,7 @@ export const useAuthStore = create<AuthStore>()(
         } catch {
           // Token invalid or expired
           api.clearToken();
+          resetSessionContext();
           set({ token: null, user: null, isAuthenticated: false, isLoading: false });
         }
       },

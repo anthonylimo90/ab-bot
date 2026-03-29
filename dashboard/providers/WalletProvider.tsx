@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import { WagmiProvider } from 'wagmi';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RainbowKitProvider, darkTheme } from '@rainbow-me/rainbowkit';
 import { createWalletConfig } from '@/lib/wallet-config';
 import { useWorkspaceStore } from '@/stores/workspace-store';
@@ -12,15 +11,6 @@ import '@rainbow-me/rainbowkit/styles.css';
 interface WalletProviderProps {
   children: React.ReactNode;
 }
-
-// Create a stable query client
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 60 * 1000, // 1 minute
-    },
-  },
-});
 
 export function WalletProvider({ children }: WalletProviderProps) {
   const [mounted, setMounted] = useState(false);
@@ -41,27 +31,21 @@ export function WalletProvider({ children }: WalletProviderProps) {
 
   // Wait for both client-side mount and store hydration
   if (!mounted || !_hasHydrated) {
-    return (
-      <QueryClientProvider client={queryClient}>
-        {children}
-      </QueryClientProvider>
-    );
+    return <>{children}</>;
   }
 
   return (
     <WagmiProvider config={config}>
-      <QueryClientProvider client={queryClient}>
-        <RainbowKitProvider
-          theme={darkTheme({
-            accentColor: '#10b981',
-            accentColorForeground: 'white',
-            borderRadius: 'medium',
-          })}
-          modalSize="compact"
-        >
-          {children}
-        </RainbowKitProvider>
-      </QueryClientProvider>
+      <RainbowKitProvider
+        theme={darkTheme({
+          accentColor: '#10b981',
+          accentColorForeground: 'white',
+          borderRadius: 'medium',
+        })}
+        modalSize="compact"
+      >
+        {children}
+      </RainbowKitProvider>
     </WagmiProvider>
   );
 }

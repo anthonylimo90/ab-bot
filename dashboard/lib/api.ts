@@ -122,6 +122,14 @@ function parsePosition(raw: Position): Position {
     take_profit: raw.take_profit != null ? Number(raw.take_profit) : undefined,
     realized_pnl:
       raw.realized_pnl != null ? Number(raw.realized_pnl) : undefined,
+    held_yes_qty: Number(raw.held_yes_qty),
+    held_no_qty: Number(raw.held_no_qty),
+    exited_yes_qty: Number(raw.exited_yes_qty),
+    exited_no_qty: Number(raw.exited_no_qty),
+    yes_exit_price:
+      raw.yes_exit_price != null ? Number(raw.yes_exit_price) : undefined,
+    no_exit_price:
+      raw.no_exit_price != null ? Number(raw.no_exit_price) : undefined,
   };
 }
 

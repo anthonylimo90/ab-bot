@@ -56,11 +56,12 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner,
                 is_open, opened_at, source, source_signal_id
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
             )
             "#,
         )
@@ -80,6 +81,11 @@ impl PositionRepository {
         .bind(position.resolution_payout_per_share)
         .bind(position.yes_entry_fee_shares)
         .bind(position.no_entry_fee_shares)
+        .bind(position.held_yes_qty)
+        .bind(position.held_no_qty)
+        .bind(position.exited_yes_qty)
+        .bind(position.exited_no_qty)
+        .bind(position.resolution_winner.as_deref())
         .bind(position.should_persist_as_open())
         .bind(position.entry_timestamp)
         .bind(source)
@@ -114,7 +120,12 @@ impl PositionRepository {
                 resolution_payout_per_share = $12,
                 yes_entry_fee_shares = $13,
                 no_entry_fee_shares = $14,
-                is_open = $15
+                held_yes_qty = $15,
+                held_no_qty = $16,
+                exited_yes_qty = $17,
+                exited_no_qty = $18,
+                resolution_winner = $19,
+                is_open = $20
             WHERE id = $1
             "#,
         )
@@ -132,6 +143,11 @@ impl PositionRepository {
         .bind(position.resolution_payout_per_share)
         .bind(position.yes_entry_fee_shares)
         .bind(position.no_entry_fee_shares)
+        .bind(position.held_yes_qty)
+        .bind(position.held_no_qty)
+        .bind(position.exited_yes_qty)
+        .bind(position.exited_no_qty)
+        .bind(position.resolution_winner.as_deref())
         .bind(position.should_persist_as_open())
         .execute(&self.pool)
         .await?;
@@ -148,7 +164,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE id = $1
             "#,
@@ -219,6 +236,19 @@ impl PositionRepository {
             no_entry_fee_shares: r
                 .get::<Option<Decimal>, _>("no_entry_fee_shares")
                 .unwrap_or(Decimal::ZERO),
+            held_yes_qty: r
+                .get::<Option<Decimal>, _>("held_yes_qty")
+                .unwrap_or(Decimal::ZERO),
+            held_no_qty: r
+                .get::<Option<Decimal>, _>("held_no_qty")
+                .unwrap_or(Decimal::ZERO),
+            exited_yes_qty: r
+                .get::<Option<Decimal>, _>("exited_yes_qty")
+                .unwrap_or(Decimal::ZERO),
+            exited_no_qty: r
+                .get::<Option<Decimal>, _>("exited_no_qty")
+                .unwrap_or(Decimal::ZERO),
+            resolution_winner: r.get::<Option<String>, _>("resolution_winner"),
         }
     }
 
@@ -232,7 +262,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state NOT IN (4, 5)
             ORDER BY entry_timestamp DESC
@@ -257,7 +288,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state NOT IN (4, 5)
               AND COALESCE(source, 0) NOT IN ($1, $2)
@@ -281,7 +313,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state IN (6, 7)
             ORDER BY last_updated ASC
@@ -302,7 +335,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state IN (6, 7)
               AND COALESCE(source, 0) NOT IN ($1, $2)
@@ -326,7 +360,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state = 2
             ORDER BY last_updated ASC
@@ -347,7 +382,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE exit_strategy = 0 AND state IN (1, 2)
             ORDER BY entry_timestamp ASC
@@ -369,6 +405,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner,
                 source, source_signal_id
             FROM positions
             WHERE exit_strategy = 1 AND state = 1
@@ -397,7 +434,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state = 6
             ORDER BY last_updated ASC
@@ -419,7 +457,8 @@ impl PositionRepository {
                 entry_timestamp, exit_strategy, state, unrealized_pnl,
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
-                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
             FROM positions
             WHERE state = 5
               AND retry_count < 3

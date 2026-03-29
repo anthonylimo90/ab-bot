@@ -68,6 +68,8 @@ pub struct AppState {
     pub order_executor: Arc<OrderExecutor>,
     /// Circuit breaker for risk management.
     pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Centralized service for position state mutations.
+    pub position_service: crate::position_service::PositionService,
     /// Broadcast channel for orderbook updates.
     pub orderbook_tx: broadcast::Sender<OrderbookUpdate>,
     /// Broadcast channel for position updates.
@@ -503,6 +505,9 @@ impl AppState {
             }
         };
 
+        let position_service =
+            crate::position_service::PositionService::new(pool.clone(), trade_event_tx.clone());
+
         Ok(Self {
             pool,
             jwt_secret,
@@ -515,6 +520,7 @@ impl AppState {
             clob_client,
             order_executor,
             circuit_breaker,
+            position_service,
             orderbook_tx,
             position_tx,
             signal_tx,

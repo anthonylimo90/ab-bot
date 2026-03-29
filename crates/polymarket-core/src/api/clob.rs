@@ -211,7 +211,7 @@ impl ClobClient {
                         url = url,
                         "HTTP request failed, backing off"
                     );
-                    last_error = Some(Error::Http(e));
+                    last_error = Some(Error::Http(Box::new(e)));
                 }
             }
 

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{info, warn};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use auth::jwt::Claims;
@@ -207,6 +207,10 @@ pub struct CreateWithdrawalRequest {
     pub destination_address: String,
     /// Amount of USDC.e to transfer.
     pub amount: Decimal,
+    /// Client-generated idempotency key. If a withdrawal with this key already exists for the
+    /// source wallet, it is returned as-is without creating a duplicate.
+    #[serde(default)]
+    pub client_request_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -843,6 +847,27 @@ pub async fn create_withdrawal(
 
     let source_address =
         resolve_user_wallet_address(state.as_ref(), user_id, req.source_address.as_deref()).await?;
+
+    // Idempotent retry: if a withdrawal with this client_request_id already exists, return it.
+    if let Some(crid) = &req.client_request_id {
+        let existing: Option<WalletWithdrawalRow> = sqlx::query_as(
+            r#"
+            SELECT id, wallet_address, destination_address, asset, amount, status,
+                   tx_hash, error, requested_at, confirmed_at
+            FROM wallet_withdrawals
+            WHERE wallet_address = $1 AND client_request_id = $2
+            "#,
+        )
+        .bind(&source_address)
+        .bind(crid)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        if let Some(row) = existing {
+            return Ok(Json(WalletWithdrawalResponse::from(row)));
+        }
+    }
+
     let destination_address = validate_wallet_address(&req.destination_address)?;
     if destination_address == source_address {
         return Err(ApiError::BadRequest(
@@ -864,6 +889,34 @@ pub async fn create_withdrawal(
         )));
     }
 
+    // Reserve check: ensure withdrawal doesn't exhaust exit liquidity for open positions.
+    // Only ExitOnCorrection positions (exit_strategy=1) need USDC to sell on the market.
+    // HoldToResolution (exit_strategy=0) redeem at resolution with no USDC outflow.
+    let available_usdc = Decimal::from(available_units) / Decimal::from(1_000_000u64);
+    let reserved_for_exits: Decimal = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(
+            held_yes_qty * yes_entry_price + held_no_qty * no_entry_price
+        ), 0)::numeric
+        FROM positions
+        WHERE is_open = TRUE AND state NOT IN (4, 5)
+          AND exit_strategy = 1
+          AND (held_yes_qty > 0 OR held_no_qty > 0)
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Decimal::ZERO);
+
+    let max_withdrawable = (available_usdc - reserved_for_exits).max(Decimal::ZERO);
+    if req.amount > max_withdrawable {
+        return Err(ApiError::BadRequest(format!(
+            "Withdrawal of {} USDC would leave insufficient exit liquidity. \
+             Open positions require ~{} USDC in reserves. Max safe withdrawal: {}",
+            req.amount, reserved_for_exits, max_withdrawable
+        )));
+    }
+
     let wallet = state
         .load_wallet_from_vault(&source_address)
         .await
@@ -872,13 +925,13 @@ pub async fn create_withdrawal(
 
     let withdrawal_id = Uuid::new_v4();
     let requested_at = Utc::now();
-    sqlx::query(
+    let insert_result = sqlx::query(
         r#"
         INSERT INTO wallet_withdrawals (
             id, user_id, workspace_id, wallet_address, destination_address, asset, amount,
-            status, requested_at, created_at, updated_at
+            status, requested_at, created_at, updated_at, client_request_id
         )
-        VALUES ($1, $2, $3, $4, $5, 'USDC', $6, 'pending', $7, $7, $7)
+        VALUES ($1, $2, $3, $4, $5, 'USDC', $6, 'pending', $7, $7, $7, $8)
         "#,
     )
     .bind(withdrawal_id)
@@ -888,8 +941,41 @@ pub async fn create_withdrawal(
     .bind(&destination_address)
     .bind(req.amount)
     .bind(requested_at)
+    .bind(req.client_request_id)
     .execute(&state.pool)
-    .await?;
+    .await;
+
+    if let Err(sqlx::Error::Database(ref db_err)) = insert_result {
+        if db_err.code().map_or(false, |c| c == "23505") {
+            // Unique constraint violation on (wallet_address, client_request_id).
+            // A concurrent request already inserted — re-fetch and return it.
+            let existing: Option<WalletWithdrawalRow> = sqlx::query_as(
+                r#"
+                SELECT id, wallet_address, destination_address, asset, amount, status,
+                       tx_hash, error, requested_at, confirmed_at
+                FROM wallet_withdrawals
+                WHERE wallet_address = $1 AND client_request_id = $2
+                "#,
+            )
+            .bind(&source_address)
+            .bind(&req.client_request_id)
+            .fetch_optional(&state.pool)
+            .await?;
+
+            if let Some(row) = existing {
+                return Ok(Json(WalletWithdrawalResponse::from(row)));
+            }
+            // Re-fetch returned None (concurrent delete race) — return a clear error
+            // rather than falling through to insert_result? which would surface a 500.
+            return Err(ApiError::Conflict(
+                "A withdrawal with this client_request_id was processed concurrently. \
+                 Please retry with a new client_request_id."
+                    .into(),
+            ));
+        }
+    }
+    // Propagate any other insert error.
+    insert_result?;
 
     let tx_hash = match polygon_client
         .submit_usdc_transfer(signer, &destination_address, amount_units)
@@ -1048,5 +1134,176 @@ pub async fn create_withdrawal(
         error: None,
         requested_at,
         confirmed_at: Some(confirmed_at),
+    }))
+}
+
+// ─── D3b: Withdrawal Preflight ────────────────────────────────────────────────
+
+/// Query parameters for the withdrawal preflight check.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct WithdrawalPreflightQuery {
+    /// Wallet address, "primary", or "active". Defaults to the active wallet.
+    pub address: Option<String>,
+    /// Proposed withdrawal amount in USDC.
+    pub amount: Decimal,
+}
+
+/// Response from the withdrawal preflight check.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WithdrawalPreflightResponse {
+    /// On-chain USDC balance of the source wallet (human-readable).
+    pub available_usdc: Decimal,
+    /// Estimated USDC required to cover exit costs for open positions.
+    pub reserved_for_exits: Decimal,
+    /// Market value of orphaned (untracked) inventory tokens.
+    pub orphan_exposure: Decimal,
+    /// Maximum USDC that can safely be withdrawn without starving open positions.
+    pub max_withdrawable: Decimal,
+    /// Whether the wallet inventory data is considered fresh (< 10 minutes old).
+    pub inventory_fresh: bool,
+    /// Timestamp of the most recent wallet inventory sync, if any.
+    pub inventory_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the requested amount can be safely withdrawn.
+    pub can_withdraw: bool,
+    /// Human-readable reasons that block the withdrawal, if any.
+    pub blocking_reasons: Vec<String>,
+}
+
+/// Check whether a proposed withdrawal is safe before submitting it.
+///
+/// Returns the on-chain balance, position-exit reserves, orphan exposure, and
+/// the computed maximum safe withdrawal amount.  No funds are moved.
+#[utoipa::path(
+    get,
+    path = "/api/v1/vault/withdrawals/preflight",
+    params(WithdrawalPreflightQuery),
+    responses(
+        (status = 200, description = "Preflight result", body = WithdrawalPreflightResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 503, description = "Polygon RPC not configured"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "vault"
+)]
+pub async fn withdrawal_preflight(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<WithdrawalPreflightQuery>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult<Json<WithdrawalPreflightResponse>> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+
+    let (_, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
+    if role != "owner" && role != "admin" {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners and admins can use the withdrawal preflight".into(),
+        ));
+    }
+
+    // Validate requested amount.
+    if params.amount <= Decimal::ZERO {
+        return Err(ApiError::BadRequest(
+            "amount must be greater than zero".into(),
+        ));
+    }
+
+    // Resolve the source wallet address.
+    let source_address =
+        resolve_user_wallet_address(state.as_ref(), user_id, params.address.as_deref()).await?;
+
+    // Fetch on-chain USDC balance.
+    let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
+    let available_units = polygon_client
+        .get_usdc_balance_units(&source_address)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch source wallet balance: {}", e)))?;
+    let available_usdc = Decimal::from(available_units) / Decimal::from(1_000_000u64);
+
+    // Query exit reserves from ExitOnCorrection positions only.
+    // HoldToResolution positions redeem at resolution with no USDC outflow.
+    let reserved_for_exits: Decimal = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(
+            held_yes_qty * yes_entry_price + held_no_qty * no_entry_price
+        ), 0)::numeric
+        FROM positions
+        WHERE is_open = TRUE AND state NOT IN (4, 5)
+          AND exit_strategy = 1
+          AND (held_yes_qty > 0 OR held_no_qty > 0)
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Decimal::ZERO);
+
+    // Query orphan exposure from wallet_inventory.
+    let orphan_exposure: Decimal = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(quantity * current_price), 0)::numeric
+        FROM wallet_inventory
+        WHERE is_orphan = true AND wallet_address = $1
+        "#,
+    )
+    .bind(&source_address)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(Decimal::ZERO);
+
+    // Query inventory freshness.
+    let inventory_synced_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        r#"
+        SELECT MAX(last_synced_at)
+        FROM wallet_inventory
+        WHERE wallet_address = $1
+        "#,
+    )
+    .bind(&source_address)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let inventory_fresh = inventory_synced_at
+        .map(|synced_at| {
+            let age = chrono::Utc::now() - synced_at;
+            age.num_seconds() < 600 // < 10 minutes
+        })
+        .unwrap_or(false);
+
+    let max_withdrawable = (available_usdc - reserved_for_exits).max(Decimal::ZERO);
+
+    let mut blocking_reasons: Vec<String> = Vec::new();
+    if params.amount > available_usdc {
+        blocking_reasons.push(format!(
+            "Requested {} USDC exceeds on-chain balance of {} USDC",
+            params.amount, available_usdc
+        ));
+    }
+    if params.amount > max_withdrawable {
+        blocking_reasons.push(format!(
+            "Withdrawal of {} USDC would leave insufficient exit liquidity. \
+             Open positions require ~{} USDC in reserves.",
+            params.amount, reserved_for_exits
+        ));
+    }
+    if !inventory_fresh {
+        blocking_reasons.push(
+            "Wallet inventory is stale or has never been synced; reserve estimate may be inaccurate."
+                .into(),
+        );
+    }
+
+    let can_withdraw = blocking_reasons.is_empty();
+
+    Ok(Json(WithdrawalPreflightResponse {
+        available_usdc,
+        reserved_for_exits,
+        orphan_exposure,
+        max_withdrawable,
+        inventory_fresh,
+        inventory_synced_at,
+        can_withdraw,
+        blocking_reasons,
     }))
 }

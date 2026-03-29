@@ -72,6 +72,7 @@ use crate::websocket;
         vault::get_wallet_balance,
         vault::list_withdrawals,
         vault::create_withdrawal,
+        vault::withdrawal_preflight,
         recommendations::get_rotation_recommendations,
         recommendations::dismiss_recommendation,
         recommendations::accept_recommendation,
@@ -204,6 +205,7 @@ use crate::websocket;
             vault::WalletBalanceResponse,
             vault::CreateWithdrawalRequest,
             vault::WalletWithdrawalResponse,
+            vault::WithdrawalPreflightResponse,
             recommendations::RotationRecommendation,
             recommendations::RecommendationType,
             recommendations::RecommendationReason,
@@ -447,6 +449,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(vault::get_wallet_balance),
         )
         .route("/api/v1/vault/withdrawals", get(vault::list_withdrawals))
+        .route(
+            "/api/v1/vault/withdrawals/preflight",
+            get(vault::withdrawal_preflight),
+        )
         // Order endpoints (read-only)
         .route("/api/v1/orders/:order_id", get(trading::get_order_status))
         // Backtest endpoints (read-only)

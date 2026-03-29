@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use polymarket_core::db::positions::{
-    PositionRepository, SOURCE_ARBITRAGE, SOURCE_COPY_TRADE, SOURCE_MANUAL, SOURCE_RECOMMENDATION,
+    SOURCE_ARBITRAGE, SOURCE_COPY_TRADE, SOURCE_MANUAL, SOURCE_RECOMMENDATION,
 };
 use polymarket_core::types::PositionState;
 use rust_decimal::Decimal;
@@ -15,8 +15,9 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::position_service::EventContext;
 use crate::state::AppState;
-use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
+
 use crate::websocket::{PositionUpdate, PositionUpdateType};
 
 /// Position response.
@@ -55,6 +56,25 @@ pub struct PositionResponse {
     pub opened_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// YES tokens currently held (not yet exited).
+    pub held_yes_qty: Decimal,
+    /// NO tokens currently held (not yet exited).
+    pub held_no_qty: Decimal,
+    /// YES tokens sold or resolved out.
+    pub exited_yes_qty: Decimal,
+    /// NO tokens sold or resolved out.
+    pub exited_no_qty: Decimal,
+    /// YES exit fill price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yes_exit_price: Option<Decimal>,
+    /// NO exit fill price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_exit_price: Option<Decimal>,
+    /// Market resolution winner ("yes" or "no"), null while open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_winner: Option<String>,
+    /// Exit strategy: "hold_to_resolution" or "exit_on_correction".
+    pub exit_strategy: String,
 }
 
 /// Summary response for dashboard/overview metrics.
@@ -151,6 +171,14 @@ struct PositionRow {
     state: i16,
     opened_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    held_yes_qty: Decimal,
+    held_no_qty: Decimal,
+    exited_yes_qty: Decimal,
+    exited_no_qty: Decimal,
+    yes_exit_price: Option<Decimal>,
+    no_exit_price: Option<Decimal>,
+    resolution_winner: Option<String>,
+    exit_strategy: i16,
 }
 
 #[derive(Debug, FromRow)]
@@ -166,7 +194,6 @@ struct CloseablePositionRow {
     take_profit: Option<Decimal>,
     realized_pnl: Option<Decimal>,
     source: i16,
-    source_signal_id: Option<Uuid>,
     opened_at: DateTime<Utc>,
 }
 
@@ -190,6 +217,14 @@ struct PositionSummaryRow {
     losses: i64,
     flat_closes: i64,
     win_rate: Decimal,
+}
+
+fn exit_strategy_name(strategy: i16) -> &'static str {
+    match strategy {
+        0 => "hold_to_resolution",
+        1 => "exit_on_correction",
+        _ => "hold_to_resolution",
+    }
 }
 
 fn position_state_name(state: i16) -> &'static str {
@@ -276,7 +311,10 @@ pub async fn list_positions(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
+               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
+               yes_exit_price, no_exit_price, resolution_winner,
+               COALESCE(exit_strategy, 0) AS exit_strategy
         FROM positions
         WHERE 1 = 1
         "#,
@@ -342,6 +380,14 @@ pub async fn list_positions(
                 state: position_state_name(row.state).to_string(),
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
+                held_yes_qty: row.held_yes_qty,
+                held_no_qty: row.held_no_qty,
+                exited_yes_qty: row.exited_yes_qty,
+                exited_no_qty: row.exited_no_qty,
+                yes_exit_price: row.yes_exit_price,
+                no_exit_price: row.no_exit_price,
+                resolution_winner: row.resolution_winner,
+                exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
             }
         })
         .collect();
@@ -496,7 +542,10 @@ pub async fn get_position(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
+               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
+               yes_exit_price, no_exit_price, resolution_winner,
+               COALESCE(exit_strategy, 0) AS exit_strategy
         FROM positions
         WHERE id = $1
         "#,
@@ -532,6 +581,14 @@ pub async fn get_position(
                 state: position_state_name(row.state).to_string(),
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
+                held_yes_qty: row.held_yes_qty,
+                held_no_qty: row.held_no_qty,
+                exited_yes_qty: row.exited_yes_qty,
+                exited_no_qty: row.exited_no_qty,
+                yes_exit_price: row.yes_exit_price,
+                no_exit_price: row.no_exit_price,
+                resolution_winner: row.resolution_winner,
+                exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
             }))
         }
         None => Err(ApiError::NotFound(format!(
@@ -579,7 +636,6 @@ pub async fn close_position(
                stop_loss, take_profit,
                realized_pnl,
                COALESCE(source, 0) AS source,
-               source_signal_id,
                COALESCE(opened_at, entry_timestamp) AS opened_at
         FROM positions
         WHERE id = $1
@@ -615,46 +671,91 @@ pub async fn close_position(
         ));
     }
 
-    let position_repo = PositionRepository::new(state.pool.clone());
-    let mut position = position_repo
+    let mut position = state
+        .position_service
+        .repo()
         .get(position_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Open position {} not found", position_id)))?;
 
-    let previous_state = position.state;
+    let execution_mode = current_execution_mode(state.as_ref()).await;
+    let (strategy, source_label) = trade_event_labels(row.source);
+    let ctx = EventContext {
+        execution_mode: execution_mode.to_string(),
+        strategy: strategy.to_string(),
+        source_label: source_label.to_string(),
+    };
+
     match position.state {
-        PositionState::Open => position.mark_exit_ready().map_err(ApiError::BadRequest)?,
-        PositionState::ExitReady | PositionState::Closing => position.touch(),
+        PositionState::Open => {
+            state
+                .position_service
+                .mark_exit_ready(&mut position, "manual_close_request", &ctx)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
+        PositionState::ExitReady | PositionState::Closing => {
+            // Already in exit flow — just touch the timestamp and persist
+            position.touch();
+            state
+                .position_service
+                .repo()
+                .update(&position)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+        }
         PositionState::ExitFailed => {
-            if !position.attempt_exit_recovery() {
+            let recovered = state
+                .position_service
+                .attempt_exit_recovery(&mut position, &ctx)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if !recovered {
                 return Err(ApiError::BadRequest(
                     "Position has exhausted exit retries and cannot be re-queued".to_string(),
                 ));
             }
         }
-        PositionState::Stalled => match position.attempt_stalled_recovery() {
-            Some(PositionState::Open) => {
-                position.mark_exit_ready().map_err(ApiError::BadRequest)?
+        PositionState::Stalled => {
+            let recovered_state = state
+                .position_service
+                .attempt_stalled_recovery(&mut position, &ctx)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            match recovered_state {
+                Some(PositionState::Open) => {
+                    state
+                        .position_service
+                        .mark_exit_ready(&mut position, "manual_close_after_stall_recovery", &ctx)
+                        .await
+                        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                }
+                Some(PositionState::ExitReady | PositionState::Closing) => {}
+                Some(state) => {
+                    return Err(ApiError::BadRequest(format!(
+                        "Position recovered to {} and cannot be manually closed yet",
+                        position_state_label(state)
+                    )))
+                }
+                None => {
+                    return Err(ApiError::BadRequest(
+                        "Position could not be recovered for manual close".to_string(),
+                    ))
+                }
             }
-            Some(PositionState::ExitReady | PositionState::Closing) => {}
-            Some(state) => {
-                return Err(ApiError::BadRequest(format!(
-                    "Position recovered to {} and cannot be manually closed yet",
-                    position_state_label(state)
-                )))
-            }
-            None => {
-                return Err(ApiError::BadRequest(
-                    "Position could not be recovered for manual close".to_string(),
-                ))
-            }
-        },
+        }
         PositionState::EntryFailed if position.is_one_legged_entry_fail() => {
-            position
-                .recover_one_legged_to_open()
-                .map_err(ApiError::BadRequest)?;
-            position.mark_exit_ready().map_err(ApiError::BadRequest)?;
+            state
+                .position_service
+                .transition_one_legged_to_exit_ready(
+                    &mut position,
+                    "yes",
+                    "manual_close_one_legged",
+                    &ctx,
+                )
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         }
         PositionState::Pending => {
             return Err(ApiError::BadRequest(
@@ -673,35 +774,6 @@ pub async fn close_position(
             )))
         }
     }
-
-    position_repo
-        .update(&position)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let execution_mode = current_execution_mode(state.as_ref()).await;
-    let (strategy, source_label) = trade_event_labels(row.source);
-    let mut event = NewTradeEvent::new(
-        strategy,
-        execution_mode,
-        source_label,
-        row.market_id.clone(),
-        "manual_exit_requested",
-    );
-    event.position_id = Some(position.id);
-    event.signal_id = row.source_signal_id;
-    event.state_from = Some(position_state_label(previous_state).to_string());
-    event.state_to = Some(position_state_label(position.state).to_string());
-    event.reason = Some("manual_close_request".to_string());
-    event.unrealized_pnl = Some(position.unrealized_pnl);
-    event.metadata = serde_json::json!({
-        "requested_quantity": close_quantity.to_string(),
-        "limit_price": request.limit_price.map(|price| price.to_string()),
-        "manual_close": true,
-    });
-    TradeEventRecorder::new(state.pool.clone(), state.trade_event_tx.clone())
-        .record_warn(event)
-        .await;
 
     // Publish position update via WebSocket
     let update = PositionUpdate {
@@ -739,6 +811,18 @@ pub async fn close_position(
         state: position_state_label(position.state).to_string(),
         opened_at: row.opened_at,
         updated_at: position.last_updated,
+        held_yes_qty: position.held_yes_qty,
+        held_no_qty: position.held_no_qty,
+        exited_yes_qty: position.exited_yes_qty,
+        exited_no_qty: position.exited_no_qty,
+        yes_exit_price: position.yes_exit_price,
+        no_exit_price: position.no_exit_price,
+        resolution_winner: position.resolution_winner.clone(),
+        exit_strategy: match position.exit_strategy {
+            polymarket_core::types::ExitStrategy::HoldToResolution => "hold_to_resolution",
+            polymarket_core::types::ExitStrategy::ExitOnCorrection => "exit_on_correction",
+        }
+        .to_string(),
     }))
 }
 
@@ -764,6 +848,14 @@ mod tests {
             state: "open".to_string(),
             opened_at: Utc::now(),
             updated_at: Utc::now(),
+            held_yes_qty: Decimal::new(100, 0),
+            held_no_qty: Decimal::ZERO,
+            exited_yes_qty: Decimal::ZERO,
+            exited_no_qty: Decimal::ZERO,
+            yes_exit_price: None,
+            no_exit_price: None,
+            resolution_winner: None,
+            exit_strategy: "hold_to_resolution".to_string(),
         };
 
         let json = serde_json::to_string(&position).unwrap();

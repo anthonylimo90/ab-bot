@@ -21,6 +21,7 @@ use trading_engine::OrderExecutor;
 use crate::arb_executor::OutcomeTokenCache;
 use crate::learning::{QuantShadowPredictionInput, ShadowPredictionRecorder};
 use crate::learning_rollouts::LearningRolloutController;
+use crate::position_service::{CreatePositionParams, EventContext, Leg, PositionService};
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 
@@ -258,6 +259,7 @@ struct QuantSignalExecutor {
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
     position_repo: PositionRepository,
+    position_service: PositionService,
     pool: PgPool,
     token_cache: Arc<OutcomeTokenCache>,
     trade_event_recorder: TradeEventRecorder,
@@ -285,6 +287,7 @@ impl QuantSignalExecutor {
         heartbeat: Arc<AtomicI64>,
     ) -> Self {
         let position_repo = PositionRepository::new(pool.clone());
+        let position_service = PositionService::new(pool.clone(), trade_event_tx.clone());
         let token_cache = Arc::new(
             OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
         );
@@ -305,6 +308,7 @@ impl QuantSignalExecutor {
             order_executor,
             circuit_breaker,
             position_repo,
+            position_service,
             pool,
             token_cache,
             trade_event_recorder,
@@ -962,34 +966,34 @@ impl QuantSignalExecutor {
             SignalDirection::BuyYes => (best_ask, Decimal::ZERO),
             SignalDirection::BuyNo => (Decimal::ZERO, best_ask),
         };
-        let mut position = Position::new(
-            signal.condition_id.clone(),
-            yes_price,
-            no_price,
-            quantity,
-            ExitStrategy::ExitOnCorrection,
-        );
-        self.position_repo
-            .insert_with_source(&position, SOURCE_RECOMMENDATION, Some(signal.id))
-            .await?;
-
-        self.trade_event_recorder
-            .record_warn(
-                NewTradeEvent::new(
-                    signal.kind.as_str(),
-                    execution_mode.clone(),
-                    "quant",
-                    signal.condition_id.clone(),
-                    "entry_requested",
-                )
-                .with_signal(&signal)
-                .with_position(position.id)
-                .with_state(None, Some("pending"))
-                .with_requested_size(position_size_usd)
-                .with_fill_price(best_ask)
-                .with_metadata(signal.metadata.clone()),
+        let ctx = EventContext {
+            execution_mode: execution_mode.clone(),
+            strategy: signal.kind.as_str().to_string(),
+            source_label: "quant".to_string(),
+        };
+        let mut position = self
+            .position_service
+            .create_position(
+                CreatePositionParams {
+                    market_id: signal.condition_id.clone(),
+                    yes_entry_price: yes_price,
+                    no_entry_price: no_price,
+                    quantity,
+                    exit_strategy: ExitStrategy::ExitOnCorrection,
+                    source: SOURCE_RECOMMENDATION,
+                    source_signal_id: Some(signal.id),
+                    arb_opportunity: None,
+                },
+                &ctx,
+                serde_json::json!({
+                    "signal_kind": signal.kind.as_str(),
+                    "direction": signal.direction.as_str(),
+                    "confidence": signal.confidence,
+                    "fill_price": best_ask.to_string(),
+                    "requested_size_usd": position_size_usd.to_string(),
+                }),
             )
-            .await;
+            .await?;
 
         info!(
             signal_id = %signal.id,
@@ -1023,12 +1027,16 @@ impl QuantSignalExecutor {
                     error = %e,
                     "Order execution failed"
                 );
-                position.mark_entry_failed(
-                    polymarket_core::types::FailureReason::ConnectivityError {
-                        message: format!("Quant order execution failed: {}", e),
-                    },
-                );
-                let _ = self.position_repo.update(&position).await;
+                let _ = self
+                    .position_service
+                    .mark_entry_failed(
+                        &mut position,
+                        polymarket_core::types::FailureReason::ConnectivityError {
+                            message: format!("Quant order execution failed: {}", e),
+                        },
+                        &ctx,
+                    )
+                    .await;
                 self.update_signal_status(signal.id, "failed", Some("execution_error"))
                     .await;
                 self.record_position_failure_event(
@@ -1049,10 +1057,16 @@ impl QuantSignalExecutor {
                 position_id = %position.id,
                 "Order rejected"
             );
-            position.mark_entry_failed(polymarket_core::types::FailureReason::OrderRejected {
-                message: "Quant order rejected by exchange".to_string(),
-            });
-            let _ = self.position_repo.update(&position).await;
+            let _ = self
+                .position_service
+                .mark_entry_failed(
+                    &mut position,
+                    polymarket_core::types::FailureReason::OrderRejected {
+                        message: "Quant order rejected by exchange".to_string(),
+                    },
+                    &ctx,
+                )
+                .await;
             self.update_signal_status(signal.id, "failed", Some("order_rejected"))
                 .await;
             self.record_position_failure_event(
@@ -1066,52 +1080,31 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        self.trade_event_recorder
-            .record_warn(
-                NewTradeEvent::new(
-                    signal.kind.as_str(),
-                    execution_mode.clone(),
-                    "quant",
-                    signal.condition_id.clone(),
-                    "entry_filled",
-                )
-                .with_signal(&signal)
-                .with_position(position.id)
-                .with_state(Some("pending"), Some("pending"))
-                .with_requested_size(position_size_usd)
-                .with_filled_size(report.total_value())
-                .with_fill_price(report.average_price)
-                .with_metadata(signal.metadata.clone()),
+        // Step 15: Record entry fill and mark position OPEN via PositionService
+        let fill_leg = match signal.direction {
+            SignalDirection::BuyYes => Leg::Yes,
+            SignalDirection::BuyNo => Leg::No,
+        };
+        if let Err(e) = self
+            .position_service
+            .record_entry_fill(
+                &mut position,
+                fill_leg,
+                report.average_price,
+                report.filled_quantity,
+                &ctx,
             )
-            .await;
+            .await
+        {
+            warn!(error = %e, position_id = %position.id, "Failed to record entry fill");
+        }
 
-        // Step 15: Mark position OPEN
-        if let Err(e) = position.mark_open() {
+        if let Err(e) = self.position_service.mark_open(&mut position, &ctx).await {
             error!(error = %e, "Failed to transition position to OPEN");
         }
-        let _ = self.position_repo.update(&position).await;
 
         // Link signal to position
         self.link_signal_to_position(signal.id, position.id).await;
-
-        self.trade_event_recorder
-            .record_warn(
-                NewTradeEvent::new(
-                    signal.kind.as_str(),
-                    execution_mode.clone(),
-                    "quant",
-                    signal.condition_id.clone(),
-                    "position_open",
-                )
-                .with_signal(&signal)
-                .with_position(position.id)
-                .with_state(Some("pending"), Some("open"))
-                .with_requested_size(position_size_usd)
-                .with_filled_size(report.total_value())
-                .with_fill_price(report.average_price)
-                .with_metadata(signal.metadata.clone()),
-            )
-            .await;
 
         // Step 16: Publish WebSocket SignalUpdate
         let ws_signal = SignalUpdate {
@@ -1346,6 +1339,7 @@ pub fn spawn_quant_signal_executor(
     info!("Quant signal executor spawned");
 }
 
+#[allow(dead_code)] // Builder methods for trade event enrichment; some currently unused.
 trait TradeEventBuilderExt {
     fn with_signal(self, signal: &QuantSignal) -> Self;
     fn with_position(self, position_id: uuid::Uuid) -> Self;

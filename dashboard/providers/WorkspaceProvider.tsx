@@ -75,7 +75,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
       try {
         await fetchCurrentWorkspace();
-        Promise.allSettled([fetchWorkspaces(), fetchWallets()]).catch(() => {});
+        await Promise.allSettled([fetchWorkspaces(), fetchWallets()]);
         setInitError(null);
         setHasInitialized(true);
       } catch (err) {

@@ -37,6 +37,7 @@ pub mod learning_rollouts;
 pub mod metrics_calculator;
 pub mod middleware;
 pub mod position_reconciler;
+pub mod position_service;
 pub mod quant_signal_executor;
 pub mod redis_forwarder;
 pub mod routes;

@@ -117,10 +117,7 @@ export const useWalletStore = create<WalletStore>()(
     }),
     {
       name: 'ab-bot-wallets',
-      partialize: (state) => ({
-        // Only persist these fields - wallet data will be re-fetched from server
-        primaryWallet: state.primaryWallet,
-      }),
+      partialize: () => ({}),
     }
   )
 );

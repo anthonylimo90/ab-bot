@@ -199,6 +199,7 @@ impl ExecutionReport {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn partial_fill(
         order_id: Uuid,
         market_id: String,
