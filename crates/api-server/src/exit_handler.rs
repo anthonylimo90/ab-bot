@@ -13,9 +13,7 @@ use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE, SOURCE_RECOMMENDATION};
 use polymarket_core::error::Error as PolymarketError;
 use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
-use polymarket_core::types::{
-    FailureReason, Market, MarketOrder, OrderSide, Position, PositionState,
-};
+use polymarket_core::types::{FailureReason, Market, MarketOrder, OrderSide, Position};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -1427,20 +1425,25 @@ impl ExitHandler {
                 continue;
             }
 
-            // Transition EntryFailed → ExitReady so execute_exit's mark_closing succeeds.
-            position.state = PositionState::ExitReady;
-            position.no_entry_price = Decimal::ZERO;
-            position.held_no_qty = Decimal::ZERO;
-            position.failure_reason = None;
-            position.retry_count += 1;
-            position.last_updated = Utc::now();
-
-            if let Err(error) = self.position_repo.update(&position).await {
+            // Transition EntryFailed → ExitReady via PositionService so
+            // mark_closing succeeds and a trade event is recorded.
+            let execution_mode = self.current_execution_mode().await;
+            let ctx = Self::event_context(&execution_mode, SOURCE_ARBITRAGE, None);
+            if let Err(error) = self
+                .position_service
+                .transition_one_legged_to_exit_ready(
+                    &mut position,
+                    "yes",
+                    "one-legged recovery: flattening held YES leg",
+                    &ctx,
+                )
+                .await
+            {
                 warn!(
                     market_id = %market_id,
                     position_id = %position.id,
                     error = %error,
-                    "Failed to persist one-legged position for flattening"
+                    "Failed to transition one-legged position for flattening"
                 );
                 continue;
             }

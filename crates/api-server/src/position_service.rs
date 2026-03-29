@@ -613,14 +613,19 @@ impl PositionService {
         failure_msg: &str,
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
-        if position.state != PositionState::Pending {
+        // Accepts Pending (arb executor: YES filled, NO failed immediately)
+        // or EntryFailed (exit handler: one-legged recovery from prior failure).
+        if !matches!(
+            position.state,
+            PositionState::Pending | PositionState::EntryFailed
+        ) {
             return Err(anyhow!(
-                "transition_one_legged_to_exit_ready requires Pending state, got {:?}",
+                "transition_one_legged_to_exit_ready requires Pending or EntryFailed state, got {:?}",
                 position.state
             ));
         }
 
-        // Set the no-leg price to zero to reflect one-legged state
+        // Set the missing-leg price and qty to zero
         if held_leg == "yes" {
             position.no_entry_price = Decimal::ZERO;
             position.held_no_qty = Decimal::ZERO;
@@ -629,7 +634,9 @@ impl PositionService {
             position.held_yes_qty = Decimal::ZERO;
         }
 
-        // mark_open expects Pending
+        // Force through Pending → Open → ExitReady regardless of current state,
+        // since both Pending and EntryFailed need the same target.
+        position.state = PositionState::Pending; // reset so mark_open() accepts it
         position
             .mark_open()
             .map_err(|e| anyhow!("one-legged mark_open: {}", e))?;

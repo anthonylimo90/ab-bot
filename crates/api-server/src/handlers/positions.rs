@@ -746,12 +746,14 @@ pub async fn close_position(
             }
         }
         PositionState::EntryFailed if position.is_one_legged_entry_fail() => {
-            position
-                .recover_one_legged_to_open()
-                .map_err(ApiError::BadRequest)?;
             state
                 .position_service
-                .mark_exit_ready(&mut position, "manual_close_one_legged", &ctx)
+                .transition_one_legged_to_exit_ready(
+                    &mut position,
+                    "yes",
+                    "manual_close_one_legged",
+                    &ctx,
+                )
                 .await
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         }

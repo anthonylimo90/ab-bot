@@ -9,9 +9,7 @@ use chrono::Utc;
 use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE};
 use polymarket_core::types::Market;
-use polymarket_core::types::{
-    ArbOpportunity, ExitStrategy, FailureReason, MarketOrder, OrderSide, Position,
-};
+use polymarket_core::types::{ArbOpportunity, ExitStrategy, FailureReason, MarketOrder, OrderSide};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -1265,14 +1263,7 @@ impl ArbAutoExecutor {
                         &ctx,
                     )
                     .await;
-                self.record_failure_event(
-                    execution_mode,
-                    market_id,
-                    &position,
-                    "yes_order_error",
-                    &telemetry,
-                )
-                .await;
+                // Trade event recorded by position_service.mark_entry_failed()
                 self.publish_failure_signal(market_id, "YES order execution error");
                 return Ok(());
             }
@@ -1300,14 +1291,7 @@ impl ArbAutoExecutor {
                     &ctx,
                 )
                 .await;
-            self.record_failure_event(
-                execution_mode,
-                market_id,
-                &position,
-                "yes_order_rejected",
-                &telemetry,
-            )
-            .await;
+            // Trade event recorded by position_service.mark_entry_failed()
             self.publish_failure_signal(market_id, "YES order rejected");
             return Ok(());
         }
@@ -1535,32 +1519,6 @@ impl ArbAutoExecutor {
             )
             .await;
     }
-
-    async fn record_failure_event(
-        &self,
-        execution_mode: &str,
-        market_id: &str,
-        position: &Position,
-        reason: &str,
-        telemetry: &ArbExecutionTelemetry,
-    ) {
-        self.trade_event_recorder
-            .record_warn(
-                NewTradeEvent::new(
-                    "arb",
-                    execution_mode.to_string(),
-                    "arb",
-                    market_id.to_string(),
-                    "position_failed",
-                )
-                .with_position(position.id)
-                .with_state(Some("pending"), Some("entry_failed"))
-                .with_reason(Some(reason))
-                .with_unrealized_pnl(position.unrealized_pnl)
-                .with_metadata(merge_metadata(serde_json::json!({}), telemetry)),
-            )
-            .await;
-    }
 }
 
 /// Spawn the arb auto-executor as a background task.
@@ -1603,6 +1561,7 @@ pub fn spawn_arb_auto_executor(
     info!("Arb auto-executor spawned as background task");
 }
 
+#[allow(dead_code)] // Builder trait — some methods used only for signal events, others reserved.
 trait ArbTradeEventExt {
     fn with_position(self, position_id: uuid::Uuid) -> Self;
     fn with_state(self, from: Option<&str>, to: Option<&str>) -> Self;
