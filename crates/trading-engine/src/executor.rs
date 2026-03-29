@@ -719,6 +719,7 @@ impl OrderExecutor {
         )
     }
 
+    #[allow(clippy::result_large_err)] // ExecutionReport is a rich domain value, not a simple error
     fn best_level_for_order(
         &self,
         order: &MarketOrder,

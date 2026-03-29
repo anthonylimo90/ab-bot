@@ -5,22 +5,22 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("HTTP request error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(Box<reqwest::Error>),
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(Box<sqlx::Error>),
 
     #[error("Database migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
 
     #[error("Redis error: {0}")]
-    Redis(#[from] redis::RedisError),
+    Redis(Box<redis::RedisError>),
 
     #[error("Configuration file error: {0}")]
     ConfigFile(#[from] config::ConfigError),
@@ -51,3 +51,28 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// Manual From impls for boxed variants (thiserror #[from] doesn't support Box).
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(Box::new(e))
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(Box::new(e))
+    }
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Database(Box::new(e))
+    }
+}
+
+impl From<redis::RedisError> for Error {
+    fn from(e: redis::RedisError) -> Self {
+        Self::Redis(Box::new(e))
+    }
+}

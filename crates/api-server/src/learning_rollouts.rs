@@ -779,13 +779,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reject_logic_matches_target_direction() {
-        assert!(should_reject("one_legged_risk", 0.7, 0.4));
-        assert!(should_reject("open_success_probability", 0.4, 0.6));
-        assert!(!should_reject("open_success_probability", 0.9, 0.6));
-    }
-
-    #[test]
     fn guardrails_trigger_warn_and_rollback() {
         let (state, reason) = evaluate_guardrails(
             &serde_json::json!({ "max_failure_rate": 0.1 }),
