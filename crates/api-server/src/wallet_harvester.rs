@@ -209,7 +209,13 @@ async fn harvest_cycle(
                     .push_bind(&trade.outcome);
             },
         );
-        query_builder.push(" ON CONFLICT (transaction_hash) DO NOTHING RETURNING transaction_hash");
+        // Conflict target includes timestamp because wallet_trades is a hypertable
+        // (migration 062) and TimescaleDB requires unique indexes to include the
+        // partitioning column. In practice each blockchain tx_hash has exactly one
+        // immutable timestamp, so this is equivalent to ON CONFLICT (transaction_hash).
+        query_builder.push(
+            " ON CONFLICT (transaction_hash, timestamp) DO NOTHING RETURNING transaction_hash",
+        );
 
         match query_builder
             .build_query_as::<InsertedTradeRow>()
