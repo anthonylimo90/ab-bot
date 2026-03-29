@@ -3,7 +3,7 @@
 use crate::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, QueryBuilder};
 use uuid::Uuid;
 
 /// Repository for reconciled wallet inventory rows.
@@ -227,67 +227,64 @@ impl WalletInventoryRepository {
     }
 
     pub async fn upsert_entries(&self, entries: &[WalletInventoryUpsert]) -> Result<()> {
-        for entry in entries {
-            sqlx::query(
-                r#"
-                INSERT INTO wallet_inventory (
-                    wallet_address,
-                    token_id,
-                    condition_id,
-                    outcome,
-                    linked_position_id,
-                    quantity,
-                    cost_basis,
-                    current_price,
-                    marked_value,
-                    is_orphan,
-                    discovery_source,
-                    recovery_status,
-                    last_exit_error,
-                    last_exit_attempted_at,
-                    first_observed_at,
-                    last_observed_at
-                )
-                VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8,
-                    $9, $10, $11, $12, $13, $14, $15, $16
-                )
-                ON CONFLICT (wallet_address, token_id) DO UPDATE SET
-                    condition_id = EXCLUDED.condition_id,
-                    outcome = EXCLUDED.outcome,
-                    linked_position_id = EXCLUDED.linked_position_id,
-                    quantity = EXCLUDED.quantity,
-                    cost_basis = EXCLUDED.cost_basis,
-                    current_price = EXCLUDED.current_price,
-                    marked_value = EXCLUDED.marked_value,
-                    is_orphan = EXCLUDED.is_orphan,
-                    discovery_source = EXCLUDED.discovery_source,
-                    recovery_status = EXCLUDED.recovery_status,
-                    last_exit_error = EXCLUDED.last_exit_error,
-                    last_exit_attempted_at = EXCLUDED.last_exit_attempted_at,
-                    first_observed_at = LEAST(wallet_inventory.first_observed_at, EXCLUDED.first_observed_at),
-                    last_observed_at = EXCLUDED.last_observed_at,
-                    updated_at = NOW()
-                "#,
-            )
-            .bind(&entry.wallet_address)
-            .bind(&entry.token_id)
-            .bind(&entry.condition_id)
-            .bind(&entry.outcome)
-            .bind(entry.linked_position_id)
-            .bind(entry.quantity)
-            .bind(entry.cost_basis)
-            .bind(entry.current_price)
-            .bind(entry.marked_value)
-            .bind(entry.is_orphan)
-            .bind(&entry.discovery_source)
-            .bind(&entry.recovery_status)
-            .bind(&entry.last_exit_error)
-            .bind(entry.last_exit_attempted_at)
-            .bind(entry.first_observed_at)
-            .bind(entry.last_observed_at)
-            .execute(&self.pool)
-            .await?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Batch all rows into a single INSERT ... ON CONFLICT statement.
+        // PostgreSQL parameter limit is 65535; each row uses 16 params → max ~4096
+        // rows per batch. A typical wallet has 5–50 tokens so one batch suffices.
+        const BATCH_SIZE: usize = 500;
+        for chunk in entries.chunks(BATCH_SIZE) {
+            let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+                "INSERT INTO wallet_inventory (\
+                    wallet_address, token_id, condition_id, outcome, \
+                    linked_position_id, quantity, cost_basis, current_price, \
+                    marked_value, is_orphan, discovery_source, recovery_status, \
+                    last_exit_error, last_exit_attempted_at, \
+                    first_observed_at, last_observed_at\
+                ) ",
+            );
+
+            qb.push_values(chunk, |mut b, e| {
+                b.push_bind(&e.wallet_address)
+                    .push_bind(&e.token_id)
+                    .push_bind(&e.condition_id)
+                    .push_bind(&e.outcome)
+                    .push_bind(e.linked_position_id)
+                    .push_bind(e.quantity)
+                    .push_bind(e.cost_basis)
+                    .push_bind(e.current_price)
+                    .push_bind(e.marked_value)
+                    .push_bind(e.is_orphan)
+                    .push_bind(&e.discovery_source)
+                    .push_bind(&e.recovery_status)
+                    .push_bind(&e.last_exit_error)
+                    .push_bind(e.last_exit_attempted_at)
+                    .push_bind(e.first_observed_at)
+                    .push_bind(e.last_observed_at);
+            });
+
+            qb.push(
+                " ON CONFLICT (wallet_address, token_id) DO UPDATE SET \
+                    condition_id           = EXCLUDED.condition_id, \
+                    outcome                = EXCLUDED.outcome, \
+                    linked_position_id     = EXCLUDED.linked_position_id, \
+                    quantity               = EXCLUDED.quantity, \
+                    cost_basis             = EXCLUDED.cost_basis, \
+                    current_price          = EXCLUDED.current_price, \
+                    marked_value           = EXCLUDED.marked_value, \
+                    is_orphan              = EXCLUDED.is_orphan, \
+                    discovery_source       = EXCLUDED.discovery_source, \
+                    recovery_status        = EXCLUDED.recovery_status, \
+                    last_exit_error        = EXCLUDED.last_exit_error, \
+                    last_exit_attempted_at = EXCLUDED.last_exit_attempted_at, \
+                    first_observed_at      = LEAST(wallet_inventory.first_observed_at, EXCLUDED.first_observed_at), \
+                    last_observed_at       = EXCLUDED.last_observed_at, \
+                    updated_at             = NOW()",
+            );
+
+            qb.build().execute(&self.pool).await?;
         }
 
         Ok(())

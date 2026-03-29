@@ -43,10 +43,12 @@ impl GammaSyncerConfig {
 
 /// Spawn the Gamma syncer background task.
 ///
-/// Follows the `spawn_wallet_harvester` pattern:
-/// - Free `spawn_*` function that calls `tokio::spawn` internally
-/// - Receives individual fields rather than full AppState
-/// - Uses DB semaphore around writes
+/// Spawns two independent loops:
+/// - API sync loop: fetches Gamma market metadata every `interval_secs` (default 1h).
+/// - Backfill loop: resolves `wallet_trades.condition_id IS NULL` every 5 minutes
+///   regardless of Gamma API availability. Decoupling ensures the flow feature
+///   calculator has live data every cycle instead of waiting up to 59 minutes
+///   for the next hourly API sync to trigger the backfill.
 pub fn spawn_gamma_syncer(config: GammaSyncerConfig, pool: PgPool, db_semaphore: Arc<Semaphore>) {
     if !config.enabled {
         info!("Gamma syncer disabled (GAMMA_SYNCER_ENABLED != true)");
@@ -59,7 +61,32 @@ pub fn spawn_gamma_syncer(config: GammaSyncerConfig, pool: PgPool, db_semaphore:
         "Spawning Gamma syncer background task"
     );
 
-    tokio::spawn(syncer_loop(config, pool, db_semaphore));
+    // Hourly Gamma API sync
+    tokio::spawn(syncer_loop(config, pool.clone(), db_semaphore));
+
+    // 5-minute condition_id backfill (no API dependency, no semaphore needed)
+    tokio::spawn(backfill_loop(pool));
+}
+
+/// Standalone backfill loop. Resolves wallet_trades.condition_id IS NULL rows
+/// using token_condition_cache every 5 minutes. When the backlog is empty the
+/// query hits idx_wallet_trades_null_condition (partial index) and returns
+/// instantly — negligible overhead.
+async fn backfill_loop(pool: PgPool) {
+    // Short startup delay to let the hourly sync populate token_condition_cache
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    interval.tick().await; // consume the first immediate tick
+
+    loop {
+        interval.tick().await;
+        match backfill_condition_ids(&pool).await {
+            Ok(0) => {} // backlog empty — silent no-op
+            Ok(n) => info!(rows = n, "Backfilled condition_ids in wallet_trades"),
+            Err(e) => debug!(error = %e, "condition_id backfill failed (non-fatal)"),
+        }
+    }
 }
 
 /// Main syncer loop. Runs until the process shuts down.
@@ -172,18 +199,13 @@ async fn sync_cycle(
         tokio::task::yield_now().await;
     }
 
-    // Step 5: Backfill NULL condition_id in wallet_trades using token_condition_cache
-    let backfilled = backfill_condition_ids(pool).await.unwrap_or_else(|e| {
-        warn!(error = %e, "Failed to backfill condition_ids in wallet_trades");
-        0
-    });
-
-    // Step 6: Release semaphore (explicit drop for clarity)
+    // Step 5: Release semaphore (explicit drop for clarity)
     drop(_permit);
 
+    // Backfill is now handled by the dedicated backfill_loop (every 5 min)
     Ok(SyncStats {
         upserted,
-        backfilled,
+        backfilled: 0,
     })
 }
 

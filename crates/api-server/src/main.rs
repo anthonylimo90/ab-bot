@@ -126,7 +126,9 @@ async fn apply_pg_memory_tuning(pool: &sqlx::PgPool) {
         "ALTER SYSTEM SET max_wal_size = '1GB'",
         "ALTER SYSTEM SET min_wal_size = '256MB'",
         "ALTER SYSTEM SET max_connections = '50'",
-        "ALTER SYSTEM SET timescaledb.max_background_workers = '4'",
+        // 7 hypertables × 2 policies (compression + retention) + 1 CA refresh = 15 jobs.
+        // 8 workers gives headroom for simultaneous policy runs without exhausting slots.
+        "ALTER SYSTEM SET timescaledb.max_background_workers = '8'",
         "SELECT pg_reload_conf()",
     ];
 
