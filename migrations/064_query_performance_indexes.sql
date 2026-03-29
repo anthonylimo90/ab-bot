@@ -34,11 +34,11 @@ CREATE INDEX IF NOT EXISTS idx_positions_exit_timestamp
 
 -- ==========================================================================
 -- 3. COVERING INDEX FOR CLOSED POSITIONS DASHBOARD VIEW
---    Supports: WHERE state = 4 ORDER BY exit_timestamp DESC filtered by workspace_id
+--    Supports: WHERE state = 4 ORDER BY exit_timestamp DESC
 -- ==========================================================================
 
 CREATE INDEX IF NOT EXISTS idx_positions_closed
-    ON positions (workspace_id, exit_timestamp DESC)
+    ON positions (exit_timestamp DESC)
     WHERE state = 4;
 
 -- ==========================================================================
