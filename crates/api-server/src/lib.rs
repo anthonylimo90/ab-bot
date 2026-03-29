@@ -242,7 +242,7 @@ impl ApiServer {
             .layer(
                 TraceLayer::new_for_http()
                     .on_request(|request: &Request<_>, _span: &tracing::Span| {
-                        tracing::info!(
+                        tracing::debug!(
                             method = %request.method(),
                             uri = %request.uri(),
                             "Incoming request"

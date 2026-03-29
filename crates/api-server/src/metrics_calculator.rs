@@ -235,7 +235,7 @@ impl MetricsCalculator {
 
             // Yield every 5 wallets to let other tasks acquire pool connections
             if (i + 1) % 5 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::task::yield_now().await;
             }
         }
 
@@ -385,7 +385,7 @@ impl MetricsCalculator {
             }
 
             // Yield between categories to avoid blocking the pool
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::task::yield_now().await;
         }
 
         // Prune stale correlation pairs not refreshed in the last 14 days
@@ -488,7 +488,10 @@ impl MetricsCalculator {
         }
 
         let classifier = StrategyClassifier::new();
-        let mut classified = 0u32;
+
+        // Collect all classifications first, then batch-update in a single round-trip.
+        let mut addresses: Vec<String> = Vec::with_capacity(rows.len());
+        let mut labels: Vec<String> = Vec::with_capacity(rows.len());
 
         for (
             address,
@@ -514,23 +517,29 @@ impl MetricsCalculator {
             };
 
             let classification = classifier.classify_basic(&features);
-            let strategy_label = format!("{:?}", classification.primary_strategy);
-
-            if let Err(e) =
-                sqlx::query("UPDATE wallet_features SET strategy_type = $1 WHERE address = $2")
-                    .bind(&strategy_label)
-                    .bind(address)
-                    .execute(&self.pool)
-                    .await
-            {
-                warn!(address = %address, error = %e, "Failed to store strategy classification");
-            } else {
-                classified += 1;
-            }
+            labels.push(format!("{:?}", classification.primary_strategy));
+            addresses.push(address.clone());
         }
 
+        let classified = addresses.len() as u32;
+
         if classified > 0 {
-            info!(classified, "Classified wallet strategies");
+            // Single UNNEST batch UPDATE — eliminates N round-trips.
+            if let Err(e) = sqlx::query(
+                "UPDATE wallet_features wf \
+                 SET strategy_type = data.label \
+                 FROM UNNEST($1::text[], $2::text[]) AS data(address, label) \
+                 WHERE wf.address = data.address",
+            )
+            .bind(&addresses)
+            .bind(&labels)
+            .execute(&self.pool)
+            .await
+            {
+                warn!(error = %e, "Failed to batch-store strategy classifications");
+            } else {
+                info!(classified, "Classified wallet strategies");
+            }
         }
 
         Ok(())

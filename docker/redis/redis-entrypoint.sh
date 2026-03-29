@@ -16,4 +16,6 @@ EOF
 exec redis-server \
   --appendonly yes \
   --aclfile /usr/local/etc/redis/users.acl \
-  --protected-mode yes
+  --protected-mode yes \
+  --maxmemory 150mb \
+  --maxmemory-policy allkeys-lru

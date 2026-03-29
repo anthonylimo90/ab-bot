@@ -158,6 +158,7 @@ async fn scan_and_emit(
                 close AS yes_price
             FROM orderbook_hourly
             WHERE market_id = mm.condition_id
+              AND bucket >= NOW() - INTERVAL '72 hours'
             ORDER BY bucket DESC
             LIMIT 1
         ) ob ON true
