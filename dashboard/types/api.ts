@@ -94,18 +94,28 @@ export interface Position {
   unrealized_pnl_pct: number;
   stop_loss?: number;
   take_profit?: number;
-  source_wallet?: string;
   realized_pnl?: number;
   opened_at: string;
   updated_at: string;
   /** Full lifecycle state (if returned by API) */
   state?: PositionState;
+  /** Per-leg exposure tracking */
+  held_yes_qty: number;
+  held_no_qty: number;
+  exited_yes_qty: number;
+  exited_no_qty: number;
   /** Actual exit prices (from backend close_via_exit / close_via_resolution) */
   yes_exit_price?: number;
   no_exit_price?: number;
-  /** Fee breakdown */
+  /** Market resolution winner ("yes" or "no"), null while open */
+  resolution_winner?: string;
+  /** Exit strategy: "hold_to_resolution" or "exit_on_correction" */
+  exit_strategy: string;
+  /** Fee breakdown (legacy, not currently populated) */
   entry_fees?: number;
   exit_fees?: number;
+  /** Source wallet (legacy, not currently populated) */
+  source_wallet?: string;
 }
 
 export interface PositionsSummary {

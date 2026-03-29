@@ -366,8 +366,19 @@ impl Position {
         (has_yes, has_no)
     }
 
+    /// True if both YES and NO legs are currently held.
+    ///
+    /// Prefers explicit qty fields when populated (new positions created
+    /// through PositionService). Falls back to price inference for legacy
+    /// positions where qty fields are still zero.
     pub fn has_full_pair_exposure(&self) -> bool {
-        self.held_outcomes() == (true, true)
+        if self.held_yes_qty > Decimal::ZERO || self.held_no_qty > Decimal::ZERO {
+            // Explicit qty fields are populated — use them
+            self.held_yes_qty > Decimal::ZERO && self.held_no_qty > Decimal::ZERO
+        } else {
+            // Legacy fallback: infer from entry prices and exit prices
+            self.held_outcomes() == (true, true)
+        }
     }
 
     // ── Per-leg exposure tracking (explicit qty fields) ─────────────

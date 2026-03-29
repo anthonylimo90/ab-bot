@@ -56,6 +56,25 @@ pub struct PositionResponse {
     pub opened_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// YES tokens currently held (not yet exited).
+    pub held_yes_qty: Decimal,
+    /// NO tokens currently held (not yet exited).
+    pub held_no_qty: Decimal,
+    /// YES tokens sold or resolved out.
+    pub exited_yes_qty: Decimal,
+    /// NO tokens sold or resolved out.
+    pub exited_no_qty: Decimal,
+    /// YES exit fill price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub yes_exit_price: Option<Decimal>,
+    /// NO exit fill price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_exit_price: Option<Decimal>,
+    /// Market resolution winner ("yes" or "no"), null while open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_winner: Option<String>,
+    /// Exit strategy: "hold_to_resolution" or "exit_on_correction".
+    pub exit_strategy: String,
 }
 
 /// Summary response for dashboard/overview metrics.
@@ -152,6 +171,14 @@ struct PositionRow {
     state: i16,
     opened_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    held_yes_qty: Decimal,
+    held_no_qty: Decimal,
+    exited_yes_qty: Decimal,
+    exited_no_qty: Decimal,
+    yes_exit_price: Option<Decimal>,
+    no_exit_price: Option<Decimal>,
+    resolution_winner: Option<String>,
+    exit_strategy: i16,
 }
 
 #[derive(Debug, FromRow)]
@@ -190,6 +217,14 @@ struct PositionSummaryRow {
     losses: i64,
     flat_closes: i64,
     win_rate: Decimal,
+}
+
+fn exit_strategy_name(strategy: i16) -> &'static str {
+    match strategy {
+        0 => "hold_to_resolution",
+        1 => "exit_on_correction",
+        _ => "hold_to_resolution",
+    }
 }
 
 fn position_state_name(state: i16) -> &'static str {
@@ -276,7 +311,10 @@ pub async fn list_positions(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
+               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
+               yes_exit_price, no_exit_price, resolution_winner,
+               COALESCE(exit_strategy, 0) AS exit_strategy
         FROM positions
         WHERE 1 = 1
         "#,
@@ -342,6 +380,14 @@ pub async fn list_positions(
                 state: position_state_name(row.state).to_string(),
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
+                held_yes_qty: row.held_yes_qty,
+                held_no_qty: row.held_no_qty,
+                exited_yes_qty: row.exited_yes_qty,
+                exited_no_qty: row.exited_no_qty,
+                yes_exit_price: row.yes_exit_price,
+                no_exit_price: row.no_exit_price,
+                resolution_winner: row.resolution_winner,
+                exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
             }
         })
         .collect();
@@ -496,7 +542,10 @@ pub async fn get_position(
                realized_pnl,
                state,
                COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
+               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
+               yes_exit_price, no_exit_price, resolution_winner,
+               COALESCE(exit_strategy, 0) AS exit_strategy
         FROM positions
         WHERE id = $1
         "#,
@@ -532,6 +581,14 @@ pub async fn get_position(
                 state: position_state_name(row.state).to_string(),
                 opened_at: row.opened_at,
                 updated_at: row.updated_at,
+                held_yes_qty: row.held_yes_qty,
+                held_no_qty: row.held_no_qty,
+                exited_yes_qty: row.exited_yes_qty,
+                exited_no_qty: row.exited_no_qty,
+                yes_exit_price: row.yes_exit_price,
+                no_exit_price: row.no_exit_price,
+                resolution_winner: row.resolution_winner,
+                exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
             }))
         }
         None => Err(ApiError::NotFound(format!(
@@ -752,6 +809,18 @@ pub async fn close_position(
         state: position_state_label(position.state).to_string(),
         opened_at: row.opened_at,
         updated_at: position.last_updated,
+        held_yes_qty: position.held_yes_qty,
+        held_no_qty: position.held_no_qty,
+        exited_yes_qty: position.exited_yes_qty,
+        exited_no_qty: position.exited_no_qty,
+        yes_exit_price: position.yes_exit_price,
+        no_exit_price: position.no_exit_price,
+        resolution_winner: position.resolution_winner.clone(),
+        exit_strategy: match position.exit_strategy {
+            polymarket_core::types::ExitStrategy::HoldToResolution => "hold_to_resolution",
+            polymarket_core::types::ExitStrategy::ExitOnCorrection => "exit_on_correction",
+        }
+        .to_string(),
     }))
 }
 
@@ -777,6 +846,14 @@ mod tests {
             state: "open".to_string(),
             opened_at: Utc::now(),
             updated_at: Utc::now(),
+            held_yes_qty: Decimal::new(100, 0),
+            held_no_qty: Decimal::ZERO,
+            exited_yes_qty: Decimal::ZERO,
+            exited_no_qty: Decimal::ZERO,
+            yes_exit_price: None,
+            no_exit_price: None,
+            resolution_winner: None,
+            exit_strategy: "hold_to_resolution".to_string(),
         };
 
         let json = serde_json::to_string(&position).unwrap();
