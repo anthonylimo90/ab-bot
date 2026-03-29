@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
             std::env::var("DB_ACQUIRE_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
+                .unwrap_or(5),
         ),
     };
     let pool = polymarket_core::db::create_pool(&db_config).await?;
@@ -129,6 +129,12 @@ async fn apply_pg_memory_tuning(pool: &sqlx::PgPool) {
         // 7 hypertables × 2 policies (compression + retention) + 1 CA refresh = 15 jobs.
         // 8 workers gives headroom for simultaneous policy runs without exhausting slots.
         "ALTER SYSTEM SET timescaledb.max_background_workers = '8'",
+        // SSD-optimised I/O settings (Railway volumes are SSD-backed).
+        // Default random_page_cost=4.0 and effective_io_concurrency=1 assume HDD.
+        "ALTER SYSTEM SET random_page_cost = '1.1'",
+        "ALTER SYSTEM SET effective_io_concurrency = '200'",
+        // JIT compilation adds overhead for short OLTP queries (<10 ms); disable it.
+        "ALTER SYSTEM SET jit = 'off'",
         "SELECT pg_reload_conf()",
     ];
 

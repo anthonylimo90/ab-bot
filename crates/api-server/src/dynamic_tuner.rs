@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{error, info, warn};
 use wallet_tracker::MarketRegime;
@@ -192,6 +192,8 @@ pub struct DynamicTuner {
     config: DynamicTunerConfig,
     current_regime: Arc<RwLock<MarketRegime>>,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Cached Redis connection — created once on first use and reused across cycles.
+    redis_conn: Mutex<Option<redis::aio::ConnectionManager>>,
 }
 
 impl DynamicTuner {
@@ -205,6 +207,7 @@ impl DynamicTuner {
             config: DynamicTunerConfig::from_env(),
             current_regime,
             circuit_breaker,
+            redis_conn: Mutex::new(None),
         }
     }
 
@@ -1134,9 +1137,18 @@ impl DynamicTuner {
         Ok(())
     }
 
+    /// Return the cached Redis ConnectionManager, creating it on first use.
+    ///
+    /// Reusing a single ConnectionManager across cycles avoids opening a new
+    /// TCP connection on every `run_cycle` call (every ~5 minutes). Cloning
+    /// a `ConnectionManager` shares the underlying multiplexed connection.
     async fn redis_connection_manager(&self) -> Option<redis::aio::ConnectionManager> {
-        let client = redis::Client::open(self.config.redis_url.as_str()).ok()?;
-        redis::aio::ConnectionManager::new(client).await.ok()
+        let mut guard = self.redis_conn.lock().await;
+        if guard.is_none() {
+            let client = redis::Client::open(self.config.redis_url.as_str()).ok()?;
+            *guard = redis::aio::ConnectionManager::new(client).await.ok();
+        }
+        guard.clone()
     }
 
     async fn publish_update(
