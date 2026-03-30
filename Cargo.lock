@@ -510,6 +510,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite 0.21.0",
  "tower 0.4.13",
  "tower-http",
  "tower_governor",

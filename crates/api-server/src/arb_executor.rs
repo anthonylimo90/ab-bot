@@ -52,6 +52,8 @@ pub struct ArbExecutorConfig {
     pub min_book_depth: Decimal,
     /// Fee rate for tracking fee drag (2% on Polymarket).
     pub fee_rate: Decimal,
+    /// Maximum total exposure across all open positions before rejecting new entries.
+    pub max_total_exposure: Decimal,
 }
 
 impl Default for ArbExecutorConfig {
@@ -68,6 +70,7 @@ impl Default for ArbExecutorConfig {
             max_position_size: Decimal::new(200, 0), // $200 max
             min_book_depth: Decimal::new(100, 0),    // $100 minimum depth
             fee_rate: Decimal::new(2, 2),            // 2%
+            max_total_exposure: Decimal::new(25000, 0), // $25,000 max total exposure
         }
     }
 }
@@ -114,6 +117,10 @@ impl ArbExecutorConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(Decimal::new(25, 0)), // $25 min depth (small wallet)
             fee_rate: Decimal::new(2, 2), // Always 2% on Polymarket
+            max_total_exposure: std::env::var("ARB_MAX_TOTAL_EXPOSURE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(25000, 0)), // $25,000 default
         }
     }
 }
@@ -937,6 +944,29 @@ impl ArbAutoExecutor {
             self.record_skip_event(&arb, execution_mode, "circuit_breaker", &telemetry)
                 .await;
             return Ok(());
+        }
+
+        // 4a. Total exposure limit check
+        match self.position_repo.get_total_active_exposure().await {
+            Ok(total_exposure) => {
+                if total_exposure >= cfg.max_total_exposure {
+                    let mut runtime = self.runtime_status.write().await;
+                    runtime.record_decision(
+                        market_id,
+                        format!(
+                            "skipped: total exposure ${total_exposure} >= limit ${}",
+                            cfg.max_total_exposure
+                        ),
+                    );
+                    telemetry.finish_total(&process_started_at);
+                    self.record_skip_event(&arb, execution_mode, "exposure_limit", &telemetry)
+                        .await;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to query total exposure, proceeding with trade");
+            }
         }
 
         // 5. Resolve outcome token IDs from cache

@@ -75,6 +75,9 @@ url.workspace = true
 aes-gcm.workspace = true
 base64.workspace = true
 
+# WebSocket (Binance CEX feeds)
+tokio-tungstenite = { workspace = true }
+
 # Database
 sqlx.workspace = true
 

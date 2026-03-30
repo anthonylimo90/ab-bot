@@ -475,7 +475,8 @@ export type TradeFlowStrategy =
   | "flow"
   | "mean_reversion"
   | "cross_market"
-  | "resolution_proximity";
+  | "resolution_proximity"
+  | "latency_arb";
 
 export interface TradeFlowStrategySummary {
   strategy: string;
@@ -1282,7 +1283,8 @@ export type TripReason =
   | "consecutive_losses"
   | "manual"
   | "connectivity"
-  | "market_conditions";
+  | "market_conditions"
+  | "hard_kill_switch";
 
 export interface CircuitBreakerConfig {
   max_daily_loss: number;
@@ -1290,6 +1292,7 @@ export interface CircuitBreakerConfig {
   max_consecutive_losses: number;
   cooldown_minutes: number;
   enabled: boolean;
+  hard_kill_drawdown_pct?: number;
 }
 
 export interface RecoveryState {
@@ -1341,7 +1344,7 @@ export interface RiskStatus {
 }
 
 // Quant Signal types
-export type QuantSignalKind = "flow" | "cross_market" | "mean_reversion" | "resolution_proximity";
+export type QuantSignalKind = "flow" | "cross_market" | "mean_reversion" | "resolution_proximity" | "latency_arb";
 export type SignalDirection = "BuyYes" | "BuyNo";
 export type SignalExecutionStatus = "pending" | "executed" | "skipped" | "expired";
 

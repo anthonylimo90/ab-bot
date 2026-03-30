@@ -50,6 +50,7 @@ const TRIP_REASON_LABELS: Record<TripReason, string> = {
   manual: "Manual Trip",
   connectivity: "Connectivity Issue",
   market_conditions: "Market Conditions",
+  hard_kill_switch: "HARD KILL",
 };
 
 function formatTimeRemaining(resumeAt: string): string {
@@ -175,7 +176,9 @@ export default function RiskPage() {
             <CardContent className="p-6">
               <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                 <div className="flex items-center gap-3">
-                  {cb.tripped ? (
+                  {cb.trip_reason === "hard_kill_switch" ? (
+                    <ShieldAlert className="h-8 w-8 text-loss animate-pulse" />
+                  ) : cb.tripped ? (
                     <ShieldOff className="h-8 w-8 text-loss" />
                   ) : cb.recovery_state ? (
                     <AlertTriangle className="h-8 w-8 text-yellow-500" />
@@ -187,26 +190,35 @@ export default function RiskPage() {
                       <span
                         className={cn(
                           "text-lg font-bold",
-                          cb.tripped
+                          cb.trip_reason === "hard_kill_switch"
                             ? "text-loss"
-                            : cb.recovery_state
-                              ? "text-yellow-500"
-                              : "text-profit",
+                            : cb.tripped
+                              ? "text-loss"
+                              : cb.recovery_state
+                                ? "text-yellow-500"
+                                : "text-profit",
                         )}
                       >
-                        {cb.tripped
-                          ? "CIRCUIT BREAKER TRIPPED"
-                          : cb.recovery_state
-                            ? "RECOVERY MODE"
-                            : "OPERATIONAL"}
+                        {cb.trip_reason === "hard_kill_switch"
+                          ? "HARD KILL \u2014 TRADING PERMANENTLY HALTED"
+                          : cb.tripped
+                            ? "CIRCUIT BREAKER TRIPPED"
+                            : cb.recovery_state
+                              ? "RECOVERY MODE"
+                              : "OPERATIONAL"}
                       </span>
-                      {cb.tripped && cb.trip_reason && (
+                      {cb.tripped && cb.trip_reason && cb.trip_reason !== "hard_kill_switch" && (
                         <Badge variant="destructive" className="text-xs">
                           {TRIP_REASON_LABELS[cb.trip_reason]}
                         </Badge>
                       )}
                     </div>
-                    {cb.tripped && cb.resume_at && (
+                    {cb.trip_reason === "hard_kill_switch" && (
+                      <p className="text-sm text-loss/80">
+                        Drawdown exceeded the hard kill threshold. Manual reset required to resume trading.
+                      </p>
+                    )}
+                    {cb.tripped && cb.trip_reason !== "hard_kill_switch" && cb.resume_at && (
                       <p className="text-sm text-muted-foreground">
                         Resumes in {formatTimeRemaining(cb.resume_at)}
                       </p>
@@ -320,7 +332,7 @@ export default function RiskPage() {
               title="Drawdown"
               value={formatPercent(drawdownPct)}
               trend={drawdownPct > 0 ? "down" : "neutral"}
-              changeLabel={`Max: ${formatPercent(cb.config.max_drawdown_pct * 100)}`}
+              changeLabel={`Trip: ${formatPercent(cb.config.max_drawdown_pct * 100)}${cb.config.hard_kill_drawdown_pct ? ` | Kill: ${formatPercent(cb.config.hard_kill_drawdown_pct * 100)}` : ""}`}
             />
             <MetricCard
               title="Trips Today"

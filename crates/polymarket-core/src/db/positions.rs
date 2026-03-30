@@ -627,4 +627,38 @@ impl PositionRepository {
             .map(|row| (row.get::<i16, _>("state"), row.get::<i64, _>("count")))
             .collect())
     }
+
+    /// Total cost-basis exposure across all open positions (states: Pending, Open, ExitReady, Closing).
+    pub async fn get_total_active_exposure(&self) -> Result<Decimal> {
+        let value: Option<Decimal> = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(SUM(
+                quantity * COALESCE(entry_price, yes_entry_price + no_entry_price, 0)
+            ), 0)
+            FROM positions
+            WHERE state IN (0, 1, 2, 3)
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(value.unwrap_or(Decimal::ZERO))
+    }
+
+    /// Count active positions for a given market across all sources.
+    pub async fn count_active_positions_for_market(&self, market_id: &str) -> Result<i64> {
+        let count: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM positions
+            WHERE market_id = $1
+              AND state IN (0, 1, 2, 3)
+            "#,
+        )
+        .bind(market_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count.unwrap_or(0))
+    }
 }

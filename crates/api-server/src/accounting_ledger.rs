@@ -76,6 +76,7 @@ struct ObservedConditionalBalances {
 }
 
 #[derive(Debug, FromRow)]
+#[allow(dead_code)] // Fields are required by the SQL query mapping (FromRow)
 struct EffectiveOpenPositionRow {
     market_id: String,
     quantity: Decimal,
@@ -111,21 +112,36 @@ impl EffectiveOpenPositionRow {
         })
     }
 
-    fn marked_value(&self, yes_qty: Decimal, no_qty: Decimal) -> Option<Decimal> {
+    /// Returns `(value, used_fallback)` — value is always computed (never None),
+    /// and `used_fallback` is true when no live market price was available and
+    /// the entry price was substituted to keep the equity display stable.
+    fn marked_value(&self, yes_qty: Decimal, no_qty: Decimal) -> (Decimal, bool) {
         let has_yes = yes_qty > Decimal::ZERO;
         let has_no = no_qty > Decimal::ZERO;
 
         match (has_yes, has_no) {
-            (false, false) => Some(Decimal::ZERO),
-            (true, false) => Some(yes_qty * self.yes_price.or(self.current_price)?),
-            (false, true) => Some(no_qty * self.no_price.or(self.current_price)?),
+            (false, false) => (Decimal::ZERO, false),
+            (true, false) => {
+                if let Some(price) = self.yes_price.or(self.current_price) {
+                    (yes_qty * price, false)
+                } else {
+                    (yes_qty * self.yes_entry_price, true)
+                }
+            }
+            (false, true) => {
+                if let Some(price) = self.no_price.or(self.current_price) {
+                    (no_qty * price, false)
+                } else {
+                    (no_qty * self.no_entry_price, true)
+                }
+            }
             (true, true) => {
                 if let (Some(yes_price), Some(no_price)) = (self.yes_price, self.no_price) {
-                    Some((yes_qty * yes_price) + (no_qty * no_price))
+                    ((yes_qty * yes_price) + (no_qty * no_price), false)
                 } else {
-                    let pair_qty = yes_qty.min(no_qty);
-                    self.current_price
-                        .map(|current_price| pair_qty * current_price)
+                    let yes_price = self.yes_price.unwrap_or(self.yes_entry_price);
+                    let no_price = self.no_price.unwrap_or(self.no_entry_price);
+                    ((yes_qty * yes_price) + (no_qty * no_price), true)
                 }
             }
         }
@@ -220,6 +236,22 @@ pub async fn load_live_account_snapshot(
 async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<()> {
     if let Some(snapshot) = load_live_account_snapshot(state).await? {
         persist_snapshot(&state.pool, &snapshot).await?;
+
+        // Bridge equity to the circuit breaker so drawdown tracking uses real
+        // portfolio value instead of cumulative P&L from zero.
+        if snapshot.total_equity > rust_decimal::Decimal::ZERO {
+            if let Err(e) = state
+                .circuit_breaker
+                .update_portfolio_value(snapshot.total_equity)
+                .await
+            {
+                warn!(
+                    error = %e,
+                    total_equity = %snapshot.total_equity,
+                    "Failed to update circuit breaker portfolio value from account snapshot"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -435,12 +467,10 @@ async fn load_position_valuation_from_positions(
         });
         let marked_cost_basis = (yes_qty * row.yes_entry_price) + (no_qty * row.no_entry_price);
 
-        if let Some(marked_value) = row.marked_value(yes_qty, no_qty) {
-            valuation.position_value += marked_value;
-            valuation.unrealized_pnl += marked_value - marked_cost_basis;
-        } else {
-            valuation.position_value += (row.entry_value + row.unrealized_pnl).max(Decimal::ZERO);
-            valuation.unrealized_pnl += row.unrealized_pnl;
+        let (marked_value, used_fallback) = row.marked_value(yes_qty, no_qty);
+        valuation.position_value += marked_value;
+        valuation.unrealized_pnl += marked_value - marked_cost_basis;
+        if used_fallback {
             valuation.unpriced_open_positions += 1;
             valuation.unpriced_position_cost_basis += row.fallback_cost_basis();
         }

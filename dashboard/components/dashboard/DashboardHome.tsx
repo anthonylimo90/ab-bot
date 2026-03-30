@@ -50,6 +50,15 @@ const activityIcons: Record<string, React.ReactNode> = {
   TRADE_PENDING: <Activity className="h-4 w-4 text-muted-foreground" />,
 };
 
+const STRATEGY_PNL_LABELS: Record<string, string> = {
+  arb: "Arb",
+  flow: "Flow",
+  mean_reversion: "Mean Rev",
+  cross_market: "Cross Mkt",
+  resolution_proximity: "Resolution",
+  latency_arb: "CEX Latency",
+};
+
 const activityLabels: Record<string, string> = {
   STOP_LOSS_TRIGGERED: "Stop Loss Triggered",
   ARBITRAGE_DETECTED: "Arbitrage Found",
@@ -79,16 +88,25 @@ export function DashboardHome() {
     Boolean(currentWorkspace) &&
     !currentWorkspace?.live_trading_enabled &&
     !currentWorkspace?.arb_auto_execute;
+  const isHardKilled = riskStatus?.circuit_breaker?.trip_reason === "hard_kill_switch";
   const isCircuitBreakerPaused = Boolean(riskStatus?.circuit_breaker?.tripped);
-  const automationStatus = isCircuitBreakerPaused
+  const automationStatus = isHardKilled
     ? {
-        label: "Paused",
+        label: "HARD KILL",
         variant: "destructive" as const,
-        className: "text-xs",
+        className: "text-xs animate-pulse",
         tooltip:
-          "The circuit breaker is active, so automated trading is paused until the risk controls allow it again.",
+          "Hard kill switch activated \u2014 trading is permanently halted. Manual reset required via the Risk page.",
       }
-    : isTradingManuallyPaused
+    : isCircuitBreakerPaused
+      ? {
+          label: "Paused",
+          variant: "destructive" as const,
+          className: "text-xs",
+          tooltip:
+            "The circuit breaker is active, so automated trading is paused until the risk controls allow it again.",
+        }
+      : isTradingManuallyPaused
       ? {
           label: "Manually paused",
           variant: "warning" as const,
@@ -291,6 +309,57 @@ export function DashboardHome() {
           trend="neutral"
         />
       </div>
+
+      {/* Per-Strategy P&L Breakdown */}
+      {tradeFlowSummary &&
+        tradeFlowSummary.strategies &&
+        tradeFlowSummary.strategies.length > 0 && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+                <BarChart2 className="h-4 w-4" />
+                Strategy P&L
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pb-4">
+              <div className="space-y-2">
+                {tradeFlowSummary.strategies
+                  .filter((s) => s.closed_positions > 0 || s.open_positions > 0)
+                  .sort((a, b) => b.net_pnl - a.net_pnl)
+                  .map((s) => {
+                    const label = STRATEGY_PNL_LABELS[s.strategy] || s.strategy;
+                    return (
+                      <div
+                        key={s.strategy}
+                        className="flex items-center justify-between rounded-md border px-3 py-2"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium">{label}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {s.closed_positions} closed
+                            {s.open_positions > 0 &&
+                              ` / ${s.open_positions} open`}
+                          </span>
+                        </div>
+                        <span
+                          className={cn(
+                            "text-sm font-semibold tabular-nums",
+                            s.net_pnl > 0
+                              ? "text-profit"
+                              : s.net_pnl < 0
+                                ? "text-loss"
+                                : "text-muted-foreground",
+                          )}
+                        >
+                          {formatCurrency(s.net_pnl, { showSign: true })}
+                        </span>
+                      </div>
+                    );
+                  })}
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
       {accountSummary && (
         <Card>

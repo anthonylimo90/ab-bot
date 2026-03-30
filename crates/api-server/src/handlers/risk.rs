@@ -111,6 +111,7 @@ fn trip_reason_to_string(reason: &risk_manager::circuit_breaker::TripReason) -> 
         risk_manager::circuit_breaker::TripReason::MarketConditions => {
             "market_conditions".to_string()
         }
+        risk_manager::circuit_breaker::TripReason::HardKillSwitch => "hard_kill_switch".to_string(),
     }
 }
 
