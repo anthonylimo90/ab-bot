@@ -11,13 +11,14 @@ import { useRecentSignalsQuery } from "@/hooks/queries/useSignalsQuery";
 import { formatTimeAgo, cn } from "@/lib/utils";
 import { ArrowUp, ArrowDown, ChevronDown, ChevronRight } from "lucide-react";
 
-type KindFilter = "all" | "flow" | "cross_market" | "mean_reversion" | "resolution_proximity";
+type KindFilter = "all" | "flow" | "cross_market" | "mean_reversion" | "resolution_proximity" | "latency_arb";
 
 const KIND_LABELS: Record<string, string> = {
   flow: "Flow",
   cross_market: "Cross Mkt",
   mean_reversion: "Mean Rev",
   resolution_proximity: "Resolution",
+  latency_arb: "CEX Latency",
 };
 
 const KIND_BADGE_STYLES: Record<string, string> = {
@@ -25,6 +26,7 @@ const KIND_BADGE_STYLES: Record<string, string> = {
   cross_market: "bg-purple-500/10 text-purple-600 border-purple-500/20",
   mean_reversion: "bg-amber-500/10 text-amber-600 border-amber-500/20",
   resolution_proximity: "bg-green-500/10 text-green-600 border-green-500/20",
+  latency_arb: "bg-cyan-500/10 text-cyan-600 border-cyan-500/20",
 };
 
 const STATUS_STYLES: Record<string, string> = {
@@ -68,6 +70,7 @@ export function RecentSignalsFeed({ onConditionClick }: RecentSignalsFeedProps) 
               <TabsTrigger value="cross_market">Cross Mkt</TabsTrigger>
               <TabsTrigger value="mean_reversion">Mean Rev</TabsTrigger>
               <TabsTrigger value="resolution_proximity">Resolution</TabsTrigger>
+              <TabsTrigger value="latency_arb">CEX Latency</TabsTrigger>
             </TabsList>
           </div>
         </Tabs>

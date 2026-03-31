@@ -28,6 +28,9 @@ pub enum TripReason {
     Connectivity,
     /// Unusual market conditions detected.
     MarketConditions,
+    /// Hard kill switch — permanent halt requiring manual reset.
+    /// Triggered when total drawdown exceeds `hard_kill_drawdown_pct`.
+    HardKillSwitch,
 }
 
 /// Configuration for circuit breaker thresholds.
@@ -51,6 +54,10 @@ pub struct CircuitBreakerConfig {
     pub recovery_stage_minutes: i64,
     /// Require a profitable trade before advancing to next stage.
     pub require_profit_to_advance: bool,
+    /// Hard kill drawdown threshold (e.g. 0.40 = 40%). When total drawdown
+    /// exceeds this, trading halts permanently until manual reset.
+    /// Set to 0 to disable. Default: 0.40.
+    pub hard_kill_drawdown_pct: Decimal,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -65,6 +72,7 @@ impl Default for CircuitBreakerConfig {
             recovery_stages: 3,             // 33%, 66%, 100%
             recovery_stage_minutes: 10,     // 10 minutes per stage
             require_profit_to_advance: false, // Time-based is sufficient for learning
+            hard_kill_drawdown_pct: Decimal::new(40, 2), // 40% permanent halt
         }
     }
 }
@@ -232,9 +240,14 @@ impl CircuitBreaker {
             // Update atomic flag
             self.is_tripped.store(state.tripped, Ordering::SeqCst);
 
-            // Check if we should auto-reset from cooldown
+            // Check if we should auto-reset from cooldown.
+            // IMPORTANT: HardKillSwitch trips must NEVER auto-reset —
+            // they require explicit manual reset via the API.
             if state.tripped {
-                if let Some(resume_at) = state.resume_at {
+                let is_hard_kill = state.trip_reason == Some(TripReason::HardKillSwitch);
+                if is_hard_kill {
+                    warn!("Hard kill switch is active — trading permanently halted until manual reset");
+                } else if let Some(resume_at) = state.resume_at {
                     if Utc::now() >= resume_at {
                         info!("Cooldown expired during downtime, resetting circuit breaker");
                         drop(state);
@@ -549,14 +562,26 @@ impl CircuitBreaker {
             state.peak_value = value;
         }
 
-        // Check drawdown
+        // Check drawdown thresholds (hard kill first, then normal)
         if state.peak_value > Decimal::ZERO {
             let drawdown = (state.peak_value - state.current_value) / state.peak_value;
+
+            // Hard kill switch — permanent halt, no auto-recovery
+            if config.hard_kill_drawdown_pct > Decimal::ZERO
+                && drawdown >= config.hard_kill_drawdown_pct
+            {
+                let reason = TripReason::HardKillSwitch;
+                self.trip_internal(&mut state, reason.clone(), &config)
+                    .await;
+                self.persist_state(&state).await;
+                return Ok(Some(reason));
+            }
+
+            // Normal drawdown trip
             if drawdown >= config.max_drawdown_pct {
                 let reason = TripReason::MaxDrawdown;
                 self.trip_internal(&mut state, reason.clone(), &config)
                     .await;
-                // Persist state to database
                 self.persist_state(&state).await;
                 return Ok(Some(reason));
             }
@@ -670,6 +695,15 @@ impl CircuitBreaker {
         // Check drawdown
         if state.peak_value > Decimal::ZERO {
             let drawdown = (state.peak_value - state.current_value) / state.peak_value;
+
+            // Hard kill switch — permanent halt, no auto-recovery
+            if config.hard_kill_drawdown_pct > Decimal::ZERO
+                && drawdown >= config.hard_kill_drawdown_pct
+            {
+                return Some(TripReason::HardKillSwitch);
+            }
+
+            // Normal drawdown trip — enters cooldown then gradual recovery
             if drawdown >= config.max_drawdown_pct {
                 return Some(TripReason::MaxDrawdown);
             }
@@ -685,23 +719,34 @@ impl CircuitBreaker {
         config: &CircuitBreakerConfig,
     ) {
         let now = Utc::now();
-        let resume_at = now + Duration::minutes(config.cooldown_minutes);
 
         state.tripped = true;
         state.trip_reason = Some(reason.clone());
         state.tripped_at = Some(now);
-        state.resume_at = Some(resume_at);
         state.trips_today += 1;
-
         self.is_tripped.store(true, Ordering::SeqCst);
 
-        error!(
-            reason = ?reason,
-            resume_at = %resume_at,
-            daily_pnl = %state.daily_pnl,
-            consecutive_losses = %state.consecutive_losses,
-            "Circuit breaker TRIPPED - trading halted"
-        );
+        // Hard kill switch has NO automatic resume — requires manual reset.
+        if reason == TripReason::HardKillSwitch {
+            state.resume_at = None;
+            error!(
+                reason = ?reason,
+                daily_pnl = %state.daily_pnl,
+                peak_value = %state.peak_value,
+                current_value = %state.current_value,
+                "HARD KILL SWITCH ACTIVATED - trading permanently halted until manual reset"
+            );
+        } else {
+            let resume_at = now + Duration::minutes(config.cooldown_minutes);
+            state.resume_at = Some(resume_at);
+            error!(
+                reason = ?reason,
+                resume_at = %resume_at,
+                daily_pnl = %state.daily_pnl,
+                consecutive_losses = %state.consecutive_losses,
+                "Circuit breaker TRIPPED - trading halted"
+            );
+        }
     }
 }
 

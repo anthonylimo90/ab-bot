@@ -33,6 +33,10 @@ const STRATEGY_STYLES: Record<string, { label: string; className: string }> = {
     label: "Resolution",
     className: "bg-green-500/10 text-green-600 border-green-500/20",
   },
+  latency_arb: {
+    label: "CEX Latency",
+    className: "bg-cyan-500/10 text-cyan-600 border-cyan-500/20",
+  },
 };
 
 function formatPnl(value: number) {

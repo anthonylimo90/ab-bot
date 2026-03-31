@@ -653,7 +653,12 @@ impl DynamicTuner {
             let vol_penalty = metrics.volatility_proxy * 0.01;
             let mut desired_arb_profit =
                 expected_arb_slippage + regime_safety_margin + low_depth_penalty + vol_penalty;
-            if no_trade_watchdog && top_skip != "slippage" {
+            // Watchdog: if many attempts but zero fills, reduce the
+            // parameter that is actually causing rejections.
+            //  - "depth"    → the book is too thin; relax min_book_depth instead
+            //  - "slippage" → execution-quality issue; don't reduce threshold
+            //  - other/none → profit threshold is the most likely gating factor
+            if no_trade_watchdog && top_skip != "slippage" && top_skip != "insufficient_depth" {
                 desired_arb_profit *= 0.90;
             }
             // No ratchet floor — apply_step_limit already caps movement
@@ -661,6 +666,17 @@ impl DynamicTuner {
             // The old `.max(current * 0.7)` prevented the tuner from
             // correcting its own upward drift.
             targets.insert(KEY_ARB_MIN_PROFIT_THRESHOLD.to_string(), desired_arb_profit);
+        }
+
+        // ARB_MIN_BOOK_DEPTH: relax when watchdog says depth is the blocking reason.
+        // This targets the actual gating parameter instead of reducing the profit
+        // threshold, which would push into lower-quality opportunities.
+        if no_trade_watchdog && top_skip == "insufficient_depth" {
+            if let Some(row) = rows.get(KEY_ARB_MIN_BOOK_DEPTH) {
+                let current_depth = decimal_to_f64(row.current_value);
+                let relaxed_depth = current_depth * 0.95; // 5% reduction
+                targets.insert(KEY_ARB_MIN_BOOK_DEPTH.to_string(), relaxed_depth);
+            }
         }
 
         // ARB_MONITOR_MAX_MARKETS: adapt to stream health + throughput.
@@ -838,13 +854,32 @@ impl DynamicTuner {
         .await
         .unwrap_or(Decimal::ZERO);
 
+        // Query the most common arb skip reason from recent trade events.
+        let top_skip_reason: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT reason
+            FROM trade_events
+            WHERE source = 'arb'
+              AND event_type = 'signal_skipped'
+              AND reason IS NOT NULL
+              AND occurred_at >= NOW() - INTERVAL '120 minutes'
+            GROUP BY reason
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
         Ok(TuningMetrics {
             slippage_skip_rate: 0.0,
             below_min_skip_rate: 0.0,
             successful_fill_rate: ratio(fills_last_window, attempts_last_window),
             attempts_last_window,
             fills_last_window,
-            top_skip_reason: None,
+            top_skip_reason,
             realized_slippage_p90: 0.0,
             depth_proxy,
             volatility_proxy,

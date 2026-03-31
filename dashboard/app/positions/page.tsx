@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, useMemo } from "react";
+import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -121,6 +122,7 @@ export default function PositionsPage() {
 
   const closeMutation = useClosePositionMutation();
   const queryClient = useQueryClient();
+  const router = useRouter();
 
   // WebSocket for real-time position updates
   const handleBatchedUpdate = useCallback(
@@ -368,7 +370,8 @@ export default function PositionsPage() {
                       return (
                         <tr
                           key={pos.id}
-                          className="border-b hover:bg-muted/30 transition-colors"
+                          className="border-b hover:bg-muted/30 transition-colors cursor-pointer"
+                          onClick={() => router.push(`/positions/${pos.id}`)}
                         >
                           <td className="px-4 py-3">
                             <span
@@ -401,7 +404,7 @@ export default function PositionsPage() {
                             {pos.entry_price.toFixed(4)}
                           </td>
                           <td className="px-4 py-3 text-right tabular-nums">
-                            {exitPrice.toFixed(4)}
+                            {exitPrice != null ? exitPrice.toFixed(4) : "-"}
                           </td>
                           <td
                             className={cn(
@@ -437,7 +440,7 @@ export default function PositionsPage() {
                             </td>
                           )}
                           {activeTab === "open" && (
-                            <td className="px-4 py-3 text-center">
+                            <td className="px-4 py-3 text-center" onClick={(e) => e.stopPropagation()}>
                               <AlertDialog>
                                 <AlertDialogTrigger asChild>
                                   <Button

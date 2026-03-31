@@ -47,6 +47,8 @@ pub struct QuantSignalExecutorConfig {
     pub resolution_allocation_pct: f64,
     /// Minimum orderbook depth in USD on the target side.
     pub min_book_depth: Decimal,
+    /// Maximum total exposure across all open positions (shared with arb executor).
+    pub max_total_exposure: Decimal,
     /// Per-strategy maximum daily loss before halting that strategy.
     pub strategy_max_daily_loss_usd: Decimal,
     /// Per-strategy maximum consecutive losses before halting.
@@ -101,6 +103,10 @@ impl QuantSignalExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(Decimal::new(50, 0)),
+            max_total_exposure: std::env::var("ARB_MAX_TOTAL_EXPOSURE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::new(25000, 0)),
             strategy_max_daily_loss_usd: std::env::var("QUANT_STRATEGY_MAX_DAILY_LOSS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -249,6 +255,78 @@ impl StrategyState {
 
         false
     }
+
+    /// Persist this strategy's state to the database.
+    async fn persist(&self, pool: &PgPool, strategy: &str) {
+        if let Err(e) = sqlx::query(
+            r#"
+            INSERT INTO strategy_risk_state (
+                strategy, daily_pnl, daily_pnl_date, consecutive_losses,
+                halted, halt_reason, halted_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            ON CONFLICT (strategy) DO UPDATE SET
+                daily_pnl = EXCLUDED.daily_pnl,
+                daily_pnl_date = EXCLUDED.daily_pnl_date,
+                consecutive_losses = EXCLUDED.consecutive_losses,
+                halted = EXCLUDED.halted,
+                halt_reason = EXCLUDED.halt_reason,
+                halted_at = EXCLUDED.halted_at,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(strategy)
+        .bind(self.daily_pnl)
+        .bind(self.daily_pnl_date)
+        .bind(self.consecutive_losses as i32)
+        .bind(self.halted)
+        .bind(self.halt_reason.as_deref())
+        .bind(self.halted_at)
+        .execute(pool)
+        .await
+        {
+            warn!(
+                strategy,
+                error = %e,
+                "Failed to persist strategy risk state"
+            );
+        }
+    }
+
+    /// Load strategy state from the database. Returns default if not found.
+    async fn load(pool: &PgPool, strategy: &str) -> Self {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            daily_pnl: Decimal,
+            daily_pnl_date: chrono::NaiveDate,
+            consecutive_losses: i32,
+            halted: bool,
+            halt_reason: Option<String>,
+            halted_at: Option<chrono::DateTime<Utc>>,
+        }
+
+        match sqlx::query_as::<_, Row>(
+            "SELECT daily_pnl, daily_pnl_date, consecutive_losses, halted, halt_reason, halted_at FROM strategy_risk_state WHERE strategy = $1",
+        )
+        .bind(strategy)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(Some(row)) => Self {
+                daily_pnl: row.daily_pnl,
+                daily_pnl_date: row.daily_pnl_date,
+                consecutive_losses: row.consecutive_losses as u32,
+                halted: row.halted,
+                halt_reason: row.halt_reason,
+                halted_at: row.halted_at,
+            },
+            Ok(None) => Self::new(),
+            Err(e) => {
+                warn!(strategy, error = %e, "Failed to load strategy risk state, using defaults");
+                Self::new()
+            }
+        }
+    }
 }
 
 /// The quant signal executor background task.
@@ -370,6 +448,21 @@ impl QuantSignalExecutor {
         // Rebuild today's per-strategy realized outcomes on startup.
         self.sync_strategy_outcomes().await;
 
+        // Load persisted per-strategy risk state from DB (survives restarts).
+        for (kind, state) in &mut self.strategy_states {
+            let loaded = StrategyState::load(&self.pool, kind.as_str()).await;
+            if loaded.daily_pnl != Decimal::ZERO || loaded.consecutive_losses > 0 || loaded.halted {
+                info!(
+                    strategy = kind.as_str(),
+                    daily_pnl = %loaded.daily_pnl,
+                    consecutive_losses = loaded.consecutive_losses,
+                    halted = loaded.halted,
+                    "Loaded per-strategy risk state from DB"
+                );
+            }
+            *state = loaded;
+        }
+
         let mut cache_ticker =
             tokio::time::interval(std::time::Duration::from_secs(cfg.cache_refresh_secs));
         cache_ticker.tick().await; // skip first tick (just loaded)
@@ -482,7 +575,8 @@ impl QuantSignalExecutor {
                     row.realized_pnl,
                     row.realized_pnl > Decimal::ZERO,
                     &cfg,
-                );
+                )
+                .await;
             } else {
                 warn!(kind = %row.kind, position_id = %row.position_id, "Unknown quant signal kind while syncing outcomes");
             }
@@ -960,6 +1054,46 @@ impl QuantSignalExecutor {
             }
         }
 
+        // Step 12a: Total exposure limit check (shared with arb executor)
+        match self.position_repo.get_total_active_exposure().await {
+            Ok(total_exposure) if total_exposure >= cfg.max_total_exposure => {
+                debug!(
+                    signal_id = %signal.id,
+                    total_exposure = %total_exposure,
+                    max = %cfg.max_total_exposure,
+                    "Total exposure limit reached, skipping quant signal"
+                );
+                self.update_signal_status(signal.id, "skipped", Some("exposure_limit"))
+                    .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("exposure_limit"),
+                )
+                .await;
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    signal_id = %signal.id,
+                    error = %e,
+                    "Failed exposure check, skipping signal for safety"
+                );
+                self.update_signal_status(signal.id, "skipped", Some("exposure_check_failed"))
+                    .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("exposure_check_failed"),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Step 13: Create PENDING position and persist to DB
         // For single-leg quant trades, the "other side" price is set to zero.
         let (yes_price, no_price) = match signal.direction {
@@ -1139,7 +1273,7 @@ impl QuantSignalExecutor {
     }
 
     /// Record an outcome with the per-strategy circuit breaker.
-    fn record_strategy_outcome(
+    async fn record_strategy_outcome(
         &mut self,
         kind: QuantSignalKind,
         pnl: Decimal,
@@ -1172,6 +1306,8 @@ impl QuantSignalExecutor {
                     "Per-strategy circuit breaker tripped — halting strategy"
                 );
             }
+            // Persist to DB so state survives restarts
+            state.persist(&self.pool, kind.as_str()).await;
         }
     }
 

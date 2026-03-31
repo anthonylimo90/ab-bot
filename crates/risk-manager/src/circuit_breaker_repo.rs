@@ -134,6 +134,7 @@ impl CircuitBreakerRepository {
             "manual" => Some(TripReason::Manual),
             "connectivity" => Some(TripReason::Connectivity),
             "market_conditions" => Some(TripReason::MarketConditions),
+            "hard_kill_switch" => Some(TripReason::HardKillSwitch),
             _ => None,
         }
     }
@@ -147,6 +148,7 @@ impl CircuitBreakerRepository {
             TripReason::Manual => "manual".to_string(),
             TripReason::Connectivity => "connectivity".to_string(),
             TripReason::MarketConditions => "market_conditions".to_string(),
+            TripReason::HardKillSwitch => "hard_kill_switch".to_string(),
         }
     }
 }
@@ -164,6 +166,7 @@ mod tests {
             TripReason::Manual,
             TripReason::Connectivity,
             TripReason::MarketConditions,
+            TripReason::HardKillSwitch,
         ];
 
         for reason in reasons {

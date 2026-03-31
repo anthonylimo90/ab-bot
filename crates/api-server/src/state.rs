@@ -391,6 +391,11 @@ impl AppState {
                 circuit_breaker_config.cooldown_minutes = n;
             }
         }
+        if let Ok(v) = std::env::var("CB_HARD_KILL_DRAWDOWN_PCT") {
+            if let Ok(d) = v.parse::<rust_decimal::Decimal>() {
+                circuit_breaker_config.hard_kill_drawdown_pct = d;
+            }
+        }
 
         // Apply DB overrides (workspace-level CB config takes priority over env vars)
         #[derive(sqlx::FromRow)]
@@ -457,7 +462,23 @@ impl AppState {
             }
         }
 
-        let circuit_breaker = Arc::new(CircuitBreaker::new(circuit_breaker_config));
+        let circuit_breaker = Arc::new(CircuitBreaker::with_persistence(
+            circuit_breaker_config,
+            pool.clone(),
+        ));
+
+        // Load persisted circuit breaker state from DB (daily P&L, drawdown, etc.)
+        match circuit_breaker.load_state().await {
+            Ok(true) => {
+                tracing::info!("Loaded circuit breaker state from database");
+            }
+            Ok(false) => {
+                tracing::info!("No persisted circuit breaker state found, starting fresh");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load circuit breaker state from DB, starting fresh: {e}");
+            }
+        }
 
         // Create Polygon client for on-chain queries (balance, etc.)
         let polygon_client = build_polygon_client_for_discovery();
