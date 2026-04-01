@@ -103,6 +103,11 @@ pub struct CircuitBreakerState {
     /// Date of last daily reset (for midnight rollover detection).
     #[serde(default = "today_naive")]
     pub last_reset_date: chrono::NaiveDate,
+    /// Whether `update_portfolio_value` has been called at least once.
+    /// Once seeded, `record_trade` stops modifying `current_value` to avoid
+    /// mixing delta-based P&L tracking with absolute equity snapshots.
+    #[serde(default)]
+    pub portfolio_value_seeded: bool,
 }
 
 fn today_naive() -> chrono::NaiveDate {
@@ -171,6 +176,7 @@ impl Default for CircuitBreakerState {
             trips_today: 0,
             recovery_state: None,
             last_reset_date: Utc::now().date_naive(),
+            portfolio_value_seeded: false,
         }
     }
 }
@@ -464,10 +470,34 @@ impl CircuitBreaker {
             state.consecutive_losses += 1;
         }
 
-        // Update peak/current value
-        state.current_value += pnl;
-        if state.current_value > state.peak_value {
-            state.peak_value = state.current_value;
+        // Update peak/current value — only when portfolio value has NOT been
+        // seeded by `update_portfolio_value`. Once seeded, the snapshot-based
+        // equity is the authoritative source for drawdown; `record_trade` must
+        // not mix in delta-based P&L which produces wild fluctuations.
+        if !state.portfolio_value_seeded {
+            state.current_value += pnl;
+            if state.current_value > state.peak_value {
+                state.peak_value = state.current_value;
+            }
+        }
+
+        // Hard kill check — must run in ALL modes (normal + recovery).
+        // This prevents 40%+ drawdowns from being missed during recovery.
+        if state.peak_value > Decimal::ZERO {
+            let drawdown = (state.peak_value - state.current_value) / state.peak_value;
+            if config.hard_kill_drawdown_pct > Decimal::ZERO
+                && drawdown >= config.hard_kill_drawdown_pct
+            {
+                warn!(
+                    drawdown = %drawdown,
+                    threshold = %config.hard_kill_drawdown_pct,
+                    "Hard kill switch triggered from record_trade"
+                );
+                state.recovery_state = None;
+                drop(state);
+                drop(config);
+                return self.record_trade_trip(TripReason::HardKillSwitch).await;
+            }
         }
 
         // Update recovery state if in recovery mode
@@ -561,6 +591,7 @@ impl CircuitBreaker {
         if value > state.peak_value {
             state.peak_value = value;
         }
+        state.portfolio_value_seeded = true;
 
         // Check drawdown thresholds (hard kill first, then normal)
         if state.peak_value > Decimal::ZERO {
