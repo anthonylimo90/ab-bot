@@ -52,6 +52,11 @@ impl CircuitBreakerRepository {
                 recovery_state: None,
                 // Use today's date; actual reset check happens in load_state()
                 last_reset_date: chrono::Utc::now().date_naive(),
+                // If peak_value was persisted above zero, portfolio value was
+                // previously seeded by update_portfolio_value — preserve that
+                // so record_trade doesn't corrupt current_value with deltas.
+                portfolio_value_seeded: r.get::<rust_decimal::Decimal, _>("peak_value")
+                    > rust_decimal::Decimal::ZERO,
             }
         });
 
