@@ -10,6 +10,19 @@ use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// Read a smallint column that may have been widened to integer by pg_restore.
+/// Tries i16 first (SMALLINT), falls back to i32 (INTEGER) and truncates.
+fn get_smallint(r: &sqlx::postgres::PgRow, col: &str) -> i16 {
+    r.try_get::<i16, _>(col)
+        .unwrap_or_else(|_| r.get::<i32, _>(col) as i16)
+}
+
+/// Optional variant of `get_smallint`.
+fn get_opt_smallint(r: &sqlx::postgres::PgRow, col: &str) -> Option<i16> {
+    r.try_get::<Option<i16>, _>(col)
+        .unwrap_or_else(|_| r.get::<Option<i32>, _>(col).map(|v| v as i16))
+}
+
 /// Repository for position data.
 pub struct PositionRepository {
     pool: PgPool,
@@ -200,11 +213,11 @@ impl PositionRepository {
             no_entry_price,
             quantity: r.get("quantity"),
             entry_timestamp: r.get("entry_timestamp"),
-            exit_strategy: match r.get::<i16, _>("exit_strategy") {
+            exit_strategy: match get_smallint(r, "exit_strategy") {
                 0 => ExitStrategy::HoldToResolution,
                 _ => ExitStrategy::ExitOnCorrection,
             },
-            state: match r.get::<i16, _>("state") {
+            state: match get_smallint(r, "state") {
                 0 => PositionState::Pending,
                 1 => PositionState::Open,
                 2 => PositionState::ExitReady,
@@ -224,9 +237,7 @@ impl PositionRepository {
             retry_count: r.get::<Option<i32>, _>("retry_count").unwrap_or(0) as u32,
             last_updated,
             pre_stall_state: None, // Runtime-only; not persisted to DB
-            fee_model: PositionFeeModel::from_i16(
-                r.get::<Option<i16>, _>("fee_model").unwrap_or(0),
-            ),
+            fee_model: PositionFeeModel::from_i16(get_opt_smallint(r, "fee_model").unwrap_or(0)),
             resolution_payout_per_share: r
                 .get::<Option<Decimal>, _>("resolution_payout_per_share")
                 .unwrap_or(legacy_resolution_payout),
@@ -624,7 +635,7 @@ impl PositionRepository {
 
         Ok(rows
             .into_iter()
-            .map(|row| (row.get::<i16, _>("state"), row.get::<i64, _>("count")))
+            .map(|row| (get_smallint(&row, "state"), row.get::<i64, _>("count")))
             .collect())
     }
 
