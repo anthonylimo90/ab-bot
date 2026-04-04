@@ -14,6 +14,8 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
+    mem_limit: 2g
+    memswap_limit: 2g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-abbot} -d ${POSTGRES_DB:-ab_bot}"]
       interval: 10s
@@ -33,6 +35,8 @@ services:
       - redis_data:/data
       - ./docker/redis/redis-entrypoint.sh:/usr/local/etc/redis/redis-entrypoint.sh:ro
     command: sh /usr/local/etc/redis/redis-entrypoint.sh
+    mem_limit: 512m
+    memswap_limit: 512m
     healthcheck:
       test: ["CMD-SHELL", "redis-cli --user app --pass ${REDIS_APP_PASSWORD:-app_secret_change_me} ping | grep -q PONG"]
       interval: 10s
@@ -88,6 +92,8 @@ services:
       DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS: ${DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS:-20}
     ports:
       - "${API_PORT:-3000}:3000"
+    mem_limit: 2g
+    memswap_limit: 2g
     depends_on:
       postgres:
         condition: service_healthy
@@ -121,6 +127,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    mem_limit: 2g
+    memswap_limit: 2g
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/healthy"]
       interval: 30s

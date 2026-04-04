@@ -151,3 +151,6 @@ clap = { version = "4", features = ["derive"] }
 
 # Pin home crate to version compatible with Rust 1.85
 home = "=0.5.9"
+
+# Memory allocator — jemalloc reduces fragmentation under Tokio async workloads
+tikv-jemallocator = "0.6"

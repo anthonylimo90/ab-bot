@@ -1,5 +1,8 @@
 //! API Server binary entrypoint.
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use api_server::{ApiServer, ServerConfig};
 use clap::{Parser, Subcommand};
 use polymarket_core::config::DatabaseConfig;
@@ -117,14 +120,16 @@ async fn main() -> anyhow::Result<()> {
 /// This is idempotent — safe to run on every startup.
 async fn apply_pg_memory_tuning(pool: &sqlx::PgPool) {
     let statements = [
-        "ALTER SYSTEM SET shared_buffers = '512MB'",
-        "ALTER SYSTEM SET work_mem = '4MB'",
-        "ALTER SYSTEM SET maintenance_work_mem = '128MB'",
-        "ALTER SYSTEM SET effective_cache_size = '1536MB'",
-        "ALTER SYSTEM SET wal_buffers = '16MB'",
+        // Tuned for 2GB container limit. Total PG RSS should stay under ~1.5GB,
+        // leaving headroom for OS page cache and background workers.
+        "ALTER SYSTEM SET shared_buffers = '256MB'",
+        "ALTER SYSTEM SET work_mem = '2MB'",
+        "ALTER SYSTEM SET maintenance_work_mem = '64MB'",
+        "ALTER SYSTEM SET effective_cache_size = '768MB'",
+        "ALTER SYSTEM SET wal_buffers = '8MB'",
         "ALTER SYSTEM SET checkpoint_completion_target = '0.9'",
-        "ALTER SYSTEM SET max_wal_size = '1GB'",
-        "ALTER SYSTEM SET min_wal_size = '256MB'",
+        "ALTER SYSTEM SET max_wal_size = '512MB'",
+        "ALTER SYSTEM SET min_wal_size = '128MB'",
         "ALTER SYSTEM SET max_connections = '50'",
         // 7 hypertables × 2 policies (compression + retention) + 1 CA refresh = 15 jobs.
         // 8 workers gives headroom for simultaneous policy runs without exhausting slots.

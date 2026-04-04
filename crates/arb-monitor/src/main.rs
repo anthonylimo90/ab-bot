@@ -2,6 +2,9 @@
 //!
 //! Real-time detection of mispriced Polymarket prediction markets.
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod monitor;
 mod position_tracker;
 mod signals;

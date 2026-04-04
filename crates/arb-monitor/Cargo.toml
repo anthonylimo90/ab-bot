@@ -45,5 +45,8 @@ tracing-subscriber = { workspace = true }
 # Configuration
 dotenvy = { workspace = true }
 
+# Memory allocator
+tikv-jemallocator = { workspace = true }
+
 [dev-dependencies]
 tokio-test = { workspace = true }

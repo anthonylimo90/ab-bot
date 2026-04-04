@@ -247,11 +247,16 @@ pub fn spawn_latency_arb_executor(
                 // positive expected value over 50+ trades.
             }
 
-            // Periodic stats log
+            // Evict expired cooldowns every 100 signals to bound memory
             if signals_evaluated > 0 && signals_evaluated % 100 == 0 {
+                let before = cooldowns.len();
+                cooldowns.retain(|_, ts| ts.elapsed() < cooldown_duration);
+                let evicted = before - cooldowns.len();
                 info!(
                     evaluated = signals_evaluated,
                     executed = signals_executed,
+                    cooldowns_active = cooldowns.len(),
+                    cooldowns_evicted = evicted,
                     "Latency arb signal stats"
                 );
             }

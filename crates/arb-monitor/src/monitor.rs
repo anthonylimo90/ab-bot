@@ -799,6 +799,9 @@ impl ArbMonitor {
                     selection_suppressed_since_tick = 0;
                     last_selection_market_delta = 0;
                     last_selection_asset_delta = 0;
+                    // Evict expired signal cooldowns to bound memory
+                    let signal_eviction_cutoff = Utc::now() - chrono::Duration::seconds(SIGNAL_COOLDOWN_SECS * 2);
+                    self.last_signal_time.retain(|_, ts| *ts > signal_eviction_cutoff);
                     let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::PeriodicRerank);
                     if outcome.applied {
                         selection_applied_since_tick = selection_applied_since_tick.saturating_add(1);

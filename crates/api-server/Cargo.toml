@@ -91,5 +91,8 @@ utoipa-swagger-ui = { version = "6", features = ["axum"] }
 # CLI
 clap.workspace = true
 
+# Memory allocator
+tikv-jemallocator.workspace = true
+
 [dev-dependencies]
 tokio-test.workspace = true
