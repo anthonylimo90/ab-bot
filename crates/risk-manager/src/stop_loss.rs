@@ -663,7 +663,7 @@ impl StopLossManager {
 
         let report = self.executor.execute_market_order(order).await?;
 
-        // Mark rule as executed
+        // Mark rule as executed, persist, then remove from in-memory cache
         if let Some(mut rule) = self.rules.get_mut(&stop.rule.id) {
             rule.mark_executed();
 
@@ -673,6 +673,11 @@ impl StopLossManager {
                     error!(rule_id = %rule.id, error = %e, "Failed to persist stop-loss execution");
                 }
             }
+        }
+        // Free memory: executed rules are persisted in DB, remove from DashMap
+        self.rules.remove(&stop.rule.id);
+        if let Some(mut pos_rules) = self.rules_by_position.get_mut(&stop.rule.position_id) {
+            pos_rules.retain(|id| *id != stop.rule.id);
         }
 
         // Send notification

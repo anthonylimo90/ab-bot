@@ -63,7 +63,8 @@ pub use cex::{
 };
 pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
 pub use error::ApiError;
-pub use exit_handler::{spawn_exit_handler, ExitHandlerConfig};
+use exit_handler::spawn_exit_handler;
+pub use exit_handler::ExitHandlerConfig;
 pub use flow_feature_calculator::{spawn_flow_feature_calculator, FlowFeatureConfig};
 pub use gamma_syncer::{spawn_gamma_syncer, GammaSyncerConfig};
 pub use learning_evaluator::{spawn_learning_evaluator, LearningEvaluatorConfig};
@@ -295,8 +296,10 @@ impl ApiServer {
         // Shared dedup set for arb executor + exit handler
         let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
 
-        // Spawn arb auto-executor unconditionally (per-signal guard checks enabled)
-        spawn_arb_auto_executor(
+        // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
+        // Returns the shared OutcomeTokenCache so exit_handler can reuse it
+        // instead of duplicating the entire Polymarket market universe (~57MB saved).
+        let shared_token_cache = spawn_arb_auto_executor(
             arb_config_arc.clone(),
             state.subscribe_arb_entry(),
             state.signal_tx.clone(),
@@ -325,6 +328,7 @@ impl ApiServer {
             state.pool.clone(),
             arb_dedup.clone(),
             state.exit_handler_heartbeat.clone(),
+            shared_token_cache,
         );
 
         // Subscribe local runtime to dynamic updates (arb executor config knobs)

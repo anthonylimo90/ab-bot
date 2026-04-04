@@ -800,8 +800,16 @@ impl ArbMonitor {
                     last_selection_market_delta = 0;
                     last_selection_asset_delta = 0;
                     // Evict expired signal cooldowns to bound memory
+                    // Evict expired signal cooldowns to bound memory
                     let signal_eviction_cutoff = Utc::now() - chrono::Duration::seconds(SIGNAL_COOLDOWN_SECS * 2);
                     self.last_signal_time.retain(|_, ts| *ts > signal_eviction_cutoff);
+                    // Prune stale order books for markets no longer in the active set
+                    let ob_before = self.order_books.len();
+                    self.order_books.retain(|k, _| self.eligible_markets.contains(&k.0));
+                    let ob_evicted = ob_before - self.order_books.len();
+                    if ob_evicted > 0 {
+                        debug!(evicted = ob_evicted, remaining = self.order_books.len(), "Pruned stale order books");
+                    }
                     let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::PeriodicRerank);
                     if outcome.applied {
                         selection_applied_since_tick = selection_applied_since_tick.saturating_add(1);

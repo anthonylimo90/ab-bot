@@ -255,6 +255,20 @@ impl OutcomeTokenCache {
         Ok(self.apply_market_update(&market).await?)
     }
 
+    /// Number of cached market → token mappings.
+    pub(crate) async fn len(&self) -> usize {
+        self.tokens.read().await.len()
+    }
+
+    /// Insert an alias mapping (e.g., asset_id → same token pair).
+    /// Used by exit_handler when a position's market_id is an asset_id.
+    pub(crate) async fn alias(&self, alias: &str, ids: &(String, String)) {
+        self.tokens
+            .write()
+            .await
+            .insert(alias.to_string(), ids.clone());
+    }
+
     async fn apply_market_update(
         &self,
         market: &Market,
@@ -516,10 +530,9 @@ impl ArbAutoExecutor {
         trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
-        clob_client: Arc<ClobClient>,
         pool: PgPool,
         active_markets: Arc<RwLock<HashSet<String>>>,
-        active_clob_markets: Arc<RwLock<HashSet<String>>>,
+        token_cache: Arc<OutcomeTokenCache>,
         heartbeat: Arc<AtomicI64>,
         runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
     ) -> Self {
@@ -535,9 +548,7 @@ impl ArbAutoExecutor {
                 pool.clone(),
                 trade_event_tx.clone(),
             ),
-            token_cache: Arc::new(
-                OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
-            ),
+            token_cache,
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             shadow_prediction_recorder: ShadowPredictionRecorder::new(pool.clone()),
             rollout_controller: LearningRolloutController::new(pool.clone()),
@@ -1553,6 +1564,10 @@ impl ArbAutoExecutor {
 
 /// Spawn the arb auto-executor as a background task.
 #[allow(clippy::too_many_arguments)]
+/// Spawn the arb auto-executor and return the shared `OutcomeTokenCache`.
+///
+/// The returned cache is shared with the exit handler to avoid duplicating
+/// the entire Polymarket market universe in memory (~57MB saved).
 pub fn spawn_arb_auto_executor(
     config: Arc<RwLock<ArbExecutorConfig>>,
     arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
@@ -1566,7 +1581,10 @@ pub fn spawn_arb_auto_executor(
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
     runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
-) {
+) -> Arc<OutcomeTokenCache> {
+    let token_cache =
+        Arc::new(OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()));
+
     let executor = ArbAutoExecutor::new(
         config,
         arb_entry_rx,
@@ -1574,10 +1592,9 @@ pub fn spawn_arb_auto_executor(
         trade_event_tx,
         order_executor,
         circuit_breaker,
-        clob_client,
         pool,
         active_markets,
-        active_clob_markets,
+        token_cache.clone(),
         heartbeat,
         runtime_status,
     );
@@ -1589,6 +1606,7 @@ pub fn spawn_arb_auto_executor(
     });
 
     info!("Arb auto-executor spawned as background task");
+    token_cache
 }
 
 #[allow(dead_code)] // Builder trait — some methods used only for signal events, others reserved.

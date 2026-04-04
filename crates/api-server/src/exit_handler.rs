@@ -9,7 +9,7 @@
 //! so closed positions unblock their markets for future trades.
 
 use chrono::Utc;
-use polymarket_core::api::{ClobClient, GammaClient};
+use polymarket_core::api::ClobClient;
 use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE, SOURCE_RECOMMENDATION};
 use polymarket_core::error::Error as PolymarketError;
 use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
@@ -103,159 +103,8 @@ impl ExitHandlerConfig {
     }
 }
 
-/// Cached mapping of market_id → (yes_token_id, no_token_id).
-struct OutcomeTokenCache {
-    gamma_client: GammaClient,
-    tokens: RwLock<HashMap<String, (String, String)>>,
-}
-
-impl OutcomeTokenCache {
-    fn new() -> Self {
-        Self {
-            gamma_client: GammaClient::new(None),
-            tokens: RwLock::new(HashMap::new()),
-        }
-    }
-
-    async fn refresh(&self) -> anyhow::Result<usize> {
-        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(200);
-        let markets = self
-            .gamma_client
-            .get_all_tradable_markets(gamma_page_size)
-            .await?;
-        let mut map = HashMap::new();
-
-        for market in &markets {
-            if market.outcomes.len() == 2 {
-                let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-                    (
-                        market.outcomes[0].token_id.clone(),
-                        market.outcomes[1].token_id.clone(),
-                    )
-                } else {
-                    (
-                        market.outcomes[1].token_id.clone(),
-                        market.outcomes[0].token_id.clone(),
-                    )
-                };
-                map.insert(market.id.clone(), (yes_id, no_id));
-            }
-        }
-
-        let count = map.len();
-        *self.tokens.write().await = map;
-        Ok(count)
-    }
-
-    async fn get(&self, market_id: &str) -> Option<(String, String)> {
-        self.tokens.read().await.get(market_id).cloned()
-    }
-
-    async fn hydrate_market(&self, market_id: &str) -> anyhow::Result<Option<(String, String)>> {
-        if let Some(ids) = self.get(market_id).await {
-            return Ok(Some(ids));
-        }
-
-        let market = match self.gamma_client.get_market(market_id).await {
-            Ok(market) => market,
-            Err(error) => {
-                warn!(
-                    market_id = %market_id,
-                    error = %error,
-                    "Failed to fetch market for exit token cache hydration"
-                );
-                return Ok(None);
-            }
-        };
-
-        let outcome_names = market
-            .outcomes
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
-        let token_ids = market
-            .clob_token_ids
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
-
-        let Some(outcome_names) = outcome_names else {
-            return Ok(None);
-        };
-        let Some(token_ids) = token_ids else {
-            return Ok(None);
-        };
-
-        if outcome_names.len() != 2 || token_ids.len() != 2 {
-            return Ok(None);
-        }
-
-        let (yes_id, no_id) = if outcome_names[0].to_lowercase().contains("yes") {
-            (token_ids[0].clone(), token_ids[1].clone())
-        } else {
-            (token_ids[1].clone(), token_ids[0].clone())
-        };
-
-        self.tokens
-            .write()
-            .await
-            .insert(market_id.to_string(), (yes_id.clone(), no_id.clone()));
-        Ok(Some((yes_id, no_id)))
-    }
-
-    async fn hydrate_clob_market(
-        &self,
-        clob_client: &ClobClient,
-        market_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
-        if let Some(ids) = self.get(market_id).await {
-            return Ok(Some(ids));
-        }
-
-        let market = match clob_client.get_market_by_id(market_id).await {
-            Ok(market) => market,
-            Err(error) => {
-                warn!(
-                    market_id = %market_id,
-                    error = %error,
-                    "Failed to fetch CLOB market for exit token cache hydration"
-                );
-                return Ok(None);
-            }
-        };
-
-        if market.outcomes.len() != 2 {
-            return Ok(None);
-        }
-
-        let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-            (
-                market.outcomes[0].token_id.clone(),
-                market.outcomes[1].token_id.clone(),
-            )
-        } else {
-            (
-                market.outcomes[1].token_id.clone(),
-                market.outcomes[0].token_id.clone(),
-            )
-        };
-
-        let mut tokens = self.tokens.write().await;
-        tokens.insert(market.id.clone(), (yes_id.clone(), no_id.clone()));
-        if market.id != market_id {
-            tokens.insert(market_id.to_string(), (yes_id.clone(), no_id.clone()));
-        }
-        Ok(Some((yes_id, no_id)))
-    }
-
-    async fn alias(&self, alias: &str, ids: &(String, String)) {
-        self.tokens
-            .write()
-            .await
-            .insert(alias.to_string(), ids.clone());
-    }
-}
+// Token cache is shared with arb_executor (saves ~57MB of duplicated market data).
+use crate::arb_executor::OutcomeTokenCache;
 
 /// Exit handler service — closes positions via sell orders or resolution detection.
 pub struct ExitHandler {
@@ -266,7 +115,7 @@ pub struct ExitHandler {
     circuit_breaker: Arc<CircuitBreaker>,
     clob_client: Arc<ClobClient>,
     signal_tx: broadcast::Sender<SignalUpdate>,
-    token_cache: OutcomeTokenCache,
+    token_cache: Arc<OutcomeTokenCache>,
     /// Shared dedup set with ArbAutoExecutor.
     arb_dedup: Arc<RwLock<HashSet<String>>>,
     trade_event_recorder: TradeEventRecorder,
@@ -287,7 +136,7 @@ struct QuantExitContext {
 
 impl ExitHandler {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         config: Arc<RwLock<ExitHandlerConfig>>,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
@@ -297,6 +146,7 @@ impl ExitHandler {
         pool: PgPool,
         arb_dedup: Arc<RwLock<HashSet<String>>>,
         heartbeat: Arc<AtomicI64>,
+        token_cache: Arc<OutcomeTokenCache>,
     ) -> Self {
         let position_service =
             crate::position_service::PositionService::new(pool.clone(), trade_event_tx.clone());
@@ -308,7 +158,7 @@ impl ExitHandler {
             circuit_breaker,
             clob_client: clob_client.clone(),
             signal_tx,
-            token_cache: OutcomeTokenCache::new(),
+            token_cache,
             arb_dedup,
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             position_service,
@@ -344,11 +194,13 @@ impl ExitHandler {
         // Mark liveness before the initial cache load, which can block on network I/O.
         self.touch_heartbeat();
 
-        // Initial token cache load
-        match self.token_cache.refresh().await {
-            Ok(count) => info!(markets = count, "Exit handler: token cache loaded"),
-            Err(e) => warn!(error = %e, "Exit handler: failed to load token cache, will retry"),
-        }
+        // Token cache is shared with arb_executor — no separate refresh needed.
+        // The arb_executor refreshes every cache_refresh_secs (default 300s).
+        let cache_size = self.token_cache.len().await;
+        info!(
+            markets = cache_size,
+            "Exit handler: using shared token cache from arb executor"
+        );
 
         let mut exit_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
             startup_cfg.exit_poll_interval_secs,
@@ -962,16 +814,18 @@ impl ExitHandler {
         &self,
         market_id: &str,
     ) -> anyhow::Result<Option<(String, String)>> {
+        // Fast path: already in shared cache
         if let Some(ids) = self.token_cache.get(market_id).await {
             return Ok(Some(ids));
         }
 
+        // Force a shared-cache refresh (arb_executor's full Gamma-based refresh)
         self.touch_heartbeat();
         if let Err(error) = self.token_cache.refresh().await {
             warn!(
                 market_id = %market_id,
                 error = %error,
-                "Failed to refresh exit token cache before retry"
+                "Failed to refresh shared token cache before retry"
             );
         }
 
@@ -979,25 +833,14 @@ impl ExitHandler {
             return Ok(Some(ids));
         }
 
-        if let Some(ids) = self
-            .token_cache
-            .hydrate_clob_market(self.clob_client.as_ref(), market_id)
-            .await?
-        {
+        // Single-market hydration via CLOB API
+        if let Some(ids) = self.token_cache.hydrate_market(market_id).await? {
             return Ok(Some(ids));
         }
 
+        // If market_id is actually a token_id (asset_id), look up its condition_id
         if let Some(condition_id) = self.lookup_condition_id_for_token(market_id).await? {
             if let Some(ids) = self.token_cache.get(&condition_id).await {
-                self.token_cache.alias(market_id, &ids).await;
-                return Ok(Some(ids));
-            }
-
-            if let Some(ids) = self
-                .token_cache
-                .hydrate_clob_market(self.clob_client.as_ref(), &condition_id)
-                .await?
-            {
                 self.token_cache.alias(market_id, &ids).await;
                 return Ok(Some(ids));
             }
@@ -1008,7 +851,7 @@ impl ExitHandler {
             }
         }
 
-        self.token_cache.hydrate_market(market_id).await
+        Ok(None)
     }
 
     async fn lookup_condition_id_for_token(
@@ -1708,7 +1551,7 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
 
 /// Spawn the exit handler as a background task.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_exit_handler(
+pub(crate) fn spawn_exit_handler(
     config: Arc<RwLock<ExitHandlerConfig>>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
@@ -1718,6 +1561,7 @@ pub fn spawn_exit_handler(
     pool: PgPool,
     arb_dedup: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
+    token_cache: Arc<OutcomeTokenCache>,
 ) {
     let handler = ExitHandler::new(
         config,
@@ -1729,6 +1573,7 @@ pub fn spawn_exit_handler(
         pool,
         arb_dedup,
         heartbeat,
+        token_cache,
     );
 
     tokio::spawn(async move {

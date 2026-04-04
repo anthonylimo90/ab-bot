@@ -346,7 +346,10 @@ struct QuantSignalExecutor {
     /// Per-strategy risk state (daily P&L, consecutive losses).
     strategy_states: HashMap<QuantSignalKind, StrategyState>,
     /// Closed quant positions that have already been folded into strategy state.
+    /// Cleared on UTC day rollover to prevent unbounded growth.
     processed_strategy_outcomes: HashSet<uuid::Uuid>,
+    /// UTC date when processed_strategy_outcomes was last cleared.
+    processed_outcomes_date: chrono::NaiveDate,
     heartbeat: Arc<AtomicI64>,
 }
 
@@ -394,6 +397,7 @@ impl QuantSignalExecutor {
             rollout_controller,
             strategy_states,
             processed_strategy_outcomes: HashSet::new(),
+            processed_outcomes_date: Utc::now().date_naive(),
             heartbeat,
         }
     }
@@ -533,6 +537,11 @@ impl QuantSignalExecutor {
         }
 
         let today = Utc::now().date_naive();
+        // Clear the dedup set on UTC day rollover to prevent unbounded growth
+        if today != self.processed_outcomes_date {
+            self.processed_strategy_outcomes.clear();
+            self.processed_outcomes_date = today;
+        }
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
             today.and_hms_opt(0, 0, 0).expect("valid midnight"),
             Utc,

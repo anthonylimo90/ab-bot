@@ -268,6 +268,10 @@ impl PositionManager {
                 realized_pnl = %realized_pnl,
                 "Position closed"
             );
+            // Release entry immediately — closed positions are persisted in DB,
+            // no need to hold them in the in-memory DashMap.
+            drop(entry);
+            self.positions.remove(&id);
             Ok(())
         } else {
             anyhow::bail!("Position {} not found", id)
