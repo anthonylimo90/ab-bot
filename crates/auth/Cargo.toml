@@ -28,11 +28,11 @@ tracing.workspace = true
 sqlx.workspace = true
 
 # Security
-jsonwebtoken = "9.2"
+jsonwebtoken = "10.3"
 argon2 = "0.5"
-rand = "0.8"
+rand = "0.9"
 base64.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 async-trait = "0.1"
 aes-gcm = "0.10"
