@@ -421,3 +421,49 @@ A signed live order is journaled before submission. `submitting` or `unknown` in
 Apply migrations 073–075 with the updated API. They add the complete market-catalog publication timestamp, inventory refresh status, and a covering index for pending or held exposure. Catalog refreshes publish a persisted markets projection; list requests return 503 until its first completed publication and then include observed-at/stale headers. The shared token refresh uses the faster of `ARB_CACHE_REFRESH_SECS` and `QUANT_CACHE_REFRESH_SECS`, with a minimum of one second.
 
 Recovery previews read the last completed inventory snapshot. Use the dashboard's **Refresh inventory** action, or `POST /api/v1/workspaces/{id}/recovery/preview?refresh=true`, to request a scan. Recovery runs require a successful fresh scan. Failed balance reads preserve previous observations and expose failure status; they never imply zero holdings. CLOB balances use six-decimal base units, converted to shares or USDC before valuation and capacity checks. Scans coordinate across replicas and publish inventory batches atomically.
+
+
+### Correctness repair upgrade (076–078)
+
+Stop the API and arb workers before applying migrations 076–078, then deploy all
+workers together. Older writers do not enforce position versions, so do not run
+mixed versions during this upgrade. Keep the existing migration-068 checksum
+repair procedure above; do not change recorded migration history wholesale.
+
+076 adds position execution mode, wallet identity and optimistic versions. 077
+adds wallet-scoped manual inventory with transactional fill accounting. 078 links
+position orders to their durable fill receipts. New live positions require a
+wallet address. Historical positions intentionally default to `unknown` and cannot
+submit automatic exits until their execution provenance has been verified.
+
+Inventory requiring operator verification can be listed with:
+
+```sql
+SELECT id, market_id, state, held_yes_qty, held_no_qty
+FROM positions WHERE execution_mode = 'unknown';
+SELECT execution_mode, wallet_address, market_id, outcome, quantity, cost_basis
+FROM manual_inventory WHERE wallet_address = 'unknown' AND quantity > 0;
+SELECT id, market_id, exchange_order_id, status
+FROM execution_intents WHERE status IN ('submitting', 'unknown');
+```
+
+Verify historical position mode and wallet against saved trade events, signed
+orders and wallet inventory before explicitly assigning provenance. Do not relabel
+all rows from the current runtime mode. Historical manual orders with missing
+wallet identity require matching their order history and ledger to the verified
+wallet in one transaction; their conservative exposure remains reserved meanwhile.
+Unlinked historical uncertain intents need verified position/leg or manual-order
+association. A missing exchange order or a 404 is not proof of non-execution and
+must not be used to delete a fence. New linked intents reconcile automatically
+from terminal exchange status and confirmed trade quantities/prices.
+
+Manual trades and automated positions retain separate inventory ownership.
+Use position exits for automated holdings and manual sell orders for manual
+holdings. Orphan recovery excludes both, including stale orphan flags. Missing
+manual fill prices reserve up to $1 per share; historical purchases retain a
+conservative basis rather than guessing their remaining lot allocation.
+
+`QUANT_TAKE_PROFIT_PCT` and `QUANT_STOP_LOSS_PCT` are fractions: `0.15` is 15%,
+`0.10` is 10%. Review existing overrides before enabling exits. Stop-loss and
+take-profit API order types now return a validation error; they are not durable
+protective orders. Dashboard development, CI and Docker use Node 24.

@@ -2,6 +2,9 @@ use super::*;
 use sqlx::Executor;
 
 async fn setup(pool: &PgPool) {
+    pool.execute("CREATE TABLE position_order_links(id UUID)")
+        .await
+        .unwrap();
     pool.execute("CREATE TABLE positions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(), market_id TEXT DEFAULT 'market', yes_entry_price NUMERIC DEFAULT 0,
         no_entry_price NUMERIC DEFAULT 0, quantity NUMERIC DEFAULT 0, entry_timestamp TIMESTAMPTZ DEFAULT NOW(), exit_strategy SMALLINT,
@@ -9,7 +12,15 @@ async fn setup(pool: &PgPool) {
         fee_model SMALLINT, resolution_payout_per_share NUMERIC, yes_entry_fee_shares NUMERIC, no_entry_fee_shares NUMERIC,
         held_yes_qty NUMERIC DEFAULT 0, held_no_qty NUMERIC DEFAULT 0, exited_yes_qty NUMERIC, exited_no_qty NUMERIC,
         resolution_winner TEXT, is_open BOOLEAN, opened_at TIMESTAMPTZ, source SMALLINT, source_signal_id UUID
-    ); CREATE TABLE orders (quantity NUMERIC,filled_quantity NUMERIC,price NUMERIC,side TEXT,status TEXT)").await.unwrap();
+    ); CREATE TABLE orders (quantity NUMERIC,filled_quantity NUMERIC,price NUMERIC,side TEXT,status TEXT,id UUID DEFAULT gen_random_uuid())").await.unwrap();
+    pool.execute("CREATE TABLE manual_inventory(cost_basis NUMERIC)")
+        .await
+        .unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/076_position_provenance.sql"
+    ))
+    .await
+    .unwrap();
     pool.execute(include_str!(
         "../../../../../migrations/069_execution_intents.sql"
     ))
@@ -22,7 +33,7 @@ async fn exposure_includes_failed_stalled_closed_holdings_and_pending_reservatio
     setup(&pool).await;
     pool.execute("INSERT INTO positions (state,held_yes_qty,held_no_qty,yes_entry_price,no_entry_price,quantity) VALUES
         (6,10,0,0.4,0,100),(7,0,5,0,0.6,100),(4,2,0,0.5,0,100),(0,1,0,0.4,0.5,10),(5,3,0,0.5,0,100);
-        INSERT INTO orders VALUES (10,4,0.5,'buy','partially_filled')").await.unwrap();
+        INSERT INTO orders(quantity,filled_quantity,price,side,status) VALUES (10,4,0.5,'buy','partially_filled')").await.unwrap();
     let repo = PositionRepository::new(pool.clone());
     assert_eq!(
         repo.get_total_active_exposure().await.unwrap(),
@@ -86,7 +97,7 @@ async fn candidate_filter_preserves_all_state_and_basis_combinations(pool: PgPoo
         CROSS JOIN (VALUES(0::numeric),(10::numeric)) yes_qty(y)
         CROSS JOIN (VALUES(0::numeric),(20::numeric)) no_qty(n);
         INSERT INTO positions(state,quantity) SELECT 4,100 FROM generate_series(1,10000);
-        INSERT INTO orders VALUES(10,2,0.4,'buy','pending'),(20,0,NULL,'buy','open');
+        INSERT INTO orders(quantity,filled_quantity,price,side,status) VALUES(10,2,0.4,'buy','pending'),(20,0,NULL,'buy','open');
         INSERT INTO execution_intents(id,market_id,signed_order,status)
         VALUES(gen_random_uuid(),'market','{\"makerAmount\":\"20000000\",\"side\":\"BUY\"}','unknown')").await.unwrap();
     let all_history =

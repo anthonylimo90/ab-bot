@@ -31,6 +31,7 @@ pub mod exit_handler;
 pub mod flow_feature_calculator;
 pub mod gamma_syncer;
 pub mod handlers;
+mod intent_reconciler;
 pub mod learning;
 pub mod learning_evaluator;
 pub mod learning_models;
@@ -47,6 +48,8 @@ pub mod redis_forwarder;
 pub mod routes;
 pub mod runtime_sync;
 pub mod schema;
+#[cfg(test)]
+mod security_http_tests;
 pub mod signals;
 pub mod state;
 pub mod strategy_health_calculator;
@@ -449,6 +452,7 @@ impl ApiServer {
         // Reconcile open-position marks and expose legacy one-legged rows to recovery.
         let position_reconciler_config = PositionReconcilerConfig::from_env();
         spawn_position_reconciler(position_reconciler_config, state.pool.clone());
+        intent_reconciler::spawn(state.clone());
 
         // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
         let account_snapshot_config = AccountSnapshotConfig::from_env();

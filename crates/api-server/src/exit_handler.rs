@@ -45,8 +45,10 @@ pub struct ExitHandlerConfig {
     /// How often to check market resolutions (seconds).
     pub resolution_check_secs: u64,
     /// Unrealized profit target for generic quant exits.
+    /// Fractional return: 0.15 means 15%.
     pub quant_take_profit_pct: Decimal,
     /// Unrealized loss threshold for generic quant exits.
+    /// Fractional loss: 0.10 means 10%.
     pub quant_stop_loss_pct: Decimal,
     /// Maximum holding period for generic quant exits.
     pub quant_max_hold_hours: i64,
@@ -284,7 +286,7 @@ impl ExitHandler {
             };
 
             candidate.position.update_pnl(yes_bid, no_bid, fee);
-            self.position_repo.update(&candidate.position).await?;
+            self.position_repo.update(&mut candidate.position).await?;
 
             if self
                 .should_mark_exit_ready(
@@ -339,13 +341,12 @@ impl ExitHandler {
 
     /// Execute the sell orders for a single ExitReady position.
     async fn execute_exit(&self, position: &mut Position) -> anyhow::Result<()> {
+        self.order_executor
+            .validate_position_execution(position)
+            .await?;
         let market_id = position.market_id.clone();
         self.touch_heartbeat();
-        let execution_mode = if self.order_executor.is_live_ready().await {
-            "live"
-        } else {
-            "paper"
-        };
+        let execution_mode = position.execution_mode.clone();
         // Always try to load quant context — dual-leg quant positions have both
         // prices set, so a zero-price gate would misclassify them as arb.
         let quant_ctx = self
@@ -360,7 +361,7 @@ impl ExitHandler {
         } else {
             SOURCE_ARBITRAGE
         };
-        let ctx = Self::event_context(execution_mode, source, quant_ctx.as_ref());
+        let ctx = Self::event_context(&execution_mode, source, quant_ctx.as_ref());
         if let Err(e) = self.position_service.mark_closing(position, &ctx).await {
             warn!(error = %e, "mark_closing failed");
             return Ok(());
@@ -393,7 +394,8 @@ impl ExitHandler {
                     "YES",
                     &yes_token_id,
                     OrderSide::Sell,
-                    position.quantity,
+                    position.held_yes_qty,
+                    position,
                 )
                 .await
             {
@@ -421,6 +423,9 @@ impl ExitHandler {
                 }
             };
 
+            if yes_report.status == polymarket_core::types::OrderStatus::Pending {
+                return Ok(());
+            }
             if !yes_report.is_success() {
                 let msg = yes_report
                     .error_message
@@ -447,6 +452,7 @@ impl ExitHandler {
                     yes_report.average_price,
                     yes_report.filled_quantity,
                     &ctx,
+                    (ctx.execution_mode == "live").then_some(yes_report.order_id),
                 )
                 .await
             {
@@ -482,7 +488,8 @@ impl ExitHandler {
                     "NO",
                     &no_token_id,
                     OrderSide::Sell,
-                    position.quantity,
+                    position.held_no_qty,
+                    position,
                 )
                 .await
             {
@@ -510,6 +517,9 @@ impl ExitHandler {
                 }
             };
 
+            if no_report.status == polymarket_core::types::OrderStatus::Pending {
+                return Ok(());
+            }
             if !no_report.is_success() {
                 let msg = no_report
                     .error_message
@@ -536,6 +546,7 @@ impl ExitHandler {
                     no_report.average_price,
                     no_report.filled_quantity,
                     &ctx,
+                    (ctx.execution_mode == "live").then_some(no_report.order_id),
                 )
                 .await
             {
@@ -562,6 +573,19 @@ impl ExitHandler {
 
         let fee = Decimal::new(2, 2); // 2%
 
+        if position.has_open_exposure() {
+            self.position_service
+                .mark_exit_failed(
+                    position,
+                    FailureReason::Unknown {
+                        message: "Partial exit; remaining shares require another confirmed sale"
+                            .into(),
+                    },
+                    &ctx,
+                )
+                .await?;
+            return Ok(());
+        }
         // Close position
         if let Err(e) = self
             .position_service
@@ -711,6 +735,14 @@ impl ExitHandler {
         quant_ctx: Option<&QuantExitContext>,
         resolved_yes_winner: Option<bool>,
     ) -> anyhow::Result<bool> {
+        if position.execution_mode == "unknown" {
+            return Ok(false);
+        }
+        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM position_order_links WHERE position_id=$1 AND NOT settled)")
+            .bind(position.id).fetch_one(&self.pool).await?;
+        if pending {
+            return Ok(false);
+        }
         let market_id = position.market_id.clone();
         let fee = Decimal::new(2, 2);
 
@@ -727,7 +759,7 @@ impl ExitHandler {
             return Ok(false);
         };
 
-        let execution_mode = self.current_execution_mode().await;
+        let execution_mode = position.execution_mode.clone();
         let ctx = Self::event_context(&execution_mode, source, quant_ctx);
         if let Err(e) = self
             .position_service
@@ -964,7 +996,7 @@ impl ExitHandler {
     fn generic_quant_exit(&self, position: &Position, cfg: &ExitHandlerConfig) -> bool {
         let entry_cost = position.entry_cost();
         let pnl_pct = if entry_cost > Decimal::ZERO {
-            (position.unrealized_pnl / entry_cost) * Decimal::new(100, 0)
+            position.unrealized_pnl / entry_cost
         } else {
             Decimal::ZERO
         };
@@ -1142,6 +1174,7 @@ impl ExitHandler {
             ("arb".to_string(), "arb".to_string())
         };
         EventContext {
+            wallet_address: None,
             execution_mode: execution_mode.to_string(),
             strategy,
             source_label,
@@ -1155,10 +1188,15 @@ impl ExitHandler {
         token_id: &str,
         side: OrderSide,
         quantity: Decimal,
+        position: &Position,
     ) -> anyhow::Result<polymarket_core::types::ExecutionReport> {
         let order = MarketOrder::new(market_id.to_string(), token_id.to_string(), side, quantity);
 
-        match self.order_executor.execute_market_order(order).await {
+        match self
+            .order_executor
+            .execute_market_order_for_position(order, position, &leg.to_ascii_lowercase())
+            .await
+        {
             Ok(report) => Ok(report),
             Err(error) if is_not_found_error(&error) => {
                 warn!(
@@ -1194,7 +1232,13 @@ impl ExitHandler {
 
                 let retry_order =
                     MarketOrder::new(market_id.to_string(), refreshed_token_id, side, quantity);
-                self.order_executor.execute_market_order(retry_order).await
+                self.order_executor
+                    .execute_market_order_for_position(
+                        retry_order,
+                        position,
+                        &leg.to_ascii_lowercase(),
+                    )
+                    .await
             }
             Err(error) => Err(error),
         }
@@ -1668,22 +1712,24 @@ mod tests {
 
     #[test]
     fn test_held_outcomes_for_single_leg_positions() {
-        let yes_only = Position::new(
+        let mut yes_only = Position::new(
             "m1".to_string(),
             Decimal::new(55, 2),
             Decimal::ZERO,
             Decimal::ONE,
             polymarket_core::types::ExitStrategy::ExitOnCorrection,
         );
+        yes_only.apply_yes_entry_fill(Decimal::ONE);
         assert_eq!(held_outcomes(&yes_only), (true, false));
 
-        let no_only = Position::new(
+        let mut no_only = Position::new(
             "m1".to_string(),
             Decimal::ZERO,
             Decimal::new(45, 2),
             Decimal::ONE,
             polymarket_core::types::ExitStrategy::ExitOnCorrection,
         );
+        no_only.apply_no_entry_fill(Decimal::ONE);
         assert_eq!(held_outcomes(&no_only), (false, true));
     }
 
@@ -1696,11 +1742,14 @@ mod tests {
             Decimal::ONE,
             polymarket_core::types::ExitStrategy::ExitOnCorrection,
         );
+        both_legs.apply_yes_entry_fill(Decimal::ONE);
+        both_legs.apply_no_entry_fill(Decimal::ONE);
         both_legs.mark_open().unwrap();
         both_legs.mark_exit_ready().unwrap();
         both_legs.mark_closing().unwrap();
         both_legs.record_yes_exit_fill(Decimal::new(54, 2)).unwrap();
 
+        both_legs.apply_yes_exit_fill(Decimal::ONE).unwrap();
         assert_eq!(held_outcomes(&both_legs), (false, true));
     }
 
@@ -1757,3 +1806,7 @@ fn resolved_yes_winner(market: &Market) -> Option<bool> {
         }
     })
 }
+
+#[cfg(test)]
+#[path = "exit_handler/correctness_tests.rs"]
+pub(crate) mod correctness_tests;

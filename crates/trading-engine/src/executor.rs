@@ -180,7 +180,7 @@ impl OrderExecutor {
     ) -> Self {
         let (report_tx, _) = broadcast::channel(1000);
 
-        let auth_client = Self::build_auth_client(wallet);
+        let auth_client = Self::build_auth_client(wallet, clob_client.as_ref().clone());
 
         info!(
             address = %auth_client.address(),
@@ -207,9 +207,8 @@ impl OrderExecutor {
         self
     }
 
-    fn build_auth_client(wallet: TradingWallet) -> AuthenticatedClobClient {
+    fn build_auth_client(wallet: TradingWallet, client: ClobClient) -> AuthenticatedClobClient {
         let signer = OrderSigner::new(wallet.into_signer());
-        let client = ClobClient::new(None, None);
         AuthenticatedClobClient::new(client, signer)
     }
 
@@ -255,7 +254,7 @@ impl OrderExecutor {
             ));
         }
 
-        let mut auth_client = Self::build_auth_client(wallet);
+        let mut auth_client = Self::build_auth_client(wallet, self.clob_client.as_ref().clone());
         let address = auth_client.address();
         auth_client
             .create_or_derive_api_key()
@@ -301,6 +300,113 @@ impl OrderExecutor {
 
     /// Execute a market order with timeout and retry logic.
     pub async fn execute_market_order(&self, order: MarketOrder) -> Result<ExecutionReport> {
+        self.execute_market_order_bound(order, self.is_live(), None)
+            .await
+    }
+
+    pub async fn validate_position_execution(
+        &self,
+        position: &polymarket_core::types::Position,
+    ) -> Result<()> {
+        self.validate_execution(&position.execution_mode, position.wallet_address.as_deref())
+            .await
+    }
+
+    async fn validate_execution(&self, mode: &str, wallet: Option<&str>) -> Result<()> {
+        match mode {
+            "paper" if !self.is_live() => Ok(()),
+            "live"
+                if self.is_live_ready().await
+                    && wallet.is_some()
+                    && self
+                        .wallet_address()
+                        .await
+                        .as_deref()
+                        .map(str::to_lowercase)
+                        == wallet.map(str::to_lowercase) =>
+            {
+                Ok(())
+            }
+            _ => anyhow::bail!("Position execution mode or wallet does not match the executor"),
+        }
+    }
+
+    pub async fn execute_reserved_market_order(
+        &self,
+        order: MarketOrder,
+        mode: &str,
+        wallet: Option<&str>,
+    ) -> Result<ExecutionReport> {
+        self.validate_execution(mode, wallet).await?;
+        self.execute_market_order_bound(order, mode == "live", wallet)
+            .await
+    }
+
+    pub async fn execute_reserved_limit_order(
+        &self,
+        order: LimitOrder,
+        mode: &str,
+        wallet: Option<&str>,
+    ) -> Result<ExecutionReport> {
+        self.validate_execution(mode, wallet).await?;
+        self.execute_limit_order_bound(order, mode == "live", wallet)
+            .await
+    }
+
+    pub async fn execute_market_order_for_position(
+        &self,
+        order: MarketOrder,
+        position: &polymarket_core::types::Position,
+        leg: &str,
+    ) -> Result<ExecutionReport> {
+        self.validate_position_execution(position).await?;
+        let id = order.id;
+        if position.execution_mode == "live" {
+            let pool = self
+                .database
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Durable storage required"))?;
+            let mut tx = pool.begin().await?;
+            sqlx::query("SELECT id FROM positions WHERE id=$1 AND version=$2 FOR UPDATE")
+                .bind(position.id)
+                .bind(position.version)
+                .fetch_one(&mut *tx)
+                .await?;
+            let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM position_order_links WHERE position_id=$1 AND NOT settled)")
+                .bind(position.id).fetch_one(&mut *tx).await?;
+            if pending {
+                anyhow::bail!("{SUBMISSION_UNKNOWN}: position has an unresolved order");
+            }
+            sqlx::query("INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity) VALUES($1,$2,$3,$4,$5)")
+                .bind(id).bind(position.id).bind(leg).bind(if order.side == OrderSide::Buy { "buy" } else { "sell" }).bind(order.quantity)
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+        let result = self
+            .execute_market_order_bound(
+                order,
+                position.execution_mode == "live",
+                position.wallet_address.as_deref(),
+            )
+            .await;
+        if let Some(pool) = &self.database {
+            if result
+                .as_ref()
+                .is_ok_and(|report| report.status == OrderStatus::Rejected)
+            {
+                sqlx::query("UPDATE position_order_links SET settled=TRUE WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM execution_intents WHERE id=$1 AND NOT (status='rejected' OR (status='acknowledged' AND LOWER(response->>'status') IN ('unmatched','rejected'))))")
+                    .bind(id).execute(pool).await?;
+            }
+        }
+        result
+    }
+
+    async fn execute_market_order_bound(
+        &self,
+        order: MarketOrder,
+        live: bool,
+        wallet: Option<&str>,
+    ) -> Result<ExecutionReport> {
         let start = std::time::Instant::now();
 
         // Validate order
@@ -332,8 +438,8 @@ impl OrderExecutor {
         let report = self
             .execute_with_retry(
                 || async {
-                    if self.is_live() {
-                        self.execute_live_market_order(&order).await
+                    if live {
+                        self.execute_live_market_order(&order, wallet).await
                     } else {
                         self.simulate_market_order(&order).await
                     }
@@ -342,6 +448,7 @@ impl OrderExecutor {
                 &order.market_id,
                 &order.outcome_id,
                 order.side,
+                live,
             )
             .await;
 
@@ -391,6 +498,7 @@ impl OrderExecutor {
         market_id: &str,
         outcome_id: &str,
         side: OrderSide,
+        live: bool,
     ) -> ExecutionReport
     where
         F: Fn() -> Fut,
@@ -402,11 +510,7 @@ impl OrderExecutor {
 
         // Live operations cross a non-idempotent exchange boundary. Never rerun
         // the operation after a timeout or transport failure.
-        let max_retries = if self.is_live() {
-            0
-        } else {
-            self.config.max_retries
-        };
+        let max_retries = if live { 0 } else { self.config.max_retries };
         while attempts <= max_retries {
             attempts += 1;
 
@@ -472,7 +576,7 @@ impl OrderExecutor {
                     }
                 }
                 Err(_) => {
-                    if self.is_live() {
+                    if live {
                         return ExecutionReport::pending(
                             *order_id,
                             market_id.into(),
@@ -524,6 +628,16 @@ impl OrderExecutor {
 
     /// Execute a limit order with timeout and retry logic.
     pub async fn execute_limit_order(&self, order: LimitOrder) -> Result<ExecutionReport> {
+        self.execute_limit_order_bound(order, self.is_live(), None)
+            .await
+    }
+
+    async fn execute_limit_order_bound(
+        &self,
+        order: LimitOrder,
+        live: bool,
+        wallet: Option<&str>,
+    ) -> Result<ExecutionReport> {
         // Validate order
         if order.quantity > self.config.max_order_size {
             let report = ExecutionReport::rejected(
@@ -554,8 +668,8 @@ impl OrderExecutor {
         let report = self
             .execute_with_retry(
                 || async {
-                    if self.is_live() {
-                        self.execute_live_limit_order(&order).await
+                    if live {
+                        self.execute_live_limit_order(&order, wallet).await
                     } else {
                         self.simulate_limit_order(&order).await
                     }
@@ -564,6 +678,7 @@ impl OrderExecutor {
                 &order.market_id,
                 &order.outcome_id,
                 order.side,
+                live,
             )
             .await;
 
@@ -861,7 +976,11 @@ impl OrderExecutor {
         None
     }
 
-    async fn execute_live_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
+    async fn execute_live_market_order(
+        &self,
+        order: &MarketOrder,
+        wallet: Option<&str>,
+    ) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
         let client_guard = self.auth_client.read().await;
         let client = match client_guard.as_ref() {
@@ -877,6 +996,10 @@ impl OrderExecutor {
                 ));
             }
         };
+
+        if wallet.is_some_and(|address| !address.eq_ignore_ascii_case(&client.address())) {
+            anyhow::bail!("Position wallet changed before submission");
+        }
 
         // Get the best price from orderbook
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
@@ -990,13 +1113,17 @@ impl OrderExecutor {
                 sqlx::query("UPDATE execution_intents SET status='unknown' WHERE id=$1")
                     .bind(order.id)
                     .execute(pool)
-                    .await?;
+                    .await.map_err(|error| anyhow::anyhow!("{SUBMISSION_UNKNOWN}: failed to persist unresolved acceptance: {error}"))?;
             }
         }
         Ok(report)
     }
 
-    async fn execute_live_limit_order(&self, order: &LimitOrder) -> Result<ExecutionReport> {
+    async fn execute_live_limit_order(
+        &self,
+        order: &LimitOrder,
+        wallet: Option<&str>,
+    ) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
         let client_guard = self.auth_client.read().await;
         let client = match client_guard.as_ref() {
@@ -1013,6 +1140,9 @@ impl OrderExecutor {
             }
         };
 
+        if wallet.is_some_and(|address| !address.eq_ignore_ascii_case(&client.address())) {
+            anyhow::bail!("Reserved order wallet changed before submission");
+        }
         // Convert order side to signing order side
         let signing_side = match order.side {
             OrderSide::Buy => SigningOrderSide::Buy,
@@ -1155,6 +1285,21 @@ impl OrderExecutor {
             order.price,
             fees,
         ))
+    }
+
+    pub async fn confirmed_exchange_fill(
+        &self,
+        maker: &str,
+        snapshot: &polymarket_core::api::clob::ExchangeOrder,
+    ) -> Result<(Decimal, Decimal)> {
+        let guard = self.auth_client.read().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No authenticated client"))?;
+        if !maker.eq_ignore_ascii_case(&client.address()) {
+            anyhow::bail!("Intent wallet mismatch");
+        }
+        Ok(client.confirmed_order_fill(snapshot).await?)
     }
 
     pub async fn get_exchange_order(
@@ -1319,6 +1464,7 @@ mod tests {
                 "market",
                 "token",
                 OrderSide::Buy,
+                true,
             )
             .await;
         assert_eq!(report.status, OrderStatus::Pending);
@@ -1330,6 +1476,7 @@ mod tests {
                 "market",
                 "token",
                 OrderSide::Buy,
+                true,
             )
             .await;
         assert_eq!(report.status, OrderStatus::Pending);

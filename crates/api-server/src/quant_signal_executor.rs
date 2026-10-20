@@ -1052,6 +1052,7 @@ impl QuantSignalExecutor {
             SignalDirection::BuyNo => (Decimal::ZERO, best_ask),
         };
         let ctx = EventContext {
+            wallet_address: self.order_executor.wallet_address().await,
             execution_mode: execution_mode.clone(),
             strategy: signal.kind.as_str().to_string(),
             source_label: "quant".to_string(),
@@ -1104,7 +1105,19 @@ impl QuantSignalExecutor {
         .with_expected_price(best_ask)
         .with_slippage(self.order_executor.default_slippage());
 
-        let report = match self.order_executor.execute_market_order(order).await {
+        let report = match self
+            .order_executor
+            .execute_market_order_for_position(
+                order,
+                &position,
+                if signal.direction == SignalDirection::BuyYes {
+                    "yes"
+                } else {
+                    "no"
+                },
+            )
+            .await
+        {
             Ok(report) => report,
             Err(e) => {
                 warn!(
@@ -1137,6 +1150,9 @@ impl QuantSignalExecutor {
             }
         };
 
+        if report.status == polymarket_core::types::OrderStatus::Pending {
+            return Ok(());
+        }
         if !report.is_success() {
             warn!(
                 signal_id = %signal.id,
@@ -1179,10 +1195,11 @@ impl QuantSignalExecutor {
                 report.average_price,
                 report.filled_quantity,
                 &ctx,
+                (ctx.execution_mode == "live").then_some(report.order_id),
             )
             .await
         {
-            warn!(error = %e, position_id = %position.id, "Failed to record entry fill");
+            return Err(e.context("Failed to persist confirmed entry fill"));
         }
 
         if let Err(e) = self.position_service.mark_open(&mut position, &ctx).await {

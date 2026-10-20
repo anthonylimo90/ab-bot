@@ -18,8 +18,8 @@ export function WorkspaceGate({ children }: WorkspaceGateProps) {
   const { currentWorkspace } = useWorkspaceStore();
   const { isInitializing } = useWorkspaceContext();
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    if (!(await logout())) return;
     router.push('/login');
   };
 

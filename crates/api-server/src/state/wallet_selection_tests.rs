@@ -21,7 +21,7 @@ fn vault() -> KeyVault {
 }
 
 async fn setup(pool: &PgPool, configured: Option<&str>) -> Uuid {
-    pool.execute("CREATE TABLE execution_intents (status TEXT); CREATE TABLE orders (execution_mode TEXT,status TEXT)").await.unwrap();
+    pool.execute("CREATE TABLE manual_inventory(execution_mode TEXT,quantity NUMERIC); CREATE TABLE execution_intents (status TEXT); CREATE TABLE orders (execution_mode TEXT,status TEXT)").await.unwrap();
     pool.execute(
         "CREATE TABLE workspaces (
             id UUID PRIMARY KEY, trading_wallet_address TEXT,

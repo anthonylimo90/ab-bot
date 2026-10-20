@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { User } from '@/types/api';
-import api from '@/lib/api';
+import api, { ApiHttpError } from '@/lib/api';
+import { useToastStore } from '@/stores/toast-store';
 import { queryClient } from '@/lib/queryClient';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { useWalletStore } from '@/stores/wallet-store';
@@ -14,7 +15,7 @@ interface AuthStore {
   _hasHydrated: boolean;
 
   setAuth: (token: string, user: User) => void;
-  logout: () => void;
+  logout: () => Promise<boolean>;
   checkAuth: () => Promise<void>;
   setHasHydrated: (state: boolean) => void;
   isPlatformAdmin: () => boolean;
@@ -45,10 +46,22 @@ export const useAuthStore = create<AuthStore>()(
         set({ token, user, isAuthenticated: true, isLoading: false });
       },
 
-      logout: () => {
+      logout: async () => {
+        const token = get().token;
+        try {
+          if (token) await api.logout();
+        } catch (error) {
+          if (!(error instanceof ApiHttpError && error.isUnauthorized)) {
+            useToastStore.getState().error('Logout failed', 'Your session is still active. Please try again.');
+            return false;
+          }
+        }
+        // A concurrent sign-in must not be cleared by an older logout request.
+        if (get().token !== token) return false;
         api.clearToken();
         resetSessionContext();
         set({ token: null, user: null, isAuthenticated: false, isLoading: false });
+        return true;
       },
 
       checkAuth: async () => {

@@ -86,6 +86,8 @@ pub struct SpreadInfo {
 /// Query parameters for listing markets.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListMarketsQuery {
+    /// Case-insensitive literal question or category search across the catalog.
+    pub search: Option<String>,
     /// Filter by category.
     pub category: Option<String>,
     /// Filter by active status.
@@ -172,9 +174,10 @@ async fn load_market_page(
          FROM markets WHERE ($1::boolean IS NULL OR active=$1)
          AND ($2::numeric IS NULL OR volume_24h >= $2)
          AND ($3::text IS NULL OR strpos(lower(category),lower($3)) > 0)
+         AND ($6::text IS NULL OR strpos(lower(question),lower($6))>0 OR strpos(lower(category),lower($6))>0)
          ORDER BY id ASC LIMIT $4 OFFSET $5"
     ).bind(query.active).bind(query.min_volume).bind(&query.category)
-        .bind(query.limit).bind(query.offset).fetch_all(pool).await?;
+        .bind(query.limit).bind(query.offset).bind(query.search.as_deref().map(str::trim).filter(|s| !s.is_empty())).fetch_all(pool).await?;
     Ok(rows
         .into_iter()
         .map(|row| MarketResponse {
@@ -452,6 +455,7 @@ mod tests {
         .await
         .unwrap();
         let mut query = ListMarketsQuery {
+            search: None,
             category: None,
             active: None,
             min_volume: None,
@@ -467,6 +471,14 @@ mod tests {
         assert_eq!(load_market_page(&pool, &query).await.unwrap()[0].id, "c");
         query.min_volume = Some(Decimal::from(31));
         assert!(load_market_page(&pool, &query).await.unwrap().is_empty());
+        pool.execute("INSERT INTO markets(id,question,category,end_date,active,volume_24h) SELECT 'prefix-'||n,'Unrelated','sports',NOW(),TRUE,10 FROM generate_series(1,150) n; INSERT INTO markets(id,question,category,end_date,active,volume_24h) VALUES ('zz-target','Rare needle question','science',NOW(),TRUE,50)").await.unwrap();
+        query.category = None;
+        query.min_volume = None;
+        query.search = Some("NEEDLE".into());
+        assert_eq!(
+            load_market_page(&pool, &query).await.unwrap()[0].id,
+            "zz-target"
+        );
         query.offset = -1;
         assert!(load_market_page(&pool, &query).await.is_err());
     }

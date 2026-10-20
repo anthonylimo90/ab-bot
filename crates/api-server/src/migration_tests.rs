@@ -79,5 +79,5 @@ async fn complete_schema_migrates_with_sqlx_transactions(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 75);
+    assert_eq!(version, 78);
 }

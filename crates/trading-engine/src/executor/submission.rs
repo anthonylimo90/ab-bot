@@ -52,6 +52,15 @@ impl OrderExecutor {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('live-order-submission'))")
             .execute(&mut *tx)
             .await?;
+        let retired: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM position_order_links WHERE id=$1 AND settled)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retired {
+            anyhow::bail!("Position order attempt was retired before submission");
+        }
         let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_intents WHERE id = $1 OR (status IN ('submitting', 'unknown') AND LOWER(signed_order->>'maker')=LOWER($2)))")
             .bind(id).bind(&signed.maker).fetch_one(&mut *tx).await?;
         if blocked {
@@ -104,6 +113,9 @@ mod tests {
         ))
         .await
         .unwrap();
+        pool.execute("CREATE TABLE position_order_links(id UUID,settled BOOLEAN)")
+            .await
+            .unwrap();
         let make_executor = || {
             OrderExecutor::new(
                 Arc::new(ClobClient::new(None, None)),

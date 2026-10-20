@@ -184,6 +184,7 @@ pub async fn run_recovery(
         "paper"
     };
     let ctx = EventContext {
+        wallet_address: None,
         execution_mode: execution_mode.to_string(),
         strategy: "recovery".to_string(),
         source_label: "recovery".to_string(),

@@ -91,6 +91,13 @@ pub enum FailureReason {
 /// An arbitrage position tracking both YES and NO holdings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
+    /// Immutable origin of the inventory; unknown legacy rows cannot be traded.
+    #[serde(default = "unknown_execution_mode")]
+    pub execution_mode: String,
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    #[serde(default)]
+    pub version: i64,
     /// Unique identifier for this position.
     pub id: Uuid,
     /// Polymarket market identifier.
@@ -150,6 +157,10 @@ pub const MAX_RETRY_ATTEMPTS: u32 = 3;
 /// Stale threshold in seconds (5 minutes).
 pub const STALE_THRESHOLD_SECS: u64 = 300;
 
+fn unknown_execution_mode() -> String {
+    "unknown".into()
+}
+
 impl Position {
     /// Create a new pending position.
     pub fn new(
@@ -163,6 +174,9 @@ impl Position {
         let legacy_entry_fee_drag =
             (yes_entry_price + no_entry_price) * ArbOpportunity::DEFAULT_FEE;
         Self {
+            execution_mode: "unknown".into(),
+            wallet_address: None,
+            version: 0,
             id: Uuid::new_v4(),
             market_id,
             yes_entry_price,
@@ -194,7 +208,13 @@ impl Position {
 
     /// Total entry cost for this position.
     pub fn entry_cost(&self) -> Decimal {
-        (self.yes_entry_price + self.no_entry_price) * self.quantity
+        let yes_qty = self.held_yes_qty + self.exited_yes_qty;
+        let no_qty = self.held_no_qty + self.exited_no_qty;
+        if yes_qty > Decimal::ZERO || no_qty > Decimal::ZERO {
+            self.yes_entry_price * yes_qty + self.no_entry_price * no_qty
+        } else {
+            (self.yes_entry_price + self.no_entry_price) * self.quantity
+        }
     }
 
     /// Apply share-based fee terms from an arbitrage opportunity.
@@ -217,6 +237,22 @@ impl Position {
     /// `fee` is only used for legacy flat-fee positions.
     pub fn update_pnl(&mut self, yes_bid: Decimal, no_bid: Decimal, fee: Decimal) {
         let entry_cost = self.entry_cost();
+        if self.execution_mode != "unknown" && self.has_open_exposure() {
+            let proceeds = self.yes_exit_price.unwrap_or_default() * self.exited_yes_qty
+                + self.no_exit_price.unwrap_or_default() * self.exited_no_qty;
+            let remaining = match self.exit_strategy {
+                ExitStrategy::ExitOnCorrection => {
+                    yes_bid * self.held_yes_qty + no_bid * self.held_no_qty
+                }
+                ExitStrategy::HoldToResolution => self.held_yes_qty.min(self.held_no_qty),
+            };
+            self.unrealized_pnl = proceeds + remaining - entry_cost;
+            if self.fee_model == PositionFeeModel::LegacyFlat {
+                self.unrealized_pnl -= fee * (entry_cost + proceeds + remaining);
+            }
+            self.last_updated = Utc::now();
+            return;
+        }
         match self.exit_strategy {
             ExitStrategy::ExitOnCorrection => {
                 self.unrealized_pnl = match self.fee_model {
@@ -361,24 +397,14 @@ impl Position {
             return (false, false);
         }
 
-        let has_yes = self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none();
-        let has_no = self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none();
+        let has_yes = self.held_yes_qty > Decimal::ZERO;
+        let has_no = self.held_no_qty > Decimal::ZERO;
         (has_yes, has_no)
     }
 
-    /// True if both YES and NO legs are currently held.
-    ///
-    /// Prefers explicit qty fields when populated (new positions created
-    /// through PositionService). Falls back to price inference for legacy
-    /// positions where qty fields are still zero.
+    /// True if both YES and NO legs have explicit remaining inventory.
     pub fn has_full_pair_exposure(&self) -> bool {
-        if self.held_yes_qty > Decimal::ZERO || self.held_no_qty > Decimal::ZERO {
-            // Explicit qty fields are populated — use them
-            self.held_yes_qty > Decimal::ZERO && self.held_no_qty > Decimal::ZERO
-        } else {
-            // Legacy fallback: infer from entry prices and exit prices
-            self.held_outcomes() == (true, true)
-        }
+        self.held_yes_qty > Decimal::ZERO && self.held_no_qty > Decimal::ZERO
     }
 
     // ── Per-leg exposure tracking (explicit qty fields) ─────────────
@@ -829,6 +855,8 @@ mod tests {
         assert_eq!(pos.entry_cost(), Decimal::new(94, 0));
         assert_eq!(pos.state, PositionState::Pending);
 
+        pos.apply_yes_entry_fill(pos.quantity);
+        pos.apply_no_entry_fill(pos.quantity);
         pos.mark_open().unwrap();
         assert_eq!(pos.state, PositionState::Open);
 
@@ -971,9 +999,12 @@ mod tests {
             Decimal::new(100, 0),
             ExitStrategy::ExitOnCorrection,
         );
+        pos.apply_yes_entry_fill(pos.quantity);
+        pos.apply_no_entry_fill(pos.quantity);
         pos.mark_open().unwrap();
         pos.record_yes_exit_fill(Decimal::new(52, 2)).unwrap();
 
+        pos.apply_yes_exit_fill(pos.quantity).unwrap();
         assert_eq!(pos.held_outcomes(), (false, true));
     }
 
@@ -1000,6 +1031,8 @@ mod tests {
             no_fee_shares: Decimal::new(2, 2),
         };
         pos.apply_arb_fee_model(&arb);
+        pos.apply_yes_entry_fill(pos.quantity);
+        pos.apply_no_entry_fill(pos.quantity);
         pos.mark_open().unwrap();
         pos.mark_exit_ready().unwrap();
 

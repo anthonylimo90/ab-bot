@@ -689,6 +689,7 @@ pub async fn close_position(
     let execution_mode = current_execution_mode(state.as_ref()).await;
     let (strategy, source_label) = trade_event_labels(row.source);
     let ctx = EventContext {
+        wallet_address: None,
         execution_mode: execution_mode.to_string(),
         strategy: strategy.to_string(),
         source_label: source_label.to_string(),
@@ -708,7 +709,7 @@ pub async fn close_position(
             state
                 .position_service
                 .repo()
-                .update(&position)
+                .update(&mut position)
                 .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
         }

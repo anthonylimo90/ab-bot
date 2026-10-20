@@ -2685,6 +2685,7 @@ fn build_summary(
     tag = "trade_flow"
 )]
 pub async fn get_trade_flow_summary(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<TradeFlowSummaryResponse>> {
@@ -2716,6 +2717,7 @@ pub async fn get_trade_flow_summary(
     tag = "trade_flow"
 )]
 pub async fn get_trade_flow_journeys(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<Vec<TradeJourneyResponse>>> {
@@ -2758,6 +2760,7 @@ pub async fn get_trade_flow_journeys(
     tag = "trade_flow"
 )]
 pub async fn get_market_trade_flow(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
     Query(query): Query<TradeFlowQuery>,
@@ -2825,6 +2828,7 @@ pub async fn get_market_trade_flow(
     tag = "trade_flow"
 )]
 pub async fn get_arb_market_scorecard(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<ArbMarketScorecardResponse>> {
@@ -2854,6 +2858,7 @@ pub async fn get_arb_market_scorecard(
     tag = "trade_flow"
 )]
 pub async fn get_arb_execution_telemetry(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<ArbExecutionTelemetryResponse>> {
@@ -2914,6 +2919,7 @@ pub async fn get_arb_execution_telemetry(
     tag = "trade_flow"
 )]
 pub async fn get_learning_overview(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<LearningOverviewResponse>> {
@@ -2951,6 +2957,7 @@ pub async fn get_learning_overview(
     tag = "trade_flow"
 )]
 pub async fn get_learning_rollout_detail(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(rollout_id): Path<Uuid>,
     Query(query): Query<TradeFlowQuery>,
@@ -2985,6 +2992,7 @@ pub async fn get_learning_rollout_detail(
     tag = "trade_flow"
 )]
 pub async fn create_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<CreateLearningModelRequest>,
@@ -3080,6 +3088,7 @@ pub async fn create_learning_model(
     tag = "trade_flow"
 )]
 pub async fn update_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3268,6 +3277,7 @@ async fn change_learning_model_status(
     tag = "trade_flow"
 )]
 pub async fn activate_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3291,6 +3301,7 @@ pub async fn activate_learning_model(
     tag = "trade_flow"
 )]
 pub async fn disable_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3314,6 +3325,7 @@ pub async fn disable_learning_model(
     tag = "trade_flow"
 )]
 pub async fn retire_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3337,6 +3349,7 @@ pub async fn retire_learning_model(
     tag = "trade_flow"
 )]
 pub async fn create_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<CreateLearningRolloutRequest>,
@@ -3451,6 +3464,7 @@ pub async fn create_learning_rollout(
     tag = "trade_flow"
 )]
 pub async fn update_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,
@@ -3641,6 +3655,7 @@ async fn change_learning_rollout_status(
     tag = "trade_flow"
 )]
 pub async fn pause_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,
@@ -3668,6 +3683,7 @@ pub async fn pause_learning_rollout(
     tag = "trade_flow"
 )]
 pub async fn resume_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,
@@ -3695,6 +3711,7 @@ pub async fn resume_learning_rollout(
     tag = "trade_flow"
 )]
 pub async fn complete_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,

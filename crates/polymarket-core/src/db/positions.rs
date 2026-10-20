@@ -25,7 +25,7 @@ fn get_opt_smallint(r: &sqlx::postgres::PgRow, col: &str) -> Option<i16> {
 
 // Explicit holdings remain exposure in every lifecycle state. Pending entries
 // reserve their full requested cost, including their not-yet-filled legs.
-const TOTAL_ACTIVE_EXPOSURE_SQL: &str = r#"
+pub const TOTAL_ACTIVE_EXPOSURE_SQL: &str = r#"
 SELECT COALESCE((SELECT SUM(CASE WHEN state=0 THEN GREATEST(
     quantity * COALESCE(NULLIF(yes_entry_price + no_entry_price,0),1),
     held_yes_qty * CASE WHEN yes_entry_price>0 THEN yes_entry_price ELSE 1 END +
@@ -35,8 +35,11 @@ SELECT COALESCE((SELECT SUM(CASE WHEN state=0 THEN GREATEST(
  FROM positions WHERE state=0 OR held_yes_qty>0 OR held_no_qty>0),0)
  + COALESCE((SELECT SUM(GREATEST(quantity-filled_quantity,0)*COALESCE(price,1))
  FROM orders WHERE side='buy' AND status IN ('pending','open','partially_filled')),0)
+ + COALESCE((SELECT SUM(cost_basis) FROM manual_inventory),0)
  + COALESCE((SELECT SUM((signed_order->>'makerAmount')::numeric/1000000)
- FROM execution_intents WHERE status IN ('submitting','unknown') AND signed_order->>'side'='BUY'),0)
+ FROM execution_intents WHERE status IN ('submitting','unknown') AND signed_order->>'side'='BUY'
+ AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.id=execution_intents.id)
+ AND NOT EXISTS (SELECT 1 FROM position_order_links WHERE position_order_links.id=execution_intents.id)),0)
 "#;
 
 #[cfg(test)]
@@ -119,11 +122,11 @@ impl PositionRepository {
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner,
-                is_open, opened_at, source, source_signal_id
+                is_open, opened_at, source, source_signal_id, execution_mode, wallet_address
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
             )
             "#,
         )
@@ -152,6 +155,8 @@ impl PositionRepository {
         .bind(position.entry_timestamp)
         .bind(source)
         .bind(source_signal_id)
+        .bind(&position.execution_mode)
+        .bind(&position.wallet_address)
         .execute(&mut *tx)
         .await?;
 
@@ -160,13 +165,48 @@ impl PositionRepository {
     }
 
     /// Update position state and P&L.
-    pub async fn update(&self, position: &Position) -> Result<()> {
+    pub async fn update(&self, position: &mut Position) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        self.update_on_connection(position, &mut connection).await
+    }
+
+    /// Persist inventory and its durable fill receipt in the same transaction.
+    pub async fn update_with_receipt(
+        &self,
+        position: &mut Position,
+        order_id: Uuid,
+        quantity: Decimal,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let receipt = sqlx::query("UPDATE position_order_links SET applied_quantity=applied_quantity+$3,settled=TRUE WHERE id=$1 AND position_id=$2 AND NOT settled")
+            .bind(order_id).bind(position.id).bind(quantity).execute(&mut *tx).await?;
+        if receipt.rows_affected() != 1 {
+            return Err(crate::Error::Position(
+                "Missing or already applied fill receipt".into(),
+            ));
+        }
+        self.update_on_connection(position, &mut tx).await?;
+        sqlx::query(
+            "UPDATE execution_intents SET status='reconciled',updated_at=NOW() WHERE id=$1",
+        )
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_on_connection(
+        &self,
+        position: &mut Position,
+        connection: &mut sqlx::PgConnection,
+    ) -> Result<()> {
         let failure_reason_json = position
             .failure_reason
             .as_ref()
             .map(|r| serde_json::to_string(r).unwrap_or_default());
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE positions SET
                 state = $2,
@@ -188,8 +228,11 @@ impl PositionRepository {
                 exited_yes_qty = $17,
                 exited_no_qty = $18,
                 resolution_winner = $19,
-                is_open = $20
-            WHERE id = $1
+                is_open = $20,
+                yes_entry_price = $21, no_entry_price = $22, quantity = $23,
+                version = version + 1
+            WHERE id = $1 AND version = $24
+              AND execution_mode = $25 AND wallet_address IS NOT DISTINCT FROM $26
             "#,
         )
         .bind(position.id)
@@ -212,10 +255,27 @@ impl PositionRepository {
         .bind(position.exited_no_qty)
         .bind(position.resolution_winner.as_deref())
         .bind(position.should_persist_as_open())
-        .execute(&self.pool)
+        .bind(position.yes_entry_price)
+        .bind(position.no_entry_price)
+        .bind(position.quantity)
+        .bind(position.version)
+        .bind(&position.execution_mode)
+        .bind(&position.wallet_address)
+        .execute(connection)
         .await?;
 
+        if result.rows_affected() != 1 {
+            return Err(crate::Error::Position(
+                "Stale position update; reload before retrying".into(),
+            ));
+        }
+        position.version += 1;
         Ok(())
+    }
+
+    pub async fn has_unsettled_orders(&self, id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM position_order_links WHERE position_id=$1 AND NOT settled)")
+            .bind(id).fetch_one(&self.pool).await?)
     }
 
     /// Get a position by ID.
@@ -228,7 +288,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE id = $1
             "#,
@@ -257,6 +317,9 @@ impl PositionRepository {
             .max(Decimal::ZERO);
 
         Position {
+            execution_mode: r.get("execution_mode"),
+            wallet_address: r.get("wallet_address"),
+            version: r.get("version"),
             id: r.get("id"),
             market_id: r.get("market_id"),
             yes_entry_price,
@@ -324,7 +387,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state NOT IN (4, 5)
             ORDER BY entry_timestamp DESC
@@ -350,7 +413,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state NOT IN (4, 5)
               AND COALESCE(source, 0) NOT IN ($1, $2)
@@ -375,7 +438,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state IN (6, 7)
             ORDER BY last_updated ASC
@@ -397,7 +460,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state IN (6, 7)
               AND COALESCE(source, 0) NOT IN ($1, $2)
@@ -422,7 +485,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state = 2
             ORDER BY last_updated ASC
@@ -444,7 +507,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE exit_strategy = 0 AND state IN (1, 2)
             ORDER BY entry_timestamp ASC
@@ -466,7 +529,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version,
                 source, source_signal_id
             FROM positions
             WHERE exit_strategy = 1 AND state = 1
@@ -496,7 +559,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state = 6
             ORDER BY last_updated ASC
@@ -519,7 +582,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
-                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state = 5
               AND retry_count < 3

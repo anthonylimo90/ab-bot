@@ -109,11 +109,10 @@ struct WalletTradeCandidateRow {
 struct EffectiveOpenPositionRow {
     id: Uuid,
     market_id: String,
-    quantity: Decimal,
+    held_yes_qty: Decimal,
+    held_no_qty: Decimal,
     yes_entry_price: Decimal,
     no_entry_price: Decimal,
-    yes_exit_price: Option<Decimal>,
-    no_exit_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -241,7 +240,29 @@ async fn refresh_wallet_inventory(
         );
     }
 
-    for position in load_effective_open_positions(&state.pool).await? {
+    let manual: Vec<(String,String,Decimal)> = sqlx::query_as("SELECT market_id,outcome,cost_basis FROM manual_inventory WHERE execution_mode='live' AND wallet_address=LOWER($1) AND quantity>0")
+        .bind(wallet_address).fetch_all(&state.pool).await?;
+    let manual_keys: HashSet<(String, String)> = manual
+        .iter()
+        .map(|(market, outcome, _)| (market.clone(), outcome.clone()))
+        .collect();
+    for (market, outcome, basis) in manual {
+        if let Some((yes, no)) = state.market_catalog.hydrate_market(&market).await? {
+            merge_candidate(
+                &mut candidates,
+                InventoryCandidate {
+                    token_id: if outcome == "yes" { yes } else { no },
+                    condition_id: Some(market),
+                    outcome: Some(outcome),
+                    cost_basis: Some(basis),
+                    discovery_source: "manual_order".into(),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    for position in load_effective_open_positions(&state.pool, wallet_address).await? {
         let Some((yes_token_id, no_token_id)) = state
             .market_catalog
             .hydrate_market(&position.market_id)
@@ -258,7 +279,7 @@ async fn refresh_wallet_inventory(
                     condition_id: Some(position.market_id.clone()),
                     outcome: Some("yes".to_string()),
                     linked_position_id: Some(position.id),
-                    cost_basis: Some(position.quantity * position.yes_entry_price),
+                    cost_basis: Some(position.held_yes_qty * position.yes_entry_price),
                     discovery_source: "open_position".to_string(),
                 },
             );
@@ -272,7 +293,7 @@ async fn refresh_wallet_inventory(
                     condition_id: Some(position.market_id.clone()),
                     outcome: Some("no".to_string()),
                     linked_position_id: Some(position.id),
-                    cost_basis: Some(position.quantity * position.no_entry_price),
+                    cost_basis: Some(position.held_no_qty * position.no_entry_price),
                     discovery_source: "open_position".to_string(),
                 },
             );
@@ -349,7 +370,15 @@ async fn refresh_wallet_inventory(
                 _ => None,
             });
         let marked_value = current_price.map(|price| price * quantity);
-        let is_orphan = quantity > Decimal::ZERO && candidate.linked_position_id.is_none();
+        let is_manual = candidate
+            .condition_id
+            .as_ref()
+            .zip(candidate.outcome.as_ref())
+            .is_some_and(|(market, outcome)| {
+                manual_keys.contains(&(market.clone(), outcome.clone()))
+            });
+        let is_orphan =
+            quantity > Decimal::ZERO && candidate.linked_position_id.is_none() && !is_manual;
         if is_orphan {
             orphan_tokens += 1;
         }
@@ -522,7 +551,10 @@ pub async fn recover_wallet_orphan_inventory(
         .with_expected_price(expected_price)
         .with_slippage(order_executor.default_slippage());
 
-        match order_executor.execute_market_order(order).await {
+        match order_executor
+            .execute_reserved_market_order(order, "live", Some(wallet_address))
+            .await
+        {
             Ok(report) if report.is_success() => {
                 repo.record_recovery_attempt(wallet_address, &entry.token_id, None)
                     .await?;
@@ -694,48 +726,10 @@ async fn load_wallet_trade_candidates(
 
 async fn load_effective_open_positions(
     pool: &sqlx::PgPool,
+    wallet: &str,
 ) -> anyhow::Result<Vec<EffectiveOpenPositionRow>> {
-    let rows = sqlx::query_as::<_, EffectiveOpenPositionRow>(
-        r#"
-        WITH active_positions AS (
-            SELECT
-                p.id,
-                p.market_id,
-                COALESCE(p.source, 0) AS source,
-                p.quantity,
-                p.yes_entry_price,
-                p.no_entry_price,
-                p.yes_exit_price,
-                p.no_exit_price,
-                COALESCE(p.last_updated, p.updated_at, p.entry_timestamp) AS sort_updated
-            FROM positions p
-            WHERE p.is_open = TRUE
-        ),
-        ranked_active AS (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY market_id, source
-                    ORDER BY sort_updated DESC, id DESC
-                ) AS rn
-            FROM active_positions
-        )
-        SELECT
-            id,
-            market_id,
-            quantity,
-            yes_entry_price,
-            no_entry_price,
-            yes_exit_price,
-            no_exit_price
-        FROM ranked_active
-        WHERE rn = 1
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
+    Ok(sqlx::query_as("SELECT id,market_id,held_yes_qty,held_no_qty,yes_entry_price,no_entry_price FROM positions WHERE (held_yes_qty>0 OR held_no_qty>0) AND execution_mode<>'paper' AND (LOWER(wallet_address)=LOWER($1) OR execution_mode='unknown')")
+        .bind(wallet).fetch_all(pool).await?)
 }
 
 async fn discover_phase2_token_ids(
@@ -1140,11 +1134,11 @@ fn normalize_outcome(outcome: Option<&str>) -> Option<String> {
 }
 
 fn holds_yes(position: &EffectiveOpenPositionRow) -> bool {
-    position.yes_entry_price > Decimal::ZERO && position.yes_exit_price.is_none()
+    position.held_yes_qty > Decimal::ZERO
 }
 
 fn holds_no(position: &EffectiveOpenPositionRow) -> bool {
-    position.no_entry_price > Decimal::ZERO && position.no_exit_price.is_none()
+    position.held_no_qty > Decimal::ZERO
 }
 
 fn looks_like_token_id(token_id: &str) -> bool {

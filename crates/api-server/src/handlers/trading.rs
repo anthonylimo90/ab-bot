@@ -140,6 +140,7 @@ struct OrderRow {
     id: Uuid,
     exchange_order_id: Option<String>,
     execution_mode: String,
+    wallet_address: Option<String>,
     client_order_id: Option<String>,
     market_id: String,
     outcome: String,
@@ -194,6 +195,8 @@ async fn reserve_order(
     pool: &PgPool,
     request: &PlaceOrderRequest,
     live: bool,
+    wallet: Option<&str>,
+    max_exposure: Decimal,
 ) -> ApiResult<(Uuid, bool)> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
@@ -208,11 +211,29 @@ async fn reserve_order(
         .as_str()
         .unwrap()
         .to_owned();
-    let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO orders (id, client_order_id, market_id, outcome, side, order_type, status, quantity, price, stop_price, time_in_force, execution_mode) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11) ON CONFLICT (client_order_id) WHERE client_order_id IS NOT NULL DO NOTHING RETURNING id")
+    let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO orders (id, client_order_id, market_id, outcome, side, order_type, status, quantity, price, stop_price, time_in_force, execution_mode, wallet_address) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11,$12) ON CONFLICT (client_order_id) WHERE client_order_id IS NOT NULL DO NOTHING RETURNING id")
         .bind(id).bind(&request.client_order_id).bind(&request.market_id).bind(&request.outcome)
-        .bind(&side).bind(&kind).bind(request.quantity).bind(request.price).bind(request.stop_price).bind(&request.time_in_force).bind(if live { "live" } else { "paper" })
+        .bind(&side).bind(&kind).bind(request.quantity).bind(if request.order_type == OrderType::Market { None } else { request.price }).bind(request.stop_price).bind(&request.time_in_force).bind(if live { "live" } else { "paper" }).bind(wallet)
         .fetch_optional(&mut *tx).await?;
     if inserted.is_some() {
+        if request.side == OrderSide::Buy {
+            let exposure: Decimal =
+                sqlx::query_scalar(polymarket_core::db::positions::TOTAL_ACTIVE_EXPOSURE_SQL)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if exposure > max_exposure {
+                return Err(ApiError::BadRequest(
+                    "Order would exceed shared exposure limit".into(),
+                ));
+            }
+        } else {
+            let available: Decimal = sqlx::query_scalar("SELECT COALESCE((SELECT quantity FROM manual_inventory WHERE execution_mode=$1 AND wallet_address=COALESCE(LOWER($2),'unknown') AND market_id=$3 AND outcome=$4),0) - COALESCE((SELECT SUM(quantity-filled_quantity) FROM orders WHERE execution_mode=$1 AND wallet_address IS NOT DISTINCT FROM $2 AND market_id=$3 AND outcome=$4 AND side='sell' AND status IN ('pending','open','partially_filled') AND id<>$5),0)")
+                .bind(if live { "live" } else { "paper" }).bind(wallet).bind(&request.market_id).bind(&request.outcome).bind(id)
+                .fetch_one(&mut *tx).await?;
+            if request.quantity > available {
+                return Err(ApiError::BadRequest("Sale exceeds available manual inventory; use position exit for automated holdings".into()));
+            }
+        }
         tx.commit().await?;
         return Ok((id, true));
     }
@@ -225,7 +246,12 @@ async fn reserve_order(
         || row.side != side
         || row.order_type != kind
         || row.quantity != request.quantity
-        || row.price != request.price
+        || row.price
+            != if request.order_type == OrderType::Market {
+                None
+            } else {
+                request.price
+            }
         || row.stop_price != request.stop_price
         || row.time_in_force != request.time_in_force
     {
@@ -259,8 +285,20 @@ pub async fn place_order(
         request.time_in_force = "FOK".into();
     }
     validate_order_request(&request)?;
-    let (order_id, fresh) =
-        reserve_order(&state.pool, &request, state.order_executor.is_live()).await?;
+    let wallet = state.order_executor.wallet_address().await;
+    let max_exposure = if let Some(cfg) = &state.arb_executor_config {
+        cfg.read().await.max_total_exposure
+    } else {
+        crate::arb_executor::ArbExecutorConfig::from_env().max_total_exposure
+    };
+    let (order_id, fresh) = reserve_order(
+        &state.pool,
+        &request,
+        state.order_executor.is_live(),
+        wallet.as_deref(),
+        max_exposure,
+    )
+    .await?;
     if !fresh {
         return Ok(Json(load_order(&state.pool, order_id).await?.into()));
     }
@@ -282,6 +320,7 @@ async fn execute_reserved_order(
     request: PlaceOrderRequest,
     order_id: Uuid,
 ) -> ApiResult<Json<OrderResponse>> {
+    let origin = load_order(&state.pool, order_id).await?;
     let workspace_live_enabled = load_canonical_workspace_flags(&state.pool)
         .await?
         .map(|flags| flags.live_trading_enabled)
@@ -351,7 +390,11 @@ async fn execute_reserved_order(
             order.id = order_id;
             state
                 .order_executor
-                .execute_market_order(order)
+                .execute_reserved_market_order(
+                    order,
+                    &origin.execution_mode,
+                    origin.wallet_address.as_deref(),
+                )
                 .await
                 .map_err(|e| ApiError::Internal(format!("Execution error: {}", e)))?
         }
@@ -372,14 +415,18 @@ async fn execute_reserved_order(
             }
             state
                 .order_executor
-                .execute_limit_order(order)
+                .execute_reserved_limit_order(
+                    order,
+                    &origin.execution_mode,
+                    origin.wallet_address.as_deref(),
+                )
                 .await
                 .map_err(|e| ApiError::Internal(format!("Execution error: {}", e)))?
         }
         OrderType::StopLoss | OrderType::TakeProfit => {
-            // Stop-loss and take-profit orders are handled by the risk manager
-            // For now, just store them as pending orders
-            return Ok(Json(load_order(&state.pool, order_id).await?.into()));
+            return Err(ApiError::BadRequest(
+                "Protective order types are not supported".into(),
+            ));
         }
     };
 
@@ -535,6 +582,14 @@ async fn load_expected_market_price(
 }
 
 fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
+    if matches!(
+        request.order_type,
+        OrderType::StopLoss | OrderType::TakeProfit
+    ) {
+        return Err(ApiError::BadRequest(
+            "Protective order types are not supported".into(),
+        ));
+    }
     if request
         .client_order_id
         .as_deref()
@@ -819,6 +874,40 @@ pub async fn cancel_order(
     Ok(Json(load_order(&state.pool, order_id).await?.into()))
 }
 
+/// Apply a terminal authenticated snapshot and release its fence atomically.
+pub(crate) async fn reconcile_manual_intent(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &polymarket_core::api::clob::ExchangeOrder,
+    price: Decimal,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
+        .execute(&mut *tx)
+        .await?;
+    let row: OrderRow = sqlx::query_as("SELECT * FROM orders WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let quantity = snapshot.size_matched.parse::<Decimal>()?;
+    if row.execution_mode != "live" || quantity < row.filled_quantity || quantity > row.quantity {
+        anyhow::bail!("Snapshot conflicts with stored manual order");
+    }
+    let status = if quantity == row.quantity {
+        "filled"
+    } else {
+        "cancelled"
+    };
+    sqlx::query("UPDATE orders SET exchange_order_id=$2,status=$3,filled_quantity=$4,avg_fill_price=$5,updated_at=NOW() WHERE id=$1")
+        .bind(id).bind(&snapshot.id).bind(status).bind(quantity).bind(if quantity>Decimal::ZERO {Some(price)} else {None}).execute(&mut *tx).await?;
+    sqlx::query("UPDATE execution_intents SET status='reconciled',updated_at=NOW() WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,7 +1052,7 @@ mod tests {
             stop_price: Some(Decimal::new(40, 2)), // 0.40
             ..valid.clone()
         };
-        assert!(validate_order_request(&good_stop).is_ok());
+        assert!(validate_order_request(&good_stop).is_err());
 
         // client_order_id too long
         let long_client_id = PlaceOrderRequest {

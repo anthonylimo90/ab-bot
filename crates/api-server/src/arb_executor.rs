@@ -393,8 +393,9 @@ impl ArbAutoExecutor {
         match sqlx::query(
             r#"
             UPDATE positions
-            SET state = 5, failure_reason = $1
-            WHERE state = 0 AND entry_timestamp < NOW() - INTERVAL '24 hours'
+            SET state = 5, failure_reason = $1, version = version + 1
+            WHERE state = 0 AND execution_mode = 'paper' AND held_yes_qty = 0 AND held_no_qty = 0
+              AND entry_timestamp < NOW() - INTERVAL '24 hours'
             "#,
         )
         .bind(&stale_cleanup_reason)
@@ -1010,6 +1011,7 @@ impl ArbAutoExecutor {
 
         // 8. Create position in PENDING state
         let ctx = EventContext {
+            wallet_address: self.order_executor.wallet_address().await,
             execution_mode: execution_mode.to_string(),
             strategy: "arb".to_string(),
             source_label: "arb".to_string(),
@@ -1055,7 +1057,10 @@ impl ArbAutoExecutor {
             .with_expected_price(arb.yes_ask)
             .with_slippage(self.order_executor.default_slippage());
         let yes_order_started_at = std::time::Instant::now();
-        let yes_result = self.order_executor.execute_market_order(yes_order).await;
+        let yes_result = self
+            .order_executor
+            .execute_market_order_for_position(yes_order, &position, "yes")
+            .await;
         telemetry.yes_order_ms = Some(yes_order_started_at.elapsed().as_millis() as i64);
         let yes_report = match yes_result {
             Ok(report) => report,
@@ -1086,6 +1091,9 @@ impl ArbAutoExecutor {
         };
 
         // 10. If YES order rejected/failed → mark EntryFailed
+        if yes_report.status == polymarket_core::types::OrderStatus::Pending {
+            return Ok(());
+        }
         if !yes_report.is_success() {
             let msg = yes_report
                 .error_message
@@ -1114,16 +1122,16 @@ impl ArbAutoExecutor {
         let yes_order_finished_at = std::time::Instant::now();
 
         // Record YES leg fill via service
-        let _ = self
-            .position_service
+        self.position_service
             .record_entry_fill(
                 &mut position,
                 Leg::Yes,
                 yes_report.average_price,
                 yes_report.filled_quantity,
                 &ctx,
+                (ctx.execution_mode == "live").then_some(yes_report.order_id),
             )
-            .await;
+            .await?;
 
         // 11. Execute NO market order
         let no_order = MarketOrder::new(
@@ -1140,7 +1148,10 @@ impl ArbAutoExecutor {
                 .duration_since(yes_order_finished_at)
                 .as_millis() as i64,
         );
-        let no_result = self.order_executor.execute_market_order(no_order).await;
+        let no_result = self
+            .order_executor
+            .execute_market_order_for_position(no_order, &position, "no")
+            .await;
         telemetry.no_order_ms = Some(no_order_started_at.elapsed().as_millis() as i64);
         let no_report = match no_result {
             Ok(report) => report,
@@ -1168,6 +1179,9 @@ impl ArbAutoExecutor {
         };
 
         // 12. If NO order failed → one-legged position
+        if no_report.status == polymarket_core::types::OrderStatus::Pending {
+            return Ok(());
+        }
         if !no_report.is_success() {
             let msg = no_report
                 .error_message
@@ -1200,16 +1214,16 @@ impl ArbAutoExecutor {
         }
 
         // Record NO leg fill via service
-        let _ = self
-            .position_service
+        self.position_service
             .record_entry_fill(
                 &mut position,
                 Leg::No,
                 no_report.average_price,
                 no_report.filled_quantity,
                 &ctx,
+                (ctx.execution_mode == "live").then_some(no_report.order_id),
             )
-            .await;
+            .await?;
 
         let actual_fill_cost = yes_report.total_value() + no_report.total_value();
         let modeled_fill_cost = arb.total_cost * quantity;

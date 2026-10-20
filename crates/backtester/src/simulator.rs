@@ -471,6 +471,9 @@ impl BacktestSimulator {
     ) -> Result<BacktestResult> {
         // Initialize simulation state
         let mut state = SimulationState::new(self.config.initial_capital);
+        state
+            .equity_curve
+            .push((query.start_time, self.config.initial_capital));
         let mut context = StrategyContext::new(self.config.initial_capital);
 
         // Initialize strategy
@@ -529,11 +532,19 @@ impl BacktestSimulator {
             context.available_cash = state.cash;
         }
 
-        // Finalize strategy
-        strategy.finalize(&context).await?;
-
-        // Close any remaining positions at last price
+        // Liquidation costs belong to the terminal observation and risk metrics.
         self.close_all_positions(&mut state, &context);
+        anyhow::ensure!(
+            state.positions.is_empty(),
+            "Unable to liquidate all positions at the end of the backtest"
+        );
+        if let Some((_, equity)) = state.equity_curve.last_mut() {
+            *equity = state.cash;
+        }
+        context.portfolio_value = state.cash;
+        context.available_cash = state.cash;
+        context.positions.clear();
+        strategy.finalize(&context).await?;
 
         // Calculate final metrics
         let result = self.calculate_results(strategy, &state, query, prepared.snapshots.len());
@@ -961,7 +972,12 @@ impl BacktestSimulator {
             .unwrap_or(0.0);
 
         // Calculate trading days for annualization
-        let days = (query.end_time - query.start_time).num_days() as f64;
+        let end_time = state
+            .equity_curve
+            .last()
+            .map(|(time, _)| *time)
+            .unwrap_or(query.start_time);
+        let days = (end_time - query.start_time).num_seconds() as f64 / 86_400.0;
         let years = days / 365.0;
         let annualized_return = if years > 0.0 {
             (1.0 + return_pct).powf(1.0 / years) - 1.0
@@ -1079,7 +1095,7 @@ impl BacktestSimulator {
             strategy_name: strategy.name().to_string(),
             strategy_params: strategy.parameters(),
             start_time: query.start_time,
-            end_time: query.end_time,
+            end_time,
             data_points,
             initial_capital: self.config.initial_capital,
             final_value,
@@ -1841,3 +1857,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "simulator/correctness_tests.rs"]
+mod correctness_tests;

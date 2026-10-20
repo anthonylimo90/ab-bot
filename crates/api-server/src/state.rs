@@ -27,7 +27,7 @@ use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 #[path = "state/wallet_selection_tests.rs"]
 mod wallet_selection_tests;
 
-const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled'))";
+const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled')) OR EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode<>'paper' AND quantity>0)";
 
 fn normalize_trading_wallet_address(address: &str) -> anyhow::Result<String> {
     let parsed = address
@@ -606,6 +606,88 @@ impl AppState {
         );
 
         Ok(Self {
+            market_catalog,
+            inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            pool,
+            jwt_secret,
+            encryption_key,
+            jwt_auth,
+            rbac,
+            key_vault,
+            audit_logger,
+            email_client,
+            clob_client,
+            order_executor,
+            circuit_breaker,
+            position_service,
+            orderbook_tx,
+            position_tx,
+            signal_tx,
+            trade_event_tx,
+            arb_entry_tx,
+            quant_signal_tx,
+            wallet_discovery,
+            polygon_client,
+            current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
+            redis_conn,
+            active_clob_markets,
+            arb_executor_config: None,
+            arb_executor_status: Arc::new(RwLock::new(
+                crate::arb_executor::ArbExecutorRuntimeStatus::default(),
+            )),
+            exit_handler_config: None,
+            quant_executor_config: None,
+            arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+            exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
+            quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(pool: PgPool) -> Arc<Self> {
+        let jwt_secret = "isolated-http-test-secret-not-production".to_string();
+        let encryption_key = jwt_secret.clone();
+        let jwt_auth = Arc::new(JwtAuth::new(JwtConfig {
+            secret: jwt_secret.clone(),
+            issuer: None,
+            audience: None,
+            expiry_hours: 1,
+        }));
+        let rbac = Arc::new(RbacManager::new());
+        let key_vault = Arc::new(KeyVault::new(
+            auth::key_vault::KeyVaultProvider::Memory,
+            jwt_secret.as_bytes().to_vec(),
+        ));
+        let audit_logger = Arc::new(AuditLogger::new(Arc::new(PostgresAuditStorage::new(
+            pool.clone(),
+        ))));
+        let email_client = None;
+        let clob_client = Arc::new(ClobClient::new(Some("http://127.0.0.1:1".into()), None));
+        let order_executor = Arc::new(
+            OrderExecutor::new(clob_client.clone(), ExecutorConfig::default())
+                .with_database(pool.clone()),
+        );
+        let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
+        let trade_event_tx = broadcast::channel(32).0;
+        let position_service =
+            crate::position_service::PositionService::new(pool.clone(), trade_event_tx.clone());
+        let orderbook_tx = broadcast::channel(32).0;
+        let position_tx = broadcast::channel(32).0;
+        let signal_tx = broadcast::channel(32).0;
+        let arb_entry_tx = broadcast::channel(32).0;
+        let quant_signal_tx = broadcast::channel(32).0;
+        let wallet_discovery = Arc::new(WalletDiscovery::from_pool(pool.clone()));
+        let polygon_client = None;
+        let redis_conn = None;
+        let active_clob_markets = Arc::new(RwLock::new(HashSet::new()));
+        let market_catalog = Arc::new(
+            crate::market_catalog::OutcomeTokenCache::new(
+                clob_client.clone(),
+                active_clob_markets.clone(),
+            )
+            .with_pool(pool.clone()),
+        );
+        Arc::new(Self {
             market_catalog,
             inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
             pool,

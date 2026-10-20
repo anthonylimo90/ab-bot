@@ -124,6 +124,7 @@ struct ParsedWsMessage {
 mod cancellation_tests;
 
 /// Polymarket CLOB API client for order book data.
+#[derive(Clone)]
 pub struct ClobClient {
     base_url: String,
     ws_url: String,
@@ -1489,6 +1490,8 @@ impl PostOrderResponse {
 /// Confirmed exchange snapshot. Limit price is not an average execution price.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeOrder {
+    #[serde(default)]
+    pub associate_trades: Vec<String>,
     pub id: String,
     pub status: String,
     pub original_size: String,
@@ -2134,6 +2137,94 @@ impl AuthenticatedClobClient {
             });
         }
         Ok(response.json().await?)
+    }
+
+    /// Reconstruct execution price from authenticated, confirmed trade records.
+    /// Schema: github.com/Polymarket/clob-client/blob/main/src/types.ts (Trade).
+    pub async fn confirmed_order_fill(&self, order: &ExchangeOrder) -> Result<(Decimal, Decimal)> {
+        let invalid = || Error::Api {
+            message: "Incomplete or inconsistent confirmed trade evidence".into(),
+            status: None,
+        };
+        let expected = order
+            .size_matched
+            .parse::<Decimal>()
+            .map_err(|_| invalid())?;
+        if expected.is_zero() {
+            return Ok((Decimal::ZERO, Decimal::ZERO));
+        }
+        let credentials = self.credentials.as_ref().ok_or_else(invalid)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut quantity = Decimal::ZERO;
+        let mut value = Decimal::ZERO;
+        for id in &order.associate_trades {
+            if !seen.insert(id) {
+                return Err(invalid());
+            }
+            let path = "/data/trades";
+            let timestamp = current_timestamp().to_string();
+            let signature = sign_l2_request(credentials, "GET", path, &timestamp, None)?;
+            let response = self
+                .client
+                .http_client
+                .get(format!("{}{}", self.client.base_url, path))
+                .query(&[("id", id.as_str())])
+                .header("POLY_ADDRESS", self.address())
+                .header("POLY_SIGNATURE", signature)
+                .header("POLY_TIMESTAMP", timestamp)
+                .header("POLY_API_KEY", &credentials.api_key)
+                .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(invalid());
+            }
+            let page: serde_json::Value = response.json().await?;
+            let rows = page
+                .get("data")
+                .and_then(|v| v.as_array())
+                .ok_or_else(invalid)?;
+            let trade = rows
+                .iter()
+                .find(|v| v["id"].as_str() == Some(id))
+                .ok_or_else(invalid)?;
+            if trade["status"].as_str() != Some("CONFIRMED") {
+                return Err(invalid());
+            }
+            let mut add = |q: &serde_json::Value, p: &serde_json::Value| -> Result<()> {
+                let q = q
+                    .as_str()
+                    .ok_or_else(invalid)?
+                    .parse::<Decimal>()
+                    .map_err(|_| invalid())?;
+                let p = p
+                    .as_str()
+                    .ok_or_else(invalid)?
+                    .parse::<Decimal>()
+                    .map_err(|_| invalid())?;
+                if q <= Decimal::ZERO || p <= Decimal::ZERO || p > Decimal::ONE {
+                    return Err(invalid());
+                }
+                quantity += q;
+                value += q * p;
+                Ok(())
+            };
+            if trade["taker_order_id"].as_str() == Some(&order.id) {
+                add(&trade["size"], &trade["price"])?;
+            } else {
+                let makers = trade["maker_orders"].as_array().ok_or_else(invalid)?;
+                for maker in makers
+                    .iter()
+                    .filter(|v| v["order_id"].as_str() == Some(&order.id))
+                {
+                    add(&maker["matched_amount"], &maker["price"])?;
+                }
+            }
+        }
+        if quantity != expected {
+            return Err(invalid());
+        }
+        Ok((quantity, value / quantity))
     }
 
     /// Cancel an order by ID.

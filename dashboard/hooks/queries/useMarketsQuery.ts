@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
 
 interface MarketFilters {
+  search?: string;
   category?: string;
   active?: boolean;
   min_volume?: number;

@@ -170,6 +170,16 @@ impl WalletInventoryRepository {
             WHERE LOWER(wallet_address) = LOWER($1)
               AND quantity > 0
               AND is_orphan = TRUE
+              AND NOT EXISTS (SELECT 1 FROM manual_inventory mi
+                  WHERE mi.execution_mode='live' AND mi.wallet_address=LOWER(wallet_inventory.wallet_address)
+                    AND mi.market_id=wallet_inventory.condition_id AND mi.outcome=wallet_inventory.outcome AND mi.quantity>0)
+              AND NOT EXISTS (SELECT 1 FROM orders o
+                  WHERE o.execution_mode='live' AND o.status IN ('pending','open','partially_filled')
+                    AND (LOWER(o.wallet_address)=LOWER(wallet_inventory.wallet_address) OR o.wallet_address IS NULL)
+                    AND o.market_id=wallet_inventory.condition_id AND o.outcome=wallet_inventory.outcome)
+              AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.market_id=wallet_inventory.condition_id
+                  AND p.execution_mode<>'paper' AND (LOWER(p.wallet_address)=LOWER(wallet_inventory.wallet_address) OR p.execution_mode='unknown')
+                  AND (p.state=0 OR (wallet_inventory.outcome='yes' AND p.held_yes_qty>0) OR (wallet_inventory.outcome='no' AND p.held_no_qty>0)))
               AND (
                     last_exit_attempted_at IS NULL
                     OR last_exit_attempted_at <= NOW() - ($2 * INTERVAL '1 second')

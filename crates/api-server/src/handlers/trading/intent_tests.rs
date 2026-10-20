@@ -2,6 +2,9 @@ use super::*;
 use sqlx::Executor;
 
 async fn setup(pool: &PgPool) {
+    pool.execute("CREATE TABLE position_order_links(id UUID)")
+        .await
+        .unwrap();
     pool.execute(include_str!(
         "../../../../../migrations/069_execution_intents.sql"
     ))
@@ -16,6 +19,12 @@ async fn setup(pool: &PgPool) {
         updated_at TIMESTAMPTZ DEFAULT NOW(), filled_at TIMESTAMPTZ
     )",
     )
+    .await
+    .unwrap();
+    pool.execute("CREATE TABLE positions(state SMALLINT,quantity NUMERIC,yes_entry_price NUMERIC,no_entry_price NUMERIC,held_yes_qty NUMERIC,held_no_qty NUMERIC)").await.unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/077_manual_inventory.sql"
+    ))
     .await
     .unwrap();
 }
@@ -39,14 +48,16 @@ async fn concurrent_and_restarted_replays_reserve_one_order_before_execution(poo
     setup(&pool).await;
     let request = order();
     let (a, b) = tokio::join!(
-        reserve_order(&pool, &request, false),
-        reserve_order(&pool, &request, false)
+        reserve_order(&pool, &request, false, None, Decimal::from(1000)),
+        reserve_order(&pool, &request, false, None, Decimal::from(1000))
     );
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_eq!(a.0, b.0);
     assert_ne!(a.1, b.1);
     assert_eq!(
-        reserve_order(&pool, &request, false).await.unwrap(),
+        reserve_order(&pool, &request, false, None, Decimal::from(1000))
+            .await
+            .unwrap(),
         (a.0, false)
     );
     sqlx::query("UPDATE orders SET status='filled',filled_quantity=quantity WHERE id=$1")
@@ -56,7 +67,10 @@ async fn concurrent_and_restarted_replays_reserve_one_order_before_execution(poo
         .unwrap();
     let replay = load_order(
         &pool,
-        reserve_order(&pool, &request, false).await.unwrap().0,
+        reserve_order(&pool, &request, false, None, Decimal::from(1000))
+            .await
+            .unwrap()
+            .0,
     )
     .await
     .unwrap();
@@ -67,7 +81,7 @@ async fn concurrent_and_restarted_replays_reserve_one_order_before_execution(poo
         ..request
     };
     assert!(matches!(
-        reserve_order(&pool, &changed, false).await,
+        reserve_order(&pool, &changed, false, None, Decimal::from(1000)).await,
         Err(ApiError::Conflict(_))
     ));
 }
@@ -84,13 +98,16 @@ fn client_intent_key_is_required() {
 #[sqlx::test(migrations = false)]
 async fn exchange_snapshots_record_only_confirmed_quantities_and_keep_progress(pool: PgPool) {
     setup(&pool).await;
-    let (id, _) = reserve_order(&pool, &order(), true).await.unwrap();
+    let (id, _) = reserve_order(&pool, &order(), true, Some("0xreview"), Decimal::from(1000))
+        .await
+        .unwrap();
     sqlx::query("UPDATE orders SET exchange_order_id='exchange-id', status='open' WHERE id=$1")
         .bind(id)
         .execute(&pool)
         .await
         .unwrap();
     let mut snapshot = polymarket_core::api::clob::ExchangeOrder {
+        associate_trades: vec![],
         id: "exchange-id".into(),
         status: "LIVE".into(),
         original_size: "10".into(),
@@ -130,19 +147,106 @@ async fn preflight_failure_rejects_only_intents_that_never_crossed_submission_bo
 ) {
     setup(&pool).await;
     let request = order();
-    let (id, _) = reserve_order(&pool, &request, true).await.unwrap();
+    let (id, _) = reserve_order(&pool, &request, true, Some("0xreview"), Decimal::from(1000))
+        .await
+        .unwrap();
     reject_unsubmitted_order(&pool, id).await.unwrap();
     assert_eq!(load_order(&pool, id).await.unwrap().status, "rejected");
     assert_eq!(
-        reserve_order(&pool, &request, true).await.unwrap(),
+        reserve_order(&pool, &request, true, Some("0xreview"), Decimal::from(1000))
+            .await
+            .unwrap(),
         (id, false)
     );
     let request = PlaceOrderRequest {
         client_order_id: Some("submitted-intent".into()),
         ..request
     };
-    let (id, _) = reserve_order(&pool, &request, true).await.unwrap();
+    let (id, _) = reserve_order(&pool, &request, true, Some("0xreview"), Decimal::from(1000))
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO execution_intents (id,market_id,signed_order,status) VALUES ($1,'market','{}','unknown')").bind(id).execute(&pool).await.unwrap();
     reject_unsubmitted_order(&pool, id).await.unwrap();
     assert_eq!(load_order(&pool, id).await.unwrap().status, "pending");
+}
+
+#[sqlx::test(migrations = false)]
+async fn manual_reservations_and_fills_share_one_atomic_exposure_budget(pool: PgPool) {
+    setup(&pool).await;
+    let first = order();
+    let second = PlaceOrderRequest {
+        client_order_id: Some("second".into()),
+        ..order()
+    };
+    let (a, b) = tokio::join!(
+        reserve_order(&pool, &first, true, Some("0xreview"), Decimal::from(7)),
+        reserve_order(&pool, &second, true, Some("0xreview"), Decimal::from(7))
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let id = a.or(b).unwrap().0;
+    sqlx::query(
+        "UPDATE orders SET status='filled',filled_quantity=10,avg_fill_price=0.5 WHERE id=$1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let exposure: Decimal =
+        sqlx::query_scalar(polymarket_core::db::positions::TOTAL_ACTIVE_EXPOSURE_SQL)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(exposure, Decimal::from(5));
+    let sell = PlaceOrderRequest {
+        side: OrderSide::Sell,
+        quantity: Decimal::from(4),
+        client_order_id: Some("sell".into()),
+        ..order()
+    };
+    let (sell_id, _) = reserve_order(&pool, &sell, true, Some("0xreview"), Decimal::from(7))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE orders SET status='filled',filled_quantity=4,avg_fill_price=0.6 WHERE id=$1",
+    )
+    .bind(sell_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let held: (Decimal, Decimal) =
+        sqlx::query_as("SELECT quantity,cost_basis FROM manual_inventory")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(held, (Decimal::from(6), Decimal::from(3)));
+    assert!(reserve_order(
+        &pool,
+        &PlaceOrderRequest {
+            client_order_id: Some("wrong-wallet".into()),
+            ..sell
+        },
+        true,
+        Some("0xother"),
+        Decimal::from(100)
+    )
+    .await
+    .is_err());
+}
+
+#[sqlx::test(migrations = false)]
+async fn unsupported_protective_orders_never_reserve_inventory(pool: PgPool) {
+    setup(&pool).await;
+    for kind in [OrderType::StopLoss, OrderType::TakeProfit] {
+        assert!(validate_order_request(&PlaceOrderRequest {
+            order_type: kind,
+            stop_price: Some(Decimal::new(4, 1)),
+            ..order()
+        })
+        .is_err());
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }

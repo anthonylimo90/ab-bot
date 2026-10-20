@@ -536,6 +536,10 @@ class ApiClient {
     return response;
   }
 
+  async logout(): Promise<void> {
+    await this.request("/api/v1/auth/logout", { method: "POST" });
+  }
+
   async getCurrentUser(): Promise<User> {
     return this.request<User>("/api/v1/auth/me");
   }
@@ -607,6 +611,7 @@ class ApiClient {
 
   // Markets
   async getMarkets(params?: {
+  search?: string;
     category?: string;
     active?: boolean;
     min_volume?: number;

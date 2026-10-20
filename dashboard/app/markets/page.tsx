@@ -1,7 +1,8 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useState, useMemo, useEffect } from "react";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
@@ -24,6 +25,13 @@ import { BarChart2, Search } from "lucide-react";
 
 export default function MarketsPage() {
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [page, setPage] = useState(0);
+  const pageSize = 50;
+  useEffect(() => {
+    const timer = setTimeout(() => { setDebouncedSearch(search.trim()); setPage(0); }, 300);
+    return () => clearTimeout(timer);
+  }, [search]);
   const [activeOnly, setActiveOnly] = useState(true);
   const [category, setCategory] = useState<string>("all");
   const [selectedMarketId, setSelectedMarketId] = useState<string | null>(null);
@@ -37,21 +45,16 @@ export default function MarketsPage() {
     return Array.from(cats).sort();
   }, [metadata]);
 
-  const { data: markets = [], isLoading } = useMarketsQuery({
+  const { data: markets = [], isLoading, isError } = useMarketsQuery({
     active: activeOnly || undefined,
     category: category !== "all" ? category : undefined,
-    limit: 100,
+    search: debouncedSearch || undefined,
+    limit: pageSize + 1,
+    offset: page * pageSize,
   });
 
-  const filteredMarkets = useMemo(() => {
-    if (!search.trim()) return markets;
-    const lower = search.toLowerCase();
-    return markets.filter(
-      (m) =>
-        m.question.toLowerCase().includes(lower) ||
-        (m.category ?? "").toLowerCase().includes(lower),
-    );
-  }, [markets, search]);
+  const filteredMarkets = markets.slice(0, pageSize);
+  const hasMore = markets.length > pageSize;
 
   return (
     <div className="space-y-5 sm:space-y-6">
@@ -87,7 +90,7 @@ export default function MarketsPage() {
             className="pl-10"
           />
         </div>
-        <Select value={category} onValueChange={setCategory}>
+        <Select value={category} onValueChange={(value) => { setCategory(value); setPage(0); }}>
           <SelectTrigger className="w-full sm:w-[180px]">
             <SelectValue placeholder="All Categories" />
           </SelectTrigger>
@@ -104,7 +107,7 @@ export default function MarketsPage() {
           <Switch
             id="active-only"
             checked={activeOnly}
-            onCheckedChange={setActiveOnly}
+            onCheckedChange={(value) => { setActiveOnly(value); setPage(0); }}
           />
           <Label htmlFor="active-only" className="inline-flex items-center gap-1 text-sm">
             Active only
@@ -115,9 +118,14 @@ export default function MarketsPage() {
 
       {/* Results count */}
       <div className="flex items-center gap-2">
-        <Badge variant="secondary">{filteredMarkets.length} markets</Badge>
+        <Badge variant="secondary">Page {page + 1} · {filteredMarkets.length} markets shown</Badge>
       </div>
 
+      <div className="flex items-center gap-3">
+        <Button variant="outline" disabled={page === 0 || isLoading} onClick={() => setPage(page - 1)}>Previous</Button>
+        <Button variant="outline" disabled={!hasMore || isLoading || isError} onClick={() => setPage(page + 1)}>Next</Button>
+      </div>
+      {isError && <p role="alert">Markets could not be loaded. Please try again.</p>}
       {/* Market Grid */}
       {isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
