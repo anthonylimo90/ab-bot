@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -117,8 +117,9 @@ export default function PositionsPage() {
   const { data: positionsSummary } = usePositionsSummaryQuery();
 
   // Closed positions data (paginated)
-  const { data: closedPositions = [], isLoading: closedLoading } =
-    usePositionsQuery({ status: "closed", limit: 500 });
+  const { data: closedPositions = [], isLoading: closedLoading, isFetching: closedFetching } =
+    usePositionsQuery({ status: "closed", limit: PAGE_SIZE, offset: closedPage * PAGE_SIZE },
+      {enabled: activeTab === "closed", keepPreviousData: true});
 
   const closeMutation = useClosePositionMutation();
   const queryClient = useQueryClient();
@@ -133,6 +134,7 @@ export default function PositionsPage() {
     }) => {
       // If positions were opened or closed, refetch
       if (acc.opened.length > 0 || acc.closed.length > 0) {
+        if (acc.closed.length > 0) setClosedPage(0);
         queryClient.invalidateQueries({ queryKey: queryKeys.positions.all() });
         return;
       }
@@ -199,15 +201,13 @@ export default function PositionsPage() {
   const summaryOpenPositions =
     positionsSummary?.open_positions ?? openPositions.length;
 
-  // Paginated closed positions
-  const paginatedClosed = useMemo(() => {
-    const start = closedPage * PAGE_SIZE;
-    return closedPositions.slice(start, start + PAGE_SIZE);
-  }, [closedPositions, closedPage]);
-  const totalClosedPages = Math.max(1, Math.ceil(loadedClosedCount / PAGE_SIZE));
+  const totalClosedPages = Math.max(1, Math.ceil(closedCount / PAGE_SIZE));
+  useEffect(() => {
+    setClosedPage((page) => Math.min(page, totalClosedPages - 1));
+  }, [totalClosedPages]);
 
   const isLoading = activeTab === "open" ? openLoading : closedLoading;
-  const positions = activeTab === "open" ? openPositions : paginatedClosed;
+  const positions = activeTab === "open" ? openPositions : closedPositions;
 
   return (
     <ErrorBoundary>
@@ -496,7 +496,7 @@ export default function PositionsPage() {
             {activeTab === "closed" && closedCount > PAGE_SIZE && (
               <div className="flex flex-col gap-2 border-t px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                 <span className="text-sm text-muted-foreground">
-                  Page {closedPage + 1} of {totalClosedPages}
+                  Page {closedPage + 1} of {totalClosedPages}{closedFetching ? " · Updating…" : ""}
                 </span>
                 <div className="flex gap-1">
                   <Button

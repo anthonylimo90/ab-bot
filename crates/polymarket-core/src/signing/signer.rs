@@ -64,7 +64,12 @@ impl OrderSigner {
     /// Sign an order and return the signed order ready for submission.
     pub async fn sign_order(&self, order: &OrderData) -> Result<SignedOrder> {
         let signature = self.sign_typed_data(order).await?;
-        Ok(SignedOrder::from_order_data(order, signature))
+        let mut signed = SignedOrder::from_order_data(order, signature);
+        signed.order_hash = Some(format!(
+            "{:#x}",
+            compute_typed_data_hash(self.domain.separator(), order.struct_hash())
+        ));
+        Ok(signed)
     }
 
     /// Sign order data using EIP-712 typed data signing.
@@ -152,6 +157,14 @@ fn compute_typed_data_hash(domain_separator: B256, struct_hash: B256) -> B256 {
     let prefix: [u8; 2] = [0x19, 0x01];
     let data = (prefix, domain_separator, struct_hash).abi_encode_packed();
     alloy_primitives::keccak256(&data)
+}
+
+/// Digest signed by browser wallets to derive their own exchange credentials.
+pub fn clob_auth_digest(address: Address, timestamp: u64, nonce: u64) -> B256 {
+    compute_typed_data_hash(
+        ClobAuthDomain::polygon().separator(),
+        clob_auth_struct_hash(address, timestamp, nonce),
+    )
 }
 
 /// Compute the EIP-712 struct hash for ClobAuth.

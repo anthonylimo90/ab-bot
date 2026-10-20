@@ -23,6 +23,26 @@ fn get_opt_smallint(r: &sqlx::postgres::PgRow, col: &str) -> Option<i16> {
         .unwrap_or_else(|_| r.get::<Option<i32>, _>(col).map(|v| v as i16))
 }
 
+// Explicit holdings remain exposure in every lifecycle state. Pending entries
+// reserve their full requested cost, including their not-yet-filled legs.
+const TOTAL_ACTIVE_EXPOSURE_SQL: &str = r#"
+SELECT COALESCE((SELECT SUM(CASE WHEN state=0 THEN GREATEST(
+    quantity * COALESCE(NULLIF(yes_entry_price + no_entry_price,0),1),
+    held_yes_qty * CASE WHEN yes_entry_price>0 THEN yes_entry_price ELSE 1 END +
+    held_no_qty * CASE WHEN no_entry_price>0 THEN no_entry_price ELSE 1 END)
+ ELSE held_yes_qty * CASE WHEN yes_entry_price>0 THEN yes_entry_price ELSE 1 END +
+    held_no_qty * CASE WHEN no_entry_price>0 THEN no_entry_price ELSE 1 END END)
+ FROM positions WHERE state=0 OR held_yes_qty>0 OR held_no_qty>0),0)
+ + COALESCE((SELECT SUM(GREATEST(quantity-filled_quantity,0)*COALESCE(price,1))
+ FROM orders WHERE side='buy' AND status IN ('pending','open','partially_filled')),0)
+ + COALESCE((SELECT SUM((signed_order->>'makerAmount')::numeric/1000000)
+ FROM execution_intents WHERE status IN ('submitting','unknown') AND signed_order->>'side'='BUY'),0)
+"#;
+
+#[cfg(test)]
+#[path = "positions/exposure_tests.rs"]
+mod exposure_tests;
+
 /// Repository for position data.
 pub struct PositionRepository {
     pool: PgPool,
@@ -57,6 +77,35 @@ impl PositionRepository {
         source: i16,
         source_signal_id: Option<Uuid>,
     ) -> Result<()> {
+        self.insert_with_source_and_limit(position, source, source_signal_id, None)
+            .await
+    }
+
+    /// Atomically reserve a pending position within the prospective exposure cap.
+    /// Every entry insertion takes the same database lock, across processes.
+    pub async fn insert_with_source_and_limit(
+        &self,
+        position: &Position,
+        source: i16,
+        source_signal_id: Option<Uuid>,
+        max_exposure: Option<Decimal>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
+            .execute(&mut *tx)
+            .await?;
+        if let Some(limit) = max_exposure {
+            let current: Decimal = sqlx::query_scalar(TOTAL_ACTIVE_EXPOSURE_SQL)
+                .fetch_one(&mut *tx)
+                .await?;
+            if position.entry_cost() <= Decimal::ZERO || current + position.entry_cost() > limit {
+                return Err(crate::Error::Position(format!(
+                    "Prospective exposure {} exceeds limit {}",
+                    current + position.entry_cost(),
+                    limit
+                )));
+            }
+        }
         let failure_reason_json = position
             .failure_reason
             .as_ref()
@@ -103,9 +152,10 @@ impl PositionRepository {
         .bind(position.entry_timestamp)
         .bind(source)
         .bind(source_signal_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -639,21 +689,12 @@ impl PositionRepository {
             .collect())
     }
 
-    /// Total cost-basis exposure across all open positions (states: Pending, Open, ExitReady, Closing).
+    /// Cost-basis holdings plus pending order/entry reservations. Query failures
+    /// propagate so entry guards cannot silently assume that exposure is zero.
     pub async fn get_total_active_exposure(&self) -> Result<Decimal> {
-        let value: Option<Decimal> = sqlx::query_scalar(
-            r#"
-            SELECT COALESCE(SUM(
-                quantity * COALESCE(entry_price, yes_entry_price + no_entry_price, 0)
-            ), 0)
-            FROM positions
-            WHERE state IN (0, 1, 2, 3)
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(value.unwrap_or(Decimal::ZERO))
+        Ok(sqlx::query_scalar(TOTAL_ACTIVE_EXPOSURE_SQL)
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     /// Count active positions for a given market across all sources.
@@ -663,7 +704,7 @@ impl PositionRepository {
             SELECT COUNT(*)
             FROM positions
             WHERE market_id = $1
-              AND state IN (0, 1, 2, 3)
+              AND (state IN (0, 1, 2, 3, 6, 7) OR held_yes_qty>0 OR held_no_qty>0)
             "#,
         )
         .bind(market_id)

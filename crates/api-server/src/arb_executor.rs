@@ -6,17 +6,15 @@
 //! sequential YES + NO market orders.
 
 use chrono::Utc;
-use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE};
-use polymarket_core::types::Market;
 use polymarket_core::types::{ArbOpportunity, ExitStrategy, FailureReason, MarketOrder, OrderSide};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 use uuid::Uuid;
@@ -125,241 +123,7 @@ impl ArbExecutorConfig {
     }
 }
 
-/// Cached mapping of market_id → (yes_token_id, no_token_id).
-pub(crate) struct OutcomeTokenCache {
-    clob_client: Arc<ClobClient>,
-    gamma_client: GammaClient,
-    tokens: RwLock<HashMap<String, (String, String)>>,
-    /// Shared set of active (non-resolved) market IDs, populated on each refresh.
-    /// Used to skip resolved markets before hitting CLOB.
-    active_clob_markets: Arc<RwLock<HashSet<String>>>,
-    /// Database pool for persisting token→condition_id mappings.
-    pool: Option<PgPool>,
-    /// Serialize cache mutations to avoid overlapping upserts deadlocking.
-    refresh_lock: Mutex<()>,
-}
-
-impl OutcomeTokenCache {
-    pub(crate) fn new(
-        clob_client: Arc<ClobClient>,
-        active_clob_markets: Arc<RwLock<HashSet<String>>>,
-    ) -> Self {
-        Self {
-            clob_client,
-            gamma_client: GammaClient::new(None),
-            tokens: RwLock::new(HashMap::new()),
-            active_clob_markets,
-            pool: None,
-            refresh_lock: Mutex::new(()),
-        }
-    }
-
-    pub(crate) fn with_pool(mut self, pool: PgPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    /// Refresh the cache using Gamma as the source of tradable markets.
-    pub(crate) async fn refresh(&self) -> anyhow::Result<(usize, usize)> {
-        let _guard = self.refresh_lock.lock().await;
-        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(200);
-        let markets = self
-            .gamma_client
-            .get_all_tradable_markets(gamma_page_size)
-            .await?;
-        let mut map = HashMap::new();
-        let mut active_set = HashSet::new();
-        // Collect token_id → condition_id mappings for DB cache
-        let mut token_condition_pairs: Vec<(String, String)> = Vec::new();
-
-        for market in &markets {
-            if !market.resolved {
-                active_set.insert(market.id.clone());
-                // Also insert outcome token IDs so trades whose market_id
-                // fell back to asset_id (when condition_id is absent) still
-                // match the active set.
-                for outcome in &market.outcomes {
-                    active_set.insert(outcome.token_id.clone());
-                    // Map token_id → condition_id (market.id) for the DB cache
-                    token_condition_pairs.push((outcome.token_id.clone(), market.id.clone()));
-                }
-            }
-            if market.outcomes.len() == 2 {
-                let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-                    (
-                        market.outcomes[0].token_id.clone(),
-                        market.outcomes[1].token_id.clone(),
-                    )
-                } else {
-                    (
-                        market.outcomes[1].token_id.clone(),
-                        market.outcomes[0].token_id.clone(),
-                    )
-                };
-                map.insert(market.id.clone(), (yes_id, no_id));
-            }
-        }
-
-        let count = map.len();
-        let active_set_size = active_set.len();
-        *self.tokens.write().await = map;
-        *self.active_clob_markets.write().await = active_set;
-
-        // Deduplicate by token_id (same token can appear if cursor pages overlap)
-        let deduped: std::collections::HashMap<&str, &str> = token_condition_pairs
-            .iter()
-            .map(|(t, c)| (t.as_str(), c.as_str()))
-            .collect();
-        let mut token_condition_pairs: Vec<(String, String)> = deduped
-            .into_iter()
-            .map(|(t, c)| (t.to_owned(), c.to_owned()))
-            .collect();
-        token_condition_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Batch UPSERT token→condition_id mappings to DB for resolution checks
-        if let Some(ref pool) = self.pool {
-            if let Err(e) = Self::upsert_token_condition_cache(pool, &token_condition_pairs).await {
-                warn!(error = %e, "Failed to update token_condition_cache");
-            } else {
-                debug!(
-                    pairs = token_condition_pairs.len(),
-                    "Updated token_condition_cache"
-                );
-            }
-        }
-
-        Ok((count, active_set_size))
-    }
-
-    /// Hydrate a single market into the cache without forcing a full-market refresh.
-    pub(crate) async fn hydrate_market(
-        &self,
-        market_id: &str,
-    ) -> anyhow::Result<Option<(String, String)>> {
-        if let Some(ids) = self.get(market_id).await {
-            return Ok(Some(ids));
-        }
-
-        let market = match self.clob_client.get_market_by_id(market_id).await {
-            Ok(market) => market,
-            Err(e) => {
-                warn!(market_id = %market_id, error = %e, "Failed to fetch single market for token cache hydration");
-                return Ok(None);
-            }
-        };
-
-        let _guard = self.refresh_lock.lock().await;
-        Ok(self.apply_market_update(&market).await?)
-    }
-
-    /// Number of cached market → token mappings.
-    pub(crate) async fn len(&self) -> usize {
-        self.tokens.read().await.len()
-    }
-
-    /// Insert an alias mapping (e.g., asset_id → same token pair).
-    /// Used by exit_handler when a position's market_id is an asset_id.
-    pub(crate) async fn alias(&self, alias: &str, ids: &(String, String)) {
-        self.tokens
-            .write()
-            .await
-            .insert(alias.to_string(), ids.clone());
-    }
-
-    async fn apply_market_update(
-        &self,
-        market: &Market,
-    ) -> anyhow::Result<Option<(String, String)>> {
-        let mut tokens = self.tokens.write().await;
-        let mut active_markets = self.active_clob_markets.write().await;
-
-        if market.resolved {
-            active_markets.remove(&market.id);
-            for outcome in &market.outcomes {
-                active_markets.remove(&outcome.token_id);
-            }
-        } else {
-            active_markets.insert(market.id.clone());
-            for outcome in &market.outcomes {
-                active_markets.insert(outcome.token_id.clone());
-            }
-        }
-
-        let token_pair = if market.outcomes.len() == 2 {
-            let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-                (
-                    market.outcomes[0].token_id.clone(),
-                    market.outcomes[1].token_id.clone(),
-                )
-            } else {
-                (
-                    market.outcomes[1].token_id.clone(),
-                    market.outcomes[0].token_id.clone(),
-                )
-            };
-            tokens.insert(market.id.clone(), (yes_id.clone(), no_id.clone()));
-            Some((yes_id, no_id))
-        } else {
-            tokens.remove(&market.id);
-            None
-        };
-        drop(tokens);
-        drop(active_markets);
-
-        if let Some(ref pool) = self.pool {
-            let mut token_condition_pairs: Vec<(String, String)> = market
-                .outcomes
-                .iter()
-                .map(|outcome| (outcome.token_id.clone(), market.id.clone()))
-                .collect();
-            token_condition_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            if let Err(e) = Self::upsert_token_condition_cache(pool, &token_condition_pairs).await {
-                warn!(market_id = %market.id, error = %e, "Failed to update token_condition_cache during single-market hydration");
-            } else {
-                debug!(market_id = %market.id, pairs = token_condition_pairs.len(), "Hydrated token_condition_cache for single market");
-            }
-        }
-
-        Ok(token_pair)
-    }
-
-    /// Batch UPSERT token→condition_id mappings into the database cache.
-    async fn upsert_token_condition_cache(
-        pool: &PgPool,
-        pairs: &[(String, String)],
-    ) -> anyhow::Result<()> {
-        if pairs.is_empty() {
-            return Ok(());
-        }
-
-        // Batch in smaller deterministic chunks to reduce row-lock contention.
-        const BATCH_SIZE: usize = 250;
-        for chunk in pairs.chunks(BATCH_SIZE) {
-            let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-                "INSERT INTO token_condition_cache (token_id, condition_id, updated_at) ",
-            );
-            qb.push_values(chunk, |mut b, (token_id, condition_id)| {
-                b.push_bind(token_id)
-                    .push_bind(condition_id)
-                    .push_bind(chrono::Utc::now());
-            });
-            qb.push(
-                " ON CONFLICT (token_id) DO UPDATE SET condition_id = EXCLUDED.condition_id, updated_at = EXCLUDED.updated_at WHERE token_condition_cache.condition_id IS DISTINCT FROM EXCLUDED.condition_id",
-            );
-            qb.build().execute(pool).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Look up token IDs for a given market.
-    pub(crate) async fn get(&self, market_id: &str) -> Option<(String, String)> {
-        self.tokens.read().await.get(market_id).cloned()
-    }
-}
+pub use crate::market_catalog::OutcomeTokenCache;
 
 #[derive(Debug, Clone, Default)]
 pub struct ArbExecutorRuntimeStatus {
@@ -668,7 +432,13 @@ impl ArbAutoExecutor {
                 }
             });
 
-            match self.token_cache.refresh().await {
+            match self
+                .token_cache
+                .refresh_if_stale(std::time::Duration::from_secs(
+                    startup_cfg.cache_refresh_secs.max(1),
+                ))
+                .await
+            {
                 Ok((count, active_set_size)) => info!(
                     markets = count,
                     active_set_size, "Outcome token cache loaded"
@@ -679,7 +449,8 @@ impl ArbAutoExecutor {
             keeper.abort();
         }
 
-        let cache_interval = tokio::time::Duration::from_secs(startup_cfg.cache_refresh_secs);
+        let cache_interval =
+            tokio::time::Duration::from_secs(startup_cfg.cache_refresh_secs.max(1));
         let mut cache_ticker = tokio::time::interval(cache_interval);
         // Skip the first immediate tick (we already loaded above)
         cache_ticker.tick().await;
@@ -706,7 +477,7 @@ impl ArbAutoExecutor {
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             {
                                 let mut runtime = self.runtime_status.write().await;
-                                runtime.lagged_signals = runtime.lagged_signals.saturating_add(n as u64);
+                                runtime.lagged_signals = runtime.lagged_signals.saturating_add(n);
                                 runtime.record_decision("channel", format!("lagged {} arb signals", n));
                             }
                             warn!(skipped = n, "Arb executor lagged, skipped signals");
@@ -726,7 +497,7 @@ impl ArbAutoExecutor {
                         let runtime_status = Arc::clone(&self.runtime_status);
                         let cache_refresh_inflight = Arc::clone(&cache_refresh_inflight);
                         tokio::spawn(async move {
-                            match token_cache.refresh().await {
+                            match token_cache.refresh_if_stale(cache_interval).await {
                                 Ok((count, active_set_size)) => {
                                     debug!(
                                         markets = count,
@@ -976,7 +747,10 @@ impl ArbAutoExecutor {
                 }
             }
             Err(e) => {
-                warn!(error = %e, "Failed to query total exposure, proceeding with trade");
+                warn!(error = %e, "Exposure check unavailable; skipping trade");
+                self.record_skip_event(&arb, execution_mode, "exposure_check_failed", &telemetry)
+                    .await;
+                return Ok(());
             }
         }
 
@@ -1252,7 +1026,7 @@ impl ArbAutoExecutor {
         );
         let mut position = match self
             .position_service
-            .create_position(
+            .create_position_with_limit(
                 CreatePositionParams {
                     market_id: market_id.clone(),
                     yes_entry_price: arb.yes_ask,
@@ -1265,6 +1039,7 @@ impl ArbAutoExecutor {
                 },
                 &ctx,
                 create_metadata,
+                Some(cfg.max_total_exposure),
             )
             .await
         {
@@ -1575,16 +1350,12 @@ pub fn spawn_arb_auto_executor(
     trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
-    clob_client: Arc<ClobClient>,
+    token_cache: Arc<OutcomeTokenCache>,
     pool: PgPool,
     active_markets: Arc<RwLock<HashSet<String>>>,
-    active_clob_markets: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
     runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
 ) -> Arc<OutcomeTokenCache> {
-    let token_cache =
-        Arc::new(OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()));
-
     let executor = ArbAutoExecutor::new(
         config,
         arb_entry_rx,

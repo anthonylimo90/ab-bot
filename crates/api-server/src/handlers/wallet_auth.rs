@@ -402,7 +402,9 @@ pub async fn verify(
     let role = user.role_string();
     let user_role = user.user_role();
 
-    let claims = Claims::new(user.id.to_string(), user_role, 24).with_wallet_address(&address);
+    let claims = crate::middleware::session_claims(&state.pool, user.id, user_role)
+        .await?
+        .with_wallet_address(&address);
     let claims = if let Some(ref email) = user.email {
         claims.with_email(email)
     } else {

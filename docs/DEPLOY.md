@@ -395,3 +395,29 @@ railway run -s api-server -- cargo sqlx migrate run
 Adding staging roughly doubles costs (~$60-100/month total) due to separate database instances. Reduce staging costs by:
 - Stopping staging services when not in use
 - Using smaller database instances for staging
+
+## Trading wallet selection
+
+The bot selects its shared trading signer at API startup. Adding or removing a personal wallet, or changing a user's primary wallet, does not change that signer. Personal primary wallets control balance lookups and withdrawals.
+
+Set `TRADING_WALLET_ADDRESS` in the API service configuration to select a wallet explicitly. Otherwise, startup uses the canonical workspace's saved `trading_wallet_address`. Its private key must be available in the configured vault or in `WALLET_PRIVATE_KEY`, and must derive the selected address. If no address is configured, `WALLET_PRIVATE_KEY` remains supported as the operator's explicit signer configuration.
+
+A missing or mismatched key never causes fallback to another user's wallet. Exchange approvals use the same signer selected for order execution. Changes to signer configuration require an API restart; personal wallet endpoints do not provide a signer reload operation.
+
+Startup rejects a change away from the saved trading wallet while positions are pending, open, recovering, or still hold tokens. Reconcile and close that exposure before rotating the wallet. Importing a key through personal wallet settings alone does not authorize its use by the bot.
+
+### Review fix migrations and client compatibility
+
+Apply the repository's migrations before starting the updated API. Migrations 069–072 add durable signed-order intents, exchange order identity/provenance, recovery of closed rows with explicit holdings, and persistent session revocation. Migration 068 now preserves unresolved positions instead of closing them by age. If a deployment already recorded the original 068 checksum, SQLx will require a reviewed migration-history repair; back up the database, reconcile the affected positions, and review migration 071 before accepting the revised checksum. Do not disable checksum validation globally.
+
+REST order placement requires a stable `client_order_id`; withdrawals require a stable `client_request_id`. Reuse the same key and original payload through retries, including lost responses. A changed payload requires a new intent. Private WebSocket clients must send `{"action":"authenticate","token":"<JWT>"}` as their first frame within five seconds; only orderbook-only streams remain public. Browser wallet orders also require a fresh wallet-signed ClobAuth proof, which the dashboard supplies.
+
+Stop all trading workers before changing the pinned signer. A permitted startup selection is saved to the workspace so later restarts recognize the same signer after positions are opened.
+
+A signed live order is journaled before submission. `submitting` or `unknown` intents block further submissions for that wallet after a timeout, process failure or uncertain response. Reconcile the stored exchange identity and signed payload against exchange fills and actual holdings before marking an intent reconciled; do not clear the fence merely to retry. Historical orders with unknown execution provenance cannot be marked cancelled locally. These changes do not submit orders, migrate production databases, or rotate production keys automatically.
+
+### Efficiency improvements
+
+Apply migrations 073–075 with the updated API. They add the complete market-catalog publication timestamp, inventory refresh status, and a covering index for pending or held exposure. Catalog refreshes publish a persisted markets projection; list requests return 503 until its first completed publication and then include observed-at/stale headers. The shared token refresh uses the faster of `ARB_CACHE_REFRESH_SECS` and `QUANT_CACHE_REFRESH_SECS`, with a minimum of one second.
+
+Recovery previews read the last completed inventory snapshot. Use the dashboard's **Refresh inventory** action, or `POST /api/v1/workspaces/{id}/recovery/preview?refresh=true`, to request a scan. Recovery runs require a successful fresh scan. Failed balance reads preserve previous observations and expose failure status; they never imply zero holdings. CLOB balances use six-decimal base units, converted to shares or USDC before valuation and capacity checks. Scans coordinate across replicas and publish inventory batches atomically.

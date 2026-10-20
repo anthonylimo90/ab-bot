@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::error::{ApiError, ApiResult};
 use crate::position_service::EventContext;
 use crate::state::AppState;
+use crate::workspace_scope::{WorkspaceReadAccess, WorkspaceTradeAccess};
 
 use crate::websocket::{PositionUpdate, PositionUpdateType};
 
@@ -289,69 +290,18 @@ fn validate_status_filter(status: &str) -> ApiResult<&str> {
     tag = "positions",
     params(ListPositionsQuery),
     responses(
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient canonical workspace permissions"),
         (status = 200, description = "List of positions", body = Vec<PositionResponse>),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn list_positions(
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListPositionsQuery>,
 ) -> ApiResult<Json<Vec<PositionResponse>>> {
-    let status_filter = validate_status_filter(&query.status)?;
-
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        r#"
-        SELECT id, market_id,
-               COALESCE(outcome, 'both') AS outcome,
-               COALESCE(side, 'long') AS side,
-               quantity,
-               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
-               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
-               unrealized_pnl, stop_loss, take_profit,
-               realized_pnl,
-               state,
-               COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
-               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
-               yes_exit_price, no_exit_price, resolution_winner,
-               COALESCE(exit_strategy, 0) AS exit_strategy
-        FROM positions
-        WHERE 1 = 1
-        "#,
-    );
-
-    if let Some(market_id) = &query.market_id {
-        qb.push(" AND market_id = ");
-        qb.push_bind(market_id);
-    }
-
-    if let Some(outcome) = &query.outcome {
-        qb.push(" AND COALESCE(outcome, 'both') = ");
-        qb.push_bind(outcome);
-    }
-
-    match status_filter {
-        "open" => {
-            qb.push(" AND is_open = TRUE");
-        }
-        "closed" => {
-            qb.push(" AND is_open = FALSE");
-        }
-        "all" => {}
-        _ => unreachable!("status_filter already validated"),
-    }
-
-    qb.push(" ORDER BY COALESCE(opened_at, entry_timestamp) DESC");
-    qb.push(" LIMIT ");
-    qb.push_bind(query.limit);
-    qb.push(" OFFSET ");
-    qb.push_bind(query.offset);
-
-    let rows: Vec<PositionRow> = qb
-        .build_query_as()
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let rows = load_position_rows(&state.pool, &query).await?;
 
     let positions: Vec<PositionResponse> = rows
         .into_iter()
@@ -395,17 +345,88 @@ pub async fn list_positions(
     Ok(Json(positions))
 }
 
+async fn load_position_rows(
+    pool: &sqlx::PgPool,
+    query: &ListPositionsQuery,
+) -> ApiResult<Vec<PositionRow>> {
+    if query.offset < 0 || !(1..=500).contains(&query.limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be 1–500 and offset nonnegative".into(),
+        ));
+    }
+    let status_filter = validate_status_filter(&query.status)?;
+
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        r#"
+        SELECT id, market_id,
+               COALESCE(outcome, 'both') AS outcome,
+               COALESCE(side, 'long') AS side,
+               quantity,
+               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
+               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+               unrealized_pnl, stop_loss, take_profit,
+               realized_pnl,
+               state,
+               COALESCE(opened_at, entry_timestamp) AS opened_at,
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
+               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
+               yes_exit_price, no_exit_price, resolution_winner,
+               COALESCE(exit_strategy, 0)::smallint AS exit_strategy
+        FROM positions
+        WHERE 1 = 1
+        "#,
+    );
+
+    if let Some(market_id) = &query.market_id {
+        qb.push(" AND market_id = ");
+        qb.push_bind(market_id);
+    }
+
+    if let Some(outcome) = &query.outcome {
+        qb.push(" AND COALESCE(outcome, 'both') = ");
+        qb.push_bind(outcome);
+    }
+
+    match status_filter {
+        "open" => {
+            qb.push(" AND is_open = TRUE");
+        }
+        "closed" => {
+            qb.push(" AND is_open = FALSE");
+        }
+        "all" => {}
+        _ => unreachable!("status_filter already validated"),
+    }
+
+    qb.push(" ORDER BY COALESCE(opened_at, entry_timestamp) DESC, id DESC");
+    qb.push(" LIMIT ");
+    qb.push_bind(query.limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(query.offset);
+
+    let rows: Vec<PositionRow> = qb
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(rows)
+}
+
 /// Get aggregate position metrics for dashboards.
 #[utoipa::path(
     get,
     path = "/api/v1/positions/summary",
     tag = "positions",
     responses(
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient canonical workspace permissions"),
         (status = 200, description = "Aggregate position metrics", body = PositionsSummaryResponse),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn get_positions_summary(
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<PositionsSummaryResponse>> {
     let row: PositionSummaryRow = sqlx::query_as(
@@ -414,7 +435,7 @@ pub async fn get_positions_summary(
             SELECT
                 id,
                 market_id,
-                COALESCE(source, 0) AS source,
+                COALESCE(source, 0)::smallint AS source,
                 quantity,
                 current_price,
                 COALESCE(entry_price, (yes_entry_price + no_entry_price), 0) AS entry_price,
@@ -522,11 +543,14 @@ pub async fn get_positions_summary(
         ("position_id" = Uuid, Path, description = "Position identifier")
     ),
     responses(
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient canonical workspace permissions"),
         (status = 200, description = "Position details", body = PositionResponse),
         (status = 404, description = "Position not found")
     )
 )]
 pub async fn get_position(
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(position_id): Path<Uuid>,
 ) -> ApiResult<Json<PositionResponse>> {
@@ -545,7 +569,7 @@ pub async fn get_position(
                COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
                yes_exit_price, no_exit_price, resolution_winner,
-               COALESCE(exit_strategy, 0) AS exit_strategy
+               COALESCE(exit_strategy, 0)::smallint AS exit_strategy
         FROM positions
         WHERE id = $1
         "#,
@@ -608,12 +632,15 @@ pub async fn get_position(
     ),
     request_body = ClosePositionRequest,
     responses(
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient canonical workspace permissions"),
         (status = 200, description = "Position closed", body = PositionResponse),
         (status = 404, description = "Position not found"),
         (status = 400, description = "Invalid request")
     )
 )]
 pub async fn close_position(
+    _access: WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Path(position_id): Path<Uuid>,
     Json(request): Json<ClosePositionRequest>,
@@ -625,27 +652,7 @@ pub async fn close_position(
     }
 
     // First, fetch the position
-    let row: Option<CloseablePositionRow> = sqlx::query_as(
-        r#"
-        SELECT id, market_id,
-               COALESCE(outcome, 'both') AS outcome,
-               COALESCE(side, 'long') AS side,
-               quantity,
-               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
-               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
-               stop_loss, take_profit,
-               realized_pnl,
-               COALESCE(source, 0) AS source,
-               COALESCE(opened_at, entry_timestamp) AS opened_at
-        FROM positions
-        WHERE id = $1
-          AND is_open = TRUE
-        "#,
-    )
-    .bind(position_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let row = load_closeable_position(&state.pool, position_id).await?;
 
     let row = match row {
         Some(r) => r,
@@ -826,9 +833,106 @@ pub async fn close_position(
     }))
 }
 
+async fn load_closeable_position(
+    pool: &sqlx::PgPool,
+    position_id: Uuid,
+) -> ApiResult<Option<CloseablePositionRow>> {
+    let row: Option<CloseablePositionRow> = sqlx::query_as(
+        r#"
+        SELECT id, market_id,
+               COALESCE(outcome, 'both') AS outcome,
+               COALESCE(side, 'long') AS side,
+               quantity,
+               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
+               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+               stop_loss, take_profit,
+               realized_pnl,
+               COALESCE(source, 0)::smallint AS source,
+               COALESCE(opened_at, entry_timestamp) AS opened_at
+        FROM positions
+        WHERE id = $1
+          AND is_open = TRUE
+        "#,
+    )
+    .bind(position_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn history_pages_cover_more_than_500_tied_timestamps_without_duplicates(
+        pool: sqlx::PgPool,
+    ) {
+        use sqlx::Executor;
+        pool.execute(
+            "CREATE VIEW positions AS SELECT md5(g::text)::uuid AS id,
+            'market'::text AS market_id,'yes'::text AS outcome,'long'::text AS side,
+            10::numeric AS quantity,0.4::numeric AS entry_price,0.5::numeric AS current_price,
+            0.4::numeric AS yes_entry_price,0::numeric AS no_entry_price,
+            0::numeric AS unrealized_pnl, NULL::numeric AS stop_loss,NULL::numeric AS take_profit,
+            1::numeric AS realized_pnl,4::smallint AS state,NULL::timestamptz AS opened_at,
+            '2026-10-19T00:00:00Z'::timestamptz AS entry_timestamp,
+            NOW() AS updated_at,NULL::timestamptz AS last_updated,
+            0::numeric AS held_yes_qty,0::numeric AS held_no_qty,
+            10::numeric AS exited_yes_qty,0::numeric AS exited_no_qty,
+            0.5::numeric AS yes_exit_price,NULL::numeric AS no_exit_price,
+            NULL::text AS resolution_winner,0::smallint AS exit_strategy,0::smallint AS source,(g>600) AS is_open
+            FROM generate_series(1,605) g",
+        )
+        .await
+        .unwrap();
+        let mut query = ListPositionsQuery {
+            market_id: None,
+            outcome: None,
+            status: "closed".into(),
+            limit: 25,
+            offset: 0,
+        };
+        let mut seen = Vec::new();
+        for page in 0..24 {
+            query.offset = page * 25;
+            let rows = load_position_rows(&pool, &query).await.unwrap();
+            assert_eq!(rows.len(), 25);
+            seen.extend(rows.into_iter().map(|row| row.id));
+        }
+        let expected: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM positions WHERE is_open=FALSE ORDER BY id DESC")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let open: Uuid = sqlx::query_scalar("SELECT id FROM positions WHERE is_open=TRUE LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            load_closeable_position(&pool, open)
+                .await
+                .unwrap()
+                .unwrap()
+                .source,
+            0
+        );
+        assert!(load_closeable_position(&pool, seen[0])
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(seen, expected);
+        assert_eq!(
+            seen.iter().collect::<std::collections::HashSet<_>>().len(),
+            600
+        );
+        query.offset = 600;
+        assert!(load_position_rows(&pool, &query).await.unwrap().is_empty());
+        query.offset = -1;
+        assert!(load_position_rows(&pool, &query).await.is_err());
+    }
 
     #[test]
     fn test_position_response_serialization() {

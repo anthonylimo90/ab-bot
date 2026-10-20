@@ -11,7 +11,8 @@ import { useWebSocket } from "@/hooks/useWebSocket";
 import { formatCurrency } from "@/lib/utils";
 import { X, TrendingUp, TrendingDown } from "lucide-react";
 import type { WebSocketMessage, OrderbookUpdate } from "@/types/api";
-import { useCallback, useState } from "react";
+import { useCallback, useRef } from "react";
+import { coalescedRefresh } from "@/lib/coalesced-refresh";
 import { useQueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryClient";
 
@@ -23,26 +24,34 @@ interface MarketDetailSheetProps {
 export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps) {
   const queryClient = useQueryClient();
   const { data: market, isLoading: isMarketLoading } = useMarketQuery(marketId);
-  const { data: orderbook, isLoading: isOrderbookLoading } = useOrderbookQuery(marketId);
+  const refresh = useRef<ReturnType<typeof coalescedRefresh> | null>(null);
+  useEffect(() => {
+    if (!marketId) return;
+    const scheduler = coalescedRefresh(() => queryClient.invalidateQueries(
+      { queryKey: queryKeys.markets.orderbook(marketId) }, { cancelRefetch: false },
+    ));
+    refresh.current = scheduler;
+    return () => { scheduler.dispose(); refresh.current = null; };
+  }, [marketId, queryClient]);
 
   const handleWsMessage = useCallback(
     (msg: WebSocketMessage) => {
       if (msg.type !== "Orderbook") return;
       const update = msg.data as OrderbookUpdate;
       if (update.market_id === marketId && marketId !== null) {
-        queryClient.invalidateQueries({
-          queryKey: queryKeys.markets.orderbook(marketId),
-        });
+        refresh.current?.notify();
       }
     },
-    [marketId, queryClient],
+    [marketId],
   );
 
-  useWebSocket({
+  const { status: wsStatus } = useWebSocket({
     channel: "orderbook",
     onMessage: handleWsMessage,
     enabled: !!marketId,
+    onConnect: () => refresh.current?.notify(),
   });
+  const { data: orderbook, isLoading: isOrderbookLoading } = useOrderbookQuery(marketId, true, wsStatus === "connected");
 
   useEffect(() => {
     if (!marketId) return;

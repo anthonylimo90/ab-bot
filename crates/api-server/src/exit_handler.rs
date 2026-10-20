@@ -819,20 +819,6 @@ impl ExitHandler {
             return Ok(Some(ids));
         }
 
-        // Force a shared-cache refresh (arb_executor's full Gamma-based refresh)
-        self.touch_heartbeat();
-        if let Err(error) = self.token_cache.refresh().await {
-            warn!(
-                market_id = %market_id,
-                error = %error,
-                "Failed to refresh shared token cache before retry"
-            );
-        }
-
-        if let Some(ids) = self.token_cache.get(market_id).await {
-            return Ok(Some(ids));
-        }
-
         // Single-market hydration via CLOB API
         if let Some(ids) = self.token_cache.hydrate_market(market_id).await? {
             return Ok(Some(ids));
@@ -1183,7 +1169,7 @@ impl ExitHandler {
                 );
 
                 self.touch_heartbeat();
-                if let Err(refresh_error) = self.token_cache.refresh().await {
+                if let Err(refresh_error) = self.token_cache.refresh_market(market_id).await {
                     warn!(
                         market_id = %market_id,
                         error = %refresh_error,

@@ -422,7 +422,7 @@ impl HistoricalDataStore {
         };
 
         let snapshots: Vec<MarketSnapshot> = rows
-            .iter()
+            .into_iter()
             .map(|row| {
                 use sqlx::Row;
                 MarketSnapshot {
@@ -586,7 +586,7 @@ impl HistoricalDataStore {
 
         // Sort each group by timestamp
         for snapshots in grouped.values_mut() {
-            snapshots.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            snapshots.sort_by_key(|a| a.timestamp);
         }
 
         grouped

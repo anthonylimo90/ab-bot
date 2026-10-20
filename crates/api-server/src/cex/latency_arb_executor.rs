@@ -15,11 +15,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use risk_manager::circuit_breaker::CircuitBreaker;
-use trading_engine::OrderExecutor;
 
 use super::market_mapper::{MappedMarket, MarketMapper};
 use super::price_tracker::{
-    CexPriceTick, CexSymbol, PriceDirection, PriceMovement, PriceTracker, PriceTrackerConfig,
+    CexPriceTick, PriceDirection, PriceMovement, PriceTracker, PriceTrackerConfig,
 };
 
 /// Configuration for the latency arb executor.
@@ -248,7 +247,7 @@ pub fn spawn_latency_arb_executor(
             }
 
             // Evict expired cooldowns every 100 signals to bound memory
-            if signals_evaluated > 0 && signals_evaluated % 100 == 0 {
+            if signals_evaluated > 0 && signals_evaluated.is_multiple_of(100) {
                 let before = cooldowns.len();
                 cooldowns.retain(|_, ts| ts.elapsed() < cooldown_duration);
                 let evicted = before - cooldowns.len();
@@ -330,6 +329,7 @@ fn compute_edge(movement: &PriceMovement, market: &MappedMarket) -> (bool, f64, 
 }
 
 /// Record a latency arb signal to the database for tracking and paper-mode analysis.
+#[allow(clippy::too_many_arguments)]
 async fn record_latency_arb_signal(
     pool: &PgPool,
     cex_symbol: &str,

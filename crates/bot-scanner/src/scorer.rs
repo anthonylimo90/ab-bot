@@ -106,7 +106,7 @@ pub fn generate_report(features: &WalletFeatures, score: &BotScore) -> String {
 #[allow(dead_code)]
 pub fn rank_wallets(wallets: &[(WalletFeatures, BotScore)]) -> Vec<&(WalletFeatures, BotScore)> {
     let mut ranked: Vec<_> = wallets.iter().collect();
-    ranked.sort_by(|a, b| b.1.total_score.cmp(&a.1.total_score));
+    ranked.sort_by_key(|wallet| std::cmp::Reverse(wallet.1.total_score));
     ranked
 }
 

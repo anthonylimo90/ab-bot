@@ -221,6 +221,8 @@ export interface RecoveryPreviewResponse {
   open_monitoring: RecoveryBucketSummary;
   other_blocked: RecoveryBucketSummary;
   inventory_last_synced_at?: string;
+  inventory_refresh_in_progress: boolean;
+  inventory_last_refresh_error?: string;
   inventory_last_scanned_block?: number;
   inventory_backfill_cursor_block?: number;
   inventory_backfill_completed_at?: string;
@@ -769,6 +771,7 @@ export interface StoreWalletRequest {
 }
 
 export interface CreateWalletWithdrawalRequest {
+  client_request_id: string;
   source_address?: string;
   destination_address: string;
   amount: number;

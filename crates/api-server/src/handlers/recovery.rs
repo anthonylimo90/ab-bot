@@ -1,12 +1,12 @@
 //! Recovery preview/run handlers for safe account unwinds.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use polymarket_core::types::{FailureReason, PositionState};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -20,8 +20,9 @@ use crate::position_service::EventContext;
 use crate::runtime_sync;
 use crate::state::AppState;
 use crate::wallet_inventory::{
+    canonical_refresh_status, force_refresh_canonical_wallet_inventory,
     load_canonical_inventory_summary, load_canonical_orphan_inventory,
-    recover_canonical_orphan_inventory, refresh_canonical_wallet_inventory,
+    recover_canonical_orphan_inventory,
 };
 use crate::workspace_scope::resolve_canonical_workspace_membership;
 
@@ -44,6 +45,8 @@ pub struct RecoveryPreviewResponse {
     pub open_monitoring: RecoveryBucketSummary,
     pub other_blocked: RecoveryBucketSummary,
     pub inventory_last_synced_at: Option<DateTime<Utc>>,
+    pub inventory_refresh_in_progress: bool,
+    pub inventory_last_refresh_error: Option<String>,
     pub inventory_last_scanned_block: Option<i64>,
     pub inventory_backfill_cursor_block: Option<i64>,
     pub inventory_backfill_completed_at: Option<DateTime<Utc>>,
@@ -99,11 +102,18 @@ struct RuntimeSnapshot {
     exit_handler_running: bool,
 }
 
+#[derive(Default, Deserialize)]
+pub struct PreviewQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/recovery/preview",
     params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("refresh" = Option<bool>, Query, description = "Refresh inventory before returning the preview")
     ),
     responses(
         (status = 200, description = "Safe recovery preview", body = RecoveryPreviewResponse),
@@ -118,8 +128,14 @@ pub async fn preview_recovery(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(_workspace_id): Path<String>,
+    Query(query): Query<PreviewQuery>,
 ) -> ApiResult<Json<RecoveryPreviewResponse>> {
     let workspace_id = parse_and_require_member(&state.pool, &claims).await?;
+    if query.refresh {
+        force_refresh_canonical_wallet_inventory(state.as_ref())
+            .await
+            .map_err(map_anyhow)?;
+    }
     let preview = build_recovery_preview(state.as_ref(), workspace_id).await?;
     Ok(Json(preview))
 }
@@ -148,9 +164,9 @@ pub async fn run_recovery(
     ensure_workspace_runtime_enabled(&state.pool, workspace_id).await?;
     runtime_sync::reconcile_runtime_service_toggles(state.as_ref()).await;
 
-    if let Err(error) = refresh_canonical_wallet_inventory(state.as_ref()).await {
-        tracing::warn!(error = %error, "Failed to refresh wallet inventory during recovery run");
-    }
+    force_refresh_canonical_wallet_inventory(state.as_ref())
+        .await
+        .map_err(map_anyhow)?;
 
     let allowance_cache_refreshed = if state.order_executor.is_live_ready().await {
         state
@@ -220,7 +236,9 @@ pub async fn run_recovery(
             .await
             .map_err(map_anyhow)?;
     if orphan_recovery.succeeded > 0 {
-        let _ = refresh_canonical_wallet_inventory(state.as_ref()).await;
+        force_refresh_canonical_wallet_inventory(state.as_ref())
+            .await
+            .map_err(map_anyhow)?;
     }
 
     let runtime = runtime_snapshot(state.as_ref(), workspace_id).await?;
@@ -270,13 +288,7 @@ async fn build_recovery_preview(
     state: &AppState,
     workspace_id: Uuid,
 ) -> ApiResult<RecoveryPreviewResponse> {
-    if let Err(error) = refresh_canonical_wallet_inventory(state).await {
-        tracing::warn!(
-            error = %error,
-            "Failed to refresh wallet inventory during recovery preview"
-        );
-    }
-
+    let refresh_status = canonical_refresh_status(state).await.map_err(map_anyhow)?;
     let runtime = runtime_snapshot(state, workspace_id).await?;
     let inventory_summary = load_canonical_inventory_summary(state)
         .await
@@ -358,9 +370,17 @@ async fn build_recovery_preview(
         suspect_inventory,
         open_monitoring,
         other_blocked,
-        inventory_last_synced_at: inventory_summary
+        inventory_last_synced_at: refresh_status
             .as_ref()
-            .and_then(|summary| summary.inventory_last_synced_at),
+            .and_then(|status| status.completed_at),
+        inventory_refresh_in_progress: refresh_status.as_ref().is_some_and(|status| {
+            status.finished_at.is_none()
+                && Utc::now()
+                    .signed_duration_since(status.started_at)
+                    .num_minutes()
+                    < 30
+        }),
+        inventory_last_refresh_error: refresh_status.and_then(|status| status.last_error),
         inventory_last_scanned_block: inventory_summary
             .as_ref()
             .and_then(|summary| summary.inventory_last_scanned_block),

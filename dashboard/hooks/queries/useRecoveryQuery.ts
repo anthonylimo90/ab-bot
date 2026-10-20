@@ -10,10 +10,19 @@ export function useRecoveryPreviewQuery(
   enabled = true,
 ) {
   return useQuery({
-    queryKey: workspaceId ? queryKeys.recovery.preview() : ["recovery", "preview", "disabled"],
+    queryKey: ["recovery", "preview", workspaceId],
     queryFn: () => api.getRecoveryPreview(workspaceId!),
     enabled: Boolean(workspaceId) && enabled,
     staleTime: 10_000,
+  });
+}
+
+export function useRefreshRecoveryPreviewMutation(workspaceId?: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.getRecoveryPreview(workspaceId!, true),
+    retry: false,
+    onSuccess: (data) => queryClient.setQueryData(["recovery", "preview", workspaceId], data),
   });
 }
 

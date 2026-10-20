@@ -271,6 +271,19 @@ impl ExecutionReport {
         }
     }
 
+    /// Submission outcome requires reconciliation; never equivalent to rejection.
+    pub fn pending(
+        order_id: Uuid,
+        market_id: String,
+        outcome_id: String,
+        side: OrderSide,
+        reason: String,
+    ) -> Self {
+        let mut report = Self::rejected(order_id, market_id, outcome_id, side, reason);
+        report.status = OrderStatus::Pending;
+        report
+    }
+
     pub fn with_tx_hash(mut self, hash: String) -> Self {
         self.transaction_hash = Some(hash);
         self

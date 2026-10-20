@@ -1014,6 +1014,7 @@ fn validate_model_dates(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_model_payload(
     model_key: &str,
     strategy_scope: &str,
@@ -2626,7 +2627,7 @@ fn merge_journeys(
 ) -> Vec<TradeJourneyResponse> {
     let mut merged: HashMap<String, TradeJourneyResponse> = HashMap::new();
 
-    for row in canonical.into_iter().chain(fallback.into_iter()) {
+    for row in canonical.into_iter().chain(fallback) {
         let key = journey_key(&row, from);
         match merged.remove(&key) {
             Some(existing) => {
@@ -2644,7 +2645,7 @@ fn merge_journeys(
     }
 
     let mut rows: Vec<TradeJourneyResponse> = merged.into_values().collect();
-    rows.sort_by(|a, b| journey_timestamp(b, from).cmp(&journey_timestamp(a, from)));
+    rows.sort_by_key(|row| std::cmp::Reverse(journey_timestamp(row, from)));
     rows.truncate(limit as usize);
     rows
 }

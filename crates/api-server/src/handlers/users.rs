@@ -370,7 +370,7 @@ pub async fn update_user(
 
     if let Some(ref role) = req.role {
         let role_value = parse_role(role)?;
-        updates.push(format!("role = ${}", params.len() + 2));
+        updates.push(format!("role = ${}::text::smallint", params.len() + 2));
         params.push(role_value.to_string());
     }
 
@@ -403,6 +403,9 @@ pub async fn update_user(
         }));
     }
 
+    if req.password.is_some() || req.role.is_some() {
+        updates.push("auth_version = auth_version + 1".into());
+    }
     updates.push(format!("updated_at = ${}", params.len() + 2));
     let now = Utc::now();
 

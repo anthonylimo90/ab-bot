@@ -6,6 +6,10 @@ use rust_decimal::Decimal;
 use sqlx::{FromRow, PgPool, QueryBuilder};
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "inventory/tests.rs"]
+mod tests;
+
 /// Repository for reconciled wallet inventory rows.
 pub struct WalletInventoryRepository {
     pool: PgPool,
@@ -235,6 +239,7 @@ impl WalletInventoryRepository {
         // PostgreSQL parameter limit is 65535; each row uses 16 params → max ~4096
         // rows per batch. A typical wallet has 5–50 tokens so one batch suffices.
         const BATCH_SIZE: usize = 500;
+        let mut tx = self.pool.begin().await?;
         for chunk in entries.chunks(BATCH_SIZE) {
             let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
                 "INSERT INTO wallet_inventory (\
@@ -284,9 +289,9 @@ impl WalletInventoryRepository {
                     updated_at             = NOW()",
             );
 
-            qb.build().execute(&self.pool).await?;
+            qb.build().execute(&mut *tx).await?;
         }
-
+        tx.commit().await?;
         Ok(())
     }
 

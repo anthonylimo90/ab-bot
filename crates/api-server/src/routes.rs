@@ -241,6 +241,7 @@ use crate::websocket;
             order_signing::PrepareOrderRequest,
             order_signing::PrepareOrderResponse,
             order_signing::SubmitOrderRequest,
+            order_signing::WalletAuthProof,
             order_signing::SubmitOrderResponse,
             order_signing::Eip712TypedData,
             order_signing::Eip712Domain,
@@ -400,7 +401,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/v1/invites/:token/accept",
             post(workspaces::accept_invite),
         )
-        // WebSocket endpoints (auth handled via query param or message)
+        // Private streams require first-frame authentication before subscription.
         .route("/ws/orderbook", get(websocket::ws_orderbook_handler))
         .route("/ws/positions", get(websocket::ws_positions_handler))
         .route("/ws/signals", get(websocket::ws_signals_handler))

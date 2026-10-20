@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
 import { useToastStore } from "@/stores/toast-store";
@@ -13,7 +13,7 @@ interface PositionFilters {
   offset?: number;
 }
 
-export function usePositionsQuery(filters?: PositionFilters) {
+export function usePositionsQuery(filters?: PositionFilters, options: {enabled?: boolean; keepPreviousData?: boolean} = {}) {
   return useQuery({
     queryKey: queryKeys.positions.list(filters),
     queryFn: () =>
@@ -23,8 +23,10 @@ export function usePositionsQuery(filters?: PositionFilters) {
         limit: filters?.limit,
         offset: filters?.offset,
       }),
+    enabled: options.enabled ?? true,
+    placeholderData: options.keepPreviousData ? keepPreviousData : undefined,
     staleTime: 30 * 1000,
-    refetchInterval: 30 * 1000,
+    refetchInterval: filters?.status === "closed" ? 60_000 : 30_000,
   });
 }
 

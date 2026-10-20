@@ -11,7 +11,7 @@ import {
   Wallet,
 } from "lucide-react";
 
-import { useRecoveryPreviewQuery, useRunRecoveryMutation } from "@/hooks/queries/useRecoveryQuery";
+import { useRecoveryPreviewQuery, useRunRecoveryMutation, useRefreshRecoveryPreviewMutation } from "@/hooks/queries/useRecoveryQuery";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -23,7 +23,7 @@ import {
 } from "@/components/ui/dialog";
 import { cn, formatTimeAgo } from "@/lib/utils";
 import { useToastStore } from "@/stores/toast-store";
-import { useWalletStore, selectPrimaryWallet } from "@/stores/wallet-store";
+import { useWorkspaceStore } from "@/stores/workspace-store";
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -80,13 +80,14 @@ export function RecoveryDialog({
 }: RecoveryDialogProps) {
   const [open, setOpen] = useState(false);
   const toast = useToastStore();
-  const activeWallet = useWalletStore(selectPrimaryWallet);
+  const tradingWalletAddress = useWorkspaceStore((state) =>
+    state.currentWorkspace && state.currentWorkspace.id === workspaceId
+      ? state.currentWorkspace.trading_wallet_address
+      : undefined,
+  );
   const previewQuery = useRecoveryPreviewQuery(workspaceId, open);
   const runMutation = useRunRecoveryMutation(workspaceId);
-  const activeWalletLabel = activeWallet
-    ? activeWallet.label ||
-      `${activeWallet.address.slice(0, 6)}...${activeWallet.address.slice(-4)}`
-    : null;
+  const refreshMutation = useRefreshRecoveryPreviewMutation(workspaceId);
 
   const handleRunRecovery = async () => {
     if (!workspaceId) return;
@@ -189,6 +190,10 @@ export function RecoveryDialog({
                   </span>
                 </div>
                 <div className="mt-2 text-muted-foreground">
+                  {preview.inventory_last_refresh_error && (
+                    <p className="text-rose-700">Inventory refresh failed: {preview.inventory_last_refresh_error}. Showing the last completed snapshot.</p>
+                  )}
+                  {preview.inventory_refresh_in_progress && <p>Inventory refresh in progress.</p>}
                   {preview.inventory_last_synced_at
                     ? `Last inventory sync ${formatTimeAgo(preview.inventory_last_synced_at)}.`
                     : "Inventory sync has not completed yet."}{" "}
@@ -210,9 +215,9 @@ export function RecoveryDialog({
                       Recovery always settles into the active trading wallet, not a separate external address.
                     </div>
                     <div className="mt-2 text-emerald-900/90">
-                      {activeWallet
-                        ? `Active wallet: ${activeWalletLabel} (${activeWallet.address}). If this matches your MetaMask Polygon wallet, no withdrawal transfer is needed after recovery.`
-                        : "No active wallet is selected yet. Connect a wallet and mark it active before expecting recovered funds to appear."}
+                      {tradingWalletAddress
+                        ? `Trading wallet: ${tradingWalletAddress}. If this matches your MetaMask Polygon wallet, no withdrawal transfer is needed after recovery.`
+                        : "The workspace trading wallet is not configured. A workspace operator must configure it before recovery."}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -308,6 +313,10 @@ export function RecoveryDialog({
           )}
 
           <DialogFooter className="gap-2 sm:justify-between">
+            <Button type="button" variant="outline" disabled={!workspaceId || refreshMutation.isPending || runMutation.isPending}
+              onClick={() => refreshMutation.mutate(undefined, {onError: (error) => toast.error("Inventory refresh failed", error.message)})}>
+              <RefreshCw className="mr-2 h-4 w-4" />{refreshMutation.isPending ? "Refreshing…" : "Refresh inventory"}
+            </Button>
             <div className="text-xs text-muted-foreground">
               Recovery now uses reconciled inventory and canonical exit routing, and recovered funds remain in the active trading wallet unless you later send a separate withdrawal.
             </div>

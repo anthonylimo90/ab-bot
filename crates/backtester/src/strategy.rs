@@ -245,6 +245,8 @@ impl Position {
 }
 
 /// Trait for implementing backtesting strategies.
+// async_trait generates must_use on its boxed future return values.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Strategy: Send + Sync {
     /// Strategy name for identification.

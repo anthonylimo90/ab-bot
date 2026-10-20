@@ -39,10 +39,13 @@ export function useCreateWalletWithdrawalMutation() {
       queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all() });
       queryClient.invalidateQueries({ queryKey: queryKeys.account.all() });
       queryClient.invalidateQueries({ queryKey: queryKeys.runtime.serviceStatus() });
-      toast.success(
-        "Withdrawal confirmed",
-        `Sent ${withdrawal.amount.toFixed(2)} USDC to ${withdrawal.destination_address.slice(0, 6)}...${withdrawal.destination_address.slice(-4)}.`,
-      );
+      if (withdrawal.status === "confirmed") {
+        toast.success("Withdrawal confirmed", `Sent ${withdrawal.amount.toFixed(2)} USDC.`);
+      } else if (withdrawal.status === "failed") {
+        toast.error("Withdrawal failed", withdrawal.error ?? "Check withdrawal history before starting another transfer.");
+      } else {
+        toast.info("Withdrawal pending", "Check withdrawal history. Retry with the same request; do not start another transfer.");
+      }
     },
   });
 }

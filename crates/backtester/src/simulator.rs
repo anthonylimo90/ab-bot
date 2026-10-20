@@ -409,6 +409,33 @@ pub struct BacktestSimulator {
     data_store: HistoricalDataStore,
 }
 
+/// One owned dataset with lightweight timestamp ranges. No snapshot clones or
+/// hash/sort pass are needed: the data store already returns chronological rows.
+struct PreparedBacktest {
+    snapshots: Vec<MarketSnapshot>,
+    batches: Vec<std::ops::Range<usize>>,
+}
+impl PreparedBacktest {
+    fn new(snapshots: Vec<MarketSnapshot>) -> Result<Self> {
+        if snapshots.is_empty() {
+            return Err(anyhow!("No data available for the specified query"));
+        }
+        let mut batches = Vec::new();
+        let mut start = 0;
+        for index in 1..snapshots.len() {
+            if snapshots[index].timestamp < snapshots[index - 1].timestamp {
+                return Err(anyhow!("Backtest snapshots must be chronological"));
+            }
+            if snapshots[index].timestamp != snapshots[start].timestamp {
+                batches.push(start..index);
+                start = index;
+            }
+        }
+        batches.push(start..snapshots.len());
+        Ok(Self { snapshots, batches })
+    }
+}
+
 impl BacktestSimulator {
     /// Create a new backtest simulator.
     pub fn new(data_store: HistoricalDataStore, config: SimulatorConfig) -> Self {
@@ -428,15 +455,20 @@ impl BacktestSimulator {
             "Starting backtest"
         );
 
-        // Fetch historical data
-        let snapshots = self.data_store.query_snapshots(&query).await?;
-        if snapshots.is_empty() {
-            return Err(anyhow!("No data available for the specified query"));
-        }
+        let prepared = self.prepare(&query).await?;
+        self.run_prepared(strategy, &query, &prepared).await
+    }
 
-        // Group data by timestamp for sequential processing
-        let timeline = self.build_timeline(&snapshots);
+    async fn prepare(&self, query: &DataQuery) -> Result<PreparedBacktest> {
+        PreparedBacktest::new(self.data_store.query_snapshots(query).await?)
+    }
 
+    async fn run_prepared<S: Strategy + ?Sized>(
+        &self,
+        strategy: &mut S,
+        query: &DataQuery,
+        prepared: &PreparedBacktest,
+    ) -> Result<BacktestResult> {
         // Initialize simulation state
         let mut state = SimulationState::new(self.config.initial_capital);
         let mut context = StrategyContext::new(self.config.initial_capital);
@@ -445,11 +477,13 @@ impl BacktestSimulator {
         strategy.initialize(&context).await?;
 
         // Process each time step
-        for (timestamp, market_snapshots) in timeline {
+        for range in &prepared.batches {
+            let market_snapshots = &prepared.snapshots[range.clone()];
+            let timestamp = market_snapshots[0].timestamp;
             context.timestamp = timestamp;
 
             // Update market data in context
-            for snapshot in &market_snapshots {
+            for snapshot in market_snapshots {
                 context
                     .market_data
                     .entry(snapshot.market_id.clone())
@@ -465,7 +499,7 @@ impl BacktestSimulator {
             }
 
             // Update position prices
-            self.update_positions(&mut context, &mut state, &market_snapshots);
+            self.update_positions(&mut context, &mut state, market_snapshots);
 
             // Get signals from strategy
             let signals = strategy.on_data(&context).await?;
@@ -473,22 +507,25 @@ impl BacktestSimulator {
             // Execute signals
             for signal in signals {
                 if let Some(trade) = self
-                    .execute_signal(&signal, &mut context, &mut state, &market_snapshots)
+                    .execute_signal(&signal, &mut context, &mut state, market_snapshots)
                     .await?
                 {
                     strategy
-                        .on_fill(&signal, trade.entry_price, trade.quantity)
+                        .on_fill(
+                            &signal,
+                            trade.exit_price.unwrap_or(trade.entry_price),
+                            trade.quantity,
+                        )
                         .await?;
                 }
             }
 
             // Record equity curve
-            state
-                .equity_curve
-                .push((timestamp, state.portfolio_value()));
+            let portfolio_value = state.portfolio_value();
+            state.equity_curve.push((timestamp, portfolio_value));
 
             // Update context portfolio value
-            context.portfolio_value = state.portfolio_value();
+            context.portfolio_value = portfolio_value;
             context.available_cash = state.cash;
         }
 
@@ -499,7 +536,7 @@ impl BacktestSimulator {
         self.close_all_positions(&mut state, &context);
 
         // Calculate final metrics
-        let result = self.calculate_results(strategy, &state, &query, snapshots.len());
+        let result = self.calculate_results(strategy, &state, query, prepared.snapshots.len());
 
         info!(
             strategy = strategy.name(),
@@ -519,9 +556,15 @@ impl BacktestSimulator {
         query: DataQuery,
     ) -> Result<Vec<BacktestResult>> {
         let mut results = Vec::new();
-
+        if strategies.is_empty() {
+            return Ok(results);
+        }
+        let prepared = self.prepare(&query).await?;
         for strategy in strategies.iter_mut() {
-            match self.run(strategy.as_mut(), query.clone()).await {
+            match self
+                .run_prepared(strategy.as_mut(), &query, &prepared)
+                .await
+            {
                 Ok(result) => results.push(result),
                 Err(e) => {
                     warn!(strategy = strategy.name(), error = %e, "Strategy backtest failed");
@@ -541,53 +584,28 @@ impl BacktestSimulator {
 
     // Private methods
 
-    fn build_timeline(
-        &self,
-        snapshots: &[MarketSnapshot],
-    ) -> Vec<(DateTime<Utc>, Vec<MarketSnapshot>)> {
-        let mut timeline: HashMap<DateTime<Utc>, Vec<MarketSnapshot>> = HashMap::new();
-
-        for snapshot in snapshots {
-            timeline
-                .entry(snapshot.timestamp)
-                .or_default()
-                .push(snapshot.clone());
-        }
-
-        let mut sorted: Vec<_> = timeline.into_iter().collect();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        sorted
-    }
-
     fn update_positions(
         &self,
         context: &mut StrategyContext,
         state: &mut SimulationState,
         snapshots: &[MarketSnapshot],
     ) {
-        for snapshot in snapshots {
-            for pos in state
-                .positions
-                .values_mut()
-                .filter(|position| position.market_id == snapshot.market_id)
-            {
-                let price = if pos.outcome_id == "yes" {
+        let prices: HashMap<&str, &MarketSnapshot> = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.market_id.as_str(), snapshot))
+            .collect();
+        for position in state.positions.values_mut() {
+            if let Some(snapshot) = prices.get(position.market_id.as_str()) {
+                let price = if position.outcome_id == "yes" {
                     snapshot.yes_bid
                 } else {
                     snapshot.no_bid
                 };
-
-                pos.current_price = price;
-                pos.unrealized_pnl = (price - pos.entry_price) * pos.quantity;
+                position.current_price = price;
+                position.unrealized_pnl = (price - position.entry_price) * position.quantity;
             }
         }
-
-        // Update context positions
-        context.positions = state
-            .positions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        context.positions = state.positions.clone();
     }
 
     async fn execute_signal(
@@ -620,7 +638,14 @@ impl BacktestSimulator {
         snapshot: &MarketSnapshot,
     ) -> Result<Option<TradeRecord>> {
         // Calculate position size
-        let max_position_value = context.portfolio_value * self.config.max_position_pct;
+        let existing_value = state
+            .positions
+            .get(&position_key(&signal.market_id, &signal.outcome_id))
+            .map(|p| p.quantity * p.current_price)
+            .unwrap_or(Decimal::ZERO);
+        let max_position_value = (context.portfolio_value * self.config.max_position_pct
+            - existing_value)
+            .max(Decimal::ZERO);
         let target_value = context.portfolio_value * signal.position_size;
         let position_value = target_value.min(max_position_value).min(state.cash);
 
@@ -723,21 +748,28 @@ impl BacktestSimulator {
         state.total_fees += fees;
         state.total_slippage += slippage * fill_quantity;
 
-        // Create or add to position
-        let position = Position {
-            market_id: signal.market_id.clone(),
-            outcome_id: signal.outcome_id.clone(),
-            quantity: fill_quantity,
-            entry_price: execution_price,
-            opened_at: context.timestamp,
-            unrealized_pnl: Decimal::ZERO,
-            current_price: execution_price,
-        };
-
-        state.positions.insert(
-            position_key(&signal.market_id, &signal.outcome_id),
-            position,
-        );
+        let key = position_key(&signal.market_id, &signal.outcome_id);
+        state
+            .positions
+            .entry(key)
+            .and_modify(|position| {
+                let total_quantity = position.quantity + fill_quantity;
+                position.entry_price = (position.entry_price * position.quantity
+                    + execution_price * fill_quantity)
+                    / total_quantity;
+                position.quantity = total_quantity;
+                position.current_price = execution_price;
+                position.unrealized_pnl = (execution_price - position.entry_price) * total_quantity;
+            })
+            .or_insert_with(|| Position {
+                market_id: signal.market_id.clone(),
+                outcome_id: signal.outcome_id.clone(),
+                quantity: fill_quantity,
+                entry_price: execution_price,
+                opened_at: context.timestamp,
+                unrealized_pnl: Decimal::ZERO,
+                current_price: execution_price,
+            });
 
         // Record trade
         let trade = TradeRecord {
@@ -826,7 +858,18 @@ impl BacktestSimulator {
         let proceeds = trade_value - fees;
 
         // Calculate P&L
-        let cost_basis = position.quantity * position.entry_price;
+        let entry_fees: Decimal = state
+            .trades
+            .iter()
+            .filter(|t| {
+                t.trade_type == TradeType::Buy
+                    && t.market_id == signal.market_id
+                    && t.outcome_id == signal.outcome_id
+                    && t.exit_time.is_none()
+            })
+            .map(|t| t.fees)
+            .sum();
+        let cost_basis = position.quantity * position.entry_price + entry_fees;
         let pnl = proceeds - cost_basis;
         let return_pct = if cost_basis > Decimal::ZERO {
             ((proceeds / cost_basis) - Decimal::ONE)
@@ -850,18 +893,24 @@ impl BacktestSimulator {
             state.total_losses += pnl.abs();
         }
 
-        // Find and update the entry trade
-        let entry_trade_idx = state.trades.iter().position(|t| {
-            t.market_id == signal.market_id
+        // Close every entry lot, allocating exit fees in proportion to quantity.
+        for entry in state.trades.iter_mut().filter(|t| {
+            t.trade_type == TradeType::Buy
+                && t.market_id == signal.market_id
                 && t.outcome_id == signal.outcome_id
                 && t.exit_time.is_none()
-        });
-
-        if let Some(idx) = entry_trade_idx {
-            state.trades[idx].exit_time = Some(snapshot.timestamp);
-            state.trades[idx].exit_price = Some(execution_price);
-            state.trades[idx].pnl = Some(pnl);
-            state.trades[idx].return_pct = Some(return_pct);
+        }) {
+            let allocated_exit_fee = fees * entry.quantity / position.quantity;
+            let entry_cost = entry.quantity * entry.entry_price + entry.fees;
+            let lot_proceeds = entry.quantity * execution_price - allocated_exit_fee;
+            entry.exit_time = Some(snapshot.timestamp);
+            entry.exit_price = Some(execution_price);
+            entry.pnl = Some(lot_proceeds - entry_cost);
+            entry.return_pct = Some(
+                ((lot_proceeds / entry_cost) - Decimal::ONE)
+                    .to_f64()
+                    .unwrap_or(0.0),
+            );
         }
 
         let trade = TradeRecord {
@@ -881,6 +930,7 @@ impl BacktestSimulator {
             return_pct: Some(return_pct),
         };
 
+        state.trades.push(trade.clone());
         Ok(Some(trade))
     }
 
@@ -970,7 +1020,12 @@ impl BacktestSimulator {
         let (var_95, cvar_95) = self.calculate_var_cvar(&state.equity_curve);
 
         // Trade-level metrics
-        let trade_returns: Vec<f64> = state.trades.iter().filter_map(|t| t.return_pct).collect();
+        let trade_returns: Vec<f64> = state
+            .trades
+            .iter()
+            .filter(|t| t.trade_type == TradeType::Close)
+            .filter_map(|t| t.return_pct)
+            .collect();
 
         let best_trade_return = trade_returns
             .iter()
@@ -1113,7 +1168,7 @@ impl BacktestSimulator {
         let mut current_wins = 0;
         let mut current_losses = 0;
 
-        for trade in trades {
+        for trade in trades.iter().filter(|t| t.trade_type == TradeType::Close) {
             if let Some(pnl) = trade.pnl {
                 if pnl > Decimal::ZERO {
                     current_wins += 1;
@@ -1211,7 +1266,10 @@ impl BacktestSimulator {
     }
 
     fn calculate_avg_trade_duration(&self, trades: &[TradeRecord]) -> f64 {
-        let closed_trades: Vec<_> = trades.iter().filter(|t| t.exit_time.is_some()).collect();
+        let closed_trades: Vec<_> = trades
+            .iter()
+            .filter(|t| t.trade_type == TradeType::Close && t.exit_time.is_some())
+            .collect();
 
         if closed_trades.is_empty() {
             return 0.0;
@@ -1281,6 +1339,224 @@ impl SimulationState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FixtureStrategy {
+        observations: Vec<(DateTime<Utc>, usize, usize)>,
+        fills: Vec<(Decimal, Decimal)>,
+    }
+    #[async_trait::async_trait]
+    impl Strategy for FixtureStrategy {
+        fn name(&self) -> &str {
+            "fixed-input-fixture"
+        }
+        async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>> {
+            let a = &context.market_data["a"];
+            let b = &context.market_data["b"];
+            assert_eq!(a.last().unwrap().timestamp, context.timestamp);
+            assert_eq!(b.last().unwrap().timestamp, context.timestamp);
+            self.observations
+                .push((context.timestamp, a.len(), b.len()));
+            Ok(if self.observations.len() == 1 {
+                vec![
+                    Signal::buy("a", "yes", Decimal::new(4, 2)),
+                    Signal::buy("b", "no", Decimal::new(4, 2)),
+                ]
+            } else {
+                vec![Signal::close("a", "yes"), Signal::close("b", "no")]
+            })
+        }
+        async fn on_fill(&mut self, _: &Signal, price: Decimal, quantity: Decimal) -> Result<()> {
+            self.fills.push((price, quantity));
+            Ok(())
+        }
+    }
+
+    fn legacy_timeline(snapshots: &[MarketSnapshot]) -> Vec<(DateTime<Utc>, Vec<MarketSnapshot>)> {
+        let mut grouped = HashMap::<DateTime<Utc>, Vec<MarketSnapshot>>::new();
+        for snapshot in snapshots {
+            grouped
+                .entry(snapshot.timestamp)
+                .or_default()
+                .push(snapshot.clone());
+        }
+        let mut result: Vec<_> = grouped.into_iter().collect();
+        result.sort_by_key(|row| row.0);
+        result
+    }
+
+    #[tokio::test]
+    async fn prepared_input_preserves_same_timestamp_context_fills_fees_and_fresh_strategy_state() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let simulator = BacktestSimulator::new(
+            HistoricalDataStore::new(pool),
+            SimulatorConfig {
+                initial_capital: Decimal::from(1000),
+                slippage_model: SlippageModel::None,
+                fee_model: FeeModel::Fixed(Decimal::new(2, 2)),
+                min_position_size: Decimal::ONE,
+                max_position_pct: Decimal::ONE,
+                ..SimulatorConfig::default()
+            },
+        );
+        let start = Utc::now();
+        let end = start + chrono::Duration::minutes(1);
+        let mut input = Vec::new();
+        for (time, price) in [(start, Decimal::new(4, 1)), (end, Decimal::new(6, 1))] {
+            for market in ["a", "b"] {
+                input.push(MarketSnapshot::new(
+                    market, time, price, price, price, price,
+                ));
+            }
+        }
+        let legacy = legacy_timeline(&input);
+        let prepared = PreparedBacktest::new(input).unwrap();
+        for (range, (timestamp, expected)) in prepared.batches.iter().zip(&legacy) {
+            let batch = &prepared.snapshots[range.clone()];
+            assert_eq!(batch[0].timestamp, *timestamp);
+            assert_eq!(
+                serde_json::to_value(batch).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        for _ in 0..2 {
+            let mut strategy = FixtureStrategy::default();
+            let result = simulator
+                .run_prepared(&mut strategy, &DataQuery::range(start, end), &prepared)
+                .await
+                .unwrap();
+            assert_eq!(result.data_points, 4);
+            assert_eq!(result.total_trades, 2);
+            assert_eq!(result.final_value, Decimal::from(1036));
+            assert_eq!(result.total_fees, Decimal::from(4));
+            assert_eq!(strategy.observations, vec![(start, 1, 1), (end, 2, 2)]);
+            assert_eq!(
+                strategy.fills,
+                vec![
+                    (Decimal::new(4, 1), Decimal::from(100)),
+                    (Decimal::new(4, 1), Decimal::from(100)),
+                    (Decimal::new(6, 1), Decimal::from(100)),
+                    (Decimal::new(6, 1), Decimal::from(100))
+                ]
+            );
+        }
+        let mut reversed = prepared.snapshots;
+        reversed.reverse();
+        assert!(PreparedBacktest::new(reversed).is_err());
+        assert!(PreparedBacktest::new(Vec::new()).is_err());
+    }
+
+    #[test]
+    #[ignore = "manual synthetic preparation benchmark"]
+    fn benchmark_sorted_preparation() {
+        let start = Utc::now();
+        let input: Vec<_> = (0..100_000)
+            .map(|index| {
+                MarketSnapshot::new(
+                    &format!("market-{}", index % 200),
+                    start + chrono::Duration::seconds(index / 200),
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                    Decimal::ONE,
+                )
+            })
+            .collect();
+        let mut old = Vec::new();
+        let mut new = Vec::new();
+        for _ in 0..5 {
+            let source = input.clone();
+            let time = std::time::Instant::now();
+            let timeline = legacy_timeline(&source);
+            std::hint::black_box(&timeline);
+            old.push(time.elapsed().as_secs_f64() * 1000.0);
+            drop(timeline);
+            drop(source);
+            let source = input.clone();
+            let time = std::time::Instant::now();
+            let prepared = PreparedBacktest::new(source).unwrap();
+            std::hint::black_box(&prepared);
+            new.push(time.elapsed().as_secs_f64() * 1000.0);
+        }
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        println!("100000 snapshots: old median {:.3} ms; prepared median {:.3} ms; removed cloned snapshot structs {} bytes plus market IDs",old[2],new[2],std::mem::size_of::<MarketSnapshot>()*input.len());
+    }
+
+    #[tokio::test]
+    async fn repeated_buys_preserve_inventory_cost_fees_and_all_entry_lots() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let simulator = BacktestSimulator::new(
+            HistoricalDataStore::new(pool),
+            SimulatorConfig {
+                initial_capital: Decimal::from(1000),
+                slippage_model: SlippageModel::None,
+                fee_model: FeeModel::Fixed(Decimal::new(2, 2)),
+                min_position_size: Decimal::ONE,
+                max_position_pct: Decimal::ONE,
+                ..SimulatorConfig::default()
+            },
+        );
+        for outcome in ["yes", "no"] {
+            let mut state = SimulationState::new(Decimal::from(1000));
+            let mut context = StrategyContext::new(Decimal::from(1000));
+            let first_time = context.timestamp;
+            for (price, fraction) in [
+                (Decimal::new(4, 1), Decimal::new(4, 2)),
+                (Decimal::new(6, 1), Decimal::new(6, 2)),
+            ] {
+                let snapshot =
+                    MarketSnapshot::new("market", context.timestamp, price, price, price, price);
+                simulator
+                    .execute_buy(
+                        &Signal::buy("market", outcome, fraction),
+                        &context,
+                        &mut state,
+                        &snapshot,
+                    )
+                    .unwrap()
+                    .unwrap();
+                context.timestamp += chrono::Duration::minutes(1);
+            }
+            let position = &state.positions[&position_key("market", outcome)];
+            assert_eq!(position.quantity, Decimal::from(200));
+            assert_eq!(position.entry_price, Decimal::new(5, 1));
+            assert_eq!(position.opened_at, first_time);
+            assert_eq!(state.cash, Decimal::from(898));
+            assert_eq!(state.portfolio_value(), Decimal::from(1018));
+            let price = Decimal::new(7, 1);
+            let snapshot =
+                MarketSnapshot::new("market", context.timestamp, price, price, price, price);
+            let closed = simulator
+                .execute_close(&Signal::close("market", outcome), &mut state, &snapshot)
+                .unwrap()
+                .unwrap();
+            assert!(state.positions.is_empty());
+            assert_eq!(state.cash, Decimal::new(10352, 1));
+            assert_eq!(state.realized_pnl, Decimal::new(352, 1));
+            assert_eq!(closed.quantity, Decimal::from(200));
+            let entries: Vec<_> = state
+                .trades
+                .iter()
+                .filter(|t| t.trade_type == TradeType::Buy)
+                .collect();
+            assert_eq!(entries.len(), 2);
+            assert!(entries.iter().all(|t| t.exit_time.is_some()));
+            assert_eq!(
+                entries.iter().map(|t| t.pnl.unwrap()).sum::<Decimal>(),
+                closed.pnl.unwrap()
+            );
+            assert_eq!(
+                simulator.calculate_consecutive_streaks(&state.trades),
+                (1, 0)
+            );
+            assert_eq!(state.winning_trades, 1);
+        }
+    }
 
     #[test]
     fn test_slippage_model_fixed() {

@@ -483,7 +483,7 @@ fn sort_wallets(wallets: &mut [DiscoveredWallet], sort_by: &str, period: &str) {
                 .partial_cmp(&a.win_rate)
                 .unwrap_or(Ordering::Equal)
         }),
-        "trades" => wallets.sort_by(|a, b| b.total_trades.cmp(&a.total_trades)),
+        "trades" => wallets.sort_by_key(|wallet| std::cmp::Reverse(wallet.total_trades)),
         _ => {
             // Default: roi
             match period {

@@ -116,7 +116,17 @@ export function useTradeSign(): UseTradeSignReturn {
         setState('preparing');
         setError(null);
 
-        const prepareResponse = await api.post<PrepareOrderResponse>('/api/v1/orders/prepare', {
+        const intentKey = `ab-bot-wallet-order:${address.toLowerCase()}`;
+        const fingerprint = JSON.stringify(params);
+        let cached: { fingerprint: string; prepared: PrepareOrderResponse; signature: `0x${string}` } | null = null;
+        try { cached = JSON.parse(sessionStorage.getItem(intentKey) ?? 'null'); } catch { /* No saved intent. */ }
+        let prepareResponse: PrepareOrderResponse;
+        let signature: `0x${string}`;
+        if (cached?.fingerprint === fingerprint) {
+          prepareResponse = cached.prepared;
+          signature = cached.signature;
+        } else {
+        prepareResponse = await api.post<PrepareOrderResponse>('/api/v1/orders/prepare', {
           token_id: params.tokenId,
           side: params.side,
           price: params.price,
@@ -173,21 +183,41 @@ export function useTradeSign(): UseTradeSignReturn {
           signatureType: typed_data.message.signatureType,
         };
 
-        const signature = await signTypedDataAsync({
+        signature = await signTypedDataAsync({
           domain,
           types,
           primaryType: 'Order',
           message,
         });
 
-        // Step 3: Submit signed order
+        sessionStorage.setItem(intentKey, JSON.stringify({ fingerprint, prepared: prepareResponse, signature }));
+        }
+        setPendingOrder(prepareResponse);
+
+        setState('awaiting_signature');
+        // Authenticate this wallet with the exchange separately from the order.
+        const timestamp = Math.floor(Date.now() / 1000);
+        const authSignature = await signTypedDataAsync({
+          domain: { name: 'ClobAuthDomain', version: '1', chainId: 137 },
+          types: { ClobAuth: [
+            { name: 'address', type: 'address' },
+            { name: 'timestamp', type: 'string' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'message', type: 'string' },
+          ] } as const,
+          primaryType: 'ClobAuth',
+          message: { address, timestamp: String(timestamp), nonce: BigInt(0), message: 'This message attests that I control the given wallet' },
+        });
         setState('submitting');
 
         const submitResponse = await api.post<SubmitOrderResponse>('/api/v1/orders/submit', {
+          auth: { timestamp, nonce: 0, signature: authSignature },
           pending_order_id: prepareResponse.pending_order_id,
           signature,
         });
 
+        sessionStorage.removeItem(intentKey);
+        if (!submitResponse.success) throw new Error('The exchange rejected this order.');
         setSubmittedOrder(submitResponse);
         setState('success');
 

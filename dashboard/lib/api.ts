@@ -685,6 +685,7 @@ class ApiClient {
 
   // Orders
   async placeOrder(params: PlaceOrderRequest): Promise<Order> {
+    params.client_order_id ??= crypto.randomUUID();
     return this.request<Order>("/api/v1/orders", {
       method: "POST",
       body: JSON.stringify(params),
@@ -971,9 +972,10 @@ class ApiClient {
 
   async getRecoveryPreview(
     workspaceId: string,
+    refresh = false,
   ): Promise<RecoveryPreviewResponse> {
     const raw = await this.request<RecoveryPreviewResponse>(
-      `/api/v1/workspaces/${workspaceId}/recovery/preview`,
+      `/api/v1/workspaces/${workspaceId}/recovery/preview${refresh ? '?refresh=true' : ''}`,
       {
         method: "POST",
       },

@@ -108,6 +108,17 @@ impl PositionService {
         ctx: &EventContext,
         metadata: serde_json::Value,
     ) -> anyhow::Result<Position> {
+        self.create_position_with_limit(params, ctx, metadata, None)
+            .await
+    }
+
+    pub async fn create_position_with_limit(
+        &self,
+        params: CreatePositionParams,
+        ctx: &EventContext,
+        metadata: serde_json::Value,
+        max_exposure: Option<Decimal>,
+    ) -> anyhow::Result<Position> {
         let mut position = Position::new(
             params.market_id.clone(),
             params.yes_entry_price,
@@ -121,7 +132,12 @@ impl PositionService {
         }
 
         self.repo
-            .insert_with_source(&position, params.source, params.source_signal_id)
+            .insert_with_source_and_limit(
+                &position,
+                params.source,
+                params.source_signal_id,
+                max_exposure,
+            )
             .await
             .map_err(|e| anyhow!("insert position: {}", e))?;
 
@@ -425,9 +441,8 @@ impl PositionService {
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
         let from = format!("{:?}", position.state).to_lowercase();
-        let event_type;
 
-        match method {
+        let event_type = match method {
             CloseMethod::MarketExit { fee } => {
                 position
                     .close_via_recorded_exit(fee)
@@ -438,7 +453,7 @@ impl PositionService {
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;
                 position.held_no_qty = Decimal::ZERO;
-                event_type = "closed_via_exit";
+                "closed_via_exit"
             }
             CloseMethod::ResolutionWithWinner { yes_wins, fee } => {
                 position
@@ -450,7 +465,7 @@ impl PositionService {
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;
                 position.held_no_qty = Decimal::ZERO;
-                event_type = "closed_via_resolution";
+                "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
                 position
@@ -461,9 +476,9 @@ impl PositionService {
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;
                 position.held_no_qty = Decimal::ZERO;
-                event_type = "closed_via_resolution";
+                "closed_via_resolution"
             }
-        }
+        };
 
         self.repo
             .update(position)

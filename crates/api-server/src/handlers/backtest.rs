@@ -1310,12 +1310,12 @@ pub async fn update_backtest_schedule(
 
     let strategy_json = request
         .strategy
-        .map(|strategy| serde_json::to_value(strategy))
+        .map(serde_json::to_value)
         .transpose()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let slippage_json = request
         .slippage_model
-        .map(|slippage| serde_json::to_value(slippage))
+        .map(serde_json::to_value)
         .transpose()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 

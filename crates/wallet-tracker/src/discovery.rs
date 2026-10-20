@@ -306,13 +306,13 @@ impl WalletDiscovery {
                 });
             }
             RankingMetric::Volume => {
-                wallets.sort_by(|a, b| b.total_volume.cmp(&a.total_volume));
+                wallets.sort_by_key(|wallet| std::cmp::Reverse(wallet.total_volume));
             }
             RankingMetric::TotalPnl => {
-                wallets.sort_by(|a, b| b.total_pnl.cmp(&a.total_pnl));
+                wallets.sort_by_key(|wallet| std::cmp::Reverse(wallet.total_pnl));
             }
             RankingMetric::TradeCount => {
-                wallets.sort_by(|a, b| b.total_trades.cmp(&a.total_trades));
+                wallets.sort_by_key(|wallet| std::cmp::Reverse(wallet.total_trades));
             }
             RankingMetric::Consistency => {
                 // Consistency = win rate * log(trades)

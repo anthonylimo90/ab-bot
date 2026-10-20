@@ -119,6 +119,10 @@ struct ParsedWsMessage {
     kind: WsParseKind,
 }
 
+#[cfg(test)]
+#[path = "clob/cancellation_tests.rs"]
+mod cancellation_tests;
+
 /// Polymarket CLOB API client for order book data.
 pub struct ClobClient {
     base_url: String,
@@ -144,6 +148,137 @@ impl ClobClient {
             ws_url: ws_url.unwrap_or_else(|| Self::DEFAULT_WS_URL.to_string()),
             http_client,
         }
+    }
+
+    /// Submit an already signed order using credentials derived for its maker.
+    /// No private key or bot trading identity is used for external wallet orders.
+    pub async fn post_signed_order(
+        &self,
+        address: &str,
+        credentials: &ApiCredentials,
+        signed_order: SignedOrder,
+        order_type: OrderType,
+    ) -> Result<PostOrderResponse> {
+        if !signed_order.maker.eq_ignore_ascii_case(address)
+            || !signed_order.signer.eq_ignore_ascii_case(address)
+        {
+            return Err(Error::Auth {
+                message: "Signed order maker must match credential owner".into(),
+            });
+        }
+        let url = format!("{}/order", self.base_url);
+        let timestamp = current_timestamp().to_string();
+        let method = "POST";
+        let path = "/order";
+
+        let request = PostOrderRequest {
+            order: signed_order,
+            order_type,
+            owner: credentials.api_key.clone(),
+            post_only: None,
+        };
+
+        let body = serde_json::to_string(&request)?;
+
+        debug!(payload = %body, "POST /order request body");
+
+        // Sign the request with L2 HMAC
+        let signature = sign_l2_request(credentials, method, path, &timestamp, Some(&body))?;
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("POLY_ADDRESS", address)
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                message: format!("Failed to post order: {} - {}", status, text),
+                status: Some(status),
+            });
+        }
+
+        let result: PostOrderResponse = response.json().await?;
+        info!(order_id = %result.order_id, "Order posted successfully");
+
+        Ok(result)
+    }
+
+    /// Exchange L1 authentication using a wallet-provided ClobAuth signature.
+    pub async fn derive_external_api_key(
+        &self,
+        address: &str,
+        timestamp: u64,
+        nonce: u64,
+        signature: &str,
+    ) -> Result<ApiCredentials> {
+        let mut response = self
+            .http_client
+            .get(format!("{}/auth/derive-api-key", self.base_url))
+            .header("POLY_ADDRESS", address)
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", timestamp.to_string())
+            .header("POLY_NONCE", nonce.to_string())
+            .send()
+            .await?;
+        if matches!(response.status().as_u16(), 400 | 404) {
+            response = self
+                .http_client
+                .post(format!("{}/auth/api-key", self.base_url))
+                .header("POLY_ADDRESS", address)
+                .header("POLY_SIGNATURE", signature)
+                .header("POLY_TIMESTAMP", timestamp.to_string())
+                .header("POLY_NONCE", nonce.to_string())
+                .send()
+                .await?;
+        }
+        if !response.status().is_success() {
+            return Err(Error::Auth {
+                message: "Unable to derive wallet-specific exchange credentials".into(),
+            });
+        }
+        let derived: DeriveApiKeyResponse = response.json().await?;
+        Ok(ApiCredentials::new(
+            derived.api_key,
+            derived.secret,
+            derived.passphrase,
+        ))
+    }
+
+    pub async fn get_order_metadata(&self, token_id: &str) -> Result<(bool, u64)> {
+        let neg: serde_json::Value = self
+            .get_with_retry(&format!("{}/neg-risk?token_id={token_id}", self.base_url))
+            .await?
+            .json()
+            .await?;
+        let fee: serde_json::Value = self
+            .get_with_retry(&format!("{}/fee-rate?token_id={token_id}", self.base_url))
+            .await?
+            .json()
+            .await?;
+        let neg = neg
+            .get("neg_risk")
+            .and_then(|v| v.as_bool())
+            .ok_or_else(|| Error::Order {
+                message: "Missing exchange contract metadata".into(),
+            })?;
+        let fee = ["base_fee", "baseFee", "fee", "fee_rate_bps", "feeRateBps"]
+            .iter()
+            .find_map(|key| fee.get(key).and_then(|v| v.as_u64()))
+            .or_else(|| fee.as_u64())
+            .ok_or_else(|| Error::Order {
+                message: "Missing exchange fee metadata".into(),
+            })?;
+        Ok((neg, fee))
     }
 
     /// Maximum retry attempts for API calls.
@@ -1185,9 +1320,9 @@ fn upsert_level(levels: &mut Vec<PriceLevel>, price: Decimal, size: Decimal, des
     }
 
     if descending {
-        levels.sort_by(|a, b| b.price.cmp(&a.price));
+        levels.sort_by_key(|level| std::cmp::Reverse(level.price));
     } else {
-        levels.sort_by(|a, b| a.price.cmp(&b.price));
+        levels.sort_by_key(|a| a.price);
     }
 }
 
@@ -1284,14 +1419,53 @@ pub struct BalanceAllowanceResponse {
     pub allowance: String,
 }
 
+impl BalanceAllowanceResponse {
+    /// CLOB collateral and conditional tokens both use six decimal places.
+    pub fn balance_in_units(&self) -> Option<Decimal> {
+        base_units_to_decimal(&self.balance)
+    }
+
+    pub fn allowance_in_units(&self) -> Option<Decimal> {
+        base_units_to_decimal(&self.allowance)
+    }
+}
+
+#[cfg(test)]
+mod balance_unit_tests {
+    use super::*;
+
+    #[test]
+    fn balances_are_six_decimal_base_units_and_invalid_is_not_zero() {
+        let response = BalanceAllowanceResponse {
+            balance: "1250000".into(),
+            allowance: "2000000".into(),
+        };
+        assert_eq!(response.balance_in_units(), Some(Decimal::new(125, 2)));
+        assert_eq!(response.allowance_in_units(), Some(Decimal::from(2)));
+        assert_eq!(base_units_to_decimal("0"), Some(Decimal::ZERO));
+        for invalid in ["", "unavailable", "-1", "1.5"] {
+            assert_eq!(base_units_to_decimal(invalid), None);
+        }
+    }
+}
+
+fn base_units_to_decimal(raw: &str) -> Option<Decimal> {
+    let value: Decimal = raw.trim().parse().ok()?;
+    (value >= Decimal::ZERO && value.fract().is_zero()).then(|| value / Decimal::from(1_000_000))
+}
+
 /// Response from posting an order.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostOrderResponse {
     /// Order ID assigned by the CLOB.
     #[serde(rename = "orderID")]
     pub order_id: String,
     /// Status of the order (e.g. "matched", "delayed", "unmatched").
     pub status: String,
+    #[serde(default, rename = "makingAmount")]
+    pub making_amount: Option<String>,
+    #[serde(default, rename = "takingAmount")]
+    pub taking_amount: Option<String>,
     /// Transaction hash if applicable.
     #[serde(rename = "transactionHash")]
     pub transaction_hash: Option<String>,
@@ -1302,7 +1476,7 @@ impl PostOrderResponse {
     /// FOK orders that fail return status "unmatched".
     pub fn is_filled(&self) -> bool {
         let s = self.status.to_lowercase();
-        s == "matched" || s == "live" || s == "delayed"
+        s == "matched"
     }
 
     /// Check if the order was explicitly not filled (FOK rejection).
@@ -1310,6 +1484,15 @@ impl PostOrderResponse {
         let s = self.status.to_lowercase();
         s == "unmatched" || s == "rejected"
     }
+}
+
+/// Confirmed exchange snapshot. Limit price is not an average execution price.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExchangeOrder {
+    pub id: String,
+    pub status: String,
+    pub original_size: String,
+    pub size_matched: String,
 }
 
 /// Open order information.
@@ -1920,52 +2103,37 @@ impl AuthenticatedClobClient {
             message: "API credentials not set - call derive_api_key() first".to_string(),
         })?;
 
-        let url = format!("{}/order", self.client.base_url);
+        self.client
+            .post_signed_order(&self.address(), credentials, signed_order, order_type)
+            .await
+    }
+
+    /// Read the authenticated exchange order, including cumulative confirmed fills.
+    pub async fn get_order(&self, order_id: &str) -> Result<ExchangeOrder> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set".into(),
+        })?;
+        let path = format!("/data/order/{order_id}");
         let timestamp = current_timestamp().to_string();
-        let method = "POST";
-        let path = "/order";
-
-        let request = PostOrderRequest {
-            order: signed_order,
-            order_type,
-            owner: credentials.api_key.clone(),
-            post_only: None,
-        };
-
-        let body = serde_json::to_string(&request)?;
-
-        debug!(payload = %body, "POST /order request body");
-
-        // Sign the request with L2 HMAC
-        let signature = sign_l2_request(credentials, method, path, &timestamp, Some(&body))?;
-
+        let signature = sign_l2_request(credentials, "GET", &path, &timestamp, None)?;
         let response = self
             .client
             .http_client
-            .post(&url)
+            .get(format!("{}{}", self.client.base_url, path))
             .header("POLY_ADDRESS", self.address())
             .header("POLY_SIGNATURE", signature)
-            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_TIMESTAMP", timestamp)
             .header("POLY_API_KEY", &credentials.api_key)
             .header("POLY_PASSPHRASE", &credentials.api_passphrase)
-            .header("Content-Type", "application/json")
-            .body(body)
             .send()
             .await?;
-
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
             return Err(Error::Api {
-                message: format!("Failed to post order: {} - {}", status, text),
-                status: Some(status),
+                message: "Failed to reconcile exchange order".into(),
+                status: Some(response.status().as_u16()),
             });
         }
-
-        let result: PostOrderResponse = response.json().await?;
-        info!(order_id = %result.order_id, "Order posted successfully");
-
-        Ok(result)
+        Ok(response.json().await?)
     }
 
     /// Cancel an order by ID.
@@ -1974,35 +2142,40 @@ impl AuthenticatedClobClient {
             message: "API credentials not set - call derive_api_key() first".to_string(),
         })?;
 
-        let url = format!("{}/order/{}", self.client.base_url, order_id);
+        let path = "/order";
         let timestamp = current_timestamp().to_string();
-        let method = "DELETE";
-        let path = format!("/order/{}", order_id);
-
-        let signature = sign_l2_request(credentials, method, &path, &timestamp, None)?;
-
+        let body = serde_json::to_string(&serde_json::json!({"orderID":order_id}))?;
+        let signature = sign_l2_request(credentials, "DELETE", path, &timestamp, Some(&body))?;
         let response = self
             .client
             .http_client
-            .delete(&url)
+            .delete(format!("{}{}", self.client.base_url, path))
             .header("POLY_ADDRESS", self.address())
             .header("POLY_SIGNATURE", signature)
-            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_TIMESTAMP", timestamp)
             .header("POLY_API_KEY", &credentials.api_key)
             .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+            .header("Content-Type", "application/json")
+            .body(body)
             .send()
             .await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
+        let status = response.status();
+        if !status.is_success() {
             return Err(Error::Api {
-                message: format!("Failed to cancel order: {} - {}", status, text),
-                status: Some(status),
+                message: "Exchange cancellation request failed".into(),
+                status: Some(status.as_u16()),
             });
         }
-
-        info!(order_id = %order_id, "Order cancelled successfully");
+        let result: serde_json::Value = response.json().await?;
+        let confirmed = result
+            .get("canceled")
+            .and_then(|v| v.as_array())
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(order_id)));
+        if !confirmed {
+            return Err(Error::Order {
+                message: "Exchange did not confirm cancellation; reconcile order status".into(),
+            });
+        }
         Ok(())
     }
 
@@ -2267,6 +2440,16 @@ mod authenticated_tests {
     #[tokio::test]
     async fn test_create_order() {
         let auth_client = test_auth_client();
+        auth_client
+            .neg_risk_cache
+            .lock()
+            .unwrap()
+            .insert("12345".into(), false);
+        auth_client
+            .fee_rate_cache
+            .lock()
+            .unwrap()
+            .insert("12345".into(), 0);
 
         let signed = auth_client
             .create_order(

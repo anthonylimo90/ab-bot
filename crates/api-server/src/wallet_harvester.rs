@@ -266,7 +266,7 @@ async fn harvest_cycle(
 
     // Sort by last_seen DESC (most recently active wallets first) before truncating
     let mut sorted_wallets: Vec<_> = stats_map.iter().collect();
-    sorted_wallets.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+    sorted_wallets.sort_by_key(|wallet| std::cmp::Reverse(wallet.1.last_seen));
 
     let batch_rows: Vec<_> = sorted_wallets
         .iter()
