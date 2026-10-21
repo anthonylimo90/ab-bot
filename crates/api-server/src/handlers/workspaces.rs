@@ -28,7 +28,9 @@ use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::strategy_modes::{resolve_strategy_modes, StrategyModeInputs, StrategyModeStatus};
-use crate::workspace_scope::resolve_canonical_workspace_membership;
+use crate::workspace_scope::{
+    is_canonical_workspace, resolve_canonical_workspace_membership, CANONICAL_WORKSPACE_SQL,
+};
 
 #[derive(Debug, sqlx::FromRow)]
 struct WorkspaceAuditSnapshot {
@@ -316,6 +318,32 @@ async fn get_user_role(
     Ok(role.map(|(r,)| r))
 }
 
+/// Authorize a write to global (non-workspace-scoped) configuration such as
+/// `dynamic_config`: platform admins, or owners/admins of the canonical workspace.
+/// Membership of any other workspace grants nothing.
+async fn require_global_config_writer(
+    pool: &sqlx::PgPool,
+    claims: &Claims,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    if claims.role == UserRole::PlatformAdmin {
+        return Ok(());
+    }
+    match resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|membership| membership.role)
+    {
+        Some(role) if role == "owner" || role == "admin" => Ok(()),
+        Some(_) => Err(ApiError::Forbidden(
+            "Only canonical workspace owners/admins or platform admins can change global configuration"
+                .into(),
+        )),
+        None => Err(ApiError::Forbidden(
+            "Not a member of the canonical workspace".into(),
+        )),
+    }
+}
+
 async fn require_canonical_workspace_member(
     pool: &sqlx::PgPool,
     user_id: Uuid,
@@ -567,6 +595,20 @@ pub async fn update_workspace(
     .fetch_one(&state.pool)
     .await?;
 
+    // Runtime flags drive the single shared runtime (live trading, exit handler,
+    // arb executor) and feed the canonical-workspace election, so a workspace may
+    // only switch them on while it is already canonical. Switching them off is
+    // always allowed. The write below repeats this check atomically.
+    let enables_runtime_flag = (req.live_trading_enabled == Some(true)
+        && !before_update.live_trading_enabled)
+        || (req.exit_handler_enabled == Some(true) && !before_update.exit_handler_enabled)
+        || (req.arb_auto_execute == Some(true) && !before_update.arb_auto_execute);
+    if enables_runtime_flag && !is_canonical_workspace(&state.pool, workspace_id).await? {
+        return Err(ApiError::Forbidden(
+            "Runtime flags can only be enabled on the canonical workspace".into(),
+        ));
+    }
+
     // Validate WalletConnect project ID format if provided
     if let Some(ref project_id) = req.walletconnect_project_id {
         if !project_id.is_empty() && !is_valid_walletconnect_project_id(project_id) {
@@ -659,9 +701,17 @@ pub async fn update_workspace(
     add_param!(exit_handler_enabled, "exit_handler_enabled");
     add_param!(inactivity_days, "inactivity_days");
 
+    // Enabling a runtime flag is only valid on the canonical workspace; re-check it in
+    // the statement itself so a concurrent election change cannot slip through.
+    let canonical_guard = if enables_runtime_flag {
+        format!(" AND id = ({CANONICAL_WORKSPACE_SQL})")
+    } else {
+        String::new()
+    };
     let query = format!(
-        "UPDATE workspaces SET {} WHERE id = $1",
-        set_parts.join(", ")
+        "UPDATE workspaces SET {} WHERE id = $1{}",
+        set_parts.join(", "),
+        canonical_guard
     );
 
     let mut q = sqlx::query(&query).bind(workspace_id).bind(now);
@@ -723,7 +773,12 @@ pub async fn update_workspace(
         q = q.bind(inactivity_days);
     }
 
-    q.execute(&state.pool).await?;
+    let update_result = q.execute(&state.pool).await?;
+    if enables_runtime_flag && update_result.rows_affected() == 0 {
+        return Err(ApiError::Forbidden(
+            "Runtime flags can only be enabled on the canonical workspace".into(),
+        ));
+    }
 
     // ── Propagate toggle changes to running services ──
     if req.arb_auto_execute.is_some()
@@ -2729,24 +2784,11 @@ pub async fn update_opportunity_selection_settings(
 ) -> ApiResult<Json<OpportunitySelectionStatusResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
+    // Dynamic config is global (not workspace-scoped): the path workspace says
+    // nothing about who may change it, so only its format is validated.
+    Uuid::parse_str(&workspace_id)
         .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
-    if role != "owner" {
-        return Err(ApiError::Forbidden(
-            "Only workspace owner can update opportunity selection settings".into(),
-        ));
-    }
-
-    // Dynamic config is global (not workspace-scoped), so restrict to platform admins
-    if claims.role != auth::UserRole::PlatformAdmin && role != "owner" {
-        return Err(ApiError::Forbidden(
-            "Only platform admins or workspace owners can update global opportunity selection settings".into(),
-        ));
-    }
+    require_global_config_writer(&state.pool, &claims, user_id).await?;
 
     if req.aggressiveness.is_none()
         && req.exploration_slots.is_none()
@@ -3098,17 +3140,11 @@ pub async fn update_arb_executor_config(
 ) -> ApiResult<Json<ArbExecutorConfigResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
+    // Dynamic config is global (not workspace-scoped): the path workspace says
+    // nothing about who may change it, so only its format is validated.
+    Uuid::parse_str(&workspace_id)
         .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
-    if role != "owner" && role != "admin" {
-        return Err(ApiError::Forbidden(
-            "Only workspace owners/admins can update arb executor config".into(),
-        ));
-    }
+    require_global_config_writer(&state.pool, &claims, user_id).await?;
 
     if req.position_size.is_none()
         && req.min_net_profit.is_none()
@@ -3410,3 +3446,7 @@ fn is_private_host(host: &str) -> bool {
 
     false
 }
+
+#[cfg(test)]
+#[path = "workspaces/security_tests.rs"]
+mod security_tests;

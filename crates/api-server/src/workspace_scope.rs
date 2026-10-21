@@ -148,7 +148,10 @@ pub struct CanonicalWorkspaceFlags {
     pub exit_handler_enabled: bool,
 }
 
-const CANONICAL_WORKSPACE_SQL: &str = r#"
+/// Election query for the single workspace that drives the shared runtime
+/// (live trading, exit handler, arb executor). Writes that can influence this
+/// election or the global runtime must be authorized against its result.
+pub(crate) const CANONICAL_WORKSPACE_SQL: &str = r#"
         SELECT w.id
         FROM workspaces w
         ORDER BY
@@ -171,6 +174,14 @@ pub async fn resolve_canonical_workspace_id(pool: &PgPool) -> Result<Option<Uuid
         .await?;
 
     Ok(row.map(|(id,)| id))
+}
+
+/// Whether `workspace_id` is currently the canonical workspace.
+pub async fn is_canonical_workspace(
+    pool: &PgPool,
+    workspace_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(resolve_canonical_workspace_id(pool).await? == Some(workspace_id))
 }
 
 pub async fn resolve_canonical_workspace_membership(
