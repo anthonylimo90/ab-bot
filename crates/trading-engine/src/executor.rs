@@ -760,6 +760,11 @@ impl OrderExecutor {
         self.config.default_slippage
     }
 
+    /// Minimum notional a market buy needs at the best ask to execute.
+    pub fn min_book_depth(&self) -> Decimal {
+        self.config.min_book_depth
+    }
+
     /// Verify that the live wallet has enough collateral balance and allowance
     /// for a multi-leg buy before any leg is submitted.
     pub async fn ensure_live_buying_power(&self, required_collateral: Decimal) -> Result<()> {

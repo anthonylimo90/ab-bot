@@ -10,7 +10,7 @@ use polymarket_core::api::clob::OrderBookUpdate;
 use polymarket_core::api::{ClobClient, GammaClient};
 use polymarket_core::config::Config;
 use polymarket_core::db;
-use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, OrderBook};
+use polymarket_core::types::{ArbOpportunity, BinaryMarketBook, FeeSchedule, OrderBook};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::cmp::Ordering;
@@ -25,8 +25,6 @@ const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false
 /// Cooldown period between signals for the same market (seconds).
 const SIGNAL_COOLDOWN_SECS: i64 = 60;
 
-/// How often to check for stale positions (every N order book updates).
-const STALE_CHECK_INTERVAL: u64 = 500;
 /// Minimum number of market replacements before a periodic rerank triggers a resubscribe.
 const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
 /// Minimum relative market-set delta before a periodic rerank triggers a resubscribe.
@@ -302,7 +300,7 @@ pub struct ArbMonitor {
     /// Static market metadata used in ranking.
     market_profiles: HashMap<String, MarketProfile>,
     /// Whether a market currently uses Polymarket's fee-enabled pricing model.
-    market_fees_enabled: HashMap<String, bool>,
+    market_fee_schedules: HashMap<String, FeeSchedule>,
     /// Rolling market-level opportunity stats used for dynamic scoring.
     market_stats: HashMap<String, MarketOpportunityStats>,
     /// Active market subset based on cap.
@@ -455,7 +453,7 @@ impl ArbMonitor {
             max_markets_cap,
             all_market_ids: Vec::new(),
             market_profiles: HashMap::new(),
-            market_fees_enabled: HashMap::new(),
+            market_fee_schedules: HashMap::new(),
             market_stats: HashMap::new(),
             eligible_markets: HashSet::new(),
             selection_snapshot: Vec::new(),
@@ -477,10 +475,9 @@ impl ArbMonitor {
         })
     }
 
-    /// Run the monitoring loop.
-    pub async fn run(&mut self) -> Result<()> {
-        info!("Fetching active markets...");
-
+    /// Load the tradable binary-market universe from Gamma, replacing the
+    /// previous one so new markets are watched and closed ones dropped.
+    async fn load_universe(&mut self) -> Result<()> {
         // Fetch tradable markets from Gamma, which is authoritative for active
         // discovery. CLOB `/markets?active=true` currently includes many closed
         // historical markets and starves the websocket selection.
@@ -494,17 +491,34 @@ impl ArbMonitor {
             .await?;
         let binary_markets: Vec<_> = markets.iter().filter(|m| m.outcomes.len() == 2).collect();
 
+        let mut profiles = HashMap::new();
+        let mut fee_schedules = HashMap::new();
+        let mut outcomes = HashMap::new();
         for market in &binary_markets {
-            self.market_profiles.insert(
+            profiles.insert(
                 market.id.clone(),
                 MarketProfile {
                     liquidity: market.liquidity.to_f64().unwrap_or(0.0),
                     volume: market.volume.to_f64().unwrap_or(0.0),
                 },
             );
-            self.market_fees_enabled
-                .insert(market.id.clone(), market.fees_enabled);
+            fee_schedules.insert(market.id.clone(), market.effective_fee_schedule());
+            let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
+                (
+                    market.outcomes[0].token_id.clone(),
+                    market.outcomes[1].token_id.clone(),
+                )
+            } else {
+                (
+                    market.outcomes[1].token_id.clone(),
+                    market.outcomes[0].token_id.clone(),
+                )
+            };
+            outcomes.insert(market.id.clone(), (yes_id, no_id));
         }
+        self.market_profiles = profiles;
+        self.market_fee_schedules = fee_schedules;
+        self.market_outcomes = outcomes;
 
         self.all_market_ids = binary_markets.iter().map(|m| m.id.clone()).collect();
         self.all_market_ids.sort_by(|a, b| {
@@ -512,28 +526,31 @@ impl ArbMonitor {
             let score_b = baseline_profile_score(self.market_profiles.get(b));
             compare_f64_desc(score_a, score_b)
         });
-        let reconciliation = self.position_tracker.reconcile_on_startup().await?;
-        if reconciliation.has_issues() {
-            warn!(
-                total_positions = reconciliation.total_positions,
-                healthy = reconciliation.healthy,
-                pending_active = reconciliation.pending_active,
-                stale_pending = reconciliation.stale_pending,
-                interrupted_closing = reconciliation.interrupted_closing,
-                already_failed = reconciliation.already_failed,
-                stalled = reconciliation.stalled,
-                auto_recovered = reconciliation.auto_recovered,
-                "Position reconciliation found recoverable issues"
-            );
-        }
+        Ok(())
+    }
+
+    /// Run the monitoring loop.
+    pub async fn run(&mut self) -> Result<()> {
+        info!("Fetching active markets...");
+        self.load_universe().await?;
+        let mut last_universe_refresh = tokio::time::Instant::now();
+        let universe_refresh_interval = StdDuration::from_secs(
+            std::env::var("ARB_UNIVERSE_REFRESH_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|secs| *secs > 0)
+                .unwrap_or(1800),
+        );
+        self.position_tracker.load_active_positions().await?;
+        self.position_tracker.log_summary();
         let _ = self.rebuild_eligible_markets(SelectionRebuildReason::Startup);
 
         info!(
             total_markets = self.all_market_ids.len(),
-            fee_enabled_markets = self
-                .market_fees_enabled
+            fee_charging_markets = self
+                .market_fee_schedules
                 .values()
-                .filter(|enabled| **enabled)
+                .filter(|schedule| schedule.rate > Decimal::ZERO)
                 .count(),
             active_markets = self.eligible_markets.len(),
             active_assets = self.active_subscription_asset_count(),
@@ -547,25 +564,6 @@ impl ArbMonitor {
             min_book_depth = %self.min_book_depth,
             "Initialized arb market universe"
         );
-
-        // Build market outcome mappings for all markets (not just currently active subset)
-        for market in &binary_markets {
-            if market.outcomes.len() == 2 {
-                let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-                    (
-                        market.outcomes[0].token_id.clone(),
-                        market.outcomes[1].token_id.clone(),
-                    )
-                } else {
-                    (
-                        market.outcomes[1].token_id.clone(),
-                        market.outcomes[0].token_id.clone(),
-                    )
-                };
-                self.market_outcomes
-                    .insert(market.id.clone(), (yes_id, no_id));
-            }
-        }
 
         // Subscribe to the current active market subset via token IDs.
         let mut updates = self
@@ -601,6 +599,11 @@ impl ArbMonitor {
         let mut resubscribe_requested = false;
         let mut ws_runtime_prev = websocket_runtime_stats_snapshot();
 
+        // Stall detection measures silence across loop iterations: a timeout
+        // recreated per iteration would be reset by every tick and never fire.
+        let update_timeout = StdDuration::from_secs(update_timeout_secs);
+        let mut last_update_at = tokio::time::Instant::now();
+
         const MAX_RESUBSCRIBE_RETRIES: u32 = 10;
         const RESUBSCRIBE_BASE_DELAY_SECS: u64 = 3;
         const RESUBSCRIBE_MAX_DELAY_SECS: u64 = 60;
@@ -625,6 +628,7 @@ impl ArbMonitor {
                             resets_since_tick += 1;
                             resubscribe_requested = false;
                             self.last_resubscribe_at = Some(Utc::now());
+                            last_update_at = tokio::time::Instant::now();
                             break;
                         }
                         Err(e) => {
@@ -810,6 +814,17 @@ impl ArbMonitor {
                     if ob_evicted > 0 {
                         debug!(evicted = ob_evicted, remaining = self.order_books.len(), "Pruned stale order books");
                     }
+                    if last_universe_refresh.elapsed() >= universe_refresh_interval {
+                        last_universe_refresh = tokio::time::Instant::now();
+                        match self.load_universe().await {
+                            Ok(()) => info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe"),
+                            Err(e) => warn!(error = %e, "Failed to refresh arb market universe; keeping previous set"),
+                        }
+                    }
+                    // Keep markets that hold positions subscribed as positions open and close.
+                    if let Err(e) = self.position_tracker.load_active_positions().await {
+                        warn!(error = %e, "Failed to refresh active positions; keeping previous set");
+                    }
                     let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::PeriodicRerank);
                     if outcome.applied {
                         selection_applied_since_tick = selection_applied_since_tick.saturating_add(1);
@@ -834,29 +849,28 @@ impl ArbMonitor {
                         );
                     }
                 }
-                maybe_update = tokio::time::timeout(StdDuration::from_secs(update_timeout_secs), updates.recv()) => {
-                    let Some(update) = (match maybe_update {
-                        Ok(update) => update,
-                        Err(_) => {
-                            stalls_since_tick += 1;
-                            warn!(timeout_secs = update_timeout_secs, "No orderbook updates received before timeout; reconnecting websocket subscription");
-                            loop {
-                                match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
-                                    Ok(new_updates) => {
-                                        updates = new_updates;
-                                        resets_since_tick += 1;
-                                        self.last_resubscribe_at = Some(Utc::now());
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "Failed reconnecting orderbook stream, retrying in 3s");
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                                    }
-                                }
+                _ = tokio::time::sleep_until(last_update_at + update_timeout) => {
+                    stalls_since_tick += 1;
+                    warn!(timeout_secs = update_timeout_secs, "No orderbook updates received before timeout; reconnecting websocket subscription");
+                    loop {
+                        match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
+                            Ok(new_updates) => {
+                                updates = new_updates;
+                                resets_since_tick += 1;
+                                self.last_resubscribe_at = Some(Utc::now());
+                                break;
                             }
-                            continue;
+                            Err(e) => {
+                                warn!(error = %e, "Failed reconnecting orderbook stream, retrying in 3s");
+                                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                            }
                         }
-                    }) else {
+                    }
+                    last_update_at = tokio::time::Instant::now();
+                    continue;
+                }
+                maybe_update = updates.recv() => {
+                    let Some(update) = maybe_update else {
                         warn!("Orderbook update channel closed; reconnecting websocket subscription");
                         loop {
                             match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
@@ -872,11 +886,17 @@ impl ArbMonitor {
                                 }
                             }
                         }
+                        last_update_at = tokio::time::Instant::now();
                         continue;
                     };
 
+                    last_update_at = tokio::time::Instant::now();
                     updates_since_tick += 1;
-                    self.process_update(update, &mut arb_telemetry).await?;
+                    // A failed publish or database call affects one update; it
+                    // must not stop monitoring every other market.
+                    if let Err(e) = self.process_update(update, &mut arb_telemetry).await {
+                        warn!(error = %e, "Failed to process orderbook update");
+                    }
                     health_tick += 1;
 
                     if health_tick.is_multiple_of(100) {
@@ -884,12 +904,6 @@ impl ArbMonitor {
                     }
                     if health_tick.is_multiple_of(5000) {
                         info!(updates = health_tick, "Arb monitor processed orderbook updates");
-                    }
-                    // Periodically check for stale positions and publish exit signals
-                    if health_tick.is_multiple_of(STALE_CHECK_INTERVAL) {
-                        if let Err(e) = self.position_tracker.check_stale_positions().await {
-                            warn!(error = %e, "Failed to check stale positions");
-                        }
                     }
                 }
             }
@@ -1212,18 +1226,19 @@ impl ArbMonitor {
                 let has_depth = binary_book
                     .entry_cost_with_depth(self.min_book_depth)
                     .is_some();
-                let fees_enabled = self
-                    .market_fees_enabled
+                // A market without known fee terms is priced at the highest rate.
+                let fee_schedule = self
+                    .market_fee_schedules
                     .get(&update.market_id)
                     .copied()
-                    .unwrap_or(false);
+                    .unwrap_or(FeeSchedule::CONSERVATIVE);
                 let observed_at = Utc::now();
                 self.track_market_evaluation(&update.market_id, observed_at);
                 arb_telemetry.evaluated_books = arb_telemetry.evaluated_books.saturating_add(1);
 
                 // Calculate arbitrage opportunity
                 if let Some(arb) =
-                    ArbOpportunity::calculate_with_fees_enabled(&binary_book, fees_enabled)
+                    ArbOpportunity::calculate_with_fee_schedule(&binary_book, fee_schedule)
                 {
                     let gross_profit_bps = arb.gross_profit.to_f64().unwrap_or(0.0) * 10_000.0;
                     let net_profit_bps = arb.net_profit.to_f64().unwrap_or(0.0) * 10_000.0;
@@ -1317,8 +1332,7 @@ impl ArbMonitor {
                                     self.track_market_signal(&arb.market_id, observed_at);
                                     arb_telemetry.entry_signals =
                                         arb_telemetry.entry_signals.saturating_add(1);
-                                    self.handle_arb_opportunity(&arb, &binary_book, observed_at)
-                                        .await?;
+                                    self.handle_arb_opportunity(&arb, observed_at).await?;
                                 } else {
                                     arb_telemetry.filtered_by_cooldown =
                                         arb_telemetry.filtered_by_cooldown.saturating_add(1);
@@ -1327,11 +1341,6 @@ impl ArbMonitor {
                         }
                     }
                 }
-
-                // Always update P&L for open positions, even if market is outside active-entry cap.
-                self.position_tracker
-                    .update_market_positions(&update.market_id, &binary_book)
-                    .await?;
             }
         }
 
@@ -1342,7 +1351,6 @@ impl ArbMonitor {
     async fn handle_arb_opportunity(
         &mut self,
         arb: &ArbOpportunity,
-        book: &BinaryMarketBook,
         observed_at: chrono::DateTime<Utc>,
     ) -> Result<()> {
         info!(
@@ -1350,14 +1358,9 @@ impl ArbMonitor {
             arb.market_id, arb.total_cost, arb.net_profit
         );
 
-        // Publish entry signal
+        // Publish entry signal; exits are evaluated by the API server.
         self.signal_publisher
             .publish_entry_signal(arb, observed_at)
-            .await?;
-
-        // Check for exit opportunities on open positions
-        self.position_tracker
-            .check_exit_opportunities(&arb.market_id, book)
             .await?;
 
         Ok(())

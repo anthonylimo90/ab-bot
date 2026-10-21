@@ -20,6 +20,9 @@ pub mod channels {
     pub const DYNAMIC_CONFIG_UPDATES: &str = "dynamic:config:update";
 }
 
+/// Lifetime of the latest runtime stats; they are republished every minute.
+const RUNTIME_STATS_TTL_SECS: u64 = 300;
+
 /// Publishes arbitrage signals to Redis and external alerting services.
 pub struct SignalPublisher {
     redis: redis::aio::ConnectionManager,
@@ -135,7 +138,11 @@ impl SignalPublisher {
         Ok(Self {
             redis,
             alerts_config,
-            http_client: reqwest::Client::new(),
+            // Alerts are sent from the order book loop: a hung webhook must
+            // not stall market data.
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
         })
     }
 
@@ -197,9 +204,14 @@ impl SignalPublisher {
     /// Publish runtime health stats so the tuner can react to stream quality.
     pub async fn publish_runtime_stats(&mut self, stats: &RuntimeStats) -> Result<()> {
         let payload = serde_json::to_string(stats)?;
+        // Expires if the monitor stops, so the tuner never acts on old stats.
         let _: () = self
             .redis
-            .set(channels::RUNTIME_STATS_LATEST, &payload)
+            .set_ex(
+                channels::RUNTIME_STATS_LATEST,
+                &payload,
+                RUNTIME_STATS_TTL_SECS,
+            )
             .await?;
         let _: () = self.redis.publish(channels::RUNTIME_STATS, payload).await?;
         Ok(())

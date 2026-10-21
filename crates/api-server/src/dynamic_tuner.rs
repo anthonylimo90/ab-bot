@@ -654,11 +654,11 @@ impl DynamicTuner {
             let mut desired_arb_profit =
                 expected_arb_slippage + regime_safety_margin + low_depth_penalty + vol_penalty;
             // Watchdog: if many attempts but zero fills, reduce the
-            // parameter that is actually causing rejections.
-            //  - "depth"    → the book is too thin; relax min_book_depth instead
-            //  - "slippage" → execution-quality issue; don't reduce threshold
-            //  - other/none → profit threshold is the most likely gating factor
-            if no_trade_watchdog && top_skip != "slippage" && top_skip != "insufficient_depth" {
+            // parameter that is actually causing rejections. Only signals
+            // skipped for falling short of the threshold justify lowering it;
+            // skips for an existing position, a stale signal, the circuit
+            // breaker, depth or slippage say nothing about the threshold.
+            if no_trade_watchdog && top_skip == "below_min_profit" {
                 desired_arb_profit *= 0.90;
             }
             // No ratchet floor — apply_step_limit already caps movement
@@ -686,16 +686,20 @@ impl DynamicTuner {
         } else {
             0.0
         };
-        let throughput_penalty =
-            if metrics.updates_per_minute > EPSILON && metrics.updates_per_minute < 120.0 {
-                0.10
-            } else {
-                0.0
-            };
+        // Few updates from a healthy stream only means quiet markets; shrinking
+        // the subscription then lowers the rate further and never recovers.
+        let healthy_stream = health_penalty < 0.10;
+        let throughput_penalty = if !healthy_stream
+            && metrics.updates_per_minute > EPSILON
+            && metrics.updates_per_minute < 120.0
+        {
+            0.10
+        } else {
+            0.0
+        };
 
         let desired_market_factor =
             (1.0 - health_penalty - throughput_penalty + throughput_bonus).clamp(0.70, 1.20);
-        let healthy_stream = metrics.updates_per_minute >= 1_000.0 && health_penalty < 0.10;
         let desired_market_target =
             if healthy_stream && max_markets_current + EPSILON < max_markets_default {
                 // Once ingestion is healthy again, bias back toward the configured
@@ -1677,6 +1681,94 @@ fn apply_step_limit(current: f64, target: f64, max_step_pct: f64, reference: f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tuner() -> DynamicTuner {
+        DynamicTuner::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/unused")
+                .unwrap(),
+            Arc::new(RwLock::new(MarketRegime::Ranging)),
+            Arc::new(CircuitBreaker::new(Default::default())),
+        )
+    }
+
+    fn row(key: &str, current: i64, default: i64) -> DynamicConfigRow {
+        DynamicConfigRow {
+            key: key.to_string(),
+            current_value: Decimal::from(current),
+            default_value: Decimal::from(default),
+            min_value: Decimal::ZERO,
+            max_value: Decimal::from(10_000),
+            max_step_pct: Decimal::new(12, 2),
+            enabled: true,
+            last_good_value: Decimal::from(current),
+            pending_eval: false,
+            pending_baseline: None,
+            last_applied_at: None,
+        }
+    }
+
+    fn idle_metrics(top_skip: &str) -> TuningMetrics {
+        TuningMetrics {
+            attempts_last_window: 50.0,
+            fills_last_window: 0.0,
+            top_skip_reason: Some(top_skip.to_string()),
+            depth_proxy: 1.0,
+            updates_per_minute: 60.0,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_only_relaxes_the_threshold_for_threshold_skips() {
+        let tuner = tuner();
+        let rows = HashMap::new();
+        let baseline = tuner.compute_targets(
+            &rows,
+            &idle_metrics("active_position_exists"),
+            MarketRegime::Ranging,
+        )[KEY_ARB_MIN_PROFIT_THRESHOLD];
+        let relaxed = tuner.compute_targets(
+            &rows,
+            &idle_metrics("below_min_profit"),
+            MarketRegime::Ranging,
+        )[KEY_ARB_MIN_PROFIT_THRESHOLD];
+        assert!(relaxed < baseline);
+        let stale = tuner.compute_targets(&rows, &idle_metrics("too_stale"), MarketRegime::Ranging)
+            [KEY_ARB_MIN_PROFIT_THRESHOLD];
+        assert_eq!(stale, baseline);
+    }
+
+    #[tokio::test]
+    async fn quiet_healthy_stream_restores_market_cap_instead_of_shrinking() {
+        let tuner = tuner();
+        let rows: HashMap<_, _> = [(
+            KEY_ARB_MONITOR_MAX_MARKETS.to_string(),
+            row(KEY_ARB_MONITOR_MAX_MARKETS, 150, 300),
+        )]
+        .into_iter()
+        .collect();
+        let quiet = TuningMetrics {
+            updates_per_minute: 60.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            tuner.compute_targets(&rows, &quiet, MarketRegime::Ranging)
+                [KEY_ARB_MONITOR_MAX_MARKETS],
+            300.0
+        );
+
+        let stalling = TuningMetrics {
+            updates_per_minute: 60.0,
+            ws_stall_rate: 0.5,
+            ..Default::default()
+        };
+        assert!(
+            tuner.compute_targets(&rows, &stalling, MarketRegime::Ranging)
+                [KEY_ARB_MONITOR_MAX_MARKETS]
+                < 150.0
+        );
+    }
 
     #[test]
     fn step_limit_caps_changes() {

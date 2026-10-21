@@ -7,7 +7,10 @@
 
 use chrono::Utc;
 use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE};
-use polymarket_core::types::{ArbOpportunity, ExitStrategy, FailureReason, MarketOrder, OrderSide};
+use polymarket_core::types::{
+    ArbOpportunity, BinaryMarketBook, ExitStrategy, FailureReason, FeeSchedule, MarketOrder,
+    OrderBook, OrderSide,
+};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -71,6 +74,47 @@ impl Default for ArbExecutorConfig {
             max_total_exposure: Decimal::new(25000, 0), // $25,000 max total exposure
         }
     }
+}
+
+/// Smallest pair notional worth sending (the exchange's minimum market buy).
+const MIN_PAIR_NOTIONAL: Decimal = Decimal::ONE;
+
+/// Re-prices an opportunity on fresh books under the fee terms it was
+/// detected with; `None` when it no longer clears `min_net_profit`.
+fn reprice_on_fresh_books(
+    signal: &ArbOpportunity,
+    yes_book: &OrderBook,
+    no_book: &OrderBook,
+    min_net_profit: Decimal,
+) -> Option<ArbOpportunity> {
+    let book = BinaryMarketBook {
+        market_id: signal.market_id.clone(),
+        timestamp: Utc::now(),
+        yes_book: yes_book.clone(),
+        no_book: no_book.clone(),
+    };
+    let schedule = signal.fee_schedule.unwrap_or(FeeSchedule::CONSERVATIVE);
+    ArbOpportunity::calculate_with_fee_schedule(&book, schedule)
+        .filter(|fresh| fresh.net_profit >= min_net_profit)
+}
+
+/// Largest pair quantity (up to `desired`) that both legs can buy at their
+/// best ask under the executor's market-buy rules: at least `min_depth`
+/// notional at that level and enough size for the whole quantity.
+fn executable_pair_quantity(
+    desired: Decimal,
+    yes_book: &OrderBook,
+    no_book: &OrderBook,
+    min_depth: Decimal,
+) -> Decimal {
+    let capacity = |book: &OrderBook| {
+        book.best_ask_level()
+            .filter(|level| level.price * level.size >= min_depth)
+            .map(|level| level.size)
+    };
+    capacity(yes_book)
+        .zip(capacity(no_book))
+        .map_or(Decimal::ZERO, |(yes, no)| desired.min(yes).min(no))
 }
 
 impl ArbExecutorConfig {
@@ -569,6 +613,7 @@ impl ArbAutoExecutor {
                 "Arb signal too stale, skipping"
             );
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(&arb, "unknown", "too_stale", &telemetry)
                 .await;
             return Ok(());
@@ -654,6 +699,7 @@ impl ArbAutoExecutor {
             runtime.disabled_skips = runtime.disabled_skips.saturating_add(1);
             runtime.record_decision(&arb.market_id, "skipped: executor disabled");
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(&arb, execution_mode, "executor_disabled", &telemetry)
                 .await;
             return Ok(());
@@ -666,6 +712,7 @@ impl ArbAutoExecutor {
                 "skipped: live arb execution not acknowledged",
             );
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(
                 &arb,
                 execution_mode,
@@ -697,6 +744,7 @@ impl ArbAutoExecutor {
                 "Arb signal below min profit threshold, skipping"
             );
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(&arb, execution_mode, "below_min_profit", &telemetry)
                 .await;
             return Ok(());
@@ -711,6 +759,8 @@ impl ArbAutoExecutor {
                 runtime.record_decision(market_id, "skipped: active position exists");
                 info!(market_id = %market_id, "Active position exists, skipping");
                 telemetry.finish_total(&process_started_at);
+                drop(runtime);
+                drop(active);
                 self.record_skip_event(&arb, execution_mode, "active_position_exists", &telemetry)
                     .await;
                 return Ok(());
@@ -724,6 +774,7 @@ impl ArbAutoExecutor {
             runtime.record_decision(market_id, "skipped: circuit breaker tripped");
             warn!(market_id = %market_id, "Circuit breaker tripped, skipping arb trade");
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(&arb, execution_mode, "circuit_breaker", &telemetry)
                 .await;
             return Ok(());
@@ -742,6 +793,7 @@ impl ArbAutoExecutor {
                         ),
                     );
                     telemetry.finish_total(&process_started_at);
+                    drop(runtime);
                     self.record_skip_event(&arb, execution_mode, "exposure_limit", &telemetry)
                         .await;
                     return Ok(());
@@ -783,6 +835,7 @@ impl ArbAutoExecutor {
                             "skipped: token lookup failed after single-market hydration",
                         );
                         warn!(market_id = %market_id, "Market not found after single-market hydration, skipping");
+                        drop(runtime);
                         self.record_skip_event(
                             &arb,
                             execution_mode,
@@ -803,6 +856,7 @@ impl ArbAutoExecutor {
                             format!("skipped: token cache hydration failed: {e}"),
                         );
                         warn!(market_id = %market_id, error = %e, "Token cache hydration failed");
+                        drop(runtime);
                         self.record_skip_event(
                             &arb,
                             execution_mode,
@@ -837,6 +891,7 @@ impl ArbAutoExecutor {
                     Some(depth_check_started_at.elapsed().as_millis() as i64);
                 telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
                 telemetry.finish_total(&process_started_at);
+                drop(runtime);
                 self.record_skip_event(&arb, execution_mode, "orderbook_unavailable", &telemetry)
                     .await;
                 return Ok(());
@@ -866,11 +921,28 @@ impl ArbAutoExecutor {
             telemetry.depth_check_ms = Some(depth_check_started_at.elapsed().as_millis() as i64);
             telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(&arb, execution_mode, "insufficient_depth", &telemetry)
                 .await;
             return Ok(());
         }
         telemetry.depth_check_ms = Some(depth_check_started_at.elapsed().as_millis() as i64);
+
+        // Re-price the opportunity on the books that will actually be traded,
+        // under the fee terms it was detected with: the signal may be stale.
+        let Some(fresh) = reprice_on_fresh_books(&arb, &yes_book, &no_book, cfg.min_net_profit)
+        else {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.record_decision(market_id, "skipped: edge gone on fresh books");
+            telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+            telemetry.finish_total(&process_started_at);
+            drop(runtime);
+            self.record_skip_event(&arb, execution_mode, "edge_gone_on_fresh_books", &telemetry)
+                .await;
+            return Ok(());
+        };
+        let signal_arb = arb.clone();
+        let arb = fresh;
 
         let rollout_decision = self
             .rollout_controller
@@ -880,7 +952,8 @@ impl ArbAutoExecutor {
             let mut runtime = self.runtime_status.write().await;
             runtime.record_decision(market_id, format!("skipped: {reason}"));
             telemetry.finish_total(&process_started_at);
-            self.record_skip_event(&arb, execution_mode, reason, &telemetry)
+            drop(runtime);
+            self.record_skip_event(&signal_arb, execution_mode, reason, &telemetry)
                 .await;
             return Ok(());
         }
@@ -943,11 +1016,31 @@ impl ArbAutoExecutor {
             warn!(market_id = %market_id, "Zero total_cost, skipping");
             telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
             telemetry.finish_total(&process_started_at);
+            drop(runtime);
             self.record_skip_event(&arb, execution_mode, "zero_total_cost", &telemetry)
                 .await;
             return Ok(());
         }
-        let quantity = position_size / arb.total_cost;
+        // Both legs must be executable at their best ask under the executor's
+        // own rules before the first leg is sent, or the second could be
+        // rejected after the first fills. Trade only what both books offer.
+        let quantity = executable_pair_quantity(
+            position_size / arb.total_cost,
+            &yes_book,
+            &no_book,
+            self.order_executor.min_book_depth(),
+        );
+        if quantity * arb.total_cost < MIN_PAIR_NOTIONAL {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.depth_skips = runtime.depth_skips.saturating_add(1);
+            runtime.record_decision(market_id, "skipped: best levels cannot fill both legs");
+            telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+            telemetry.finish_total(&process_started_at);
+            drop(runtime);
+            self.record_skip_event(&arb, execution_mode, "best_level_too_thin", &telemetry)
+                .await;
+            return Ok(());
+        }
         if live_ready {
             let Some(yes_best_ask) = yes_book.best_ask() else {
                 let mut runtime = self.runtime_status.write().await;
@@ -955,6 +1048,7 @@ impl ArbAutoExecutor {
                 runtime.record_decision(market_id, "skipped: YES best ask missing");
                 telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
                 telemetry.finish_total(&process_started_at);
+                drop(runtime);
                 self.record_skip_event(&arb, execution_mode, "yes_best_ask_missing", &telemetry)
                     .await;
                 return Ok(());
@@ -965,6 +1059,7 @@ impl ArbAutoExecutor {
                 runtime.record_decision(market_id, "skipped: NO best ask missing");
                 telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
                 telemetry.finish_total(&process_started_at);
+                drop(runtime);
                 self.record_skip_event(&arb, execution_mode, "no_best_ask_missing", &telemetry)
                     .await;
                 return Ok(());
@@ -988,6 +1083,7 @@ impl ArbAutoExecutor {
                 telemetry.failure_stage = Some("pair_capacity_preflight".to_string());
                 telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
                 telemetry.finish_total(&process_started_at);
+                drop(runtime);
                 self.record_skip_event(
                     &arb,
                     execution_mode,
@@ -1063,10 +1159,17 @@ impl ArbAutoExecutor {
             }
         };
 
-        // 9. Execute YES market order
+        // 9. Execute YES market order. Its slippage may not consume more than
+        // the edge left above the minimum, or the pair would be unprofitable.
+        let edge_headroom = (arb.net_profit - cfg.min_net_profit).max(Decimal::ZERO);
+        let yes_slippage = self.order_executor.default_slippage().min(
+            edge_headroom
+                .checked_div(arb.yes_ask)
+                .unwrap_or(Decimal::ZERO),
+        );
         let yes_order = MarketOrder::new(market_id.clone(), yes_token_id, OrderSide::Buy, quantity)
             .with_expected_price(arb.yes_ask)
-            .with_slippage(self.order_executor.default_slippage());
+            .with_slippage(yes_slippage);
         let yes_order_started_at = std::time::Instant::now();
         let yes_result = self
             .order_executor
@@ -1457,6 +1560,93 @@ impl ArbTradeEventExt for NewTradeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn book(asks: &[(i64, i64)]) -> OrderBook {
+        OrderBook {
+            market_id: "m".into(),
+            outcome_id: "o".into(),
+            timestamp: Utc::now(),
+            bids: vec![],
+            asks: asks
+                .iter()
+                .map(|&(price, size)| polymarket_core::types::PriceLevel {
+                    price: Decimal::new(price, 2),
+                    size: Decimal::from(size),
+                })
+                .collect(),
+        }
+    }
+
+    fn signal(schedule: FeeSchedule) -> ArbOpportunity {
+        ArbOpportunity::calculate_with_fee_schedule(
+            &BinaryMarketBook {
+                market_id: "m".into(),
+                timestamp: Utc::now(),
+                yes_book: book(&[(45, 1000)]),
+                no_book: book(&[(50, 1000)]),
+            },
+            schedule,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_edge_is_rejected_on_fresh_books() {
+        let signal = signal(FeeSchedule::FREE);
+        let min = Decimal::new(5, 3);
+        // Asks moved up a cent each: 0.46 + 0.51 still leaves 3 cents.
+        let fresh =
+            reprice_on_fresh_books(&signal, &book(&[(46, 500)]), &book(&[(51, 500)]), min).unwrap();
+        assert_eq!(fresh.yes_ask, Decimal::new(46, 2));
+        assert_eq!(fresh.net_profit, Decimal::new(3, 2));
+        // 0.49 + 0.51: the edge is gone.
+        assert!(
+            reprice_on_fresh_books(&signal, &book(&[(49, 500)]), &book(&[(51, 500)]), min)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repricing_keeps_the_signal_fee_terms() {
+        let fees = FeeSchedule {
+            rate: Decimal::new(5, 2),
+            exponent: Decimal::ONE,
+        };
+        let signal = signal(fees);
+        // 4.5% gross minus ~2.5% of fees clears 0.5%...
+        assert!(reprice_on_fresh_books(
+            &signal,
+            &book(&[(45, 500)]),
+            &book(&[(50, 500)]),
+            Decimal::new(5, 3)
+        )
+        .is_some());
+        // ...but 2% gross does not.
+        assert!(reprice_on_fresh_books(
+            &signal,
+            &book(&[(48, 500)]),
+            &book(&[(50, 500)]),
+            Decimal::new(5, 3)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn pair_quantity_fits_both_best_levels() {
+        let min_depth = Decimal::from(100);
+        let deep = book(&[(99, 5000), (40, 1000)]);
+        let shallow = book(&[(50, 300)]);
+        assert_eq!(
+            executable_pair_quantity(Decimal::from(500), &deep, &shallow, min_depth),
+            Decimal::from(300)
+        );
+        // A best level under the executor's $100 notional would reject that leg.
+        let thin = book(&[(50, 100)]);
+        assert_eq!(
+            executable_pair_quantity(Decimal::from(50), &deep, &thin, min_depth),
+            Decimal::ZERO
+        );
+    }
 
     #[test]
     fn test_config_default() {

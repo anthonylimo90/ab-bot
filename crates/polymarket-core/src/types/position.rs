@@ -1069,6 +1069,7 @@ mod tests {
             worst_case_payout: Decimal::new(98, 2),
             yes_fee_shares: Decimal::new(1, 2),
             no_fee_shares: Decimal::new(2, 2),
+            fee_schedule: None,
         };
         pos.apply_arb_fee_model(&arb);
         pos.mark_open().unwrap();
@@ -1164,6 +1165,7 @@ mod tests {
             worst_case_payout: Decimal::new(98, 2),
             yes_fee_shares: Decimal::new(1, 2),
             no_fee_shares: Decimal::new(2, 2),
+            fee_schedule: None,
         };
         pos.apply_arb_fee_model(&arb);
         pos.apply_yes_entry_fill(pos.quantity);

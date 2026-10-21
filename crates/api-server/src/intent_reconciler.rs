@@ -77,6 +77,19 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     )
     .execute(&state.pool)
     .await?;
+    // Paper fills are simulated synchronously and leave no order links, so a
+    // paper entry or exit still in flight after five minutes was interrupted.
+    sqlx::query(
+        "UPDATE positions SET state=CASE \
+           WHEN state=0 AND (held_yes_qty>0 OR held_no_qty>0) \
+                AND (yes_entry_price<=0 OR held_yes_qty>0) AND (no_entry_price<=0 OR held_no_qty>0) THEN 1 \
+           WHEN held_yes_qty>0 OR held_no_qty>0 OR exited_yes_qty>0 OR exited_no_qty>0 THEN 2 \
+           ELSE 5 END, \
+         version=version+1,last_updated=NOW() \
+         WHERE state IN (0,3) AND execution_mode='paper' AND last_updated<NOW()-INTERVAL '5 minutes'",
+    )
+    .execute(&state.pool)
+    .await?;
     let Some(wallet) = state.order_executor.wallet_address().await else {
         return Ok(());
     };
@@ -801,5 +814,57 @@ mod tests {
         assert!(breaker.daily_pnl < Decimal::ZERO);
         assert!(!state.arb_dedup.read().await.contains("market"));
         server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn interrupted_paper_entries_and_exits_are_finished(pool: PgPool) {
+        crate::exit_handler::correctness_tests::setup(&pool).await;
+        let state = AppState::for_tests(pool.clone());
+        let mut ids = Vec::new();
+        for (initial_state, yes, no, held_yes, held_no) in [
+            (PositionState::Pending, 48, 50, 10, 10), // complete paper pair
+            (PositionState::Pending, 48, 50, 10, 0),  // one leg of a pair
+            (PositionState::Pending, 48, 0, 0, 0),    // nothing acquired
+            (PositionState::Closing, 48, 0, 4, 0),    // interrupted exit
+        ] {
+            let mut position = Position::new(
+                "market".into(),
+                Decimal::new(yes, 2),
+                Decimal::new(no, 2),
+                Decimal::TEN,
+                ExitStrategy::HoldToResolution,
+            );
+            position.execution_mode = "paper".into();
+            position.held_yes_qty = Decimal::from(held_yes);
+            position.held_no_qty = Decimal::from(held_no);
+            position.state = initial_state;
+            state
+                .position_service
+                .repo()
+                .insert(&position)
+                .await
+                .unwrap();
+            ids.push(position.id);
+        }
+        sqlx::query("UPDATE positions SET last_updated=NOW()-INTERVAL '10 minutes'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reconcile(&state).await.unwrap();
+
+        let mut states = Vec::new();
+        for id in ids {
+            states.push(state.position_service.load(id).await.unwrap().state);
+        }
+        assert_eq!(
+            states,
+            [
+                PositionState::Open,
+                PositionState::ExitReady,
+                PositionState::EntryFailed,
+                PositionState::ExitReady
+            ]
+        );
     }
 }

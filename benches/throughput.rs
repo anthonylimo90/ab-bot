@@ -284,6 +284,7 @@ fn bench_signal_batch_serialization(c: &mut Criterion) {
                     worst_case_payout: Decimal::new(98, 2),
                     yes_fee_shares: Decimal::ZERO,
                     no_fee_shares: Decimal::ZERO,
+                    fee_schedule: None,
                 }
             })
             .collect();

@@ -1135,6 +1135,7 @@ mod tests {
             tags: Vec::new(),
             fees_enabled: false,
             fee_type: None,
+            fee_schedule: None,
         };
 
         assert_eq!(

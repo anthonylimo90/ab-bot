@@ -17,6 +17,35 @@ const DEFAULT_BASE_URL: &str = "https://gamma-api.polymarket.com";
 const DEFAULT_MAX_PAGE_SIZE: u32 = 100;
 const DEFAULT_PAGE_DELAY_MS: u64 = 125;
 
+/// Taker fee terms as Gamma publishes them, e.g.
+/// `{"exponent": 1, "rate": 0.05, "rebateRate": 0.15, "takerOnly": true}`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GammaFeeSchedule {
+    pub rate: f64,
+    #[serde(default = "default_fee_exponent")]
+    pub exponent: f64,
+}
+
+fn default_fee_exponent() -> f64 {
+    1.0
+}
+
+impl GammaFeeSchedule {
+    /// `None` for terms that cannot be priced (negative or non-finite), so the
+    /// market falls back to the conservative schedule.
+    fn into_schedule(self) -> Option<crate::types::FeeSchedule> {
+        if !(self.rate.is_finite() && self.rate >= 0.0)
+            || !(self.exponent.is_finite() && self.exponent > 0.0)
+        {
+            return None;
+        }
+        Some(crate::types::FeeSchedule {
+            rate: Decimal::try_from(self.rate).ok()?,
+            exponent: Decimal::try_from(self.exponent).ok()?,
+        })
+    }
+}
+
 /// Market metadata from the Gamma API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GammaMarket {
@@ -37,6 +66,9 @@ pub struct GammaMarket {
     /// Optional fee type label from Gamma.
     #[serde(default, alias = "feeType")]
     pub fee_type: Option<String>,
+    /// Published taker fee terms (`rate`, `exponent`).
+    #[serde(default, alias = "feeSchedule")]
+    pub fee_schedule: Option<GammaFeeSchedule>,
     /// When the market is expected to resolve.
     #[serde(alias = "endDate", alias = "end_date")]
     pub end_date: Option<String>,
@@ -188,6 +220,7 @@ impl GammaMarket {
             tags: self.tags,
             fees_enabled: self.fees_enabled,
             fee_type: self.fee_type,
+            fee_schedule: self.fee_schedule.and_then(GammaFeeSchedule::into_schedule),
         })
     }
 }
@@ -450,6 +483,27 @@ mod tests {
     }
 
     #[test]
+    fn test_gamma_fee_schedule_is_parsed() {
+        let json = r#"{
+            "conditionId": "0x1",
+            "question": "Who wins?",
+            "feesEnabled": true,
+            "feeType": "sports_fees_v3",
+            "feeSchedule": {"exponent": 1, "rate": 0.05, "rebateRate": 0.15, "takerOnly": true}
+        }"#;
+        let market: GammaMarket = serde_json::from_str(json).unwrap();
+        let schedule = market.fee_schedule.unwrap().into_schedule().unwrap();
+        assert_eq!(schedule.rate, Decimal::new(5, 2));
+        assert_eq!(schedule.exponent, Decimal::ONE);
+
+        let invalid = GammaFeeSchedule {
+            rate: -1.0,
+            exponent: 1.0,
+        };
+        assert!(invalid.into_schedule().is_none());
+    }
+
+    #[test]
     fn test_gamma_market_missing_fields() {
         let json = r#"{
             "conditionId": "0xabcd",
@@ -474,6 +528,7 @@ mod tests {
             tags: vec!["election".to_string()],
             fees_enabled: false,
             fee_type: None,
+            fee_schedule: None,
             end_date: Some("2026-06-01T00:00:00Z".to_string()),
             volume: Some("50000.50".to_string()),
             liquidity: Some("12000".to_string()),
@@ -504,6 +559,7 @@ mod tests {
             tags: vec!["bitcoin".to_string()],
             fees_enabled: true,
             fee_type: Some("curve".to_string()),
+            fee_schedule: None,
             end_date: Some("2026-06-01T00:00:00Z".to_string()),
             volume: Some("50000.50".to_string()),
             liquidity: Some("12000".to_string()),

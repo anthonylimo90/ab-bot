@@ -25,6 +25,66 @@ pub struct Market {
     pub fees_enabled: bool,
     #[serde(default)]
     pub fee_type: Option<String>,
+    /// Taker fee terms published for the market, when known.
+    #[serde(default)]
+    pub fee_schedule: Option<FeeSchedule>,
+}
+
+impl Market {
+    /// The taker fee terms to price trades with. A market that reports fees
+    /// without publishing their terms is priced at the highest known rate.
+    pub fn effective_fee_schedule(&self) -> FeeSchedule {
+        match (self.fee_schedule, self.fees_enabled) {
+            (Some(schedule), _) => schedule,
+            (None, true) => FeeSchedule::CONSERVATIVE,
+            (None, false) => FeeSchedule::FREE,
+        }
+    }
+}
+
+/// Taker fee terms of a market. A taker buying or selling `C` shares at price
+/// `p` pays `C × rate × (p × (1 − p))^exponent` USDC; makers pay nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeeSchedule {
+    pub rate: Decimal,
+    pub exponent: Decimal,
+}
+
+impl FeeSchedule {
+    /// No trading fee.
+    pub const FREE: Self = Self {
+        rate: Decimal::ZERO,
+        exponent: Decimal::ONE,
+    };
+
+    /// The highest published category rate (crypto, 0.07), for markets that
+    /// report fees without their terms.
+    pub const CONSERVATIVE: Self = Self {
+        rate: Decimal::from_parts(7, 0, 0, false, 2),
+        exponent: Decimal::ONE,
+    };
+
+    /// Taker fee in USDC for one share traded at `price`.
+    pub fn fee_per_share(&self, price: Decimal) -> Decimal {
+        if self.rate <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let p = price.max(Decimal::ZERO).min(Decimal::ONE);
+        let base = p * (Decimal::ONE - p);
+        let curve = if self.exponent == Decimal::ONE {
+            base
+        } else if self.exponent.fract().is_zero() && self.exponent >= Decimal::ZERO {
+            (0..self.exponent.to_u32().unwrap_or(1)).fold(Decimal::ONE, |acc, _| acc * base)
+        } else {
+            base.to_f64()
+                .zip(self.exponent.to_f64())
+                .and_then(|(base, exponent)| Decimal::from_f64_retain(base.powf(exponent)))
+                // An unrepresentable curve is priced at exponent 1, the
+                // larger value for any p(1 − p) ≤ 1/4.
+                .unwrap_or(base)
+        };
+        self.rate * curve
+    }
 }
 
 /// A single outcome (e.g., YES or NO) within a market.
@@ -180,13 +240,15 @@ pub struct ArbOpportunity {
     pub yes_fee_shares: Decimal,
     #[serde(default)]
     pub no_fee_shares: Decimal,
+    /// Fee terms the opportunity was priced with, so it can be re-priced on
+    /// fresh books before execution.
+    #[serde(default)]
+    pub fee_schedule: Option<FeeSchedule>,
 }
 
 impl ArbOpportunity {
     /// Default fee percentage (2%).
     pub const DEFAULT_FEE: Decimal = Decimal::from_parts(2, 0, 0, false, 2); // 0.02
-    /// Current fee-enabled market base rate from Polymarket docs.
-    pub const FEE_ENABLED_BASE_RATE: Decimal = Decimal::from_parts(25, 0, 0, false, 2); // 0.25
 
     /// Calculate arbitrage opportunity from a binary market book.
     ///
@@ -217,17 +279,16 @@ impl ArbOpportunity {
             worst_case_payout: Decimal::ONE - (total_cost * fee),
             yes_fee_shares: Decimal::ZERO,
             no_fee_shares: Decimal::ZERO,
+            fee_schedule: None,
         })
     }
 
-    /// Calculate arbitrage profitability using Polymarket's fee-enabled market model.
-    ///
-    /// When fees are enabled, Polymarket currently charges buy-side fees in shares.
-    /// For a YES+NO pair held to resolution, the guaranteed payout is reduced by the
-    /// larger of the two entry-share fees.
-    pub fn calculate_with_fees_enabled(
+    /// Price buying one YES and one NO share at the best asks under the
+    /// market's taker fees. Fees are charged in USDC on each leg, so the pair
+    /// still pays $1 at resolution and the fees reduce the net edge.
+    pub fn calculate_with_fee_schedule(
         book: &BinaryMarketBook,
-        fees_enabled: bool,
+        schedule: FeeSchedule,
     ) -> Option<Self> {
         let (yes_ask, no_ask, total_cost) = book.entry_cost()?;
         if total_cost <= Decimal::ZERO {
@@ -235,11 +296,8 @@ impl ArbOpportunity {
         }
 
         let gross_profit = Decimal::ONE - total_cost;
-        let yes_fee_shares = Self::estimate_buy_fee_shares(yes_ask, fees_enabled);
-        let no_fee_shares = Self::estimate_buy_fee_shares(no_ask, fees_enabled);
-        let fee_drag = yes_fee_shares.max(no_fee_shares);
-        let worst_case_payout = (Decimal::ONE - fee_drag).max(Decimal::ZERO);
-        let net_profit = worst_case_payout - total_cost;
+        let fee_drag = schedule.fee_per_share(yes_ask) + schedule.fee_per_share(no_ask);
+        let net_profit = gross_profit - fee_drag;
 
         Some(Self {
             market_id: book.market_id.clone(),
@@ -250,32 +308,16 @@ impl ArbOpportunity {
             gross_profit,
             net_profit,
             fee_drag,
-            worst_case_payout,
-            yes_fee_shares,
-            no_fee_shares,
+            worst_case_payout: (Decimal::ONE - fee_drag).max(Decimal::ZERO),
+            yes_fee_shares: Decimal::ZERO,
+            no_fee_shares: Decimal::ZERO,
+            fee_schedule: Some(schedule),
         })
     }
 
     /// Returns true if this is a profitable arbitrage opportunity.
     pub fn is_profitable(&self) -> bool {
         self.net_profit > Decimal::ZERO
-    }
-
-    fn estimate_buy_fee_shares(price: Decimal, fees_enabled: bool) -> Decimal {
-        if !fees_enabled {
-            return Decimal::ZERO;
-        }
-
-        let bounded_price = price.max(Decimal::ZERO).min(Decimal::ONE);
-        let curve_input = bounded_price * (Decimal::ONE - bounded_price);
-        if curve_input <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-
-        let base_rate = Self::FEE_ENABLED_BASE_RATE.to_f64().unwrap_or(0.25);
-        let curve_value = curve_input.to_f64().unwrap_or(0.0);
-        let fee_shares = base_rate * curve_value.powi(2);
-        Decimal::from_f64_retain(fee_shares).unwrap_or(Decimal::ZERO)
     }
 }
 
@@ -413,14 +455,15 @@ mod tests {
             },
         };
 
-        let arb = ArbOpportunity::calculate_with_fees_enabled(&book, false).unwrap();
+        let arb = ArbOpportunity::calculate_with_fee_schedule(&book, FeeSchedule::FREE).unwrap();
         assert_eq!(arb.fee_drag, Decimal::ZERO);
         assert_eq!(arb.worst_case_payout, Decimal::ONE);
         assert_eq!(arb.net_profit, Decimal::new(6, 2));
+        assert_eq!(arb.fee_schedule, Some(FeeSchedule::FREE));
     }
 
     #[test]
-    fn test_fee_enabled_market_uses_share_fee_drag() {
+    fn test_fee_enabled_market_charges_usdc_taker_fees_on_both_legs() {
         let book = BinaryMarketBook {
             market_id: "test".to_string(),
             timestamp: Utc::now(),
@@ -430,7 +473,7 @@ mod tests {
                 timestamp: Utc::now(),
                 bids: vec![],
                 asks: vec![PriceLevel {
-                    price: Decimal::new(55, 2),
+                    price: Decimal::new(48, 2),
                     size: Decimal::new(100, 0),
                 }],
             },
@@ -440,17 +483,71 @@ mod tests {
                 timestamp: Utc::now(),
                 bids: vec![],
                 asks: vec![PriceLevel {
-                    price: Decimal::new(40, 2),
+                    price: Decimal::new(50, 2),
                     size: Decimal::new(100, 0),
                 }],
             },
         };
 
-        let arb = ArbOpportunity::calculate_with_fees_enabled(&book, true).unwrap();
-        assert!(arb.fee_drag > Decimal::ZERO);
-        assert_eq!(arb.fee_drag, arb.yes_fee_shares.max(arb.no_fee_shares));
+        // sports_fees_v3: fee = C × 0.05 × p × (1 − p) on each leg.
+        let schedule = FeeSchedule {
+            rate: Decimal::new(5, 2),
+            exponent: Decimal::ONE,
+        };
+        let arb = ArbOpportunity::calculate_with_fee_schedule(&book, schedule).unwrap();
+        // 0.05 × 0.48 × 0.52 + 0.05 × 0.50 × 0.50 = 0.01248 + 0.0125
+        assert_eq!(arb.fee_drag, "0.02498".parse::<Decimal>().unwrap());
+        assert_eq!(arb.gross_profit, Decimal::new(2, 2));
+        // A 2% gross edge is a loss once both taker fees are paid.
+        assert_eq!(arb.net_profit, "-0.00498".parse::<Decimal>().unwrap());
+        assert!(!arb.is_profitable());
         assert_eq!(arb.worst_case_payout, Decimal::ONE - arb.fee_drag);
-        assert!(arb.net_profit < arb.gross_profit);
+        assert_eq!(arb.yes_fee_shares, Decimal::ZERO);
+    }
+
+    #[test]
+    fn effective_fee_schedule_never_assumes_free_when_fees_are_reported() {
+        let mut market = Market {
+            id: "m".into(),
+            question: "q".into(),
+            description: None,
+            outcomes: vec![],
+            volume: Decimal::ZERO,
+            liquidity: Decimal::ZERO,
+            end_date: None,
+            resolved: false,
+            resolution: None,
+            category: None,
+            tags: vec![],
+            fees_enabled: false,
+            fee_type: None,
+            fee_schedule: None,
+        };
+        assert_eq!(market.effective_fee_schedule(), FeeSchedule::FREE);
+        market.fees_enabled = true;
+        assert_eq!(market.effective_fee_schedule(), FeeSchedule::CONSERVATIVE);
+        let zero = FeeSchedule {
+            rate: Decimal::ZERO,
+            exponent: Decimal::ONE,
+        };
+        market.fee_schedule = Some(zero);
+        assert_eq!(market.effective_fee_schedule(), zero);
+    }
+
+    #[test]
+    fn fee_curve_honours_integer_exponents() {
+        let squared = FeeSchedule {
+            rate: Decimal::ONE,
+            exponent: Decimal::TWO,
+        };
+        assert_eq!(
+            squared.fee_per_share(Decimal::new(50, 2)),
+            Decimal::new(625, 4)
+        );
+        assert_eq!(
+            FeeSchedule::FREE.fee_per_share(Decimal::new(50, 2)),
+            Decimal::ZERO
+        );
     }
 
     #[test]

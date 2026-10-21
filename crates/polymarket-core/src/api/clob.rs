@@ -613,7 +613,12 @@ impl ClobClient {
         let max_backoff_secs = 60u64;
         let base_delay_secs = 1u64;
 
+        // A session that stayed up this long was healthy: the next reconnect
+        // starts from the base delay instead of the accumulated backoff.
+        const HEALTHY_SESSION: StdDuration = StdDuration::from_secs(60);
+
         loop {
+            let session_started = std::time::Instant::now();
             match Self::ws_loop(&ws_url, &asset_ids, &tx).await {
                 Ok(()) => {
                     info!("WebSocket connection closed cleanly");
@@ -621,6 +626,9 @@ impl ClobClient {
                 Err(e) => {
                     warn!(attempt = attempt + 1, error = %e, "WebSocket connection failed");
                 }
+            }
+            if session_started.elapsed() >= HEALTHY_SESSION {
+                attempt = 0;
             }
 
             // Check if the receiver has been dropped (no one listening)
@@ -1056,6 +1064,7 @@ impl From<ClobMarket> for Market {
             tags: Vec::new(),
             fees_enabled: false,
             fee_type: None,
+            fee_schedule: None,
         }
     }
 }

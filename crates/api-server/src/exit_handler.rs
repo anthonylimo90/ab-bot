@@ -2,7 +2,8 @@
 //!
 //! Companion to `arb_executor.rs`: the arb executor opens positions but nothing
 //! closes them. This module handles two exit paths:
-//! - **ExitOnCorrection**: sell YES + NO when arb-monitor marks position `ExitReady`
+//! - **ExitOnCorrection**: mark an open position `ExitReady` once its spread
+//!   normalizes, then sell its holdings
 //! - **HoldToResolution**: wait for market to resolve ($1 payout)
 //!
 //! Shares the `active_markets` dedup set with `ArbAutoExecutor` via `Arc<RwLock<>>`
@@ -1853,6 +1854,7 @@ mod tests {
             tags: Vec::new(),
             fees_enabled: false,
             fee_type: None,
+            fee_schedule: None,
         };
 
         assert_eq!(resolved_yes_winner(&market), Some(true));
