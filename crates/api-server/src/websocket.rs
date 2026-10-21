@@ -178,6 +178,35 @@ async fn authenticate_socket(socket: &mut WebSocket, state: &SocketState) -> Opt
     None
 }
 
+/// Largest inbound frame/message accepted on any socket. Clients only ever send
+/// small JSON control frames (authenticate, ping, subscribe), so anything bigger
+/// is refused instead of being buffered.
+const MAX_INBOUND_BYTES: usize = 64 * 1024;
+
+/// How the per-connection authorization verdict is cached.
+///
+/// Re-checking the database for every broadcast event of every connected client
+/// is a join per event per client, and a transient database error used to close
+/// every socket at once (a reconnect storm). Instead the verdict is cached and
+/// refreshed at most every `verdict_ttl`.
+#[derive(Clone, Copy, Debug)]
+struct AuthPolicy {
+    /// How long a positive verdict is trusted before an event triggers a re-check.
+    verdict_ttl: std::time::Duration,
+    /// How long after the last positive verdict a connection survives while the
+    /// database cannot be reached (errors that are not a definitive "no").
+    transient_grace: std::time::Duration,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self {
+            verdict_ttl: std::time::Duration::from_secs(15),
+            transient_grace: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
 /// Transport state kept separate from the full app for protocol-level tests.
 #[derive(Clone)]
 struct SocketState {
@@ -188,6 +217,7 @@ struct SocketState {
     signals: broadcast::Sender<SignalUpdate>,
     trade_flow: broadcast::Sender<TradeEventUpdate>,
     auth_interval: std::time::Duration,
+    auth_policy: AuthPolicy,
 }
 
 impl From<&AppState> for SocketState {
@@ -200,6 +230,7 @@ impl From<&AppState> for SocketState {
             signals: state.signal_tx.clone(),
             trade_flow: state.trade_event_tx.clone(),
             auth_interval: std::time::Duration::from_secs(15),
+            auth_policy: AuthPolicy::default(),
         }
     }
 }
@@ -227,9 +258,15 @@ impl Channel {
     }
 }
 
+/// Apply the inbound size limits that every socket gets.
+fn limit_inbound(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    ws.max_message_size(MAX_INBOUND_BYTES)
+        .max_frame_size(MAX_INBOUND_BYTES)
+}
+
 fn upgrade(ws: WebSocketUpgrade, state: Arc<AppState>, channel: Channel) -> Response {
     let state = SocketState::from(state.as_ref());
-    ws.on_upgrade(move |socket| handle_socket(socket, state, channel))
+    limit_inbound(ws).on_upgrade(move |socket| handle_socket(socket, state, channel))
 }
 
 pub async fn ws_orderbook_handler(
@@ -304,29 +341,127 @@ async fn send(sender: &mut SocketSender, message: WsMessage) -> bool {
         Err(_) => false,
     }
 }
-async fn authorized(state: &SocketState, token: &Option<String>) -> bool {
-    match token {
-        Some(token) => authorize_stream_token(&state.pool, &state.jwt_auth, token)
-            .await
-            .is_ok(),
-        None => true,
+/// Outcome of one authorization re-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Session and canonical-workspace membership are still valid.
+    Allowed,
+    /// A definitive "no": revoked, role changed, no longer a member.
+    Denied,
+    /// The database could not answer (pool timeout, connection loss, ...).
+    Unavailable,
+}
+
+impl Check {
+    fn from_result(result: crate::error::ApiResult<()>) -> Self {
+        match result {
+            Ok(()) => Self::Allowed,
+            Err(crate::error::ApiError::Database(error)) => {
+                warn!(error = %error, "WebSocket authorization check could not reach the database");
+                Self::Unavailable
+            }
+            Err(_) => Self::Denied,
+        }
     }
 }
-async fn policy_close(sender: &mut SocketSender) {
+
+/// Why a connection must be closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// Definitive negative verdict: close immediately with 1008 (policy).
+    Revoked,
+    /// The database has been unreachable for longer than the grace period.
+    AuthorizationUnavailable,
+}
+
+/// Cached authorization verdict for one private connection.
+struct StreamAuth {
+    token: String,
+    policy: AuthPolicy,
+    /// When the verdict was last positive.
+    verified_at: tokio::time::Instant,
+    /// When the database was last asked (answer or not); paces retries while it is down.
+    checked_at: tokio::time::Instant,
+}
+
+impl StreamAuth {
+    /// Start from the successful authorization performed at connect time.
+    fn new(token: String, policy: AuthPolicy, now: tokio::time::Instant) -> Self {
+        Self {
+            token,
+            policy,
+            verified_at: now,
+            checked_at: now,
+        }
+    }
+
+    /// Whether an event may be delivered on the cached verdict alone.
+    fn is_fresh(&self, now: tokio::time::Instant) -> bool {
+        now.saturating_duration_since(self.checked_at) < self.policy.verdict_ttl
+    }
+
+    /// Fold a re-check into the cache; `Some` means close the connection.
+    fn apply(&mut self, now: tokio::time::Instant, check: Check) -> Option<Stop> {
+        self.checked_at = now;
+        match check {
+            Check::Allowed => {
+                self.verified_at = now;
+                None
+            }
+            Check::Denied => Some(Stop::Revoked),
+            // Keep serving on the last positive verdict, but only for a bounded
+            // time: the grace is measured from the last *positive* answer.
+            Check::Unavailable => (now.saturating_duration_since(self.verified_at)
+                > self.policy.transient_grace)
+                .then_some(Stop::AuthorizationUnavailable),
+        }
+    }
+
+    async fn recheck(&mut self, state: &SocketState) -> Option<Stop> {
+        let check = Check::from_result(
+            authorize_stream_token(&state.pool, &state.jwt_auth, &self.token).await,
+        );
+        self.apply(tokio::time::Instant::now(), check)
+    }
+
+    /// Before delivering an event: use the cached verdict while it is fresh.
+    async fn on_event(&mut self, state: &SocketState) -> Option<Stop> {
+        if self.is_fresh(tokio::time::Instant::now()) {
+            return None;
+        }
+        self.recheck(state).await
+    }
+
+    /// On the idle timer: always re-check, so revocation is noticed without traffic.
+    async fn on_timer(&mut self, state: &SocketState) -> Option<Stop> {
+        self.recheck(state).await
+    }
+}
+
+async fn close_for(sender: &mut SocketSender, stop: Stop) {
+    let (code, reason) = match stop {
+        Stop::Revoked => (1008, "Workspace session no longer authorized"),
+        // 1013: try again later. The client should reconnect once the service is back.
+        Stop::AuthorizationUnavailable => (1013, "Authorization temporarily unavailable"),
+    };
     let _ = sender
         .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-            code: 1008,
-            reason: "Workspace session no longer authorized".into(),
+            code,
+            reason: reason.into(),
         })))
         .await;
 }
 
 async fn handle_socket(mut socket: WebSocket, state: SocketState, channel: Channel) {
-    let token = if channel.private() {
+    let mut stream_auth = if channel.private() {
         let Some(token) = authenticate_socket(&mut socket, &state).await else {
             return;
         };
-        Some(token)
+        Some(StreamAuth::new(
+            token,
+            state.auth_policy,
+            tokio::time::Instant::now(),
+        ))
     } else {
         None
     };
@@ -351,8 +486,10 @@ async fn handle_socket(mut socket: WebSocket, state: SocketState, channel: Chann
     info!(channel = channel.name(), "WebSocket client connected");
     loop {
         tokio::select! {
-            _=auth_check.tick(),if token.is_some()=>{
-                if !authorized(&state,&token).await {policy_close(&mut sender).await;break}
+            _=auth_check.tick(),if stream_auth.is_some()=>{
+                if let Some(stop)=match stream_auth.as_mut() {Some(a)=>a.on_timer(&state).await,None=>None} {
+                    close_for(&mut sender,stop).await;break
+                }
             }
             incoming=receiver.next()=>match incoming {
                 Some(Ok(Message::Text(text)))=>{
@@ -363,7 +500,9 @@ async fn handle_socket(mut socket: WebSocket, state: SocketState, channel: Chann
                 _=>{},
             },
             event=subscriptions.next()=>{
-                if !authorized(&state,&token).await {policy_close(&mut sender).await;break}
+                if let Some(stop)=match stream_auth.as_mut() {Some(a)=>a.on_event(&state).await,None=>None} {
+                    close_for(&mut sender,stop).await;break
+                }
                 let message=match event {
                     Ok(message)=>message,
                     Err((stream,broadcast::error::RecvError::Lagged(n)))=>{
