@@ -125,7 +125,7 @@ pub async fn list_users(
 ) -> ApiResult<Json<Vec<UserListItem>>> {
     let users: Vec<UserRow> = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         ORDER BY created_at DESC
         "#,
@@ -286,7 +286,7 @@ pub async fn get_user(
 
     let user: Option<UserRow> = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         WHERE id = $1
         "#,
@@ -348,7 +348,7 @@ pub async fn update_user(
     // Check if user exists
     let user: Option<UserRow> = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         WHERE id = $1
         "#,
@@ -443,7 +443,7 @@ pub async fn update_user(
     // Fetch updated user
     let updated_user: UserRow = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         WHERE id = $1
         "#,
@@ -490,10 +490,11 @@ pub async fn delete_user(
         .map_err(|_| ApiError::BadRequest("Invalid user ID format".into()))?;
 
     // Fetch user email before deletion for audit log
-    let user: Option<(String,)> = sqlx::query_as("SELECT email FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await?;
+    let user: Option<(String,)> =
+        sqlx::query_as("SELECT COALESCE(email, wallet_address, '') FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     let user_email = user
         .as_ref()

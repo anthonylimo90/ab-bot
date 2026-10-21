@@ -103,8 +103,10 @@ pub struct ResetPasswordResponse {
 #[derive(Debug, sqlx::FromRow)]
 struct UserRow {
     id: Uuid,
-    email: String,
-    password_hash: String,
+    /// NULL for wallet-only accounts (serialized as "" to keep the API shape).
+    email: Option<String>,
+    /// NULL for wallet-only accounts, which cannot sign in with a password.
+    password_hash: Option<String>,
     role: i16,
     name: Option<String>,
     created_at: DateTime<Utc>,
@@ -279,30 +281,33 @@ pub async fn login(
     // was found. This prevents timing side-channels: a missing user takes the same
     // wall-clock time as a wrong password because Argon2 runs either way.
     let (user, password_valid) = match user {
-        Some(u) => {
-            let hash_str = u.password_hash.clone();
-            let password = req.password.clone();
-            let valid = tokio::task::spawn_blocking(move || {
-                PasswordHash::new(&hash_str).ok().is_some_and(|parsed| {
-                    Argon2::default()
-                        .verify_password(password.as_bytes(), &parsed)
-                        .is_ok()
+        Some(u) => match u.password_hash.clone() {
+            Some(hash_str) => {
+                let password = req.password.clone();
+                let valid = tokio::task::spawn_blocking(move || {
+                    PasswordHash::new(&hash_str).ok().is_some_and(|parsed| {
+                        Argon2::default()
+                            .verify_password(password.as_bytes(), &parsed)
+                            .is_ok()
+                    })
                 })
-            })
-            .await
-            .unwrap_or(false);
-            (Some(u), valid)
-        }
+                .await
+                .unwrap_or(false);
+                (Some(u), valid)
+            }
+            None => {
+                // Wallet-only account: there is no password to check, so password
+                // login is always refused. Still pay for an Argon2 run so this
+                // case is not distinguishable by response time.
+                burn_dummy_hash(req.password.clone()).await;
+                (Some(u), false)
+            }
+        },
         None => {
             // Perform a dummy Argon2 hash to equalize timing with the found-user path.
             // This prevents attackers from distinguishing "user not found" (~1ms) from
             // "wrong password" (~200ms) via response timing.
-            let dummy_password = req.password.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let salt = SaltString::generate(&mut OsRng);
-                let _ = Argon2::default().hash_password(dummy_password.as_bytes(), &salt);
-            })
-            .await;
+            burn_dummy_hash(req.password.clone()).await;
             (None, false)
         }
     };
@@ -344,7 +349,7 @@ pub async fn login(
         token,
         user: UserInfo {
             id: user.id.to_string(),
-            email: user.email,
+            email: user.email.unwrap_or_default(),
             name: user.name,
             role,
             created_at: user.created_at,
@@ -398,7 +403,7 @@ pub async fn refresh_token(
         token,
         user: UserInfo {
             id: user.id.to_string(),
-            email: user.email,
+            email: user.email.unwrap_or_default(),
             name: user.name,
             role,
             created_at: user.created_at,
@@ -474,11 +479,21 @@ pub async fn get_current_user(
 
     Ok(Json(UserInfo {
         id: user.id.to_string(),
-        email: user.email,
+        email: user.email.unwrap_or_default(),
         name: user.name,
         role,
         created_at: user.created_at,
     }))
+}
+
+/// Run (and discard) one Argon2 hash so a login that cannot succeed costs the
+/// same as one that can.
+async fn burn_dummy_hash(password: String) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        let _ = Argon2::default().hash_password(password.as_bytes(), &salt);
+    })
+    .await;
 }
 
 /// Generate a secure random token for password reset.

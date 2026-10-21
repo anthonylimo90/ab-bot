@@ -66,18 +66,19 @@ async fn execution_migrations_preserve_unknown_historical_provenance(pool: PgPoo
 #[sqlx::test(migrations = false)]
 #[ignore = "requires an isolated TimescaleDB test service"]
 async fn complete_schema_migrates_with_sqlx_transactions(pool: PgPool) {
-    sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../migrations"
     )))
     .await
-    .unwrap()
-    .run(&pool)
-    .await
     .unwrap();
+    migrator.run(&pool).await.unwrap();
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 78);
+    // Every migration on disk was applied (not a hard-coded version that goes stale).
+    let latest = migrator.iter().map(|m| m.version).max().unwrap();
+    assert!(latest >= 80);
+    assert_eq!(version, latest);
 }

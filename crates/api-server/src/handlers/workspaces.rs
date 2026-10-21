@@ -254,7 +254,8 @@ struct InviteLookupRow {
 #[derive(Debug, sqlx::FromRow)]
 struct InviteAcceptUserRow {
     id: Uuid,
-    email: String,
+    /// NULL for wallet-only accounts, which can never match an invite email.
+    email: Option<String>,
 }
 
 fn generate_invite_token() -> String {
@@ -963,7 +964,7 @@ pub async fn list_members(
 
     let members: Vec<MemberRow> = sqlx::query_as(
         r#"
-        SELECT wm.user_id, u.email, u.name, wm.role, wm.joined_at
+        SELECT wm.user_id, COALESCE(u.email, '') AS email, u.name, wm.role, wm.joined_at
         FROM workspace_members wm
         INNER JOIN users u ON wm.user_id = u.id
         WHERE wm.workspace_id = $1
@@ -1185,10 +1186,11 @@ pub async fn create_workspace_invite(
         .fetch_one(&state.pool)
         .await?;
 
-    let inviter_email: (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&state.pool)
-        .await?;
+    let inviter_email: (String,) =
+        sqlx::query_as("SELECT COALESCE(email, '') FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await?;
 
     let token = generate_invite_token();
     let token_hash = hash_token(&token);
@@ -1359,7 +1361,7 @@ pub async fn get_invite_info(
             w.name AS workspace_name,
             wi.email,
             wi.role,
-            inviter.email AS inviter_email,
+            COALESCE(inviter.email, '') AS inviter_email,
             wi.expires_at,
             wi.accepted_at
         FROM workspace_invites wi
@@ -1436,7 +1438,7 @@ pub async fn accept_invite(
             w.name AS workspace_name,
             wi.email,
             wi.role,
-            inviter.email AS inviter_email,
+            COALESCE(inviter.email, '') AS inviter_email,
             wi.expires_at,
             wi.accepted_at
         FROM workspace_invites wi
@@ -1568,7 +1570,11 @@ pub async fn accept_invite(
         .await?
         .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
-        if !user.email.eq_ignore_ascii_case(&invite.email) {
+        if !user
+            .email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(&invite.email))
+        {
             return Err(ApiError::Forbidden(
                 "This invite was sent to a different email address".into(),
             ));
@@ -1757,7 +1763,7 @@ pub async fn update_member_role(
 
     let member: MemberRow = sqlx::query_as(
         r#"
-        SELECT wm.user_id, u.email, u.name, wm.role, wm.joined_at
+        SELECT wm.user_id, COALESCE(u.email, '') AS email, u.name, wm.role, wm.joined_at
         FROM workspace_members wm
         INNER JOIN users u ON wm.user_id = u.id
         WHERE wm.workspace_id = $1 AND wm.user_id = $2

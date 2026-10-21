@@ -197,6 +197,22 @@ fn normalize_uri(uri: &str) -> String {
     }
 }
 
+async fn find_wallet_user(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &str,
+) -> ApiResult<Option<UserRow>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT id, email, wallet_address, role, name, created_at
+        FROM users
+        WHERE wallet_address = $1
+        "#,
+    )
+    .bind(address)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
 /// Atomically consume a challenge nonce issued for `address`.
 ///
 /// One statement checks and marks it, so of any number of concurrent attempts
@@ -398,32 +414,27 @@ pub async fn verify(
             "Signature verification failed".into(),
         ));
     }
-    tx.commit().await?;
 
-    // Find or create user
-    let existing_user: Option<UserRow> = sqlx::query_as(
-        r#"
-        SELECT id, email, wallet_address, role, name, created_at
-        FROM users
-        WHERE wallet_address = $1
-        "#,
-    )
-    .bind(&address)
-    .fetch_optional(&state.pool)
-    .await?;
-
+    // Find or create the user in the same transaction as the nonce consumption: if
+    // creating the account fails, the nonce is not burned and the sign-in can be
+    // retried.
+    let existing_user: Option<UserRow> = find_wallet_user(&mut tx, &address).await?;
     let (user, is_new_user) = match existing_user {
         Some(u) => (u, false),
         None => {
-            // Create new user with wallet
+            // Wallet-only account: no email or password (users.email and
+            // users.password_hash are nullable for wallet accounts).
             let user_id = Uuid::new_v4();
             let role: i16 = 1; // Trader by default
             let now = Utc::now();
 
-            sqlx::query(
+            // A concurrent first sign-in for the same wallet (with a different
+            // nonce) may win the insert; then we simply sign in as that user.
+            let inserted = sqlx::query(
                 r#"
                 INSERT INTO users (id, wallet_address, wallet_linked_at, role, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $5)
+                ON CONFLICT (wallet_address) DO NOTHING
                 "#,
             )
             .bind(user_id)
@@ -431,41 +442,37 @@ pub async fn verify(
             .bind(now)
             .bind(role)
             .bind(now)
-            .execute(&state.pool)
-            .await?;
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
 
-            // Log user creation
-            let audit_event =
-                AuditEvent::builder(AuditAction::UserCreated, format!("user/{}", user_id))
-                    .user(user_id.to_string())
-                    .details(serde_json::json!({
-                        "wallet_address": &address,
-                        "role": "Trader",
-                        "source": "wallet_auth"
-                    }))
-                    .build();
-            state.audit_logger.log(audit_event);
-
-            (
-                UserRow {
-                    id: user_id,
-                    email: None,
-                    wallet_address: Some(address.clone()),
-                    role,
-                    name: None,
-                    created_at: now,
-                },
-                true,
-            )
+            let user = find_wallet_user(&mut tx, &address)
+                .await?
+                .ok_or_else(|| ApiError::Internal("Wallet user missing after insert".into()))?;
+            (user, inserted)
         }
     };
 
-    // Update last login
-    let _ = sqlx::query("UPDATE users SET last_login = $1 WHERE id = $2")
+    sqlx::query("UPDATE users SET last_login = $1 WHERE id = $2")
         .bind(Utc::now())
         .bind(user.id)
-        .execute(&state.pool)
-        .await;
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if is_new_user {
+        let audit_event =
+            AuditEvent::builder(AuditAction::UserCreated, format!("user/{}", user.id))
+                .user(user.id.to_string())
+                .details(serde_json::json!({
+                    "wallet_address": &address,
+                    "role": "Trader",
+                    "source": "wallet_auth"
+                }))
+                .build();
+        state.audit_logger.log(audit_event);
+    }
 
     // Log successful login
     state
@@ -577,14 +584,13 @@ pub async fn link_wallet(
             "Signature verification failed".into(),
         ));
     }
-    tx.commit().await?;
 
     // Check if wallet is already linked to another user
     let wallet_exists: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM users WHERE wallet_address = $1 AND id != $2")
             .bind(&address)
             .bind(user_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
     if wallet_exists.is_some() {
@@ -593,13 +599,22 @@ pub async fn link_wallet(
         ));
     }
 
-    // Link wallet to user
-    sqlx::query("UPDATE users SET wallet_address = $1, wallet_linked_at = $2 WHERE id = $3")
-        .bind(&address)
-        .bind(Utc::now())
-        .bind(user_id)
-        .execute(&state.pool)
-        .await?;
+    // Link the wallet in the same transaction as the nonce consumption, and only
+    // while the account has none (a concurrent link must not overwrite it).
+    let linked = sqlx::query(
+        "UPDATE users SET wallet_address = $1, wallet_linked_at = $2 WHERE id = $3 AND wallet_address IS NULL",
+    )
+    .bind(&address)
+    .bind(Utc::now())
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    if linked.rows_affected() != 1 {
+        return Err(ApiError::BadRequest(
+            "A wallet is already linked to this account".into(),
+        ));
+    }
+    tx.commit().await?;
 
     // Log wallet linking
     let audit_event = AuditEvent::builder(

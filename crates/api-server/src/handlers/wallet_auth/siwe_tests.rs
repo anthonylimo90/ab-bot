@@ -53,11 +53,27 @@ async fn fixture(pool: &PgPool) -> Fixture {
             crate::middleware::require_auth,
         ))
     };
+    let admin = |router: axum::routing::MethodRouter<Arc<AppState>>| {
+        authed(router.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_admin,
+        )))
+    };
     let app = Router::new()
         .route("/challenge", post(challenge))
         .route("/verify", post(verify))
+        .route("/login", post(crate::handlers::auth::login))
         .route("/link", authed(post(link_wallet)))
         .route("/me", authed(get(crate::handlers::auth::get_current_user)))
+        .route("/users", admin(get(crate::handlers::users::list_users)))
+        .route(
+            "/users/:user_id",
+            admin(get(crate::handlers::users::get_user)),
+        )
+        .route(
+            "/workspaces/:workspace_id/members",
+            authed(get(crate::handlers::workspaces::list_members)),
+        )
         .with_state(state);
     Fixture {
         app,
@@ -348,4 +364,219 @@ async fn link_wallet_enforces_site_binding_and_single_use(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(rival_wallet, None);
+}
+
+/// Sign in with `wallet` and return the response.
+async fn wallet_login(f: &Fixture, wallet: &Wallet) -> (StatusCode, serde_json::Value) {
+    let message = f.challenge(wallet).await;
+    f.verify(&message, &wallet.sign(&message)).await
+}
+
+async fn user_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = false)]
+async fn first_wallet_login_creates_a_wallet_only_account_and_returns_a_token(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let wallet = Wallet::new(7);
+    let (status, body) = wallet_login(&f, &wallet).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["is_new_user"], true);
+    assert_eq!(body["user"]["wallet_address"], wallet.address);
+    assert_eq!(body["user"]["role"], "Trader");
+    assert!(body["user"].get("email").is_none());
+
+    // No email or password, but the account is complete and usable.
+    let (email, hash, linked): (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT email, password_hash, wallet_address FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((email, hash), (None, None));
+    assert_eq!(linked.as_deref(), Some(wallet.address.as_str()));
+    assert_eq!(f.unused_challenges().await, 0);
+
+    // The token is a real session, and the account reads back without errors:
+    // a missing email serializes as "" so the API shape is unchanged.
+    let token = body["token"].as_str().unwrap();
+    let (status, me) = fx::call(&f.app, "GET", "/me", Some(token), None).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["email"], "");
+    assert_eq!(me["role"], "Trader");
+
+    // The second sign-in is an ordinary login of the same account.
+    let (status, again) = wallet_login(&f, &wallet).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["is_new_user"], false);
+    assert_eq!(again["user"]["id"], body["user"]["id"]);
+    assert_eq!(user_count(&pool).await, 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn concurrent_first_logins_of_one_wallet_create_one_account(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let wallet = Wallet::new(7);
+    // Two distinct, valid challenges for the same new wallet, redeemed at once.
+    let mut signed = Vec::new();
+    for _ in 0..2 {
+        let message = f.challenge(&wallet).await;
+        let signature = wallet.sign(&message);
+        signed.push((message, signature));
+    }
+    let results = futures_util::future::join_all(signed.iter().map(|(m, s)| f.verify(m, s))).await;
+    assert!(
+        results.iter().all(|(s, _)| *s == StatusCode::OK),
+        "{results:?}"
+    );
+    let created = results
+        .iter()
+        .filter(|(_, body)| body["is_new_user"] == true)
+        .count();
+    assert_eq!(created, 1, "{results:?}");
+    assert_eq!(user_count(&pool).await, 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_failed_account_creation_does_not_burn_the_nonce(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let wallet = Wallet::new(7);
+    let message = f.challenge(&wallet).await;
+    let signature = wallet.sign(&message);
+    sqlx::query(
+        "ALTER TABLE users ADD CONSTRAINT test_reject_signup CHECK (wallet_address IS NULL OR role <> 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, _) = f.verify(&message, &signature).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    // Nonce consumption and account creation are one transaction.
+    assert_eq!(f.unused_challenges().await, 1);
+    sqlx::query("ALTER TABLE users DROP CONSTRAINT test_reject_signup")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = f.verify(&message, &signature).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["is_new_user"], true);
+}
+
+#[sqlx::test(migrations = false)]
+async fn password_login_is_refused_for_accounts_without_a_password(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let wallet = Wallet::new(7);
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, role, wallet_address) VALUES ($1, 'wallet@example.test', NULL, 1, $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&wallet.address)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for password in [
+        "",
+        "x",
+        "correct horse battery staple",
+        "$argon2id$v=19$m=19456,t=2,p=1$",
+    ] {
+        let (status, _) = fx::call(
+            &f.app,
+            "POST",
+            "/login",
+            None,
+            Some(json!({"email": "wallet@example.test", "password": password})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "password {password:?}");
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn every_account_needs_a_credential_or_a_wallet(pool: PgPool) {
+    fx::real_schema(&pool).await;
+    // Neither a full email/password pair nor a wallet: rejected by the CHECK constraint.
+    for (email, hash) in [
+        (None, None),
+        (Some("a@example.test"), None),
+        (None, Some("h")),
+    ] {
+        let err = sqlx::query(
+            "INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, 1)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(email)
+        .bind(hash)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        let code = err
+            .as_database_error()
+            .and_then(|e| e.code().map(|c| c.to_string()));
+        assert_eq!(code.as_deref(), Some("23514"), "{email:?} {hash:?}");
+    }
+    // A full credential pair, or a wallet alone, is fine.
+    sqlx::query(
+        "INSERT INTO users (id, email, password_hash, role) VALUES ($1, 'ok@example.test', 'h', 1)",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, role, wallet_address) VALUES ($1, 1, '0x0000000000000000000000000000000000000001')",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn user_and_member_listings_tolerate_accounts_without_email(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let wallet = Wallet::new(7);
+    let (_, login) = wallet_login(&f, &wallet).await;
+    let wallet_user: Uuid = login["user"]["id"].as_str().unwrap().parse().unwrap();
+    let wallet_token = login["token"].as_str().unwrap();
+    let workspace = fx::workspace(&pool, "ws", 10).await;
+    fx::add_member(&pool, workspace, wallet_user, "owner").await;
+
+    let state = AppState::for_tests(pool.clone());
+    let admin = fx::user(&pool, auth::UserRole::PlatformAdmin).await;
+    let admin_token = fx::token(&state, admin, auth::UserRole::PlatformAdmin).await;
+
+    let (status, users) = fx::call(&f.app, "GET", "/users", Some(&admin_token), None).await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let listed = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == wallet_user.to_string())
+        .expect("wallet account is listed");
+    assert_eq!(listed["email"], "");
+    let (status, one) = fx::call(
+        &f.app,
+        "GET",
+        &format!("/users/{wallet_user}"),
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["email"], "");
+
+    let (status, members) = fx::call(
+        &f.app,
+        "GET",
+        &format!("/workspaces/{workspace}/members"),
+        Some(wallet_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    assert_eq!(members[0]["email"], "");
 }
