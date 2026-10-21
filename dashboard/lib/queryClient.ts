@@ -33,8 +33,11 @@ export const queryClient = new QueryClient({
       retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000),
     },
     mutations: {
-      // Retry mutations once
-      retry: 1,
+      // Never retry mutations automatically. They are not idempotent (for example
+      // createCashFlow has no idempotency key), so a retry could apply the write
+      // twice. Operations that are safe to repeat carry their own request id and
+      // are retried explicitly by the user.
+      retry: 0,
     },
   },
 });

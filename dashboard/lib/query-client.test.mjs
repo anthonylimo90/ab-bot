@@ -21,3 +21,19 @@ test('query retry keeps a small retry budget for network errors and 5xx', () => 
 test('the shared query client uses the retry policy', () => {
   assert.equal(queryClient.getDefaultOptions().queries.retry, shouldRetryQuery);
 });
+
+test('mutations are never retried automatically (they are not idempotent)', () => {
+  assert.equal(queryClient.getDefaultOptions().mutations.retry, 0);
+});
+
+test('a failing mutation runs exactly once', async () => {
+  let attempts = 0;
+  const mutation = queryClient.getMutationCache().build(queryClient, {
+    mutationFn: async () => {
+      attempts += 1;
+      throw httpError(500);
+    },
+  });
+  await assert.rejects(mutation.execute(undefined), (error) => error.statusCode === 500);
+  assert.equal(attempts, 1);
+});
