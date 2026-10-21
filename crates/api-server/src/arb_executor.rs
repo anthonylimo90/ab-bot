@@ -925,6 +925,17 @@ impl ArbAutoExecutor {
             );
         }
 
+        // Gradual recovery after a circuit-breaker trip trades at reduced size.
+        let recovery_capacity = self.circuit_breaker.trading_capacity().await;
+        if recovery_capacity < Decimal::ONE {
+            position_size *= recovery_capacity;
+            let mut runtime = self.runtime_status.write().await;
+            runtime.record_decision(
+                market_id,
+                format!("circuit breaker recovery capacity {recovery_capacity}"),
+            );
+        }
+
         if arb.total_cost.is_zero() {
             let mut runtime = self.runtime_status.write().await;
             runtime.zero_cost_skips = runtime.zero_cost_skips.saturating_add(1);

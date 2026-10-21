@@ -4,7 +4,7 @@ use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use sqlx::{FromRow, PgPool};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time;
 use tracing::{info, warn};
@@ -51,6 +51,12 @@ pub struct AccountSnapshotRecord {
     pub open_markets: i64,
     pub unpriced_open_positions: i64,
     pub unpriced_position_cost_basis: Decimal,
+    /// Whether `total_equity` is a complete live valuation (live trading and
+    /// an observed cash balance) that may drive the circuit breaker.
+    pub equity_complete: bool,
+    /// Taken before the cash balance read: cash flows recorded up to this
+    /// instant are reflected in `cash_balance`.
+    pub cash_observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, FromRow)]
@@ -74,76 +80,94 @@ struct ObservedConditionalBalances {
     no: Option<Decimal>,
 }
 
+/// One position row holding explicit inventory.
 #[derive(Debug, FromRow)]
-#[allow(dead_code)] // Fields are required by the SQL query mapping (FromRow)
-struct EffectiveOpenPositionRow {
+struct HeldPositionRow {
     market_id: String,
-    quantity: Decimal,
     current_price: Option<Decimal>,
     yes_price: Option<Decimal>,
     no_price: Option<Decimal>,
     yes_entry_price: Decimal,
     no_entry_price: Decimal,
-    yes_exit_price: Option<Decimal>,
-    no_exit_price: Option<Decimal>,
-    entry_value: Decimal,
-    unrealized_pnl: Decimal,
+    held_yes_qty: Decimal,
+    held_no_qty: Decimal,
 }
 
-impl EffectiveOpenPositionRow {
-    fn holds_yes(&self) -> bool {
-        self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none()
+/// Holdings of one market aggregated across its position rows.
+#[derive(Debug, Default)]
+struct MarketHoldings {
+    positions: i64,
+    yes_qty: Decimal,
+    no_qty: Decimal,
+    yes_cost: Decimal,
+    no_cost: Decimal,
+    yes_price: Option<Decimal>,
+    no_price: Option<Decimal>,
+    /// Row mark; usable as a leg price only when the market holds one leg.
+    current_price: Option<Decimal>,
+}
+
+impl MarketHoldings {
+    fn add(&mut self, row: &HeldPositionRow) {
+        self.positions += 1;
+        self.yes_qty += row.held_yes_qty;
+        self.no_qty += row.held_no_qty;
+        self.yes_cost += row.held_yes_qty * row.yes_entry_price;
+        self.no_cost += row.held_no_qty * row.no_entry_price;
+        self.yes_price = self.yes_price.or(row.yes_price);
+        self.no_price = self.no_price.or(row.no_price);
+        self.current_price = self.current_price.or(row.current_price);
     }
 
-    fn holds_no(&self) -> bool {
-        self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none()
-    }
-
-    fn fallback_cost_basis(&self) -> Decimal {
-        (if self.holds_yes() {
-            self.quantity * self.yes_entry_price
+    /// Cost basis of `qty` shares of a leg holding `held` shares at `cost`:
+    /// exact when the whole leg is valued, pro rata otherwise.
+    fn leg_cost(qty: Decimal, held: Decimal, cost: Decimal) -> Decimal {
+        if qty == held {
+            cost
+        } else if held > Decimal::ZERO {
+            qty * cost / held
         } else {
             Decimal::ZERO
-        }) + (if self.holds_no() {
-            self.quantity * self.no_entry_price
-        } else {
-            Decimal::ZERO
-        })
+        }
     }
 
-    /// Returns `(value, used_fallback)` — value is always computed (never None),
-    /// and `used_fallback` is true when no live market price was available and
-    /// the entry price was substituted to keep the equity display stable.
-    fn marked_value(&self, yes_qty: Decimal, no_qty: Decimal) -> (Decimal, bool) {
-        let has_yes = yes_qty > Decimal::ZERO;
-        let has_no = no_qty > Decimal::ZERO;
-
-        match (has_yes, has_no) {
-            (false, false) => (Decimal::ZERO, false),
-            (true, false) => {
-                if let Some(price) = self.yes_price.or(self.current_price) {
-                    (yes_qty * price, false)
-                } else {
-                    (yes_qty * self.yes_entry_price, true)
-                }
+    /// Values `(yes_qty, no_qty)` shares: `(value, cost_basis, unpriced_cost)`.
+    /// A leg without a market price is marked at its average entry cost and
+    /// reported as unpriced.
+    fn value(&self, yes_qty: Decimal, no_qty: Decimal) -> (Decimal, Decimal, Decimal) {
+        let single_leg_mark = if (yes_qty > Decimal::ZERO) != (no_qty > Decimal::ZERO) {
+            self.current_price
+        } else {
+            None
+        };
+        let mut value = Decimal::ZERO;
+        let mut cost_basis = Decimal::ZERO;
+        let mut unpriced = Decimal::ZERO;
+        for (qty, price, leg_cost) in [
+            (
+                yes_qty,
+                self.yes_price.or(single_leg_mark),
+                Self::leg_cost(yes_qty, self.yes_qty, self.yes_cost),
+            ),
+            (
+                no_qty,
+                self.no_price.or(single_leg_mark),
+                Self::leg_cost(no_qty, self.no_qty, self.no_cost),
+            ),
+        ] {
+            if qty <= Decimal::ZERO {
+                continue;
             }
-            (false, true) => {
-                if let Some(price) = self.no_price.or(self.current_price) {
-                    (no_qty * price, false)
-                } else {
-                    (no_qty * self.no_entry_price, true)
-                }
-            }
-            (true, true) => {
-                if let (Some(yes_price), Some(no_price)) = (self.yes_price, self.no_price) {
-                    ((yes_qty * yes_price) + (no_qty * no_price), false)
-                } else {
-                    let yes_price = self.yes_price.unwrap_or(self.yes_entry_price);
-                    let no_price = self.no_price.unwrap_or(self.no_entry_price);
-                    ((yes_qty * yes_price) + (no_qty * no_price), true)
+            cost_basis += leg_cost;
+            match price {
+                Some(price) => value += qty * price,
+                None => {
+                    value += leg_cost;
+                    unpriced += leg_cost;
                 }
             }
         }
+        (value, cost_basis, unpriced)
     }
 }
 
@@ -197,7 +221,8 @@ pub async fn load_live_account_snapshot(
         return Ok(None);
     };
 
-    let inventory_refreshed = if state.order_executor.is_live_ready().await {
+    let live = state.order_executor.is_live_ready().await;
+    let inventory_refreshed = if live {
         match refresh_canonical_wallet_inventory(state).await {
             Ok(_) => true,
             Err(error) => {
@@ -212,7 +237,10 @@ pub async fn load_live_account_snapshot(
     let valuation = load_account_valuation(state, inventory_refreshed).await?;
     let realized_pnl_24h = load_realized_pnl_24h(&state.pool).await?;
     let net_cash_flows_24h = load_net_cash_flows_24h(&state.pool, workspace_id).await?;
-    let cash_balance = load_wallet_balance(state, target.trading_wallet_address.as_deref()).await?;
+    let cash_observed_at = Utc::now();
+    let observed_cash =
+        load_wallet_balance(state, target.trading_wallet_address.as_deref()).await?;
+    let cash_balance = observed_cash.unwrap_or(Decimal::ZERO);
     let total_equity = cash_balance + valuation.position_value;
 
     Ok(Some(AccountSnapshotRecord {
@@ -229,6 +257,8 @@ pub async fn load_live_account_snapshot(
         open_markets: valuation.open_markets,
         unpriced_open_positions: valuation.unpriced_open_positions,
         unpriced_position_cost_basis: valuation.unpriced_position_cost_basis,
+        equity_complete: live && observed_cash.is_some(),
+        cash_observed_at,
     }))
 }
 
@@ -236,24 +266,77 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
     if let Some(snapshot) = load_live_account_snapshot(state).await? {
         persist_snapshot(&state.pool, &snapshot).await?;
 
-        // Bridge equity to the circuit breaker so drawdown tracking uses real
-        // portfolio value instead of cumulative P&L from zero.
-        if snapshot.total_equity > rust_decimal::Decimal::ZERO {
-            if let Err(e) = state
-                .circuit_breaker
-                .update_portfolio_value(snapshot.total_equity)
-                .await
-            {
-                warn!(
-                    error = %e,
-                    total_equity = %snapshot.total_equity,
-                    "Failed to update circuit breaker portfolio value from account snapshot"
-                );
-            }
+        // Only a complete live valuation may drive drawdown: paper fills and
+        // an unobserved cash balance do not describe real equity.
+        if snapshot.equity_complete {
+            feed_circuit_breaker(state, &snapshot).await?;
         }
     }
 
     Ok(())
+}
+
+/// Passes live equity to the circuit breaker together with the withdrawals
+/// recorded since the previous snapshot, so moving cash out of the trading
+/// wallet is not mistaken for a trading loss.
+async fn feed_circuit_breaker(
+    state: &AppState,
+    snapshot: &AccountSnapshotRecord,
+) -> anyhow::Result<()> {
+    let through = snapshot.cash_observed_at;
+    let (withdrawals, flows_through) =
+        match state.circuit_breaker.cash_flows_applied_through().await {
+            Some(applied) if applied >= through => (Decimal::ZERO, None),
+            Some(applied) => (
+                load_withdrawals_between(&state.pool, snapshot.workspace_id, applied, through)
+                    .await?,
+                Some(through),
+            ),
+            // First feed: start the cursor here; earlier withdrawals are
+            // already reflected in the equity this snapshot seeds.
+            None => (Decimal::ZERO, Some(through)),
+        };
+
+    if let Err(e) = state
+        .circuit_breaker
+        .update_portfolio_value_with_flows(snapshot.total_equity, withdrawals, flows_through)
+        .await
+    {
+        warn!(
+            error = %e,
+            total_equity = %snapshot.total_equity,
+            "Failed to update circuit breaker portfolio value from account snapshot"
+        );
+    }
+    Ok(())
+}
+
+/// Sum of cash moved out of the trading wallet (withdrawals and outbound
+/// transfers) recorded in `(after, through]`.
+async fn load_withdrawals_between(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    after: DateTime<Utc>,
+    through: DateTime<Utc>,
+) -> anyhow::Result<Decimal> {
+    let value: Option<Decimal> = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE(SUM(amount), 0)
+        FROM cash_flow_events
+        WHERE workspace_id = $1
+          AND event_type IN ('withdrawal', 'transfer')
+          AND amount < 0
+          AND created_at > $2
+          AND created_at <= $3
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(after)
+    .bind(through)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(value.unwrap_or(Decimal::ZERO))
 }
 
 async fn persist_snapshot(pool: &PgPool, snapshot: &AccountSnapshotRecord) -> anyhow::Result<()> {
@@ -309,16 +392,18 @@ async fn persist_snapshot(pool: &PgPool, snapshot: &AccountSnapshotRecord) -> an
     Ok(())
 }
 
+/// Observed USDC balance of the trading wallet; `None` when no wallet or RPC
+/// client is configured, so the balance is unknown rather than zero.
 async fn load_wallet_balance(
     state: &AppState,
     wallet_address: Option<&str>,
-) -> anyhow::Result<Decimal> {
+) -> anyhow::Result<Option<Decimal>> {
     let Some(address) = wallet_address else {
-        return Ok(Decimal::ZERO);
+        return Ok(None);
     };
 
     let Some(polygon_client) = state.polygon_client.as_ref() else {
-        return Ok(Decimal::ZERO);
+        return Ok(None);
     };
 
     let balance = polygon_client
@@ -326,7 +411,9 @@ async fn load_wallet_balance(
         .await
         .with_context(|| format!("failed to fetch USDC balance for {address}"))?;
 
-    Decimal::from_f64_retain(balance).context("failed to convert wallet balance into Decimal")
+    Decimal::from_f64_retain(balance)
+        .context("failed to convert wallet balance into Decimal")
+        .map(Some)
 }
 
 async fn load_realized_pnl_24h(pool: &PgPool) -> anyhow::Result<Decimal> {
@@ -383,120 +470,82 @@ async fn load_account_valuation(
 async fn load_position_valuation_from_positions(
     state: &AppState,
 ) -> anyhow::Result<AccountValuationRow> {
-    let rows = sqlx::query_as::<_, EffectiveOpenPositionRow>(
+    let live = state.order_executor.is_live_ready().await;
+    // Explicit held quantities are the only evidence of inventory; every row
+    // holding shares counts, in whatever lifecycle state it is.
+    let rows = sqlx::query_as::<_, HeldPositionRow>(
         r#"
-        WITH active_positions AS (
-            SELECT
-                p.id,
-                p.market_id,
-                COALESCE(p.source, 0) AS source,
-                p.quantity,
-                p.current_price,
-                p.yes_entry_price,
-                p.no_entry_price,
-                p.yes_exit_price,
-                p.no_exit_price,
-                COALESCE(p.entry_price, (p.yes_entry_price + p.no_entry_price), 0) AS entry_price,
-                (p.quantity * COALESCE(p.entry_price, (p.yes_entry_price + p.no_entry_price), 0)) AS entry_value,
-                COALESCE(p.unrealized_pnl, 0) AS unrealized_pnl,
-                COALESCE(p.last_updated, p.updated_at, p.entry_timestamp) AS sort_updated
-            FROM positions p
-            WHERE p.is_open = TRUE
-        ),
-        ranked_active AS (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY market_id, source
-                    ORDER BY sort_updated DESC, id DESC
-                ) AS rn
-            FROM active_positions
-        )
         SELECT
-            ra.market_id,
-            ra.quantity,
-            ra.current_price,
+            p.market_id,
+            p.current_price,
             m.yes_price,
             m.no_price,
-            ra.yes_entry_price,
-            ra.no_entry_price,
-            ra.yes_exit_price,
-            ra.no_exit_price,
-            ra.entry_value,
-            ra.unrealized_pnl
-        FROM ranked_active ra
+            p.yes_entry_price,
+            p.no_entry_price,
+            p.held_yes_qty,
+            p.held_no_qty
+        FROM positions p
         LEFT JOIN markets m
-          ON m.id = ra.market_id
-        WHERE ra.rn = 1
+          ON m.id = p.market_id
+        WHERE (p.held_yes_qty > 0 OR p.held_no_qty > 0)
+          AND ($1 OR p.execution_mode <> 'paper')
         "#,
     )
+    .bind(!live)
     .fetch_all(&state.pool)
     .await?;
 
-    let observed_balances = if state.order_executor.is_live_ready().await {
-        load_observed_conditional_balances(state, &rows).await?
+    let mut markets: HashMap<String, MarketHoldings> = HashMap::new();
+    for row in &rows {
+        markets.entry(row.market_id.clone()).or_default().add(row);
+    }
+
+    let observed_balances = if live {
+        load_observed_conditional_balances(state, &markets).await?
     } else {
         HashMap::new()
     };
 
     let mut valuation = AccountValuationRow::default();
-    let mut open_markets = HashSet::new();
+    for (market_id, holdings) in &markets {
+        valuation.open_positions += holdings.positions;
+        valuation.open_markets += 1;
 
-    for row in rows {
-        valuation.open_positions += 1;
-        open_markets.insert(row.market_id.clone());
-
+        // A wallet balance covers every row of the market, so it replaces
+        // the summed row quantities once per market.
         let observed = observed_balances
-            .get(&row.market_id)
+            .get(market_id)
             .copied()
             .unwrap_or_default();
-        let yes_qty = observed.yes.unwrap_or_else(|| {
-            if row.holds_yes() {
-                row.quantity
-            } else {
-                Decimal::ZERO
-            }
-        });
-        let no_qty = observed.no.unwrap_or_else(|| {
-            if row.holds_no() {
-                row.quantity
-            } else {
-                Decimal::ZERO
-            }
-        });
-        let marked_cost_basis = (yes_qty * row.yes_entry_price) + (no_qty * row.no_entry_price);
+        let yes_qty = observed.yes.unwrap_or(holdings.yes_qty);
+        let no_qty = observed.no.unwrap_or(holdings.no_qty);
 
-        let (marked_value, used_fallback) = row.marked_value(yes_qty, no_qty);
-        valuation.position_value += marked_value;
-        valuation.unrealized_pnl += marked_value - marked_cost_basis;
-        if used_fallback {
-            valuation.unpriced_open_positions += 1;
-            valuation.unpriced_position_cost_basis += row.fallback_cost_basis();
+        let (value, cost_basis, unpriced) = holdings.value(yes_qty, no_qty);
+        valuation.position_value += value;
+        valuation.unrealized_pnl += value - cost_basis;
+        if unpriced > Decimal::ZERO {
+            valuation.unpriced_open_positions += holdings.positions;
+            valuation.unpriced_position_cost_basis += unpriced;
         }
     }
 
-    valuation.open_markets = open_markets.len() as i64;
     Ok(valuation)
 }
 
 async fn load_observed_conditional_balances(
     state: &AppState,
-    rows: &[EffectiveOpenPositionRow],
+    markets: &HashMap<String, MarketHoldings>,
 ) -> anyhow::Result<HashMap<String, ObservedConditionalBalances>> {
     let mut market_tokens = HashMap::new();
     let mut balances = HashMap::new();
 
-    for row in rows {
-        if !row.holds_yes() && !row.holds_no() {
-            continue;
-        }
-
-        let tokens = match resolve_market_tokens(state, &mut market_tokens, &row.market_id).await {
+    for (market_id, holdings) in markets {
+        let tokens = match resolve_market_tokens(state, &mut market_tokens, market_id).await {
             Ok(Some(tokens)) => tokens,
             Ok(None) => continue,
             Err(error) => {
                 warn!(
-                    market_id = %row.market_id,
+                    market_id = %market_id,
                     error = %error,
                     "Failed to resolve market tokens for live equity valuation"
                 );
@@ -504,45 +553,32 @@ async fn load_observed_conditional_balances(
             }
         };
 
-        let yes = if row.holds_yes() {
-            load_conditional_balance(state, &tokens.0)
-                .await
-                .map_err(|error| {
-                    warn!(
-                        market_id = %row.market_id,
-                        token_id = %tokens.0,
-                        error = %error,
-                        "Failed to load observed YES conditional balance"
-                    );
-                    error
-                })
-                .ok()
-                .flatten()
-        } else {
-            None
+        let observe = |token_id: String, held: Decimal, leg: &'static str| {
+            let market_id = market_id.clone();
+            async move {
+                if held <= Decimal::ZERO {
+                    return None;
+                }
+                load_conditional_balance(state, &token_id)
+                    .await
+                    .map_err(|error| {
+                        warn!(
+                            market_id = %market_id,
+                            token_id = %token_id,
+                            leg,
+                            error = %error,
+                            "Failed to load observed conditional balance"
+                        );
+                        error
+                    })
+                    .ok()
+                    .flatten()
+            }
         };
-        let no = if row.holds_no() {
-            load_conditional_balance(state, &tokens.1)
-                .await
-                .map_err(|error| {
-                    warn!(
-                        market_id = %row.market_id,
-                        token_id = %tokens.1,
-                        error = %error,
-                        "Failed to load observed NO conditional balance"
-                    );
-                    error
-                })
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
+        let yes = observe(tokens.0, holdings.yes_qty, "yes").await;
+        let no = observe(tokens.1, holdings.no_qty, "no").await;
 
-        balances.insert(
-            row.market_id.clone(),
-            ObservedConditionalBalances { yes, no },
-        );
+        balances.insert(market_id.clone(), ObservedConditionalBalances { yes, no });
     }
 
     Ok(balances)
@@ -602,4 +638,135 @@ async fn load_conditional_balance(
         .await;
 
     Ok(snapshot?.balance_in_units())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held_row(market: &str, entry: (i64, i64), held: (i64, i64)) -> HeldPositionRow {
+        HeldPositionRow {
+            market_id: market.to_string(),
+            current_price: Some(Decimal::new(90, 2)),
+            yes_price: None,
+            no_price: None,
+            yes_entry_price: Decimal::new(entry.0, 2),
+            no_entry_price: Decimal::new(entry.1, 2),
+            held_yes_qty: Decimal::from(held.0),
+            held_no_qty: Decimal::from(held.1),
+        }
+    }
+
+    #[test]
+    fn holdings_value_every_row_and_use_weighted_cost() {
+        let mut holdings = MarketHoldings::default();
+        holdings.add(&HeldPositionRow {
+            yes_price: Some(Decimal::new(50, 2)),
+            ..held_row("m", (40, 0), (10, 0))
+        });
+        holdings.add(&held_row("m", (60, 0), (5, 0)));
+
+        let (value, cost, unpriced) = holdings.value(holdings.yes_qty, holdings.no_qty);
+        assert_eq!(value, Decimal::new(750, 2));
+        assert_eq!(cost, Decimal::new(700, 2));
+        assert_eq!(unpriced, Decimal::ZERO);
+    }
+
+    #[test]
+    fn blended_row_mark_is_never_used_for_paired_legs() {
+        let mut holdings = MarketHoldings::default();
+        holdings.add(&held_row("m", (48, 50), (100, 100)));
+
+        // No per-leg market price: both legs fall back to cost and are unpriced.
+        let (value, cost, unpriced) = holdings.value(holdings.yes_qty, holdings.no_qty);
+        assert_eq!(value, Decimal::new(98, 0));
+        assert_eq!(cost, Decimal::new(98, 0));
+        assert_eq!(unpriced, Decimal::new(98, 0));
+
+        // A single held leg may use the row mark.
+        let mut single = MarketHoldings::default();
+        single.add(&held_row("m", (40, 0), (10, 0)));
+        assert_eq!(
+            single.value(single.yes_qty, single.no_qty).0,
+            Decimal::new(9, 0)
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn fallback_valuation_counts_explicit_holdings_of_every_row(pool: PgPool) {
+        crate::exit_handler::correctness_tests::setup(&pool).await;
+        let state = AppState::for_tests(pool.clone());
+        sqlx::query("INSERT INTO markets(id, yes_price, no_price) VALUES ('m', 0.5, 0.5)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (yes_entry, held_yes, yes_exit, open) in [
+            // Partly exited: an exit price exists, but 10 shares are still held.
+            ("0.40", "10", Some("0.55"), true),
+            // A second position in the same market and source.
+            ("0.60", "5", None, true),
+            // Flat history.
+            ("0.30", "0", Some("0.70"), false),
+        ] {
+            sqlx::query(
+                "INSERT INTO positions(id, market_id, yes_entry_price, no_entry_price, quantity, \
+                 held_yes_qty, held_no_qty, yes_exit_price, is_open, source) \
+                 VALUES ($1, 'm', $2::numeric, 0, 20, $3::numeric, 0, $4::numeric, $5, 1)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(yes_entry)
+            .bind(held_yes)
+            .bind(yes_exit)
+            .bind(open)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let valuation = load_position_valuation_from_positions(&state)
+            .await
+            .unwrap();
+        assert_eq!(valuation.open_positions, 2);
+        assert_eq!(valuation.open_markets, 1);
+        assert_eq!(valuation.position_value, Decimal::new(750, 2));
+        assert_eq!(valuation.unrealized_pnl, Decimal::new(50, 2));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn only_outbound_cash_in_the_window_counts_as_withdrawal(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE cash_flow_events (id UUID PRIMARY KEY, workspace_id UUID NOT NULL, \
+             event_type TEXT NOT NULL, amount DECIMAL(18, 8) NOT NULL, \
+             created_at TIMESTAMPTZ NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workspace = Uuid::new_v4();
+        let start = Utc::now() - Duration::minutes(10);
+        let end = Utc::now();
+        for (ws, kind, amount, minutes) in [
+            (workspace, "withdrawal", "-100", 5),
+            (workspace, "transfer", "-20", 5),
+            (workspace, "deposit", "500", 5),
+            (workspace, "fee", "-3", 5),
+            (workspace, "withdrawal", "-7", 15),
+            (Uuid::new_v4(), "withdrawal", "-50", 5),
+        ] {
+            sqlx::query("INSERT INTO cash_flow_events VALUES ($1, $2, $3, $4::numeric, $5)")
+                .bind(Uuid::new_v4())
+                .bind(ws)
+                .bind(kind)
+                .bind(amount)
+                .bind(end - Duration::minutes(minutes))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let total = load_withdrawals_between(&pool, workspace, start, end)
+            .await
+            .unwrap();
+        assert_eq!(total, Decimal::new(-120, 0));
+    }
 }

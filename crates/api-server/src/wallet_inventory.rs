@@ -560,9 +560,15 @@ pub async fn recover_wallet_orphan_inventory(
                     .await?;
                 result.succeeded += 1;
 
-                let realized_pnl = entry
-                    .cost_basis
-                    .map(|cost_basis| report.total_value() - cost_basis);
+                // A partial fill only disposes of its share of the cost basis.
+                let realized_pnl = entry.cost_basis.and_then(|cost_basis| {
+                    (entry.quantity > Decimal::ZERO).then(|| {
+                        let filled = report.filled_quantity.min(entry.quantity);
+                        report.total_value()
+                            - report.fees_paid
+                            - cost_basis * filled / entry.quantity
+                    })
+                });
 
                 if let Some(recorder) = trade_event_recorder {
                     recorder

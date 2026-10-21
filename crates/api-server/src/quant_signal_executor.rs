@@ -921,6 +921,12 @@ impl QuantSignalExecutor {
             position_size_usd *= rollout_decision.size_multiplier;
         }
 
+        // Gradual recovery after a circuit-breaker trip trades at reduced size.
+        let recovery_capacity = self.circuit_breaker.trading_capacity().await;
+        if recovery_capacity < Decimal::ONE {
+            position_size_usd *= recovery_capacity;
+        }
+
         if position_size_usd < Decimal::new(1, 0) {
             debug!(
                 signal_id = %signal.id,
