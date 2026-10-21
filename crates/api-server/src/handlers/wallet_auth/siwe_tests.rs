@@ -180,6 +180,12 @@ async fn a_message_issued_by_this_site_logs_in(pool: PgPool) {
     let (status, me) = fx::call(&f.app, "GET", "/me", Some(token), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(me["id"], user.to_string());
+    // The session lifetime is the configured one (1h in the test state), not a literal.
+    let claims = AppState::for_tests(pool.clone())
+        .jwt_auth
+        .validate_token(token)
+        .unwrap();
+    assert_eq!(claims.exp - claims.iat, 3600);
 }
 
 #[sqlx::test(migrations = false)]

@@ -26,7 +26,7 @@ async fn account_and_credential_changes_revoke_signed_tokens_across_instances(po
         .execute(&pool)
         .await
         .unwrap();
-    let claims = session_claims(&pool, id, UserRole::PlatformAdmin)
+    let claims = session_claims(&pool, id, UserRole::PlatformAdmin, 1)
         .await
         .unwrap();
     let token = jwt().create_token_with_claims(&claims).unwrap();
@@ -38,7 +38,7 @@ async fn account_and_credential_changes_revoke_signed_tokens_across_instances(po
         .unwrap();
     assert!(jwt().validate_token(&token).is_ok());
     assert!(authorize_session(&pool, &jwt(), &token).await.is_err());
-    let current = session_claims(&pool, id, UserRole::PlatformAdmin)
+    let current = session_claims(&pool, id, UserRole::PlatformAdmin, 1)
         .await
         .unwrap();
     let token = jwt().create_token_with_claims(&current).unwrap();
@@ -67,7 +67,9 @@ async fn logout_and_role_changes_are_checked_in_persistent_state(pool: sqlx::PgP
         .execute(&pool)
         .await
         .unwrap();
-    let claims = session_claims(&pool, id, UserRole::Trader).await.unwrap();
+    let claims = session_claims(&pool, id, UserRole::Trader, 1)
+        .await
+        .unwrap();
     let token = jwt().create_token_with_claims(&claims).unwrap();
     sqlx::query("INSERT INTO revoked_sessions VALUES ($1,$2,NOW()+INTERVAL '1 hour')")
         .bind(&claims.jti)
@@ -76,7 +78,9 @@ async fn logout_and_role_changes_are_checked_in_persistent_state(pool: sqlx::PgP
         .await
         .unwrap();
     assert!(authorize_session(&pool, &jwt(), &token).await.is_err());
-    let fresh = session_claims(&pool, id, UserRole::Trader).await.unwrap();
+    let fresh = session_claims(&pool, id, UserRole::Trader, 1)
+        .await
+        .unwrap();
     let token = jwt().create_token_with_claims(&fresh).unwrap();
     authorize_session(&pool, &jwt(), &token).await.unwrap();
     sqlx::query("UPDATE users SET role=0 WHERE id=$1")
@@ -85,6 +89,19 @@ async fn logout_and_role_changes_are_checked_in_persistent_state(pool: sqlx::PgP
         .await
         .unwrap();
     assert!(authorize_session(&pool, &jwt(), &token).await.is_err());
+}
+
+#[sqlx::test(migrations = false)]
+async fn issued_session_tokens_use_the_configured_expiry(pool: sqlx::PgPool) {
+    use crate::workspace_scope::test_fixture as fx;
+    fx::real_schema(&pool).await;
+    // The test state is configured for 1 hour tokens (production: 24).
+    let state = AppState::for_tests(pool.clone());
+    assert_eq!(state.jwt_auth.expiry_hours(), 1);
+    let user = fx::user(&pool, UserRole::Trader).await;
+    let token = fx::token(&state, user, UserRole::Trader).await;
+    let claims = state.jwt_auth.validate_token(&token).unwrap();
+    assert_eq!(claims.exp - claims.iat, 3600);
 }
 
 // `state.rbac` is not consulted for any authorization decision, so authenticating

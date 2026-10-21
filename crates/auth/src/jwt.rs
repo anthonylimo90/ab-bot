@@ -163,6 +163,12 @@ impl JwtAuth {
         }
     }
 
+    /// Configured token lifetime in hours; callers that build their own claims
+    /// (e.g. to add a session version) must use this rather than a literal.
+    pub fn expiry_hours(&self) -> i64 {
+        self.config.expiry_hours
+    }
+
     /// Create a new token for a user.
     pub fn create_token(&self, user_id: &str, role: UserRole) -> Result<String> {
         let claims = Claims::new(user_id, role, self.config.expiry_hours);

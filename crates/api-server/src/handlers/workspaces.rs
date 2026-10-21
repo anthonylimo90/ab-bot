@@ -1524,8 +1524,12 @@ pub async fn accept_invite(
         .execute(&mut *tx)
         .await?;
 
-        let claims =
-            Claims::new(user_id.to_string(), UserRole::Trader, 24).with_email(&invite.email);
+        let claims = Claims::new(
+            user_id.to_string(),
+            UserRole::Trader,
+            state.jwt_auth.expiry_hours(),
+        )
+        .with_email(&invite.email);
         let token = state
             .jwt_auth
             .create_token_with_claims(&claims)
