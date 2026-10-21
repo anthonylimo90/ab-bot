@@ -904,13 +904,11 @@ impl OrderExecutor {
     ) -> std::result::Result<(Decimal, Decimal), ExecutionReport> {
         match order.side {
             OrderSide::Buy => book
-                .asks
-                .first()
+                .best_ask_level()
                 .map(|ask| (ask.price, ask.size))
                 .ok_or_else(|| self.reject_market_order(order, "No asks available")),
             OrderSide::Sell => book
-                .bids
-                .first()
+                .best_bid_level()
                 .map(|bid| (bid.price, bid.size))
                 .ok_or_else(|| self.reject_market_order(order, "No bids available")),
         }

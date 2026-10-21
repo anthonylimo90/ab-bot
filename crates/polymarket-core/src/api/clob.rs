@@ -123,6 +123,10 @@ struct ParsedWsMessage {
 #[path = "clob/cancellation_tests.rs"]
 mod cancellation_tests;
 
+#[cfg(test)]
+#[path = "clob/book_tests.rs"]
+mod book_tests;
+
 /// Polymarket CLOB API client for order book data.
 #[derive(Clone)]
 pub struct ClobClient {
@@ -1077,24 +1081,26 @@ impl From<ClobOrderBook> for OrderBook {
             market_id: b.market,
             outcome_id: b.asset_id,
             timestamp: b.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
-            bids: b
-                .bids
-                .into_iter()
-                .map(|l| PriceLevel {
-                    price: l.price.parse().unwrap_or_default(),
-                    size: l.size.parse().unwrap_or_default(),
-                })
-                .collect(),
-            asks: b
-                .asks
-                .into_iter()
-                .map(|l| PriceLevel {
-                    price: l.price.parse().unwrap_or_default(),
-                    size: l.size.parse().unwrap_or_default(),
-                })
-                .collect(),
+            bids: parse_book_levels(b.bids, true),
+            asks: parse_book_levels(b.asks, false),
         }
     }
+}
+
+/// Converts exchange levels into a validated, best-first side of the book.
+/// The exchange lists levels worst-first, and a malformed level must never
+/// default to a zero price that would then sort as the best ask.
+fn parse_book_levels(levels: Vec<ClobPriceLevel>, bids: bool) -> Vec<PriceLevel> {
+    let mut parsed: Vec<PriceLevel> = levels
+        .into_iter()
+        .filter_map(|l| PriceLevel::parse_exchange(&l.price, &l.size))
+        .collect();
+    if bids {
+        crate::types::sort_bids_best_first(&mut parsed);
+    } else {
+        crate::types::sort_asks_best_first(&mut parsed);
+    }
+    parsed
 }
 
 #[derive(Debug, Deserialize)]
@@ -1214,22 +1220,8 @@ fn parse_ws_book_from_value(value: serde_json::Value) -> Option<OrderBookUpdate>
         market_id: ws_book.market,
         asset_id: ws_book.asset_id,
         timestamp: parse_ws_timestamp(&ws_book.timestamp),
-        bids: ws_book
-            .bids
-            .into_iter()
-            .map(|l| PriceLevel {
-                price: l.price.parse().unwrap_or_default(),
-                size: l.size.parse().unwrap_or_default(),
-            })
-            .collect(),
-        asks: ws_book
-            .asks
-            .into_iter()
-            .map(|l| PriceLevel {
-                price: l.price.parse().unwrap_or_default(),
-                size: l.size.parse().unwrap_or_default(),
-            })
-            .collect(),
+        bids: parse_book_levels(ws_book.bids, true),
+        asks: parse_book_levels(ws_book.asks, false),
     })
 }
 
@@ -1254,15 +1246,12 @@ fn apply_price_changes(
             Err(_) => continue,
         };
 
-        let mut book = book_state
-            .remove(&change.asset_id)
-            .unwrap_or_else(|| OrderBook {
-                market_id: event.market.clone(),
-                outcome_id: change.asset_id.clone(),
-                timestamp,
-                bids: Vec::new(),
-                asks: Vec::new(),
-            });
+        // A delta without its snapshot would publish a partial book whose
+        // first level need not be the real best price; wait for the snapshot.
+        let Some(mut book) = book_state.remove(&change.asset_id) else {
+            debug!(asset_id = %change.asset_id, "Ignoring price change before book snapshot");
+            continue;
+        };
 
         book.market_id = event.market.clone();
         book.timestamp = timestamp;
@@ -1316,14 +1305,14 @@ fn upsert_level(levels: &mut Vec<PriceLevel>, price: Decimal, size: Decimal, des
         } else {
             levels[idx].size = size;
         }
-    } else if size > Decimal::ZERO {
+    } else if size > Decimal::ZERO && price > Decimal::ZERO && price < Decimal::ONE {
         levels.push(PriceLevel { price, size });
     }
 
     if descending {
-        levels.sort_by_key(|level| std::cmp::Reverse(level.price));
+        crate::types::sort_bids_best_first(levels);
     } else {
-        levels.sort_by_key(|a| a.price);
+        crate::types::sort_asks_best_first(levels);
     }
 }
 

@@ -492,9 +492,9 @@ impl StopLossManager {
 
             // Get current price for this rule's outcome
             let current_price = if rule.outcome_id == book.yes_book.outcome_id {
-                book.yes_book.bids.first().map(|l| l.price)
+                book.yes_book.best_bid()
             } else if rule.outcome_id == book.no_book.outcome_id {
-                book.no_book.bids.first().map(|l| l.price)
+                book.no_book.best_bid()
             } else {
                 warn!(
                     rule_id = %rule.id,

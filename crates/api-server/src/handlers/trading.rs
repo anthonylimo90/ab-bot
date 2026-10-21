@@ -565,8 +565,8 @@ async fn load_expected_market_price(
         })?;
 
     let level = match side {
-        CoreOrderSide::Buy => book.asks.first(),
-        CoreOrderSide::Sell => book.bids.first(),
+        CoreOrderSide::Buy => book.best_ask_level(),
+        CoreOrderSide::Sell => book.best_bid_level(),
     };
 
     level.map(|price_level| price_level.price).ok_or_else(|| {

@@ -51,14 +51,32 @@ pub struct OrderBook {
 }
 
 impl OrderBook {
+    /// Restores the best-first invariant: bids by descending price, asks by
+    /// ascending price. Polymarket's REST `/book` and WebSocket `book` events
+    /// list levels worst-first, so every ingest path must call this.
+    pub fn sort_levels(&mut self) {
+        sort_bids_best_first(&mut self.bids);
+        sort_asks_best_first(&mut self.asks);
+    }
+
+    /// Returns the best bid level (highest buy order), regardless of level order.
+    pub fn best_bid_level(&self) -> Option<&PriceLevel> {
+        self.bids.iter().max_by(|a, b| a.price.cmp(&b.price))
+    }
+
+    /// Returns the best ask level (lowest sell order), regardless of level order.
+    pub fn best_ask_level(&self) -> Option<&PriceLevel> {
+        self.asks.iter().min_by(|a, b| a.price.cmp(&b.price))
+    }
+
     /// Returns the best bid price (highest buy order).
     pub fn best_bid(&self) -> Option<Decimal> {
-        self.bids.first().map(|l| l.price)
+        self.best_bid_level().map(|l| l.price)
     }
 
     /// Returns the best ask price (lowest sell order).
     pub fn best_ask(&self) -> Option<Decimal> {
-        self.asks.first().map(|l| l.price)
+        self.best_ask_level().map(|l| l.price)
     }
 }
 
@@ -67,6 +85,27 @@ impl OrderBook {
 pub struct PriceLevel {
     pub price: Decimal,
     pub size: Decimal,
+}
+
+impl PriceLevel {
+    /// Parses an exchange level, rejecting anything that cannot be a resting
+    /// order: unparseable values, prices outside (0, 1) and empty sizes.
+    pub fn parse_exchange(price: &str, size: &str) -> Option<Self> {
+        let price = price.trim().parse::<Decimal>().ok()?;
+        let size = size.trim().parse::<Decimal>().ok()?;
+        (price > Decimal::ZERO && price < Decimal::ONE && size > Decimal::ZERO)
+            .then_some(Self { price, size })
+    }
+}
+
+/// Sorts bid levels best-first (highest price first).
+pub fn sort_bids_best_first(levels: &mut [PriceLevel]) {
+    levels.sort_by_key(|level| std::cmp::Reverse(level.price));
+}
+
+/// Sorts ask levels best-first (lowest price first).
+pub fn sort_asks_best_first(levels: &mut [PriceLevel]) {
+    levels.sort_by_key(|level| level.price);
 }
 
 /// Paired order book data for both outcomes of a binary market.
@@ -94,8 +133,8 @@ impl BinaryMarketBook {
         &self,
         min_depth_usd: Decimal,
     ) -> Option<(Decimal, Decimal, Decimal, Decimal, Decimal)> {
-        let yes_ask_level = self.yes_book.asks.first()?;
-        let no_ask_level = self.no_book.asks.first()?;
+        let yes_ask_level = self.yes_book.best_ask_level()?;
+        let no_ask_level = self.no_book.best_ask_level()?;
 
         let yes_notional = yes_ask_level.price * yes_ask_level.size;
         let no_notional = no_ask_level.price * no_ask_level.size;
@@ -243,6 +282,64 @@ impl ArbOpportunity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn level(price: i64, size: i64) -> PriceLevel {
+        PriceLevel {
+            price: Decimal::new(price, 2),
+            size: Decimal::new(size, 0),
+        }
+    }
+
+    #[test]
+    fn best_levels_do_not_depend_on_level_order() {
+        let mut book = OrderBook {
+            market_id: "m".to_string(),
+            outcome_id: "o".to_string(),
+            timestamp: Utc::now(),
+            bids: vec![level(1, 1000), level(45, 10), level(47, 5)],
+            asks: vec![level(99, 1000), level(52, 7), level(49, 3)],
+        };
+
+        assert_eq!(book.best_bid(), Some(Decimal::new(47, 2)));
+        assert_eq!(book.best_ask(), Some(Decimal::new(49, 2)));
+        assert_eq!(book.best_ask_level().unwrap().size, Decimal::new(3, 0));
+
+        book.sort_levels();
+        assert_eq!(book.bids[0].price, Decimal::new(47, 2));
+        assert_eq!(book.asks[0].price, Decimal::new(49, 2));
+        assert_eq!(book.asks[2].price, Decimal::new(99, 2));
+
+        let paired = BinaryMarketBook {
+            market_id: "m".to_string(),
+            timestamp: Utc::now(),
+            yes_book: OrderBook {
+                asks: vec![level(99, 1000), level(49, 300)],
+                ..book.clone()
+            },
+            no_book: OrderBook {
+                asks: vec![level(98, 1000), level(48, 300)],
+                ..book
+            },
+        };
+        let (yes, no, total, _, _) = paired.entry_cost_with_depth(Decimal::ONE).unwrap();
+        assert_eq!(
+            (yes, no, total),
+            (
+                Decimal::new(49, 2),
+                Decimal::new(48, 2),
+                Decimal::new(97, 2)
+            )
+        );
+    }
+
+    #[test]
+    fn parse_exchange_level_rejects_impossible_levels() {
+        assert!(PriceLevel::parse_exchange("0.5", "10").is_some());
+        assert!(PriceLevel::parse_exchange("0", "10").is_none());
+        assert!(PriceLevel::parse_exchange("1", "10").is_none());
+        assert!(PriceLevel::parse_exchange("0.5", "0").is_none());
+        assert!(PriceLevel::parse_exchange("x", "10").is_none());
+    }
 
     #[test]
     fn test_arb_detection() {
