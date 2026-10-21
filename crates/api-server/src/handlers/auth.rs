@@ -781,6 +781,16 @@ pub async fn reset_password(
         ));
     }
 
+    // The password just changed: any other reset link issued earlier (e.g. by
+    // someone who could read the same mailbox) must not still work.
+    sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL",
+    )
+    .bind(Utc::now())
+    .bind(token_row.user_id)
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
 
     // Log password reset
@@ -821,6 +831,92 @@ mod tests {
         assert!(argon2
             .verify_password(b"wrongpassword", &parsed_hash)
             .is_err());
+    }
+
+    async fn add_reset_token(pool: &sqlx::PgPool, user: Uuid, token: &str) {
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '1 hour')",
+        )
+        .bind(user)
+        .bind(hash_token(token))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn reset(app: &axum::Router, token: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        crate::workspace_scope::test_fixture::call(
+            app,
+            "POST",
+            "/reset",
+            None,
+            Some(serde_json::json!({"token": token, "password": "a brand new password"})),
+        )
+        .await
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_successful_reset_invalidates_the_other_outstanding_tokens(pool: sqlx::PgPool) {
+        use crate::workspace_scope::test_fixture as fx;
+        fx::real_schema(&pool).await;
+        let victim = fx::user(&pool, UserRole::Trader).await;
+        let bystander = fx::user(&pool, UserRole::Trader).await;
+        for token in ["first", "second", "third"] {
+            add_reset_token(&pool, victim, token).await;
+        }
+        add_reset_token(&pool, bystander, "bystander").await;
+        let app = axum::Router::new()
+            .route("/reset", axum::routing::post(reset_password))
+            .with_state(AppState::for_tests(pool.clone()));
+
+        let (status, body) = reset(&app, "second").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        // The sibling links issued for the same account no longer work...
+        for token in ["first", "third", "second"] {
+            let (status, _) = reset(&app, token).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{token}");
+        }
+        let outstanding: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM password_reset_tokens WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(victim)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outstanding, 0);
+        // ...while another account's token is untouched.
+        let (status, _) = reset(&app, "bystander").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn reset_token_lookup_has_a_partial_index_on_the_hash(pool: sqlx::PgPool) {
+        crate::workspace_scope::test_fixture::real_schema(&pool).await;
+        let definition: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'password_reset_tokens' AND indexname = 'idx_password_reset_tokens_token_hash_unused'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(definition.contains("(token_hash)"), "{definition}");
+        assert!(definition.contains("used_at IS NULL"), "{definition}");
+        // With sequential scans disabled the planner can serve the exact lookup from it.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN SELECT id, user_id FROM password_reset_tokens WHERE token_hash = 'x' AND expires_at > NOW() AND used_at IS NULL",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_password_reset_tokens_token_hash_unused")),
+            "{plan:?}"
+        );
     }
 
     #[tokio::test]
