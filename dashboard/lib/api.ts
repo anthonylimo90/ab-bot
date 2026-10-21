@@ -437,9 +437,22 @@ function parseLearningRolloutObservation(
   };
 }
 
+/**
+ * Called when an authenticated request is rejected with 401, i.e. the session
+ * token we sent is expired or revoked. Receives the token that was rejected so the
+ * owner can ignore a stale response that races a newer sign-in.
+ */
+export type UnauthorizedHandler = (rejectedToken: string) => void;
+
+// Credential and session endpoints answer 401 for reasons other than an expired
+// session (wrong password, bad signature, already-revoked logout) and are handled
+// by their callers, so they never trigger the global handler.
+const AUTH_ENDPOINT_PREFIX = "/api/v1/auth/";
+
 class ApiClient {
   private baseUrl: string;
   private token?: string;
+  private unauthorizedHandler: UnauthorizedHandler | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
@@ -451,6 +464,10 @@ class ApiClient {
 
   clearToken() {
     this.token = undefined;
+  }
+
+  setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
+    this.unauthorizedHandler = handler;
   }
 
   // Generic HTTP methods for flexibility
@@ -490,9 +507,11 @@ class ApiClient {
       ...options.headers,
     };
 
-    if (requestOptions?.auth !== false && this.token) {
+    const sentToken =
+      requestOptions?.auth !== false ? this.token : undefined;
+    if (sentToken) {
       (headers as Record<string, string>)["Authorization"] =
-        `Bearer ${this.token}`;
+        `Bearer ${sentToken}`;
     }
 
     const response = await fetch(`${this.baseUrl}${endpoint}`, {
@@ -505,6 +524,18 @@ class ApiClient {
         code: "UNKNOWN_ERROR",
         message: `HTTP ${response.status}`,
       }));
+      if (
+        response.status === 401 &&
+        sentToken &&
+        !endpoint.startsWith(AUTH_ENDPOINT_PREFIX)
+      ) {
+        try {
+          this.unauthorizedHandler?.(sentToken);
+        } catch (handlerError) {
+          // The caller still needs the original 401 below.
+          console.error("Unauthorized handler failed:", handlerError);
+        }
+      }
       throw new ApiHttpError(
         response.status,
         error.message || `HTTP ${response.status}`,

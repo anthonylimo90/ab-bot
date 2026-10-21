@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useAuthStore } from '@/stores/auth-store';
+import api from '@/lib/api';
 
 // Routes that don't require authentication
 const PUBLIC_ROUTES = ['/login', '/forgot-password', '/reset-password', '/admin/login'];
@@ -32,6 +33,15 @@ export function AuthGuard({ children }: AuthGuardProps) {
   // Track client-side mount
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  // A 401 on any authenticated request means the session token is expired or
+  // revoked: clear the session so the redirect effect below sends the user to login.
+  useEffect(() => {
+    api.setUnauthorizedHandler((rejectedToken) =>
+      useAuthStore.getState().sessionExpired(rejectedToken)
+    );
+    return () => api.setUnauthorizedHandler(null);
   }, []);
 
   // Wait for hydration, then check auth

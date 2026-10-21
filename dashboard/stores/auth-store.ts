@@ -17,6 +17,7 @@ interface AuthStore {
   setAuth: (token: string, user: User) => void;
   logout: () => Promise<boolean>;
   checkAuth: () => Promise<void>;
+  sessionExpired: (rejectedToken: string) => void;
   setHasHydrated: (state: boolean) => void;
   isPlatformAdmin: () => boolean;
 }
@@ -80,12 +81,35 @@ export const useAuthStore = create<AuthStore>()(
         try {
           const user = await api.getCurrentUser();
           set({ user, isAuthenticated: true, isLoading: false });
-        } catch {
-          // Token invalid or expired
-          api.clearToken();
-          resetSessionContext();
-          set({ token: null, user: null, isAuthenticated: false, isLoading: false });
+        } catch (error) {
+          if (error instanceof ApiHttpError && error.isUnauthorized) {
+            // The server rejected the token: it is invalid, expired or revoked.
+            // A concurrent sign-in must not be cleared by this older check.
+            if (get().token === token) {
+              api.clearToken();
+              resetSessionContext();
+              set({ token: null, user: null, isAuthenticated: false, isLoading: false });
+            } else {
+              set({ isLoading: false });
+            }
+            return;
+          }
+          // Network failure, 5xx or 429: the token has not been proven invalid, so keep
+          // it. A backend outage must not sign the user out. Continue with the
+          // persisted user; a genuinely expired token surfaces as a 401 on the next
+          // request and is handled by sessionExpired.
+          set({ isAuthenticated: get().user !== null, isLoading: false });
         }
+      },
+
+      sessionExpired: (rejectedToken) => {
+        // A 401 for an older token (a request that raced a sign-in or an earlier
+        // expiry) must not sign out the current session.
+        if (get().token !== rejectedToken) return;
+        api.clearToken();
+        resetSessionContext();
+        set({ token: null, user: null, isAuthenticated: false, isLoading: false });
+        useToastStore.getState().warning('Session expired', 'Please sign in again.');
       },
 
       isPlatformAdmin: () => {

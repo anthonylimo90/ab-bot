@@ -60,3 +60,85 @@ test('getMarkets encodes special characters in the search term', async () => {
   assert.match(requests[0].url, /search=a%26b%3Dc%23d/);
   assert.equal(new URL(requests[0].url).searchParams.get('search'), 'a&b=c#d');
 });
+
+// ---- global 401 handling --------------------------------------------------
+
+function loadApiWithHandler(respond) {
+  const loaded = loadApi(respond);
+  const rejected = [];
+  loaded.api.setUnauthorizedHandler((token) => rejected.push(token));
+  return { ...loaded, rejected };
+}
+
+const unauthorized = () => jsonResponse({ code: 'UNAUTHORIZED', message: 'Token expired' }, 401);
+
+test('a 401 on an authenticated request reports the rejected token and still throws', async () => {
+  const { api, rejected } = loadApiWithHandler(unauthorized);
+  api.setToken('expired-token');
+  await assert.rejects(api.getPositions(), (error) => {
+    assert.equal(error.name, 'ApiHttpError');
+    assert.equal(error.statusCode, 401);
+    assert.equal(error.isUnauthorized, true);
+    return true;
+  });
+  assert.deepEqual(rejected, ['expired-token']);
+});
+
+test('the handler receives the token the request was sent with, not a newer one', async () => {
+  const state = { api: null };
+  const loaded = loadApiWithHandler(() => {
+    // A sign-in lands while the request is in flight.
+    state.api.setToken('new-token');
+    return unauthorized();
+  });
+  state.api = loaded.api;
+  loaded.api.setToken('old-token');
+  await assert.rejects(loaded.api.getPositions());
+  assert.deepEqual(loaded.rejected, ['old-token']);
+});
+
+test('requests without a token, other statuses and auth endpoints never trigger the handler', async () => {
+  // No token sent.
+  const anonymous = loadApiWithHandler(unauthorized);
+  await assert.rejects(anonymous.api.getMarkets());
+  assert.deepEqual(anonymous.rejected, []);
+
+  // Explicitly unauthenticated request (invite acceptance for a signed-out visitor).
+  const noAuth = loadApiWithHandler(unauthorized);
+  noAuth.api.setToken('some-token');
+  await assert.rejects(noAuth.api.acceptInvite('invite-token', {}, { auth: false }));
+  assert.equal(noAuth.requests[0].init.headers.Authorization, undefined);
+  assert.deepEqual(noAuth.rejected, []);
+
+  // Credential/session endpoints answer 401 for ordinary reasons (wrong password, bad signature).
+  const auth = loadApiWithHandler(unauthorized);
+  auth.api.setToken('stale-token');
+  await assert.rejects(auth.api.login('a@example.com', 'wrong'));
+  await assert.rejects(auth.api.getCurrentUser());
+  await assert.rejects(auth.api.walletVerify('msg', 'sig'));
+  await assert.rejects(auth.api.logout());
+  assert.deepEqual(auth.rejected, []);
+
+  // Other failures are not session problems.
+  for (const status of [400, 403, 404, 429, 500, 503]) {
+    const other = loadApiWithHandler(() => jsonResponse({ code: 'X', message: 'nope' }, status));
+    other.api.setToken('good-token');
+    await assert.rejects(other.api.getPositions());
+    assert.deepEqual(other.rejected, [], String(status));
+  }
+});
+
+test('a throwing unauthorized handler does not mask the original 401', async () => {
+  const { api } = loadApi(unauthorized);
+  api.setToken('expired-token');
+  api.setUnauthorizedHandler(() => { throw new Error('handler bug'); });
+  await assert.rejects(api.getPositions(), (error) => error.statusCode === 401);
+});
+
+test('clearing the handler stops notifications', async () => {
+  const { api, rejected } = loadApiWithHandler(unauthorized);
+  api.setToken('expired-token');
+  api.setUnauthorizedHandler(null);
+  await assert.rejects(api.getPositions());
+  assert.deepEqual(rejected, []);
+});
