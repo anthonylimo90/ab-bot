@@ -38,10 +38,17 @@ pub struct WalletFeatures {
     /// Lower values indicate more consistent (bot-like) timing.
     pub interval_cv: Option<f64>,
 
-    /// Win rate across all closed positions.
+    /// Win rate across all closed positions: the share of closing sales with a
+    /// positive FIFO-realized P&L (see `feature_extractor::fifo`).
+    ///
+    /// `None` when it cannot be computed from real trade data (no `wallet_trades`
+    /// history, or too few closed sales). It is never estimated from transfers.
     pub win_rate: Option<f64>,
 
     /// Average latency from market event to trade (milliseconds).
+    ///
+    /// No data source currently provides the triggering market event time, so
+    /// this is always `None`; the `FastLatency` signal cannot fire until one does.
     pub avg_latency_ms: Option<f64>,
 
     /// Number of distinct markets traded.

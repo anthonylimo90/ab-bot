@@ -8,7 +8,11 @@
 //!   - smart_money_flow >= $500
 //!   - trade_count >= 5
 //!
-//! Direction: positive imbalance → BuyYes, negative → BuyNo
+//! Direction: positive imbalance → BuyYes, negative → BuyNo. The imbalance is
+//! signed towards YES by the flow feature calculator (BUY YES / SELL NO are
+//! bullish, SELL YES / BUY NO bearish), so buying NO never counts as YES demand.
+//! Smart money means wallets with a bot score below the threshold; wallets
+//! without a score are unknown and do not count.
 //! Confidence: heuristic score using imbalance, smart-money share, participant
 //! breadth, liquidity, and price regime
 //! Expiry: 30 minutes from generation
@@ -260,6 +264,19 @@ async fn generator_loop(
     }
 }
 
+/// Direction of the signal from the YES-signed imbalance: positive flow favours
+/// YES → BuyYes, negative → BuyNo.
+///
+/// The imbalance stored in `market_flow_features` already accounts for which
+/// outcome token each trade bought or sold, so the sign can be used directly.
+pub(crate) fn direction_from_imbalance(imbalance_ratio: Decimal) -> SignalDirection {
+    if imbalance_ratio > Decimal::ZERO {
+        SignalDirection::BuyYes
+    } else {
+        SignalDirection::BuyNo
+    }
+}
+
 async fn scan_and_emit(
     config: &FlowSignalConfig,
     pool: &PgPool,
@@ -313,6 +330,7 @@ async fn scan_and_emit(
             INNER JOIN latest_features lf
               ON lf.condition_id = wt.condition_id
             WHERE wt.condition_id IS NOT NULL
+              AND LOWER(wt.outcome) IN ('yes', 'no')
               AND wt.timestamp >= $6
               AND wt.timestamp <= $2
         ),
@@ -466,12 +484,7 @@ async fn scan_and_emit(
         let imbalance_abs = decimal_to_f64(row.imbalance_ratio.abs());
         let smart_money_abs = decimal_to_f64(row.smart_money_flow.abs());
 
-        // Direction: positive imbalance (more buys) → BuyYes, negative → BuyNo
-        let direction = if row.imbalance_ratio > Decimal::ZERO {
-            SignalDirection::BuyYes
-        } else {
-            SignalDirection::BuyNo
-        };
+        let direction = direction_from_imbalance(row.imbalance_ratio);
 
         let Some(calibration_stats) = calibration
             .usable_for(direction, config.calibration_min_closed_trades)
@@ -695,6 +708,24 @@ mod tests {
         assert!(config.require_calibration);
         assert!(config.min_bot_score_coverage > 0.0);
         assert_eq!(config.window_minutes, 60);
+    }
+
+    #[test]
+    fn direction_follows_the_sign_of_the_yes_signed_imbalance() {
+        assert_eq!(
+            direction_from_imbalance(Decimal::new(25, 2)),
+            SignalDirection::BuyYes
+        );
+        assert_eq!(
+            direction_from_imbalance(Decimal::new(-25, 2)),
+            SignalDirection::BuyNo
+        );
+        // Flat flow never qualifies for a signal (|imbalance| is gated), but the
+        // mapping itself must be total.
+        assert_eq!(
+            direction_from_imbalance(Decimal::ZERO),
+            SignalDirection::BuyNo
+        );
     }
 
     #[test]

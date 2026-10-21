@@ -5,6 +5,7 @@
 mod feature_extractor;
 mod indexer;
 mod scorer;
+mod trade_history;
 
 use anyhow::Result;
 use polymarket_core::config::Config;
@@ -67,12 +68,13 @@ async fn analyze_wallet(config: &Config, address: &str) -> Result<()> {
         }
     };
 
-    // Fetch wallet transactions
+    // Fetch wallet transactions (both directions)
     let transfers = polygon.get_asset_transfers(address, None, None).await?;
     info!("Found {} transfers for wallet", transfers.len());
 
-    // Extract features
-    let features = feature_extractor::extract_features(address, &transfers)?;
+    // Extract features, then add the realized win rate from trade history
+    let mut features = feature_extractor::extract_features(address, &transfers)?;
+    trade_history::attach_win_rate(&pool, &mut features).await;
     info!(
         "Extracted features: {} trades, interval_cv={:?}, win_rate={:?}",
         features.total_trades, features.interval_cv, features.win_rate

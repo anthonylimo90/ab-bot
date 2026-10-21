@@ -3,6 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -285,7 +286,22 @@ pub trait Strategy: Send + Sync {
     fn parameters(&self) -> HashMap<String, String> {
         HashMap::new()
     }
+
+    /// Number of most recent snapshots per market the strategy reads from
+    /// `StrategyContext::market_data`.
+    ///
+    /// The simulator retains at least this many (bounded by
+    /// `simulator::MAX_HISTORY_BARS`) and never fewer than
+    /// [`DEFAULT_REQUIRED_HISTORY`]. Strategies with a lookback longer than the
+    /// default must override this, otherwise their `snapshots.len() >= lookback`
+    /// checks would never pass.
+    fn required_history(&self) -> usize {
+        DEFAULT_REQUIRED_HISTORY
+    }
 }
+
+/// History (snapshots per market) every strategy gets by default.
+pub const DEFAULT_REQUIRED_HISTORY: usize = 100;
 
 /// Enhanced arbitrage strategy for backtesting.
 ///
@@ -299,7 +315,8 @@ pub struct ArbitrageStrategy {
     pub base_min_spread: Decimal,
     /// Trading fee percentage (used to calculate effective min spread).
     pub trading_fee_pct: Decimal,
-    /// Position size as fraction of portfolio.
+    /// Total capital per arbitrage entry, as a fraction of the portfolio, split
+    /// across the YES and NO legs so both buy the same number of shares.
     pub position_size: Decimal,
     /// Maximum positions to hold.
     pub max_positions: usize,
@@ -381,7 +398,7 @@ impl ArbitrageStrategy {
             .iter()
             .map(|s| {
                 let spread = Decimal::ONE - s.yes_ask - s.no_ask;
-                spread.to_string().parse().unwrap_or(0.0)
+                spread.to_f64().unwrap_or(0.0)
             })
             .collect();
 
@@ -414,6 +431,14 @@ impl Strategy for ArbitrageStrategy {
 
     fn description(&self) -> &str {
         "Fee-aware arbitrage with liquidity filtering and optional dynamic thresholds"
+    }
+
+    fn required_history(&self) -> usize {
+        if self.use_dynamic_threshold {
+            self.volatility_lookback
+        } else {
+            1
+        }
     }
 
     async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>> {
@@ -454,15 +479,21 @@ impl Strategy for ArbitrageStrategy {
                     let expected_profit = spread - round_trip_fee(self.trading_fee_pct);
 
                     // Confidence based on expected profit relative to fees
-                    let confidence = expected_profit
-                        .to_string()
-                        .parse::<f64>()
-                        .unwrap_or(0.5)
-                        .clamp(0.0, 1.0);
+                    let confidence = expected_profit.to_f64().unwrap_or(0.5).clamp(0.0, 1.0);
 
-                    let per_leg_size = self.position_size / Decimal::TWO;
+                    // Size both legs with equal SHARES. One YES plus one NO pays
+                    // exactly $1 at resolution, so the pair is only hedged when the
+                    // share counts match; equal *dollars* would leave the cheaper
+                    // leg over-sized and the position directional. The total budget
+                    // (`position_size` of the portfolio) is split in proportion to
+                    // the leg prices: shares = budget / (yes_ask + no_ask), and each
+                    // leg's fraction of the portfolio is shares * price / portfolio.
+                    if total_ask <= Decimal::ZERO {
+                        continue;
+                    }
                     for (outcome, price) in [("yes", snapshot.yes_ask), ("no", snapshot.no_ask)] {
-                        let signal = Signal::buy(market_id, outcome, per_leg_size)
+                        let leg_size = self.position_size * price / total_ask;
+                        let signal = Signal::buy(market_id, outcome, leg_size)
                             .with_entry_price(price)
                             .with_confidence(confidence)
                             .with_metadata("spread", &spread.to_string())
@@ -607,20 +638,11 @@ impl MomentumStrategy {
             let prev = window[0];
             let curr = window[1];
 
-            let high_diff: f64 = (curr.yes_ask - prev.yes_ask)
-                .to_string()
-                .parse()
-                .unwrap_or(0.0);
-            let low_diff: f64 = (prev.yes_bid - curr.yes_bid)
-                .to_string()
-                .parse()
-                .unwrap_or(0.0);
+            let high_diff: f64 = (curr.yes_ask - prev.yes_ask).to_f64().unwrap_or(0.0);
+            let low_diff: f64 = (prev.yes_bid - curr.yes_bid).to_f64().unwrap_or(0.0);
 
             // True range (simplified)
-            let range: f64 = (curr.yes_ask - curr.yes_bid)
-                .to_string()
-                .parse()
-                .unwrap_or(0.01);
+            let range: f64 = (curr.yes_ask - curr.yes_bid).to_f64().unwrap_or(0.01);
             true_range_sum += range.max(0.01);
 
             if high_diff > low_diff && high_diff > 0.0 {
@@ -721,6 +743,14 @@ impl Strategy for MomentumStrategy {
         "Enhanced momentum with volume confirmation and trend strength"
     }
 
+    fn required_history(&self) -> usize {
+        if self.use_multi_timeframe {
+            self.lookback_periods.max(self.long_term_lookback)
+        } else {
+            self.lookback_periods
+        }
+    }
+
     async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>> {
         let mut signals = Vec::new();
 
@@ -785,9 +815,8 @@ impl Strategy for MomentumStrategy {
                     }
 
                     // Calculate confidence based on momentum and trend strength
-                    let confidence = (momentum.to_string().parse::<f64>().unwrap_or(0.0)
-                        * trend_strength)
-                        .clamp(0.1, 1.0);
+                    let confidence =
+                        (momentum.to_f64().unwrap_or(0.0) * trend_strength).clamp(0.1, 1.0);
 
                     signals.push(
                         Signal::buy(market_id, "yes", self.position_size)
@@ -1022,6 +1051,10 @@ impl Strategy for MeanReversionStrategy {
         "Enhanced mean reversion with regime detection and dynamic thresholds"
     }
 
+    fn required_history(&self) -> usize {
+        self.lookback_periods
+    }
+
     async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>> {
         self.current_period += 1;
         let mut signals = Vec::new();
@@ -1032,10 +1065,7 @@ impl Strategy for MeanReversionStrategy {
             }
 
             let recent = context.recent_snapshots(market_id, self.lookback_periods);
-            let prices: Vec<f64> = recent
-                .iter()
-                .filter_map(|s| s.yes_bid.to_string().parse().ok())
-                .collect();
+            let prices: Vec<f64> = recent.iter().filter_map(|s| s.yes_bid.to_f64()).collect();
 
             if prices.len() < self.lookback_periods {
                 continue;
@@ -1244,7 +1274,7 @@ impl GridStrategy {
 
         let deviation = (price - center) / center;
         let level = deviation / self.grid_spacing_pct;
-        level.to_string().parse::<f64>().unwrap_or(0.0).round() as i32
+        level.to_f64().unwrap_or(0.0).round() as i32
     }
 
     /// Calculate price from grid level.
@@ -1279,6 +1309,14 @@ impl Strategy for GridStrategy {
 
     fn description(&self) -> &str {
         "Grid trading with automatic level management"
+    }
+
+    fn required_history(&self) -> usize {
+        if self.use_dynamic_center {
+            self.center_lookback
+        } else {
+            1
+        }
     }
 
     async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>> {
@@ -1517,5 +1555,136 @@ mod tests {
 
         let small: Vec<f64> = vec![0.5, 0.51];
         assert_eq!(strategy.detect_regime(&small), MarketRegime::RangeBound);
+    }
+}
+
+/// Arbitrage legs must buy equal share counts so the pair is hedged.
+#[cfg(test)]
+mod arbitrage_sizing_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn context_with(yes_ask: &str, no_ask: &str) -> StrategyContext {
+        let mut context = StrategyContext::new(Decimal::new(10_000, 0));
+        let snapshot = MarketSnapshot::new(
+            "m",
+            Utc::now(),
+            yes_ask.parse::<Decimal>().unwrap() - Decimal::new(1, 2),
+            yes_ask.parse().unwrap(),
+            no_ask.parse::<Decimal>().unwrap() - Decimal::new(1, 2),
+            no_ask.parse().unwrap(),
+        )
+        .with_depth(
+            Decimal::from(1000),
+            Decimal::from(1000),
+            Decimal::from(1000),
+            Decimal::from(1000),
+        );
+        context.market_data.insert("m".to_string(), vec![snapshot]);
+        context
+    }
+
+    fn shares(signal: &Signal, portfolio: Decimal, price: Decimal) -> Decimal {
+        portfolio * signal.position_size / price
+    }
+
+    #[tokio::test]
+    async fn both_legs_buy_the_same_number_of_shares() {
+        let mut strategy =
+            ArbitrageStrategy::new(Decimal::ZERO, Decimal::new(20, 2), 10).with_fee(Decimal::ZERO);
+        let context = context_with("0.40", "0.55");
+
+        let signals = strategy.on_data(&context).await.unwrap();
+        assert_eq!(signals.len(), 2);
+        let yes = signals.iter().find(|s| s.outcome_id == "yes").unwrap();
+        let no = signals.iter().find(|s| s.outcome_id == "no").unwrap();
+
+        let portfolio = context.portfolio_value;
+        let yes_shares = shares(yes, portfolio, Decimal::new(40, 2));
+        let no_shares = shares(no, portfolio, Decimal::new(55, 2));
+        assert!(
+            (yes_shares - no_shares).abs() < Decimal::new(1, 9),
+            "{yes_shares} YES vs {no_shares} NO"
+        );
+
+        // The two legs together still spend exactly `position_size` of the
+        // portfolio, split by price (the old code spent half on each leg, i.e.
+        // 2,500 YES shares but only ~1,818 NO shares for a $1,000 leg budget).
+        let total = yes.position_size + no.position_size;
+        assert!((total - Decimal::new(20, 2)).abs() < Decimal::new(1, 12));
+        assert!(
+            yes.position_size < no.position_size,
+            "cheaper leg gets less"
+        );
+        // 20% of $10,000 over a $0.95 pair = 2,105.26 shares of each.
+        assert!((yes_shares - Decimal::new(210_526, 2)).abs() < Decimal::ONE);
+    }
+
+    #[tokio::test]
+    async fn equal_prices_split_the_budget_evenly() {
+        let mut strategy =
+            ArbitrageStrategy::new(Decimal::ZERO, Decimal::new(10, 2), 10).with_fee(Decimal::ZERO);
+        let signals = strategy
+            .on_data(&context_with("0.45", "0.45"))
+            .await
+            .unwrap();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].position_size, signals[1].position_size);
+        assert_eq!(signals[0].position_size, Decimal::new(5, 2));
+    }
+
+    #[tokio::test]
+    async fn no_signal_without_a_spread() {
+        let mut strategy = ArbitrageStrategy::new(Decimal::new(1, 2), Decimal::new(10, 2), 10)
+            .with_fee(Decimal::ZERO);
+        assert!(strategy
+            .on_data(&context_with("0.50", "0.52"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn required_history_follows_the_declared_lookbacks() {
+        assert_eq!(
+            MomentumStrategy::new(288, Decimal::new(5, 2), Decimal::new(1, 1)).required_history(),
+            288
+        );
+        let multi = MomentumStrategy::new(20, Decimal::new(5, 2), Decimal::new(1, 1))
+            .with_multi_timeframe(300);
+        assert_eq!(multi.required_history(), 300);
+        assert_eq!(
+            MeanReversionStrategy::new(576, 2.0, Decimal::new(1, 1)).required_history(),
+            576
+        );
+        assert_eq!(
+            ArbitrageStrategy::default().required_history(),
+            1,
+            "static threshold needs only the latest snapshot"
+        );
+        assert_eq!(
+            ArbitrageStrategy::default()
+                .with_dynamic_threshold(40, 1.5)
+                .required_history(),
+            40
+        );
+        assert_eq!(
+            GridStrategy::new(3, Decimal::new(2, 2), Decimal::new(5, 2))
+                .with_dynamic_center(60)
+                .required_history(),
+            60
+        );
+
+        struct Plain;
+        #[async_trait]
+        impl Strategy for Plain {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            async fn on_data(&mut self, _: &StrategyContext) -> Result<Vec<Signal>> {
+                Ok(vec![])
+            }
+        }
+        assert_eq!(Plain.required_history(), DEFAULT_REQUIRED_HISTORY);
     }
 }

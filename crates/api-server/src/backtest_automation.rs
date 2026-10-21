@@ -8,8 +8,12 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::handlers::backtest::{
-    enqueue_backtest, RunBacktestRequest, SlippageModel, StrategyConfig,
+    enqueue_backtest, reap_stale_running_backtests, RunBacktestRequest, SlippageModel,
+    StrategyConfig,
 };
+
+/// Default time after which a backtest still marked `running` is considered dead.
+pub const DEFAULT_STALE_RUN_TIMEOUT_MINUTES: i64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct BacktestAutomationConfig {
@@ -17,6 +21,8 @@ pub struct BacktestAutomationConfig {
     pub interval_secs: u64,
     pub startup_delay_secs: u64,
     pub claim_limit: i64,
+    /// A backtest `running` for longer than this is marked `failed` by the reaper.
+    pub stale_run_timeout_minutes: i64,
 }
 
 impl BacktestAutomationConfig {
@@ -37,6 +43,11 @@ impl BacktestAutomationConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
+            stale_run_timeout_minutes: std::env::var("BACKTEST_STALE_RUN_TIMEOUT_MINUTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|minutes| *minutes > 0)
+                .unwrap_or(DEFAULT_STALE_RUN_TIMEOUT_MINUTES),
         }
     }
 }
@@ -54,6 +65,10 @@ struct ClaimedScheduleRow {
 }
 
 pub fn spawn_backtest_automation(config: BacktestAutomationConfig, pool: PgPool) {
+    // The reaper protects manual runs as well, so it runs even when scheduling
+    // itself is disabled.
+    tokio::spawn(run_reaper(config.clone(), pool.clone()));
+
     if !config.enabled {
         info!("Backtest automation disabled (BACKTEST_AUTOMATION_ENABLED != true)");
         return;
@@ -67,6 +82,26 @@ pub fn spawn_backtest_automation(config: BacktestAutomationConfig, pool: PgPool)
     );
 
     tokio::spawn(run_scheduler(config, pool));
+}
+
+/// Periodically fail backtests whose worker died before recording an outcome.
+async fn run_reaper(config: BacktestAutomationConfig, pool: PgPool) {
+    let max_age = Duration::minutes(config.stale_run_timeout_minutes);
+    let interval = time::Duration::from_secs(config.interval_secs.max(30));
+
+    loop {
+        match reap_stale_running_backtests(&pool, max_age).await {
+            Ok(0) => {}
+            Ok(reaped) => warn!(
+                reaped,
+                timeout_minutes = config.stale_run_timeout_minutes,
+                "Marked stale running backtests as failed"
+            ),
+            Err(error) => warn!(error = %error, "Stale backtest reaper failed"),
+        }
+
+        tokio::time::sleep(interval).await;
+    }
 }
 
 async fn run_scheduler(config: BacktestAutomationConfig, pool: PgPool) {
@@ -186,5 +221,6 @@ mod tests {
         assert!(config.interval_secs > 0);
         assert!(config.startup_delay_secs > 0);
         assert!(config.claim_limit > 0);
+        assert!(config.stale_run_timeout_minutes > 0);
     }
 }

@@ -284,9 +284,13 @@ impl MetricsCalculator {
     /// Compute Pearson correlation coefficients between same-category markets.
     ///
     /// For each active category in `market_metadata`, self-joins `orderbook_hourly`
-    /// to compute pairwise correlations from hourly close prices over the last 90 days.
-    /// Pairs with `|r| > 0.50` and at least 168 overlapping observations (≈ 1 week)
-    /// are UPSERTed into `market_correlations`. Stale pairs (>14 days) are pruned.
+    /// to compute pairwise correlations of **hourly price changes** (differences of
+    /// consecutive hourly closes) over the last 90 days. Correlating price *levels*
+    /// would report any two markets that both drifted over the period as correlated
+    /// (spurious correlation between trending series); changes remove that trend.
+    /// Pairs with `|r| > 0.50` and at least 168 overlapping hourly changes (≈ 1 week)
+    /// are UPSERTed into `market_correlations`. Pairs of a computed category that no
+    /// longer qualify, and any pair not refreshed in 14 days, are pruned.
     async fn compute_market_correlations(&self) -> Result<()> {
         let start = Utc::now();
 
@@ -311,6 +315,13 @@ impl MetricsCalculator {
             return Ok(());
         }
 
+        // Database clock: rows upserted below are stamped with the database's
+        // NOW(), so the "not refreshed in this run" cut-off must come from the same
+        // clock rather than from this process's.
+        let run_started: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&self.pool)
+            .await?;
+
         let mut total_pairs: u64 = 0;
 
         for category in &categories {
@@ -331,28 +342,41 @@ impl MetricsCalculator {
                       AND mm.active = true
                       AND oh.bucket >= NOW() - INTERVAL '90 days'
                       AND oh.close > 0
+                ),
+                hourly_changes AS (
+                    SELECT
+                        market_id,
+                        bucket,
+                        price - LAG(price) OVER w AS change,
+                        bucket - LAG(bucket) OVER w AS gap
+                    FROM hourly_prices
+                    WINDOW w AS (PARTITION BY market_id ORDER BY bucket)
+                ),
+                changes AS (
+                    -- Only changes between *consecutive* hours: a missing hour would
+                    -- make the difference span several hours.
+                    SELECT market_id, bucket, change
+                    FROM hourly_changes
+                    WHERE change IS NOT NULL
+                      AND gap = INTERVAL '1 hour'
                 )
                 SELECT
                     a.market_id AS condition_id_a,
                     b.market_id AS condition_id_b,
-                    CORR(a.price, b.price) AS correlation,
+                    CORR(a.change, b.change) AS correlation,
                     COUNT(*)::INT AS sample_size
-                FROM hourly_prices a
-                JOIN hourly_prices b
+                FROM changes a
+                JOIN changes b
                     ON a.bucket = b.bucket
                     AND a.market_id < b.market_id
                 GROUP BY a.market_id, b.market_id
                 HAVING COUNT(*) >= 168
-                   AND ABS(CORR(a.price, b.price)) > 0.50
+                   AND ABS(CORR(a.change, b.change)) > 0.50
                 "#,
             )
             .bind(category)
             .fetch_all(&self.pool)
             .await?;
-
-            if rows.is_empty() {
-                continue;
-            }
 
             // Filter out NULL correlations (degenerate pairs with zero variance)
             let valid_rows: Vec<&CorrelationRow> =
@@ -383,6 +407,16 @@ impl MetricsCalculator {
                 qb.build().execute(&self.pool).await?;
                 total_pairs += chunk.len() as u64;
             }
+
+            // Drop this category's pairs that were not refreshed above: they no
+            // longer qualify (e.g. pairs stored from the old level-based
+            // correlation, or whose changes decorrelated) and must not linger
+            // until the 14-day prune.
+            sqlx::query("DELETE FROM market_correlations WHERE category = $1 AND computed_at < $2")
+                .bind(category)
+                .bind(run_started)
+                .execute(&self.pool)
+                .await?;
 
             // Yield between categories to avoid blocking the pool
             tokio::task::yield_now().await;
@@ -608,5 +642,266 @@ mod tests {
         std::env::remove_var("METRICS_CALCULATOR_INTERVAL_SECS");
         std::env::remove_var("METRICS_CALCULATOR_BATCH_SIZE");
         std::env::remove_var("METRICS_RECALC_AFTER_HOURS");
+    }
+}
+
+/// Market correlations are computed on hourly price changes, not on levels.
+#[cfg(test)]
+mod correlation_tests {
+    use super::*;
+    use chrono::DurationRound;
+
+    /// The query used before: Pearson correlation of price LEVELS.
+    const LEVELS_SQL: &str = r#"
+        WITH hourly_prices AS (
+            SELECT oh.market_id, oh.bucket, oh.close AS price
+            FROM orderbook_hourly oh
+            JOIN market_metadata mm ON mm.condition_id = oh.market_id
+            WHERE mm.category = $1 AND mm.active = true
+              AND oh.bucket >= NOW() - INTERVAL '90 days' AND oh.close > 0
+        )
+        SELECT a.market_id AS condition_id_a, b.market_id AS condition_id_b,
+               CORR(a.price, b.price) AS correlation, COUNT(*)::INT AS sample_size
+        FROM hourly_prices a
+        JOIN hourly_prices b ON a.bucket = b.bucket AND a.market_id < b.market_id
+        GROUP BY a.market_id, b.market_id
+        HAVING COUNT(*) >= 168 AND ABS(CORR(a.price, b.price)) > 0.50
+    "#;
+
+    async fn create_tables(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE market_metadata (
+                condition_id TEXT PRIMARY KEY,
+                category TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE
+            );
+            CREATE TABLE orderbook_hourly (
+                market_id TEXT NOT NULL,
+                bucket TIMESTAMPTZ NOT NULL,
+                close NUMERIC
+            );
+            CREATE TABLE market_correlations (
+                condition_id_a  TEXT NOT NULL,
+                condition_id_b  TEXT NOT NULL,
+                correlation     DOUBLE PRECISION NOT NULL,
+                category        TEXT,
+                sample_size     INT NOT NULL,
+                computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (condition_id_a, condition_id_b),
+                CONSTRAINT market_correlations_ordered CHECK (condition_id_a < condition_id_b)
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// Deterministic uniform noise in [-0.01, 0.01).
+    fn noise(seed: u64, n: usize) -> Vec<f64> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.02
+            })
+            .collect()
+    }
+
+    const POINTS: usize = 400;
+
+    /// `level(i)` per hourly bucket, ending at the current hour.
+    async fn insert_series(
+        pool: &PgPool,
+        market: &str,
+        category: &str,
+        values: &[f64],
+        skip: Option<usize>,
+    ) {
+        sqlx::query("INSERT INTO market_metadata VALUES ($1, $2, TRUE) ON CONFLICT DO NOTHING")
+            .bind(market)
+            .bind(category)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let now_hour = Utc::now()
+            .duration_trunc(Duration::hours(1))
+            .expect("truncate to the hour");
+        let n = values.len();
+        let mut buckets = Vec::new();
+        let mut closes = Vec::new();
+        for (i, value) in values.iter().enumerate() {
+            if Some(i) == skip {
+                continue;
+            }
+            buckets.push(now_hour - Duration::hours((n - 1 - i) as i64));
+            closes.push(*value);
+        }
+        sqlx::query(
+            "INSERT INTO orderbook_hourly (market_id, bucket, close) \
+             SELECT $1, b, c::numeric FROM UNNEST($2::timestamptz[], $3::float8[]) AS t(b, c)",
+        )
+        .bind(market)
+        .bind(&buckets)
+        .bind(&closes)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// a and b drift upwards independently; c shares a's shocks but has its
+    /// own drift. Levels: all three look strongly correlated (shared uptrend).
+    /// Hourly changes: only a and c are related.
+    async fn seed_politics(pool: &PgPool) {
+        let na = noise(1, POINTS);
+        let nb = noise(2, POINTS);
+        let a: Vec<f64> = (0..POINTS)
+            .map(|i| 0.20 + 0.0004 * i as f64 + na[i])
+            .collect();
+        let b: Vec<f64> = (0..POINTS)
+            .map(|i| 0.30 + 0.0003 * i as f64 + nb[i])
+            .collect();
+        let c: Vec<f64> = (0..POINTS)
+            .map(|i| 0.35 + 0.0002 * i as f64 + na[i])
+            .collect();
+        insert_series(pool, "a", "politics", &a, None).await;
+        insert_series(pool, "b", "politics", &b, None).await;
+        insert_series(pool, "c", "politics", &c, None).await;
+    }
+
+    fn calculator(pool: &PgPool) -> MetricsCalculator {
+        MetricsCalculator::new(pool.clone(), MetricsCalculatorConfig::default())
+    }
+
+    async fn stored(pool: &PgPool) -> Vec<(String, String, f64, i32)> {
+        sqlx::query_as(
+            "SELECT condition_id_a, condition_id_b, correlation, sample_size \
+             FROM market_correlations ORDER BY condition_id_a, condition_id_b",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn trending_markets_are_not_reported_as_correlated(pool: PgPool) {
+        create_tables(&pool).await;
+        seed_politics(&pool).await;
+
+        // Control: the old level-based query flags every pair (spurious).
+        let old: Vec<CorrelationRow> = sqlx::query_as(LEVELS_SQL)
+            .bind("politics")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let old_pairs: Vec<_> = old
+            .iter()
+            .map(|r| (r.condition_id_a.as_str(), r.condition_id_b.as_str()))
+            .collect();
+        assert!(old_pairs.contains(&("a", "b")), "levels: {old_pairs:?}");
+        assert!(old_pairs.contains(&("b", "c")), "levels: {old_pairs:?}");
+
+        calculator(&pool)
+            .compute_market_correlations()
+            .await
+            .unwrap();
+
+        // Only the pair whose hourly changes really move together remains.
+        let rows = stored(&pool).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (a, c, correlation, sample_size) = &rows[0];
+        assert_eq!((a.as_str(), c.as_str()), ("a", "c"));
+        assert!(*correlation > 0.99, "got {correlation}");
+        assert_eq!(
+            *sample_size,
+            (POINTS - 1) as i32,
+            "one change per consecutive hour pair"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn missing_hours_do_not_create_multi_hour_changes(pool: PgPool) {
+        create_tables(&pool).await;
+        let na = noise(1, POINTS);
+        let a: Vec<f64> = (0..POINTS)
+            .map(|i| 0.20 + 0.0004 * i as f64 + na[i])
+            .collect();
+        let c: Vec<f64> = (0..POINTS)
+            .map(|i| 0.35 + 0.0002 * i as f64 + na[i])
+            .collect();
+        // Drop hour 200 from `a`: the change into it does not exist and the
+        // change out of it spans two hours, so both are excluded.
+        insert_series(&pool, "a", "politics", &a, Some(200)).await;
+        insert_series(&pool, "c", "politics", &c, None).await;
+
+        calculator(&pool)
+            .compute_market_correlations()
+            .await
+            .unwrap();
+
+        let rows = stored(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, (POINTS - 3) as i32);
+        assert!(rows[0].2 > 0.99);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn short_histories_are_not_enough(pool: PgPool) {
+        create_tables(&pool).await;
+        let na = noise(1, 100);
+        let a: Vec<f64> = (0..100).map(|i| 0.20 + 0.0004 * i as f64 + na[i]).collect();
+        let c: Vec<f64> = (0..100).map(|i| 0.35 + 0.0002 * i as f64 + na[i]).collect();
+        insert_series(&pool, "a", "politics", &a, None).await;
+        insert_series(&pool, "c", "politics", &c, None).await;
+
+        calculator(&pool)
+            .compute_market_correlations()
+            .await
+            .unwrap();
+        assert!(stored(&pool).await.is_empty(), "fewer than 168 changes");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pairs_that_no_longer_qualify_are_removed_but_other_categories_are_kept(pool: PgPool) {
+        create_tables(&pool).await;
+        seed_politics(&pool).await;
+        // A pair stored by the old level-based computation, and one in another
+        // category that this run does not recompute.
+        sqlx::query(
+            "INSERT INTO market_correlations VALUES \
+             ('a', 'b', 0.97, 'politics', 400, NOW() - INTERVAL '1 day'), \
+             ('x', 'y', 0.80, 'sports', 300, NOW() - INTERVAL '1 day')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO market_metadata VALUES ('x', 'sports', FALSE), ('y', 'sports', FALSE)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        calculator(&pool)
+            .compute_market_correlations()
+            .await
+            .unwrap();
+
+        let pairs: Vec<(String, String)> = stored(&pool)
+            .await
+            .into_iter()
+            .map(|(a, b, _, _)| (a, b))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), "c".to_string()),
+                ("x".to_string(), "y".to_string())
+            ]
+        );
     }
 }

@@ -257,13 +257,21 @@ impl WalletDiscovery {
             );
         }
 
-        // Sort by composite score (falls back to ROI when composite unavailable)
+        // Rank by composite score (0 when not computed), then ROI, then address.
+        // This is the same key the query orders by; the composite score (a
+        // probability) is never mixed with ROI (an unbounded ratio) as one number.
         discovered.sort_by(|a, b| {
-            let score_a = a.composite_score.unwrap_or(a.roi);
-            let score_b = b.composite_score.unwrap_or(b.roi);
+            let score_a = a.composite_score.unwrap_or(0.0);
+            let score_b = b.composite_score.unwrap_or(0.0);
             score_b
                 .partial_cmp(&score_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.roi
+                        .partial_cmp(&a.roi)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.address.cmp(&b.address))
         });
 
         // Apply limit
@@ -391,6 +399,15 @@ impl WalletDiscovery {
         cutoff_date: &DateTime<Utc>,
         criteria: &DiscoveryCriteria,
     ) -> Result<Vec<DiscoveredWallet>> {
+        // Every criterion is applied in SQL so that LIMIT keeps the best wallets
+        // that actually qualify (filtering after the LIMIT could return fewer, or
+        // none, even though qualifying wallets exist further down the ranking).
+        // The latest bot score per wallet is picked with a LATERAL lookup so a
+        // wallet with several historical scores is one row, judged on its newest
+        // score. Rank key: composite score (predicted success probability, 0 when
+        // not computed); ROI and address only break ties deterministically.
+        let stale_cutoff = (criteria.max_staleness_days > 0)
+            .then(|| Utc::now() - Duration::days(criteria.max_staleness_days as i64));
         let rows = sqlx::query(
             r#"
             SELECT
@@ -400,25 +417,41 @@ impl WalletDiscovery {
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
-                COALESCE(bs.total_score, 0)::INT4 as bot_score,
+                bs.total_score::INT4 as bot_score,
                 COALESCE(bs.classification, 0)::INT2 as classification,
                 COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
                 COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl,
                 COALESCE(wsm.predicted_success_prob, 0)::FLOAT8 as composite_score
             FROM wallet_features wf
-            LEFT JOIN bot_scores bs ON bs.address = wf.address
+            LEFT JOIN LATERAL (
+                SELECT b.total_score, b.classification
+                FROM bot_scores b
+                WHERE b.address = wf.address
+                ORDER BY b.computed_at DESC
+                LIMIT 1
+            ) bs ON TRUE
             LEFT JOIN wallet_success_metrics wsm ON wsm.address = wf.address
             WHERE wf.last_trade >= $1
               AND wf.total_trades >= $2
               AND wf.total_volume >= $3
-            ORDER BY COALESCE(wsm.predicted_success_prob, wsm.roi_30d, 0) DESC
+              AND ($5::timestamptz IS NULL OR wf.last_trade >= $5)
+              AND COALESCE(wsm.win_rate_30d, 0)::FLOAT8 >= $6
+              AND ($7::FLOAT8 IS NULL OR COALESCE(wsm.roi_30d, 0)::FLOAT8 >= $7)
+              AND (NOT $8 OR bs.total_score IS NULL OR bs.total_score < 50)
+            ORDER BY COALESCE(wsm.predicted_success_prob, 0) DESC,
+                     COALESCE(wsm.roi_30d, 0) DESC,
+                     wf.address ASC
             LIMIT $4
             "#,
         )
         .bind(cutoff_date)
         .bind(criteria.min_trades as i64)
         .bind(criteria.min_volume)
-        .bind((criteria.limit * 2) as i64)
+        .bind(i64::try_from(criteria.limit).unwrap_or(i64::MAX))
+        .bind(stale_cutoff)
+        .bind(criteria.min_win_rate)
+        .bind(criteria.min_roi)
+        .bind(criteria.exclude_bots)
         .fetch_all(&self.pool)
         .await?;
 
@@ -448,7 +481,9 @@ impl WalletDiscovery {
                     first_trade: row.get("first_trade"),
                     last_trade: row.get("last_trade"),
                     is_bot: row.get::<i16, _>("classification") >= 2,
-                    bot_score: Some(row.get::<i32, _>("bot_score") as u32),
+                    bot_score: row
+                        .get::<Option<i32>, _>("bot_score")
+                        .map(|score| score as u32),
                     discovered_at: Utc::now(),
                     composite_score,
                 }
@@ -468,15 +503,23 @@ impl WalletDiscovery {
                 wf.total_volume,
                 wf.first_trade,
                 wf.last_trade,
-                COALESCE(bs.total_score, 0)::INT4 as bot_score,
+                bs.total_score::INT4 as bot_score,
                 COALESCE(bs.classification, 0)::INT2 as classification,
                 COALESCE(wsm.roi_30d, 0)::FLOAT8 as roi,
                 COALESCE(wsm.roi_30d * wf.total_volume, 0) as total_pnl,
                 COALESCE(wsm.predicted_success_prob, 0)::FLOAT8 as composite_score
             FROM wallet_features wf
-            LEFT JOIN bot_scores bs ON bs.address = wf.address
+            LEFT JOIN LATERAL (
+                SELECT b.total_score, b.classification
+                FROM bot_scores b
+                WHERE b.address = wf.address
+                ORDER BY b.computed_at DESC
+                LIMIT 1
+            ) bs ON TRUE
             LEFT JOIN wallet_success_metrics wsm ON wsm.address = wf.address
             WHERE LOWER(wf.address) = $1
+            ORDER BY wf.address
+            LIMIT 1
             "#,
         )
         .bind(address)
@@ -507,7 +550,9 @@ impl WalletDiscovery {
                 first_trade: r.get("first_trade"),
                 last_trade: r.get("last_trade"),
                 is_bot: r.get::<i16, _>("classification") >= 2,
-                bot_score: Some(r.get::<i32, _>("bot_score") as u32),
+                bot_score: r
+                    .get::<Option<i32>, _>("bot_score")
+                    .map(|score| score as u32),
                 discovered_at: Utc::now(),
                 composite_score,
             }
@@ -534,6 +579,14 @@ impl WalletDiscovery {
         let mut last_trade: Option<DateTime<Utc>> = None;
 
         for transfer in transfers {
+            // `get_asset_transfers` returns both directions. This heuristic was
+            // written for outgoing transfers only (the only ones previously
+            // returned); keep it that way rather than counting every incoming
+            // transfer as a "win".
+            if transfer.from.to_lowercase() != address.to_lowercase() {
+                continue;
+            }
+
             if let Some(value) = transfer.value {
                 total_volume += Decimal::try_from(value).unwrap_or_default();
             }
@@ -840,5 +893,274 @@ mod tests {
             discovery.meets_criteria(&recent_wallet, &criteria),
             "Wallet active 10 days ago should pass staleness check"
         );
+    }
+}
+
+/// Discovery queries: filters before LIMIT, one row per wallet, a single rank key.
+#[cfg(test)]
+mod sql_tests {
+    use super::*;
+
+    async fn create_tables(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE wallet_features (
+                address TEXT PRIMARY KEY,
+                total_trades BIGINT NOT NULL,
+                total_volume NUMERIC NOT NULL,
+                first_trade TIMESTAMPTZ NOT NULL,
+                last_trade TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE bot_scores (
+                id SERIAL PRIMARY KEY,
+                address TEXT NOT NULL,
+                total_score INTEGER NOT NULL,
+                classification SMALLINT NOT NULL,
+                computed_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE wallet_success_metrics (
+                address TEXT PRIMARY KEY,
+                win_rate_30d NUMERIC(5, 4) NOT NULL DEFAULT 0,
+                roi_30d NUMERIC(20, 8) NOT NULL DEFAULT 0,
+                predicted_success_prob NUMERIC(5, 4) NOT NULL DEFAULT 0
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    struct Wallet<'a> {
+        address: &'a str,
+        trades: i64,
+        last_trade_days_ago: i64,
+        /// (win_rate, roi, predicted_success_prob); `None` = no metrics row.
+        metrics: Option<(&'a str, &'a str, &'a str)>,
+    }
+
+    impl<'a> Wallet<'a> {
+        fn new(address: &'a str) -> Self {
+            Self {
+                address,
+                trades: 100,
+                last_trade_days_ago: 1,
+                metrics: Some(("0.60", "0.10", "0.50")),
+            }
+        }
+    }
+
+    async fn insert(pool: &PgPool, w: &Wallet<'_>) {
+        sqlx::query(
+            "INSERT INTO wallet_features VALUES ($1, $2, 10000, NOW() - INTERVAL '60 days', \
+             NOW() - make_interval(days => $3::int))",
+        )
+        .bind(w.address)
+        .bind(w.trades)
+        .bind(w.last_trade_days_ago as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+        if let Some((win_rate, roi, prob)) = w.metrics {
+            sqlx::query(
+                "INSERT INTO wallet_success_metrics VALUES ($1, $2::numeric, $3::numeric, $4::numeric)",
+            )
+            .bind(w.address)
+            .bind(win_rate)
+            .bind(roi)
+            .bind(prob)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn score(pool: &PgPool, address: &str, total: i32, days_ago: i64) {
+        sqlx::query(
+            "INSERT INTO bot_scores (address, total_score, classification, computed_at) \
+             VALUES ($1, $2, CASE WHEN $2 >= 50 THEN 2 ELSE 0 END, \
+                     NOW() - make_interval(days => $3::int))",
+        )
+        .bind(address)
+        .bind(total)
+        .bind(days_ago as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn criteria() -> DiscoveryCriteria {
+        DiscoveryCriteria::new()
+            .min_trades(1)
+            .min_win_rate(0.0)
+            .min_volume(Decimal::ZERO)
+            .no_min_roi()
+            .time_window(90)
+            .limit(50)
+    }
+
+    fn addresses(wallets: &[DiscoveredWallet]) -> Vec<&str> {
+        wallets.iter().map(|w| w.address.as_str()).collect()
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn wallets_with_many_scores_are_one_row_judged_by_the_latest(pool: PgPool) {
+        create_tables(&pool).await;
+        insert(&pool, &Wallet::new("0xa")).await;
+        insert(&pool, &Wallet::new("0xb")).await;
+        // 0xa: was flagged, but its newest score is human-like.
+        score(&pool, "0xa", 90, 10).await;
+        score(&pool, "0xa", 10, 1).await;
+        // 0xb: was human-like, but its newest score flags it as a bot.
+        score(&pool, "0xb", 10, 10).await;
+        score(&pool, "0xb", 90, 1).await;
+
+        let discovery = WalletDiscovery::from_pool(pool);
+        let found = discovery
+            .discover_profitable_wallets(&criteria())
+            .await
+            .unwrap();
+
+        assert_eq!(addresses(&found), vec!["0xa"], "one row, newest score wins");
+        assert_eq!(found[0].bot_score, Some(10));
+
+        // Bots are only included when asked for - still one row each.
+        let with_bots = discovery
+            .discover_profitable_wallets(&criteria().include_bots())
+            .await
+            .unwrap();
+        assert_eq!(with_bots.len(), 2);
+        let b = with_bots.iter().find(|w| w.address == "0xb").unwrap();
+        assert_eq!(b.bot_score, Some(90));
+        assert!(b.is_bot);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn unscored_wallets_have_no_bot_score_instead_of_zero(pool: PgPool) {
+        create_tables(&pool).await;
+        insert(&pool, &Wallet::new("0xnew")).await;
+
+        let discovery = WalletDiscovery::from_pool(pool);
+        let found = discovery
+            .discover_profitable_wallets(&criteria())
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bot_score, None);
+        assert!(!found[0].is_bot);
+        let single = discovery.query_single_wallet_public("0xnew").await.unwrap();
+        assert_eq!(single.unwrap().bot_score, None);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn criteria_are_applied_before_the_limit(pool: PgPool) {
+        create_tables(&pool).await;
+        // Six wallets rank highest by composite score but fail the win-rate
+        // criterion; the two that qualify rank lower.
+        for i in 0..6 {
+            let address = format!("0xhigh{i}");
+            let mut wallet = Wallet::new(&address);
+            wallet.metrics = Some(("0.30", "0.50", "0.95"));
+            insert(&pool, &wallet).await;
+        }
+        for (address, prob) in [("0xgood1", "0.40"), ("0xgood2", "0.30")] {
+            let mut wallet = Wallet::new(address);
+            wallet.metrics = Some(("0.70", "0.20", prob));
+            insert(&pool, &wallet).await;
+        }
+
+        let discovery = WalletDiscovery::from_pool(pool);
+        let found = discovery
+            .discover_profitable_wallets(&criteria().min_win_rate(0.60).limit(2))
+            .await
+            .unwrap();
+        // The old query took LIMIT 4 (limit * 2) of the top composite scores - all
+        // failing wallets - and then filtered them down to nothing.
+        assert_eq!(addresses(&found), vec!["0xgood1", "0xgood2"]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn roi_staleness_and_bot_criteria_also_filter_in_sql(pool: PgPool) {
+        create_tables(&pool).await;
+        // High composite, but: low ROI / stale / bot.
+        let mut low_roi = Wallet::new("0xlowroi");
+        low_roi.metrics = Some(("0.70", "0.01", "0.99"));
+        insert(&pool, &low_roi).await;
+        let mut stale = Wallet::new("0xstale");
+        stale.last_trade_days_ago = 30;
+        stale.metrics = Some(("0.70", "0.20", "0.98"));
+        insert(&pool, &stale).await;
+        let mut bot = Wallet::new("0xbot");
+        bot.metrics = Some(("0.70", "0.20", "0.97"));
+        insert(&pool, &bot).await;
+        score(&pool, "0xbot", 80, 1).await;
+        // The only qualifying wallet, with the lowest composite score.
+        let mut ok = Wallet::new("0xok");
+        ok.metrics = Some(("0.70", "0.20", "0.10"));
+        insert(&pool, &ok).await;
+
+        let discovery = WalletDiscovery::from_pool(pool);
+        let found = discovery
+            .discover_profitable_wallets(&criteria().min_roi(0.05).max_staleness_days(14).limit(1))
+            .await
+            .unwrap();
+        assert_eq!(addresses(&found), vec!["0xok"]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn ranking_is_by_composite_score_then_roi_never_a_mix(pool: PgPool) {
+        create_tables(&pool).await;
+        let mut x = Wallet::new("0xx");
+        x.metrics = Some(("0.60", "0.05", "0.60"));
+        insert(&pool, &x).await;
+        // No composite score yet, but an enormous ROI. The old ORDER BY used
+        // COALESCE(probability, roi) and ranked this wallet first.
+        let mut y = Wallet::new("0xy");
+        y.metrics = Some(("0.60", "5.00", "0"));
+        insert(&pool, &y).await;
+        let mut z = Wallet::new("0xz");
+        z.metrics = Some(("0.60", "0.10", "0.80"));
+        insert(&pool, &z).await;
+        // Same composite as 0xx: ROI breaks the tie.
+        let mut w = Wallet::new("0xw");
+        w.metrics = Some(("0.60", "0.07", "0.60"));
+        insert(&pool, &w).await;
+
+        let discovery = WalletDiscovery::from_pool(pool);
+        let found = discovery
+            .discover_profitable_wallets(&criteria())
+            .await
+            .unwrap();
+        assert_eq!(addresses(&found), vec!["0xz", "0xw", "0xx", "0xy"]);
+
+        // With a limit, the SQL ranking and the in-memory ranking agree.
+        let top2 = discovery
+            .discover_profitable_wallets(&criteria().limit(2))
+            .await
+            .unwrap();
+        assert_eq!(addresses(&top2), vec!["0xz", "0xw"]);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn single_wallet_lookup_uses_the_latest_score(pool: PgPool) {
+        create_tables(&pool).await;
+        insert(&pool, &Wallet::new("0xabc")).await;
+        score(&pool, "0xabc", 95, 20).await;
+        score(&pool, "0xabc", 5, 2).await;
+        score(&pool, "0xabc", 40, 1).await;
+
+        let discovery = WalletDiscovery::from_pool(pool);
+        let wallet = discovery
+            .query_single_wallet_public("0xabc")
+            .await
+            .unwrap()
+            .expect("wallet exists");
+        assert_eq!(wallet.bot_score, Some(40));
+        assert!(!wallet.is_bot);
+        assert!(discovery
+            .query_single_wallet_public("0xmissing")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

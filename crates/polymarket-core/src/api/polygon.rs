@@ -186,26 +186,41 @@ impl PolygonClient {
         Ok(token_ids)
     }
 
-    /// Get transactions for a wallet address (via Alchemy enhanced API).
+    /// Get ERC-20 transfers involving a wallet address (via Alchemy enhanced API).
+    ///
+    /// `alchemy_getAssetTransfers` filters on exactly one side per call, so the
+    /// wallet's outgoing (`fromAddress`) and incoming (`toAddress`) transfers are
+    /// fetched with two calls and merged. A transfer that matches both filters
+    /// (e.g. a self-transfer) is returned once, identified by Alchemy's
+    /// `uniqueId` (`<tx hash>:log:<log index>`), falling back to a
+    /// hash/from/to/value/asset key. The result is ordered by block number.
+    ///
+    /// Each direction returns at most 1000 transfers (oldest first); paging via
+    /// `pageKey` is not implemented. If either call fails the whole call fails,
+    /// so callers never see a one-directional view of the wallet.
     pub async fn get_asset_transfers(
         &self,
         address: &str,
         from_block: Option<u64>,
         to_block: Option<u64>,
     ) -> Result<Vec<AssetTransfer>> {
-        let params = serde_json::json!([{
-            "fromAddress": address,
-            "fromBlock": from_block.map(|b| format!("0x{:x}", b)).unwrap_or_else(|| "0x0".to_string()),
-            "toBlock": to_block.map(|b| format!("0x{:x}", b)).unwrap_or_else(|| "latest".to_string()),
-            "category": ["erc20"],
-            "withMetadata": true,
-            "maxCount": "0x3e8" // 1000
-        }]);
+        let mut per_direction = Vec::with_capacity(2);
+        for direction in [TransferDirection::From, TransferDirection::To] {
+            let params = asset_transfers_params(address, direction, from_block, to_block);
+            let response: JsonRpcResponse<AssetTransfersResponse> =
+                self.rpc_call("alchemy_getAssetTransfers", params).await?;
+            let result = response.result.ok_or_else(|| Error::Api {
+                message: format!(
+                    "alchemy_getAssetTransfers ({}) returned no result: {}",
+                    direction.filter_key(),
+                    response.error.map(|e| e.message).unwrap_or_default()
+                ),
+                status: None,
+            })?;
+            per_direction.push(result.transfers);
+        }
 
-        let response: JsonRpcResponse<AssetTransfersResponse> =
-            self.rpc_call("alchemy_getAssetTransfers", params).await?;
-
-        Ok(response.result.map(|r| r.transfers).unwrap_or_default())
+        Ok(merge_asset_transfers(per_direction))
     }
 
     /// Get the USDC.e (PoS bridged) balance for a wallet — the token Polymarket uses.
@@ -543,6 +558,71 @@ fn topic_for_address(wallet_address: &str) -> String {
     )
 }
 
+/// Which side of a transfer the queried wallet is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferDirection {
+    /// Transfers sent by the wallet.
+    From,
+    /// Transfers received by the wallet.
+    To,
+}
+
+impl TransferDirection {
+    fn filter_key(self) -> &'static str {
+        match self {
+            TransferDirection::From => "fromAddress",
+            TransferDirection::To => "toAddress",
+        }
+    }
+}
+
+/// Build the `alchemy_getAssetTransfers` params for one direction.
+fn asset_transfers_params(
+    address: &str,
+    direction: TransferDirection,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+) -> serde_json::Value {
+    let mut filter = serde_json::json!({
+        "fromBlock": from_block.map(|b| format!("0x{:x}", b)).unwrap_or_else(|| "0x0".to_string()),
+        "toBlock": to_block.map(|b| format!("0x{:x}", b)).unwrap_or_else(|| "latest".to_string()),
+        "category": ["erc20"],
+        "withMetadata": true,
+        "maxCount": "0x3e8" // 1000
+    });
+    filter[direction.filter_key()] = serde_json::Value::String(address.to_string());
+    serde_json::json!([filter])
+}
+
+/// Identity of a transfer for de-duplication across the two direction queries.
+fn transfer_identity(transfer: &AssetTransfer) -> String {
+    match &transfer.unique_id {
+        Some(id) if !id.is_empty() => id.to_lowercase(),
+        _ => format!(
+            "{}|{}|{}|{:?}|{:?}",
+            transfer.hash.to_lowercase(),
+            transfer.from.to_lowercase(),
+            transfer.to.to_lowercase(),
+            transfer.value.map(f64::to_bits),
+            transfer.asset
+        ),
+    }
+}
+
+/// Merge per-direction transfer lists: drop duplicates (first occurrence wins)
+/// and order by block number. The sort is stable, so transfers within a block
+/// keep their relative order; blocks that cannot be parsed sort last.
+fn merge_asset_transfers(lists: Vec<Vec<AssetTransfer>>) -> Vec<AssetTransfer> {
+    let mut seen = HashSet::new();
+    let mut merged: Vec<AssetTransfer> = lists
+        .into_iter()
+        .flatten()
+        .filter(|transfer| seen.insert(transfer_identity(transfer)))
+        .collect();
+    merged.sort_by_key(|t| parse_hex_u64(&t.block_num).unwrap_or(u64::MAX));
+    merged
+}
+
 fn extract_ctf_token_ids(log: &Log) -> Result<Vec<String>> {
     let Some(topic_0) = log.topics.first() else {
         return Ok(Vec::new());
@@ -643,6 +723,10 @@ pub struct AssetTransfer {
     pub value: Option<f64>,
     pub asset: Option<String>,
     pub hash: String,
+    /// Alchemy's per-transfer id (`<tx hash>:log:<log index>`); distinguishes
+    /// several transfers within one transaction.
+    #[serde(rename = "uniqueId", default)]
+    pub unique_id: Option<String>,
     #[serde(rename = "blockNum")]
     pub block_num: String,
     pub metadata: Option<TransferMetadata>,
@@ -665,8 +749,130 @@ struct AssetTransfersResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_ctf_token_ids, Log, ERC1155_TRANSFER_BATCH_TOPIC, ERC1155_TRANSFER_SINGLE_TOPIC,
+        asset_transfers_params, extract_ctf_token_ids, merge_asset_transfers, AssetTransfer,
+        AssetTransfersResponse, Log, TransferDirection, ERC1155_TRANSFER_BATCH_TOPIC,
+        ERC1155_TRANSFER_SINGLE_TOPIC,
     };
+
+    fn transfer(
+        unique_id: Option<&str>,
+        hash: &str,
+        from: &str,
+        to: &str,
+        block: &str,
+    ) -> AssetTransfer {
+        AssetTransfer {
+            from: from.to_string(),
+            to: to.to_string(),
+            value: Some(10.0),
+            asset: Some("USDC".to_string()),
+            hash: hash.to_string(),
+            unique_id: unique_id.map(str::to_string),
+            block_num: block.to_string(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn asset_transfer_params_filter_on_the_requested_side_only() {
+        let from = asset_transfers_params("0xabc", TransferDirection::From, None, None);
+        let filter = &from[0];
+        assert_eq!(filter["fromAddress"], "0xabc");
+        assert!(filter.get("toAddress").is_none());
+        assert_eq!(filter["fromBlock"], "0x0");
+        assert_eq!(filter["toBlock"], "latest");
+        assert_eq!(filter["maxCount"], "0x3e8");
+        assert_eq!(filter["category"][0], "erc20");
+
+        let to = asset_transfers_params("0xabc", TransferDirection::To, Some(255), Some(4096));
+        let filter = &to[0];
+        assert_eq!(filter["toAddress"], "0xabc");
+        assert!(filter.get("fromAddress").is_none());
+        assert_eq!(filter["fromBlock"], "0xff");
+        assert_eq!(filter["toBlock"], "0x1000");
+    }
+
+    #[test]
+    fn merge_asset_transfers_dedupes_by_unique_id_and_orders_by_block() {
+        let outgoing = vec![
+            transfer(Some("0xaa:log:0x1"), "0xaa", "0xw", "0xex", "0x10"),
+            // Self-transfer: appears in both direction queries.
+            transfer(Some("0xcc:log:0x0"), "0xcc", "0xw", "0xw", "0x30"),
+        ];
+        let incoming = vec![
+            transfer(Some("0xbb:log:0x2"), "0xbb", "0xex", "0xw", "0x20"),
+            transfer(Some("0xCC:log:0x0"), "0xcc", "0xw", "0xw", "0x30"),
+            // Same transaction, different log: must NOT be treated as a duplicate.
+            transfer(Some("0xaa:log:0x3"), "0xaa", "0xex2", "0xw", "0x10"),
+        ];
+
+        let merged = merge_asset_transfers(vec![outgoing, incoming]);
+        let ids: Vec<_> = merged
+            .iter()
+            .map(|t| t.unique_id.clone().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "0xaa:log:0x1",
+                "0xaa:log:0x3",
+                "0xbb:log:0x2",
+                "0xcc:log:0x0"
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_asset_transfers_falls_back_to_content_key_without_unique_id() {
+        let a = transfer(None, "0xaa", "0xw", "0xex", "0x10");
+        let same = transfer(None, "0xAA", "0xW", "0xEX", "0x10");
+        let mut different_value = transfer(None, "0xaa", "0xw", "0xex", "0x10");
+        different_value.value = Some(11.0);
+
+        let merged = merge_asset_transfers(vec![vec![a], vec![same, different_value]]);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_asset_transfers_sorts_unparseable_blocks_last() {
+        let merged = merge_asset_transfers(vec![vec![
+            transfer(Some("x"), "0x1", "0xw", "0xe", "garbage"),
+            transfer(Some("y"), "0x2", "0xw", "0xe", "0x2"),
+        ]]);
+        assert_eq!(merged[0].block_num, "0x2");
+        assert_eq!(merged[1].block_num, "garbage");
+    }
+
+    #[test]
+    fn alchemy_response_with_unique_id_deserializes() {
+        let json = r#"{
+            "transfers": [{
+                "blockNum": "0x1b4",
+                "uniqueId": "0xabc:log:0x7",
+                "hash": "0xabc",
+                "from": "0x1",
+                "to": "0x2",
+                "value": 12.5,
+                "asset": "USDC",
+                "category": "erc20",
+                "metadata": {"blockTimestamp": "2025-01-01T00:00:00.000Z"}
+            }, {
+                "blockNum": "0x1b5",
+                "hash": "0xdef",
+                "from": "0x2",
+                "to": "0x1",
+                "value": null,
+                "asset": null
+            }]
+        }"#;
+        let parsed: AssetTransfersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.transfers.len(), 2);
+        assert_eq!(
+            parsed.transfers[0].unique_id.as_deref(),
+            Some("0xabc:log:0x7")
+        );
+        assert_eq!(parsed.transfers[1].unique_id, None);
+    }
 
     fn hex_word(value: u64) -> String {
         format!("{value:064x}")

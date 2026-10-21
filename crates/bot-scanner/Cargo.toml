@@ -30,6 +30,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 rust_decimal = { workspace = true }
 
+# Event topic hashing
+alloy-primitives = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }

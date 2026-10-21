@@ -34,6 +34,11 @@ pub struct SimulatorConfig {
     pub max_position_pct: Decimal,
     /// Maximum spread to allow fills (wider spreads may be rejected).
     pub max_spread_for_fill: Decimal,
+    /// Refuse to run if the query yields more snapshots than this, instead of
+    /// loading an unbounded data set into memory or silently truncating it.
+    /// `None` = unlimited.
+    #[serde(default)]
+    pub max_snapshots: Option<usize>,
 }
 
 impl Default for SimulatorConfig {
@@ -49,6 +54,7 @@ impl Default for SimulatorConfig {
             min_position_size: Decimal::new(10, 0),
             max_position_pct: Decimal::new(20, 2),    // 20%
             max_spread_for_fill: Decimal::new(10, 2), // 10% max spread
+            max_snapshots: None,
         }
     }
 }
@@ -460,7 +466,11 @@ impl BacktestSimulator {
     }
 
     async fn prepare(&self, query: &DataQuery) -> Result<PreparedBacktest> {
-        PreparedBacktest::new(self.data_store.query_snapshots(query).await?)
+        let mut query = query.clone();
+        query.limit = effective_query_limit(query.limit, self.config.max_snapshots);
+        let snapshots = self.data_store.query_snapshots(&query).await?;
+        enforce_snapshot_limit(snapshots.len(), self.config.max_snapshots)?;
+        PreparedBacktest::new(snapshots)
     }
 
     async fn run_prepared<S: Strategy + ?Sized>(
@@ -479,6 +489,10 @@ impl BacktestSimulator {
         // Initialize strategy
         strategy.initialize(&context).await?;
 
+        // Retain as much history per market as the strategy's longest lookback
+        // needs (bounded), so lookbacks beyond the old fixed 100 can trade.
+        let history_limit = history_limit(strategy.required_history());
+
         // Process each time step
         for range in &prepared.batches {
             let market_snapshots = &prepared.snapshots[range.clone()];
@@ -487,18 +501,12 @@ impl BacktestSimulator {
 
             // Update market data in context
             for snapshot in market_snapshots {
-                context
+                let data = context
                     .market_data
                     .entry(snapshot.market_id.clone())
-                    .or_default()
-                    .push(snapshot.clone());
-
-                // Limit history size
-                if let Some(data) = context.market_data.get_mut(&snapshot.market_id) {
-                    if data.len() > 100 {
-                        data.drain(0..50);
-                    }
-                }
+                    .or_default();
+                data.push(snapshot.clone());
+                trim_history(data, history_limit);
             }
 
             // Update position prices
@@ -762,7 +770,7 @@ impl BacktestSimulator {
         let key = position_key(&signal.market_id, &signal.outcome_id);
         state
             .positions
-            .entry(key)
+            .entry(key.clone())
             .and_modify(|position| {
                 let total_quantity = position.quantity + fill_quantity;
                 position.entry_price = (position.entry_price * position.quantity
@@ -801,6 +809,11 @@ impl BacktestSimulator {
         };
 
         state.trades.push(trade.clone());
+        state
+            .open_lots
+            .entry(key)
+            .or_default()
+            .push(state.trades.len() - 1);
         Ok(Some(trade))
     }
 
@@ -820,13 +833,13 @@ impl BacktestSimulator {
         state: &mut SimulationState,
         snapshot: &MarketSnapshot,
     ) -> Result<Option<TradeRecord>> {
-        let position = match state
-            .positions
-            .remove(&position_key(&signal.market_id, &signal.outcome_id))
-        {
+        let key = position_key(&signal.market_id, &signal.outcome_id);
+        let position = match state.positions.remove(&key) {
             Some(p) => p,
             None => return Ok(None),
         };
+        // Entry lots of this position that this close will settle.
+        let lot_indices = state.open_lots.remove(&key).unwrap_or_default();
 
         // Get execution price with slippage
         let base_price = if position.outcome_id == "yes" {
@@ -869,17 +882,7 @@ impl BacktestSimulator {
         let proceeds = trade_value - fees;
 
         // Calculate P&L
-        let entry_fees: Decimal = state
-            .trades
-            .iter()
-            .filter(|t| {
-                t.trade_type == TradeType::Buy
-                    && t.market_id == signal.market_id
-                    && t.outcome_id == signal.outcome_id
-                    && t.exit_time.is_none()
-            })
-            .map(|t| t.fees)
-            .sum();
+        let entry_fees: Decimal = lot_indices.iter().map(|&i| state.trades[i].fees).sum();
         let cost_basis = position.quantity * position.entry_price + entry_fees;
         let pnl = proceeds - cost_basis;
         let return_pct = if cost_basis > Decimal::ZERO {
@@ -905,12 +908,8 @@ impl BacktestSimulator {
         }
 
         // Close every entry lot, allocating exit fees in proportion to quantity.
-        for entry in state.trades.iter_mut().filter(|t| {
-            t.trade_type == TradeType::Buy
-                && t.market_id == signal.market_id
-                && t.outcome_id == signal.outcome_id
-                && t.exit_time.is_none()
-        }) {
+        for &index in &lot_indices {
+            let entry = &mut state.trades[index];
             let allocated_exit_fee = fees * entry.quantity / position.quantity;
             let entry_cost = entry.quantity * entry.entry_price + entry.fees;
             let lot_proceeds = entry.quantity * execution_price - allocated_exit_fee;
@@ -1131,50 +1130,9 @@ impl BacktestSimulator {
         }
     }
 
-    /// Calculate VaR and CVaR at 95% confidence.
+    /// Calculate VaR and CVaR at 95% confidence from daily returns.
     fn calculate_var_cvar(&self, equity_curve: &[(DateTime<Utc>, Decimal)]) -> (f64, f64) {
-        if equity_curve.len() < 2 {
-            return (0.0, 0.0);
-        }
-
-        // Calculate daily returns
-        let mut returns: Vec<f64> = equity_curve
-            .windows(2)
-            .map(|w| {
-                let prev = w[0].1;
-                let curr = w[1].1;
-                if prev == Decimal::ZERO {
-                    0.0
-                } else {
-                    ((curr - prev) / prev).to_f64().unwrap_or(0.0)
-                }
-            })
-            .collect();
-
-        if returns.is_empty() {
-            return (0.0, 0.0);
-        }
-
-        // Sort returns for percentile calculation
-        returns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        // VaR at 95% (5th percentile of returns)
-        let var_index = (returns.len() as f64 * 0.05).ceil() as usize;
-        let var_95 = if var_index < returns.len() {
-            -returns[var_index] // Negate because losses are negative
-        } else {
-            0.0
-        };
-
-        // CVaR (average of returns below VaR)
-        let tail_returns: Vec<f64> = returns.iter().take(var_index.max(1)).copied().collect();
-        let cvar_95 = if !tail_returns.is_empty() {
-            -(tail_returns.iter().sum::<f64>() / tail_returns.len() as f64)
-        } else {
-            0.0
-        };
-
-        (var_95, cvar_95)
+        var_cvar_95(&daily_returns(equity_curve))
     }
 
     /// Calculate maximum consecutive wins and losses.
@@ -1220,65 +1178,10 @@ impl BacktestSimulator {
         max_drawdown
     }
 
+    /// Sharpe and Sortino ratios from UTC-day-close returns, annualized with
+    /// [`ANNUALIZATION_DAYS`].
     fn calculate_risk_metrics(&self, equity_curve: &[(DateTime<Utc>, Decimal)]) -> (f64, f64) {
-        if equity_curve.len() < 2 {
-            return (0.0, 0.0);
-        }
-
-        // Calculate daily returns
-        let returns: Vec<f64> = equity_curve
-            .windows(2)
-            .map(|w| {
-                let prev = w[0].1;
-                let curr = w[1].1;
-                if prev == Decimal::ZERO {
-                    0.0
-                } else {
-                    ((curr - prev) / prev).to_f64().unwrap_or(0.0)
-                }
-            })
-            .collect();
-
-        if returns.is_empty() {
-            return (0.0, 0.0);
-        }
-
-        let mean_return: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance: f64 = returns
-            .iter()
-            .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>()
-            / returns.len() as f64;
-        let std_dev = variance.sqrt();
-
-        // Sharpe ratio (assuming 0% risk-free rate for simplicity)
-        let sharpe = if std_dev > 0.0 {
-            (mean_return / std_dev) * (252.0_f64).sqrt() // Annualized
-        } else {
-            0.0
-        };
-
-        // Sortino ratio (only downside deviation)
-        let downside_returns: Vec<f64> = returns
-            .iter()
-            .filter(|&&r| r < 0.0)
-            .map(|&r| r * r)
-            .collect();
-        let downside_dev = if !downside_returns.is_empty() {
-            (downside_returns.iter().sum::<f64>() / downside_returns.len() as f64).sqrt()
-        } else {
-            0.0
-        };
-
-        let sortino = if downside_dev > 0.0 {
-            (mean_return / downside_dev) * (252.0_f64).sqrt()
-        } else if mean_return > 0.0 {
-            f64::INFINITY
-        } else {
-            0.0
-        };
-
-        (sharpe, sortino)
+        sharpe_sortino(&daily_returns(equity_curve))
     }
 
     fn calculate_avg_trade_duration(&self, trades: &[TradeRecord]) -> f64 {
@@ -1305,11 +1208,185 @@ impl BacktestSimulator {
     }
 }
 
+/// Row limit to send with the query so an oversized data set is detected.
+///
+/// One row more than `max` is requested: if it comes back, the data set is too
+/// large and the run is refused (see [`enforce_snapshot_limit`]) rather than
+/// being silently cut off at `max` rows (the query is ordered by time, so a
+/// truncated run would just miss its most recent period).
+fn effective_query_limit(
+    query_limit: Option<usize>,
+    max_snapshots: Option<usize>,
+) -> Option<usize> {
+    match max_snapshots {
+        Some(max) => {
+            let cap = max.saturating_add(1);
+            Some(query_limit.map_or(cap, |limit| limit.min(cap)))
+        }
+        None => query_limit,
+    }
+}
+
+/// Fail if more than `max_snapshots` rows were loaded.
+fn enforce_snapshot_limit(loaded: usize, max_snapshots: Option<usize>) -> Result<()> {
+    if let Some(max) = max_snapshots {
+        anyhow::ensure!(
+            loaded <= max,
+            "Backtest data set exceeds {max} snapshots; narrow the date range or select fewer markets"
+        );
+    }
+    Ok(())
+}
+
+/// Snapshots per market always retained for strategies (the previous fixed
+/// window), whatever lookback they declare.
+pub const MIN_HISTORY_BARS: usize = crate::strategy::DEFAULT_REQUIRED_HISTORY;
+
+/// Upper bound on snapshots retained per market, to bound memory when a
+/// strategy declares a very long lookback.
+pub const MAX_HISTORY_BARS: usize = 5_000;
+
+/// Snapshots per market to retain for a strategy that reads `required` of them.
+fn history_limit(required: usize) -> usize {
+    required.clamp(MIN_HISTORY_BARS, MAX_HISTORY_BARS)
+}
+
+/// Drop the oldest snapshots once the history exceeds `keep` by a slack margin,
+/// leaving exactly `keep` (so it always holds at least `keep`, and trimming is
+/// amortized over `slack` pushes rather than done every step).
+fn trim_history(data: &mut Vec<MarketSnapshot>, keep: usize) {
+    let slack = (keep / 4).max(50);
+    if data.len() > keep + slack {
+        let excess = data.len() - keep;
+        data.drain(0..excess);
+    }
+}
+
+/// Observations per year used to annualize *daily* returns.
+///
+/// Polymarket trades around the clock, so every calendar day is an observation
+/// (365, not the 252 trading days of equities).
+const ANNUALIZATION_DAYS: f64 = 365.0;
+
+/// Resample an equity curve to UTC-day closes and return the simple daily
+/// returns.
+///
+/// The curve gets one point per market-data step (minutes apart), so annualizing
+/// step-to-step returns with a daily factor overstates risk by roughly
+/// `sqrt(steps per day)`. Here the first point is the opening equity and every
+/// later UTC day contributes its last observation (the day close):
+/// `r_1 = close_1 / opening - 1` and `r_k = close_k / close_(k-1) - 1`. A day
+/// without observations contributes nothing (the next return then spans the
+/// gap); a zero previous equity yields a `0.0` return.
+fn daily_returns(equity_curve: &[(DateTime<Utc>, Decimal)]) -> Vec<f64> {
+    let Some(((_, opening), rest)) = equity_curve.split_first() else {
+        return Vec::new();
+    };
+
+    let mut closes: Vec<(chrono::NaiveDate, Decimal)> = Vec::new();
+    for (time, value) in rest {
+        let day = time.date_naive();
+        match closes.last_mut() {
+            Some((last_day, last_value)) if *last_day == day => *last_value = *value,
+            _ => closes.push((day, *value)),
+        }
+    }
+
+    let mut previous = *opening;
+    closes
+        .into_iter()
+        .map(|(_, close)| {
+            let ret = if previous.is_zero() {
+                0.0
+            } else {
+                ((close - previous) / previous).to_f64().unwrap_or(0.0)
+            };
+            previous = close;
+            ret
+        })
+        .collect()
+}
+
+/// Annualized Sharpe (0% risk-free rate) and Sortino ratios of daily returns.
+///
+/// Fewer than two daily observations cannot describe dispersion, so both ratios
+/// are reported as `0.0` instead of an artefact of a single day.
+fn sharpe_sortino(returns: &[f64]) -> (f64, f64) {
+    if returns.len() < 2 {
+        return (0.0, 0.0);
+    }
+
+    let annualization = ANNUALIZATION_DAYS.sqrt();
+    let mean_return: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance: f64 = returns
+        .iter()
+        .map(|r| (r - mean_return).powi(2))
+        .sum::<f64>()
+        / returns.len() as f64;
+    let std_dev = variance.sqrt();
+
+    // Sharpe ratio (assuming 0% risk-free rate for simplicity)
+    let sharpe = if std_dev > 0.0 {
+        (mean_return / std_dev) * annualization
+    } else {
+        0.0
+    };
+
+    // Sortino ratio (only downside deviation)
+    let downside_returns: Vec<f64> = returns
+        .iter()
+        .filter(|&&r| r < 0.0)
+        .map(|&r| r * r)
+        .collect();
+    let downside_dev = if !downside_returns.is_empty() {
+        (downside_returns.iter().sum::<f64>() / downside_returns.len() as f64).sqrt()
+    } else {
+        0.0
+    };
+
+    let sortino = if downside_dev > 0.0 {
+        (mean_return / downside_dev) * annualization
+    } else if mean_return > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+
+    (sharpe, sortino)
+}
+
+/// Historical 95% VaR and CVaR (expected shortfall) of daily returns, as
+/// positive loss figures.
+///
+/// Both use the same tail: the worst `ceil(5% * n)` returns (at least one).
+/// VaR is the loss at the boundary of that tail (its least severe member) and
+/// CVaR is the average loss over the whole tail, so `CVaR >= VaR` always holds.
+fn var_cvar_95(returns: &[f64]) -> (f64, f64) {
+    if returns.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut sorted = returns.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let tail_len = ((sorted.len() as f64 * 0.05).ceil() as usize).clamp(1, sorted.len());
+    let tail = &sorted[..tail_len];
+
+    let var_95 = -tail[tail_len - 1];
+    let cvar_95 = -(tail.iter().sum::<f64>() / tail_len as f64);
+
+    (var_95, cvar_95)
+}
+
 /// Internal simulation state.
 struct SimulationState {
     cash: Decimal,
     positions: HashMap<String, Position>,
     trades: Vec<TradeRecord>,
+    /// Indices into `trades` of the still-open entry lots of each position key,
+    /// so closing a position touches only its own lots instead of scanning every
+    /// trade ever made.
+    open_lots: HashMap<String, Vec<usize>>,
     equity_curve: Vec<(DateTime<Utc>, Decimal)>,
     total_fees: Decimal,
     total_slippage: Decimal,
@@ -1330,6 +1407,7 @@ impl SimulationState {
             cash: initial_capital,
             positions: HashMap::new(),
             trades: Vec::new(),
+            open_lots: HashMap::new(),
             equity_curve: Vec::new(),
             total_fees: Decimal::ZERO,
             total_slippage: Decimal::ZERO,
@@ -1861,3 +1939,548 @@ mod tests {
 #[cfg(test)]
 #[path = "simulator/correctness_tests.rs"]
 mod correctness_tests;
+
+/// Risk metrics are computed from UTC-day closes, not from every sample.
+#[cfg(test)]
+mod risk_metric_tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn day0() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap()
+    }
+
+    fn dec(v: f64) -> Decimal {
+        Decimal::try_from(v).unwrap()
+    }
+
+    /// One equity point per day close, preceded by the opening equity.
+    fn daily_curve(opening: f64, daily_returns: &[f64]) -> Vec<(DateTime<Utc>, Decimal)> {
+        let mut curve = vec![(day0(), dec(opening))];
+        let mut equity = opening;
+        for (i, r) in daily_returns.iter().enumerate() {
+            equity *= 1.0 + r;
+            // Close at 23:55 of each day.
+            curve.push((
+                day0() + Duration::days(i as i64) + Duration::minutes(23 * 60 + 55),
+                dec(equity),
+            ));
+        }
+        curve
+    }
+
+    /// The same daily closes, but sampled every 5 minutes with large intraday
+    /// swings that net out by the close of each day.
+    fn five_minute_curve(opening: f64, daily_returns: &[f64]) -> Vec<(DateTime<Utc>, Decimal)> {
+        let mut curve = vec![(day0(), dec(opening))];
+        let mut previous_close = opening;
+        for (i, r) in daily_returns.iter().enumerate() {
+            let close = previous_close * (1.0 + r);
+            let start = day0() + Duration::days(i as i64);
+            // 287 noisy samples (+/-3%), then the exact close at 23:55.
+            for step in 1..288 {
+                let swing = if step % 2 == 0 { 0.03 } else { -0.03 };
+                curve.push((
+                    start + Duration::minutes(5 * step),
+                    dec(previous_close * (1.0 + swing)),
+                ));
+            }
+            curve.push((start + Duration::minutes(23 * 60 + 55), dec(close)));
+            previous_close = close;
+        }
+        curve
+    }
+
+    #[test]
+    fn daily_returns_use_day_closes_and_ignore_intraday_noise() {
+        let returns = [0.02, -0.01, 0.03, 0.0, -0.02];
+        let curve = five_minute_curve(1000.0, &returns);
+        assert!(curve.len() > 1400, "fixture is 5-minute resolution");
+
+        let got = daily_returns(&curve);
+        assert_eq!(got.len(), returns.len());
+        for (g, want) in got.iter().zip(returns) {
+            assert!(approx(*g, want), "{g} != {want}");
+        }
+    }
+
+    #[test]
+    fn sharpe_and_sortino_match_hand_computed_daily_values() {
+        // mean 1%, population std 2%, downside deviation 1%.
+        let returns = [0.03, -0.01, 0.03, -0.01];
+        let annualization = 365.0_f64.sqrt();
+
+        for curve in [
+            daily_curve(1000.0, &returns),
+            five_minute_curve(1000.0, &returns),
+        ] {
+            let (sharpe, sortino) = sharpe_sortino(&daily_returns(&curve));
+            assert!(approx(sharpe, 0.5 * annualization), "sharpe {sharpe}");
+            assert!(approx(sortino, 1.0 * annualization), "sortino {sortino}");
+        }
+    }
+
+    #[test]
+    fn five_minute_sampling_no_longer_inflates_the_ratios() {
+        // A drifting curve whose 5-minute path is dominated by +/-3% noise. The
+        // daily series only sees the closes, so both samplings agree.
+        let returns = [0.01, 0.02, 0.005, 0.015, 0.01, 0.02, 0.0, 0.01];
+        let from_daily = sharpe_sortino(&daily_returns(&daily_curve(5000.0, &returns)));
+        let from_noisy = sharpe_sortino(&daily_returns(&five_minute_curve(5000.0, &returns)));
+        assert!(approx(from_daily.0, from_noisy.0));
+        assert!(from_daily.0 > 3.0, "clear drift, got {}", from_daily.0);
+    }
+
+    #[tokio::test]
+    async fn simulator_methods_use_the_daily_series() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        let simulator =
+            BacktestSimulator::new(HistoricalDataStore::new(pool), SimulatorConfig::default());
+        let returns = [0.03, -0.01, 0.03, -0.01];
+        let curve = five_minute_curve(1000.0, &returns);
+        let (sharpe, sortino) = simulator.calculate_risk_metrics(&curve);
+        let annualization = 365.0_f64.sqrt();
+        assert!(approx(sharpe, 0.5 * annualization));
+        assert!(approx(sortino, annualization));
+
+        let (var_95, cvar_95) = simulator.calculate_var_cvar(&curve);
+        // Four daily returns -> tail of one: the worst day (-1%).
+        assert!(approx(var_95, 0.01) && approx(cvar_95, 0.01));
+    }
+
+    #[test]
+    fn first_day_is_measured_against_opening_equity_and_gaps_are_skipped() {
+        let curve = vec![
+            (day0(), dec(1000.0)),
+            // Same UTC day as the opening point: its last value is the day close.
+            (day0() + Duration::hours(3), dec(1100.0)),
+            (day0() + Duration::hours(20), dec(1050.0)),
+            // Days 2 and 3 have no observations; day 4 closes at 1155.
+            (day0() + Duration::days(3) + Duration::hours(1), dec(1155.0)),
+        ];
+        let got = daily_returns(&curve);
+        assert_eq!(got.len(), 2);
+        assert!(approx(got[0], 0.05));
+        assert!(approx(got[1], 0.10));
+    }
+
+    #[test]
+    fn degenerate_curves_yield_no_ratios() {
+        assert!(daily_returns(&[]).is_empty());
+        assert!(daily_returns(&[(day0(), dec(1000.0))]).is_empty());
+        // Zero opening equity: no division by zero.
+        let curve = vec![
+            (day0(), Decimal::ZERO),
+            (day0() + Duration::days(1), dec(10.0)),
+        ];
+        assert_eq!(daily_returns(&curve), vec![0.0]);
+
+        assert_eq!(sharpe_sortino(&[]), (0.0, 0.0));
+        // One daily observation is not enough to measure dispersion.
+        assert_eq!(sharpe_sortino(&[0.05]), (0.0, 0.0));
+        assert_eq!(var_cvar_95(&[]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn no_downside_gives_infinite_sortino_and_flat_curve_gives_zero() {
+        let (sharpe, sortino) = sharpe_sortino(&[0.01, 0.02, 0.03]);
+        assert!(sharpe > 0.0);
+        assert!(sortino.is_infinite() && sortino > 0.0);
+
+        assert_eq!(sharpe_sortino(&[0.0, 0.0, 0.0]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn var_and_cvar_use_the_same_tail() {
+        // 100 returns from -4.9% to +5.0%; the 5% tail is the worst five.
+        let returns: Vec<f64> = (1..=100).map(|i| (i as f64 - 50.0) / 1000.0).collect();
+        let (var_95, cvar_95) = var_cvar_95(&returns);
+        // Tail: -4.9%, -4.8%, -4.7%, -4.6%, -4.5%.
+        assert!(approx(var_95, 0.045), "var {var_95}");
+        assert!(approx(cvar_95, 0.047), "cvar {cvar_95}");
+        assert!(cvar_95 >= var_95);
+
+        // Input order is irrelevant.
+        let mut shuffled = returns.clone();
+        shuffled.reverse();
+        assert_eq!(var_cvar_95(&shuffled), (var_95, cvar_95));
+    }
+
+    #[test]
+    fn var_and_cvar_for_small_samples_are_consistent() {
+        // One return: both are that loss (the old code reported VaR 0 here).
+        let (var_95, cvar_95) = var_cvar_95(&[-0.02]);
+        assert!(approx(var_95, 0.02) && approx(cvar_95, 0.02));
+
+        // Ten returns: tail of one, so VaR equals CVaR (the worst day). The old
+        // code took VaR from the second-worst return and CVaR from the worst.
+        let returns = [-0.05, -0.04, -0.01, 0.0, 0.01, 0.02, 0.02, 0.03, 0.03, 0.04];
+        let (var_95, cvar_95) = var_cvar_95(&returns);
+        assert!(approx(var_95, 0.05) && approx(cvar_95, 0.05));
+
+        // Twenty-one returns: tail of two.
+        let mut returns: Vec<f64> = vec![0.01; 19];
+        returns.extend([-0.03, -0.07]);
+        let (var_95, cvar_95) = var_cvar_95(&returns);
+        assert!(approx(var_95, 0.03), "var {var_95}");
+        assert!(approx(cvar_95, 0.05), "cvar {cvar_95}");
+    }
+}
+
+/// Per-market history retention follows the strategy's declared lookback.
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use crate::strategy::{ArbitrageStrategy, MomentumStrategy};
+    use chrono::Duration;
+
+    /// Records the history length it sees every step.
+    struct Recorder {
+        required: usize,
+        seen: Vec<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Strategy for Recorder {
+        fn name(&self) -> &str {
+            "history-recorder"
+        }
+        async fn on_data(&mut self, context: &StrategyContext) -> Result<Vec<Signal>> {
+            self.seen.push(context.market_data["m"].len());
+            Ok(vec![])
+        }
+        fn required_history(&self) -> usize {
+            self.required
+        }
+    }
+
+    fn simulator(initial: i64) -> BacktestSimulator {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        BacktestSimulator::new(
+            HistoricalDataStore::new(pool),
+            SimulatorConfig {
+                initial_capital: Decimal::from(initial),
+                slippage_model: SlippageModel::None,
+                fee_model: FeeModel::Fixed(Decimal::ZERO),
+                min_position_size: Decimal::ONE,
+                ..SimulatorConfig::default()
+            },
+        )
+    }
+
+    /// `n` five-minute snapshots whose yes_bid rises by `step` per bar.
+    fn rising(n: usize, start: &str, step: &str) -> (Vec<MarketSnapshot>, DateTime<Utc>) {
+        let t0 = Utc::now();
+        let mut price: Decimal = start.parse().unwrap();
+        let step: Decimal = step.parse().unwrap();
+        let snapshots = (0..n)
+            .map(|i| {
+                let ask = price + Decimal::new(5, 3);
+                let snapshot = MarketSnapshot::new(
+                    "m",
+                    t0 + Duration::minutes(5 * i as i64),
+                    price,
+                    ask,
+                    Decimal::ONE - ask,
+                    Decimal::ONE - price,
+                );
+                price += step;
+                snapshot
+            })
+            .collect();
+        (snapshots, t0)
+    }
+
+    async fn run_recorder(required: usize, bars: usize) -> Vec<usize> {
+        let (snapshots, t0) = rising(bars, "0.30", "0.0001");
+        let prepared = PreparedBacktest::new(snapshots).unwrap();
+        let mut strategy = Recorder {
+            required,
+            seen: vec![],
+        };
+        simulator(10_000)
+            .run_prepared(
+                &mut strategy,
+                &DataQuery::range(t0, t0 + Duration::days(30)),
+                &prepared,
+            )
+            .await
+            .unwrap();
+        strategy.seen
+    }
+
+    #[test]
+    fn history_limit_is_clamped() {
+        assert_eq!(history_limit(0), MIN_HISTORY_BARS);
+        assert_eq!(history_limit(1), MIN_HISTORY_BARS);
+        assert_eq!(history_limit(288), 288);
+        assert_eq!(history_limit(1_000_000), MAX_HISTORY_BARS);
+    }
+
+    #[tokio::test]
+    async fn default_strategies_keep_at_least_the_old_window() {
+        let seen = run_recorder(0, 600).await;
+        // Never trimmed below the default window once it has filled...
+        assert!(seen[MIN_HISTORY_BARS..]
+            .iter()
+            .all(|len| *len >= MIN_HISTORY_BARS));
+        // ...and bounded: limit plus max(limit / 4, 50) slack.
+        assert!(seen.iter().all(|len| *len <= MIN_HISTORY_BARS + 50));
+    }
+
+    #[tokio::test]
+    async fn long_lookbacks_see_their_full_window() {
+        // The old fixed cap trimmed history to 51-100 snapshots, so a 288-bar
+        // (24h at 5 minutes) lookback never saw 288.
+        let seen = run_recorder(288, 1_200).await;
+        assert!(seen.contains(&288));
+        assert!(seen[288..].iter().all(|len| *len >= 288));
+        // Retention stays bounded: limit + max(limit/4, 50) slack.
+        assert!(seen.iter().all(|len| *len <= 288 + 72));
+    }
+
+    #[tokio::test]
+    async fn retention_is_capped_for_absurd_lookbacks() {
+        let seen = run_recorder(10_000_000, MAX_HISTORY_BARS + 2_000).await;
+        let max = *seen.iter().max().unwrap();
+        assert!(max <= MAX_HISTORY_BARS + MAX_HISTORY_BARS / 4);
+    }
+
+    #[tokio::test]
+    async fn a_24_hour_momentum_lookback_now_trades() {
+        // 24h of 5-minute bars = 288. The price climbs ~0.0001 per bar from
+        // 0.30, i.e. well over the 5% threshold across any 288-bar window, so
+        // the strategy must enter once 288 bars of history exist.
+        let (snapshots, t0) = rising(500, "0.30", "0.0005");
+        let prepared = PreparedBacktest::new(snapshots).unwrap();
+        let mut strategy = MomentumStrategy::new(288, Decimal::new(5, 2), Decimal::new(10, 2));
+        let result = simulator(10_000)
+            .run_prepared(
+                &mut strategy,
+                &DataQuery::range(t0, t0 + Duration::days(3)),
+                &prepared,
+            )
+            .await
+            .unwrap();
+        assert!(
+            result.total_trades > 0,
+            "a lookback beyond the old 100-bar cap must be able to trade"
+        );
+    }
+
+    #[tokio::test]
+    async fn arbitrage_legs_fill_equal_share_counts() {
+        let t0 = Utc::now();
+        let snapshots: Vec<MarketSnapshot> = (0..3)
+            .map(|i| {
+                MarketSnapshot::new(
+                    "m",
+                    t0 + Duration::minutes(5 * i),
+                    Decimal::new(39, 2),
+                    Decimal::new(40, 2),
+                    Decimal::new(54, 2),
+                    Decimal::new(55, 2),
+                )
+                .with_depth(
+                    Decimal::from(1000),
+                    Decimal::from(1000),
+                    Decimal::from(1000),
+                    Decimal::from(1000),
+                )
+            })
+            .collect();
+        let prepared = PreparedBacktest::new(snapshots).unwrap();
+        let mut strategy =
+            ArbitrageStrategy::new(Decimal::ZERO, Decimal::new(20, 2), 10).with_fee(Decimal::ZERO);
+        let result = simulator(10_000)
+            .run_prepared(
+                &mut strategy,
+                &DataQuery::range(t0, t0 + Duration::days(1)),
+                &prepared,
+            )
+            .await
+            .unwrap();
+
+        let buy_quantity = |outcome: &str| -> Decimal {
+            result
+                .trades
+                .iter()
+                .find(|t| t.trade_type == TradeType::Buy && t.outcome_id == outcome)
+                .map(|t| t.quantity)
+                .expect("buy fill")
+        };
+        let yes = buy_quantity("yes");
+        let no = buy_quantity("no");
+        assert!(
+            (yes - no).abs() < Decimal::new(1, 6),
+            "{yes} YES vs {no} NO shares"
+        );
+    }
+}
+
+/// Data-set size guard and indexed closing of entry lots.
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn query_limit_requests_one_extra_row_to_detect_oversized_data() {
+        assert_eq!(effective_query_limit(None, None), None);
+        assert_eq!(effective_query_limit(Some(50), None), Some(50));
+        assert_eq!(effective_query_limit(None, Some(1_000)), Some(1_001));
+        // A stricter caller limit is respected.
+        assert_eq!(effective_query_limit(Some(10), Some(1_000)), Some(10));
+        // A looser caller limit is tightened.
+        assert_eq!(effective_query_limit(Some(5_000), Some(1_000)), Some(1_001));
+        assert_eq!(
+            effective_query_limit(None, Some(usize::MAX)),
+            Some(usize::MAX)
+        );
+    }
+
+    #[test]
+    fn oversized_data_is_refused_not_truncated() {
+        assert!(enforce_snapshot_limit(1_000, Some(1_000)).is_ok());
+        assert!(enforce_snapshot_limit(0, Some(1_000)).is_ok());
+        assert!(enforce_snapshot_limit(10_000_000, None).is_ok());
+        let err = enforce_snapshot_limit(1_001, Some(1_000)).unwrap_err();
+        assert!(err.to_string().contains("exceeds 1000 snapshots"), "{err}");
+    }
+
+    fn simulator() -> BacktestSimulator {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
+            .unwrap();
+        BacktestSimulator::new(
+            HistoricalDataStore::new(pool),
+            SimulatorConfig {
+                initial_capital: Decimal::from(1_000_000),
+                slippage_model: SlippageModel::None,
+                fee_model: FeeModel::Fixed(Decimal::new(2, 2)),
+                min_position_size: Decimal::ONE,
+                ..SimulatorConfig::default()
+            },
+        )
+    }
+
+    fn snapshot(market: &str, minute: i64, bid: &str) -> MarketSnapshot {
+        let bid: Decimal = bid.parse().unwrap();
+        MarketSnapshot::new(
+            market,
+            Utc::now() + Duration::minutes(minute),
+            bid,
+            bid + Decimal::new(1, 2),
+            Decimal::ONE - bid - Decimal::new(1, 2),
+            Decimal::ONE - bid,
+        )
+    }
+
+    fn context() -> StrategyContext {
+        let mut context = StrategyContext::new(Decimal::from(1_000_000));
+        context.timestamp = Utc::now();
+        context
+    }
+
+    #[tokio::test]
+    async fn closing_settles_only_the_positions_own_lots() {
+        let simulator = simulator();
+        let context = context();
+        let mut state = SimulationState::new(Decimal::from(1_000_000));
+
+        let a_open = snapshot("a", 0, "0.40");
+        let b_open = snapshot("b", 0, "0.40");
+        let size = Decimal::new(1, 3);
+        // Two adds to a/yes (one position, two lots) and one lot in b/yes.
+        for (market, snap) in [("a", &a_open), ("b", &b_open), ("a", &a_open)] {
+            simulator
+                .execute_buy(
+                    &Signal::buy(market, "yes", size),
+                    &context,
+                    &mut state,
+                    snap,
+                )
+                .unwrap()
+                .expect("buy fills");
+        }
+        assert_eq!(state.open_lots["a:yes"].len(), 2);
+        assert_eq!(state.open_lots["b:yes"].len(), 1);
+
+        let a_close = snapshot("a", 60, "0.55");
+        let close = simulator
+            .execute_close(&Signal::close("a", "yes"), &mut state, &a_close)
+            .unwrap()
+            .expect("close fills");
+
+        // a's lots are settled and unregistered; b's lot is untouched.
+        assert!(!state.open_lots.contains_key("a:yes"));
+        assert_eq!(state.open_lots["b:yes"].len(), 1);
+        let lots = |market: &str| -> Vec<&TradeRecord> {
+            state
+                .trades
+                .iter()
+                .filter(|t| t.trade_type == TradeType::Buy && t.market_id == market)
+                .collect()
+        };
+        assert_eq!(lots("a").len(), 2);
+        assert!(lots("a")
+            .iter()
+            .all(|t| t.exit_time.is_some() && t.pnl.is_some() && t.return_pct.is_some()));
+        assert!(lots("b")
+            .iter()
+            .all(|t| t.exit_time.is_none() && t.pnl.is_none()));
+
+        // Per-lot P&L adds up to the close trade's P&L (entry and exit fees
+        // included), exactly as with the previous full scan.
+        let lot_pnl: Decimal = lots("a").iter().filter_map(|t| t.pnl).sum();
+        let close_pnl = close.pnl.unwrap();
+        assert!(
+            (lot_pnl - close_pnl).abs() < Decimal::new(1, 12),
+            "{lot_pnl} vs {close_pnl}"
+        );
+    }
+
+    #[tokio::test]
+    async fn many_round_trips_leave_no_open_lots() {
+        let simulator = simulator();
+        let context = context();
+        let mut state = SimulationState::new(Decimal::from(1_000_000));
+        let size = Decimal::new(1, 4);
+
+        for round in 0..2_000_i64 {
+            let market = format!("m{}", round % 7);
+            let open = snapshot(&market, round, "0.40");
+            let close = snapshot(&market, round + 1, "0.45");
+            simulator
+                .execute_buy(
+                    &Signal::buy(&market, "yes", size),
+                    &context,
+                    &mut state,
+                    &open,
+                )
+                .unwrap()
+                .expect("buy fills");
+            simulator
+                .execute_close(&Signal::close(&market, "yes"), &mut state, &close)
+                .unwrap()
+                .expect("close fills");
+        }
+
+        assert!(state.open_lots.is_empty());
+        assert!(state.positions.is_empty());
+        assert!(state
+            .trades
+            .iter()
+            .filter(|t| t.trade_type == TradeType::Buy)
+            .all(|t| t.exit_time.is_some() && t.pnl.is_some()));
+        assert_eq!(state.winning_trades + state.losing_trades, 2_000);
+    }
+}

@@ -44,9 +44,19 @@ struct StrategyHealthAggRow {
     closed_positions: i64,
     entry_failed_positions: i64,
     exit_failed_positions: i64,
+    /// Sum of the expected edge recorded per executed signal. The unit depends on
+    /// the strategy: basis points for quant strategies (`expected_edge_bps`), USD
+    /// per share for `arb` (`net_profit`). Use [`expected_edge_bps`] to compare.
     total_expected_edge: Decimal,
+    /// Sum of the observed edge on the same events (gross profit per share for `arb`).
     total_observed_edge: Decimal,
+    /// Realized P&L of closed positions, in USD.
     total_realized_pnl: Decimal,
+    /// Number of events/signals that contributed to `total_expected_edge`.
+    expected_edge_events: i64,
+    /// USD entry cost (filled notional) of the closed positions whose realized
+    /// P&L is in `total_realized_pnl`.
+    closed_filled_notional: Decimal,
     avg_hold_hours: Option<f64>,
 }
 
@@ -213,6 +223,24 @@ async fn load_strategy_health(
             WHERE position_id IS NOT NULL
             ORDER BY strategy, position_id, occurred_at DESC, id DESC
         ),
+        closed_notional AS (
+            -- Entry cost of exactly the positions whose realized P&L is summed
+            -- below, including entry fills that happened before the window.
+            SELECT
+                cp.strategy,
+                COALESCE(SUM(te.filled_size_usd), 0) AS closed_filled_notional
+            FROM (
+                SELECT DISTINCT strategy, position_id
+                FROM filtered
+                WHERE position_id IS NOT NULL
+                  AND (event_type IN ('position_closed', 'closed_via_resolution')
+                       OR state_to = 'closed')
+            ) cp
+            JOIN trade_events te
+              ON te.position_id = cp.position_id
+             AND te.event_type = 'entry_filled'
+            GROUP BY cp.strategy
+        ),
         position_state_counts AS (
             SELECT
                 strategy,
@@ -275,6 +303,11 @@ async fn load_strategy_health(
                     WHERE event_type IN ('entry_filled', 'position_open')
                        OR state_to = 'open'
                 ), 0) AS total_observed_edge,
+                COUNT(*) FILTER (
+                    WHERE expected_edge IS NOT NULL
+                      AND (event_type IN ('entry_filled', 'position_open')
+                           OR state_to = 'open')
+                )::bigint AS expected_edge_events,
                 COALESCE(SUM(realized_pnl) FILTER (
                     WHERE event_type IN ('position_closed', 'closed_via_resolution')
                        OR state_to = 'closed'
@@ -296,10 +329,13 @@ async fn load_strategy_health(
             e.total_expected_edge,
             e.total_observed_edge,
             e.total_realized_pnl,
+            e.expected_edge_events,
+            COALESCE(cn.closed_filled_notional, 0) AS closed_filled_notional,
             h.avg_hold_hours
         FROM event_metrics e
         LEFT JOIN position_state_counts p USING (strategy)
         LEFT JOIN hold_metrics h USING (strategy)
+        LEFT JOIN closed_notional cn USING (strategy)
         ORDER BY e.strategy ASC
         "#,
     )
@@ -337,6 +373,23 @@ async fn load_derived_strategy_health(
             ) AS total_expected_edge,
             0::numeric AS total_observed_edge,
             COALESCE(SUM(p.realized_pnl) FILTER (WHERE p.state = 4), 0) AS total_realized_pnl,
+            COUNT(*) FILTER (
+                WHERE qs.execution_status = 'executed'
+                  AND NULLIF(qs.metadata ->> 'expected_edge_bps', '') IS NOT NULL
+            )::bigint AS expected_edge_events,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN (p.held_yes_qty + p.exited_yes_qty) > 0
+                          OR (p.held_no_qty + p.exited_no_qty) > 0
+                        THEN COALESCE(p.yes_entry_price, 0) * (p.held_yes_qty + p.exited_yes_qty)
+                           + COALESCE(p.no_entry_price, 0) * (p.held_no_qty + p.exited_no_qty)
+                        ELSE (COALESCE(p.yes_entry_price, 0) + COALESCE(p.no_entry_price, 0))
+                           * p.quantity
+                    END
+                ) FILTER (WHERE p.state = 4),
+                0
+            ) AS closed_filled_notional,
             AVG((EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0)::double precision)
                 FILTER (WHERE p.state = 4 AND p.exit_timestamp IS NOT NULL) AS avg_hold_hours
         FROM quant_signals qs
@@ -398,11 +451,59 @@ fn failure_rate(row: &StrategyHealthAggRow) -> Option<f64> {
     Some((row.entry_failed_positions + row.exit_failed_positions) as f64 / total as f64)
 }
 
-fn edge_capture_ratio(row: &StrategyHealthAggRow) -> Option<Decimal> {
-    if row.total_expected_edge <= Decimal::ZERO {
+const BASIS_POINTS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);
+
+/// Realized P&L as basis points of the filled notional of the closed positions
+/// it came from. `None` without a positive notional.
+fn realized_edge_bps(row: &StrategyHealthAggRow) -> Option<Decimal> {
+    if row.closed_filled_notional <= Decimal::ZERO {
         return None;
     }
-    Some(row.total_realized_pnl / row.total_expected_edge)
+    Some(row.total_realized_pnl / row.closed_filled_notional * BASIS_POINTS)
+}
+
+/// Average expected edge per executed signal, in basis points of entry cost.
+///
+/// The recorded edge has strategy-specific units: quant strategies store basis
+/// points already, while `arb` stores `net_profit` in USD per share (a $1-payout
+/// pair). The arb figure is converted to bps of its entry cost per share,
+/// `1 - gross_edge` (the pair costs `1 - gross profit` per share), using the
+/// average observed (gross) edge; without one the cost is taken as $1.
+/// `None` when no edge was recorded or it is not positive.
+fn expected_edge_bps(row: &StrategyHealthAggRow) -> Option<Decimal> {
+    if row.expected_edge_events <= 0 {
+        return None;
+    }
+    let events = Decimal::from(row.expected_edge_events);
+    let mean_edge = row.total_expected_edge / events;
+    if mean_edge <= Decimal::ZERO {
+        return None;
+    }
+
+    if row.strategy == "arb" {
+        let mean_gross = row.total_observed_edge / events;
+        let cost_per_share = if mean_gross > Decimal::ZERO && mean_gross < Decimal::ONE {
+            Decimal::ONE - mean_gross
+        } else {
+            Decimal::ONE
+        };
+        Some(mean_edge / cost_per_share * BASIS_POINTS)
+    } else {
+        Some(mean_edge)
+    }
+}
+
+/// Share of the expected edge that was actually realized: realized bps over
+/// expected bps, both measured against filled notional, so the ratio is
+/// dimensionless (1.0 = captured exactly the edge the signals promised).
+///
+/// Both sides are window-level averages: realized P&L and its notional come from
+/// positions closed in the window, the expected edge from the executed signals
+/// recorded in it. `None` if either side is unavailable.
+fn edge_capture_ratio(row: &StrategyHealthAggRow) -> Option<Decimal> {
+    let expected = expected_edge_bps(row)?;
+    let realized = realized_edge_bps(row)?;
+    Some(realized / expected)
 }
 
 fn merge_strategy_health_rows(
@@ -450,13 +551,18 @@ fn hydrate_strategy_health_row(
         .exit_failed_positions
         .max(derived.exit_failed_positions);
     if canonical.total_expected_edge.is_zero() && !derived.total_expected_edge.is_zero() {
+        // The sum and the number of events it was built from travel together.
         canonical.total_expected_edge = derived.total_expected_edge;
+        canonical.expected_edge_events = derived.expected_edge_events;
     }
     if canonical.total_observed_edge.is_zero() && !derived.total_observed_edge.is_zero() {
         canonical.total_observed_edge = derived.total_observed_edge;
     }
     if canonical.total_realized_pnl.is_zero() && !derived.total_realized_pnl.is_zero() {
+        // Realized P&L and the notional it is measured against must come from
+        // the same positions, so they are taken together or not at all.
         canonical.total_realized_pnl = derived.total_realized_pnl;
+        canonical.closed_filled_notional = derived.closed_filled_notional;
     }
     canonical.avg_hold_hours = canonical.avg_hold_hours.or(derived.avg_hold_hours);
     canonical
@@ -512,7 +618,9 @@ fn recommend(row: &StrategyHealthAggRow) -> Recommendation {
 mod tests {
     use super::*;
 
+    /// `arb` rows record edge in USD per share, every other strategy in bps.
     fn sample_row(strategy: &str) -> StrategyHealthAggRow {
+        let is_arb = strategy == "arb";
         StrategyHealthAggRow {
             strategy: strategy.to_string(),
             generated_signals: 10,
@@ -524,9 +632,26 @@ mod tests {
             closed_positions: 7,
             entry_failed_positions: 0,
             exit_failed_positions: 0,
-            total_expected_edge: Decimal::new(100, 0),
-            total_observed_edge: Decimal::new(90, 0),
-            total_realized_pnl: Decimal::new(80, 0),
+            // arb: $0.03 net / $0.04 gross per share over 10 events;
+            // others: 100 bps per event.
+            total_expected_edge: if is_arb {
+                Decimal::new(30, 2)
+            } else {
+                Decimal::new(1000, 0)
+            },
+            total_observed_edge: if is_arb {
+                Decimal::new(40, 2)
+            } else {
+                Decimal::new(900, 0)
+            },
+            // $300 (arb) / $80 realized on $10,000 of closed notional.
+            total_realized_pnl: if is_arb {
+                Decimal::new(300, 0)
+            } else {
+                Decimal::new(80, 0)
+            },
+            expected_edge_events: 10,
+            closed_filled_notional: Decimal::new(10_000, 0),
             avg_hold_hours: Some(2.0),
         }
     }
@@ -574,6 +699,8 @@ mod tests {
                 total_expected_edge: Decimal::ZERO,
                 total_observed_edge: Decimal::ZERO,
                 total_realized_pnl: Decimal::new(-5, 0),
+                expected_edge_events: 0,
+                closed_filled_notional: Decimal::ZERO,
                 avg_hold_hours: None,
             }],
             vec![StrategyHealthAggRow {
@@ -590,6 +717,8 @@ mod tests {
                 total_expected_edge: Decimal::new(120, 0),
                 total_observed_edge: Decimal::ZERO,
                 total_realized_pnl: Decimal::new(-5, 0),
+                expected_edge_events: 3,
+                closed_filled_notional: Decimal::new(250, 0),
                 avg_hold_hours: Some(4.0),
             }],
         );
@@ -598,5 +727,471 @@ mod tests {
         assert_eq!(merged[0].executed_signals, 3);
         assert_eq!(merged[0].total_expected_edge, Decimal::new(120, 0));
         assert_eq!(merged[0].avg_hold_hours, Some(4.0));
+    }
+}
+
+/// `edge_capture_ratio` compares realized and expected edge in the same unit.
+#[cfg(test)]
+mod edge_capture_tests {
+    use super::*;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    fn approx(a: Decimal, b: &str) -> bool {
+        (a - d(b)).abs() < d("0.0001")
+    }
+
+    fn row(strategy: &str) -> StrategyHealthAggRow {
+        StrategyHealthAggRow {
+            strategy: strategy.to_string(),
+            generated_signals: 10,
+            executed_signals: 5,
+            skipped_signals: 0,
+            expired_signals: 0,
+            open_positions: 0,
+            exit_ready_positions: 0,
+            closed_positions: 5,
+            entry_failed_positions: 0,
+            exit_failed_positions: 0,
+            total_expected_edge: Decimal::ZERO,
+            total_observed_edge: Decimal::ZERO,
+            total_realized_pnl: Decimal::ZERO,
+            expected_edge_events: 0,
+            closed_filled_notional: Decimal::ZERO,
+            avg_hold_hours: None,
+        }
+    }
+
+    #[test]
+    fn quant_edge_is_compared_in_basis_points_of_notional() {
+        // Five signals promised 120 bps each; the closed trades earned $12 on
+        // $1,000 of filled notional = 120 bps: the edge was fully captured.
+        let r = StrategyHealthAggRow {
+            total_expected_edge: d("600"),
+            expected_edge_events: 5,
+            total_realized_pnl: d("12"),
+            closed_filled_notional: d("1000"),
+            ..row("flow")
+        };
+        assert!(approx(realized_edge_bps(&r).unwrap(), "120"));
+        assert!(approx(expected_edge_bps(&r).unwrap(), "120"));
+        assert!(approx(edge_capture_ratio(&r).unwrap(), "1"));
+        // The old ratio divided USD by summed bps: 12 / 600 = 0.02 ("reduce").
+        assert_eq!(r.total_realized_pnl / r.total_expected_edge, d("0.02"));
+    }
+
+    #[test]
+    fn arb_per_share_edge_is_converted_to_bps_of_entry_cost() {
+        // $0.03 net per share on a pair costing 1 - 0.04 = $0.96: 312.5 bps.
+        // $24 earned on $1,000 of notional = 240 bps: 76.8% captured.
+        let r = StrategyHealthAggRow {
+            total_expected_edge: d("0.15"),
+            total_observed_edge: d("0.20"),
+            expected_edge_events: 5,
+            total_realized_pnl: d("24"),
+            closed_filled_notional: d("1000"),
+            ..row("arb")
+        };
+        assert!(approx(expected_edge_bps(&r).unwrap(), "312.5"));
+        assert!(approx(realized_edge_bps(&r).unwrap(), "240"));
+        assert!(approx(edge_capture_ratio(&r).unwrap(), "0.768"));
+        // The old ratio divided $24 by $0.15 of summed per-share edge = 160.
+        assert_eq!(r.total_realized_pnl / r.total_expected_edge, d("160"));
+    }
+
+    #[test]
+    fn arb_without_observed_edge_assumes_a_one_dollar_cost() {
+        let r = StrategyHealthAggRow {
+            total_expected_edge: d("0.15"),
+            expected_edge_events: 5,
+            total_realized_pnl: d("30"),
+            closed_filled_notional: d("1000"),
+            ..row("arb")
+        };
+        assert!(approx(expected_edge_bps(&r).unwrap(), "300"));
+        assert!(approx(edge_capture_ratio(&r).unwrap(), "1"));
+    }
+
+    #[test]
+    fn ratio_does_not_depend_on_trade_size() {
+        let base = StrategyHealthAggRow {
+            total_expected_edge: d("600"),
+            expected_edge_events: 5,
+            total_realized_pnl: d("9"),
+            closed_filled_notional: d("1000"),
+            ..row("mean_reversion")
+        };
+        let scaled = StrategyHealthAggRow {
+            total_realized_pnl: d("90"),
+            closed_filled_notional: d("10000"),
+            ..base.clone()
+        };
+        assert_eq!(edge_capture_ratio(&base), edge_capture_ratio(&scaled));
+        assert!(approx(edge_capture_ratio(&base).unwrap(), "0.75"));
+    }
+
+    #[test]
+    fn losses_give_a_negative_ratio() {
+        let r = StrategyHealthAggRow {
+            total_expected_edge: d("300"),
+            expected_edge_events: 3,
+            total_realized_pnl: d("-5"),
+            closed_filled_notional: d("1000"),
+            ..row("flow")
+        };
+        assert!(edge_capture_ratio(&r).unwrap() < Decimal::ZERO);
+        assert_eq!(recommend(&r).label, "reduce");
+    }
+
+    #[test]
+    fn missing_inputs_give_no_ratio() {
+        let ok = StrategyHealthAggRow {
+            total_expected_edge: d("300"),
+            expected_edge_events: 3,
+            total_realized_pnl: d("5"),
+            closed_filled_notional: d("1000"),
+            ..row("flow")
+        };
+        assert!(edge_capture_ratio(&ok).is_some());
+
+        let no_notional = StrategyHealthAggRow {
+            closed_filled_notional: Decimal::ZERO,
+            ..ok.clone()
+        };
+        assert_eq!(edge_capture_ratio(&no_notional), None);
+
+        let no_events = StrategyHealthAggRow {
+            expected_edge_events: 0,
+            ..ok.clone()
+        };
+        assert_eq!(edge_capture_ratio(&no_events), None);
+
+        let no_edge = StrategyHealthAggRow {
+            total_expected_edge: Decimal::ZERO,
+            ..ok.clone()
+        };
+        assert_eq!(edge_capture_ratio(&no_edge), None);
+
+        let negative_edge = StrategyHealthAggRow {
+            total_expected_edge: d("-10"),
+            ..ok
+        };
+        assert_eq!(edge_capture_ratio(&negative_edge), None);
+    }
+
+    #[test]
+    fn hydration_keeps_pnl_and_notional_paired() {
+        let canonical = |pnl: &str, notional: &str| StrategyHealthAggRow {
+            total_realized_pnl: d(pnl),
+            closed_filled_notional: d(notional),
+            ..row("flow")
+        };
+        let derived = StrategyHealthAggRow {
+            total_expected_edge: d("300"),
+            expected_edge_events: 3,
+            total_realized_pnl: d("5"),
+            closed_filled_notional: d("140"),
+            ..row("flow")
+        };
+
+        // Canonical has no P&L: P&L, notional and the edge/event pair all come
+        // from the derived row.
+        let merged = merge_strategy_health_rows(vec![canonical("0", "0")], vec![derived.clone()]);
+        assert_eq!(merged[0].total_realized_pnl, d("5"));
+        assert_eq!(merged[0].closed_filled_notional, d("140"));
+        assert_eq!(merged[0].expected_edge_events, 3);
+        assert_eq!(merged[0].total_expected_edge, d("300"));
+        assert!(approx(edge_capture_ratio(&merged[0]).unwrap(), "3.5714"));
+
+        // Canonical has its own P&L but no notional: the derived notional is
+        // NOT mixed in, the ratio is simply unavailable.
+        let merged = merge_strategy_health_rows(vec![canonical("7", "0")], vec![derived]);
+        assert_eq!(merged[0].total_realized_pnl, d("7"));
+        assert_eq!(merged[0].closed_filled_notional, Decimal::ZERO);
+        assert_eq!(edge_capture_ratio(&merged[0]), None);
+    }
+
+    #[test]
+    fn recommendations_use_the_unit_consistent_ratio() {
+        // arb: 96% capture, healthy execution -> scale.
+        assert_eq!(recommend(&sample_arb_row()).label, "scale");
+
+        // Weak capture (realized well below the promised edge) -> reduce.
+        let weak = StrategyHealthAggRow {
+            total_realized_pnl: d("30"),
+            ..sample_arb_row()
+        };
+        assert!(edge_capture_ratio(&weak).unwrap() < d("0.20"));
+        assert_eq!(recommend(&weak).label, "reduce");
+    }
+
+    fn sample_arb_row() -> StrategyHealthAggRow {
+        StrategyHealthAggRow {
+            executed_signals: 8,
+            total_expected_edge: d("0.30"),
+            total_observed_edge: d("0.40"),
+            expected_edge_events: 10,
+            total_realized_pnl: d("300"),
+            closed_filled_notional: d("10000"),
+            ..row("arb")
+        }
+    }
+
+    // -- SQL ----------------------------------------------------------------
+
+    async fn create_tables(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE trade_events (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                strategy TEXT NOT NULL,
+                execution_mode TEXT NOT NULL DEFAULT 'paper',
+                source TEXT NOT NULL DEFAULT 'test',
+                market_id TEXT NOT NULL DEFAULT 'm',
+                position_id UUID,
+                signal_id UUID,
+                event_type TEXT NOT NULL,
+                state_from TEXT,
+                state_to TEXT,
+                reason TEXT,
+                direction TEXT,
+                confidence DOUBLE PRECISION,
+                expected_edge DECIMAL(20, 10),
+                observed_edge DECIMAL(20, 10),
+                requested_size_usd DECIMAL(20, 10),
+                filled_size_usd DECIMAL(20, 10),
+                fill_price DECIMAL(20, 10),
+                realized_pnl DECIMAL(20, 10),
+                unrealized_pnl DECIMAL(20, 10),
+                metadata JSONB NOT NULL DEFAULT '{}'::JSONB
+            );
+            CREATE TABLE positions (
+                id UUID PRIMARY KEY,
+                state SMALLINT NOT NULL DEFAULT 0,
+                realized_pnl NUMERIC,
+                entry_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                exit_timestamp TIMESTAMPTZ,
+                yes_entry_price NUMERIC NOT NULL DEFAULT 0,
+                no_entry_price NUMERIC NOT NULL DEFAULT 0,
+                quantity NUMERIC NOT NULL DEFAULT 0,
+                held_yes_qty NUMERIC NOT NULL DEFAULT 0,
+                held_no_qty NUMERIC NOT NULL DEFAULT 0,
+                exited_yes_qty NUMERIC NOT NULL DEFAULT 0,
+                exited_no_qty NUMERIC NOT NULL DEFAULT 0
+            );
+            CREATE TABLE quant_signals (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                kind TEXT NOT NULL,
+                execution_status TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
+                generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                position_id UUID
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn event(
+        pool: &PgPool,
+        strategy: &str,
+        position: Uuid,
+        event_type: &str,
+        state_to: Option<&str>,
+        age: chrono::Duration,
+        filled: Option<&str>,
+        realized: Option<&str>,
+        expected: Option<(&str, &str)>,
+    ) {
+        sqlx::query(
+            "INSERT INTO trade_events (strategy, position_id, event_type, state_to, occurred_at, \
+             filled_size_usd, realized_pnl, expected_edge, observed_edge) \
+             VALUES ($1, $2, $3, $4, $5, $6::numeric, $7::numeric, $8::numeric, $9::numeric)",
+        )
+        .bind(strategy)
+        .bind(position)
+        .bind(event_type)
+        .bind(state_to)
+        .bind(Utc::now() - age)
+        .bind(filled)
+        .bind(realized)
+        .bind(expected.map(|e| e.0))
+        .bind(expected.map(|e| e.1))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn canonical_query_measures_notional_of_the_closed_positions(pool: PgPool) {
+        create_tables(&pool).await;
+        let day = |n| chrono::Duration::days(n);
+        let hour = |n| chrono::Duration::hours(n);
+
+        // P1: entered 10 days ago (before the 7-day window), closed 1 day ago.
+        let p1 = Uuid::new_v4();
+        event(
+            &pool,
+            "arb",
+            p1,
+            "entry_filled",
+            None,
+            day(10),
+            Some("300"),
+            None,
+            None,
+        )
+        .await;
+        event(
+            &pool,
+            "arb",
+            p1,
+            "entry_filled",
+            None,
+            day(10),
+            Some("280"),
+            None,
+            None,
+        )
+        .await;
+        event(
+            &pool,
+            "arb",
+            p1,
+            "position_open",
+            Some("open"),
+            day(3),
+            None,
+            None,
+            Some(("0.03", "0.04")),
+        )
+        .await;
+        event(
+            &pool,
+            "arb",
+            p1,
+            "position_closed",
+            Some("closed"),
+            day(1),
+            None,
+            Some("12"),
+            None,
+        )
+        .await;
+
+        // P2: entered and still open inside the window: not in the closed notional.
+        let p2 = Uuid::new_v4();
+        event(
+            &pool,
+            "arb",
+            p2,
+            "entry_filled",
+            None,
+            hour(5),
+            Some("100"),
+            None,
+            None,
+        )
+        .await;
+        event(
+            &pool,
+            "arb",
+            p2,
+            "position_open",
+            Some("open"),
+            hour(5),
+            None,
+            None,
+            Some(("0.05", "0.06")),
+        )
+        .await;
+
+        let rows = load_strategy_health(&pool, Utc::now() - day(7), Utc::now())
+            .await
+            .unwrap();
+        let arb = rows.iter().find(|r| r.strategy == "arb").unwrap();
+        assert_eq!(arb.total_realized_pnl, d("12"));
+        assert_eq!(
+            arb.closed_filled_notional,
+            d("580"),
+            "P1's pre-window fills, not P2"
+        );
+        assert_eq!(arb.expected_edge_events, 2);
+        assert_eq!(arb.total_expected_edge, d("0.08"));
+        assert_eq!(arb.total_observed_edge, d("0.10"));
+
+        // mean net 0.04 / (1 - 0.05) = 421.05 bps; realized 12 / 580 = 206.9 bps.
+        assert!(approx(expected_edge_bps(arb).unwrap(), "421.0526"));
+        assert!(approx(realized_edge_bps(arb).unwrap(), "206.8966"));
+        assert!(approx(edge_capture_ratio(arb).unwrap(), "0.4914"));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn derived_query_uses_position_entry_cost_of_closed_positions(pool: PgPool) {
+        create_tables(&pool).await;
+
+        // Closed single-leg positions: 100 YES @ 0.40 = $40 and 200 YES @ 0.50
+        // = $100; plus one still-open position that must not count.
+        let mut ids = Vec::new();
+        for (state, qty, price, pnl) in [
+            (4, "100", "0.40", "2"),
+            (4, "200", "0.50", "3"),
+            (1, "50", "0.60", "0"),
+        ] {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO positions (id, state, realized_pnl, yes_entry_price, quantity, \
+                 exited_yes_qty, held_yes_qty) \
+                 VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, \
+                         CASE WHEN $2 = 4 THEN $5::numeric ELSE 0 END, \
+                         CASE WHEN $2 = 4 THEN 0 ELSE $5::numeric END)",
+            )
+            .bind(id)
+            .bind(state as i16)
+            .bind(pnl)
+            .bind(price)
+            .bind(qty)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        for (id, bps) in ids.iter().zip(["100", "120", "80"]) {
+            sqlx::query(
+                "INSERT INTO quant_signals (kind, execution_status, metadata, position_id) \
+                 VALUES ('flow', 'executed', jsonb_build_object('expected_edge_bps', $1::numeric), $2)",
+            )
+            .bind(bps)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let rows = load_derived_strategy_health(
+            &pool,
+            Utc::now() - chrono::Duration::days(7),
+            Utc::now() + chrono::Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        let flow = rows.iter().find(|r| r.strategy == "flow").unwrap();
+        assert_eq!(flow.expected_edge_events, 3);
+        assert_eq!(flow.total_expected_edge, d("300"));
+        assert_eq!(flow.total_realized_pnl, d("5"));
+        assert_eq!(flow.closed_filled_notional, d("140"));
+
+        // 5 / 140 = 357.14 bps realized vs a 100 bps average promise.
+        assert!(approx(realized_edge_bps(flow).unwrap(), "357.1429"));
+        assert!(approx(expected_edge_bps(flow).unwrap(), "100"));
+        assert!(approx(edge_capture_ratio(flow).unwrap(), "3.5714"));
     }
 }
