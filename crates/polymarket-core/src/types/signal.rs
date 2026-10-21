@@ -93,6 +93,40 @@ pub struct QuantSignal {
     pub metadata: serde_json::Value,
     /// When the signal was generated.
     pub generated_at: DateTime<Utc>,
+    /// The market price the generator acted on. The executor refuses a
+    /// signal without one, or once the market has moved away from it.
+    #[serde(default)]
+    pub reference: Option<PriceReference>,
+}
+
+/// A YES price a signal was derived from and when it was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceReference {
+    /// YES outcome price (probability) in (0, 1).
+    pub yes_price: Decimal,
+    /// When that price was observed. For an aggregated bar this is the start
+    /// of the bar, so the reference is never assumed fresher than it is.
+    pub observed_at: DateTime<Utc>,
+}
+
+impl PriceReference {
+    /// A reference from a generator's float price; `None` unless the price is
+    /// a valid probability strictly between 0 and 1.
+    pub fn from_yes_price(yes_price: f64, observed_at: DateTime<Utc>) -> Option<Self> {
+        let yes_price = Decimal::from_f64_retain(yes_price)?.round_dp(6);
+        (yes_price > Decimal::ZERO && yes_price < Decimal::ONE).then_some(Self {
+            yes_price,
+            observed_at,
+        })
+    }
+
+    /// Reference price of the outcome token a signal in `direction` buys.
+    pub fn target_price(&self, direction: SignalDirection) -> Decimal {
+        match direction {
+            SignalDirection::BuyYes => self.yes_price,
+            SignalDirection::BuyNo => Decimal::ONE - self.yes_price,
+        }
+    }
 }
 
 impl QuantSignal {
@@ -115,12 +149,19 @@ impl QuantSignal {
             expiry,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             generated_at: Utc::now(),
+            reference: None,
         }
     }
 
     /// Attach metadata to the signal.
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Record the market price the signal was derived from.
+    pub fn with_reference(mut self, reference: Option<PriceReference>) -> Self {
+        self.reference = reference;
         self
     }
 
@@ -234,6 +275,38 @@ mod tests {
         assert_eq!(deserialized.kind, QuantSignalKind::CrossMarket);
         assert_eq!(deserialized.direction, SignalDirection::BuyNo);
         assert_eq!(deserialized.condition_id, "0xbeef");
+    }
+
+    #[test]
+    fn reference_prices_the_token_the_signal_buys() {
+        let at = Utc::now();
+        let reference = PriceReference::from_yes_price(0.7, at).unwrap();
+        assert_eq!(reference.yes_price, Decimal::new(7, 1));
+        assert_eq!(
+            reference.target_price(SignalDirection::BuyYes),
+            Decimal::new(7, 1)
+        );
+        assert_eq!(
+            reference.target_price(SignalDirection::BuyNo),
+            Decimal::new(3, 1)
+        );
+        for invalid in [0.0, 1.0, -0.2, 1.3, f64::NAN, f64::INFINITY] {
+            assert!(PriceReference::from_yes_price(invalid, at).is_none());
+        }
+
+        // Signals serialized before references existed still decode.
+        let mut json = serde_json::to_value(QuantSignal::new(
+            QuantSignalKind::Flow,
+            "0x1".into(),
+            SignalDirection::BuyYes,
+            0.7,
+            Decimal::ONE,
+            at,
+        ))
+        .unwrap();
+        json.as_object_mut().unwrap().remove("reference");
+        let decoded: QuantSignal = serde_json::from_value(json).unwrap();
+        assert!(decoded.reference.is_none());
     }
 
     #[test]

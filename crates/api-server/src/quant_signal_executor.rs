@@ -7,7 +7,7 @@
 use chrono::Utc;
 use polymarket_core::db::positions::{PositionRepository, SOURCE_RECOMMENDATION};
 use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
-use polymarket_core::types::{ExitStrategy, MarketOrder, OrderSide, Position};
+use polymarket_core::types::{ExitStrategy, MarketOrder, OrderBook, OrderSide, Position};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -36,6 +36,11 @@ pub struct QuantSignalExecutorConfig {
     pub min_confidence: f64,
     /// Maximum signal age in seconds before discarding.
     pub max_signal_age_secs: i64,
+    /// Maximum age of the market price a signal was derived from.
+    pub max_reference_age_secs: i64,
+    /// Largest move of the traded token's price away from the signal's
+    /// reference price before the signal no longer describes the market.
+    pub max_reference_drift: Decimal,
     /// How often to refresh the outcome token cache in the background.
     pub cache_refresh_secs: u64,
     /// Maximum simultaneous quant positions.
@@ -75,6 +80,18 @@ impl QuantSignalExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            // Generators read hourly bars that materialize up to two hours
+            // late; the drift check below bounds how far the price has moved.
+            max_reference_age_secs: std::env::var("QUANT_MAX_REFERENCE_AGE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|secs| *secs > 0)
+                .unwrap_or(3 * 3600),
+            max_reference_drift: std::env::var("QUANT_MAX_REFERENCE_DRIFT")
+                .ok()
+                .and_then(|s| s.parse::<Decimal>().ok())
+                .filter(|drift| *drift > Decimal::ZERO && *drift < Decimal::ONE)
+                .unwrap_or(Decimal::new(3, 2)),
             cache_refresh_secs: std::env::var("QUANT_CACHE_REFRESH_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -495,7 +512,7 @@ impl QuantSignalExecutor {
                 qs.kind,
                 p.realized_pnl
             FROM positions p
-            JOIN quant_signals qs ON qs.position_id = p.id
+            JOIN quant_signals qs ON qs.id = p.source_signal_id
             WHERE p.source = 3
               AND p.state = 4
               AND p.realized_pnl IS NOT NULL
@@ -539,45 +556,43 @@ impl QuantSignalExecutor {
         let cfg = self.snapshot_config().await;
         let execution_mode = self.execution_mode(&cfg).await.to_string();
 
-        // ── Fire-and-forget: persist signal to quant_signals ──
-        let pool = self.pool.clone();
-        let signal_id = signal.id;
-        let kind_str = signal.kind.as_str().to_string();
-        let dir_str = signal.direction.as_str().to_string();
-        let cid = signal.condition_id.clone();
-        let confidence = signal.confidence;
-        let size = signal.suggested_size_usd;
-        let meta = signal.metadata.clone();
-        let gen_at = signal.generated_at;
-
-        tokio::spawn(async move {
-            if let Err(error) = sqlx::query(
-                r#"
-                INSERT INTO quant_signals (id, kind, condition_id, direction, confidence, size_usd, metadata, generated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (id, generated_at) DO NOTHING
-                "#,
+        // Persist the signal before anything refers to it: status updates,
+        // the position link, exit context and the per-strategy breaker all
+        // read this row. A signal that cannot be recorded is not executed.
+        if let Err(error) = sqlx::query(
+            r#"
+            INSERT INTO quant_signals (id, kind, condition_id, direction, confidence, size_usd, metadata, generated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id, generated_at) DO NOTHING
+            "#,
+        )
+        .bind(signal.id)
+        .bind(signal.kind.as_str())
+        .bind(&signal.condition_id)
+        .bind(signal.direction.as_str())
+        .bind(signal.confidence)
+        .bind(signal.suggested_size_usd)
+        .bind(&signal.metadata)
+        .bind(signal.generated_at)
+        .execute(&self.pool)
+        .await
+        {
+            warn!(
+                error = %error,
+                signal_id = %signal.id,
+                kind = signal.kind.as_str(),
+                condition_id = %signal.condition_id,
+                "Failed to persist quant signal; not executing it"
+            );
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("signal_persist_failed"),
             )
-            .bind(signal_id)
-            .bind(&kind_str)
-            .bind(&cid)
-            .bind(&dir_str)
-            .bind(confidence)
-            .bind(size)
-            .bind(&meta)
-            .bind(gen_at)
-            .execute(&pool)
-            .await
-            {
-                warn!(
-                    error = %error,
-                    signal_id = %signal_id,
-                    kind = %kind_str,
-                    condition_id = %cid,
-                    "Failed to persist quant signal"
-                );
-            }
-        });
+            .await;
+            return Ok(());
+        }
 
         self.trade_event_recorder
             .record_warn(
@@ -886,6 +901,36 @@ impl QuantSignalExecutor {
                 &execution_mode,
                 "signal_skipped",
                 Some("insufficient_depth"),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // Step 10b: The signal must still describe this market. Its reference
+        // price has to be recent, and the token's live price close to it:
+        // a move either way since the generator read the market (a flip, or
+        // the expected move already priced in) invalidates the signal.
+        if let Some(reason) = reference_rejection(
+            &signal,
+            &book,
+            Utc::now(),
+            cfg.max_reference_age_secs,
+            cfg.max_reference_drift,
+        ) {
+            debug!(
+                signal_id = %signal.id,
+                reason,
+                reference = ?signal.reference,
+                best_ask = %best_ask,
+                "Signal no longer matches the live market, skipping"
+            );
+            self.update_signal_status(signal.id, "skipped", Some(reason))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some(reason),
             )
             .await;
             return Ok(());
@@ -1512,6 +1557,40 @@ impl TradeEventBuilderExt for NewTradeEvent {
     }
 }
 
+/// Why a signal must not be executed against `book` (the book of the token it
+/// buys), or `None` when its reference price is recent and the token's live
+/// price — the mid when both sides are quoted, otherwise the ask — and its
+/// ask are both within `max_drift` of the reference.
+fn reference_rejection(
+    signal: &QuantSignal,
+    book: &OrderBook,
+    now: chrono::DateTime<Utc>,
+    max_age_secs: i64,
+    max_drift: Decimal,
+) -> Option<&'static str> {
+    let Some(reference) = signal.reference else {
+        return Some("missing_reference_price");
+    };
+    let age_secs = now
+        .signed_duration_since(reference.observed_at)
+        .num_seconds();
+    if age_secs > max_age_secs {
+        return Some("stale_reference_price");
+    }
+    let Some(ask) = book.best_ask() else {
+        return Some("no_liquidity");
+    };
+    let live = match book.best_bid() {
+        Some(bid) if bid < ask => (bid + ask) / Decimal::TWO,
+        _ => ask,
+    };
+    let target = reference.target_price(signal.direction);
+    if (live - target).abs() > max_drift || ask - target > max_drift {
+        return Some("price_drifted");
+    }
+    None
+}
+
 fn expected_edge_from_signal(signal: &QuantSignal) -> Option<Decimal> {
     signal
         .metadata
@@ -1632,6 +1711,148 @@ mod tests {
             + config.mean_reversion_allocation_pct
             + config.resolution_allocation_pct;
         assert!((total - 1.0).abs() < 0.01);
+    }
+
+    fn quoted_book(bid: Option<i64>, ask: i64) -> OrderBook {
+        let level = |cents: i64| polymarket_core::types::PriceLevel {
+            price: Decimal::new(cents, 2),
+            size: Decimal::from(1000),
+        };
+        OrderBook {
+            market_id: "m".into(),
+            outcome_id: "t".into(),
+            timestamp: Utc::now(),
+            bids: bid.map(level).into_iter().collect(),
+            asks: vec![level(ask)],
+        }
+    }
+
+    fn referenced_signal(
+        direction: SignalDirection,
+        yes_price: f64,
+        observed_at: chrono::DateTime<Utc>,
+    ) -> QuantSignal {
+        QuantSignal::new(
+            QuantSignalKind::ResolutionProximity,
+            "0xabc".into(),
+            direction,
+            0.8,
+            Decimal::from(30),
+            Utc::now() + chrono::Duration::minutes(10),
+        )
+        .with_reference(polymarket_core::types::PriceReference::from_yes_price(
+            yes_price,
+            observed_at,
+        ))
+    }
+
+    #[test]
+    fn signals_are_only_executed_against_the_market_they_describe() {
+        let now = Utc::now();
+        let drift = Decimal::new(3, 2);
+        let age = 3 * 3600;
+        let check = |signal: &QuantSignal, book: &OrderBook| {
+            reference_rejection(signal, book, now, age, drift)
+        };
+
+        // YES read at 0.80; the YES book is 0.79/0.81 → still the same market.
+        let buy_yes = referenced_signal(SignalDirection::BuyYes, 0.80, now);
+        assert_eq!(check(&buy_yes, &quoted_book(Some(79), 81)), None);
+        // The market flipped to 0.30: buying YES now bets against the signal.
+        assert_eq!(
+            check(&buy_yes, &quoted_book(Some(29), 31)),
+            Some("price_drifted")
+        );
+        // The expected move already happened: YES is 0.90.
+        assert_eq!(
+            check(&buy_yes, &quoted_book(Some(89), 91)),
+            Some("price_drifted")
+        );
+        // A mid near the reference with an ask far above it is still too dear.
+        assert_eq!(
+            check(&buy_yes, &quoted_book(Some(74), 84)),
+            Some("price_drifted")
+        );
+        // One-sided book: the ask is the live price.
+        assert_eq!(check(&buy_yes, &quoted_book(None, 82)), None);
+
+        // BuyNo is checked against the NO token: YES 0.80 → NO 0.20.
+        let buy_no = referenced_signal(SignalDirection::BuyNo, 0.80, now);
+        assert_eq!(check(&buy_no, &quoted_book(Some(19), 21)), None);
+        assert_eq!(
+            check(&buy_no, &quoted_book(Some(69), 71)),
+            Some("price_drifted")
+        );
+
+        // Old or missing references are refused outright.
+        let stale = referenced_signal(
+            SignalDirection::BuyYes,
+            0.80,
+            now - chrono::Duration::hours(4),
+        );
+        assert_eq!(
+            check(&stale, &quoted_book(Some(79), 81)),
+            Some("stale_reference_price")
+        );
+        let unreferenced =
+            referenced_signal(SignalDirection::BuyYes, 0.80, now).with_reference(None);
+        assert_eq!(
+            check(&unreferenced, &quoted_book(Some(79), 81)),
+            Some("missing_reference_price")
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn strategy_breaker_counts_losses_of_unlinked_signals(pool: PgPool) {
+        crate::exit_handler::correctness_tests::setup(&pool).await;
+        sqlx::Executor::execute(
+            &pool,
+            "CREATE TABLE strategy_risk_state (
+                strategy TEXT PRIMARY KEY, daily_pnl NUMERIC, daily_pnl_date DATE,
+                consecutive_losses INT, halted BOOLEAN, halt_reason TEXT,
+                halted_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+            )",
+        )
+        .await
+        .unwrap();
+        // The signal row was never linked to its position (quant_signals has
+        // no position_id here); the position still names its signal.
+        let signal_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO quant_signals (id, kind, direction) VALUES ($1, 'flow', 'buy_yes')",
+        )
+        .bind(signal_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO positions (id, source, state, realized_pnl, exit_timestamp, source_signal_id)
+             VALUES ($1, 3, 4, -250, NOW(), $2)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(signal_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = crate::state::AppState::for_tests(pool.clone());
+        let mut executor = QuantSignalExecutor::new(
+            Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env())),
+            broadcast::channel(1).1,
+            broadcast::channel(1).0,
+            broadcast::channel(1).0,
+            state.order_executor.clone(),
+            state.circuit_breaker.clone(),
+            state.market_catalog.clone(),
+            pool.clone(),
+            Arc::new(AtomicI64::new(0)),
+        );
+        executor.sync_strategy_outcomes().await;
+
+        let flow = &executor.strategy_states[&QuantSignalKind::Flow];
+        assert_eq!(flow.daily_pnl, Decimal::from(-250));
+        // -$250 is past the default $200 per-strategy daily loss limit.
+        assert!(flow.halted);
     }
 
     #[test]

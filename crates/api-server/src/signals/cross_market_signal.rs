@@ -14,7 +14,9 @@
 //! Expiry: 60 minutes
 
 use chrono::{Duration, Utc};
-use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
+use polymarket_core::types::signal::{
+    PriceReference, QuantSignal, QuantSignalKind, SignalDirection,
+};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::time;
@@ -83,6 +85,8 @@ struct DivergenceRow {
     lag_change: f64,
     /// Current close price of the lag market.
     lag_current_price: f64,
+    /// Start of the hourly bar `lag_current_price` closed.
+    lag_current_bucket: chrono::DateTime<Utc>,
 }
 
 /// Spawn the cross-market signal generator.
@@ -160,7 +164,8 @@ async fn generate_signals(
                 oh.market_id,
                 (last_val.close - first_val.close) /
                     NULLIF(first_val.close, 0) AS price_change,
-                last_val.close AS current_price
+                last_val.close AS current_price,
+                last_val.bucket AS current_bucket
             FROM (
                 SELECT DISTINCT market_id
                 FROM orderbook_hourly
@@ -175,7 +180,7 @@ async fn generate_signals(
                 LIMIT 1
             ) first_val
             CROSS JOIN LATERAL (
-                SELECT close
+                SELECT close, bucket
                 FROM orderbook_hourly
                 WHERE market_id = oh.market_id
                   AND bucket >= NOW() - INTERVAL '4 hours'
@@ -211,7 +216,12 @@ async fn generate_signals(
                 WHEN ABS(pc_a.price_change) > ABS(pc_b.price_change)
                 THEN pc_b.current_price::double precision
                 ELSE pc_a.current_price::double precision
-            END AS lag_current_price
+            END AS lag_current_price,
+            CASE
+                WHEN ABS(pc_a.price_change) > ABS(pc_b.price_change)
+                THEN pc_b.current_bucket
+                ELSE pc_a.current_bucket
+            END AS lag_current_bucket
         FROM market_correlations mc
         JOIN price_changes pc_a ON pc_a.market_id = mc.condition_id_a
         JOIN price_changes pc_b ON pc_b.market_id = mc.condition_id_b
@@ -289,6 +299,10 @@ async fn generate_signals(
             expiry: now + Duration::minutes(config.expiry_minutes),
             metadata,
             generated_at: now,
+            reference: PriceReference::from_yes_price(
+                row.lag_current_price,
+                row.lag_current_bucket,
+            ),
         });
     }
 
@@ -350,5 +364,45 @@ mod tests {
         let confidence = (corr_factor * 0.5 + divergence * 5.0 * 0.5).clamp(0.0, 0.90);
         // 0.95 * 0.5 + 0.20 * 5.0 * 0.5 = 0.475 + 0.5 = 0.975 → clamped to 0.90
         assert!((confidence - 0.90).abs() < 0.001);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn divergence_references_the_lag_market_latest_close(pool: PgPool) {
+        use crate::signals::hourly_bars;
+        sqlx::Executor::execute(
+            &pool,
+            include_str!("../../../../migrations/043_market_correlations.sql"),
+        )
+        .await
+        .unwrap();
+        hourly_bars::create(&pool).await;
+        sqlx::query(
+            "INSERT INTO market_correlations (condition_id_a, condition_id_b, correlation, sample_size)
+             VALUES ('0xa', '0xb', 0.9, 200)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let start = now - Duration::minutes(200);
+        let latest = now - Duration::minutes(20);
+        // Lead 0xa rises 0.40 → 0.50 (+25%); lag 0xb stays at 0.60.
+        for (market, open, close) in [("0xa", 40, 50), ("0xb", 60, 60)] {
+            hourly_bars::insert(&pool, market, start, Decimal::new(open, 2), Decimal::ONE).await;
+            hourly_bars::insert(&pool, market, latest, Decimal::new(close, 2), Decimal::ONE).await;
+        }
+
+        let config = CrossMarketSignalConfig::from_env();
+        let signals = generate_signals(&config, &pool).await.unwrap();
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal.condition_id, "0xb");
+        assert_eq!(signal.direction, SignalDirection::BuyYes);
+        let reference = signal.reference.unwrap();
+        assert_eq!(reference.yes_price, Decimal::new(60, 2));
+        assert_eq!(
+            reference.observed_at.timestamp_micros(),
+            latest.timestamp_micros()
+        );
     }
 }

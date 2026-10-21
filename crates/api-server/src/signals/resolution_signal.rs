@@ -13,7 +13,9 @@
 //! Expiry: 60 minutes (longer horizon strategy)
 
 use chrono::{Duration, Utc};
-use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
+use polymarket_core::types::signal::{
+    PriceReference, QuantSignal, QuantSignalKind, SignalDirection,
+};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::time;
@@ -76,6 +78,8 @@ struct ResolutionRow {
     volume: Option<Decimal>,
     /// Most recent YES mid-price from orderbook snapshots.
     yes_price: Option<f64>,
+    /// Start of the hourly bar `yes_price` closed.
+    yes_price_bucket: Option<chrono::DateTime<Utc>>,
 }
 
 /// Spawn the resolution proximity signal generator.
@@ -151,11 +155,13 @@ async fn scan_and_emit(
             mm.question,
             mm.end_date,
             mm.volume,
-            ob.yes_price
+            ob.yes_price,
+            ob.yes_price_bucket
         FROM market_metadata mm
         LEFT JOIN LATERAL (
             SELECT
-                close AS yes_price
+                close::float8 AS yes_price,
+                bucket AS yes_price_bucket
             FROM orderbook_hourly
             WHERE market_id = mm.condition_id
               AND bucket >= NOW() - INTERVAL '72 hours'
@@ -182,9 +188,9 @@ async fn scan_and_emit(
     let mut emitted = 0;
 
     for row in &rows {
-        let yes_price = match row.yes_price {
-            Some(p) => p,
-            None => continue,
+        let (Some(yes_price), Some(yes_price_bucket)) = (row.yes_price, row.yes_price_bucket)
+        else {
+            continue;
         };
 
         let hours_remaining = row.end_date.signed_duration_since(now).num_hours().max(1) as f64;
@@ -225,6 +231,7 @@ async fn scan_and_emit(
             config.base_position_size_usd,
             expiry,
         )
+        .with_reference(PriceReference::from_yes_price(yes_price, yes_price_bucket))
         .with_metadata(serde_json::json!({
             "question": row.question,
             "yes_price": yes_price,
@@ -296,5 +303,43 @@ mod tests {
         // YES at 0.25 → should BuyNo (market leans NO near resolution)
         // 0.25 < 0.5
         let _ = 0.25_f64;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scan_decodes_hourly_bars_and_references_the_latest_close(pool: PgPool) {
+        use crate::signals::hourly_bars;
+        sqlx::Executor::execute(
+            &pool,
+            include_str!("../../../../migrations/038_market_metadata.sql"),
+        )
+        .await
+        .unwrap();
+        hourly_bars::create(&pool).await;
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO market_metadata (condition_id, question, end_date, volume, active)
+             VALUES ('0xfav', 'Will it?', $1, 50000, true)",
+        )
+        .bind(now + Duration::days(3))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let older = now - Duration::hours(5);
+        let latest = now - Duration::minutes(30);
+        hourly_bars::insert(&pool, "0xfav", older, Decimal::new(30, 2), Decimal::ONE).await;
+        hourly_bars::insert(&pool, "0xfav", latest, Decimal::new(80, 2), Decimal::ONE).await;
+
+        let config = ResolutionSignalConfig::from_env();
+        let (tx, mut rx) = broadcast::channel(8);
+        assert_eq!(scan_and_emit(&config, &pool, &tx).await.unwrap(), 1);
+
+        let signal = rx.try_recv().unwrap();
+        assert_eq!(signal.direction, SignalDirection::BuyYes);
+        let reference = signal.reference.unwrap();
+        assert_eq!(reference.yes_price, Decimal::new(80, 2));
+        assert_eq!(
+            reference.observed_at.timestamp_micros(),
+            latest.timestamp_micros()
+        );
     }
 }

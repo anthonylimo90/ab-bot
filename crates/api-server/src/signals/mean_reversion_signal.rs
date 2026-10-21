@@ -12,7 +12,9 @@
 //! Expiry: 20 minutes (short-lived reversion window)
 
 use chrono::{Duration, Utc};
-use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
+use polymarket_core::types::signal::{
+    PriceReference, QuantSignal, QuantSignalKind, SignalDirection,
+};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::time;
@@ -63,6 +65,8 @@ struct MeanReversionRow {
     condition_id: String,
     /// Current (most recent) hourly mid-price for YES.
     current_price: f64,
+    /// Start of the hourly bar `current_price` closed.
+    current_bucket: chrono::DateTime<Utc>,
     /// Previous hourly mid-price for YES.
     previous_price: f64,
     /// Price change as a fraction.
@@ -154,13 +158,14 @@ async fn scan_and_emit(
         current_prev AS (
             SELECT
                 c.condition_id,
-                c.mid_price AS current_price,
-                p.mid_price AS previous_price,
-                CASE
+                c.mid_price::float8 AS current_price,
+                c.bucket AS current_bucket,
+                p.mid_price::float8 AS previous_price,
+                (CASE
                     WHEN p.mid_price > 0 THEN (c.mid_price - p.mid_price) / p.mid_price
                     ELSE 0
-                END AS price_change,
-                c.avg_volume AS current_volume
+                END)::float8 AS price_change,
+                c.avg_volume::float8 AS current_volume
             FROM recent c
             JOIN recent p ON c.condition_id = p.condition_id AND p.rn = 2
             WHERE c.rn = 1
@@ -178,10 +183,11 @@ async fn scan_and_emit(
         SELECT
             cp.condition_id,
             cp.current_price,
+            cp.current_bucket,
             cp.previous_price,
             cp.price_change,
             cp.current_volume,
-            COALESCE(vm.median_volume, cp.current_volume) AS median_volume
+            COALESCE(vm.median_volume, cp.current_volume)::float8 AS median_volume
         FROM current_prev cp
         LEFT JOIN vol_median vm ON cp.condition_id = vm.condition_id
         WHERE ABS(cp.price_change) >= $2
@@ -222,6 +228,10 @@ async fn scan_and_emit(
             config.base_position_size_usd,
             expiry,
         )
+        .with_reference(PriceReference::from_yes_price(
+            row.current_price,
+            row.current_bucket,
+        ))
         .with_metadata(serde_json::json!({
             "current_price": row.current_price,
             "previous_price": row.previous_price,
@@ -285,5 +295,44 @@ mod tests {
         // Price went down (negative change) → BuyYes (reversion up)
         let price_change = -0.12;
         assert!(price_change < 0.0); // BuyYes
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scan_decodes_hourly_bars_and_references_the_latest_close(pool: PgPool) {
+        use crate::signals::hourly_bars;
+        hourly_bars::create(&pool).await;
+        let now = Utc::now();
+        let current_bucket = now - Duration::minutes(40);
+        hourly_bars::insert(
+            &pool,
+            "0xspike",
+            now - Duration::minutes(100),
+            Decimal::new(50, 2),
+            Decimal::from(1000),
+        )
+        .await;
+        hourly_bars::insert(
+            &pool,
+            "0xspike",
+            current_bucket,
+            Decimal::new(60, 2),
+            Decimal::from(1000),
+        )
+        .await;
+
+        let config = MeanReversionSignalConfig::from_env();
+        let (tx, mut rx) = broadcast::channel(8);
+        assert_eq!(scan_and_emit(&config, &pool, &tx).await.unwrap(), 1);
+
+        let signal = rx.try_recv().unwrap();
+        assert_eq!(signal.condition_id, "0xspike");
+        // +20% → bet on reversion by buying NO.
+        assert_eq!(signal.direction, SignalDirection::BuyNo);
+        let reference = signal.reference.unwrap();
+        assert_eq!(reference.yes_price, Decimal::new(60, 2));
+        assert_eq!(
+            reference.observed_at.timestamp_micros(),
+            current_bucket.timestamp_micros()
+        );
     }
 }
