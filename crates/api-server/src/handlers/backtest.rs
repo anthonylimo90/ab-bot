@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -571,6 +571,19 @@ pub(crate) async fn enqueue_backtest(
 ) -> ApiResult<BacktestResultResponse> {
     validate_backtest_request(&request)?;
 
+    // Runs wait for a permit while `running`; refuse to grow the queue
+    // without bound (a schedule whose runs outlast its interval would).
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM backtest_results WHERE status = 'running'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if queued >= MAX_QUEUED_RUNS {
+        return Err(ApiError::ServiceUnavailable(format!(
+            "{queued} backtests are already queued or running; try again later"
+        )));
+    }
+
     let result_id = Uuid::new_v4();
     let now = Utc::now();
 
@@ -769,6 +782,9 @@ fn limits() -> &'static BacktestLimits {
     static LIMITS: OnceLock<BacktestLimits> = OnceLock::new();
     LIMITS.get_or_init(BacktestLimits::from_env)
 }
+
+/// Most runs that may be queued or running at once.
+const MAX_QUEUED_RUNS: i64 = 10;
 
 /// Permits shared by every backtest run in the process, manual or scheduled.
 fn run_permits() -> &'static Semaphore {
@@ -996,9 +1012,28 @@ pub(crate) async fn run_backtest_task(
     // Manual and scheduled runs share the permits; later runs wait here (their
     // row stays `running`) instead of all simulating at once.
     with_run_permit(run_permits(), async {
-        run_backtest_inner(pool, result_id, request, schedule_id).await;
+        // The reaper may have failed the run while it waited for a permit.
+        match still_running(&pool, result_id).await {
+            Ok(true) => run_backtest_inner(pool, result_id, request, schedule_id).await,
+            Ok(false) => {
+                warn!(backtest_id = %result_id, "Backtest was finalized while queued; not running it")
+            }
+            Err(e) => {
+                error!(backtest_id = %result_id, error = %e, "Failed to check backtest status");
+                fail_backtest(&pool, result_id, schedule_id, "Failed to start backtest").await;
+            }
+        }
     })
     .await;
+}
+
+async fn still_running(pool: &PgPool, result_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM backtest_results WHERE id = $1 AND status = 'running')",
+    )
+    .bind(result_id)
+    .fetch_one(pool)
+    .await
 }
 
 async fn run_backtest_inner(
@@ -1069,7 +1104,11 @@ async fn finish_backtest(
     match result {
         Ok(backtest_result) => {
             match persist_backtest_result(pool, result_id, &backtest_result).await {
-                Ok(()) => {
+                Ok(false) => {
+                    // Already failed (reaped); a finished run never changes status.
+                    warn!(backtest_id = %result_id, "Backtest was finalized before its result was stored");
+                }
+                Ok(true) => {
                     set_schedule_status(pool, schedule_id, result_id, "completed").await;
                     info!(
                         backtest_id = %result_id,
@@ -1114,7 +1153,8 @@ fn metric(val: f64) -> Option<Decimal> {
     Decimal::try_from(val).ok()
 }
 
-/// Write the finished result and mark the row `completed`.
+/// Write the finished result and mark the row `completed`; `false` when the
+/// row was no longer `running` (already finalized) and nothing was written.
 ///
 /// Any database error (including a numeric overflow) is returned to the caller,
 /// which must mark the run failed so the row never stays `running`.
@@ -1122,7 +1162,7 @@ async fn persist_backtest_result(
     pool: &PgPool,
     result_id: Uuid,
     backtest_result: &backtester::BacktestResult,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     // Build equity curve with running-peak drawdown
     let mut peak = Decimal::ZERO;
     let equity_curve: Vec<EquityPoint> = backtest_result
@@ -1166,7 +1206,7 @@ async fn persist_backtest_result(
         .collect();
     let trade_log_json = serde_json::to_value(&trade_log).ok();
 
-    sqlx::query(
+    let updated = sqlx::query(
         r#"
         UPDATE backtest_results SET
             status = 'completed',
@@ -1199,7 +1239,7 @@ async fn persist_backtest_result(
             max_consecutive_wins = $27,
             max_consecutive_losses = $28,
             avg_trade_duration_hours = $29
-        WHERE id = $1
+        WHERE id = $1 AND status = 'running'
         "#,
     )
     .bind(result_id) // $1
@@ -1234,7 +1274,7 @@ async fn persist_backtest_result(
     .execute(pool)
     .await?;
 
-    Ok(())
+    Ok(updated.rows_affected() > 0)
 }
 
 /// Record the final status of the run on its schedule (no-op for manual runs).
@@ -1270,17 +1310,25 @@ async fn set_schedule_status(
 /// that on its schedule.
 async fn fail_backtest(pool: &PgPool, result_id: Uuid, schedule_id: Option<Uuid>, message: &str) {
     let message: String = message.chars().take(2000).collect();
-    if let Err(db_err) = sqlx::query(
-        "UPDATE backtest_results SET status = 'failed', error = $2, completed_at = NOW() WHERE id = $1",
+    match sqlx::query(
+        "UPDATE backtest_results SET status = 'failed', error = $2, completed_at = NOW() \
+         WHERE id = $1 AND status = 'running'",
     )
     .bind(result_id)
     .bind(&message)
     .execute(pool)
     .await
     {
-        error!(backtest_id = %result_id, error = %db_err, "Failed to update backtest error");
+        // Only the transition that finalizes the run updates its schedule.
+        Ok(done) if done.rows_affected() > 0 => {
+            set_schedule_status(pool, schedule_id, result_id, "failed").await
+        }
+        Ok(_) => {}
+        Err(db_err) => {
+            error!(backtest_id = %result_id, error = %db_err, "Failed to update backtest error");
+            set_schedule_status(pool, schedule_id, result_id, "failed").await;
+        }
     }
-    set_schedule_status(pool, schedule_id, result_id, "failed").await;
 }
 
 /// Fail runs that have been `running` for longer than `max_age`.
@@ -2391,6 +2439,37 @@ mod persistence_tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_reaped_run_stays_failed_when_its_result_arrives(pool: PgPool) {
+        create_pre_085_schema(&pool).await;
+        apply_migration_085(&pool).await;
+        // Queued behind a long run past the reaper's timeout.
+        let id = insert_running(&pool, chrono::Duration::hours(3)).await;
+        let schedule = insert_schedule(&pool, "queued", id).await;
+        reap_stale_running_backtests(&pool, chrono::Duration::hours(2))
+            .await
+            .unwrap();
+        assert!(!still_running(&pool, id).await.unwrap());
+
+        finish_backtest(&pool, id, Some(schedule), Ok(sample_result())).await;
+        let (status, error, annualized, ..) = read_metrics(&pool, id).await;
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("Timed out"));
+        assert_ne!(annualized, Some(3.5), "no result written over a failed run");
+        assert_eq!(
+            schedule_status(&pool, schedule).await.as_deref(),
+            Some("failed")
+        );
+
+        // A late failure does not rewrite the recorded reason either.
+        fail_backtest(&pool, id, Some(schedule), "late failure").await;
+        assert!(read_metrics(&pool, id)
+            .await
+            .1
+            .unwrap()
+            .contains("Timed out"));
     }
 }
 

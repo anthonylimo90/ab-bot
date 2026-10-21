@@ -79,10 +79,11 @@ impl FlowFeatureConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
+            // Bounded so the cutoff date arithmetic can never overflow.
             retention_days: std::env::var("FLOW_FEATURE_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|days| *days > 0)
+                .filter(|days| (1..=3650).contains(days))
                 .unwrap_or(DEFAULT_RETENTION_DAYS),
         }
     }

@@ -295,18 +295,17 @@ async fn load_strategy_health(
                     WHERE event_type IN ('position_closed', 'closed_via_resolution')
                        OR state_to = 'closed'
                 )::bigint AS closed_positions,
+                -- Each position's promised edge is recorded once, on its
+                -- entry request.
                 COALESCE(SUM(expected_edge) FILTER (
-                    WHERE event_type IN ('entry_filled', 'position_open')
-                       OR state_to = 'open'
+                    WHERE event_type = 'entry_requested'
                 ), 0) AS total_expected_edge,
                 COALESCE(SUM(observed_edge) FILTER (
-                    WHERE event_type IN ('entry_filled', 'position_open')
-                       OR state_to = 'open'
+                    WHERE event_type = 'entry_requested'
                 ), 0) AS total_observed_edge,
                 COUNT(*) FILTER (
                     WHERE expected_edge IS NOT NULL
-                      AND (event_type IN ('entry_filled', 'position_open')
-                           OR state_to = 'open')
+                      AND event_type = 'entry_requested'
                 )::bigint AS expected_edge_events,
                 COALESCE(SUM(realized_pnl) FILTER (
                     WHERE event_type IN ('position_closed', 'closed_via_resolution')
@@ -1066,8 +1065,8 @@ mod edge_capture_tests {
             &pool,
             "arb",
             p1,
-            "position_open",
-            Some("open"),
+            "entry_requested",
+            Some("pending"),
             day(3),
             None,
             None,
@@ -1105,8 +1104,8 @@ mod edge_capture_tests {
             &pool,
             "arb",
             p2,
-            "position_open",
-            Some("open"),
+            "entry_requested",
+            Some("pending"),
             hour(5),
             None,
             None,

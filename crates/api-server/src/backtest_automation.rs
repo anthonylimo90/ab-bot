@@ -43,10 +43,11 @@ impl BacktestAutomationConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(4),
+            // Bounded (30 days) so the interval arithmetic can never overflow.
             stale_run_timeout_minutes: std::env::var("BACKTEST_STALE_RUN_TIMEOUT_MINUTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|minutes| *minutes > 0)
+                .filter(|minutes| (1..=43_200).contains(minutes))
                 .unwrap_or(DEFAULT_STALE_RUN_TIMEOUT_MINUTES),
         }
     }

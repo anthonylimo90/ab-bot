@@ -1795,6 +1795,16 @@ async fn load_arb_market_scorecard_rows(
                 position_id,
                 MAX(expected_edge) FILTER (WHERE expected_edge IS NOT NULL) AS expected_edge,
                 MAX(observed_edge) FILTER (WHERE observed_edge IS NOT NULL) AS observed_edge,
+                -- Expected profit in USD: net edge per share times the shares
+                -- requested (requested cost over the per-share pair cost,
+                -- which is 1 - gross edge).
+                MAX(expected_edge * requested_size_usd / (1 - observed_edge)) FILTER (
+                    WHERE event_type = 'entry_requested'
+                      AND expected_edge IS NOT NULL
+                      AND requested_size_usd IS NOT NULL
+                      AND observed_edge IS NOT NULL
+                      AND observed_edge < 1
+                ) AS expected_usd,
                 MAX(filled_size_usd) FILTER (WHERE filled_size_usd IS NOT NULL) AS filled_size_usd,
                 MAX(occurred_at) FILTER (
                     WHERE event_type IN ('entry_filled', 'position_open')
@@ -1853,6 +1863,7 @@ async fn load_arb_market_scorecard_rows(
                 e.position_id,
                 e.expected_edge,
                 e.observed_edge,
+                e.expected_usd,
                 e.filled_size_usd,
                 e.traded_at,
                 c.realized_pnl,
@@ -1894,7 +1905,10 @@ async fn load_arb_market_scorecard_rows(
                 AVG(p.expected_edge) AS avg_expected_edge,
                 AVG(p.observed_edge) AS avg_observed_edge,
                 AVG(p.realized_pnl) FILTER (WHERE p.closed_at IS NOT NULL) AS avg_realized_pnl,
-                COALESCE(SUM(p.expected_edge) FILTER (WHERE p.closed_at IS NOT NULL), 0) AS closed_expected_edge,
+                SUM(p.expected_usd) FILTER (WHERE p.closed_at IS NOT NULL) AS closed_expected_usd,
+                SUM(p.realized_pnl) FILTER (
+                    WHERE p.closed_at IS NOT NULL AND p.expected_usd IS NOT NULL
+                ) AS closed_realized_pnl_with_expectation,
                 AVG((EXTRACT(EPOCH FROM (p.closed_at - p.opened_at)) / 3600.0)::double precision)
                     FILTER (WHERE p.closed_at IS NOT NULL AND p.opened_at IS NOT NULL) AS avg_hold_hours,
                 AVG(p.filled_size_usd) AS avg_filled_size_usd,
@@ -1918,9 +1932,10 @@ async fn load_arb_market_scorecard_rows(
             pa.avg_expected_edge,
             pa.avg_observed_edge,
             pa.avg_realized_pnl,
+            -- Realized over expected USD profit of the same closed positions.
             CASE
-                WHEN COALESCE(pa.closed_expected_edge, 0) = 0 THEN NULL
-                ELSE COALESCE(pa.total_realized_pnl, 0) / NULLIF(pa.closed_expected_edge, 0)
+                WHEN COALESCE(pa.closed_expected_usd, 0) <= 0 THEN NULL
+                ELSE COALESCE(pa.closed_realized_pnl_with_expectation, 0) / pa.closed_expected_usd
             END AS edge_capture_ratio,
             pa.avg_hold_hours,
             pa.avg_filled_size_usd,
@@ -3874,5 +3889,59 @@ mod tests {
         assert!(!query.contains("MAX(position_id)"));
         assert!(!query.contains("MAX(direction)"));
         assert!(!query.contains("MAX(confidence)"));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn arb_scorecard_compares_realized_and_expected_usd(pool: sqlx::PgPool) {
+        let schema = include_str!("../../../../migrations/048_trade_events.sql")
+            .replace("uuid_generate_v4()", "gen_random_uuid()");
+        sqlx::Executor::execute(&pool, schema.as_str())
+            .await
+            .unwrap();
+        let position = uuid::Uuid::new_v4();
+        let event = |event_type: &str, state_to: Option<&str>| {
+            sqlx::query(
+                "INSERT INTO trade_events (strategy, execution_mode, source, market_id, \
+                 position_id, event_type, state_to, expected_edge, observed_edge, \
+                 requested_size_usd, realized_pnl) \
+                 VALUES ('arb', 'paper', 'arb', 'm', $1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(position)
+            .bind(event_type.to_string())
+            .bind(state_to.map(str::to_string))
+        };
+        // 100 pairs at 0.96 promising $0.02 net each: $2 expected.
+        event("entry_requested", Some("pending"))
+            .bind(Some(Decimal::new(2, 2)))
+            .bind(Some(Decimal::new(4, 2)))
+            .bind(Some(Decimal::from(96)))
+            .bind(None::<Decimal>)
+            .execute(&pool)
+            .await
+            .unwrap();
+        event("position_closed", Some("closed"))
+            .bind(None::<Decimal>)
+            .bind(None::<Decimal>)
+            .bind(None::<Decimal>)
+            .bind(Some(Decimal::new(15, 1)))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = load_arb_market_scorecard_rows(
+            &pool,
+            Utc::now() - chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::minutes(1),
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        // $1.50 realized of $2.00 expected.
+        assert_eq!(
+            rows[0].edge_capture_ratio.map(|r| r.round_dp(6)),
+            Some(Decimal::new(75, 2))
+        );
     }
 }

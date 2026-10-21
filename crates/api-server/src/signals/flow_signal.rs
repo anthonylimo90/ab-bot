@@ -18,7 +18,9 @@
 //! Expiry: 30 minutes from generation
 
 use chrono::{Duration, Utc};
-use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
+use polymarket_core::types::signal::{
+    PriceReference, QuantSignal, QuantSignalKind, SignalDirection,
+};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::time;
@@ -148,6 +150,8 @@ struct FlowFeatureRow {
     liquidity: Decimal,
     market_volume: Decimal,
     yes_price: Option<f64>,
+    /// Start of the hourly bar `yes_price` closed.
+    yes_price_bucket: Option<chrono::DateTime<Utc>>,
     bot_score_coverage: f64,
 }
 
@@ -277,6 +281,29 @@ pub(crate) fn direction_from_imbalance(imbalance_ratio: Decimal) -> SignalDirect
     }
 }
 
+/// The direction to follow, only when the overall imbalance, the net flow and
+/// the smart-money flow all point the same way. Smart money is a subset of
+/// the flow and can oppose it; following the crowd against it is not a flow
+/// signal.
+fn agreed_flow_direction(
+    imbalance_ratio: Decimal,
+    net_flow: Decimal,
+    smart_money_flow: Decimal,
+) -> Option<SignalDirection> {
+    let sign = |value: Decimal| {
+        if value > Decimal::ZERO {
+            1
+        } else if value < Decimal::ZERO {
+            -1
+        } else {
+            0
+        }
+    };
+    let direction = sign(imbalance_ratio);
+    (direction != 0 && sign(net_flow) == direction && sign(smart_money_flow) == direction)
+        .then(|| direction_from_imbalance(imbalance_ratio))
+}
+
 async fn scan_and_emit(
     config: &FlowSignalConfig,
     pool: &PgPool,
@@ -302,7 +329,7 @@ async fn scan_and_emit(
     // that meet our minimum thresholds.
     let rows = sqlx::query_as::<_, FlowFeatureRow>(
         r#"
-        WITH latest_features AS (
+        WITH newest_features AS (
             SELECT DISTINCT ON (mff.condition_id)
                 mff.condition_id,
                 mff.imbalance_ratio,
@@ -317,10 +344,16 @@ async fn scan_and_emit(
             FROM market_flow_features mff
             WHERE mff.window_minutes = $1
               AND mff.window_end >= $2 - INTERVAL '10 minutes'
-              AND ABS(mff.imbalance_ratio) >= $3
-              AND ABS(mff.smart_money_flow) >= $4
-              AND mff.trade_count >= $5
             ORDER BY mff.condition_id, mff.window_end DESC
+        ),
+        -- Thresholds apply to each market's newest window only: an older
+        -- window must never stand in for a newer one that no longer qualifies.
+        latest_features AS (
+            SELECT nf.*
+            FROM newest_features nf
+            WHERE ABS(nf.imbalance_ratio) >= $3
+              AND ABS(nf.smart_money_flow) >= $4
+              AND nf.trade_count >= $5
         ),
         recent_window_trades AS (
             SELECT
@@ -362,7 +395,8 @@ async fn scan_and_emit(
         latest_orderbook_prices AS (
             SELECT DISTINCT ON (oh.market_id)
                 oh.market_id,
-                oh.close AS yes_price
+                oh.close::float8 AS yes_price,
+                oh.bucket AS yes_price_bucket
             FROM orderbook_hourly oh
             INNER JOIN latest_features lf
               ON lf.condition_id = oh.market_id
@@ -381,6 +415,7 @@ async fn scan_and_emit(
             COALESCE(mm.liquidity, 0) AS liquidity,
             COALESCE(mm.volume, 0) AS market_volume,
             ob.yes_price,
+            ob.yes_price_bucket,
             COALESCE(sc.bot_score_coverage, 0) AS bot_score_coverage
         FROM latest_features lf
         LEFT JOIN market_metadata mm
@@ -413,6 +448,11 @@ async fn scan_and_emit(
         }
 
         if row.bot_score_coverage < config.min_bot_score_coverage {
+            continue;
+        }
+
+        if agreed_flow_direction(row.imbalance_ratio, row.net_flow, row.smart_money_flow).is_none()
+        {
             continue;
         }
 
@@ -484,7 +524,11 @@ async fn scan_and_emit(
         let imbalance_abs = decimal_to_f64(row.imbalance_ratio.abs());
         let smart_money_abs = decimal_to_f64(row.smart_money_flow.abs());
 
-        let direction = direction_from_imbalance(row.imbalance_ratio);
+        let Some(direction) =
+            agreed_flow_direction(row.imbalance_ratio, row.net_flow, row.smart_money_flow)
+        else {
+            continue;
+        };
 
         let Some(calibration_stats) = calibration
             .usable_for(direction, config.calibration_min_closed_trades)
@@ -514,6 +558,11 @@ async fn scan_and_emit(
             confidence,
             config.base_position_size_usd,
             expiry,
+        )
+        .with_reference(
+            row.yes_price
+                .zip(row.yes_price_bucket)
+                .and_then(|(price, at)| PriceReference::from_yes_price(price, at)),
         )
         .with_metadata(serde_json::json!({
             "imbalance_ratio": decimal_to_f64(row.imbalance_ratio),
@@ -629,7 +678,7 @@ async fn load_flow_calibration(
                 NULLIF(qs.metadata ->> 'expected_edge_bps', '')::double precision AS predicted_edge_bps
             FROM quant_signals qs
             JOIN positions p
-              ON p.id = qs.position_id
+              ON p.source_signal_id = qs.id
             WHERE qs.kind = 'flow'
               AND qs.execution_status = 'executed'
               AND p.state = 4
@@ -781,5 +830,123 @@ mod tests {
 
         assert!(snapshot.usable_for(SignalDirection::BuyYes, 8).is_some());
         assert!(snapshot.usable_for(SignalDirection::BuyNo, 8).is_some());
+    }
+
+    #[test]
+    fn flow_is_followed_only_when_smart_money_agrees() {
+        let d = |v: i64| Decimal::from(v);
+        // Unscored wallets buy YES while smart money sells it: the crowd's
+        // +0.389 imbalance must not become a BuyYes "smart money" signal.
+        assert_eq!(
+            agreed_flow_direction(Decimal::new(389, 3), d(2800), d(-1200)),
+            None
+        );
+        assert_eq!(
+            agreed_flow_direction(Decimal::new(40, 2), d(2000), d(1500)),
+            Some(SignalDirection::BuyYes)
+        );
+        assert_eq!(
+            agreed_flow_direction(Decimal::new(-40, 2), d(-2000), d(-1500)),
+            Some(SignalDirection::BuyNo)
+        );
+        assert_eq!(agreed_flow_direction(Decimal::ZERO, d(0), d(900)), None);
+        assert_eq!(
+            agreed_flow_direction(Decimal::new(40, 2), d(-5), d(900)),
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scan_follows_only_each_market_newest_agreeing_window(pool: PgPool) {
+        use crate::signals::hourly_bars;
+        sqlx::Executor::execute(
+            &pool,
+            r#"
+            CREATE TABLE market_flow_features (
+                condition_id TEXT, window_end TIMESTAMPTZ, window_minutes INT,
+                buy_volume NUMERIC, sell_volume NUMERIC, net_flow NUMERIC,
+                imbalance_ratio NUMERIC, unique_buyers INT, unique_sellers INT,
+                smart_money_flow NUMERIC, trade_count INT
+            );
+            CREATE TABLE wallet_trades (
+                condition_id TEXT, wallet_address TEXT, outcome TEXT, timestamp TIMESTAMPTZ
+            );
+            CREATE TABLE bot_scores (address TEXT, total_score INT, computed_at TIMESTAMPTZ);
+            CREATE TABLE positions (
+                id UUID, state SMALLINT, realized_pnl NUMERIC, source_signal_id UUID
+            );
+            CREATE TABLE quant_signals (
+                id UUID, kind TEXT, direction TEXT, size_usd NUMERIC, metadata JSONB,
+                execution_status TEXT, generated_at TIMESTAMPTZ
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+        sqlx::Executor::execute(
+            &pool,
+            include_str!("../../../../migrations/038_market_metadata.sql"),
+        )
+        .await
+        .unwrap();
+        hourly_bars::create(&pool).await;
+
+        let now = Utc::now();
+        let window = |market: &str, minutes_ago: i64, imbalance: i64, net: i64, smart: i64| {
+            let pool = pool.clone();
+            let market = market.to_string();
+            async move {
+                sqlx::query(
+                    "INSERT INTO market_flow_features VALUES
+                     ($1, $2, 60, 3500, 1500, $4, $3, 6, 2, $5, 10)",
+                )
+                .bind(&market)
+                .bind(now - Duration::minutes(minutes_ago))
+                .bind(Decimal::new(imbalance, 3))
+                .bind(Decimal::from(net))
+                .bind(Decimal::from(smart))
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO wallet_trades VALUES ($1, '0xscored', 'Yes', $2)")
+                    .bind(&market)
+                    .bind(now - Duration::minutes(5))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        // Everyone agrees: follow it.
+        window("0xgood", 2, 400, 2000, 1500).await;
+        // Smart money sells into an unscored crowd's buying.
+        window("0xsplit", 2, 389, 2800, -1200).await;
+        // Qualified eight minutes ago; the newest window no longer does.
+        window("0xfaded", 8, 400, 2000, 1500).await;
+        window("0xfaded", 3, 50, 250, 600).await;
+        sqlx::query("INSERT INTO bot_scores VALUES ('0xscored', 10, NOW())")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let bar = now - Duration::minutes(30);
+        for market in ["0xgood", "0xsplit", "0xfaded"] {
+            hourly_bars::insert(&pool, market, bar, Decimal::new(55, 2), Decimal::ONE).await;
+        }
+
+        let mut config = FlowSignalConfig::from_env();
+        config.require_calibration = false;
+        config.min_score = 0.0;
+        config.min_expected_edge_bps = 0.0;
+        let (tx, mut rx) = broadcast::channel(8);
+        assert_eq!(scan_and_emit(&config, &pool, &tx).await.unwrap(), 1);
+
+        let signal = rx.try_recv().unwrap();
+        assert_eq!(signal.condition_id, "0xgood");
+        assert_eq!(signal.direction, SignalDirection::BuyYes);
+        let reference = signal.reference.unwrap();
+        assert_eq!(reference.yes_price, Decimal::new(55, 2));
+        assert_eq!(
+            reference.observed_at.timestamp_micros(),
+            bar.timestamp_micros()
+        );
     }
 }

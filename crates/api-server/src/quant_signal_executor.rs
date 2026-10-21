@@ -1120,6 +1120,8 @@ impl QuantSignalExecutor {
                     source: SOURCE_RECOMMENDATION,
                     source_signal_id: Some(signal.id),
                     arb_opportunity: None,
+                    expected_edge: expected_edge_from_signal(&signal),
+                    observed_edge: None,
                 },
                 &ctx,
                 serde_json::json!({

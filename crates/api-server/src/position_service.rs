@@ -58,6 +58,13 @@ pub struct CreatePositionParams {
     pub source_signal_id: Option<Uuid>,
     /// If Some, applies share-based fee model from the arb opportunity.
     pub arb_opportunity: Option<ArbOpportunity>,
+    /// Edge the entry was expected to earn, in the strategy's own unit (net
+    /// USD per share for arb, basis points for quant signals). Recorded on
+    /// the `entry_requested` event so realized results can be compared
+    /// against what each position promised.
+    pub expected_edge: Option<Decimal>,
+    /// Gross edge observed at entry (arb: gross profit per share).
+    pub observed_edge: Option<Decimal>,
 }
 
 /// Context fields for trade event recording.
@@ -149,21 +156,20 @@ impl PositionService {
             .await
             .map_err(|e| anyhow!("insert position: {}", e))?;
 
-        self.events
-            .record_warn(
-                NewTradeEvent::new(
-                    &ctx.strategy,
-                    &ctx.execution_mode,
-                    &ctx.source_label,
-                    &params.market_id,
-                    "entry_requested",
-                )
-                .with_position(position.id)
-                .with_state(None, Some("pending"))
-                .with_requested_size(position.entry_cost())
-                .with_metadata(metadata),
-            )
-            .await;
+        let mut requested = NewTradeEvent::new(
+            &ctx.strategy,
+            &ctx.execution_mode,
+            &ctx.source_label,
+            &params.market_id,
+            "entry_requested",
+        )
+        .with_position(position.id)
+        .with_state(None, Some("pending"))
+        .with_requested_size(position.entry_cost())
+        .with_metadata(metadata);
+        requested.expected_edge = params.expected_edge;
+        requested.observed_edge = params.observed_edge;
+        self.events.record_warn(requested).await;
 
         Ok(position)
     }

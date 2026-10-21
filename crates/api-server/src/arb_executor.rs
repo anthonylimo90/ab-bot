@@ -1145,6 +1145,8 @@ impl ArbAutoExecutor {
                     source: SOURCE_ARBITRAGE,
                     source_signal_id: None,
                     arb_opportunity: Some(arb.clone()),
+                    expected_edge: Some(arb.net_profit),
+                    observed_edge: Some(arb.gross_profit),
                 },
                 &ctx,
                 create_metadata,
