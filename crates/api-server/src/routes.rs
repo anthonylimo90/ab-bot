@@ -4,9 +4,7 @@ use axum::middleware as axum_middleware;
 use axum::routing::{delete, get, patch, post, put};
 use axum::Router;
 use std::sync::Arc;
-use tower_governor::{
-    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
-};
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -15,6 +13,7 @@ use crate::handlers::{
     order_signing, positions, recommendations, recovery, risk, signals, strategy_health,
     trade_flow, trading, users, vault, wallet_auth, wallets, workspaces,
 };
+use crate::middleware::rate_limit::{LimiterJanitor, TrustedProxyKeyExtractor};
 use crate::middleware::{require_admin, require_auth, require_trader};
 use crate::state::AppState;
 use crate::websocket;
@@ -326,36 +325,48 @@ use crate::websocket;
 pub struct ApiDoc;
 
 /// Create the main router with all routes.
+///
+/// The rate limiters keep per-client state that must be pruned periodically;
+/// callers that run the server should use [`create_router_with_janitor`] and
+/// spawn the janitor.
 pub fn create_router(state: Arc<AppState>) -> Router {
-    // Rate limiter for auth endpoints: 5 requests per 60 seconds per IP
-    // Uses SmartIpKeyExtractor to handle X-Forwarded-For from Railway's proxy
-    let auth_rate_limit_config = GovernorConfigBuilder::default()
-        .per_second(60)
-        .burst_size(5)
-        .key_extractor(SmartIpKeyExtractor)
-        .finish()
-        .expect("Failed to create auth rate limiter config");
+    create_router_with_janitor(state).0
+}
 
-    // Rate limiter for admin endpoints: 30 requests per 60 seconds per IP
-    // Uses SmartIpKeyExtractor to handle X-Forwarded-For from Railway's proxy
+/// Create the router together with the janitor that prunes its rate limiters.
+pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanitor) {
+    // Clients are identified by the X-Forwarded-For entry appended by our own
+    // proxy (TRUSTED_PROXY_HOPS, default 1), falling back to the TCP peer address;
+    // entries further left are client-controlled and never trusted.
+    let key_extractor = TrustedProxyKeyExtractor::from_env();
+    let mut janitor = LimiterJanitor::default();
+    let mut rate_limit_config = |burst_size: u32| {
+        let config = GovernorConfigBuilder::default()
+            .per_second(60)
+            .burst_size(burst_size)
+            .key_extractor(key_extractor)
+            .finish()
+            .expect("Failed to create rate limiter config");
+        // Drop per-client state that has fully replenished, or it grows forever.
+        janitor.register(config.limiter(), |limiter| {
+            limiter.retain_recent();
+            limiter.shrink_to_fit();
+        });
+        Arc::new(config)
+    };
+
+    // Rate limiter for auth endpoints: 5 requests per 60 seconds per client
+    let auth_rate_limit_config = rate_limit_config(5);
+
+    // Rate limiter for admin endpoints: 30 requests per 60 seconds per client
     // Higher burst to accommodate cascading refetches after bulk deletions
-    let admin_rate_limit_config = GovernorConfigBuilder::default()
-        .per_second(60)
-        .burst_size(30)
-        .key_extractor(SmartIpKeyExtractor)
-        .finish()
-        .expect("Failed to create admin rate limiter config");
+    let admin_rate_limit_config = rate_limit_config(30);
 
-    // Rate limiter for workspace config updates: 10 requests per 60 seconds per IP
+    // Rate limiter for workspace config updates: 10 requests per 60 seconds per client
     // Tighter limit for sensitive config changes (API keys, trading toggles)
-    let config_rate_limit_config = GovernorConfigBuilder::default()
-        .per_second(60)
-        .burst_size(10)
-        .key_extractor(SmartIpKeyExtractor)
-        .finish()
-        .expect("Failed to create config rate limiter config");
+    let config_rate_limit_config = rate_limit_config(10);
 
-    // Auth routes with rate limiting (SmartIpKeyExtractor handles proxy IPs)
+    // Auth routes with rate limiting
     let auth_routes = Router::new()
         .route("/api/v1/auth/register", post(auth::register))
         .route("/api/v1/auth/login", post(auth::login))
@@ -368,7 +379,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v1/auth/wallet/verify", post(wallet_auth::verify))
         .layer(GovernorLayer {
-            config: Arc::new(auth_rate_limit_config),
+            config: auth_rate_limit_config,
         });
 
     // Public routes - no authentication required
@@ -721,7 +732,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Apply rate limiting first (outermost layer runs last)
         .layer(GovernorLayer {
-            config: Arc::new(admin_rate_limit_config),
+            config: admin_rate_limit_config,
         })
         // Apply admin check, then auth
         .layer(axum_middleware::from_fn_with_state(
@@ -760,7 +771,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(recovery::run_recovery),
         )
         .layer(GovernorLayer {
-            config: Arc::new(config_rate_limit_config),
+            config: config_rate_limit_config,
         })
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -771,7 +782,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             require_auth,
         ));
 
-    Router::new()
+    let router = Router::new()
         .merge(auth_routes)
         .merge(public_routes)
         .merge(protected_routes)
@@ -781,7 +792,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Swagger UI (public for development)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         // Add state
-        .with_state(state)
+        .with_state(state);
+    (router, janitor)
 }
 
 #[cfg(test)]

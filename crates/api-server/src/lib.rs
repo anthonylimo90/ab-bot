@@ -256,7 +256,9 @@ impl ApiServer {
         // ── Wrap state in Arc and build router ──
         let state = Arc::new(self.state);
 
-        let router = create_router(state.clone());
+        let (router, limiter_janitor) = routes::create_router_with_janitor(state.clone());
+        // Prune per-client rate-limit state, which otherwise grows without bound.
+        limiter_janitor.spawn();
         let router = router
             .layer(
                 TraceLayer::new_for_http()
@@ -509,7 +511,12 @@ impl ApiServer {
         info!(address = %addr, "Starting API server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, router).await?;
+        // ConnectInfo gives the rate limiter the TCP peer address to fall back on.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
 
         Ok(())
     }

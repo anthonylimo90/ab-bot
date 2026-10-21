@@ -15,6 +15,8 @@ use auth::jwt::{Claims, UserRole};
 use crate::error::ErrorResponse;
 use crate::state::AppState;
 
+#[path = "middleware/rate_limit.rs"]
+pub mod rate_limit;
 #[cfg(test)]
 #[path = "middleware/session_tests.rs"]
 mod session_tests;
