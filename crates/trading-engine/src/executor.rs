@@ -17,6 +17,11 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const SUBMISSION_UNKNOWN: &str = "submission_requires_reconciliation";
+/// The order was not sent because another live order for the wallet is
+/// unresolved; unlike [`SUBMISSION_UNKNOWN`] this is a definitive non-submission.
+const SUBMISSION_FENCE_BUSY: &str = "live_submission_fence_busy";
+/// Multiple of the configured timeout allowed for a whole live operation.
+const LIVE_SAFETY_TIMEOUT_FACTOR: u64 = 3;
 
 #[path = "executor/submission.rs"]
 mod submission;
@@ -512,7 +517,17 @@ impl OrderExecutor {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<ExecutionReport>>,
     {
-        let timeout = std::time::Duration::from_millis(self.config.timeout_ms);
+        // A live operation prepares under its own deadline and then posts once,
+        // bounded by the HTTP client timeout, so it records its own outcome.
+        // The outer timeout is only a safety net: dropping a journaled POST
+        // mid-flight would leave an intent the exchange may never have seen.
+        let timeout = std::time::Duration::from_millis(if live {
+            self.config
+                .timeout_ms
+                .saturating_mul(LIVE_SAFETY_TIMEOUT_FACTOR)
+        } else {
+            self.config.timeout_ms
+        });
         let mut attempts = 0u32;
         let mut last_error = String::new();
 
@@ -904,6 +919,22 @@ impl OrderExecutor {
         )
     }
 
+    /// Deadline for preparing a live order (book, balance and signing data).
+    fn preparation_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_millis(self.config.timeout_ms)
+    }
+
+    /// Runs one preparation step before `deadline`. Expiry is a plain error:
+    /// preparation precedes the journaled POST, so nothing has been sent.
+    async fn prepare<T>(
+        deadline: tokio::time::Instant,
+        step: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        tokio::time::timeout_at(deadline, step).await.map_err(|_| {
+            anyhow::anyhow!("Live order preparation exceeded its deadline; nothing was sent")
+        })
+    }
+
     /// Prices a market order: the limit to sign and the expected average fill.
     #[allow(clippy::result_large_err)] // ExecutionReport is a rich domain value, not a simple error
     fn price_market_order(
@@ -1088,7 +1119,11 @@ impl OrderExecutor {
             anyhow::bail!("Position wallet changed before submission");
         }
 
-        let book = self.clob_client.get_order_book(&order.outcome_id).await?;
+        // Everything before the journaled POST runs under this deadline: when it
+        // expires, nothing has been sent and the order is plainly rejected.
+        let deadline = self.preparation_deadline();
+        let book =
+            Self::prepare(deadline, self.clob_client.get_order_book(&order.outcome_id)).await??;
         let price = match self.price_market_order(order, &book) {
             Ok(execution) => execution.limit,
             Err(report) => return Ok(report),
@@ -1111,26 +1146,31 @@ impl OrderExecutor {
             OrderSide::Sell => order.quantity,
         };
 
-        Self::ensure_live_order_capacity(
-            client,
-            order.id,
-            order.side,
-            &order.outcome_id,
-            market_amount,
+        Self::prepare(
+            deadline,
+            Self::ensure_live_order_capacity(
+                client,
+                order.id,
+                order.side,
+                &order.outcome_id,
+                market_amount,
+            ),
         )
-        .await?;
+        .await??;
 
         // Create signed order (FOK for market orders, expiration=0)
-        let signed_order = client
-            .create_market_order(
+        let signed_order = Self::prepare(
+            deadline,
+            client.create_market_order(
                 &order.outcome_id,
                 signing_side,
                 price,
                 market_amount,
                 OrderType::Fok,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create market order: {}", e))?;
+            ),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("Failed to create market order: {}", e))?;
 
         // Post the order (FOK for market orders)
         let response = match self
@@ -1242,14 +1282,18 @@ impl OrderExecutor {
             OrderSide::Sell => order.quantity,
         };
 
-        Self::ensure_live_order_capacity(
-            client,
-            order.id,
-            order.side,
-            &order.outcome_id,
-            required_amount,
+        let deadline = self.preparation_deadline();
+        Self::prepare(
+            deadline,
+            Self::ensure_live_order_capacity(
+                client,
+                order.id,
+                order.side,
+                &order.outcome_id,
+                required_amount,
+            ),
         )
-        .await?;
+        .await??;
 
         let kind = if order.order_type == polymarket_core::types::OrderType::FOK {
             OrderType::Fok
@@ -1257,16 +1301,18 @@ impl OrderExecutor {
             OrderType::Gtc
         };
         // GTC/FOK signatures use expiration=0.
-        let signed_order = client
-            .create_order(
+        let signed_order = Self::prepare(
+            deadline,
+            client.create_order(
                 &order.outcome_id,
                 signing_side,
                 order.price,
                 order.quantity,
                 kind,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
+            ),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("Failed to create order: {}", e))?;
 
         // Post the order (GTC for limit orders)
         let response = match self
@@ -1389,6 +1435,37 @@ impl OrderExecutor {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Live client unavailable"))?;
         Ok(client.get_order(id).await?)
+    }
+
+    /// The exchange's record of an order, or `None` when it holds none.
+    pub async fn find_exchange_order(
+        &self,
+        id: &str,
+    ) -> Result<Option<polymarket_core::api::clob::ExchangeOrder>> {
+        let slot = self.auth_client.read().await;
+        let client = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Live client unavailable"))?;
+        Ok(client.find_order(id).await?)
+    }
+
+    /// Whether `maker`'s trades on `asset_id` since `after` (unix seconds)
+    /// involve the exchange order `order_id`.
+    pub async fn exchange_order_has_trades(
+        &self,
+        maker: &str,
+        order_id: &str,
+        asset_id: &str,
+        after: i64,
+    ) -> Result<bool> {
+        let slot = self.auth_client.read().await;
+        let client = slot
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Live client unavailable"))?;
+        if !maker.eq_ignore_ascii_case(&client.address()) {
+            anyhow::bail!("Intent wallet mismatch");
+        }
+        Ok(client.order_has_trades(order_id, asset_id, after).await?)
     }
 
     fn report_from_exchange_response(
@@ -1588,6 +1665,32 @@ mod tests {
             assert_eq!(report.status, expected);
             assert_eq!(report.average_price, Decimal::new(5, 1));
         }
+    }
+
+    #[tokio::test]
+    async fn fence_busy_is_a_definitive_rejection() {
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(None, None)),
+            ExecutorConfig {
+                live_trading: true,
+                ..ExecutorConfig::default()
+            },
+        );
+        let report = executor
+            .execute_with_retry(
+                || async {
+                    Err(anyhow::anyhow!(
+                        "{SUBMISSION_FENCE_BUSY}: another live order is still being posted; nothing was sent"
+                    ))
+                },
+                &Uuid::new_v4(),
+                "market",
+                "token",
+                OrderSide::Sell,
+                true,
+            )
+            .await;
+        assert_eq!(report.status, OrderStatus::Rejected);
     }
 
     #[tokio::test]

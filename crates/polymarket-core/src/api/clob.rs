@@ -2128,6 +2128,116 @@ impl AuthenticatedClobClient {
         Ok(response.json().await?)
     }
 
+    /// Like [`Self::get_order`], but `Ok(None)` when the exchange holds no
+    /// such order (HTTP 404 or an empty body). Any other failure is an error,
+    /// never evidence of absence.
+    pub async fn find_order(&self, order_id: &str) -> Result<Option<ExchangeOrder>> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set".into(),
+        })?;
+        let path = format!("/data/order/{order_id}");
+        let timestamp = current_timestamp().to_string();
+        let signature = sign_l2_request(credentials, "GET", &path, &timestamp, None)?;
+        let response = self
+            .client
+            .http_client
+            .get(format!("{}{}", self.client.base_url, path))
+            .header("POLY_ADDRESS", self.address())
+            .header("POLY_SIGNATURE", signature)
+            .header("POLY_TIMESTAMP", timestamp)
+            .header("POLY_API_KEY", &credentials.api_key)
+            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(Error::Api {
+                message: "Failed to reconcile exchange order".into(),
+                status: Some(response.status().as_u16()),
+            });
+        }
+        let body: serde_json::Value = response.json().await?;
+        let empty = body.is_null()
+            || body.as_str().is_some_and(str::is_empty)
+            || body.as_object().is_some_and(serde_json::Map::is_empty);
+        if empty {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(body)?))
+    }
+
+    /// Whether any of this wallet's trades on `asset_id` since `after` (unix
+    /// seconds) involved `order_id`, as taker or as a matched maker order.
+    /// Every page must be read: a partial listing is an error, not a "no".
+    pub async fn order_has_trades(
+        &self,
+        order_id: &str,
+        asset_id: &str,
+        after: i64,
+    ) -> Result<bool> {
+        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
+            message: "API credentials not set".into(),
+        })?;
+        let incomplete = |message: &str| Error::Api {
+            message: message.to_string(),
+            status: None,
+        };
+        let mut cursor: Option<String> = None;
+        for _ in 0..50 {
+            let path = "/data/trades";
+            let timestamp = current_timestamp().to_string();
+            let signature = sign_l2_request(credentials, "GET", path, &timestamp, None)?;
+            let mut query = vec![
+                ("asset_id", asset_id.to_string()),
+                ("after", after.to_string()),
+            ];
+            if let Some(cursor) = &cursor {
+                query.push(("next_cursor", cursor.clone()));
+            }
+            let response = self
+                .client
+                .http_client
+                .get(format!("{}{}", self.client.base_url, path))
+                .query(&query)
+                .header("POLY_ADDRESS", self.address())
+                .header("POLY_SIGNATURE", signature)
+                .header("POLY_TIMESTAMP", timestamp)
+                .header("POLY_API_KEY", &credentials.api_key)
+                .header("POLY_PASSPHRASE", &credentials.api_passphrase)
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                return Err(Error::Api {
+                    message: "Failed to list trades".into(),
+                    status: Some(response.status().as_u16()),
+                });
+            }
+            let page: serde_json::Value = response.json().await?;
+            let rows = page
+                .get("data")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| incomplete("Trade listing has no data array"))?;
+            let involves_order = |trade: &serde_json::Value| {
+                trade["taker_order_id"].as_str() == Some(order_id)
+                    || trade["maker_orders"].as_array().is_some_and(|makers| {
+                        makers
+                            .iter()
+                            .any(|maker| maker["order_id"].as_str() == Some(order_id))
+                    })
+            };
+            if rows.iter().any(involves_order) {
+                return Ok(true);
+            }
+            match page.get("next_cursor").and_then(|v| v.as_str()) {
+                None | Some("") | Some("LTE=") => return Ok(false),
+                Some(next) => cursor = Some(next.to_string()),
+            }
+        }
+        Err(incomplete("Too many trade pages to rule out an execution"))
+    }
+
     /// Reconstruct execution price from authenticated, confirmed trade records.
     /// Schema: github.com/Polymarket/clob-client/blob/main/src/types.ts (Trade).
     pub async fn confirmed_order_fill(&self, order: &ExchangeOrder) -> Result<(Decimal, Decimal)> {

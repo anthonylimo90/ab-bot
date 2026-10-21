@@ -95,7 +95,6 @@ pub use wallet_inventory::{spawn_wallet_inventory_reconciler, WalletInventoryCon
 use axum::extract::DefaultBodyLimit;
 use axum::http::Request;
 use sqlx::PgPool;
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock, Semaphore};
@@ -307,8 +306,8 @@ impl ApiServer {
             state.arb_entry_tx.clone(),
         );
 
-        // Shared dedup set for arb executor + exit handler
-        let arb_dedup = Arc::new(RwLock::new(HashSet::new()));
+        // Shared dedup set for arb executor, exit handler and intent reconciler
+        let arb_dedup = state.arb_dedup.clone();
 
         // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
         // Returns the shared OutcomeTokenCache so exit_handler can reuse it

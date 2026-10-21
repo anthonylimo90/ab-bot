@@ -205,6 +205,9 @@ pub struct AppState {
         Option<Arc<RwLock<crate::quant_signal_executor::QuantSignalExecutorConfig>>>,
     /// Heartbeat timestamp (epoch secs) from arb executor loop — 0 means never updated.
     pub arb_executor_heartbeat: Arc<AtomicI64>,
+    /// Markets with an active arb position (shared by the arb executor, the
+    /// exit handler and the intent reconciler).
+    pub arb_dedup: Arc<RwLock<HashSet<String>>>,
     /// Heartbeat timestamp (epoch secs) from exit handler loop — 0 means never updated.
     pub exit_handler_heartbeat: Arc<AtomicI64>,
     /// Heartbeat timestamp (epoch secs) from quant signal executor — 0 means never updated.
@@ -638,6 +641,7 @@ impl AppState {
             exit_handler_config: None,
             quant_executor_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+            arb_dedup: Arc::new(RwLock::new(HashSet::new())),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
         })
@@ -720,6 +724,7 @@ impl AppState {
             exit_handler_config: None,
             quant_executor_config: None,
             arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+            arb_dedup: Arc::new(RwLock::new(HashSet::new())),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
         })

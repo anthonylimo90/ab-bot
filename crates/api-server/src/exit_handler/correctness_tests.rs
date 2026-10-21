@@ -21,7 +21,7 @@ pub(crate) async fn setup(pool: &PgPool) -> PositionService {
             current_price NUMERIC
         );
         CREATE TABLE markets(id TEXT, yes_price NUMERIC, no_price NUMERIC);
-        CREATE TABLE orders(quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT, status TEXT,id UUID);
+        CREATE TABLE orders(quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT, status TEXT,id UUID, execution_mode TEXT NOT NULL DEFAULT 'unknown', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ);
 
         CREATE TABLE quant_signals(id UUID, kind TEXT, direction TEXT, metadata JSONB);
     "#).await.unwrap();

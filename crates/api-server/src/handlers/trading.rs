@@ -874,6 +874,34 @@ pub async fn cancel_order(
     Ok(Json(load_order(&state.pool, order_id).await?.into()))
 }
 
+/// Settle a manual order the exchange never received and release its fence.
+pub(crate) async fn reject_never_executed_manual_intent(
+    pool: &PgPool,
+    id: Uuid,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
+        .execute(&mut *tx)
+        .await?;
+    let row: OrderRow = sqlx::query_as("SELECT * FROM orders WHERE id=$1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if row.execution_mode != "live" || row.filled_quantity > Decimal::ZERO {
+        anyhow::bail!("Recorded fills conflict with an order the exchange never received");
+    }
+    sqlx::query("UPDATE orders SET status='rejected',updated_at=NOW() WHERE id=$1 AND status IN ('pending','open')")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE execution_intents SET status='rejected',updated_at=NOW() WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Apply a terminal authenticated snapshot and release its fence atomically.
 pub(crate) async fn reconcile_manual_intent(
     pool: &PgPool,

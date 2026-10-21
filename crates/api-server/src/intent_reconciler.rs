@@ -3,21 +3,39 @@ use crate::{
     position_service::{CloseMethod, EventContext, Leg},
     state::AppState,
 };
-use polymarket_core::types::{FailureReason, PositionState};
+use chrono::{DateTime, Duration, Utc};
+use polymarket_core::api::clob::ExchangeOrder;
+use polymarket_core::types::{FailureReason, Position, PositionState};
 use rust_decimal::Decimal;
 use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// A `submitting`/`unknown` intent that the exchange still has no record of
+/// after this long, and that no trade involves, was never executed.
+const ABSENCE_GRACE_MINUTES: i64 = 10;
+
 #[derive(FromRow)]
 struct Intent {
     id: Uuid,
+    status: String,
+    created_at: DateTime<Utc>,
     exchange_order_id: Option<String>,
     maker: Option<String>,
+    token_id: Option<String>,
     position_id: Option<Uuid>,
     leg: Option<String>,
     side: Option<String>,
     applied_quantity: Option<Decimal>,
+    has_order: bool,
+}
+
+/// Authoritative execution outcome of one exchange order.
+struct Outcome {
+    quantity: Decimal,
+    price: Decimal,
+    /// The exchange's record; `None` when the order was never received.
+    snapshot: Option<ExchangeOrder>,
 }
 
 pub fn spawn(state: Arc<AppState>) {
@@ -33,21 +51,38 @@ pub fn spawn(state: Arc<AppState>) {
 
 pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     // Retire only attempts which never crossed the durable POST boundary. The
-    // submitter checks this receipt while holding the same lock before POST.
+    // submitter checks these markers while holding the same lock before POST.
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('live-order-submission'))")
         .execute(&mut *tx)
         .await?;
     sqlx::query("UPDATE position_order_links l SET settled=TRUE WHERE NOT settled AND created_at<NOW()-INTERVAL '5 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=l.id)")
         .execute(&mut *tx).await?;
+    sqlx::query("UPDATE orders o SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='live' AND created_at<NOW()-INTERVAL '10 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=o.id)")
+        .execute(&mut *tx).await?;
     tx.commit().await?;
-    // Finish interrupted local bookkeeping after all order receipts are settled.
-    sqlx::query("UPDATE positions p SET state=CASE WHEN held_yes_qty>0 OR held_no_qty>0 OR exited_yes_qty>0 OR exited_no_qty>0 THEN 2 ELSE 5 END,version=version+1,last_updated=NOW() WHERE state IN (0,3) AND execution_mode='live' AND last_updated<NOW()-INTERVAL '5 minutes' AND EXISTS(SELECT 1 FROM position_order_links l WHERE l.position_id=p.id) AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.position_id=p.id AND NOT settled)")
-        .execute(&state.pool).await?;
+    // Finish interrupted local bookkeeping after all order receipts are settled:
+    // a complete entry opens, held or partly exited inventory is queued for
+    // exit, and an entry that acquired nothing has failed.
+    sqlx::query(
+        "UPDATE positions p SET state=CASE \
+           WHEN state=0 AND (held_yes_qty>0 OR held_no_qty>0) \
+                AND (yes_entry_price<=0 OR held_yes_qty>0) AND (no_entry_price<=0 OR held_no_qty>0) THEN 1 \
+           WHEN held_yes_qty>0 OR held_no_qty>0 OR exited_yes_qty>0 OR exited_no_qty>0 THEN 2 \
+           ELSE 5 END, \
+         version=version+1,last_updated=NOW() \
+         WHERE state IN (0,3) AND execution_mode='live' AND last_updated<NOW()-INTERVAL '5 minutes' \
+           AND EXISTS(SELECT 1 FROM position_order_links l WHERE l.position_id=p.id) \
+           AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.position_id=p.id AND NOT settled)",
+    )
+    .execute(&state.pool)
+    .await?;
     let Some(wallet) = state.order_executor.wallet_address().await else {
         return Ok(());
     };
-    let intents: Vec<Intent> = sqlx::query_as("SELECT i.id,i.exchange_order_id,i.signed_order->>'maker' AS maker,l.position_id,l.leg,l.side,l.applied_quantity FROM execution_intents i LEFT JOIN position_order_links l ON l.id=i.id WHERE LOWER(i.signed_order->>'maker')=LOWER($1) AND (l.id IS NOT NULL OR EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id)) AND i.status IN ('submitting','unknown','acknowledged') AND i.updated_at<NOW()-INTERVAL '30 seconds' AND (l.id IS NULL OR NOT l.settled) ORDER BY CASE WHEN i.status IN ('submitting','unknown') THEN 0 WHEN l.id IS NOT NULL THEN 1 ELSE 2 END,i.updated_at,i.id LIMIT 100")
+    // Every intent of the trading wallet is reconciled, including orphan
+    // inventory sells that have neither a position link nor an order row.
+    let intents: Vec<Intent> = sqlx::query_as("SELECT i.id,i.status,i.created_at,i.exchange_order_id,i.signed_order->>'maker' AS maker,i.signed_order->>'tokenId' AS token_id,l.position_id,l.leg,l.side,l.applied_quantity,EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AS has_order FROM execution_intents i LEFT JOIN position_order_links l ON l.id=i.id WHERE LOWER(i.signed_order->>'maker')=LOWER($1) AND i.status IN ('submitting','unknown','acknowledged') AND i.updated_at<NOW()-INTERVAL '30 seconds' AND (l.id IS NULL OR NOT l.settled) ORDER BY CASE WHEN i.status IN ('submitting','unknown') THEN 0 WHEN l.id IS NOT NULL THEN 1 ELSE 2 END,i.updated_at,i.id LIMIT 100")
         .bind(wallet).fetch_all(&state.pool).await?;
     for intent in intents {
         let id = intent.id;
@@ -81,133 +116,267 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
         .exchange_order_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Missing exchange identity"))?;
-    let snapshot = state.order_executor.get_exchange_order(exchange_id).await?;
-    if snapshot.id != exchange_id {
-        anyhow::bail!("Exchange identity mismatch");
-    }
-    let filled = snapshot.size_matched.parse::<Decimal>()?;
-    let original = snapshot.original_size.parse::<Decimal>()?;
-    if original <= Decimal::ZERO || filled < Decimal::ZERO || filled > original {
-        anyhow::bail!("Invalid fill quantity");
-    }
-    let terminal = filled == original
-        || matches!(
-            snapshot.status.to_ascii_lowercase().as_str(),
-            "canceled" | "cancelled" | "expired" | "rejected"
-        );
-    if !terminal {
-        anyhow::bail!("Exchange order remains active");
-    }
-    let (quantity, price) = state
+    let outcome = match state
         .order_executor
-        .confirmed_exchange_fill(maker, &snapshot)
-        .await?;
-    if let Some(position_id) = intent.position_id {
-        let mut position = state.position_service.load(position_id).await?;
-        if position.execution_mode != "live"
-            || position.wallet_address.as_deref().map(str::to_lowercase)
-                != Some(maker.to_lowercase())
-        {
-            anyhow::bail!("Position provenance mismatch");
-        }
-        let applied = intent.applied_quantity.unwrap_or_default();
-        if applied != Decimal::ZERO {
-            anyhow::bail!("Fill already accounted; reload receipt");
-        }
-        let ctx = EventContext {
-            execution_mode: "live".into(),
-            wallet_address: Some(maker.into()),
-            strategy: "recovery".into(),
-            source_label: "recovery".into(),
-        };
-        let leg = match intent.leg.as_deref() {
-            Some("yes") => Leg::Yes,
-            Some("no") => Leg::No,
-            _ => anyhow::bail!("Missing position leg"),
-        };
-        position.state = if quantity.is_zero()
-            && !position.has_open_exposure()
-            && intent.side.as_deref() == Some("buy")
-        {
-            PositionState::EntryFailed
-        } else {
-            PositionState::ExitReady
-        };
-        if quantity > Decimal::ZERO {
-            match intent.side.as_deref() {
-                Some("buy") => {
-                    state
-                        .position_service
-                        .record_entry_fill(
-                            &mut position,
-                            leg,
-                            price,
-                            quantity,
-                            &ctx,
-                            Some(intent.id),
-                        )
-                        .await?
-                }
-                Some("sell") => {
-                    state
-                        .position_service
-                        .record_exit_fill(
-                            &mut position,
-                            leg,
-                            price,
-                            quantity,
-                            &ctx,
-                            Some(intent.id),
-                        )
-                        .await?
-                }
-                _ => anyhow::bail!("Missing intent side"),
+        .find_exchange_order(exchange_id)
+        .await?
+    {
+        Some(snapshot) => {
+            if snapshot.id != exchange_id {
+                anyhow::bail!("Exchange identity mismatch");
             }
-        } else {
-            state
-                .position_service
-                .repo()
-                .update_with_receipt(&mut position, intent.id, Decimal::ZERO)
+            let filled = snapshot.size_matched.parse::<Decimal>()?;
+            let original = snapshot.original_size.parse::<Decimal>()?;
+            if original <= Decimal::ZERO || filled < Decimal::ZERO || filled > original {
+                anyhow::bail!("Invalid fill quantity");
+            }
+            let terminal = filled == original
+                || matches!(
+                    snapshot.status.to_ascii_lowercase().as_str(),
+                    "canceled" | "cancelled" | "expired" | "rejected"
+                );
+            if !terminal {
+                anyhow::bail!("Exchange order remains active");
+            }
+            let (quantity, price) = state
+                .order_executor
+                .confirmed_exchange_fill(maker, &snapshot)
                 .await?;
+            Outcome {
+                quantity,
+                price,
+                snapshot: Some(snapshot),
+            }
         }
-        if position.has_open_exposure() {
-            // Queue the remaining confirmed inventory for a fresh, exclusive exit.
-            position.state = PositionState::ExitReady;
-            state.position_service.repo().update(&mut position).await?;
-        } else if intent.side.as_deref() == Some("sell") {
-            state
-                .position_service
-                .close_position(
+        None => {
+            // Absence alone is weak evidence; it is accepted only for an
+            // unacknowledged submission, after a grace period, and when no
+            // trade of the wallet on that token involves the order.
+            if !matches!(intent.status.as_str(), "submitting" | "unknown") {
+                anyhow::bail!("Acknowledged order is missing from the exchange");
+            }
+            if Utc::now() - intent.created_at < Duration::minutes(ABSENCE_GRACE_MINUTES) {
+                anyhow::bail!("Exchange has no record of the order yet");
+            }
+            let token_id = intent
+                .token_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Missing token identity"))?;
+            let after = (intent.created_at - Duration::minutes(5)).timestamp();
+            if state
+                .order_executor
+                .exchange_order_has_trades(maker, exchange_id, token_id, after)
+                .await?
+            {
+                anyhow::bail!("Trades involve an order the exchange cannot find");
+            }
+            tracing::warn!(
+                intent_id = %intent.id,
+                exchange_order_id = %exchange_id,
+                "Exchange never received an unresolved submission; releasing it as not executed"
+            );
+            Outcome {
+                quantity: Decimal::ZERO,
+                price: Decimal::ZERO,
+                snapshot: None,
+            }
+        }
+    };
+
+    if let Some(position_id) = intent.position_id {
+        apply_to_position(state, &intent, maker, position_id, &outcome).await
+    } else if intent.has_order {
+        match &outcome.snapshot {
+            Some(snapshot) => {
+                crate::handlers::trading::reconcile_manual_intent(
+                    &state.pool,
+                    intent.id,
+                    snapshot,
+                    outcome.price,
+                )
+                .await
+            }
+            None => {
+                crate::handlers::trading::reject_never_executed_manual_intent(
+                    &state.pool,
+                    intent.id,
+                )
+                .await
+            }
+        }
+    } else {
+        // An orphan-inventory sale: wallet inventory refreshes from observed
+        // balances, so only the submission itself needs a terminal status.
+        sqlx::query("UPDATE execution_intents SET status=$2,updated_at=NOW() WHERE id=$1")
+            .bind(intent.id)
+            .bind(if outcome.snapshot.is_some() {
+                "reconciled"
+            } else {
+                "rejected"
+            })
+            .execute(&state.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+async fn apply_to_position(
+    state: &AppState,
+    intent: &Intent,
+    maker: &str,
+    position_id: Uuid,
+    outcome: &Outcome,
+) -> anyhow::Result<()> {
+    let mut position = state.position_service.load(position_id).await?;
+    if position.execution_mode != "live"
+        || position.wallet_address.as_deref().map(str::to_lowercase) != Some(maker.to_lowercase())
+    {
+        anyhow::bail!("Position provenance mismatch");
+    }
+    let applied = intent.applied_quantity.unwrap_or_default();
+    if applied != Decimal::ZERO {
+        anyhow::bail!("Fill already accounted; reload receipt");
+    }
+    let ctx = EventContext {
+        execution_mode: "live".into(),
+        wallet_address: Some(maker.into()),
+        strategy: "recovery".into(),
+        source_label: "recovery".into(),
+    };
+    let leg = match intent.leg.as_deref() {
+        Some("yes") => Leg::Yes,
+        Some("no") => Leg::No,
+        _ => anyhow::bail!("Missing position leg"),
+    };
+    let selling = match intent.side.as_deref() {
+        Some("buy") => false,
+        Some("sell") => true,
+        _ => anyhow::bail!("Missing intent side"),
+    };
+    let service = &state.position_service;
+    if outcome.quantity > Decimal::ZERO {
+        if selling {
+            service
+                .record_exit_fill(
                     &mut position,
-                    CloseMethod::MarketExit {
-                        fee: Decimal::new(2, 2),
-                    },
+                    leg,
+                    outcome.price,
+                    outcome.quantity,
                     &ctx,
+                    Some(intent.id),
                 )
                 .await?;
         } else {
-            state
-                .position_service
-                .mark_entry_failed(
+            service
+                .record_entry_fill(
                     &mut position,
-                    FailureReason::OrderRejected {
-                        message: "Exchange confirmed no fill".into(),
-                    },
+                    leg,
+                    outcome.price,
+                    outcome.quantity,
                     &ctx,
+                    Some(intent.id),
                 )
                 .await?;
         }
     } else {
-        crate::handlers::trading::reconcile_manual_intent(&state.pool, intent.id, &snapshot, price)
+        service
+            .repo()
+            .update_with_receipt(&mut position, intent.id, Decimal::ZERO)
             .await?;
     }
+    if outcome.snapshot.is_none() {
+        sqlx::query("UPDATE execution_intents SET status='rejected',updated_at=NOW() WHERE id=$1")
+            .bind(intent.id)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    if selling {
+        settle_after_sale(state, &mut position, &ctx).await
+    } else {
+        settle_after_purchase(state, &mut position, &ctx).await
+    }
+}
+
+/// After a reconciled buy: a complete entry opens (and keeps its exit
+/// strategy), an incomplete pair is flattened, and nothing held is a failure.
+async fn settle_after_purchase(
+    state: &AppState,
+    position: &mut Position,
+    ctx: &EventContext,
+) -> anyhow::Result<()> {
+    let service = &state.position_service;
+    if !position.has_open_exposure() {
+        service
+            .mark_entry_failed(
+                position,
+                FailureReason::OrderRejected {
+                    message: "Exchange confirmed no fill".into(),
+                },
+                ctx,
+            )
+            .await?;
+        state.arb_dedup.write().await.remove(&position.market_id);
+    } else if entry_complete(position) {
+        if position.state == PositionState::Pending {
+            service.mark_open(position, ctx).await?;
+        }
+    } else if position.state != PositionState::ExitReady {
+        // One leg of a planned pair: flatten it rather than hold it naked.
+        position.state = PositionState::ExitReady;
+        service.repo().update(position).await?;
+    }
     Ok(())
+}
+
+/// After a reconciled sale: remaining shares are queued for another exit and a
+/// flat position closes, feeding the circuit breaker like any other close.
+async fn settle_after_sale(
+    state: &AppState,
+    position: &mut Position,
+    ctx: &EventContext,
+) -> anyhow::Result<()> {
+    let service = &state.position_service;
+    service.write_off_unsellable_dust(position, ctx).await?;
+    if position.has_open_exposure() {
+        // Queue the remaining confirmed inventory for a fresh, exclusive exit.
+        position.state = PositionState::ExitReady;
+        service.repo().update(position).await?;
+        return Ok(());
+    }
+    service
+        .close_position(
+            position,
+            CloseMethod::MarketExit {
+                fee: Decimal::new(2, 2),
+            },
+            ctx,
+        )
+        .await?;
+    let realized_pnl = position.realized_pnl.unwrap_or_default();
+    if let Err(error) = state
+        .circuit_breaker
+        .record_trade(realized_pnl, realized_pnl > Decimal::ZERO)
+        .await
+    {
+        tracing::warn!(%error, "Failed to record reconciled close with circuit breaker");
+    }
+    state.arb_dedup.write().await.remove(&position.market_id);
+    Ok(())
+}
+
+/// Whether every leg the position planned to buy is held.
+fn entry_complete(position: &Position) -> bool {
+    position.has_open_exposure()
+        && (position.yes_entry_price <= Decimal::ZERO || position.held_yes_qty > Decimal::ZERO)
+        && (position.no_entry_price <= Decimal::ZERO || position.held_no_qty > Decimal::ZERO)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
+        response::IntoResponse,
         routing::{get, post},
         Json, Router,
     };
@@ -300,9 +469,337 @@ mod tests {
         let position = state.position_service.load(position.id).await.unwrap();
         assert_eq!(position.held_yes_qty, Decimal::TEN);
         assert_eq!(position.yes_entry_price, Decimal::new(5, 1));
-        assert_eq!(position.state, PositionState::ExitReady);
+        // Its only planned leg is now held: the entry opens instead of being
+        // queued for an immediate sale.
+        assert_eq!(position.state, PositionState::Open);
         let row:(String,Decimal,bool)=sqlx::query_as("SELECT i.status,l.applied_quantity,l.settled FROM execution_intents i JOIN position_order_links l USING(id) WHERE id=$1").bind(id).fetch_one(&pool).await.unwrap();
         assert_eq!(row, ("reconciled".into(), Decimal::TEN, true));
+        server.abort();
+    }
+
+    /// A local exchange: `/data/order/:id` answers `order` (404 when `None`)
+    /// and `/data/trades` lists `trades`.
+    async fn exchange(
+        order: Option<serde_json::Value>,
+        trades: serde_json::Value,
+    ) -> (ClobClient, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/auth/api-key",
+                post(|| async {
+                    Json(serde_json::json!({"apiKey":"test","secret":"c2VjcmV0","passphrase":"test"}))
+                }),
+            )
+            .route(
+                "/data/order/:id",
+                get(move || {
+                    let order = order.clone();
+                    async move {
+                        match order {
+                            Some(order) => Json(order).into_response(),
+                            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/data/trades",
+                get(move || {
+                    let trades = trades.clone();
+                    async move { Json(serde_json::json!({"data": trades, "next_cursor": "LTE="})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut clob = ClobClient::new(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        clob.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (clob, server)
+    }
+
+    async fn live_state(pool: &PgPool, clob: ClobClient) -> (Arc<AppState>, String) {
+        crate::exit_handler::correctness_tests::setup(pool).await;
+        let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
+        let executor = OrderExecutor::new_with_wallet(
+            Arc::new(clob),
+            wallet,
+            ExecutorConfig {
+                live_trading: true,
+                ..Default::default()
+            },
+        )
+        .with_database(pool.clone());
+        executor.initialize_live_trading().await.unwrap();
+        let maker = executor.wallet_address().await.unwrap();
+        let mut state = AppState::for_tests(pool.clone());
+        Arc::get_mut(&mut state).unwrap().order_executor = Arc::new(executor);
+        (state, maker)
+    }
+
+    async fn live_position(state: &AppState, maker: &str, yes: i64, no: i64) -> Position {
+        let mut position = Position::new(
+            "market".into(),
+            Decimal::new(yes, 2),
+            Decimal::new(no, 2),
+            Decimal::TEN,
+            ExitStrategy::HoldToResolution,
+        );
+        position.execution_mode = "live".into();
+        position.wallet_address = Some(maker.to_string());
+        state
+            .position_service
+            .repo()
+            .insert(&position)
+            .await
+            .unwrap();
+        position
+    }
+
+    async fn journal(
+        pool: &PgPool,
+        maker: &str,
+        position: Option<(Uuid, &str, &str)>,
+        status: &str,
+        age_minutes: i64,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        if let Some((position_id, leg, side)) = position {
+            sqlx::query("INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity) VALUES($1,$2,$3,$4,10)")
+                .bind(id).bind(position_id).bind(leg).bind(side).execute(pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO execution_intents(id,market_id,exchange_order_id,signed_order,status,created_at,updated_at) VALUES($1,'market','exchange',$2,$3,NOW()-make_interval(mins=>$4::int),NOW()-make_interval(mins=>$4::int))")
+            .bind(id)
+            .bind(serde_json::json!({"maker": maker, "tokenId": "token"}))
+            .bind(status)
+            .bind(age_minutes as i32)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn completing_a_hedged_pair_opens_it_instead_of_selling_it(pool: PgPool) {
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"MATCHED","original_size":"10","size_matched":"10","associate_trades":["trade"]})),
+            serde_json::json!([{"id":"trade","taker_order_id":"exchange","status":"CONFIRMED","size":"10","price":"0.5"}]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let mut position = live_position(&state, &maker, 48, 49).await;
+        // The YES leg filled in-process; the NO leg's response was lost.
+        position.held_yes_qty = Decimal::TEN;
+        state
+            .position_service
+            .repo()
+            .update(&mut position)
+            .await
+            .unwrap();
+        journal(
+            &pool,
+            &maker,
+            Some((position.id, "no", "buy")),
+            "unknown",
+            1,
+        )
+        .await;
+
+        reconcile(&state).await.unwrap();
+
+        let stored = state.position_service.load(position.id).await.unwrap();
+        assert_eq!(stored.state, PositionState::Open);
+        assert_eq!(
+            (stored.held_yes_qty, stored.held_no_qty),
+            (Decimal::TEN, Decimal::TEN)
+        );
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_lone_leg_of_a_pair_is_flattened(pool: PgPool) {
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"CANCELED","original_size":"10","size_matched":"0","associate_trades":[]})),
+            serde_json::json!([]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let mut position = live_position(&state, &maker, 48, 49).await;
+        position.held_yes_qty = Decimal::TEN;
+        state
+            .position_service
+            .repo()
+            .update(&mut position)
+            .await
+            .unwrap();
+        journal(
+            &pool,
+            &maker,
+            Some((position.id, "no", "buy")),
+            "unknown",
+            1,
+        )
+        .await;
+
+        reconcile(&state).await.unwrap();
+
+        let stored = state.position_service.load(position.id).await.unwrap();
+        assert_eq!(stored.state, PositionState::ExitReady);
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_order_the_exchange_never_received_releases_the_fence(pool: PgPool) {
+        let (clob, server) = exchange(None, serde_json::json!([])).await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let position = live_position(&state, &maker, 48, 0).await;
+        let recent = journal(
+            &pool,
+            &maker,
+            Some((position.id, "yes", "buy")),
+            "submitting",
+            2,
+        )
+        .await;
+
+        // Inside the grace period absence proves nothing.
+        reconcile(&state).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(recent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "submitting");
+
+        sqlx::query("UPDATE execution_intents SET created_at=NOW()-INTERVAL '20 minutes', updated_at=NOW()-INTERVAL '20 minutes' WHERE id=$1")
+            .bind(recent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reconcile(&state).await.unwrap();
+
+        let row: (String, Decimal, bool) = sqlx::query_as("SELECT i.status,l.applied_quantity,l.settled FROM execution_intents i JOIN position_order_links l USING(id) WHERE id=$1")
+            .bind(recent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, ("rejected".into(), Decimal::ZERO, true));
+        let stored = state.position_service.load(position.id).await.unwrap();
+        assert_eq!(stored.state, PositionState::EntryFailed);
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_absent_order_with_trades_stays_fenced(pool: PgPool) {
+        let (clob, server) = exchange(
+            None,
+            serde_json::json!([{"id":"t","taker_order_id":"other","maker_orders":[{"order_id":"exchange"}],"status":"MATCHED"}]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let position = live_position(&state, &maker, 48, 0).await;
+        let id = journal(
+            &pool,
+            &maker,
+            Some((position.id, "yes", "buy")),
+            "unknown",
+            30,
+        )
+        .await;
+
+        reconcile(&state).await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown");
+        assert_eq!(
+            state
+                .position_service
+                .load(position.id)
+                .await
+                .unwrap()
+                .state,
+            PositionState::Pending
+        );
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn orphan_sales_and_unjournaled_manual_orders_are_resolved(pool: PgPool) {
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"CANCELED","original_size":"10","size_matched":"0","associate_trades":[]})),
+            serde_json::json!([]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        // An orphan-inventory sale has neither a position link nor an order row.
+        let orphan = journal(&pool, &maker, None, "unknown", 1).await;
+        // A manual order that never reached the journal.
+        let manual = Uuid::new_v4();
+        sqlx::query("INSERT INTO orders(id,status,execution_mode,created_at,quantity,filled_quantity) VALUES($1,'pending','live',NOW()-INTERVAL '15 minutes',10,0)")
+            .bind(manual)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        reconcile(&state).await.unwrap();
+
+        let orphan_status: String =
+            sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+                .bind(orphan)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphan_status, "reconciled");
+        let manual_status: String = sqlx::query_scalar("SELECT status FROM orders WHERE id=$1")
+            .bind(manual)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(manual_status, "rejected");
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn reconciled_exit_closes_through_the_circuit_breaker(pool: PgPool) {
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"MATCHED","original_size":"10","size_matched":"10","associate_trades":["trade"]})),
+            serde_json::json!([{"id":"trade","taker_order_id":"exchange","status":"CONFIRMED","size":"10","price":"0.3"}]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let mut position = live_position(&state, &maker, 50, 0).await;
+        position.held_yes_qty = Decimal::TEN;
+        position.state = PositionState::Closing;
+        state
+            .position_service
+            .repo()
+            .update(&mut position)
+            .await
+            .unwrap();
+        state.arb_dedup.write().await.insert("market".into());
+        journal(
+            &pool,
+            &maker,
+            Some((position.id, "yes", "sell")),
+            "unknown",
+            1,
+        )
+        .await;
+
+        reconcile(&state).await.unwrap();
+
+        let stored = state.position_service.load(position.id).await.unwrap();
+        assert_eq!(stored.state, PositionState::Closed);
+        assert!(stored.realized_pnl.unwrap() < Decimal::ZERO);
+        let breaker = state.circuit_breaker.state().await;
+        assert_eq!(breaker.consecutive_losses, 1);
+        assert!(breaker.daily_pnl < Decimal::ZERO);
+        assert!(!state.arb_dedup.read().await.contains("market"));
         server.abort();
     }
 }
