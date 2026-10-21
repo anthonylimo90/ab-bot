@@ -72,6 +72,17 @@ import type {
   CreateLearningRolloutRequest,
   UpdateLearningRolloutRequest,
 } from "@/types/api";
+import {
+  parseActivity,
+  parseBacktestResult,
+  parseCircuitBreakerConfig,
+  parseCircuitBreakerStatus,
+  parseMarket,
+  parseOrder,
+  parseOrderbook,
+  parseRiskStatus,
+  parseWorkspace,
+} from "@/lib/wire";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
@@ -426,9 +437,22 @@ function parseLearningRolloutObservation(
   };
 }
 
+/**
+ * Called when an authenticated request is rejected with 401, i.e. the session
+ * token we sent is expired or revoked. Receives the token that was rejected so the
+ * owner can ignore a stale response that races a newer sign-in.
+ */
+export type UnauthorizedHandler = (rejectedToken: string) => void;
+
+// Credential and session endpoints answer 401 for reasons other than an expired
+// session (wrong password, bad signature, already-revoked logout) and are handled
+// by their callers, so they never trigger the global handler.
+const AUTH_ENDPOINT_PREFIX = "/api/v1/auth/";
+
 class ApiClient {
   private baseUrl: string;
   private token?: string;
+  private unauthorizedHandler: UnauthorizedHandler | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
@@ -440,6 +464,10 @@ class ApiClient {
 
   clearToken() {
     this.token = undefined;
+  }
+
+  setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
+    this.unauthorizedHandler = handler;
   }
 
   // Generic HTTP methods for flexibility
@@ -479,9 +507,11 @@ class ApiClient {
       ...options.headers,
     };
 
-    if (requestOptions?.auth !== false && this.token) {
+    const sentToken =
+      requestOptions?.auth !== false ? this.token : undefined;
+    if (sentToken) {
       (headers as Record<string, string>)["Authorization"] =
-        `Bearer ${this.token}`;
+        `Bearer ${sentToken}`;
     }
 
     const response = await fetch(`${this.baseUrl}${endpoint}`, {
@@ -494,6 +524,18 @@ class ApiClient {
         code: "UNKNOWN_ERROR",
         message: `HTTP ${response.status}`,
       }));
+      if (
+        response.status === 401 &&
+        sentToken &&
+        !endpoint.startsWith(AUTH_ENDPOINT_PREFIX)
+      ) {
+        try {
+          this.unauthorizedHandler?.(sentToken);
+        } catch (handlerError) {
+          // The caller still needs the original 401 below.
+          console.error("Unauthorized handler failed:", handlerError);
+        }
+      }
       throw new ApiHttpError(
         response.status,
         error.message || `HTTP ${response.status}`,
@@ -611,7 +653,7 @@ class ApiClient {
 
   // Markets
   async getMarkets(params?: {
-  search?: string;
+    search?: string;
     category?: string;
     active?: boolean;
     min_volume?: number;
@@ -619,6 +661,9 @@ class ApiClient {
     offset?: number;
   }): Promise<Market[]> {
     const searchParams = new URLSearchParams();
+    // The backend trims and ignores a blank search, so only send a real term.
+    const search = params?.search?.trim();
+    if (search) searchParams.set("search", search);
     if (params?.category) searchParams.set("category", params.category);
     if (params?.active !== undefined)
       searchParams.set("active", String(params.active));
@@ -627,15 +672,22 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Market[]>(`/api/v1/markets${query ? `?${query}` : ""}`);
+    const raw = await this.request<Market[]>(
+      `/api/v1/markets${query ? `?${query}` : ""}`,
+    );
+    return raw.map(parseMarket);
   }
 
   async getMarket(marketId: string): Promise<Market> {
-    return this.request<Market>(`/api/v1/markets/${marketId}`);
+    const raw = await this.request<Market>(`/api/v1/markets/${marketId}`);
+    return parseMarket(raw);
   }
 
   async getOrderbook(marketId: string): Promise<Orderbook> {
-    return this.request<Orderbook>(`/api/v1/markets/${marketId}/orderbook`);
+    const raw = await this.request<Orderbook>(
+      `/api/v1/markets/${marketId}/orderbook`,
+    );
+    return parseOrderbook(raw);
   }
 
   // Positions
@@ -691,28 +743,32 @@ class ApiClient {
   // Orders
   async placeOrder(params: PlaceOrderRequest): Promise<Order> {
     params.client_order_id ??= crypto.randomUUID();
-    return this.request<Order>("/api/v1/orders", {
+    const raw = await this.request<Order>("/api/v1/orders", {
       method: "POST",
       body: JSON.stringify(params),
     });
+    return parseOrder(raw);
   }
 
   async getOrder(orderId: string): Promise<Order> {
-    return this.request<Order>(`/api/v1/orders/${orderId}`);
+    const raw = await this.request<Order>(`/api/v1/orders/${orderId}`);
+    return parseOrder(raw);
   }
 
   async cancelOrder(orderId: string): Promise<Order> {
-    return this.request<Order>(`/api/v1/orders/${orderId}/cancel`, {
+    const raw = await this.request<Order>(`/api/v1/orders/${orderId}/cancel`, {
       method: "POST",
     });
+    return parseOrder(raw);
   }
 
   // Backtest
   async runBacktest(params: BacktestParams): Promise<BacktestResult> {
-    return this.request<BacktestResult>("/api/v1/backtest", {
+    const raw = await this.request<BacktestResult>("/api/v1/backtest", {
       method: "POST",
       body: JSON.stringify(params),
     });
+    return parseBacktestResult(raw);
   }
 
   async getBacktestResults(params?: {
@@ -728,13 +784,17 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<BacktestResult[]>(
+    const raw = await this.request<BacktestResult[]>(
       `/api/v1/backtest/results${query ? `?${query}` : ""}`,
     );
+    return raw.map(parseBacktestResult);
   }
 
   async getBacktestResult(resultId: string): Promise<BacktestResult> {
-    return this.request<BacktestResult>(`/api/v1/backtest/results/${resultId}`);
+    const raw = await this.request<BacktestResult>(
+      `/api/v1/backtest/results/${resultId}`,
+    );
+    return parseBacktestResult(raw);
   }
 
   async getMarketRegime(): Promise<MarketRegimeResponse> {
@@ -837,24 +897,32 @@ class ApiClient {
   async adminCreateWorkspace(
     params: CreateWorkspaceRequest,
   ): Promise<Workspace> {
-    return this.request<Workspace>("/api/v1/admin/workspaces", {
+    const raw = await this.request<Workspace>("/api/v1/admin/workspaces", {
       method: "POST",
       body: JSON.stringify(params),
     });
+    return parseWorkspace(raw);
   }
 
   async adminGetWorkspace(workspaceId: string): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`);
+    const raw = await this.request<Workspace>(
+      `/api/v1/admin/workspaces/${workspaceId}`,
+    );
+    return parseWorkspace(raw);
   }
 
   async adminUpdateWorkspace(
     workspaceId: string,
     params: UpdateWorkspaceRequest,
   ): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`, {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
+    const raw = await this.request<Workspace>(
+      `/api/v1/admin/workspaces/${workspaceId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseWorkspace(raw);
   }
 
   async adminDeleteWorkspace(workspaceId: string): Promise<void> {
@@ -917,21 +985,29 @@ class ApiClient {
   }
 
   async getCurrentWorkspace(): Promise<Workspace> {
-    return this.request<Workspace>("/api/v1/workspaces/current");
+    const raw = await this.request<Workspace>("/api/v1/workspaces/current");
+    return parseWorkspace(raw);
   }
 
   async getWorkspace(workspaceId: string): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`);
+    const raw = await this.request<Workspace>(
+      `/api/v1/workspaces/${workspaceId}`,
+    );
+    return parseWorkspace(raw);
   }
 
   async updateWorkspace(
     workspaceId: string,
     params: UpdateWorkspaceRequest,
   ): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`, {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
+    const raw = await this.request<Workspace>(
+      `/api/v1/workspaces/${workspaceId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseWorkspace(raw);
   }
 
   async switchWorkspace(workspaceId: string): Promise<void> {
@@ -1111,27 +1187,30 @@ class ApiClient {
 
   // Risk Monitoring
   async getRiskStatus(workspaceId: string): Promise<RiskStatus> {
-    return this.request<RiskStatus>(
+    const raw = await this.request<RiskStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/status`,
     );
+    return parseRiskStatus(raw);
   }
 
   async manualTripCircuitBreaker(
     workspaceId: string,
   ): Promise<CircuitBreakerStatus> {
-    return this.request<CircuitBreakerStatus>(
+    const raw = await this.request<CircuitBreakerStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/trip`,
       { method: "POST" },
     );
+    return parseCircuitBreakerStatus(raw);
   }
 
   async resetCircuitBreaker(
     workspaceId: string,
   ): Promise<CircuitBreakerStatus> {
-    return this.request<CircuitBreakerStatus>(
+    const raw = await this.request<CircuitBreakerStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/reset`,
       { method: "POST" },
     );
+    return parseCircuitBreakerStatus(raw);
   }
 
   async updateCircuitBreakerConfig(
@@ -1144,10 +1223,11 @@ class ApiClient {
       enabled?: boolean;
     },
   ): Promise<CircuitBreakerConfig> {
-    return this.request<CircuitBreakerConfig>(
+    const raw = await this.request<CircuitBreakerConfig>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/config`,
       { method: "PUT", body: JSON.stringify(params) },
     );
+    return parseCircuitBreakerConfig(raw);
   }
 
   // Activity Feed
@@ -1159,9 +1239,10 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Activity[]>(
+    const raw = await this.request<Activity[]>(
       `/api/v1/activity${query ? `?${query}` : ""}`,
     );
+    return raw.map(parseActivity);
   }
 
   async getAccountSummary(workspaceId: string): Promise<AccountSummary> {

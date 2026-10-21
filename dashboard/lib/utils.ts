@@ -102,6 +102,27 @@ export function formatLargePercent(
   return `${sign}${abs.toFixed(decimals)}%`;
 }
 
+const NO_VALUE = "\u2014";
+
+/** `value.toFixed(decimals)` plus an optional suffix, or an em dash for null / undefined / NaN. */
+export function formatFixed(
+  value: number | null | undefined,
+  decimals: number,
+  suffix: string = "",
+): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return NO_VALUE;
+  return `${value.toFixed(decimals)}${suffix}`;
+}
+
+/** {@link formatCurrency}, or an em dash for null / undefined / NaN. */
+export function formatCurrencyOrDash(
+  value: number | null | undefined,
+  options?: { showSign?: boolean; decimals?: number },
+): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return NO_VALUE;
+  return formatCurrency(value, options);
+}
+
 export function formatNumber(value: number, decimals: number = 2): string {
   return new Intl.NumberFormat("en-US", {
     minimumFractionDigits: decimals,

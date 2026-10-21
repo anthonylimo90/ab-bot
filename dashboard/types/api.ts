@@ -366,9 +366,13 @@ export interface BacktestParams {
   fee_pct?: number;
 }
 
+// Backtest numbers are Rust Decimals (JSON strings) that lib/wire.ts converts to
+// numbers. They are `null` when the backend cannot represent a non-finite value, so
+// every consumer must handle null (render it as an em dash, never call `.toFixed`).
 export interface EquityPoint {
   timestamp: string;
-  value: number;
+  value: number | null;
+  drawdown_pct?: number | null;
 }
 
 export interface TradeLogEntry {
@@ -377,12 +381,12 @@ export interface TradeLogEntry {
   trade_type: string;
   entry_time: string;
   exit_time?: string;
-  entry_price: number;
-  exit_price?: number;
-  quantity: number;
-  fees: number;
-  pnl?: number;
-  return_pct?: number;
+  entry_price: number | null;
+  exit_price?: number | null;
+  quantity: number | null;
+  fees: number | null;
+  pnl?: number | null;
+  return_pct?: number | null;
 }
 
 export interface BacktestResult {
@@ -390,38 +394,38 @@ export interface BacktestResult {
   strategy: StrategyConfig;
   start_date: string;
   end_date: string;
-  initial_capital: number;
-  final_value: number;
-  total_return: number;
-  total_return_pct: number;
-  annualized_return: number;
-  sharpe_ratio: number;
-  sortino_ratio: number;
-  max_drawdown: number;
-  max_drawdown_pct: number;
+  initial_capital: number | null;
+  final_value: number | null;
+  total_return: number | null;
+  total_return_pct: number | null;
+  annualized_return: number | null;
+  sharpe_ratio: number | null;
+  sortino_ratio: number | null;
+  max_drawdown: number | null;
+  max_drawdown_pct: number | null;
   total_trades: number;
   winning_trades: number;
   losing_trades: number;
-  win_rate: number;
-  avg_win: number;
-  avg_loss: number;
-  profit_factor: number;
-  total_fees: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  profit_factor: number | null;
+  total_fees: number | null;
   created_at: string;
   status: "pending" | "running" | "completed" | "failed";
   error?: string;
   equity_curve?: EquityPoint[];
   // Extended metrics
-  expectancy?: number;
-  calmar_ratio?: number;
-  var_95?: number;
-  cvar_95?: number;
-  recovery_factor?: number;
-  best_trade_return?: number;
-  worst_trade_return?: number;
+  expectancy?: number | null;
+  calmar_ratio?: number | null;
+  var_95?: number | null;
+  cvar_95?: number | null;
+  recovery_factor?: number | null;
+  best_trade_return?: number | null;
+  worst_trade_return?: number | null;
   max_consecutive_wins?: number;
   max_consecutive_losses?: number;
-  avg_trade_duration_hours?: number;
+  avg_trade_duration_hours?: number | null;
   trade_log?: TradeLogEntry[];
 }
 
@@ -813,17 +817,16 @@ export interface PaginatedResponse<T> {
   offset: number;
 }
 
-// WebSocket types
+// WebSocket types. These mirror crates/api-server/src/websocket.rs: the enums are
+// serialised with `rename_all = "snake_case"`, the envelope is
+// `#[serde(tag = "type", content = "data")]`, and Decimal fields arrive as strings
+// (lib/wire.ts normalizeWsMessage converts them before they reach consumers).
 export type PositionUpdateType =
-  | "Opened"
-  | "Updated"
-  | "Closed"
-  | "PriceChanged";
-export type SignalType =
-  | "Arbitrage"
-  | "StopLoss"
-  | "TakeProfit"
-  | "Alert";
+  | "opened"
+  | "updated"
+  | "closed"
+  | "price_changed";
+export type SignalType = "arbitrage" | "alert" | "quant_signal";
 
 export interface OrderbookUpdate {
   market_id: string;
@@ -886,9 +889,9 @@ export type WebSocketMessage =
   | { type: "Position"; data: PositionUpdate }
   | { type: "Signal"; data: SignalUpdate }
   | { type: "TradeFlow"; data: TradeFlowEvent }
-  | { type: "Subscribed"; channel: string }
-  | { type: "Unsubscribed"; channel: string }
-  | { type: "Error"; code: string; message: string }
+  | { type: "Subscribed"; data: { channel: string } }
+  | { type: "Unsubscribed"; data: { channel: string } }
+  | { type: "Error"; data: { code: string; message: string } }
   | { type: "Ping" }
   | { type: "Pong" };
 

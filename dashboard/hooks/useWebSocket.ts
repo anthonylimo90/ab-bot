@@ -1,8 +1,17 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import type { WebSocketMessage } from '@/types/api';
 import { useAuthStore } from '@/stores/auth-store';
+import { normalizeWsMessage } from '@/lib/wire';
+import {
+  createReconnectingSocket,
+  type ReconnectingSocket,
+} from '@/lib/reconnecting-socket';
+import {
+  createPositionBatcher,
+  type PositionUpdateAccumulator,
+} from '@/lib/position-batcher';
 
 export type ConnectionStatus =
   | 'connecting'
@@ -11,6 +20,19 @@ export type ConnectionStatus =
   | 'error';
 
 const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001';
+
+// Wire drift (a renamed variant, an unreadable price) would otherwise fail
+// silently, so say so once per message type instead of once per frame.
+const warnedMessageTypes = new Set<string>();
+function warnUnrecognisedMessage(parsed: unknown) {
+  const type =
+    typeof parsed === 'object' && parsed !== null && 'type' in parsed
+      ? String((parsed as { type: unknown }).type)
+      : 'unknown';
+  if (warnedMessageTypes.has(type)) return;
+  warnedMessageTypes.add(type);
+  console.warn(`Ignoring unrecognised or malformed WebSocket message (type: ${type})`);
+}
 
 export type WebSocketChannel =
   | 'orderbook'
@@ -54,7 +76,8 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     onError,
     reconnect = true,
     reconnectInterval = 3000,
-    maxReconnectAttempts = 5,
+    // Reconnect indefinitely by default (jittered exponential backoff capped at 30s).
+    maxReconnectAttempts = Infinity,
     enabled = true,
     batchMessages = false,
     batchInterval = 100,
@@ -62,15 +85,12 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
 
   const token = useAuthStore((state) => state.token);
   const privateChannel = channel !== 'orderbook';
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const socketRef = useRef<ReconnectingSocket | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
 
   // Message batching refs
   const messageQueueRef = useRef<WebSocketMessage[]>([]);
-  const flushTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const flushTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Refs for latest callbacks to avoid stale closures
   const onMessageRef = useRef(onMessage);
@@ -90,11 +110,16 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
 
   // Flush batched messages - uses refs to avoid stale closures
   const flushBatch = useCallback(() => {
+    // Always release the timer handle, even when the queue is empty; a stale handle
+    // would stop queueMessage from ever scheduling another flush.
+    if (flushTimeoutRef.current) {
+      clearTimeout(flushTimeoutRef.current);
+      flushTimeoutRef.current = null;
+    }
     if (messageQueueRef.current.length === 0) return;
 
     const messages = [...messageQueueRef.current];
     messageQueueRef.current = [];
-    flushTimeoutRef.current = null;
 
     if (onMessageBatchRef.current) {
       onMessageBatchRef.current(messages);
@@ -130,111 +155,96 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     },
     [batchMessages, queueMessage]
   );
+  const handleMessageRef = useRef(handleMessage);
+  useEffect(() => { handleMessageRef.current = handleMessage; }, [handleMessage]);
 
-  const connect = useCallback(() => {
+  // One ReconnectingSocket per (url, token, enabled) combination. The connection
+  // itself (connect guard, backoff, pings, replacing dead sockets) lives in
+  // lib/reconnecting-socket.ts; this effect only wires it to React state.
+  useEffect(() => {
     if (!enabled || (privateChannel && !token)) {
       setStatus('disconnected');
       return;
     }
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    setStatus('connecting');
-
-    try {
-      const ws = new WebSocket(url);
-
-      ws.onopen = () => {
-        if (privateChannel) {
-          ws.send(JSON.stringify({ action: 'authenticate', token }));
-        }
-        pingIntervalRef.current = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ action: 'ping' }));
-          }
-        }, 30000);
-      };
-
-      ws.onmessage = (event) => {
+    const socket = createReconnectingSocket({
+      url,
+      authToken: privateChannel ? token : null,
+      reconnect,
+      baseDelayMs: reconnectInterval,
+      maxAttempts: maxReconnectAttempts,
+      onStatus: setStatus,
+      onMessage: (raw) => {
+        let parsed: unknown;
         try {
-          const data = JSON.parse(event.data) as WebSocketMessage;
-          if (data.type === 'Subscribed') {
-            setStatus('connected');
-            reconnectAttemptsRef.current = 0;
-            onConnectRef.current?.();
-          }
-          handleMessage(data);
+          parsed = JSON.parse(raw as string);
         } catch {
-          console.error('Failed to parse WebSocket message:', event.data);
+          console.error('Failed to parse WebSocket message:', raw);
+          return;
         }
-      };
-
-      ws.onclose = (event) => {
-        setStatus(event.code === 1008 ? 'error' : 'disconnected');
+        // Validate the frame and convert Rust Decimal strings to numbers before any
+        // consumer (query cache, components) sees it.
+        const data = normalizeWsMessage(parsed);
+        if (!data) {
+          warnUnrecognisedMessage(parsed);
+          return;
+        }
+        if (data.type === 'Subscribed') {
+          // The server confirmed the subscription: the connection is established
+          // and the reconnect backoff starts over.
+          socket.markConnected();
+          onConnectRef.current?.();
+        }
+        handleMessageRef.current(data);
+      },
+      onDisconnect: () => {
         onDisconnectRef.current?.();
+        // Deliver whatever was queued before the connection dropped.
+        flushBatch();
+      },
+      onError: (event) => onErrorRef.current?.(event as Event),
+    });
+    socketRef.current = socket;
+    socket.connect();
 
-        if (pingIntervalRef.current) {
-          clearInterval(pingIntervalRef.current);
-        }
+    // Reconnect promptly when the tab becomes visible again.
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        socket.resume();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
-        if (flushTimeoutRef.current) {
-          clearTimeout(flushTimeoutRef.current);
-          flushBatch();
-        }
-
-        if (
-          event.code !== 1008 &&
-          reconnect &&
-          reconnectAttemptsRef.current < maxReconnectAttempts &&
-          enabled
-        ) {
-          reconnectAttemptsRef.current++;
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connect();
-          }, reconnectInterval);
-        }
-      };
-
-      ws.onerror = (error) => {
-        setStatus('error');
-        onErrorRef.current?.(error);
-      };
-
-      wsRef.current = ws;
-    } catch (error) {
-      setStatus('error');
-      console.error('WebSocket connection failed:', error);
-    }
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      socket.dispose();
+      if (socketRef.current === socket) socketRef.current = null;
+      // Drop (do not deliver) anything still queued, and release the timer handle
+      // so a later effect run on this hook instance can schedule flushes again.
+      if (flushTimeoutRef.current) {
+        clearTimeout(flushTimeoutRef.current);
+        flushTimeoutRef.current = null;
+      }
+      messageQueueRef.current = [];
+    };
   }, [
     url,
     token,
     privateChannel,
-    handleMessage,
+    enabled,
     reconnect,
     reconnectInterval,
     maxReconnectAttempts,
-    enabled,
     flushBatch,
   ]);
 
   const disconnect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-    }
-    if (pingIntervalRef.current) {
-      clearInterval(pingIntervalRef.current);
-    }
-    if (flushTimeoutRef.current) {
-      clearTimeout(flushTimeoutRef.current);
-      flushBatch();
-    }
-    reconnectAttemptsRef.current = maxReconnectAttempts; // Prevent reconnection
-    wsRef.current?.close();
-  }, [maxReconnectAttempts, flushBatch]);
+    socketRef.current?.disconnect();
+    flushBatch();
+  }, [flushBatch]);
 
   const send = useCallback((data: Record<string, unknown>) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-    }
+    socketRef.current?.send(JSON.stringify(data));
   }, []);
 
   const subscribe = useCallback(
@@ -259,45 +269,8 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
   );
 
   const manualReconnect = useCallback(() => {
-    reconnectAttemptsRef.current = 0;
-    disconnect();
-    setTimeout(connect, 100);
-  }, [connect, disconnect]);
-
-  useEffect(() => {
-    if (enabled) {
-      connect();
-    }
-
-    // Reconnect when tab becomes visible again
-    const handleVisibilityChange = () => {
-      if (
-        document.visibilityState === 'visible' &&
-        enabled &&
-        wsRef.current?.readyState !== WebSocket.OPEN
-      ) {
-        reconnectAttemptsRef.current = 0;
-        connect();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-      if (pingIntervalRef.current) {
-        clearInterval(pingIntervalRef.current);
-      }
-      if (flushTimeoutRef.current) {
-        clearTimeout(flushTimeoutRef.current);
-      }
-      if (wsRef.current) wsRef.current.onclose = null;
-      wsRef.current?.close();
-      messageQueueRef.current = [];
-    };
-  }, [connect, enabled]);
+    socketRef.current?.reconnectNow();
+  }, []);
 
   return {
     status,
@@ -312,87 +285,24 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
 /**
  * Hook for batched position updates - processes multiple updates efficiently
  */
-interface PositionUpdateAccumulator {
-  updates: Map<string, { price: number; pnl: number; quantity: number }>;
-  opened: string[];
-  closed: string[];
-}
-
 export function useBatchedPositionUpdates(
   onUpdate: (accumulator: PositionUpdateAccumulator) => void,
   debounceMs = 200
 ) {
-  const accumulatorRef = useRef<PositionUpdateAccumulator>({
-    updates: new Map(),
-    opened: [],
-    closed: [],
-  });
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const flush = useCallback(() => {
-    if (
-      accumulatorRef.current.updates.size === 0 &&
-      accumulatorRef.current.opened.length === 0 &&
-      accumulatorRef.current.closed.length === 0
-    ) {
-      return;
-    }
-
-    onUpdate(accumulatorRef.current);
-
-    // Reset accumulator
-    accumulatorRef.current = {
-      updates: new Map(),
-      opened: [],
-      closed: [],
-    };
-    timeoutRef.current = null;
+  // The batcher outlives renders; route delivery through a ref so it always calls
+  // the latest callback without being recreated.
+  const onUpdateRef = useRef(onUpdate);
+  useEffect(() => {
+    onUpdateRef.current = onUpdate;
   }, [onUpdate]);
 
-  const addUpdate = useCallback(
-    (
-      positionId: string,
-      updateType: 'Opened' | 'Updated' | 'Closed' | 'PriceChanged',
-      data?: { price?: number; pnl?: number; quantity?: number }
-    ) => {
-      switch (updateType) {
-        case 'Opened':
-          accumulatorRef.current.opened.push(positionId);
-          break;
-        case 'Closed':
-          accumulatorRef.current.closed.push(positionId);
-          // Remove from updates if pending
-          accumulatorRef.current.updates.delete(positionId);
-          break;
-        case 'Updated':
-        case 'PriceChanged':
-          if (data) {
-            const existing = accumulatorRef.current.updates.get(positionId);
-            accumulatorRef.current.updates.set(positionId, {
-              price: data.price ?? existing?.price ?? 0,
-              pnl: data.pnl ?? existing?.pnl ?? 0,
-              quantity: data.quantity ?? existing?.quantity ?? 0,
-            });
-          }
-          break;
-      }
-
-      // Schedule flush if not already scheduled
-      if (!timeoutRef.current) {
-        timeoutRef.current = setTimeout(flush, debounceMs);
-      }
-    },
-    [flush, debounceMs]
+  const batcher = useMemo(
+    () => createPositionBatcher((accumulator) => onUpdateRef.current(accumulator), debounceMs),
+    [debounceMs]
   );
 
   // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-    };
-  }, []);
+  useEffect(() => () => batcher.dispose(), [batcher]);
 
-  return { addUpdate, flush };
+  return { addUpdate: batcher.addUpdate, flush: batcher.flush };
 }

@@ -27,7 +27,11 @@ import {
   ArrowUpRight,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
-import { withdrawalIntent } from '@/lib/withdrawal-intent';
+import {
+  clearWithdrawalIntent,
+  isWithdrawalIntentSettled,
+  withdrawalIntent,
+} from '@/lib/withdrawal-intent';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { InviteMemberDialog } from '@/components/workspace/InviteMemberDialog';
 import { MemberList } from '@/components/workspace/MemberList';
@@ -353,9 +357,13 @@ export default function SettingsPage() {
         destination_address: withdrawDestination.trim(),
         amount,
       });
-      if (result.status === 'confirmed') {
-        sessionStorage.removeItem('ab-bot-withdrawal-intent');
+      // Confirmed or terminally failed ends this intent so the next attempt gets a
+      // new request id; pending/submitted/unknown keep it so a retry stays idempotent.
+      if (isWithdrawalIntentSettled(result.status)) {
+        clearWithdrawalIntent(sessionStorage);
         withdrawalIntentRef.current = null;
+      }
+      if (result.status === 'confirmed') {
         setWithdrawDestination('');
         setWithdrawAmount('');
       }

@@ -1,5 +1,23 @@
 import { QueryClient } from "@tanstack/react-query";
 
+/** HTTP status of an API error (ApiHttpError), or undefined for anything else. */
+function httpStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const status = (error as { statusCode?: unknown }).statusCode;
+  return typeof status === "number" ? status : undefined;
+}
+
+/**
+ * Retry transient failures only. A 4xx response (expired token, not found,
+ * validation, rate limit) will not succeed on an immediate retry, so it fails fast;
+ * network errors and 5xx get a small number of retries.
+ */
+export function shouldRetryQuery(failureCount: number, error: unknown): boolean {
+  const status = httpStatus(error);
+  if (status !== undefined && status >= 400 && status < 500) return false;
+  return failureCount < 2;
+}
+
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
@@ -9,14 +27,17 @@ export const queryClient = new QueryClient({
       gcTime: 5 * 60 * 1000,
       // Refetch when window regains focus
       refetchOnWindowFocus: true,
-      // Retry failed requests twice
-      retry: 2,
+      // Retry network/5xx failures twice; never retry 4xx responses
+      retry: shouldRetryQuery,
       // Exponential backoff for retries
       retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000),
     },
     mutations: {
-      // Retry mutations once
-      retry: 1,
+      // Never retry mutations automatically. They are not idempotent (for example
+      // createCashFlow has no idempotency key), so a retry could apply the write
+      // twice. Operations that are safe to repeat carry their own request id and
+      // are retried explicitly by the user.
+      retry: 0,
     },
   },
 });

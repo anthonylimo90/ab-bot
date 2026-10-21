@@ -14,11 +14,13 @@ import { useAuthStore } from '@/stores/auth-store';
 import { useToastStore } from '@/stores/toast-store';
 import { WalletLoginButton } from '@/components/wallet';
 import api from '@/lib/api';
+import { safeRedirectPath } from '@/lib/safe-redirect';
 
 export default function LoginPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const redirectTo = searchParams.get('redirect') || '/';
+  // Only same-origin paths are followed; anything else (open redirect) goes home.
+  const redirectTo = safeRedirectPath(searchParams.get('redirect'));
   const [isLoading, setIsLoading] = useState(false);
   const setAuth = useAuthStore((state) => state.setAuth);
   const addToast = useToastStore((state) => state.addToast);
