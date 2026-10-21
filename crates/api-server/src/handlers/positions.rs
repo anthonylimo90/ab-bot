@@ -721,36 +721,21 @@ pub async fn close_position(
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             if !recovered {
                 return Err(ApiError::BadRequest(
-                    "Position has exhausted exit retries and cannot be re-queued".to_string(),
+                    "Position could not be re-queued for exit".to_string(),
                 ));
             }
         }
         PositionState::Stalled => {
-            let recovered_state = state
+            // Validate before mutating: only held shares can be queued for sale.
+            let requeued = state
                 .position_service
-                .attempt_stalled_recovery(&mut position, &ctx)
+                .requeue_stalled_for_exit(&mut position, &ctx)
                 .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            match recovered_state {
-                Some(PositionState::Open) => {
-                    state
-                        .position_service
-                        .mark_exit_ready(&mut position, "manual_close_after_stall_recovery", &ctx)
-                        .await
-                        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-                }
-                Some(PositionState::ExitReady | PositionState::Closing) => {}
-                Some(state) => {
-                    return Err(ApiError::BadRequest(format!(
-                        "Position recovered to {} and cannot be manually closed yet",
-                        position_state_label(state)
-                    )))
-                }
-                None => {
-                    return Err(ApiError::BadRequest(
-                        "Position could not be recovered for manual close".to_string(),
-                    ))
-                }
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            if !requeued {
+                return Err(ApiError::BadRequest(
+                    "Stalled position holds no shares to close".to_string(),
+                ));
             }
         }
         PositionState::EntryFailed if position.is_one_legged_entry_fail() => {

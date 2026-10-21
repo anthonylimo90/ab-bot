@@ -514,7 +514,7 @@ pub async fn recover_wallet_orphan_inventory(
             continue;
         };
 
-        if entry.quantity <= Decimal::ZERO {
+        if polymarket_core::types::sellable_shares(entry.quantity) <= Decimal::ZERO {
             continue;
         }
 
@@ -546,7 +546,7 @@ pub async fn recover_wallet_orphan_inventory(
             market_id.clone(),
             entry.token_id.clone(),
             OrderSide::Sell,
-            entry.quantity,
+            polymarket_core::types::sellable_shares(entry.quantity),
         )
         .with_expected_price(expected_price)
         .with_slippage(order_executor.default_slippage());

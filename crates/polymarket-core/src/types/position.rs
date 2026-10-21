@@ -463,6 +463,70 @@ impl Position {
         self.held_yes_qty > Decimal::ZERO || self.held_no_qty > Decimal::ZERO
     }
 
+    /// Writes off per-leg remainders below the smallest sellable quantity.
+    ///
+    /// Market sells carry whole hundredths of a share, so a remainder such as
+    /// 0.0033 shares can never be sold. It is recorded as exited at zero
+    /// proceeds: the weighted exit price is diluted so the leg's recorded
+    /// proceeds are unchanged. Returns the written-off `(yes, no)` quantities.
+    pub fn write_off_unsellable_dust(&mut self) -> (Decimal, Decimal) {
+        fn write_off(
+            held: &mut Decimal,
+            exited: &mut Decimal,
+            price: &mut Option<Decimal>,
+        ) -> Decimal {
+            let dust = *held;
+            if dust <= Decimal::ZERO || dust >= super::order::MIN_SELLABLE_SHARES {
+                return Decimal::ZERO;
+            }
+            let proceeds = price.unwrap_or_default() * *exited;
+            *exited += dust;
+            *held = Decimal::ZERO;
+            *price = Some(proceeds / *exited);
+            dust
+        }
+
+        let yes = write_off(
+            &mut self.held_yes_qty,
+            &mut self.exited_yes_qty,
+            &mut self.yes_exit_price,
+        );
+        let no = write_off(
+            &mut self.held_no_qty,
+            &mut self.exited_no_qty,
+            &mut self.no_exit_price,
+        );
+        if yes > Decimal::ZERO || no > Decimal::ZERO {
+            self.last_updated = Utc::now();
+        }
+        (yes, no)
+    }
+
+    /// Requeues a failed exit for another attempt, regardless of how many
+    /// attempts failed; callers pace retries (see the exit handler backoff).
+    pub fn requeue_failed_exit(&mut self) -> bool {
+        if self.state != PositionState::ExitFailed {
+            return false;
+        }
+        self.state = PositionState::ExitReady;
+        self.failure_reason = None;
+        self.last_updated = Utc::now();
+        true
+    }
+
+    /// Sends a stalled position that still holds shares straight to the exit
+    /// queue. Without holdings there is nothing to sell, so nothing changes.
+    pub fn requeue_stalled_for_exit(&mut self) -> bool {
+        if self.state != PositionState::Stalled || !self.has_open_exposure() {
+            return false;
+        }
+        self.state = PositionState::ExitReady;
+        self.pre_stall_state = None;
+        self.failure_reason = None;
+        self.last_updated = Utc::now();
+        true
+    }
+
     /// Close the position using any previously recorded per-leg exit fills.
     /// `fee` is only used for legacy flat-fee positions.
     pub fn close_via_recorded_exit(&mut self, fee: Decimal) -> std::result::Result<(), String> {
@@ -840,6 +904,77 @@ impl PositionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsellable_dust_is_written_off_without_changing_proceeds() {
+        let mut p = Position::new(
+            "m".into(),
+            Decimal::new(48, 2),
+            Decimal::ZERO,
+            Decimal::ONE,
+            ExitStrategy::ExitOnCorrection,
+        );
+        p.held_yes_qty = "52.0833".parse().unwrap();
+        p.state = PositionState::Closing;
+        p.held_yes_qty -= "52.08".parse::<Decimal>().unwrap();
+        p.exited_yes_qty = "52.08".parse().unwrap();
+        p.yes_exit_price = Some(Decimal::new(50, 2));
+
+        let (yes, no) = p.write_off_unsellable_dust();
+        assert_eq!(yes, "0.0033".parse().unwrap());
+        assert_eq!(no, Decimal::ZERO);
+        assert!(!p.has_open_exposure());
+        assert_eq!(p.exited_yes_qty, "52.0833".parse().unwrap());
+        let proceeds = p.yes_exit_price.unwrap() * p.exited_yes_qty;
+        assert_eq!(proceeds.round_dp(8), "26.04".parse().unwrap());
+
+        // A whole sellable lot is never written off.
+        p.held_no_qty = Decimal::new(1, 2);
+        assert_eq!(
+            p.write_off_unsellable_dust(),
+            (Decimal::ZERO, Decimal::ZERO)
+        );
+        assert!(p.has_open_exposure());
+    }
+
+    #[test]
+    fn failed_exits_requeue_past_the_retry_count() {
+        let mut p = Position::new(
+            "m".into(),
+            Decimal::new(48, 2),
+            Decimal::ZERO,
+            Decimal::ONE,
+            ExitStrategy::ExitOnCorrection,
+        );
+        p.held_yes_qty = Decimal::ONE;
+        for _ in 0..(MAX_RETRY_ATTEMPTS + 2) {
+            p.mark_exit_failed(FailureReason::Unknown {
+                message: "no bids".into(),
+            });
+        }
+        assert!(p.requeue_failed_exit());
+        assert_eq!(p.state, PositionState::ExitReady);
+        assert!(!p.requeue_failed_exit());
+    }
+
+    #[test]
+    fn stalled_positions_requeue_for_exit_only_with_holdings() {
+        let mut p = Position::new(
+            "m".into(),
+            Decimal::new(48, 2),
+            Decimal::ZERO,
+            Decimal::ONE,
+            ExitStrategy::ExitOnCorrection,
+        );
+        p.mark_stalled();
+        assert!(!p.requeue_stalled_for_exit());
+        assert_eq!(p.state, PositionState::Stalled);
+
+        p.held_yes_qty = Decimal::ONE;
+        assert!(p.requeue_stalled_for_exit());
+        assert_eq!(p.state, PositionState::ExitReady);
+        assert_eq!(p.pre_stall_state, None);
+    }
 
     #[test]
     fn test_position_lifecycle() {

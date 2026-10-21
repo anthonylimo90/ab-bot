@@ -69,16 +69,33 @@ fn position() -> Position {
 }
 
 async fn handler(pool: &PgPool) -> (ExitHandler, tokio::task::JoinHandle<()>) {
-    let app = axum::Router::new().route(
+    handler_with(
+        pool,
+        book_router(serde_json::json!([{"price":"0.5","size":"1000"}])),
+    )
+    .await
+}
+
+fn book_router(bids: serde_json::Value) -> axum::Router {
+    axum::Router::new().route(
         "/book",
-        axum::routing::get(|| async {
-            axum::Json(serde_json::json!({
-                "market":"market","asset_id":"yes","timestamp":"2026-10-20T00:00:00Z",
-                "bids":[{"price":"0.5","size":"1000"}],
-                "asks":[{"price":"0.6","size":"1000"}]
-            }))
+        axum::routing::get(move || {
+            let bids = bids.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "market":"market","asset_id":"yes","timestamp":"2026-10-20T00:00:00Z",
+                    "bids": bids,
+                    "asks":[{"price":"0.6","size":"1000"}]
+                }))
+            }
         }),
-    );
+    )
+}
+
+async fn handler_with(
+    pool: &PgPool,
+    app: axum::Router,
+) -> (ExitHandler, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -492,4 +509,176 @@ async fn share_fee_resolution_uses_actual_unequal_leg_basis_without_a_second_fee
         )
         .await
         .is_err());
+}
+
+fn paper_exit_ready(held_yes: Decimal) -> Position {
+    let mut p = position();
+    p.execution_mode = "paper".into();
+    p.held_yes_qty = held_yes;
+    p.quantity = held_yes;
+    p.state = PositionState::ExitReady;
+    p
+}
+
+#[sqlx::test(migrations = false)]
+async fn exit_sells_whole_lots_and_writes_off_unsellable_dust(pool: PgPool) {
+    let service = setup(&pool).await;
+    // A $25 market buy at 0.48 leaves fractional shares.
+    let mut p = paper_exit_ready("52.0833".parse().unwrap());
+    service.repo().insert(&p).await.unwrap();
+    let (handler, server) = handler(&pool).await;
+
+    handler.execute_exit(&mut p).await.unwrap();
+
+    let stored = service.load(p.id).await.unwrap();
+    assert_eq!(
+        stored.state,
+        PositionState::Closed,
+        "{:?}",
+        stored.failure_reason
+    );
+    assert_eq!(stored.held_yes_qty, Decimal::ZERO);
+    assert_eq!(stored.exited_yes_qty, "52.0833".parse::<Decimal>().unwrap());
+    // Only 52.08 shares were sold at 0.50; the 0.0033 remainder earned nothing.
+    let proceeds = stored.yes_exit_price.unwrap() * stored.exited_yes_qty;
+    assert_eq!(proceeds.round_dp(8), "26.04".parse::<Decimal>().unwrap());
+    assert_eq!(handler.order_executor.metrics().orders_submitted, 1);
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn exit_walks_thin_bids_within_slippage(pool: PgPool) {
+    let service = setup(&pool).await;
+    let mut p = paper_exit_ready(Decimal::from(500));
+    service.repo().insert(&p).await.unwrap();
+    // Worst-first, as the exchange sends them; the best level alone is too small.
+    let (handler, server) = handler_with(
+        &pool,
+        book_router(serde_json::json!([
+            {"price":"0.40","size":"1000"},
+            {"price":"0.499","size":"300"},
+            {"price":"0.50","size":"300"}
+        ])),
+    )
+    .await;
+
+    handler.execute_exit(&mut p).await.unwrap();
+
+    let stored = service.load(p.id).await.unwrap();
+    assert_eq!(
+        stored.state,
+        PositionState::Closed,
+        "{:?}",
+        stored.failure_reason
+    );
+    // 300 @ 0.50 + 200 @ 0.499; the 0.40 level is beyond the 1% tolerance.
+    assert_eq!(stored.yes_exit_price, Some("0.4996".parse().unwrap()));
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn exit_without_liquidity_inside_slippage_fails_and_keeps_shares(pool: PgPool) {
+    let service = setup(&pool).await;
+    let mut p = paper_exit_ready(Decimal::from(500));
+    service.repo().insert(&p).await.unwrap();
+    let (handler, server) = handler_with(
+        &pool,
+        book_router(serde_json::json!([
+            {"price":"0.40","size":"1000"},
+            {"price":"0.50","size":"100"}
+        ])),
+    )
+    .await;
+
+    handler.execute_exit(&mut p).await.unwrap();
+
+    let stored = service.load(p.id).await.unwrap();
+    assert_eq!(stored.state, PositionState::ExitFailed);
+    assert_eq!(stored.held_yes_qty, Decimal::from(500));
+    assert_eq!(stored.retry_count, 1);
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn failed_exits_keep_retrying_at_a_slowing_pace(pool: PgPool) {
+    let service = setup(&pool).await;
+    let (handler, server) = handler(&pool).await;
+    let cfg = ExitHandlerConfig::default();
+
+    let mut exhausted = paper_exit_ready(Decimal::TEN);
+    exhausted.state = PositionState::ExitFailed;
+    exhausted.retry_count = 7;
+    service.repo().insert(&exhausted).await.unwrap();
+    let mut recent = paper_exit_ready(Decimal::TEN);
+    recent.state = PositionState::ExitFailed;
+    recent.retry_count = 2;
+    service.repo().insert(&recent).await.unwrap();
+    sqlx::query("UPDATE positions SET last_updated = NOW() - INTERVAL '2 hours' WHERE id = $1")
+        .bind(exhausted.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE positions SET last_updated = NOW() - INTERVAL '6 minutes' WHERE id = $1")
+        .bind(recent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    handler.process_failed_exits(&cfg).await.unwrap();
+
+    // Past the old three-attempt cap, an hour-old failure is retried again...
+    assert_eq!(
+        service.load(exhausted.id).await.unwrap().state,
+        PositionState::ExitReady
+    );
+    // ...while the second failure waits for its doubled (10 minute) backoff.
+    assert_eq!(
+        service.load(recent.id).await.unwrap().state,
+        PositionState::ExitFailed
+    );
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn resolution_settles_failed_exits_in_named_outcome_markets(pool: PgPool) {
+    let service = setup(&pool).await;
+    let mut p = paper_exit_ready(Decimal::TEN);
+    p.state = PositionState::ExitFailed;
+    p.retry_count = 9;
+    service.repo().insert(&p).await.unwrap();
+
+    let app = book_router(serde_json::json!([])).route(
+        "/markets/:id",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "condition_id": "market",
+                "question": "Who wins?",
+                "closed": true,
+                "tokens": [
+                    {"token_id": "no", "outcome": "Lakers", "winner": true},
+                    {"token_id": "yes", "outcome": "Celtics", "winner": false}
+                ]
+            }))
+        }),
+    );
+    let (handler, server) = handler_with(&pool, app).await;
+
+    handler.check_market_resolutions().await.unwrap();
+
+    let stored = service.load(p.id).await.unwrap();
+    assert_eq!(stored.state, PositionState::Closed);
+    assert_eq!(stored.resolution_winner.as_deref(), Some("no"));
+    assert_eq!(stored.held_yes_qty, Decimal::ZERO);
+    assert!(stored.realized_pnl.unwrap() < Decimal::ZERO);
+    server.abort();
+}
+
+#[test]
+fn failed_exit_retry_delay_doubles_and_caps() {
+    assert_eq!(failed_exit_retry_delay_secs(300, 1), 300);
+    assert_eq!(failed_exit_retry_delay_secs(300, 2), 600);
+    assert_eq!(failed_exit_retry_delay_secs(300, 3), 1200);
+    assert_eq!(failed_exit_retry_delay_secs(300, 5), 3600);
+    assert_eq!(failed_exit_retry_delay_secs(300, 40), 3600);
+    assert_eq!(failed_exit_retry_delay_secs(7200, 3), 7200);
 }

@@ -200,30 +200,45 @@ pub async fn run_recovery(
         .await
         .map_err(map_anyhow)?
     {
-        match position.state {
-            PositionState::ExitFailed => {
-                if should_requeue_exit_failure(position.failure_reason.as_ref()) {
-                    let recovered = state
-                        .position_service
-                        .attempt_exit_recovery(&mut position, &ctx)
-                        .await
-                        .map_err(map_anyhow)?;
-                    if recovered {
-                        safe_exit_failures_requeued += 1;
-                    }
-                }
-            }
-            PositionState::Stalled => {
-                let recovered = state
+        // One failing row must not abandon the rest of the recovery run.
+        let outcome = match position.state {
+            PositionState::ExitFailed
+                if should_requeue_exit_failure(position.failure_reason.as_ref()) =>
+            {
+                state
                     .position_service
-                    .attempt_stalled_recovery(&mut position, &ctx)
+                    .attempt_exit_recovery(&mut position, &ctx)
                     .await
-                    .map_err(map_anyhow)?;
-                if recovered.is_some() {
-                    stalled_positions_reopened += 1;
-                }
+                    .map(|recovered| {
+                        if recovered {
+                            safe_exit_failures_requeued += 1;
+                        }
+                    })
             }
-            _ => {}
+            // Held shares go straight to the exit queue; reopening a stalled
+            // row by heuristic could strand them in an entry state.
+            PositionState::Stalled if position.has_open_exposure() => state
+                .position_service
+                .requeue_stalled_for_exit(&mut position, &ctx)
+                .await
+                .map(|requeued| {
+                    if requeued {
+                        stalled_positions_reopened += 1;
+                    }
+                }),
+            PositionState::Stalled => state
+                .position_service
+                .attempt_stalled_recovery(&mut position, &ctx)
+                .await
+                .map(|recovered| {
+                    if recovered.is_some() {
+                        stalled_positions_reopened += 1;
+                    }
+                }),
+            _ => Ok(()),
+        };
+        if let Err(error) = outcome {
+            tracing::warn!(position_id = %position.id, %error, "Recovery skipped position");
         }
     }
 

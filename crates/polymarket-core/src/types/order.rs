@@ -5,6 +5,23 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Decimal places the exchange accepts for the share amount of a market sell.
+pub const MARKET_SELL_SHARE_DECIMALS: u32 = 2;
+
+/// Smallest share quantity a market sell can carry; anything below it cannot
+/// be sold and only pays out at resolution.
+pub const MIN_SELLABLE_SHARES: Decimal = Decimal::from_parts(1, 0, 0, false, 2);
+
+/// Floors a share quantity to what a market sell can actually carry.
+pub fn sellable_shares(quantity: Decimal) -> Decimal {
+    quantity
+        .round_dp_with_strategy(
+            MARKET_SELL_SHARE_DECIMALS,
+            rust_decimal::RoundingStrategy::ToZero,
+        )
+        .max(Decimal::ZERO)
+}
+
 /// Side of the order (buy or sell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -352,6 +369,17 @@ impl ArbOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sellable_shares_floor_to_whole_hundredths() {
+        assert_eq!(
+            sellable_shares("52.0833".parse().unwrap()),
+            "52.08".parse().unwrap()
+        );
+        assert_eq!(sellable_shares("0.0099".parse().unwrap()), Decimal::ZERO);
+        assert_eq!(sellable_shares(Decimal::new(-1, 0)), Decimal::ZERO);
+        assert_eq!(sellable_shares(MIN_SELLABLE_SHARES), MIN_SELLABLE_SHARES);
+    }
 
     #[test]
     fn test_market_order_creation() {

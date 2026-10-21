@@ -76,6 +76,14 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Execution price of a market order.
+struct MarketExecutionPrice {
+    /// Worst price the order may fill at; signed as the FOK limit.
+    limit: Decimal,
+    /// Expected average fill price across the levels it consumes.
+    average: Decimal,
+}
+
 /// Result of a retry operation.
 #[derive(Debug, Clone)]
 pub enum RetryOutcome<T> {
@@ -896,6 +904,87 @@ impl OrderExecutor {
         )
     }
 
+    /// Prices a market order: the limit to sign and the expected average fill.
+    #[allow(clippy::result_large_err)] // ExecutionReport is a rich domain value, not a simple error
+    fn price_market_order(
+        &self,
+        order: &MarketOrder,
+        book: &OrderBook,
+    ) -> std::result::Result<MarketExecutionPrice, ExecutionReport> {
+        if order.side == OrderSide::Sell {
+            return self.price_market_sell(order, book);
+        }
+        let (price, available_size) = self.best_level_for_order(order, book)?;
+        if let Some(report) = self.validate_market_order_at_best_level(order, price, available_size)
+        {
+            return Err(report);
+        }
+        Ok(MarketExecutionPrice {
+            limit: price,
+            average: price,
+        })
+    }
+
+    /// Exits must be able to leave thin books, so entry depth gates do not
+    /// apply to sells. A sell walks the bids down to the price that covers its
+    /// whole quantity, staying within the slippage tolerance of the best bid
+    /// (and of the expected price, when given), and signs that floor as its
+    /// FOK limit; resting bids at or above it fill at their own prices.
+    #[allow(clippy::result_large_err)] // ExecutionReport is a rich domain value, not a simple error
+    fn price_market_sell(
+        &self,
+        order: &MarketOrder,
+        book: &OrderBook,
+    ) -> std::result::Result<MarketExecutionPrice, ExecutionReport> {
+        let mut bids: Vec<&polymarket_core::types::PriceLevel> = book.bids.iter().collect();
+        bids.sort_by_key(|level| std::cmp::Reverse(level.price));
+        let Some(best) = bids.first().map(|level| level.price) else {
+            return Err(self.reject_market_order(order, "No bids available"));
+        };
+        if order.quantity <= Decimal::ZERO {
+            return Err(self.reject_market_order(order, "Sell quantity must be positive"));
+        }
+
+        let tolerance = order
+            .max_slippage
+            .unwrap_or(self.config.default_slippage)
+            .max(Decimal::ZERO);
+        let mut floor = best * (Decimal::ONE - tolerance);
+        if order.expected_price > Decimal::ZERO {
+            floor = floor.max(order.expected_price * (Decimal::ONE - tolerance));
+        }
+
+        let mut remaining = order.quantity;
+        let mut proceeds = Decimal::ZERO;
+        let mut limit = best;
+        for level in bids {
+            if level.price < floor || remaining.is_zero() {
+                break;
+            }
+            let take = remaining.min(level.size);
+            proceeds += take * level.price;
+            remaining -= take;
+            limit = level.price;
+        }
+        if remaining > Decimal::ZERO {
+            return Err(self.reject_market_order(
+                order,
+                format!(
+                    "Insufficient bid liquidity: {} of {} shares available within {} of best bid {}",
+                    order.quantity - remaining,
+                    order.quantity,
+                    tolerance,
+                    best
+                ),
+            ));
+        }
+
+        Ok(MarketExecutionPrice {
+            limit,
+            average: proceeds / order.quantity,
+        })
+    }
+
     #[allow(clippy::result_large_err)] // ExecutionReport is a rich domain value, not a simple error
     fn best_level_for_order(
         &self,
@@ -999,16 +1088,11 @@ impl OrderExecutor {
             anyhow::bail!("Position wallet changed before submission");
         }
 
-        // Get the best price from orderbook
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
-        let (price, available_size) = match self.best_level_for_order(order, &book) {
-            Ok(level) => level,
+        let price = match self.price_market_order(order, &book) {
+            Ok(execution) => execution.limit,
             Err(report) => return Ok(report),
         };
-        if let Some(report) = self.validate_market_order_at_best_level(order, price, available_size)
-        {
-            return Ok(report);
-        }
 
         // Convert order side to signing order side
         let signing_side = match order.side {
@@ -1232,14 +1316,10 @@ impl OrderExecutor {
     async fn simulate_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
         // Paper trading simulation - fetch real orderbook prices
         let book = self.clob_client.get_order_book(&order.outcome_id).await?;
-        let (price, available_size) = match self.best_level_for_order(order, &book) {
-            Ok(level) => level,
+        let price = match self.price_market_order(order, &book) {
+            Ok(execution) => execution.average,
             Err(report) => return Ok(report),
         };
-        if let Some(report) = self.validate_market_order_at_best_level(order, price, available_size)
-        {
-            return Ok(report);
-        }
 
         let fees = order.quantity * price * self.config.fee_rate;
 
@@ -1393,6 +1473,78 @@ impl Clone for ExecutionMetrics {
 mod tests {
     use super::*;
     use polymarket_core::api::ClobClient;
+
+    fn book(bids: &[(&str, &str)], asks: &[(&str, &str)]) -> OrderBook {
+        let level = |(price, size): &(&str, &str)| polymarket_core::types::PriceLevel {
+            price: price.parse().unwrap(),
+            size: size.parse().unwrap(),
+        };
+        OrderBook {
+            market_id: "m".into(),
+            outcome_id: "t".into(),
+            timestamp: chrono::Utc::now(),
+            bids: bids.iter().map(level).collect(),
+            asks: asks.iter().map(level).collect(),
+        }
+    }
+
+    fn executor() -> OrderExecutor {
+        OrderExecutor::new(
+            Arc::new(ClobClient::new(None, None)),
+            ExecutorConfig::default(),
+        )
+    }
+
+    fn sell(quantity: &str) -> MarketOrder {
+        MarketOrder::new(
+            "m".into(),
+            "t".into(),
+            OrderSide::Sell,
+            quantity.parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn market_sell_walks_bids_to_cover_its_quantity() {
+        let executor = executor();
+        // Worst-first, small best level, no $100 best-level notional.
+        let book = book(&[("0.40", "1000"), ("0.495", "50"), ("0.50", "60")], &[]);
+
+        let priced = executor
+            .price_market_order(&sell("100"), &book)
+            .ok()
+            .unwrap();
+        assert_eq!(priced.limit, Decimal::new(495, 3));
+        assert_eq!(priced.average, Decimal::new(498, 3));
+    }
+
+    #[test]
+    fn market_sell_rejects_liquidity_beyond_slippage() {
+        let executor = executor();
+        let book = book(&[("0.40", "1000"), ("0.50", "60")], &[]);
+        assert!(executor.price_market_order(&sell("100"), &book).is_err());
+
+        // A wider tolerance reaches the deeper level.
+        let wide = sell("100").with_slippage(Decimal::new(25, 2));
+        let priced = executor.price_market_order(&wide, &book).ok().unwrap();
+        assert_eq!(priced.limit, Decimal::new(40, 2));
+
+        // The expected price bounds the floor too.
+        let anchored = wide.with_expected_price(Decimal::new(60, 2));
+        assert!(executor.price_market_order(&anchored, &book).is_err());
+    }
+
+    #[test]
+    fn market_buy_keeps_best_level_depth_gates() {
+        let executor = executor();
+        let thin = book(&[], &[("0.99", "1000"), ("0.50", "10")]);
+        let buy = MarketOrder::new("m".into(), "t".into(), OrderSide::Buy, Decimal::from(5));
+        assert!(executor.price_market_order(&buy, &thin).is_err());
+
+        let deep = book(&[], &[("0.99", "1000"), ("0.50", "1000")]);
+        let priced = executor.price_market_order(&buy, &deep).ok().unwrap();
+        assert_eq!(priced.limit, Decimal::new(50, 2));
+    }
 
     #[test]
     fn accepted_limit_orders_need_confirmed_amounts_before_reporting_fills() {

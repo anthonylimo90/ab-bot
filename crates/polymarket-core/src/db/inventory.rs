@@ -168,7 +168,8 @@ impl WalletInventoryRepository {
                 updated_at
             FROM wallet_inventory
             WHERE LOWER(wallet_address) = LOWER($1)
-              AND quantity > 0
+              -- Balances under one sellable lot (0.01 shares) cannot be sold.
+              AND quantity >= 0.01
               AND is_orphan = TRUE
               AND NOT EXISTS (SELECT 1 FROM manual_inventory mi
                   WHERE mi.execution_mode='live' AND mi.wallet_address=LOWER(wallet_inventory.wallet_address)

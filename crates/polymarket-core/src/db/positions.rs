@@ -519,6 +519,31 @@ impl PositionRepository {
         Ok(rows.iter().map(Self::row_to_position).collect())
     }
 
+    /// Positions still holding shares that a market resolution would settle:
+    /// Open, ExitReady, ExitFailed and Stalled rows of any exit strategy.
+    /// Pending and Closing rows have orders in flight and are excluded.
+    pub async fn get_resolution_candidates(&self) -> Result<Vec<Position>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, market_id, yes_entry_price, no_entry_price, quantity,
+                entry_timestamp, exit_strategy, state, unrealized_pnl,
+                realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
+                failure_reason, retry_count, last_updated, fee_model,
+                resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
+            FROM positions
+            WHERE state IN (1, 2, 6, 7)
+              AND (held_yes_qty > 0 OR held_no_qty > 0)
+            ORDER BY entry_timestamp ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_position).collect())
+    }
+
     /// Get open ExitOnCorrection positions that still need exit evaluation.
     pub async fn get_open_exit_candidates(&self) -> Result<Vec<ExitCandidate>> {
         let rows = sqlx::query(

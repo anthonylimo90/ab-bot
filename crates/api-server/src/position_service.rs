@@ -422,6 +422,8 @@ impl PositionService {
         );
         *held -= fill_qty;
         *exited += fill_qty;
+        // A confirmed sale is progress: retry pacing restarts from the first step.
+        position.retry_count = 0;
         position.last_updated = chrono::Utc::now();
 
         if let Some(id) = receipt {
@@ -452,6 +454,37 @@ impl PositionService {
             )
             .await;
 
+        Ok(())
+    }
+
+    /// Writes off per-leg remainders too small to sell (see
+    /// [`Position::write_off_unsellable_dust`]). Records "exit_dust_written_off".
+    pub async fn write_off_unsellable_dust(
+        &self,
+        position: &mut Position,
+        ctx: &EventContext,
+    ) -> anyhow::Result<()> {
+        let (yes, no) = position.write_off_unsellable_dust();
+        if yes.is_zero() && no.is_zero() {
+            return Ok(());
+        }
+        self.repo.update(position).await?;
+        self.events
+            .record_warn(
+                NewTradeEvent::new(
+                    &ctx.strategy,
+                    &ctx.execution_mode,
+                    &ctx.source_label,
+                    &position.market_id,
+                    "exit_dust_written_off",
+                )
+                .with_position(position.id)
+                .with_metadata(serde_json::json!({
+                    "yes_qty": yes.to_string(),
+                    "no_qty": no.to_string(),
+                })),
+            )
+            .await;
         Ok(())
     }
 
@@ -632,15 +665,15 @@ impl PositionService {
         Ok(())
     }
 
-    /// ExitFailed → ExitReady (if retry count permits).
-    /// Records "exit_recovery_requeued" event.
-    /// Returns true if recovery was applied, false if max retries exceeded.
+    /// ExitFailed → ExitReady. Records "exit_recovery_requeued" event.
+    /// Returns false when the position is not in ExitFailed. Retries are never
+    /// exhausted while shares are held; callers pace them.
     pub async fn attempt_exit_recovery(
         &self,
         position: &mut Position,
         ctx: &EventContext,
     ) -> anyhow::Result<bool> {
-        let recovered = position.attempt_exit_recovery();
+        let recovered = position.requeue_failed_exit();
         if !recovered {
             return Ok(false);
         }
@@ -667,6 +700,42 @@ impl PositionService {
             )
             .await;
 
+        Ok(true)
+    }
+
+    /// Stalled → ExitReady for a stalled position that still holds shares.
+    /// Records "stall_requeued_for_exit". Returns false without any change
+    /// otherwise.
+    pub async fn requeue_stalled_for_exit(
+        &self,
+        position: &mut Position,
+        ctx: &EventContext,
+    ) -> anyhow::Result<bool> {
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
+        if !position.requeue_stalled_for_exit() {
+            return Ok(false);
+        }
+        self.repo
+            .update(position)
+            .await
+            .map_err(|e| anyhow!("update after stalled requeue: {}", e))?;
+        self.events
+            .record_warn(
+                NewTradeEvent::new(
+                    &ctx.strategy,
+                    &ctx.execution_mode,
+                    &ctx.source_label,
+                    &position.market_id,
+                    "stall_requeued_for_exit",
+                )
+                .with_position(position.id)
+                .with_state(Some("stalled"), Some("exit_ready")),
+            )
+            .await;
         Ok(true)
     }
 

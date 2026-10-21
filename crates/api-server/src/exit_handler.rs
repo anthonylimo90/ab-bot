@@ -13,7 +13,9 @@ use polymarket_core::api::ClobClient;
 use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE, SOURCE_RECOMMENDATION};
 use polymarket_core::error::Error as PolymarketError;
 use polymarket_core::types::signal::{QuantSignalKind, SignalDirection};
-use polymarket_core::types::{FailureReason, Market, MarketOrder, OrderSide, Position};
+use polymarket_core::types::{
+    sellable_shares, FailureReason, Market, MarketOrder, OrderSide, Position,
+};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -266,49 +268,65 @@ impl ExitHandler {
 
         debug!(count = candidates.len(), "Evaluating open exit candidates");
 
-        let fee = Decimal::new(2, 2);
         for candidate in &mut candidates {
             self.touch_heartbeat();
-            let quant_ctx = quant_contexts.get(&candidate.position.id);
-            let (yes_bid, no_bid) = match self.current_exit_bids(&candidate.position).await? {
-                ExitBidStatus::Available(yes_bid, no_bid) => (yes_bid, no_bid),
-                ExitBidStatus::Resolved => {
-                    let _ = self
-                        .close_open_position_via_resolution(
-                            &mut candidate.position,
-                            candidate.source,
-                            quant_ctx,
-                        )
-                        .await?;
-                    continue;
-                }
-                ExitBidStatus::Unavailable => continue,
-            };
+            let position_id = candidate.position.id;
+            // One failing row (e.g. a stale version written by another worker)
+            // must not starve every later candidate of exit evaluation.
+            if let Err(error) = self
+                .evaluate_open_candidate(candidate, quant_contexts.get(&position_id), cfg)
+                .await
+            {
+                warn!(%position_id, %error, "Failed to evaluate open position for exit");
+            }
+        }
 
-            candidate.position.update_pnl(yes_bid, no_bid, fee);
-            self.position_repo.update(&mut candidate.position).await?;
+        Ok(())
+    }
 
-            if self
-                .should_mark_exit_ready(
-                    &candidate.position,
+    async fn evaluate_open_candidate(
+        &self,
+        candidate: &mut polymarket_core::db::positions::ExitCandidate,
+        quant_ctx: Option<&QuantExitContext>,
+        cfg: &ExitHandlerConfig,
+    ) -> anyhow::Result<()> {
+        let fee = Decimal::new(2, 2);
+        let (yes_bid, no_bid) = match self.current_exit_bids(&candidate.position).await? {
+            ExitBidStatus::Available(yes_bid, no_bid) => (yes_bid, no_bid),
+            ExitBidStatus::Resolved => {
+                self.close_open_position_via_resolution(
+                    &mut candidate.position,
                     candidate.source,
                     quant_ctx,
-                    yes_bid,
-                    no_bid,
-                    cfg,
                 )
-                .await?
+                .await?;
+                return Ok(());
+            }
+            ExitBidStatus::Unavailable => return Ok(()),
+        };
+
+        candidate.position.update_pnl(yes_bid, no_bid, fee);
+        self.position_repo.update(&mut candidate.position).await?;
+
+        if self
+            .should_mark_exit_ready(
+                &candidate.position,
+                candidate.source,
+                quant_ctx,
+                yes_bid,
+                no_bid,
+                cfg,
+            )
+            .await?
+        {
+            let execution_mode = self.current_execution_mode().await;
+            let ctx = Self::event_context(&execution_mode, candidate.source, quant_ctx);
+            if let Err(e) = self
+                .position_service
+                .mark_exit_ready(&mut candidate.position, "spread_normalized", &ctx)
+                .await
             {
-                let execution_mode = self.current_execution_mode().await;
-                let ctx = Self::event_context(&execution_mode, candidate.source, quant_ctx);
-                if let Err(e) = self
-                    .position_service
-                    .mark_exit_ready(&mut candidate.position, "spread_normalized", &ctx)
-                    .await
-                {
-                    warn!(error = %e, "Failed to mark exit ready");
-                    continue;
-                }
+                warn!(error = %e, "Failed to mark exit ready");
             }
         }
 
@@ -386,15 +404,19 @@ impl ExitHandler {
             }
         };
 
+        // Market sells carry whole hundredths of a share; a smaller remainder
+        // is written off below rather than retried forever.
         let (has_yes, has_no) = held_outcomes(position);
-        if has_yes {
+        let yes_qty = sellable_shares(position.held_yes_qty);
+        let no_qty = sellable_shares(position.held_no_qty);
+        if has_yes && yes_qty > Decimal::ZERO {
             let yes_report = match self
                 .execute_sell_order_with_refresh(
                     &market_id,
                     "YES",
                     &yes_token_id,
                     OrderSide::Sell,
-                    position.held_yes_qty,
+                    yes_qty,
                     position,
                 )
                 .await
@@ -481,14 +503,14 @@ impl ExitHandler {
             }
         }
 
-        if has_no {
+        if has_no && no_qty > Decimal::ZERO {
             let no_report = match self
                 .execute_sell_order_with_refresh(
                     &market_id,
                     "NO",
                     &no_token_id,
                     OrderSide::Sell,
-                    position.held_no_qty,
+                    no_qty,
                     position,
                 )
                 .await
@@ -573,6 +595,14 @@ impl ExitHandler {
 
         let fee = Decimal::new(2, 2); // 2%
 
+        if let Err(error) = self
+            .position_service
+            .write_off_unsellable_dust(position, &ctx)
+            .await
+        {
+            warn!(position_id = %position.id, %error, "Failed to write off unsellable dust");
+            return Ok(());
+        }
         if position.has_open_exposure() {
             self.position_service
                 .mark_exit_failed(
@@ -688,7 +718,9 @@ impl ExitHandler {
             .get_order_book(token_id)
             .await
         {
-            Ok(book) => Ok(Some(book.best_bid().unwrap_or(Decimal::ZERO))),
+            // An empty bid side is no price at all, not a zero mark that
+            // would read as a total loss and trigger a stop-loss exit.
+            Ok(book) => Ok(book.best_bid()),
             Err(polymarket_core::error::Error::Api {
                 status: Some(404), ..
             }) => {
@@ -838,8 +870,16 @@ impl ExitHandler {
             return Ok(false);
         }
 
-        self.finalize_resolution_close(position, source, quant_ctx, resolved_yes_winner(&market))
+        let yes_winner = self.resolved_yes_winner(&market).await;
+        self.finalize_resolution_close(position, source, quant_ctx, yes_winner)
             .await
+    }
+
+    /// Winner of a resolved market from the YES leg's point of view, matched
+    /// by the token ids positions trade (see [`resolved_yes_winner_for_tokens`]).
+    async fn resolved_yes_winner(&self, market: &Market) -> Option<bool> {
+        let tokens = self.resolve_market_tokens(&market.id).await.ok().flatten();
+        resolved_yes_winner_for_tokens(market, tokens.as_ref())
     }
 
     async fn resolve_market_tokens(
@@ -1099,9 +1139,10 @@ impl ExitHandler {
         Ok(strategy_exit)
     }
 
-    /// Check for HoldToResolution positions whose markets have resolved.
+    /// Settle every position still holding shares in a resolved market,
+    /// including exits that failed or stalled, whatever their exit strategy.
     async fn check_market_resolutions(&self) -> anyhow::Result<()> {
-        let positions = self.position_repo.get_hold_to_resolution().await?;
+        let positions = self.position_repo.get_resolution_candidates().await?;
         if positions.is_empty() {
             return Ok(());
         }
@@ -1116,7 +1157,8 @@ impl ExitHandler {
             self.touch_heartbeat();
             match self.clob_client.get_market_by_id(market_id).await {
                 Ok(market) if market.resolved => {
-                    resolved_markets.insert(market_id.clone(), resolved_yes_winner(&market));
+                    let yes_winner = self.resolved_yes_winner(&market).await;
+                    resolved_markets.insert(market_id.clone(), yes_winner);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -1141,11 +1183,21 @@ impl ExitHandler {
                 continue;
             };
 
-            let closed = self
-                .finalize_resolution_close(&mut position, SOURCE_ARBITRAGE, None, yes_winner)
-                .await?;
-            if !closed {
-                continue;
+            let quant_ctx = self
+                .load_quant_exit_context(position.id)
+                .await
+                .ok()
+                .flatten();
+            let source = if quant_ctx.is_some() {
+                SOURCE_RECOMMENDATION
+            } else {
+                SOURCE_ARBITRAGE
+            };
+            if let Err(error) = self
+                .finalize_resolution_close(&mut position, source, quant_ctx.as_ref(), yes_winner)
+                .await
+            {
+                warn!(position_id = %position.id, %error, "Failed to settle resolved position");
             }
         }
 
@@ -1270,7 +1322,8 @@ impl ExitHandler {
         } else {
             SOURCE_ARBITRAGE
         };
-        self.finalize_resolution_close(position, source, quant_ctx, resolved_yes_winner(&market))
+        let yes_winner = self.resolved_yes_winner(&market).await;
+        self.finalize_resolution_close(position, source, quant_ctx, yes_winner)
             .await
     }
 
@@ -1386,7 +1439,12 @@ impl ExitHandler {
         for mut position in positions {
             self.touch_heartbeat();
             let age_secs = position.age_secs();
-            if age_secs < cfg.failed_exit_retry_backoff_secs {
+            if age_secs
+                < failed_exit_retry_delay_secs(
+                    cfg.failed_exit_retry_backoff_secs,
+                    position.retry_count,
+                )
+            {
                 continue;
             }
 
@@ -1434,6 +1492,17 @@ impl ExitHandler {
         };
         let _ = self.signal_tx.send(signal);
     }
+}
+
+/// Delay before retrying a failed exit: the configured backoff, doubling with
+/// each consecutive failure, capped at an hour (or the backoff if longer).
+/// Held shares are never abandoned; they keep being retried at this pace and
+/// are closed by the resolution sweep once the market resolves.
+fn failed_exit_retry_delay_secs(base_secs: u64, consecutive_failures: u32) -> u64 {
+    let doublings = consecutive_failures.saturating_sub(1).min(16);
+    base_secs
+        .saturating_mul(1u64 << doublings)
+        .min(base_secs.max(3600))
 }
 
 fn parse_quant_kind(kind: &str) -> Option<QuantSignalKind> {
@@ -1792,6 +1861,29 @@ mod tests {
 
 fn held_outcomes(position: &Position) -> (bool, bool) {
     position.held_outcomes()
+}
+
+/// Winner of a resolved market from the YES leg's point of view. The YES leg
+/// is the token the token cache maps as YES, so markets whose outcomes are
+/// named (not "Yes"/"No") resolve too; outcome names are only a fallback.
+fn resolved_yes_winner_for_tokens(
+    market: &Market,
+    tokens: Option<&(String, String)>,
+) -> Option<bool> {
+    if let Some((yes_token, no_token)) = tokens {
+        for outcome in &market.outcomes {
+            let Some(winner) = outcome.winner else {
+                continue;
+            };
+            if outcome.token_id == *yes_token {
+                return Some(winner);
+            }
+            if outcome.token_id == *no_token {
+                return Some(!winner);
+            }
+        }
+    }
+    resolved_yes_winner(market)
 }
 
 fn resolved_yes_winner(market: &Market) -> Option<bool> {
