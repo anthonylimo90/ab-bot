@@ -6,6 +6,10 @@ use rust_decimal::Decimal;
 use sqlx::{FromRow, PgPool, QueryBuilder};
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "inventory/tests.rs"]
+mod tests;
+
 /// Repository for reconciled wallet inventory rows.
 pub struct WalletInventoryRepository {
     pool: PgPool,
@@ -166,6 +170,16 @@ impl WalletInventoryRepository {
             WHERE LOWER(wallet_address) = LOWER($1)
               AND quantity > 0
               AND is_orphan = TRUE
+              AND NOT EXISTS (SELECT 1 FROM manual_inventory mi
+                  WHERE mi.execution_mode='live' AND mi.wallet_address=LOWER(wallet_inventory.wallet_address)
+                    AND mi.market_id=wallet_inventory.condition_id AND mi.outcome=wallet_inventory.outcome AND mi.quantity>0)
+              AND NOT EXISTS (SELECT 1 FROM orders o
+                  WHERE o.execution_mode='live' AND o.status IN ('pending','open','partially_filled')
+                    AND (LOWER(o.wallet_address)=LOWER(wallet_inventory.wallet_address) OR o.wallet_address IS NULL)
+                    AND o.market_id=wallet_inventory.condition_id AND o.outcome=wallet_inventory.outcome)
+              AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.market_id=wallet_inventory.condition_id
+                  AND p.execution_mode<>'paper' AND (LOWER(p.wallet_address)=LOWER(wallet_inventory.wallet_address) OR p.execution_mode='unknown')
+                  AND (p.state=0 OR (wallet_inventory.outcome='yes' AND p.held_yes_qty>0) OR (wallet_inventory.outcome='no' AND p.held_no_qty>0)))
               AND (
                     last_exit_attempted_at IS NULL
                     OR last_exit_attempted_at <= NOW() - ($2 * INTERVAL '1 second')
@@ -235,6 +249,7 @@ impl WalletInventoryRepository {
         // PostgreSQL parameter limit is 65535; each row uses 16 params → max ~4096
         // rows per batch. A typical wallet has 5–50 tokens so one batch suffices.
         const BATCH_SIZE: usize = 500;
+        let mut tx = self.pool.begin().await?;
         for chunk in entries.chunks(BATCH_SIZE) {
             let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
                 "INSERT INTO wallet_inventory (\
@@ -284,9 +299,9 @@ impl WalletInventoryRepository {
                     updated_at             = NOW()",
             );
 
-            qb.build().execute(&self.pool).await?;
+            qb.build().execute(&mut *tx).await?;
         }
-
+        tx.commit().await?;
         Ok(())
     }
 

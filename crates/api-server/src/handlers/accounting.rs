@@ -325,17 +325,7 @@ pub async fn get_account_history(
         })
         .collect();
 
-    if equity_curve.is_empty() {
-        equity_curve.push(AccountEquityPointResponse {
-            snapshot_time: summary.snapshot_time,
-            cash_balance: summary.cash_balance,
-            position_value: summary.position_value,
-            total_equity: summary.total_equity,
-            unrealized_pnl: summary.unrealized_pnl,
-            realized_pnl_24h: summary.realized_pnl_24h,
-            net_cash_flows_24h: summary.net_cash_flows_24h,
-        });
-    } else if equity_curve
+    if equity_curve
         .last()
         .map(|point| point.snapshot_time < summary.snapshot_time)
         .unwrap_or(true)

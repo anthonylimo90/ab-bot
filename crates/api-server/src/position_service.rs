@@ -1,8 +1,8 @@
 //! Centralized service for all position state mutations.
 //!
-//! Every method follows the contract: load → validate → mutate → persist → record event → return.
-//! This eliminates scattered `position.mark_*() + repo.update() + event.record_warn()` calls
-//! across arb_executor, quant_signal_executor, exit_handler, and handlers.
+//! Mutations validate a caller snapshot and persist it with an optimistic version
+//! check. Stale writes fail and must be reloaded. Live fill receipts and inventory
+//! are committed atomically; analytics events are published after persistence.
 
 use anyhow::anyhow;
 use polymarket_core::db::positions::PositionRepository;
@@ -63,6 +63,7 @@ pub struct CreatePositionParams {
 /// Context fields for trade event recording.
 #[derive(Debug, Clone)]
 pub struct EventContext {
+    pub wallet_address: Option<String>,
     pub execution_mode: String,
     pub strategy: String,
     pub source_label: String,
@@ -72,13 +73,8 @@ pub struct EventContext {
 
 /// Centralized service for all position state mutations.
 ///
-/// Every public method:
-///   1. Loads the current position from the repository.
-///   2. Validates the state transition.
-///   3. Mutates the in-memory struct (including per-leg qty fields).
-///   4. Persists via PositionRepository.
-///   5. Records a trade event.
-///   6. Returns the updated Position.
+/// Callers pass a repository snapshot. Successful updates advance its version;
+/// failures require a reload before retrying. Receipt replay never reapplies a fill.
 #[derive(Clone)]
 pub struct PositionService {
     repo: Arc<PositionRepository>,
@@ -108,6 +104,17 @@ impl PositionService {
         ctx: &EventContext,
         metadata: serde_json::Value,
     ) -> anyhow::Result<Position> {
+        self.create_position_with_limit(params, ctx, metadata, None)
+            .await
+    }
+
+    pub async fn create_position_with_limit(
+        &self,
+        params: CreatePositionParams,
+        ctx: &EventContext,
+        metadata: serde_json::Value,
+        max_exposure: Option<Decimal>,
+    ) -> anyhow::Result<Position> {
         let mut position = Position::new(
             params.market_id.clone(),
             params.yes_entry_price,
@@ -116,12 +123,29 @@ impl PositionService {
             params.exit_strategy,
         );
 
+        if !matches!(ctx.execution_mode.as_str(), "paper" | "live")
+            || (ctx.execution_mode == "live" && ctx.wallet_address.is_none())
+        {
+            return Err(anyhow!("Position requires execution provenance"));
+        }
+        position.execution_mode = ctx.execution_mode.clone();
+        position.wallet_address = if ctx.execution_mode == "live" {
+            ctx.wallet_address.clone()
+        } else {
+            None
+        };
+
         if let Some(ref arb) = params.arb_opportunity {
             position.apply_arb_fee_model(arb);
         }
 
         self.repo
-            .insert_with_source(&position, params.source, params.source_signal_id)
+            .insert_with_source_and_limit(
+                &position,
+                params.source,
+                params.source_signal_id,
+                max_exposure,
+            )
             .await
             .map_err(|e| anyhow!("insert position: {}", e))?;
 
@@ -158,26 +182,35 @@ impl PositionService {
         fill_price: Decimal,
         fill_qty: Decimal,
         ctx: &EventContext,
+        receipt: Option<Uuid>,
     ) -> anyhow::Result<()> {
-        // Update canonical quantity from actual fill (handles both arb two-leg
-        // and quant single-leg entries — BuyNo would otherwise leave quantity stale).
-        position.quantity = fill_qty;
-
+        if fill_qty <= Decimal::ZERO || fill_price <= Decimal::ZERO {
+            return Err(anyhow!("Entry fill must have positive quantity and price"));
+        }
         match leg {
             Leg::Yes => {
-                position.yes_entry_price = fill_price;
+                position.yes_entry_price = (position.yes_entry_price * position.held_yes_qty
+                    + fill_price * fill_qty)
+                    / (position.held_yes_qty + fill_qty);
                 position.apply_yes_entry_fill(fill_qty);
             }
             Leg::No => {
-                position.no_entry_price = fill_price;
+                position.no_entry_price = (position.no_entry_price * position.held_no_qty
+                    + fill_price * fill_qty)
+                    / (position.held_no_qty + fill_qty);
                 position.apply_no_entry_fill(fill_qty);
             }
         }
 
-        self.repo
-            .update(position)
-            .await
-            .map_err(|e| anyhow!("update after entry fill: {}", e))?;
+        position.quantity = (position.held_yes_qty + position.exited_yes_qty)
+            .max(position.held_no_qty + position.exited_no_qty);
+        if let Some(id) = receipt {
+            self.repo
+                .update_with_receipt(position, id, fill_qty)
+                .await?;
+        } else {
+            self.repo.update(position).await?;
+        }
 
         self.events
             .record_warn(
@@ -244,6 +277,12 @@ impl PositionService {
         reason: FailureReason,
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
+
         let from = format!("{:?}", position.state).to_lowercase();
         let reason_str = format!("{:?}", reason);
         position.mark_entry_failed(reason);
@@ -312,6 +351,12 @@ impl PositionService {
         position: &mut Position,
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
+
         let from = format!("{:?}", position.state).to_lowercase();
         position
             .mark_closing()
@@ -343,8 +388,8 @@ impl PositionService {
 
     /// Record a single-leg exit fill.
     ///
-    /// Dual-writes: calls the legacy `record_*_exit_fill(price)` for PnL
-    /// compatibility AND the new `apply_*_exit_fill(qty)` for explicit tracking.
+    /// Accumulates a weighted exit price and moves only confirmed quantities
+    /// from held to exited. A partial exit leaves the remaining inventory intact.
     pub async fn record_exit_fill(
         &self,
         position: &mut Position,
@@ -352,45 +397,40 @@ impl PositionService {
         fill_price: Decimal,
         fill_qty: Decimal,
         ctx: &EventContext,
+        receipt: Option<Uuid>,
     ) -> anyhow::Result<()> {
-        // Pre-validate qty before mutating to prevent inconsistent dual-write:
-        // if record_*_exit_fill succeeds but apply_*_exit_fill would fail,
-        // the position would have yes_exit_price set but held_qty unchanged.
-        match leg {
-            Leg::Yes => {
-                if fill_qty > position.held_yes_qty {
-                    return Err(anyhow!(
-                        "YES exit fill {} exceeds held qty {}",
-                        fill_qty,
-                        position.held_yes_qty
-                    ));
-                }
-                position
-                    .record_yes_exit_fill(fill_price)
-                    .map_err(|e| anyhow!("record_yes_exit_fill: {}", e))?;
-                // Safe: pre-validated above
-                let _ = position.apply_yes_exit_fill(fill_qty);
-            }
-            Leg::No => {
-                if fill_qty > position.held_no_qty {
-                    return Err(anyhow!(
-                        "NO exit fill {} exceeds held qty {}",
-                        fill_qty,
-                        position.held_no_qty
-                    ));
-                }
-                position
-                    .record_no_exit_fill(fill_price)
-                    .map_err(|e| anyhow!("record_no_exit_fill: {}", e))?;
-                // Safe: pre-validated above
-                let _ = position.apply_no_exit_fill(fill_qty);
-            }
+        if fill_qty <= Decimal::ZERO || fill_price < Decimal::ZERO {
+            return Err(anyhow!("Invalid exit fill"));
         }
+        let (held, exited, price) = match leg {
+            Leg::Yes => (
+                &mut position.held_yes_qty,
+                &mut position.exited_yes_qty,
+                &mut position.yes_exit_price,
+            ),
+            Leg::No => (
+                &mut position.held_no_qty,
+                &mut position.exited_no_qty,
+                &mut position.no_exit_price,
+            ),
+        };
+        if fill_qty > *held {
+            return Err(anyhow!("Exit fill exceeds holdings"));
+        }
+        *price = Some(
+            (price.unwrap_or_default() * *exited + fill_price * fill_qty) / (*exited + fill_qty),
+        );
+        *held -= fill_qty;
+        *exited += fill_qty;
+        position.last_updated = chrono::Utc::now();
 
-        self.repo
-            .update(position)
-            .await
-            .map_err(|e| anyhow!("update after exit fill: {}", e))?;
+        if let Some(id) = receipt {
+            self.repo
+                .update_with_receipt(position, id, fill_qty)
+                .await?;
+        } else {
+            self.repo.update(position).await?;
+        }
 
         self.events
             .record_warn(
@@ -424,46 +464,107 @@ impl PositionService {
         method: CloseMethod,
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
-        let from = format!("{:?}", position.state).to_lowercase();
-        let event_type;
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
 
-        match method {
+        if matches!(
+            position.state,
+            PositionState::Closed | PositionState::EntryFailed
+        ) {
+            return Err(anyhow!("Cannot close a closed or entry-failed position"));
+        }
+        if position.held_yes_qty
+            + position.held_no_qty
+            + position.exited_yes_qty
+            + position.exited_no_qty
+            <= Decimal::ZERO
+        {
+            return Err(anyhow!(
+                "Cannot close a position without confirmed inventory"
+            ));
+        }
+        let from = format!("{:?}", position.state).to_lowercase();
+
+        let event_type = match method {
             CloseMethod::MarketExit { fee } => {
-                position
-                    .close_via_recorded_exit(fee)
-                    .map_err(|e| anyhow!("close_via_recorded_exit: {}", e))?;
-                // Move any remaining held qty to exited (normally zero after fills,
-                // but covers partial-fill edge cases to prevent inventory loss).
-                position.exited_yes_qty += position.held_yes_qty;
-                position.exited_no_qty += position.held_no_qty;
-                position.held_yes_qty = Decimal::ZERO;
-                position.held_no_qty = Decimal::ZERO;
-                event_type = "closed_via_exit";
+                let fee =
+                    if position.fee_model == polymarket_core::types::PositionFeeModel::ShareBased {
+                        Decimal::ZERO
+                    } else {
+                        fee
+                    };
+                if position.has_open_exposure() {
+                    return Err(anyhow!("Cannot close while shares remain held"));
+                }
+                let proceeds = position.yes_exit_price.unwrap_or_default()
+                    * position.exited_yes_qty
+                    + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
+                let basis = position.yes_entry_price * position.exited_yes_qty
+                    + position.no_entry_price * position.exited_no_qty;
+                position.realized_pnl = Some(proceeds - basis - fee * (basis + proceeds));
+                position.unrealized_pnl = Decimal::ZERO;
+                position.state = PositionState::Closed;
+                position.exit_timestamp = Some(chrono::Utc::now());
+                "closed_via_exit"
             }
             CloseMethod::ResolutionWithWinner { yes_wins, fee } => {
-                position
-                    .close_via_resolution_with_winner(yes_wins, fee)
-                    .map_err(|e| anyhow!("close_via_resolution_with_winner: {}", e))?;
-                position.resolution_winner = Some(if yes_wins { "yes" } else { "no" }.to_string());
-                // Move held to exited for resolution
+                let fee =
+                    if position.fee_model == polymarket_core::types::PositionFeeModel::ShareBased {
+                        Decimal::ZERO
+                    } else {
+                        fee
+                    };
+                let proceeds = position.yes_exit_price.unwrap_or_default()
+                    * position.exited_yes_qty
+                    + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
+                let payout = if yes_wins {
+                    position.held_yes_qty
+                } else {
+                    position.held_no_qty
+                };
+                let basis = position.entry_cost();
+                position.realized_pnl = Some(proceeds + payout - basis - fee * (basis + proceeds));
+                position.resolution_winner = Some(if yes_wins { "yes" } else { "no" }.into());
                 position.exited_yes_qty += position.held_yes_qty;
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;
                 position.held_no_qty = Decimal::ZERO;
-                event_type = "closed_via_resolution";
+                position.state = PositionState::Closed;
+                position.exit_timestamp = Some(chrono::Utc::now());
+                position.unrealized_pnl = Decimal::ZERO;
+                "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
-                position
-                    .close_via_resolution(fee)
-                    .map_err(|e| anyhow!("close_via_resolution: {}", e))?;
-                // Move held to exited for resolution
+                let fee =
+                    if position.fee_model == polymarket_core::types::PositionFeeModel::ShareBased {
+                        Decimal::ZERO
+                    } else {
+                        fee
+                    };
+                if position.held_yes_qty != position.held_no_qty {
+                    return Err(anyhow!(
+                        "Winner required for unequal remaining resolution holdings"
+                    ));
+                }
+                let proceeds = position.yes_exit_price.unwrap_or_default()
+                    * position.exited_yes_qty
+                    + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
+                let basis = position.entry_cost();
+                position.realized_pnl =
+                    Some(proceeds + position.held_yes_qty - basis - fee * (basis + proceeds));
                 position.exited_yes_qty += position.held_yes_qty;
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;
                 position.held_no_qty = Decimal::ZERO;
-                event_type = "closed_via_resolution";
+                position.state = PositionState::Closed;
+                position.exit_timestamp = Some(chrono::Utc::now());
+                position.unrealized_pnl = Decimal::ZERO;
+                "closed_via_resolution"
             }
-        }
+        };
 
         self.repo
             .update(position)
@@ -498,6 +599,12 @@ impl PositionService {
         reason: FailureReason,
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
+
         let from = format!("{:?}", position.state).to_lowercase();
         let reason_str = format!("{:?}", reason);
         position.mark_exit_failed(reason);
@@ -613,6 +720,12 @@ impl PositionService {
         failure_msg: &str,
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
+
         // Accepts Pending (arb executor: YES filled, NO failed immediately)
         // or EntryFailed (exit handler: one-legged recovery from prior failure).
         if !matches!(
@@ -626,6 +739,14 @@ impl PositionService {
         }
 
         // Set the missing-leg price and qty to zero
+        if (held_leg == "yes" && position.held_no_qty > Decimal::ZERO)
+            || (held_leg == "no" && position.held_yes_qty > Decimal::ZERO)
+            || !matches!(held_leg, "yes" | "no")
+        {
+            return Err(anyhow!(
+                "One-legged recovery conflicts with explicit holdings"
+            ));
+        }
         if held_leg == "yes" {
             position.no_entry_price = Decimal::ZERO;
             position.held_no_qty = Decimal::ZERO;

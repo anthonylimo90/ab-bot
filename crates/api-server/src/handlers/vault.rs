@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::warn;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -22,6 +22,10 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::workspace_scope::resolve_canonical_workspace_membership;
 use polymarket_core::api::PolygonClient;
+
+#[cfg(test)]
+#[path = "vault/ownership_tests.rs"]
+mod wallet_ownership_tests;
 
 const POLYGONSCAN_TX_BASE_URL: &str = "https://polygonscan.com/tx/";
 
@@ -124,6 +128,41 @@ fn validate_wallet_address(address: &str) -> ApiResult<String> {
     }
 
     Ok(normalized)
+}
+
+fn validate_wallet_key(address: &str, private_key: &str) -> ApiResult<Vec<u8>> {
+    let normalized = validate_wallet_address(address)?;
+    let private_key = private_key.trim();
+    let wallet = auth::TradingWallet::from_private_key(private_key)
+        .map_err(|_| ApiError::BadRequest("Invalid wallet private key".into()))?;
+    if wallet.address_string().to_lowercase() != normalized {
+        return Err(ApiError::BadRequest(
+            "Private key does not match the wallet address".into(),
+        ));
+    }
+    hex::decode(private_key.strip_prefix("0x").unwrap_or(private_key))
+        .map_err(|_| ApiError::BadRequest("Invalid wallet private key".into()))
+}
+
+/// Serialize metadata and vault mutations across accounts and API replicas.
+/// Lock the user first so concurrent first-wallet requests cannot both become primary.
+/// The final lock also protects file-provider read/modify/write across addresses.
+async fn lock_wallet_mutation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+    address: &str,
+) -> ApiResult<()> {
+    for key in [
+        format!("wallet-user:{user_id}"),
+        format!("wallet-address:{address}"),
+        "wallet-vault-file".to_string(),
+    ] {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 fn decimal_to_usdc_units(amount: Decimal) -> ApiResult<u128> {
@@ -343,47 +382,54 @@ pub async fn store_wallet(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
+    let wallet = register_wallet(&state.pool, &state.key_vault, user_id, &req).await?;
+    Ok((StatusCode::CREATED, Json(wallet)))
+}
+
+async fn register_wallet(
+    pool: &PgPool,
+    vault: &auth::KeyVault,
+    user_id: Uuid,
+    req: &StoreWalletRequest,
+) -> ApiResult<WalletInfo> {
     // Validate address format (basic check)
     let address = validate_wallet_address(&req.address)?;
 
-    // Validate private key format
-    let private_key = req.private_key.trim();
-    let key_bytes = if let Some(stripped) = private_key.strip_prefix("0x") {
-        hex::decode(stripped)
-            .map_err(|_| ApiError::BadRequest("Invalid private key format".into()))?
-    } else {
-        hex::decode(private_key)
-            .map_err(|_| ApiError::BadRequest("Invalid private key format".into()))?
-    };
+    // Prove control before touching metadata or the address-indexed vault.
+    let key_bytes = validate_wallet_key(&address, &req.private_key)?;
+    let mut tx = pool.begin().await?;
+    lock_wallet_mutation(&mut tx, user_id, &address).await?;
 
-    if key_bytes.len() != 32 {
-        return Err(ApiError::BadRequest("Private key must be 32 bytes".into()));
-    }
-
-    // Check if wallet already exists for this user
+    // Vault keys are global by address, so ownership checks must be global too.
     let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM user_wallets WHERE user_id = $1 AND address = $2")
-            .bind(user_id)
+        sqlx::query_as("SELECT user_id FROM user_wallets WHERE LOWER(address) = $1 LIMIT 1")
             .bind(&address)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
     if existing.is_some() {
-        return Err(ApiError::Conflict("Wallet already connected".into()));
+        return Err(ApiError::Conflict(
+            "Wallet address is already connected".into(),
+        ));
     }
 
-    // Store the private key in the KeyVault
-    state
-        .key_vault
-        .store_wallet_key(&address, &key_bytes)
+    // Existing keys can come from startup configuration or a prior failed DB commit.
+    // Reuse identical material; never replace a key when connecting metadata.
+    let existing_key = vault
+        .get_wallet_key(&address)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to store key: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to check wallet key: {}", e)))?;
+    if existing_key.as_ref().is_some_and(|key| key != &key_bytes) {
+        return Err(ApiError::Conflict(
+            "Wallet key does not match the stored signer".into(),
+        ));
+    }
 
     // Check if this is the first wallet (will be primary)
     let wallet_count: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM user_wallets WHERE user_id = $1")
             .bind(user_id)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut *tx)
             .await?;
     let is_primary = wallet_count.0 == 0;
 
@@ -403,29 +449,24 @@ pub async fn store_wallet(
     .bind(&req.label)
     .bind(is_primary)
     .bind(now)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
 
-    // Seamless live mode: first/primary connected wallet becomes active trading wallet immediately.
-    if is_primary && state.order_executor.is_live() {
-        match state.activate_trading_wallet(&address).await {
-            Ok(loaded) => info!(wallet = %loaded, "Activated primary wallet for live trading"),
-            Err(e) => {
-                warn!(wallet = %address, error = %e, "Failed to activate primary wallet for live trading")
-            }
-        }
+    if existing_key.is_none() {
+        vault
+            .store_wallet_key(&address, &key_bytes)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to store key: {}", e)))?;
     }
+    tx.commit().await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(WalletInfo {
-            id: wallet_id.to_string(),
-            address,
-            label: req.label,
-            is_primary,
-            created_at: now,
-        }),
-    ))
+    Ok(WalletInfo {
+        id: wallet_id.to_string(),
+        address,
+        label: req.label.clone(),
+        is_primary,
+        created_at: now,
+    })
 }
 
 /// List all connected wallets for the current user.
@@ -534,15 +575,27 @@ pub async fn remove_wallet(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
-    let address = address.to_lowercase();
+    disconnect_wallet(&state.pool, &state.key_vault, user_id, &address).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn disconnect_wallet(
+    pool: &PgPool,
+    vault: &auth::KeyVault,
+    user_id: Uuid,
+    address: &str,
+) -> ApiResult<()> {
+    let address = validate_wallet_address(address)?;
+    let mut tx = pool.begin().await?;
+    lock_wallet_mutation(&mut tx, user_id, &address).await?;
 
     // Check if wallet exists
     let wallet: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT id, is_primary FROM user_wallets WHERE user_id = $1 AND address = $2",
+        "SELECT id, is_primary FROM user_wallets WHERE user_id = $1 AND LOWER(address) = $2",
     )
     .bind(user_id)
     .bind(&address)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let (wallet_id, was_primary) = match wallet {
@@ -550,13 +603,26 @@ pub async fn remove_wallet(
         None => return Err(ApiError::NotFound("Wallet not connected".into())),
     };
 
-    // Remove from KeyVault
-    let _ = state.key_vault.remove_wallet_key(&address).await;
+    // Legacy data may contain multiple registrations, including mixed-case rows.
+    // Disconnecting one row must not remove signer material still referenced elsewhere.
+    let shared: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM user_wallets WHERE LOWER(address) = $1 AND id <> $2)",
+    )
+    .bind(&address)
+    .bind(wallet_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !shared {
+        vault
+            .remove_wallet_key(&address)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to remove wallet key: {}", e)))?;
+    }
 
     // Remove from database
     sqlx::query("DELETE FROM user_wallets WHERE id = $1")
         .bind(wallet_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
     // If this was the primary wallet, make another one primary
@@ -574,28 +640,11 @@ pub async fn remove_wallet(
             "#,
         )
         .bind(user_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
-
-        if state.order_executor.is_live() {
-            let next_primary: Option<(String,)> = sqlx::query_as(
-                "SELECT address FROM user_wallets WHERE user_id = $1 AND is_primary = true LIMIT 1",
-            )
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
-
-            if let Some((next_address,)) = next_primary {
-                if let Err(e) = state.activate_trading_wallet(&next_address).await {
-                    warn!(wallet = %next_address, error = %e, "Failed to activate fallback primary wallet");
-                }
-            } else {
-                warn!("No fallback primary wallet available after removal");
-            }
-        }
     }
-
-    Ok(StatusCode::NO_CONTENT)
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Set a wallet as the primary wallet.
@@ -623,19 +672,31 @@ pub async fn set_primary_wallet(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
-    let address = address.to_lowercase();
+    Ok(Json(
+        set_personal_primary_wallet(&state.pool, user_id, &address).await?,
+    ))
+}
+
+async fn set_personal_primary_wallet(
+    pool: &PgPool,
+    user_id: Uuid,
+    address: &str,
+) -> ApiResult<WalletInfo> {
+    let address = validate_wallet_address(address)?;
+    let mut tx = pool.begin().await?;
+    lock_wallet_mutation(&mut tx, user_id, &address).await?;
 
     // Check if wallet exists
     let wallet: Option<UserWalletRow> = sqlx::query_as(
         r#"
         SELECT id, address, label, is_primary, created_at
         FROM user_wallets
-        WHERE user_id = $1 AND address = $2
+        WHERE user_id = $1 AND LOWER(address) = $2
         "#,
     )
     .bind(user_id)
     .bind(&address)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let wallet = match wallet {
@@ -643,50 +704,29 @@ pub async fn set_primary_wallet(
         None => return Err(ApiError::NotFound("Wallet not connected".into())),
     };
 
-    // When live, verify the vault key exists before committing the DB change
-    if state.order_executor.is_live() {
-        let key_exists = state
-            .key_vault
-            .get_wallet_key(&wallet.address)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to check vault key: {}", e)))?
-            .is_some();
-
-        if !key_exists {
-            return Err(ApiError::BadRequest(
-                "Cannot set as primary: wallet key not found in vault".into(),
-            ));
-        }
-    }
-
     // Unset all other wallets as primary
     sqlx::query(
         "UPDATE user_wallets SET is_primary = false, updated_at = NOW() WHERE user_id = $1",
     )
     .bind(user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
 
     // Set this wallet as primary
     sqlx::query("UPDATE user_wallets SET is_primary = true, updated_at = NOW() WHERE id = $1")
         .bind(wallet.id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
-    if state.order_executor.is_live() {
-        state
-            .activate_trading_wallet(&wallet.address)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to activate primary wallet: {}", e)))?;
-    }
+    tx.commit().await?;
 
-    Ok(Json(WalletInfo {
+    Ok(WalletInfo {
         id: wallet.id.to_string(),
         address: wallet.address,
         label: wallet.label,
         is_primary: true,
         created_at: wallet.created_at,
-    }))
+    })
 }
 
 /// Response for wallet USDC balance.
@@ -816,6 +856,27 @@ pub async fn list_withdrawals(
     Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 
+async fn existing_withdrawal(
+    pool: &PgPool,
+    user_id: Uuid,
+    source: &str,
+    destination: &str,
+    amount: Decimal,
+    request_id: Uuid,
+) -> ApiResult<Option<WalletWithdrawalRow>> {
+    let row: Option<WalletWithdrawalRow> = sqlx::query_as(
+        "SELECT id, wallet_address, destination_address, asset, amount, status, tx_hash, error, requested_at, confirmed_at FROM wallet_withdrawals WHERE wallet_address=$1 AND client_request_id=$2 AND user_id=$3"
+    ).bind(source).bind(request_id).bind(user_id).fetch_optional(pool).await?;
+    if let Some(row) = &row {
+        if !row.destination_address.eq_ignore_ascii_case(destination) || row.amount != amount {
+            return Err(ApiError::Conflict(
+                "client_request_id was already used for a different withdrawal".into(),
+            ));
+        }
+    }
+    Ok(row)
+}
+
 /// Send USDC.e from a connected vault wallet to an external Polygon wallet.
 #[utoipa::path(
     post,
@@ -848,34 +909,30 @@ pub async fn create_withdrawal(
     let source_address =
         resolve_user_wallet_address(state.as_ref(), user_id, req.source_address.as_deref()).await?;
 
-    // Idempotent retry: if a withdrawal with this client_request_id already exists, return it.
-    if let Some(crid) = &req.client_request_id {
-        let existing: Option<WalletWithdrawalRow> = sqlx::query_as(
-            r#"
-            SELECT id, wallet_address, destination_address, asset, amount, status,
-                   tx_hash, error, requested_at, confirmed_at
-            FROM wallet_withdrawals
-            WHERE wallet_address = $1 AND client_request_id = $2
-            "#,
-        )
-        .bind(&source_address)
-        .bind(crid)
-        .fetch_optional(&state.pool)
-        .await?;
-
-        if let Some(row) = existing {
-            return Ok(Json(WalletWithdrawalResponse::from(row)));
-        }
+    let request_id = req.client_request_id.ok_or_else(|| {
+        ApiError::BadRequest("client_request_id is required for safe withdrawal retries".into())
+    })?;
+    let destination_address = validate_wallet_address(&req.destination_address)?;
+    let amount_units = decimal_to_usdc_units(req.amount)?;
+    if let Some(row) = existing_withdrawal(
+        &state.pool,
+        user_id,
+        &source_address,
+        &destination_address,
+        req.amount,
+        request_id,
+    )
+    .await?
+    {
+        return Ok(Json(row.into()));
     }
 
-    let destination_address = validate_wallet_address(&req.destination_address)?;
     if destination_address == source_address {
         return Err(ApiError::BadRequest(
             "Destination matches the source wallet. If this address is already in MetaMask, no withdrawal is needed.".into(),
         ));
     }
 
-    let amount_units = decimal_to_usdc_units(req.amount)?;
     let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
     let available_units = polygon_client
         .get_usdc_balance_units(&source_address)
@@ -899,14 +956,12 @@ pub async fn create_withdrawal(
             held_yes_qty * yes_entry_price + held_no_qty * no_entry_price
         ), 0)::numeric
         FROM positions
-        WHERE is_open = TRUE AND state NOT IN (4, 5)
-          AND exit_strategy = 1
+        WHERE exit_strategy = 1
           AND (held_yes_qty > 0 OR held_no_qty > 0)
         "#,
     )
     .fetch_one(&state.pool)
-    .await
-    .unwrap_or(Decimal::ZERO);
+    .await?;
 
     let max_withdrawable = (available_usdc - reserved_for_exits).max(Decimal::ZERO);
     if req.amount > max_withdrawable {
@@ -946,20 +1001,17 @@ pub async fn create_withdrawal(
     .await;
 
     if let Err(sqlx::Error::Database(ref db_err)) = insert_result {
-        if db_err.code().map_or(false, |c| c == "23505") {
+        if db_err.code().is_some_and(|c| c == "23505") {
             // Unique constraint violation on (wallet_address, client_request_id).
             // A concurrent request already inserted — re-fetch and return it.
-            let existing: Option<WalletWithdrawalRow> = sqlx::query_as(
-                r#"
-                SELECT id, wallet_address, destination_address, asset, amount, status,
-                       tx_hash, error, requested_at, confirmed_at
-                FROM wallet_withdrawals
-                WHERE wallet_address = $1 AND client_request_id = $2
-                "#,
+            let existing = existing_withdrawal(
+                &state.pool,
+                user_id,
+                &source_address,
+                &destination_address,
+                req.amount,
+                request_id,
             )
-            .bind(&source_address)
-            .bind(&req.client_request_id)
-            .fetch_optional(&state.pool)
             .await?;
 
             if let Some(row) = existing {
@@ -969,7 +1021,7 @@ pub async fn create_withdrawal(
             // rather than falling through to insert_result? which would surface a 500.
             return Err(ApiError::Conflict(
                 "A withdrawal with this client_request_id was processed concurrently. \
-                 Please retry with a new client_request_id."
+                 Retry with the same client_request_id after checking withdrawal history."
                     .into(),
             ));
         }
@@ -1000,7 +1052,7 @@ pub async fn create_withdrawal(
             sqlx::query(
                 r#"
                 UPDATE wallet_withdrawals
-                SET status = 'failed', error = $2, updated_at = NOW()
+                SET status = 'pending', error = $2, updated_at = NOW()
                 WHERE id = $1
                 "#,
             )
@@ -1018,14 +1070,14 @@ pub async fn create_withdrawal(
                 .details(serde_json::json!({
                     "destination_address": destination_address,
                     "amount": req.amount.to_string(),
-                    "status": "failed_pre_submission"
+                    "status": "submission_requires_reconciliation"
                 }))
                 .failure(message.clone())
                 .build(),
             );
 
             return Err(ApiError::Internal(format!(
-                "Failed to submit withdrawal transaction: {}",
+                "Withdrawal submission outcome is unresolved; reuse the same request ID and check history: {}",
                 message
             )));
         }
@@ -1041,7 +1093,7 @@ pub async fn create_withdrawal(
             sqlx::query(
                 r#"
                 UPDATE wallet_withdrawals
-                SET status = 'failed', error = $2, updated_at = NOW()
+                SET status = 'submitted', error = $2, updated_at = NOW()
                 WHERE id = $1
                 "#,
             )
@@ -1059,7 +1111,7 @@ pub async fn create_withdrawal(
                 .details(serde_json::json!({
                     "destination_address": destination_address,
                     "amount": req.amount.to_string(),
-                    "status": "failed_after_submission",
+                    "status": "receipt_pending",
                     "tx_hash": tx_hash
                 }))
                 .failure(message.clone())
@@ -1067,7 +1119,7 @@ pub async fn create_withdrawal(
             );
 
             return Err(ApiError::Internal(format!(
-                "Withdrawal transaction failed after submission: {}",
+                "Withdrawal receipt remains pending; reuse the same request ID and check history: {}",
                 message
             )));
         }
@@ -1229,14 +1281,12 @@ pub async fn withdrawal_preflight(
             held_yes_qty * yes_entry_price + held_no_qty * no_entry_price
         ), 0)::numeric
         FROM positions
-        WHERE is_open = TRUE AND state NOT IN (4, 5)
-          AND exit_strategy = 1
+        WHERE exit_strategy = 1
           AND (held_yes_qty > 0 OR held_no_qty > 0)
         "#,
     )
     .fetch_one(&state.pool)
-    .await
-    .unwrap_or(Decimal::ZERO);
+    .await?;
 
     // Query orphan exposure from wallet_inventory.
     let orphan_exposure: Decimal = sqlx::query_scalar(
@@ -1248,8 +1298,7 @@ pub async fn withdrawal_preflight(
     )
     .bind(&source_address)
     .fetch_one(&state.pool)
-    .await
-    .unwrap_or(Decimal::ZERO);
+    .await?;
 
     // Query inventory freshness.
     let inventory_synced_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(

@@ -119,6 +119,9 @@ fn rand_salt() -> u64 {
 /// A signed order ready for submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedOrder {
+    /// Local reconciliation identity; excluded from the exchange payload.
+    #[serde(skip)]
+    pub order_hash: Option<String>,
     /// Order salt (must be a JSON number).
     pub salt: u64,
     /// Maker address as hex string.
@@ -158,6 +161,7 @@ impl SignedOrder {
         let side = if order.side == 0 { "BUY" } else { "SELL" };
 
         Self {
+            order_hash: None,
             salt: order.salt.to::<u64>(),
             maker: format!("{:?}", order.maker),
             signer: format!("{:?}", order.signer),

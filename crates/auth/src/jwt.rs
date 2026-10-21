@@ -44,6 +44,9 @@ impl UserRole {
 pub struct Claims {
     /// Subject (user ID).
     pub sub: String,
+    /// Account credential/session generation, checked by the API against PostgreSQL.
+    #[serde(default)]
+    pub session_version: i64,
     /// User's email.
     pub email: Option<String>,
     /// User's wallet address (if authenticated via wallet).
@@ -64,6 +67,7 @@ impl Claims {
         let now = Utc::now();
         Self {
             sub: user_id.into(),
+            session_version: 0,
             email: None,
             wallet_address: None,
             role,
@@ -220,9 +224,11 @@ impl JwtAuth {
         let claims = self.validate_token(token)?;
 
         // Create new claims with same user but new expiry
-        let new_claims = Claims::new(&claims.sub, claims.role, self.config.expiry_hours)
+        let mut new_claims = Claims::new(&claims.sub, claims.role, self.config.expiry_hours)
             .with_email(claims.email.unwrap_or_default());
 
+        new_claims.session_version = claims.session_version;
+        new_claims.wallet_address = claims.wallet_address;
         self.create_token_with_claims(&new_claims)
     }
 

@@ -210,6 +210,7 @@ struct ExecutionReportRow {
     tag = "activity"
 )]
 pub async fn list_activity(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ActivityQuery>,
 ) -> ApiResult<Json<Vec<ActivityResponse>>> {

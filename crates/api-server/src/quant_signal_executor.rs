@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
@@ -362,16 +362,12 @@ impl QuantSignalExecutor {
         trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
-        clob_client: Arc<polymarket_core::api::ClobClient>,
+        token_cache: Arc<OutcomeTokenCache>,
         pool: PgPool,
-        active_clob_markets: Arc<RwLock<HashSet<String>>>,
         heartbeat: Arc<AtomicI64>,
     ) -> Self {
         let position_repo = PositionRepository::new(pool.clone());
         let position_service = PositionService::new(pool.clone(), trade_event_tx.clone());
-        let token_cache = Arc::new(
-            OutcomeTokenCache::new(clob_client, active_clob_markets).with_pool(pool.clone()),
-        );
         let trade_event_recorder = TradeEventRecorder::new(pool.clone(), trade_event_tx);
         let shadow_prediction_recorder = ShadowPredictionRecorder::new(pool.clone());
         let rollout_controller = LearningRolloutController::new(pool.clone());
@@ -407,33 +403,6 @@ impl QuantSignalExecutor {
         self.config.read().await.clone()
     }
 
-    fn spawn_cache_refresh(
-        &self,
-        result_tx: mpsc::UnboundedSender<anyhow::Result<(usize, usize)>>,
-    ) {
-        let token_cache = self.token_cache.clone();
-        let heartbeat = self.heartbeat.clone();
-
-        tokio::spawn(async move {
-            // Full Gamma refresh can take minutes. Keep the executor heartbeat
-            // alive while this runs so monitoring doesn't mistake it for a dead task.
-            let keeper = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
-                loop {
-                    tick.tick().await;
-                    heartbeat.store(Utc::now().timestamp(), Ordering::Relaxed);
-                }
-            });
-
-            let result = token_cache.refresh().await;
-            keeper.abort();
-
-            if result_tx.send(result).is_err() {
-                debug!("Quant token cache refresh result receiver dropped");
-            }
-        });
-    }
-
     /// Main executor loop.
     async fn run(mut self) {
         let cfg = self.snapshot_config().await;
@@ -467,14 +436,6 @@ impl QuantSignalExecutor {
             *state = loaded;
         }
 
-        let mut cache_ticker =
-            tokio::time::interval(std::time::Duration::from_secs(cfg.cache_refresh_secs));
-        cache_ticker.tick().await; // skip first tick (just loaded)
-        let (cache_refresh_tx, mut cache_refresh_rx) =
-            mpsc::unbounded_channel::<anyhow::Result<(usize, usize)>>();
-        let mut cache_refresh_in_flight = true;
-        self.spawn_cache_refresh(cache_refresh_tx.clone());
-
         let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
         let mut outcome_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         outcome_ticker.tick().await;
@@ -498,25 +459,6 @@ impl QuantSignalExecutor {
                             info!("Quant signal channel closed, shutting down executor");
                             break;
                         }
-                    }
-                }
-                Some(result) = cache_refresh_rx.recv() => {
-                    cache_refresh_in_flight = false;
-                    match result {
-                        Ok((markets, active_set_size)) => {
-                            debug!(markets, active_set_size, "Quant token cache refreshed");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Quant token cache refresh failed");
-                        }
-                    }
-                }
-                _ = cache_ticker.tick() => {
-                    if cache_refresh_in_flight {
-                        debug!("Quant token cache refresh still in flight, skipping tick");
-                    } else {
-                        self.spawn_cache_refresh(cache_refresh_tx.clone());
-                        cache_refresh_in_flight = true;
                     }
                 }
                 _ = outcome_ticker.tick() => {
@@ -1110,13 +1052,14 @@ impl QuantSignalExecutor {
             SignalDirection::BuyNo => (Decimal::ZERO, best_ask),
         };
         let ctx = EventContext {
+            wallet_address: self.order_executor.wallet_address().await,
             execution_mode: execution_mode.clone(),
             strategy: signal.kind.as_str().to_string(),
             source_label: "quant".to_string(),
         };
         let mut position = self
             .position_service
-            .create_position(
+            .create_position_with_limit(
                 CreatePositionParams {
                     market_id: signal.condition_id.clone(),
                     yes_entry_price: yes_price,
@@ -1135,6 +1078,7 @@ impl QuantSignalExecutor {
                     "fill_price": best_ask.to_string(),
                     "requested_size_usd": position_size_usd.to_string(),
                 }),
+                Some(cfg.max_total_exposure),
             )
             .await?;
 
@@ -1161,7 +1105,19 @@ impl QuantSignalExecutor {
         .with_expected_price(best_ask)
         .with_slippage(self.order_executor.default_slippage());
 
-        let report = match self.order_executor.execute_market_order(order).await {
+        let report = match self
+            .order_executor
+            .execute_market_order_for_position(
+                order,
+                &position,
+                if signal.direction == SignalDirection::BuyYes {
+                    "yes"
+                } else {
+                    "no"
+                },
+            )
+            .await
+        {
             Ok(report) => report,
             Err(e) => {
                 warn!(
@@ -1194,6 +1150,9 @@ impl QuantSignalExecutor {
             }
         };
 
+        if report.status == polymarket_core::types::OrderStatus::Pending {
+            return Ok(());
+        }
         if !report.is_success() {
             warn!(
                 signal_id = %signal.id,
@@ -1236,10 +1195,11 @@ impl QuantSignalExecutor {
                 report.average_price,
                 report.filled_quantity,
                 &ctx,
+                (ctx.execution_mode == "live").then_some(report.order_id),
             )
             .await
         {
-            warn!(error = %e, position_id = %position.id, "Failed to record entry fill");
+            return Err(e.context("Failed to persist confirmed entry fill"));
         }
 
         if let Err(e) = self.position_service.mark_open(&mut position, &ctx).await {
@@ -1458,9 +1418,8 @@ pub fn spawn_quant_signal_executor(
     trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
     order_executor: Arc<OrderExecutor>,
     circuit_breaker: Arc<CircuitBreaker>,
-    clob_client: Arc<polymarket_core::api::ClobClient>,
+    token_cache: Arc<OutcomeTokenCache>,
     pool: PgPool,
-    active_clob_markets: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
 ) {
     let executor = QuantSignalExecutor::new(
@@ -1470,9 +1429,8 @@ pub fn spawn_quant_signal_executor(
         trade_event_tx,
         order_executor,
         circuit_breaker,
-        clob_client,
+        token_cache,
         pool,
-        active_clob_markets,
         heartbeat,
     );
 

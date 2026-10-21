@@ -87,7 +87,7 @@ export function ConnectWalletModal({ open, onOpenChange }: ConnectWalletModalPro
             Connect Wallet
           </DialogTitle>
           <DialogDescription>
-            Connect your wallet to enable live trading. Your private key is encrypted and stored securely.
+            Connect a personal wallet for balances and withdrawals. This does not change the wallet used by the bot. Your private key is encrypted and stored securely.
           </DialogDescription>
         </DialogHeader>
 

@@ -15,6 +15,97 @@ use auth::jwt::{Claims, UserRole};
 use crate::error::ErrorResponse;
 use crate::state::AppState;
 
+#[cfg(test)]
+#[path = "middleware/session_tests.rs"]
+mod session_tests;
+
+fn role_number(role: UserRole) -> i32 {
+    match role {
+        UserRole::Viewer => 0,
+        UserRole::Trader => 1,
+        UserRole::PlatformAdmin => 2,
+    }
+}
+
+pub(crate) async fn session_claims(
+    pool: &sqlx::PgPool,
+    user: uuid::Uuid,
+    role: UserRole,
+) -> crate::error::ApiResult<Claims> {
+    let current: Option<(i64, i32)> =
+        sqlx::query_as("SELECT auth_version, role::integer FROM users WHERE id=$1")
+            .bind(user)
+            .fetch_optional(pool)
+            .await?;
+    let (version, current_role) = current
+        .ok_or_else(|| crate::error::ApiError::Unauthorized("Account no longer exists".into()))?;
+    if current_role != role_number(role) {
+        return Err(crate::error::ApiError::Unauthorized(
+            "Account role changed".into(),
+        ));
+    }
+    let mut claims = Claims::new(user.to_string(), role, 24);
+    claims.session_version = version;
+    Ok(claims)
+}
+
+pub(crate) async fn issue_session_token(
+    state: &AppState,
+    user: uuid::Uuid,
+    role: UserRole,
+) -> crate::error::ApiResult<String> {
+    let claims = session_claims(&state.pool, user, role).await?;
+    state
+        .jwt_auth
+        .create_token_with_claims(&claims)
+        .map_err(|_| crate::error::ApiError::Internal("Token generation failed".into()))
+}
+
+pub(crate) async fn authorize_session(
+    pool: &sqlx::PgPool,
+    jwt: &auth::jwt::JwtAuth,
+    token: &str,
+) -> crate::error::ApiResult<Claims> {
+    let claims = validate_session_token(jwt, token)?;
+    let user = uuid::Uuid::parse_str(&claims.sub)
+        .map_err(|_| crate::error::ApiError::Unauthorized("Invalid subject".into()))?;
+    let current: Option<(i64,i32,bool)> = sqlx::query_as("SELECT auth_version, role::integer, EXISTS(SELECT 1 FROM revoked_sessions WHERE jti=$2) FROM users WHERE id=$1")
+        .bind(user).bind(&claims.jti).fetch_optional(pool).await?;
+    require_current_session(&claims, current)?;
+    Ok(claims)
+}
+
+pub(crate) fn validate_session_token(
+    jwt: &auth::jwt::JwtAuth,
+    token: &str,
+) -> crate::error::ApiResult<Claims> {
+    use crate::error::ApiError;
+    let claims = jwt
+        .validate_token(token)
+        .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+    if claims.exp <= chrono::Utc::now().timestamp() {
+        return Err(ApiError::Unauthorized("Token expired".into()));
+    }
+    Ok(claims)
+}
+
+pub(crate) fn require_current_session(
+    claims: &Claims,
+    current: Option<(i64, i32, bool)>,
+) -> crate::error::ApiResult<()> {
+    use crate::error::ApiError;
+    match current {
+        Some((version, role, false))
+            if version == claims.session_version && role == role_number(claims.role) =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::Unauthorized(
+            "Session revoked or account changed".into(),
+        )),
+    }
+}
+
 /// Extract and validate JWT token from Authorization header.
 /// On success, injects `Claims` into request extensions for use by handlers.
 pub async fn require_auth(
@@ -46,11 +137,11 @@ pub async fn require_auth(
     };
 
     // Validate token
-    let claims = match state.jwt_auth.validate_token(token) {
+    let claims = match authorize_session(&state.pool, &state.jwt_auth, token).await {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(error = %e, "Token validation failed");
-            return unauthorized_response("Invalid or expired token");
+            return e.into_response();
         }
     };
 

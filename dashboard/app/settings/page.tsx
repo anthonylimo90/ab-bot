@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -27,6 +27,7 @@ import {
   ArrowUpRight,
 } from 'lucide-react';
 import { useAuthStore } from '@/stores/auth-store';
+import { withdrawalIntent } from '@/lib/withdrawal-intent';
 import { useWorkspaceStore } from '@/stores/workspace-store';
 import { InviteMemberDialog } from '@/components/workspace/InviteMemberDialog';
 import { MemberList } from '@/components/workspace/MemberList';
@@ -75,6 +76,7 @@ export default function SettingsPage() {
   const [isTrippingCb, setIsTrippingCb] = useState(false);
   const [isResettingCb, setIsResettingCb] = useState(false);
   const [withdrawDestination, setWithdrawDestination] = useState('');
+  const withdrawalIntentRef = useRef<{ fingerprint: string; id: string } | null>(null);
   const [withdrawAmount, setWithdrawAmount] = useState('');
 
   const {
@@ -294,7 +296,7 @@ export default function SettingsPage() {
   const handleMakePrimary = async (address: string) => {
     try {
       await setPrimary(address);
-      toast.success('Primary wallet updated', 'This wallet is now active for live trading');
+      toast.success('Primary wallet updated', 'This wallet is now selected for balances and withdrawals.');
     } catch (err) {
       toast.error(
         'Failed to set primary wallet',
@@ -336,19 +338,27 @@ export default function SettingsPage() {
     if (withdrawDestination.trim().toLowerCase() === sourceAddress.toLowerCase()) {
       toast.error(
         'Same wallet selected',
-        'The destination matches your active trading wallet. If this is already your MetaMask address, no transfer is needed.',
+        'The destination matches the source wallet. If this is already your MetaMask address, no transfer is needed.',
       );
       return;
     }
 
     try {
-      await createWithdrawalMutation.mutateAsync({
+      const fingerprint = JSON.stringify([user?.id, sourceAddress.toLowerCase(), withdrawDestination.trim().toLowerCase(), amount]);
+      const intent = withdrawalIntent(sessionStorage, fingerprint, withdrawalIntentRef.current);
+      withdrawalIntentRef.current = intent;
+      const result = await createWithdrawalMutation.mutateAsync({
+        client_request_id: intent.id,
         source_address: sourceAddress,
         destination_address: withdrawDestination.trim(),
         amount,
       });
-      setWithdrawDestination('');
-      setWithdrawAmount('');
+      if (result.status === 'confirmed') {
+        sessionStorage.removeItem('ab-bot-withdrawal-intent');
+        withdrawalIntentRef.current = null;
+        setWithdrawDestination('');
+        setWithdrawAmount('');
+      }
     } catch (err) {
       toast.error(
         'Withdrawal failed',
@@ -387,7 +397,7 @@ export default function SettingsPage() {
             Account
           </CardTitle>
           <CardDescription>
-            Choose which wallet the bot is allowed to use for live trading and withdraw settled USDC when needed
+            Manage your personal wallets and withdraw settled USDC when needed
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -396,10 +406,13 @@ export default function SettingsPage() {
               <div>
                 <p className="flex items-center gap-2 font-medium">
                   <span>Connected Wallets</span>
-                  <InfoTooltip content="These are the wallets connected under your account. The wallet marked Active is the one the bot will use for live trading." />
+                  <InfoTooltip content="Your primary wallet is used for balances and withdrawals. Changing it does not switch the bot's trading wallet." />
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  The wallet marked Active is used automatically for live trading
+                  Your primary wallet is used for balances and withdrawals
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground break-all">
+                  Bot trading wallet: {currentWorkspace?.trading_wallet_address || 'Not configured'}
                 </p>
               </div>
               <Button onClick={() => setConnectWalletOpen(true)} className="w-full sm:w-auto">Add Wallet</Button>
@@ -432,7 +445,7 @@ export default function SettingsPage() {
                         {isPrimary ? (
                           <span className="inline-flex items-center gap-1 rounded-full border border-green-500/30 bg-green-500/10 px-2 py-1 text-xs text-green-600">
                             <Star className="h-3 w-3" />
-                            Active
+                            Primary
                           </span>
                         ) : (
                           <Button
@@ -441,7 +454,7 @@ export default function SettingsPage() {
                             onClick={() => handleMakePrimary(wallet.address)}
                             disabled={walletLoading}
                           >
-                            Use for Trading
+                            Make Primary
                           </Button>
                         )}
                         <Button
@@ -465,10 +478,10 @@ export default function SettingsPage() {
             <div className="mb-4">
               <p className="flex items-center gap-2 font-medium">
                 <span>Withdraw USDC</span>
-                <InfoTooltip content="This sends a real on-chain Polygon USDC.e transfer from the active trading wallet. It only moves free USDC, not open position inventory." />
+                <InfoTooltip content="This sends a real on-chain Polygon USDC.e transfer from your primary wallet. It only moves free USDC, not open position inventory." />
               </p>
               <p className="text-sm text-muted-foreground">
-                Send settled USDC from the active trading wallet to another Polygon address, such as a different MetaMask wallet.
+                Send settled USDC from your primary wallet to another Polygon address, such as a different MetaMask wallet.
               </p>
             </div>
 
@@ -478,11 +491,11 @@ export default function SettingsPage() {
               </p>
             ) : walletLoading && connectedWallets.length === 0 ? (
               <p className="text-sm text-muted-foreground">
-                Loading active wallet details...
+                Loading primary wallet details...
               </p>
             ) : !primaryConnectedWallet ? (
               <p className="text-sm text-muted-foreground">
-                Connect and activate a wallet before withdrawing funds.
+                Connect a wallet and make it primary before withdrawing funds.
               </p>
             ) : (
               <div className="space-y-4">

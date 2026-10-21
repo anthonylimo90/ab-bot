@@ -65,6 +65,7 @@ pub struct MarketMetadataResponse {
     )
 )]
 pub async fn get_flow_features(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(params): Query<FlowQuery>,
 ) -> ApiResult<Json<Vec<FlowFeatureResponse>>> {
@@ -130,6 +131,7 @@ pub struct MetadataQuery {
     )
 )]
 pub async fn get_market_metadata(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(params): Query<MetadataQuery>,
 ) -> ApiResult<Json<Vec<MarketMetadataResponse>>> {
@@ -227,6 +229,7 @@ pub struct RecentSignalResponse {
     )
 )]
 pub async fn get_recent_signals(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(params): Query<RecentSignalsQuery>,
 ) -> ApiResult<Json<Vec<RecentSignalResponse>>> {
@@ -319,6 +322,7 @@ pub struct StrategyPerformanceResponse {
     )
 )]
 pub async fn get_strategy_performance(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(params): Query<PerformanceQuery>,
 ) -> ApiResult<Json<Vec<StrategyPerformanceResponse>>> {

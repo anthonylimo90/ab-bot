@@ -226,10 +226,7 @@ pub async fn register(
     state.audit_logger.log(audit_event);
 
     // Generate JWT token
-    let token = state
-        .jwt_auth
-        .create_token(&user_id.to_string(), UserRole::Trader)
-        .map_err(|e| ApiError::Internal(format!("Token generation failed: {}", e)))?;
+    let token = crate::middleware::issue_session_token(&state, user_id, UserRole::Trader).await?;
 
     let response = AuthResponse {
         token,
@@ -341,10 +338,7 @@ pub async fn login(
     let user_role = user.user_role();
 
     // Generate JWT token
-    let token = state
-        .jwt_auth
-        .create_token(&user.id.to_string(), user_role)
-        .map_err(|e| ApiError::Internal(format!("Token generation failed: {}", e)))?;
+    let token = crate::middleware::issue_session_token(&state, user.id, user_role).await?;
 
     let response = AuthResponse {
         token,
@@ -398,10 +392,7 @@ pub async fn refresh_token(
     let user_role = user.user_role();
 
     // Generate new token
-    let token = state
-        .jwt_auth
-        .create_token(&user.id.to_string(), user_role)
-        .map_err(|e| ApiError::Internal(format!("Token generation failed: {}", e)))?;
+    let token = crate::middleware::issue_session_token(&state, user.id, user_role).await?;
 
     let response = AuthResponse {
         token,
@@ -434,6 +425,10 @@ pub async fn logout(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let user = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Unauthorized("Invalid subject".into()))?;
+    sqlx::query("INSERT INTO revoked_sessions (jti,user_id,expires_at) VALUES ($1,$2,to_timestamp($3::bigint::double precision)) ON CONFLICT (jti) DO NOTHING")
+        .bind(&claims.jti).bind(user).bind(claims.exp).execute(&state.pool).await?;
     // Revoke the current token so it can't be reused
     state.jwt_auth.revoke_token(&claims.jti, claims.exp);
 
@@ -701,18 +696,25 @@ pub async fn reset_password(
     // Update password and mark token as used in a transaction
     let mut tx = state.pool.begin().await?;
 
-    sqlx::query("UPDATE users SET password_hash = $1, updated_at = $2 WHERE id = $3")
+    sqlx::query("UPDATE users SET password_hash = $1, updated_at = $2, auth_version = auth_version + 1 WHERE id = $3")
         .bind(&password_hash)
         .bind(Utc::now())
         .bind(token_row.user_id)
         .execute(&mut *tx)
         .await?;
 
-    sqlx::query("UPDATE password_reset_tokens SET used_at = $1 WHERE id = $2")
-        .bind(Utc::now())
-        .bind(token_row.id)
-        .execute(&mut *tx)
-        .await?;
+    let claimed = sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = $1 WHERE id = $2 AND used_at IS NULL",
+    )
+    .bind(Utc::now())
+    .bind(token_row.id)
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() != 1 {
+        return Err(ApiError::BadRequest(
+            "Password reset token was already used".into(),
+        ));
+    }
 
     tx.commit().await?;
 

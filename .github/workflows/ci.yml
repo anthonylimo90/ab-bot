@@ -84,13 +84,27 @@ jobs:
           shared-key: "rust-ci"
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   rust-test:
     name: Rust Tests
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:test-only@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
 
@@ -135,7 +149,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: dashboard/package-lock.json
 
@@ -144,6 +158,9 @@ jobs:
 
       - name: Run ESLint
         run: npm run lint
+
+      - name: Browser intent regression tests
+        run: npm run test:unit
 
       - name: Type check
         run: npx tsc --noEmit
@@ -162,7 +179,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: dashboard/package-lock.json
 

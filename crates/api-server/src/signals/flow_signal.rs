@@ -386,8 +386,8 @@ async fn scan_and_emit(
     .await?;
 
     let mut emitted = 0;
-    let mut scored_rows: Vec<(f64, f64, &FlowFeatureRow, f64, f64, f64, f64, f64, f64)> =
-        Vec::new();
+    type ScoredFlowRow<'a> = (f64, f64, &'a FlowFeatureRow, f64, f64, f64, f64, f64, f64);
+    let mut scored_rows: Vec<ScoredFlowRow<'_>> = Vec::new();
 
     for row in &rows {
         if config.require_yes_price && row.yes_price.is_none() {
@@ -572,6 +572,7 @@ fn calibrate_expected_edge_bps(raw_expected_edge_bps: f64, stats: FlowCalibratio
     raw_expected_edge_bps * scale.clamp(-1.5, 1.5)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flow_score_components(
     imbalance_abs: f64,
     smart_money_share: f64,

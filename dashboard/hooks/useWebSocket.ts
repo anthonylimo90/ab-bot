@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type { WebSocketMessage } from '@/types/api';
+import { useAuthStore } from '@/stores/auth-store';
 
 export type ConnectionStatus =
   | 'connecting'
@@ -59,6 +60,8 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     batchInterval = 100,
   } = options;
 
+  const token = useAuthStore((state) => state.token);
+  const privateChannel = channel !== 'orderbook';
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -129,7 +132,10 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
   );
 
   const connect = useCallback(() => {
-    if (!enabled) return;
+    if (!enabled || (privateChannel && !token)) {
+      setStatus('disconnected');
+      return;
+    }
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     setStatus('connecting');
@@ -138,10 +144,9 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
-        setStatus('connected');
-        reconnectAttemptsRef.current = 0;
-        onConnectRef.current?.();
-
+        if (privateChannel) {
+          ws.send(JSON.stringify({ action: 'authenticate', token }));
+        }
         pingIntervalRef.current = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ action: 'ping' }));
@@ -152,14 +157,19 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data) as WebSocketMessage;
+          if (data.type === 'Subscribed') {
+            setStatus('connected');
+            reconnectAttemptsRef.current = 0;
+            onConnectRef.current?.();
+          }
           handleMessage(data);
         } catch {
           console.error('Failed to parse WebSocket message:', event.data);
         }
       };
 
-      ws.onclose = () => {
-        setStatus('disconnected');
+      ws.onclose = (event) => {
+        setStatus(event.code === 1008 ? 'error' : 'disconnected');
         onDisconnectRef.current?.();
 
         if (pingIntervalRef.current) {
@@ -172,6 +182,7 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
         }
 
         if (
+          event.code !== 1008 &&
           reconnect &&
           reconnectAttemptsRef.current < maxReconnectAttempts &&
           enabled
@@ -195,6 +206,8 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     }
   }, [
     url,
+    token,
+    privateChannel,
     handleMessage,
     reconnect,
     reconnectInterval,
@@ -280,7 +293,9 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
       if (flushTimeoutRef.current) {
         clearTimeout(flushTimeoutRef.current);
       }
+      if (wsRef.current) wsRef.current.onclose = null;
       wsRef.current?.close();
+      messageQueueRef.current = [];
     };
   }, [connect, enabled]);
 

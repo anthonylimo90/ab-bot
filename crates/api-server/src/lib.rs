@@ -31,12 +31,16 @@ pub mod exit_handler;
 pub mod flow_feature_calculator;
 pub mod gamma_syncer;
 pub mod handlers;
+mod intent_reconciler;
 pub mod learning;
 pub mod learning_evaluator;
 pub mod learning_models;
 pub mod learning_rollouts;
+pub mod market_catalog;
 pub mod metrics_calculator;
 pub mod middleware;
+#[cfg(test)]
+mod migration_tests;
 pub mod position_reconciler;
 pub mod position_service;
 pub mod quant_signal_executor;
@@ -44,6 +48,8 @@ pub mod redis_forwarder;
 pub mod routes;
 pub mod runtime_sync;
 pub mod schema;
+#[cfg(test)]
+mod security_http_tests;
 pub mod signals;
 pub mod state;
 pub mod strategy_health_calculator;
@@ -238,6 +244,14 @@ impl ApiServer {
 
         let quant_config = Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env()));
         self.state.quant_executor_config = Some(quant_config.clone());
+        // One refresh owner, at the faster legacy consumer's configured cadence.
+        let refresh_secs = arb_config_arc
+            .read()
+            .await
+            .cache_refresh_secs
+            .min(quant_config.read().await.cache_refresh_secs)
+            .max(1);
+        arb_config_arc.write().await.cache_refresh_secs = refresh_secs;
 
         // ── Wrap state in Arc and build router ──
         let state = Arc::new(self.state);
@@ -306,10 +320,9 @@ impl ApiServer {
             state.trade_event_tx.clone(),
             state.order_executor.clone(),
             state.circuit_breaker.clone(),
-            state.clob_client.clone(),
+            state.market_catalog.clone(),
             state.pool.clone(),
             arb_dedup.clone(),
-            state.active_clob_markets.clone(),
             state.arb_executor_heartbeat.clone(),
             state.arb_executor_status.clone(),
         );
@@ -380,9 +393,8 @@ impl ApiServer {
             state.trade_event_tx.clone(),
             state.order_executor.clone(),
             state.circuit_breaker.clone(),
-            state.clob_client.clone(),
+            state.market_catalog.clone(),
             state.pool.clone(),
-            state.active_clob_markets.clone(),
             state.quant_executor_heartbeat.clone(),
         );
 
@@ -440,6 +452,7 @@ impl ApiServer {
         // Reconcile open-position marks and expose legacy one-legged rows to recovery.
         let position_reconciler_config = PositionReconcilerConfig::from_env();
         spawn_position_reconciler(position_reconciler_config, state.pool.clone());
+        intent_reconciler::spawn(state.clone());
 
         // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
         let account_snapshot_config = AccountSnapshotConfig::from_env();

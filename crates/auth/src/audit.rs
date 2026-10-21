@@ -146,6 +146,8 @@ impl AuditEventBuilder {
 }
 
 /// Storage backend for audit logs.
+// async_trait adds must_use to an already must-use boxed future.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AuditStorage: Send + Sync {
     /// Store an audit event.

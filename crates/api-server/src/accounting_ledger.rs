@@ -5,7 +5,6 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use sqlx::{FromRow, PgPool};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time;
 use tracing::{info, warn};
@@ -602,14 +601,5 @@ async fn load_conditional_balance(
         .get_live_balance_allowance("CONDITIONAL", Some(token_id))
         .await;
 
-    Ok(snapshot.and_then(|snapshot| parse_decimal_string(&snapshot.balance)))
-}
-
-fn parse_decimal_string(raw: &str) -> Option<Decimal> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    Decimal::from_str(trimmed).ok()
+    Ok(snapshot?.balance_in_units())
 }

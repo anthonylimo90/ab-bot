@@ -23,24 +23,123 @@ use crate::email::{EmailClient, EmailConfig};
 use crate::trade_events::TradeEventUpdate;
 use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 
-async fn resolve_startup_wallet_address(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
-    if let Ok(address) = std::env::var("TRADING_WALLET_ADDRESS") {
-        return Ok(Some(address.to_lowercase()));
+#[cfg(test)]
+#[path = "state/wallet_selection_tests.rs"]
+mod wallet_selection_tests;
+
+const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled')) OR EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode<>'paper' AND quantity>0)";
+
+fn normalize_trading_wallet_address(address: &str) -> anyhow::Result<String> {
+    let parsed = address
+        .trim()
+        .parse::<alloy_primitives::Address>()
+        .context("Invalid configured trading wallet address")?;
+    Ok(parsed.to_string().to_lowercase())
+}
+
+pub(crate) async fn resolve_startup_wallet_address(
+    pool: &PgPool,
+    configured_address: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let workspace_id = crate::workspace_scope::resolve_canonical_workspace_id(pool).await?;
+    let previous: Option<String> = match workspace_id {
+        Some(id) => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT trading_wallet_address FROM workspaces WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .flatten(),
+        None => None,
+    };
+    let selected = configured_address
+        .or(previous.as_deref())
+        .map(normalize_trading_wallet_address)
+        .transpose()?;
+
+    if let (Some(previous), Some(selected)) = (previous.as_deref(), selected.as_deref()) {
+        if normalize_trading_wallet_address(previous)? != selected {
+            let has_exposure: bool = sqlx::query_scalar(STARTUP_EXPOSURE_SQL)
+                .fetch_one(pool)
+                .await?;
+            anyhow::ensure!(
+                !has_exposure,
+                "Cannot change the trading wallet while positions remain open or hold exposure"
+            );
+        }
     }
+    Ok(selected)
+}
 
-    let row: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT address
-        FROM user_wallets
-        WHERE is_primary = true
-        ORDER BY updated_at DESC, created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .fetch_optional(pool)
-    .await?;
+async fn pin_startup_trading_wallet(pool: &PgPool, address: &str) -> anyhow::Result<()> {
+    let Some(workspace) = crate::workspace_scope::resolve_canonical_workspace_id(pool).await?
+    else {
+        return Ok(());
+    };
+    let address = normalize_trading_wallet_address(address)?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('live-order-submission'))")
+        .execute(&mut *tx)
+        .await?;
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT trading_wallet_address FROM workspaces WHERE id=$1 FOR UPDATE")
+            .bind(workspace)
+            .fetch_one(&mut *tx)
+            .await?;
+    if previous
+        .as_deref()
+        .is_none_or(|previous| !previous.eq_ignore_ascii_case(&address))
+    {
+        let exposed: bool = sqlx::query_scalar(STARTUP_EXPOSURE_SQL)
+            .fetch_one(&mut *tx)
+            .await?;
+        anyhow::ensure!(
+            !exposed,
+            "Cannot pin a different signer while exposure or unresolved live orders remain"
+        );
+    }
+    sqlx::query("UPDATE workspaces SET trading_wallet_address=$2 WHERE id=$1")
+        .bind(workspace)
+        .bind(address)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
 
-    Ok(row.map(|(address,)| address.to_lowercase()))
+async fn load_startup_trading_wallet(
+    vault: &KeyVault,
+    selected_address: Option<&str>,
+    environment_key: Option<&str>,
+) -> anyhow::Result<Option<TradingWallet>> {
+    let selected_address = selected_address
+        .map(normalize_trading_wallet_address)
+        .transpose()?;
+    let vault_key = match selected_address.as_deref() {
+        Some(address) => vault.get_wallet_key(address).await?,
+        None => None,
+    };
+    let key = vault_key
+        .map(hex::encode)
+        .or_else(|| environment_key.map(str::to_owned));
+    let Some(key) = key else {
+        anyhow::ensure!(
+            selected_address.is_none(),
+            "The configured trading wallet key is unavailable"
+        );
+        return Ok(None);
+    };
+    let wallet = TradingWallet::from_private_key(&key).context("Invalid trading wallet key")?;
+    if let Some(address) = selected_address {
+        anyhow::ensure!(
+            wallet.address_string().eq_ignore_ascii_case(&address),
+            "Trading wallet key does not match the configured address"
+        );
+    }
+    Ok(Some(wallet))
 }
 
 /// Shared application state.
@@ -64,6 +163,9 @@ pub struct AppState {
     pub email_client: Option<Arc<EmailClient>>,
     /// CLOB API client for Polymarket.
     pub clob_client: Arc<ClobClient>,
+    /// One token catalog shared by arb, quant, exit workers and API reads.
+    pub market_catalog: Arc<crate::market_catalog::OutcomeTokenCache>,
+    pub inventory_refresh: Arc<tokio::sync::Mutex<()>>,
     /// Order execution engine.
     pub order_executor: Arc<OrderExecutor>,
     /// Circuit breaker for risk management.
@@ -111,6 +213,7 @@ pub struct AppState {
 
 impl AppState {
     /// Create a new application state.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         pool: PgPool,
         jwt_secret: String,
@@ -194,7 +297,9 @@ impl AppState {
                 .unwrap_or(rust_decimal::Decimal::new(100, 0)),
             ..Default::default()
         };
-        let order_executor = Arc::new(OrderExecutor::new(clob_client.clone(), executor_config));
+        let order_executor = Arc::new(
+            OrderExecutor::new(clob_client.clone(), executor_config).with_database(pool.clone()),
+        );
 
         if live_trading {
             tracing::info!(
@@ -202,77 +307,39 @@ impl AppState {
                 live_workspace = live_trading_workspace,
                 "Live trading enabled — initializing wallet"
             );
-            let startup_wallet = resolve_startup_wallet_address(&pool)
-                .await
-                .context("Failed resolving startup trading wallet address")?;
-
-            if let Some(address) = startup_wallet {
-                match key_vault.get_wallet_key(&address).await {
-                    Ok(Some(key_bytes)) => {
-                        let key_hex = format!("0x{}", hex::encode(key_bytes));
-                        match TradingWallet::from_private_key(&key_hex) {
-                            Ok(wallet) => match order_executor.reload_wallet(wallet).await {
-                                Ok(loaded_address) => {
-                                    tracing::info!(wallet = %loaded_address, "Live trading executor initialized from vault");
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "Failed to derive API credentials from vault wallet. Server will start without live trading."
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                tracing::error!(error = %e, "Failed to build trading wallet from vault key bytes");
-                            }
-                        }
+            let configured_address = std::env::var("TRADING_WALLET_ADDRESS").ok();
+            let selected_address =
+                resolve_startup_wallet_address(&pool, configured_address.as_deref())
+                    .await
+                    .context("Failed resolving startup trading wallet address")?;
+            let environment_key = std::env::var("WALLET_PRIVATE_KEY").ok();
+            let startup_wallet = match load_startup_trading_wallet(
+                &key_vault,
+                selected_address.as_deref(),
+                environment_key.as_deref(),
+            )
+            .await
+            {
+                Ok(wallet) => wallet,
+                Err(error) => {
+                    tracing::error!(error = %error, "Trading signer unavailable; correct the configuration and restart");
+                    None
+                }
+            };
+            if let Some(wallet) = startup_wallet.as_ref() {
+                pin_startup_trading_wallet(&pool, &wallet.address_string())
+                    .await
+                    .context("Failed persisting the selected trading signer")?;
+                match order_executor.reload_wallet(wallet.clone()).await {
+                    Ok(address) => {
+                        tracing::info!(wallet = %address, "Initialized configured trading signer")
                     }
-                    Ok(None) => {
-                        tracing::warn!(
-                            address = %address,
-                            "Startup trading wallet was selected but key not found in vault"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            address = %address,
-                            error = %e,
-                            "Failed loading startup trading wallet from vault"
-                        );
+                    Err(error) => {
+                        tracing::error!(error = %error, "Failed to initialize trading credentials; restart after correcting configuration")
                     }
                 }
             } else {
-                tracing::warn!(
-                    "No primary wallet found in vault metadata for live trading startup"
-                );
-            }
-
-            if !order_executor.is_live_ready().await {
-                tracing::warn!(
-                    "Falling back to WALLET_PRIVATE_KEY for live trading wallet initialization"
-                );
-                match TradingWallet::from_env() {
-                    Ok(wallet) => match order_executor.reload_wallet(wallet).await {
-                        Ok(loaded_address) => {
-                            tracing::info!(wallet = %loaded_address, "Live trading executor initialized from WALLET_PRIVATE_KEY");
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "Failed to derive Polymarket API credentials. \
-                                 Server will start without live trading. \
-                                 Use the /api/trading/wallet/reload endpoint to retry."
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "LIVE_TRADING=true but no valid wallet found. \
-                             Server will start without live trading."
-                        );
-                    }
-                }
+                tracing::warn!("No configured trading signer is available; live order execution is unavailable");
             }
 
             // Ensure on-chain Polymarket approvals are set for the trading wallet.
@@ -286,7 +353,7 @@ impl AppState {
                     .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
                 // Build a signer from the same key the executor used
-                let approval_wallet = TradingWallet::from_env().ok();
+                let approval_wallet = startup_wallet.as_ref();
 
                 if let Some(wallet) = approval_wallet {
                     let signer = wallet.signer();
@@ -529,7 +596,18 @@ impl AppState {
         let position_service =
             crate::position_service::PositionService::new(pool.clone(), trade_event_tx.clone());
 
+        let active_clob_markets = Arc::new(RwLock::new(HashSet::new()));
+        let market_catalog = Arc::new(
+            crate::market_catalog::OutcomeTokenCache::new(
+                clob_client.clone(),
+                active_clob_markets.clone(),
+            )
+            .with_pool(pool.clone()),
+        );
+
         Ok(Self {
+            market_catalog,
+            inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
             pool,
             jwt_secret,
             encryption_key,
@@ -552,7 +630,89 @@ impl AppState {
             polygon_client,
             current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
             redis_conn,
-            active_clob_markets: Arc::new(RwLock::new(HashSet::new())),
+            active_clob_markets,
+            arb_executor_config: None,
+            arb_executor_status: Arc::new(RwLock::new(
+                crate::arb_executor::ArbExecutorRuntimeStatus::default(),
+            )),
+            exit_handler_config: None,
+            quant_executor_config: None,
+            arb_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+            exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
+            quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(pool: PgPool) -> Arc<Self> {
+        let jwt_secret = "isolated-http-test-secret-not-production".to_string();
+        let encryption_key = jwt_secret.clone();
+        let jwt_auth = Arc::new(JwtAuth::new(JwtConfig {
+            secret: jwt_secret.clone(),
+            issuer: None,
+            audience: None,
+            expiry_hours: 1,
+        }));
+        let rbac = Arc::new(RbacManager::new());
+        let key_vault = Arc::new(KeyVault::new(
+            auth::key_vault::KeyVaultProvider::Memory,
+            jwt_secret.as_bytes().to_vec(),
+        ));
+        let audit_logger = Arc::new(AuditLogger::new(Arc::new(PostgresAuditStorage::new(
+            pool.clone(),
+        ))));
+        let email_client = None;
+        let clob_client = Arc::new(ClobClient::new(Some("http://127.0.0.1:1".into()), None));
+        let order_executor = Arc::new(
+            OrderExecutor::new(clob_client.clone(), ExecutorConfig::default())
+                .with_database(pool.clone()),
+        );
+        let circuit_breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
+        let trade_event_tx = broadcast::channel(32).0;
+        let position_service =
+            crate::position_service::PositionService::new(pool.clone(), trade_event_tx.clone());
+        let orderbook_tx = broadcast::channel(32).0;
+        let position_tx = broadcast::channel(32).0;
+        let signal_tx = broadcast::channel(32).0;
+        let arb_entry_tx = broadcast::channel(32).0;
+        let quant_signal_tx = broadcast::channel(32).0;
+        let wallet_discovery = Arc::new(WalletDiscovery::from_pool(pool.clone()));
+        let polygon_client = None;
+        let redis_conn = None;
+        let active_clob_markets = Arc::new(RwLock::new(HashSet::new()));
+        let market_catalog = Arc::new(
+            crate::market_catalog::OutcomeTokenCache::new(
+                clob_client.clone(),
+                active_clob_markets.clone(),
+            )
+            .with_pool(pool.clone()),
+        );
+        Arc::new(Self {
+            market_catalog,
+            inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            pool,
+            jwt_secret,
+            encryption_key,
+            jwt_auth,
+            rbac,
+            key_vault,
+            audit_logger,
+            email_client,
+            clob_client,
+            order_executor,
+            circuit_breaker,
+            position_service,
+            orderbook_tx,
+            position_tx,
+            signal_tx,
+            trade_event_tx,
+            arb_entry_tx,
+            quant_signal_tx,
+            wallet_discovery,
+            polygon_client,
+            current_regime: Arc::new(RwLock::new(MarketRegime::Uncertain)),
+            redis_conn,
+            active_clob_markets,
             arb_executor_config: None,
             arb_executor_status: Arc::new(RwLock::new(
                 crate::arb_executor::ArbExecutorRuntimeStatus::default(),
@@ -619,17 +779,8 @@ impl AppState {
     pub fn publish_arb_entry(
         &self,
         arb: ArbOpportunity,
-    ) -> Result<usize, broadcast::error::SendError<ArbOpportunity>> {
-        self.arb_entry_tx.send(arb)
-    }
-
-    /// Activate a vault wallet for live trading without restarting the server.
-    pub async fn activate_trading_wallet(&self, address: &str) -> anyhow::Result<String> {
-        let wallet = self.load_wallet_from_vault(address).await?;
-        self.order_executor
-            .reload_wallet(wallet)
-            .await
-            .with_context(|| format!("Failed to activate trading wallet {}", address))
+    ) -> Result<usize, Box<broadcast::error::SendError<ArbOpportunity>>> {
+        self.arb_entry_tx.send(arb).map_err(Box::new)
     }
 
     /// Load a wallet signer from the secure vault without mutating executor state.
@@ -641,8 +792,13 @@ impl AppState {
             .context("Failed to load wallet key from vault")?
             .ok_or_else(|| anyhow::anyhow!("Wallet key not found in vault for {}", address))?;
         let key_hex = format!("0x{}", hex::encode(key_bytes));
-        TradingWallet::from_private_key(&key_hex)
-            .context("Failed to parse private key from vault payload")
+        let wallet = TradingWallet::from_private_key(&key_hex)
+            .context("Failed to parse private key from vault payload")?;
+        anyhow::ensure!(
+            wallet.address_string().eq_ignore_ascii_case(address),
+            "Stored wallet key does not match its address"
+        );
+        Ok(wallet)
     }
 }
 

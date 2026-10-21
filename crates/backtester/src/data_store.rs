@@ -346,7 +346,7 @@ impl HistoricalDataStore {
                 r#"
                 SELECT
                     market_id,
-                    time_bucket('{}', timestamp) AS bucket,
+                    time_bucket('{0}', timestamp) + INTERVAL '{0}' AS bucket,
                     last(yes_bid, timestamp) as yes_bid,
                     last(yes_ask, timestamp) as yes_ask,
                     last(no_bid, timestamp) as no_bid,
@@ -361,10 +361,12 @@ impl HistoricalDataStore {
                     last(no_spread, timestamp) as no_spread,
                     max(volume_24h) as volume_24h
                 FROM orderbook_snapshots
-                WHERE timestamp >= $1 AND timestamp <= $2
+                WHERE timestamp >= $1 AND timestamp < $2
+                  AND time_bucket('{0}', timestamp) >= $1
+                  AND time_bucket('{0}', timestamp) + INTERVAL '{0}' <= $2
                 GROUP BY market_id, bucket
-                ORDER BY bucket
-                {}
+                ORDER BY bucket, market_id
+                {1}
                 "#,
                 query.resolution.to_pg_interval(),
                 query
@@ -377,7 +379,7 @@ impl HistoricalDataStore {
                 r#"
                 SELECT
                     market_id,
-                    time_bucket('{}', timestamp) AS bucket,
+                    time_bucket('{0}', timestamp) + INTERVAL '{0}' AS bucket,
                     last(yes_bid, timestamp) as yes_bid,
                     last(yes_ask, timestamp) as yes_ask,
                     last(no_bid, timestamp) as no_bid,
@@ -393,10 +395,12 @@ impl HistoricalDataStore {
                     max(volume_24h) as volume_24h
                 FROM orderbook_snapshots
                 WHERE market_id = ANY($3)
-                  AND timestamp >= $1 AND timestamp <= $2
+                  AND timestamp >= $1 AND timestamp < $2
+                  AND time_bucket('{0}', timestamp) >= $1
+                  AND time_bucket('{0}', timestamp) + INTERVAL '{0}' <= $2
                 GROUP BY market_id, bucket
-                ORDER BY bucket
-                {}
+                ORDER BY bucket, market_id
+                {1}
                 "#,
                 query.resolution.to_pg_interval(),
                 query
@@ -422,7 +426,7 @@ impl HistoricalDataStore {
         };
 
         let snapshots: Vec<MarketSnapshot> = rows
-            .iter()
+            .into_iter()
             .map(|row| {
                 use sqlx::Row;
                 MarketSnapshot {
@@ -586,7 +590,7 @@ impl HistoricalDataStore {
 
         // Sort each group by timestamp
         for snapshots in grouped.values_mut() {
-            snapshots.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+            snapshots.sort_by_key(|a| a.timestamp);
         }
 
         grouped

@@ -1014,6 +1014,7 @@ fn validate_model_dates(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_model_payload(
     model_key: &str,
     strategy_scope: &str,
@@ -2626,7 +2627,7 @@ fn merge_journeys(
 ) -> Vec<TradeJourneyResponse> {
     let mut merged: HashMap<String, TradeJourneyResponse> = HashMap::new();
 
-    for row in canonical.into_iter().chain(fallback.into_iter()) {
+    for row in canonical.into_iter().chain(fallback) {
         let key = journey_key(&row, from);
         match merged.remove(&key) {
             Some(existing) => {
@@ -2644,7 +2645,7 @@ fn merge_journeys(
     }
 
     let mut rows: Vec<TradeJourneyResponse> = merged.into_values().collect();
-    rows.sort_by(|a, b| journey_timestamp(b, from).cmp(&journey_timestamp(a, from)));
+    rows.sort_by_key(|row| std::cmp::Reverse(journey_timestamp(row, from)));
     rows.truncate(limit as usize);
     rows
 }
@@ -2684,6 +2685,7 @@ fn build_summary(
     tag = "trade_flow"
 )]
 pub async fn get_trade_flow_summary(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<TradeFlowSummaryResponse>> {
@@ -2715,6 +2717,7 @@ pub async fn get_trade_flow_summary(
     tag = "trade_flow"
 )]
 pub async fn get_trade_flow_journeys(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<Vec<TradeJourneyResponse>>> {
@@ -2757,6 +2760,7 @@ pub async fn get_trade_flow_journeys(
     tag = "trade_flow"
 )]
 pub async fn get_market_trade_flow(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
     Query(query): Query<TradeFlowQuery>,
@@ -2824,6 +2828,7 @@ pub async fn get_market_trade_flow(
     tag = "trade_flow"
 )]
 pub async fn get_arb_market_scorecard(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<ArbMarketScorecardResponse>> {
@@ -2853,6 +2858,7 @@ pub async fn get_arb_market_scorecard(
     tag = "trade_flow"
 )]
 pub async fn get_arb_execution_telemetry(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<ArbExecutionTelemetryResponse>> {
@@ -2913,6 +2919,7 @@ pub async fn get_arb_execution_telemetry(
     tag = "trade_flow"
 )]
 pub async fn get_learning_overview(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<LearningOverviewResponse>> {
@@ -2950,6 +2957,7 @@ pub async fn get_learning_overview(
     tag = "trade_flow"
 )]
 pub async fn get_learning_rollout_detail(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(rollout_id): Path<Uuid>,
     Query(query): Query<TradeFlowQuery>,
@@ -2984,6 +2992,7 @@ pub async fn get_learning_rollout_detail(
     tag = "trade_flow"
 )]
 pub async fn create_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<CreateLearningModelRequest>,
@@ -3079,6 +3088,7 @@ pub async fn create_learning_model(
     tag = "trade_flow"
 )]
 pub async fn update_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3267,6 +3277,7 @@ async fn change_learning_model_status(
     tag = "trade_flow"
 )]
 pub async fn activate_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3290,6 +3301,7 @@ pub async fn activate_learning_model(
     tag = "trade_flow"
 )]
 pub async fn disable_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3313,6 +3325,7 @@ pub async fn disable_learning_model(
     tag = "trade_flow"
 )]
 pub async fn retire_learning_model(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(model_id): Path<Uuid>,
@@ -3336,6 +3349,7 @@ pub async fn retire_learning_model(
     tag = "trade_flow"
 )]
 pub async fn create_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<CreateLearningRolloutRequest>,
@@ -3450,6 +3464,7 @@ pub async fn create_learning_rollout(
     tag = "trade_flow"
 )]
 pub async fn update_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,
@@ -3640,6 +3655,7 @@ async fn change_learning_rollout_status(
     tag = "trade_flow"
 )]
 pub async fn pause_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,
@@ -3667,6 +3683,7 @@ pub async fn pause_learning_rollout(
     tag = "trade_flow"
 )]
 pub async fn resume_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,
@@ -3694,6 +3711,7 @@ pub async fn resume_learning_rollout(
     tag = "trade_flow"
 )]
 pub async fn complete_learning_rollout(
+    _access: crate::workspace_scope::WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(rollout_id): Path<Uuid>,

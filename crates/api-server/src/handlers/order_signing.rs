@@ -93,7 +93,7 @@ pub struct PrepareOrderRequest {
     pub side: String,
     /// Price (0.0 to 1.0 probability).
     pub price: Decimal,
-    /// Size in USDC.
+    /// Number of outcome shares (both BUY and SELL).
     pub size: Decimal,
     /// Maker/signer wallet address.
     pub maker_address: String,
@@ -130,7 +130,16 @@ pub struct OrderSummary {
 
 /// Request to submit a signed order.
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct WalletAuthProof {
+    pub timestamp: u64,
+    pub nonce: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SubmitOrderRequest {
+    /// Fresh wallet-signed ClobAuth proof for this order's maker.
+    pub auth: WalletAuthProof,
     /// The pending order ID from prepare_order.
     pub pending_order_id: String,
     /// The EIP-712 signature from MetaMask.
@@ -175,51 +184,18 @@ struct PendingOrderRow {
 
 /// Generate a random salt for order uniqueness.
 fn generate_salt() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let random_component = (std::process::id() as u128) << 64;
-    format!("{}", timestamp ^ random_component)
+    ((Uuid::new_v4().as_u128() as u64) & ((1u64 << 53) - 1)).to_string()
 }
 
 /// Calculate maker and taker amounts from price and size.
-fn calculate_amounts(side: &str, price: Decimal, size: Decimal) -> (String, String) {
-    // USDC has 6 decimals
-    let usdc_decimals = Decimal::from(1_000_000u64);
-    let size_base = (size * usdc_decimals).round();
-
-    match side.to_uppercase().as_str() {
-        "BUY" => {
-            // Buying tokens: pay size USDC, receive (size / price) tokens
-            let maker_amount = size_base.to_string().replace('.', "");
-            let token_amount = if price > Decimal::ZERO {
-                size / price
-            } else {
-                Decimal::ZERO
-            };
-            let taker_amount = (token_amount * usdc_decimals)
-                .round()
-                .to_string()
-                .replace('.', "");
-            (maker_amount, taker_amount)
-        }
-        "SELL" => {
-            // Selling tokens: provide (size / price) tokens, receive size USDC
-            let token_amount = if price > Decimal::ZERO {
-                size / price
-            } else {
-                Decimal::ZERO
-            };
-            let maker_amount = (token_amount * usdc_decimals)
-                .round()
-                .to_string()
-                .replace('.', "");
-            let taker_amount = size_base.to_string().replace('.', "");
-            (maker_amount, taker_amount)
-        }
-        _ => ("0".to_string(), "0".to_string()),
+fn calculate_amounts(side: &str, price: Decimal, shares: Decimal) -> (String, String) {
+    let scale = Decimal::from(1_000_000u64);
+    let tokens = (shares * scale).trunc().normalize().to_string();
+    let usdc = (shares * price * scale).trunc().normalize().to_string();
+    match side.to_ascii_uppercase().as_str() {
+        "BUY" => (usdc, tokens),
+        "SELL" => (tokens, usdc),
+        _ => ("0".into(), "0".into()),
     }
 }
 
@@ -335,17 +311,37 @@ pub async fn prepare_order(
     }
 
     // Validate size
-    if req.size <= Decimal::ZERO {
-        return Err(ApiError::BadRequest("Size must be positive".into()));
+    if req.size <= Decimal::ZERO
+        || req.size > Decimal::from(1_000_000)
+        || req.size.normalize().scale() > 2
+    {
+        return Err(ApiError::BadRequest(
+            "Share size must be positive, at most 1,000,000, with at most two decimals".into(),
+        ));
     }
 
     // Validate maker address
-    if !req.maker_address.starts_with("0x") || req.maker_address.len() != 42 {
-        return Err(ApiError::BadRequest("Invalid maker address".into()));
-    }
+    req.maker_address
+        .parse::<Address>()
+        .map_err(|_| ApiError::BadRequest("Invalid maker address".into()))?;
+    req.token_id
+        .parse::<alloy_primitives::U256>()
+        .map_err(|_| ApiError::BadRequest("Invalid token ID".into()))?;
+    let (neg_risk, fee_rate) = state
+        .clob_client
+        .get_order_metadata(&req.token_id)
+        .await
+        .map_err(|_| {
+            ApiError::ServiceUnavailable("Exchange contract/fee metadata unavailable".into())
+        })?;
 
     // Calculate expiration
     let expires_in_secs = req.expires_in_secs.unwrap_or(3600); // Default 1 hour
+    if !(60..=86400).contains(&expires_in_secs) {
+        return Err(ApiError::BadRequest(
+            "Order expiry must be between 60 seconds and one day".into(),
+        ));
+    }
     let now = Utc::now();
     let expires_at = now + Duration::seconds(expires_in_secs as i64);
     let expiration_timestamp = expires_at.timestamp() as u64;
@@ -378,16 +374,19 @@ pub async fn prepare_order(
     .bind(&salt)
     .bind(expiration_timestamp as i64)
     .bind("0") // nonce
-    .bind(0i32) // fee_rate_bps
+    .bind(
+        i32::try_from(fee_rate)
+            .map_err(|_| ApiError::ServiceUnavailable("Invalid fee rate".into()))?,
+    ) // fee_rate_bps
     .bind(0i16) // signature_type (EOA)
-    .bind(req.neg_risk)
+    .bind(neg_risk)
     .bind(expires_at)
     .bind(now)
     .execute(&state.pool)
     .await?;
 
     // Build EIP-712 typed data
-    let verifying_contract = if req.neg_risk {
+    let verifying_contract = if neg_risk {
         NEG_RISK_CTF_EXCHANGE_ADDRESS
     } else {
         CTF_EXCHANGE_ADDRESS
@@ -412,7 +411,7 @@ pub async fn prepare_order(
             taker_amount: taker_amount.clone(),
             expiration: expiration_timestamp.to_string(),
             nonce: "0".to_string(),
-            fee_rate_bps: "0".to_string(),
+            fee_rate_bps: fee_rate.to_string(),
             side,
             signature_type: 0, // EOA
         },
@@ -420,9 +419,9 @@ pub async fn prepare_order(
 
     // Build human-readable summary
     let potential_payout = if side_str == "BUY" {
-        req.size / req.price
-    } else {
         req.size
+    } else {
+        req.size * req.price
     };
 
     let summary = OrderSummary {
@@ -433,8 +432,8 @@ pub async fn prepare_order(
             "NO".to_string()
         },
         price: format!("${:.2}", req.price),
-        size: format!("${:.2}", req.size),
-        total_cost: format!("${:.2}", req.size),
+        size: format!("{} shares", req.size),
+        total_cost: format!("${:.2}", req.size * req.price),
         potential_payout: format!("${:.2}", potential_payout),
     };
 
@@ -491,6 +490,25 @@ pub async fn submit_order(
         ApiError::NotFound("Pending order not found or does not belong to you".into())
     })?;
 
+    let previous: Option<(String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT status,response FROM execution_intents WHERE id=$1")
+            .bind(pending_order_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    if let Some((status, response)) = previous {
+        if status == "acknowledged" {
+            if let Some(response) = response {
+                let response: polymarket_core::api::clob::PostOrderResponse =
+                    serde_json::from_value(response)?;
+                return Ok(Json(wallet_submission_response(response)));
+            }
+        }
+        return Err(ApiError::Conflict(
+            "This order was already submitted; reconcile its outcome before placing another order"
+                .into(),
+        ));
+    }
+
     // Check if order has expired
     if Utc::now() > pending_order.expires_at {
         // Delete expired order
@@ -542,6 +560,10 @@ pub async fn submit_order(
     };
 
     let signed_order = SignedOrder {
+        order_hash: Some(format!(
+            "{:#x}",
+            order_digest(&pending_order).map_err(ApiError::BadRequest)?
+        )),
         salt: pending_order.salt.parse::<u64>().unwrap_or(0),
         maker: pending_order.maker_address.clone(),
         signer: pending_order.maker_address.clone(),
@@ -557,165 +579,124 @@ pub async fn submit_order(
         signature: req.signature.clone(),
     };
 
-    // Submit to Polymarket CLOB API
-    let clob_result = submit_to_clob(&state, &signed_order, pending_order.neg_risk).await;
+    verify_wallet_auth(
+        &pending_order.maker_address,
+        &req.auth,
+        Utc::now().timestamp(),
+    )?;
+    let credentials = state
+        .clob_client
+        .derive_external_api_key(
+            &pending_order.maker_address,
+            req.auth.timestamp,
+            req.auth.nonce,
+            &req.auth.signature,
+        )
+        .await
+        .map_err(|_| {
+            ApiError::ServiceUnavailable("Wallet-specific exchange authentication failed".into())
+        })?;
+    let response = state
+        .order_executor
+        .submit_wallet_order(
+            &state.clob_client,
+            pending_order_id,
+            signed_order,
+            &credentials,
+        )
+        .await
+        .map_err(|_| {
+            ApiError::ServiceUnavailable(
+                "Order submission requires reconciliation; keep this pending order ID for retries"
+                    .into(),
+            )
+        })?;
+    Ok(Json(wallet_submission_response(response)))
+}
 
-    // Delete pending order after submission attempt
-    sqlx::query("DELETE FROM pending_wallet_orders WHERE id = $1")
-        .bind(pending_order_id)
-        .execute(&state.pool)
-        .await?;
-
-    match clob_result {
-        Ok(response) => {
-            tracing::info!(
-                user_id = %user_id,
-                pending_order_id = %pending_order_id,
-                order_id = %response.order_id,
-                maker = %pending_order.maker_address,
-                token_id = %pending_order.token_id,
-                side = %side_str,
-                "Order submitted to CLOB successfully"
-            );
-
-            Ok(Json(SubmitOrderResponse {
-                success: true,
-                order_id: Some(response.order_id),
-                message: "Order submitted successfully".to_string(),
-                tx_hash: response.tx_hash,
-            }))
-        }
-        Err(e) => {
-            tracing::error!(
-                user_id = %user_id,
-                pending_order_id = %pending_order_id,
-                maker = %pending_order.maker_address,
-                error = %e,
-                "Failed to submit order to CLOB"
-            );
-
-            // Return error but don't expose internal details
-            Err(ApiError::Internal(format!(
-                "Order submission failed: {}",
-                e
-            )))
-        }
+fn wallet_submission_response(
+    response: polymarket_core::api::clob::PostOrderResponse,
+) -> SubmitOrderResponse {
+    SubmitOrderResponse {
+        success: !response.is_unfilled(),
+        order_id: Some(response.order_id),
+        message: "Exchange response recorded; check order status for confirmed fills".into(),
+        tx_hash: response.transaction_hash,
     }
+}
+
+fn verify_wallet_auth(maker: &str, proof: &WalletAuthProof, now: i64) -> ApiResult<()> {
+    let timestamp = i64::try_from(proof.timestamp)
+        .map_err(|_| ApiError::BadRequest("Invalid authentication timestamp".into()))?;
+    if timestamp < now - 300 || timestamp > now + 30 || proof.nonce != 0 {
+        return Err(ApiError::BadRequest(
+            "Wallet authentication proof is stale or has an unsupported nonce".into(),
+        ));
+    }
+    let maker = maker
+        .parse::<Address>()
+        .map_err(|_| ApiError::BadRequest("Invalid maker".into()))?;
+    let digest =
+        polymarket_core::signing::signer::clob_auth_digest(maker, proof.timestamp, proof.nonce);
+    let recovered = recover_signature(&digest, &proof.signature).map_err(ApiError::BadRequest)?;
+    if recovered != maker {
+        return Err(ApiError::Forbidden(
+            "Authentication proof does not match the order maker".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-/// Response from CLOB submission.
-struct ClobSubmitResponse {
-    order_id: String,
-    tx_hash: Option<String>,
+fn recover_signature(digest: &B256, signature: &str) -> Result<Address, String> {
+    let bytes =
+        hex::decode(signature.trim_start_matches("0x")).map_err(|_| "Invalid signature hex")?;
+    if bytes.len() != 65 {
+        return Err("Signature must be 65 bytes".into());
+    }
+    let r: [u8; 32] = bytes[..32].try_into().unwrap();
+    let s: [u8; 32] = bytes[32..64].try_into().unwrap();
+    recover_address(digest, &r, &s, bytes[64])
 }
 
-/// Verify the EIP-712 signature and recover the signer address.
-fn verify_order_signature(
-    pending_order: &PendingOrderRow,
-    signature: &str,
-) -> Result<Address, String> {
+fn order_digest(pending: &PendingOrderRow) -> Result<B256, String> {
     use alloy_primitives::U256;
-
-    // Parse signature bytes
-    let sig_bytes = hex::decode(signature.trim_start_matches("0x"))
-        .map_err(|e| format!("Invalid signature hex: {}", e))?;
-
-    if sig_bytes.len() != 65 {
-        return Err("Signature must be 65 bytes".to_string());
-    }
-
-    // Extract r, s, v from signature
-    let mut r = [0u8; 32];
-    let mut s = [0u8; 32];
-    r.copy_from_slice(&sig_bytes[0..32]);
-    s.copy_from_slice(&sig_bytes[32..64]);
-    let v = sig_bytes[64];
-
-    // Build the EIP-712 struct hash
-    let order_type_hash = keccak256(
-        b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
-    );
-
-    // Parse order fields
-    let salt = U256::from_str_radix(&pending_order.salt, 10)
-        .map_err(|e| format!("Invalid salt: {}", e))?;
-    let maker: Address = pending_order
-        .maker_address
-        .parse()
-        .map_err(|e| format!("Invalid maker address: {}", e))?;
-    let signer = maker;
-    let taker = Address::ZERO;
-    let token_id = U256::from_str_radix(&pending_order.token_id, 10)
-        .map_err(|e| format!("Invalid token_id: {}", e))?;
-    let maker_amount = U256::from_str_radix(&pending_order.maker_amount, 10)
-        .map_err(|e| format!("Invalid maker_amount: {}", e))?;
-    let taker_amount = U256::from_str_radix(&pending_order.taker_amount, 10)
-        .map_err(|e| format!("Invalid taker_amount: {}", e))?;
-    let expiration = U256::from(pending_order.expiration as u64);
-    let nonce = U256::from_str_radix(&pending_order.nonce, 10).unwrap_or(U256::ZERO);
-    let fee_rate_bps = U256::from(pending_order.fee_rate_bps as u64);
-    let side = U256::from(pending_order.side as u64);
-    let signature_type = U256::from(pending_order.signature_type as u64);
-
-    // Encode struct hash
-    let struct_encoded = (
-        order_type_hash,
-        salt,
-        maker,
-        signer,
-        taker,
-        token_id,
-        maker_amount,
-        taker_amount,
-        expiration,
-        nonce,
-        fee_rate_bps,
-        side,
-        signature_type,
-    )
-        .abi_encode_packed();
-
-    let struct_hash = keccak256(&struct_encoded);
-
-    // Build domain separator
-    let domain_type_hash = keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    );
-    let name_hash = keccak256(b"Polymarket CTF Exchange");
-    let version_hash = keccak256(b"1");
-    let chain_id = U256::from(POLYGON_CHAIN_ID);
-    let verifying_contract: Address = if pending_order.neg_risk {
-        NEG_RISK_CTF_EXCHANGE_ADDRESS
-            .parse()
-            .map_err(|e| format!("Invalid neg-risk exchange address: {}", e))?
-    } else {
-        CTF_EXCHANGE_ADDRESS
-            .parse()
-            .map_err(|e| format!("Invalid exchange address: {}", e))?
+    let number = |value: &str| {
+        U256::from_str_radix(value, 10).map_err(|_| "Invalid order integer".to_string())
     };
+    let maker = pending
+        .maker_address
+        .parse::<Address>()
+        .map_err(|_| "Invalid maker")?;
+    let order = polymarket_core::signing::OrderData {
+        salt: number(&pending.salt)?,
+        maker,
+        signer: maker,
+        taker: Address::ZERO,
+        token_id: number(&pending.token_id)?,
+        maker_amount: number(&pending.maker_amount)?,
+        taker_amount: number(&pending.taker_amount)?,
+        expiration: U256::from(pending.expiration as u64),
+        nonce: number(&pending.nonce)?,
+        fee_rate_bps: U256::from(pending.fee_rate_bps as u64),
+        side: pending.side as u8,
+        signature_type: pending.signature_type as u8,
+    };
+    let domain = if pending.neg_risk {
+        polymarket_core::signing::Eip712Domain::neg_risk_ctf_exchange()
+    } else {
+        polymarket_core::signing::Eip712Domain::ctf_exchange()
+    };
+    Ok(keccak256(
+        ([0x19u8, 0x01u8], domain.separator(), order.struct_hash()).abi_encode_packed(),
+    ))
+}
 
-    let domain_encoded = (
-        domain_type_hash,
-        name_hash,
-        version_hash,
-        chain_id,
-        verifying_contract,
-    )
-        .abi_encode_packed();
-
-    let domain_separator = keccak256(&domain_encoded);
-
-    // Build EIP-712 hash: keccak256("\x19\x01" ++ domainSeparator ++ structHash)
-    let prefix = [0x19u8, 0x01u8];
-    let typed_data = (prefix, domain_separator, struct_hash).abi_encode_packed();
-    let digest = keccak256(&typed_data);
-
-    // Recover the signer address using secp256k1
-    recover_address(&digest, &r, &s, v)
+fn verify_order_signature(pending: &PendingOrderRow, signature: &str) -> Result<Address, String> {
+    recover_signature(&order_digest(pending)?, signature)
 }
 
 /// Recover address from signature using secp256k1.
@@ -755,55 +736,96 @@ fn recover_address(digest: &B256, r: &[u8; 32], s: &[u8; 32], v: u8) -> Result<A
     Ok(Address::from(address_bytes))
 }
 
-/// Submit signed order to Polymarket CLOB API.
-async fn submit_to_clob(
-    state: &Arc<AppState>,
-    signed_order: &SignedOrder,
-    _neg_risk: bool,
-) -> Result<ClobSubmitResponse, String> {
-    // Build request body
-    let request_body = serde_json::json!({
-        "order": signed_order,
-        "orderType": "GTC"
-    });
-
-    // Submit to CLOB
-    let url = format!(
-        "{}/order",
-        polymarket_core::api::ClobClient::DEFAULT_BASE_URL
-    );
-
-    let response = state
-        .clob_client
-        .http_client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("CLOB API error {}: {}", status, body));
+#[cfg(test)]
+mod amount_tests {
+    use super::*;
+    #[tokio::test]
+    async fn browser_order_and_auth_signatures_match_shared_signing_for_both_domains() {
+        let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
+        let now = Utc::now();
+        let signer = polymarket_core::signing::OrderSigner::new(wallet.signer().clone());
+        for neg in [false, true] {
+            let signer = if neg {
+                signer.to_neg_risk()
+            } else {
+                signer.clone()
+            };
+            let salt = generate_salt();
+            assert!(salt.parse::<u64>().unwrap() < (1u64 << 53));
+            let data = signer
+                .order_builder()
+                .token_id_str("1")
+                .side(polymarket_core::signing::OrderSide::Buy)
+                .price(Decimal::new(4, 1))
+                .size(Decimal::TEN)
+                .expires_at((now.timestamp() + 3600) as u64)
+                .build()
+                .unwrap();
+            let signed = signer.sign_order(&data).await.unwrap();
+            let mut pending = PendingOrderRow {
+                id: Uuid::new_v4(),
+                user_id: Uuid::new_v4(),
+                maker_address: wallet.address_string(),
+                token_id: "1".into(),
+                side: 0,
+                maker_amount: signed.maker_amount.clone(),
+                taker_amount: signed.taker_amount.clone(),
+                salt: signed.salt.to_string(),
+                expiration: now.timestamp() + 3600,
+                nonce: "0".into(),
+                fee_rate_bps: 0,
+                signature_type: 0,
+                neg_risk: neg,
+                expires_at: now + Duration::hours(1),
+                created_at: now,
+            };
+            assert_eq!(
+                verify_order_signature(&pending, &signed.signature).unwrap(),
+                wallet.address()
+            );
+            assert_eq!(
+                Some(format!("{:#x}", order_digest(&pending).unwrap())),
+                signed.order_hash
+            );
+            pending.taker_amount = "11000000".into();
+            assert_ne!(
+                verify_order_signature(&pending, &signed.signature).unwrap(),
+                wallet.address()
+            );
+        }
+        let proof = WalletAuthProof {
+            timestamp: now.timestamp() as u64,
+            nonce: 0,
+            signature: signer
+                .sign_clob_auth_message(now.timestamp() as u64, 0)
+                .await
+                .unwrap(),
+        };
+        verify_wallet_auth(&wallet.address_string(), &proof, now.timestamp()).unwrap();
+        assert!(
+            verify_wallet_auth(&wallet.address_string(), &proof, now.timestamp() + 400).is_err()
+        );
+        assert!(verify_wallet_auth(
+            "0x0000000000000000000000000000000000000001",
+            &proof,
+            now.timestamp()
+        )
+        .is_err());
     }
 
-    #[derive(Deserialize)]
-    struct ClobResponse {
-        #[serde(rename = "orderID")]
-        order_id: String,
-        #[serde(rename = "transactionHash")]
-        transaction_hash: Option<String>,
+    #[test]
+    fn share_quantity_and_notional_match_for_buys_and_sells() {
+        assert_eq!(
+            calculate_amounts("BUY", Decimal::new(4, 1), Decimal::TEN),
+            ("4000000".into(), "10000000".into())
+        );
+        assert_eq!(
+            calculate_amounts("SELL", Decimal::new(4, 1), Decimal::TEN),
+            ("10000000".into(), "4000000".into())
+        );
+        assert_eq!(
+            calculate_amounts("BUY", Decimal::new(23, 2), Decimal::new(1025, 2)),
+            ("2357500".into(), "10250000".into())
+        );
     }
-
-    let clob_response: ClobResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse CLOB response: {}", e))?;
-
-    Ok(ClobSubmitResponse {
-        order_id: clob_response.order_id,
-        tx_hash: clob_response.transaction_hash,
-    })
 }

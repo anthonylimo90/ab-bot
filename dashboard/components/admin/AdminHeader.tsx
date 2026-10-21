@@ -58,8 +58,8 @@ export function AdminHeader() {
     };
   }, [isMobileMenuOpen]);
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    if (!(await logout())) return;
     setIsUserMenuOpen(false);
     setIsMobileMenuOpen(false);
     router.push('/admin/login');

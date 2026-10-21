@@ -129,11 +129,11 @@ export function OrderForm({
         {/* Summary */}
         <div className="rounded-lg border bg-muted/30 p-3 space-y-1 text-sm">
           <div className="flex justify-between">
-            <span className="text-muted-foreground">Total Cost</span>
+            <span className="text-muted-foreground">{side === "BUY" ? "Total cost" : "Sale proceeds"}</span>
             <span className="font-medium tabular-nums">{formatCurrency(totalCost)}</span>
           </div>
           <div className="flex justify-between">
-            <span className="text-muted-foreground">Potential Payout</span>
+            <span className="text-muted-foreground">{side === "BUY" ? "Potential profit at resolution" : "Sale proceeds"}</span>
             <span className="font-medium tabular-nums">{formatCurrency(potentialPayout)}</span>
           </div>
           <div className="flex justify-between">

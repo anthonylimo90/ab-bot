@@ -11,7 +11,9 @@ use tracing::warn;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::error::{ApiError, ApiResult};
+use crate::market_catalog::{extract_prices, infer_category};
 use crate::state::AppState;
+use axum::http::{HeaderMap, HeaderValue};
 
 /// Market response.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -84,6 +86,8 @@ pub struct SpreadInfo {
 /// Query parameters for listing markets.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListMarketsQuery {
+    /// Case-insensitive literal question or category search across the catalog.
+    pub search: Option<String>,
     /// Filter by category.
     pub category: Option<String>,
     /// Filter by active status.
@@ -131,125 +135,65 @@ struct MarketRow {
 pub async fn list_markets(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListMarketsQuery>,
-) -> ApiResult<Json<Vec<MarketResponse>>> {
-    // Fetch markets from ClobClient
-    let clob_markets = state.clob_client.get_markets().await.map_err(|e| {
-        warn!(error = %e, "Failed to fetch markets from CLOB");
-        ApiError::Internal(format!("Failed to fetch markets: {}", e))
-    })?;
+) -> ApiResult<(HeaderMap, Json<Vec<MarketResponse>>)> {
+    let observed_at = crate::market_catalog::catalog_observed_at(&state.pool)
+        .await?
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable("Market catalog is warming up; retry shortly".into())
+        })?;
+    let markets = load_market_page(&state.pool, &query).await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-catalog-observed-at",
+        HeaderValue::from_str(&observed_at.to_rfc3339()).unwrap(),
+    );
+    headers.insert(
+        "x-catalog-stale",
+        HeaderValue::from_static(
+            if Utc::now().signed_duration_since(observed_at).num_seconds() > 600 {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+    );
+    Ok((headers, Json(markets)))
+}
 
-    // Filter and transform to response format
-    let now = Utc::now();
-    let mut markets: Vec<MarketResponse> = clob_markets
+async fn load_market_page(
+    pool: &sqlx::PgPool,
+    query: &ListMarketsQuery,
+) -> ApiResult<Vec<MarketResponse>> {
+    if query.offset < 0 || !(1..=500).contains(&query.limit) {
+        return Err(ApiError::BadRequest(
+            "limit must be 1–500 and offset nonnegative".into(),
+        ));
+    }
+    let rows: Vec<MarketRow> = sqlx::query_as(
+        "SELECT id,question,description,category,end_date,active,yes_price,no_price,volume_24h,liquidity,created_at
+         FROM markets WHERE ($1::boolean IS NULL OR active=$1)
+         AND ($2::numeric IS NULL OR volume_24h >= $2)
+         AND ($3::text IS NULL OR strpos(lower(category),lower($3)) > 0)
+         AND ($6::text IS NULL OR strpos(lower(question),lower($6))>0 OR strpos(lower(category),lower($6))>0)
+         ORDER BY id ASC LIMIT $4 OFFSET $5"
+    ).bind(query.active).bind(query.min_volume).bind(&query.category)
+        .bind(query.limit).bind(query.offset).bind(query.search.as_deref().map(str::trim).filter(|s| !s.is_empty())).fetch_all(pool).await?;
+    Ok(rows
         .into_iter()
-        .filter(|m| {
-            // Filter by active status (not resolved)
-            let active = !m.resolved;
-            if let Some(q_active) = query.active {
-                if active != q_active {
-                    return false;
-                }
-            }
-
-            // Filter by minimum volume
-            if let Some(min_vol) = query.min_volume {
-                if m.volume < min_vol {
-                    return false;
-                }
-            }
-
-            true
+        .map(|row| MarketResponse {
+            id: row.id,
+            question: row.question,
+            description: row.description,
+            category: row.category,
+            end_date: row.end_date,
+            active: row.active,
+            yes_price: row.yes_price,
+            no_price: row.no_price,
+            volume_24h: row.volume_24h,
+            liquidity: row.liquidity,
+            created_at: row.created_at,
         })
-        .map(|m| {
-            let (yes_price, no_price) = extract_prices(&m.outcomes);
-            let category = infer_category(&m.question);
-
-            MarketResponse {
-                id: m.id,
-                question: m.question,
-                description: m.description,
-                category,
-                end_date: m.end_date.unwrap_or(now + chrono::Duration::days(365)),
-                active: !m.resolved,
-                yes_price,
-                no_price,
-                volume_24h: m.volume,
-                liquidity: m.liquidity,
-                created_at: now, // CLOB doesn't provide created_at
-            }
-        })
-        .collect();
-
-    // Apply category filter
-    if let Some(ref cat) = query.category {
-        markets.retain(|m| m.category.to_lowercase().contains(&cat.to_lowercase()));
-    }
-
-    // Apply pagination
-    let total = markets.len();
-    let offset = query.offset as usize;
-    let limit = query.limit as usize;
-
-    if offset < total {
-        markets = markets.into_iter().skip(offset).take(limit).collect();
-    } else {
-        markets = Vec::new();
-    }
-
-    Ok(Json(markets))
-}
-
-/// Infer category from market question.
-fn infer_category(question: &str) -> String {
-    let q = question.to_lowercase();
-
-    if q.contains("bitcoin") || q.contains("btc") || q.contains("ethereum") || q.contains("crypto")
-    {
-        "crypto".to_string()
-    } else if q.contains("president")
-        || q.contains("election")
-        || q.contains("congress")
-        || q.contains("senate")
-    {
-        "politics".to_string()
-    } else if q.contains("nfl")
-        || q.contains("nba")
-        || q.contains("world cup")
-        || q.contains("super bowl")
-    {
-        "sports".to_string()
-    } else if q.contains("stock") || q.contains("s&p") || q.contains("nasdaq") || q.contains("fed")
-    {
-        "finance".to_string()
-    } else if q.contains("ai")
-        || q.contains("openai")
-        || q.contains("google")
-        || q.contains("apple")
-    {
-        "tech".to_string()
-    } else {
-        "other".to_string()
-    }
-}
-
-/// Extract yes/no prices from market outcomes.
-///
-/// Looks for outcomes named "Yes" and "No" and returns their CLOB prices.
-/// Falls back to 0.50/0.50 if prices are unavailable.
-fn extract_prices(outcomes: &[polymarket_core::types::Outcome]) -> (Decimal, Decimal) {
-    let yes = outcomes
-        .iter()
-        .find(|o| o.name.to_lowercase().contains("yes"))
-        .and_then(|o| o.price)
-        .unwrap_or(Decimal::new(50, 2));
-
-    let no = outcomes
-        .iter()
-        .find(|o| o.name.to_lowercase().contains("no"))
-        .and_then(|o| o.price)
-        .unwrap_or(Decimal::new(50, 2));
-
-    (yes, no)
+        .collect())
 }
 
 /// Get a specific market.
@@ -346,90 +290,16 @@ pub async fn get_market_orderbook(
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<OrderbookResponse>> {
-    // Fetch the specific market by condition ID (avoids loading all 5000+ markets)
-    let market = state
-        .clob_client
-        .get_market_by_id(&market_id)
+    let (yes_token, no_token) = state
+        .market_catalog
+        .hydrate_market(&market_id)
         .await
-        .map_err(|e| {
-            warn!(error = %e, market_id = %market_id, "Failed to fetch market from CLOB");
-            ApiError::NotFound(format!("Market {} not found", market_id))
-        })?;
-
-    // Get token IDs for yes/no outcomes
-    let (yes_token, no_token) = if market.outcomes.len() >= 2 {
-        let yes = market
-            .outcomes
-            .iter()
-            .find(|o| o.name.to_lowercase().contains("yes"));
-        let no = market
-            .outcomes
-            .iter()
-            .find(|o| o.name.to_lowercase().contains("no"));
-        (
-            yes.map(|o| o.token_id.clone()),
-            no.map(|o| o.token_id.clone()),
-        )
-    } else {
-        (None, None)
-    };
-
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("Market {market_id} not found")))?;
     let now = Utc::now();
-
-    // Fetch orderbooks for both outcomes
-    let (yes_bids, yes_asks) = if let Some(token_id) = yes_token {
-        match state.clob_client.get_order_book(&token_id).await {
-            Ok(book) => (
-                book.bids
-                    .into_iter()
-                    .map(|p| PriceLevel {
-                        price: p.price,
-                        quantity: p.size,
-                    })
-                    .collect(),
-                book.asks
-                    .into_iter()
-                    .map(|p| PriceLevel {
-                        price: p.price,
-                        quantity: p.size,
-                    })
-                    .collect(),
-            ),
-            Err(e) => {
-                warn!(error = %e, token_id = %token_id, "Failed to fetch yes orderbook");
-                (Vec::new(), Vec::new())
-            }
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    let (no_bids, no_asks) = if let Some(token_id) = no_token {
-        match state.clob_client.get_order_book(&token_id).await {
-            Ok(book) => (
-                book.bids
-                    .into_iter()
-                    .map(|p| PriceLevel {
-                        price: p.price,
-                        quantity: p.size,
-                    })
-                    .collect(),
-                book.asks
-                    .into_iter()
-                    .map(|p| PriceLevel {
-                        price: p.price,
-                        quantity: p.size,
-                    })
-                    .collect(),
-            ),
-            Err(e) => {
-                warn!(error = %e, token_id = %token_id, "Failed to fetch no orderbook");
-                (Vec::new(), Vec::new())
-            }
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (yes, no) = fetch_orderbook_pair(state.clob_client.as_ref(), &yes_token, &no_token).await;
+    let (yes_bids, yes_asks) = yes;
+    let (no_bids, no_asks) = no;
 
     // Calculate spreads
     let yes_spread = calculate_spread(&yes_bids, &yes_asks);
@@ -451,6 +321,43 @@ pub async fn get_market_orderbook(
     };
 
     Ok(Json(orderbook))
+}
+
+async fn fetch_orderbook_pair(
+    client: &polymarket_core::api::ClobClient,
+    yes: &str,
+    no: &str,
+) -> (
+    (Vec<PriceLevel>, Vec<PriceLevel>),
+    (Vec<PriceLevel>, Vec<PriceLevel>),
+) {
+    let (yes_book, no_book) = tokio::join!(client.get_order_book(yes), client.get_order_book(no));
+    let levels = |result: polymarket_core::Result<polymarket_core::types::OrderBook>,
+                  token_id: &str| {
+        match result {
+            Ok(book) => (
+                book.bids
+                    .into_iter()
+                    .map(|p| PriceLevel {
+                        price: p.price,
+                        quantity: p.size,
+                    })
+                    .collect(),
+                book.asks
+                    .into_iter()
+                    .map(|p| PriceLevel {
+                        price: p.price,
+                        quantity: p.size,
+                    })
+                    .collect(),
+            ),
+            Err(error) => {
+                warn!(%error,token_id,"Failed to fetch outcome orderbook");
+                (Vec::new(), Vec::new())
+            }
+        }
+    };
+    (levels(yes_book, yes), levels(no_book, no))
 }
 
 /// Calculate bid-ask spread.
@@ -483,6 +390,98 @@ fn calculate_arb_spread(yes_asks: &[PriceLevel], no_asks: &[PriceLevel]) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn orderbook_pair_fetches_concurrently_and_keeps_healthy_side() {
+        use axum::{response::IntoResponse, routing::get, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let failing = Arc::new(AtomicBool::new(false));
+        let fail = failing.clone();
+        let app=Router::new().route("/book",get(move |Query(params):Query<std::collections::HashMap<String,String>>| {
+            let barrier=barrier.clone();let fail=fail.clone();async move {
+                // A sequential implementation cannot get past this barrier.
+                barrier.wait().await;
+                let token=&params["token_id"];
+                if token=="no" && fail.load(Ordering::SeqCst) {
+                    return axum::http::StatusCode::BAD_REQUEST.into_response();
+                }
+                Json(serde_json::json!({"market":"market","asset_id":token,"timestamp":"2026-10-19T00:00:00Z",
+                    "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.5","size":"20"}]})).into_response()
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = polymarket_core::api::ClobClient::new(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            None,
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (yes, no) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fetch_orderbook_pair(&client, "yes", "no"),
+        )
+        .await
+        .unwrap();
+        assert_eq!((yes.0.len(), no.0.len()), (1, 1));
+        failing.store(true, Ordering::SeqCst);
+        let (yes, no) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fetch_orderbook_pair(&client, "yes", "no"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(yes.0.len(), 1);
+        assert!(no.0.is_empty());
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn catalog_pages_filter_before_limit_and_include_inactive_history(pool: sqlx::PgPool) {
+        use sqlx::Executor;
+        let schema = include_str!("../../../../migrations/005_api_server_tables.sql");
+        pool.execute(
+            schema
+                .split("CREATE TABLE IF NOT EXISTS orders")
+                .next()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        pool.execute(
+            "INSERT INTO markets(id,question,category,end_date,active,volume_24h) VALUES
+            ('c','Third','crypto',NOW(),TRUE,30),('a','First','crypto',NOW(),FALSE,10),
+            ('b','Second','sports',NOW(),TRUE,20)",
+        )
+        .await
+        .unwrap();
+        let mut query = ListMarketsQuery {
+            search: None,
+            category: None,
+            active: None,
+            min_volume: None,
+            limit: 1,
+            offset: 0,
+        };
+        assert_eq!(load_market_page(&pool, &query).await.unwrap()[0].id, "a");
+        query.offset = 1;
+        assert_eq!(load_market_page(&pool, &query).await.unwrap()[0].id, "b");
+        query.active = Some(true);
+        query.category = Some("CRYP".into());
+        query.offset = 0;
+        assert_eq!(load_market_page(&pool, &query).await.unwrap()[0].id, "c");
+        query.min_volume = Some(Decimal::from(31));
+        assert!(load_market_page(&pool, &query).await.unwrap().is_empty());
+        pool.execute("INSERT INTO markets(id,question,category,end_date,active,volume_24h) SELECT 'prefix-'||n,'Unrelated','sports',NOW(),TRUE,10 FROM generate_series(1,150) n; INSERT INTO markets(id,question,category,end_date,active,volume_24h) VALUES ('zz-target','Rare needle question','science',NOW(),TRUE,50)").await.unwrap();
+        query.category = None;
+        query.min_volume = None;
+        query.search = Some("NEEDLE".into());
+        assert_eq!(
+            load_market_page(&pool, &query).await.unwrap()[0].id,
+            "zz-target"
+        );
+        query.offset = -1;
+        assert!(load_market_page(&pool, &query).await.is_err());
+    }
 
     #[test]
     fn test_market_response_serialization() {

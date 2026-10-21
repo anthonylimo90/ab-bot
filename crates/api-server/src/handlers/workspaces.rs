@@ -282,10 +282,21 @@ fn validate_invite_email(email: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn extract_optional_claims(state: &AppState, headers: &HeaderMap) -> Option<Claims> {
-    let auth_header = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let token = auth_header.strip_prefix("Bearer ")?;
-    state.jwt_auth.validate_token(token).ok()
+async fn extract_optional_claims(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> ApiResult<Option<Claims>> {
+    let Some(header) = headers.get(AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let token = header
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("Invalid authorization header".into()))?;
+    crate::middleware::authorize_session(&state.pool, &state.jwt_auth, token)
+        .await
+        .map(Some)
 }
 
 /// Get user's role in a workspace.
@@ -1360,6 +1371,8 @@ pub async fn accept_invite(
         ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
     })?;
 
+    let claims = extract_optional_claims(&state, &headers).await?;
+
     let invite = sqlx::query_as::<_, InviteLookupRow>(
         r#"
         SELECT
@@ -1390,7 +1403,6 @@ pub async fn accept_invite(
         return Err(ApiError::Gone("Invite has expired".into()));
     }
 
-    let claims = extract_optional_claims(&state, &headers);
     let requested_email = req
         .email
         .as_deref()

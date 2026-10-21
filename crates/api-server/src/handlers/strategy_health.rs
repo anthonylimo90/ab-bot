@@ -99,6 +99,7 @@ struct StrategyHealthRow {
     )
 )]
 pub async fn get_strategy_health(
+    _access: crate::workspace_scope::WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<StrategyHealthQuery>,
 ) -> ApiResult<Json<StrategyHealthResponse>> {

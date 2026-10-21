@@ -5,6 +5,7 @@ import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
 
 interface MarketFilters {
+  search?: string;
   category?: string;
   active?: boolean;
   min_volume?: number;
@@ -29,12 +30,12 @@ export function useMarketQuery(marketId: string | null) {
   });
 }
 
-export function useOrderbookQuery(marketId: string | null, enabled = true) {
+export function useOrderbookQuery(marketId: string | null, enabled = true, live = false) {
   return useQuery({
     queryKey: queryKeys.markets.orderbook(marketId ?? ""),
     queryFn: () => api.getOrderbook(marketId!),
     enabled: !!marketId && enabled,
     staleTime: 10_000,
-    refetchInterval: 15_000,
+    refetchInterval: live ? 60_000 : 15_000,
   });
 }

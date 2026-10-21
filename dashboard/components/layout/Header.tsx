@@ -157,8 +157,8 @@ export function Header() {
     setIsMobileMenuOpen(false);
   }, [pathname]);
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    if (!(await logout())) return;
     setIsUserMenuOpen(false);
     setIsMobileMenuOpen(false);
     router.push("/login");

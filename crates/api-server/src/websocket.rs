@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use crate::state::AppState;
@@ -104,7 +104,7 @@ pub enum WsMessage {
     /// Trading signal.
     Signal(SignalUpdate),
     /// Canonical trade lifecycle event.
-    TradeFlow(TradeEventUpdate),
+    TradeFlow(Box<TradeEventUpdate>),
     /// Subscription confirmation.
     Subscribed {
         channel: String,
@@ -141,423 +141,325 @@ pub enum WsRequest {
     Ping,
 }
 
-/// WebSocket upgrade handler for orderbook updates.
+// Browser clients authenticate in the first frame, keeping tokens out of URLs
+// and access logs. No private receiver is subscribed until this succeeds.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum AuthenticationFrame {
+    Authenticate { token: String },
+}
+
+async fn authorize_stream_token(
+    pool: &sqlx::PgPool,
+    jwt: &auth::jwt::JwtAuth,
+    token: &str,
+) -> crate::error::ApiResult<()> {
+    crate::workspace_scope::authorize_workspace_session(pool, jwt, token).await
+}
+
+async fn authenticate_socket(socket: &mut WebSocket, state: &SocketState) -> Option<String> {
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv()).await;
+    if let Ok(Some(Ok(Message::Text(text)))) = frame {
+        if let Ok(AuthenticationFrame::Authenticate { token }) = serde_json::from_str(&text) {
+            if authorize_stream_token(&state.pool, &state.jwt_auth, &token)
+                .await
+                .is_ok()
+            {
+                return Some(token);
+            }
+        }
+    }
+    let _ = socket
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1008,
+            reason: "Workspace authentication required".into(),
+        })))
+        .await;
+    None
+}
+
+/// Transport state kept separate from the full app for protocol-level tests.
+#[derive(Clone)]
+struct SocketState {
+    pool: sqlx::PgPool,
+    jwt_auth: Arc<auth::jwt::JwtAuth>,
+    orderbook: broadcast::Sender<OrderbookUpdate>,
+    positions: broadcast::Sender<PositionUpdate>,
+    signals: broadcast::Sender<SignalUpdate>,
+    trade_flow: broadcast::Sender<TradeEventUpdate>,
+    auth_interval: std::time::Duration,
+}
+
+impl From<&AppState> for SocketState {
+    fn from(state: &AppState) -> Self {
+        Self {
+            pool: state.pool.clone(),
+            jwt_auth: state.jwt_auth.clone(),
+            orderbook: state.orderbook_tx.clone(),
+            positions: state.position_tx.clone(),
+            signals: state.signal_tx.clone(),
+            trade_flow: state.trade_event_tx.clone(),
+            auth_interval: std::time::Duration::from_secs(15),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Channel {
+    Orderbook,
+    Positions,
+    Signals,
+    TradeFlow,
+    All,
+}
+impl Channel {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Orderbook => "orderbook",
+            Self::Positions => "positions",
+            Self::Signals => "signals",
+            Self::TradeFlow => "trade-flow",
+            Self::All => "all",
+        }
+    }
+    fn private(self) -> bool {
+        !matches!(self, Self::Orderbook)
+    }
+}
+
+fn upgrade(ws: WebSocketUpgrade, state: Arc<AppState>, channel: Channel) -> Response {
+    let state = SocketState::from(state.as_ref());
+    ws.on_upgrade(move |socket| handle_socket(socket, state, channel))
+}
+
 pub async fn ws_orderbook_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_orderbook_socket(socket, state))
+    upgrade(ws, state, Channel::Orderbook)
 }
-
-/// WebSocket upgrade handler for position updates.
 pub async fn ws_positions_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_positions_socket(socket, state))
+    upgrade(ws, state, Channel::Positions)
 }
-
-/// WebSocket upgrade handler for trading signals.
 pub async fn ws_signals_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_signals_socket(socket, state))
+    upgrade(ws, state, Channel::Signals)
 }
-
-/// WebSocket upgrade handler for canonical trade-flow events.
 pub async fn ws_trade_flow_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_trade_flow_socket(socket, state))
+    upgrade(ws, state, Channel::TradeFlow)
 }
-
-/// WebSocket upgrade handler for all updates (multiplexed).
 pub async fn ws_all_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
-    ws.on_upgrade(move |socket| handle_all_socket(socket, state))
+    upgrade(ws, state, Channel::All)
 }
 
-async fn handle_orderbook_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut orderbook_rx = state.subscribe_orderbook();
-
-    info!("WebSocket client connected to orderbook channel");
-
-    // Send subscription confirmation
-    let msg = WsMessage::Subscribed {
-        channel: "orderbook".to_string(),
-    };
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = sender.send(Message::Text(json)).await;
+struct Subscriptions {
+    orderbook: Option<broadcast::Receiver<OrderbookUpdate>>,
+    positions: Option<broadcast::Receiver<PositionUpdate>>,
+    signals: Option<broadcast::Receiver<SignalUpdate>>,
+    trade_flow: Option<broadcast::Receiver<TradeEventUpdate>>,
+}
+impl Subscriptions {
+    fn new(state: &SocketState, channel: Channel) -> Self {
+        Self {
+            orderbook: matches!(channel, Channel::Orderbook | Channel::All)
+                .then(|| state.orderbook.subscribe()),
+            positions: matches!(channel, Channel::Positions | Channel::All)
+                .then(|| state.positions.subscribe()),
+            signals: matches!(channel, Channel::Signals | Channel::All)
+                .then(|| state.signals.subscribe()),
+            trade_flow: matches!(channel, Channel::TradeFlow | Channel::All)
+                .then(|| state.trade_flow.subscribe()),
+        }
     }
+    async fn next(&mut self) -> Result<WsMessage, (&'static str, broadcast::error::RecvError)> {
+        tokio::select! {
+            event=receive(&mut self.orderbook)=>event.map(WsMessage::Orderbook).map_err(|e|("orderbook",e)),
+            event=receive(&mut self.positions)=>event.map(WsMessage::Position).map_err(|e|("positions",e)),
+            event=receive(&mut self.signals)=>event.map(WsMessage::Signal).map_err(|e|("signals",e)),
+            event=receive(&mut self.trade_flow)=>event.map(|e|WsMessage::TradeFlow(Box::new(e))).map_err(|e|("trade-flow",e)),
+        }
+    }
+}
+async fn receive<T: Clone>(
+    rx: &mut Option<broadcast::Receiver<T>>,
+) -> Result<T, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
+type SocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
+async fn send(sender: &mut SocketSender, message: WsMessage) -> bool {
+    match serde_json::to_string(&message) {
+        Ok(json) => sender.send(Message::Text(json)).await.is_ok(),
+        Err(_) => false,
+    }
+}
+async fn authorized(state: &SocketState, token: &Option<String>) -> bool {
+    match token {
+        Some(token) => authorize_stream_token(&state.pool, &state.jwt_auth, token)
+            .await
+            .is_ok(),
+        None => true,
+    }
+}
+async fn policy_close(sender: &mut SocketSender) {
+    let _ = sender
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1008,
+            reason: "Workspace session no longer authorized".into(),
+        })))
+        .await;
+}
+
+async fn handle_socket(mut socket: WebSocket, state: SocketState, channel: Channel) {
+    let token = if channel.private() {
+        let Some(token) = authenticate_socket(&mut socket, &state).await else {
+            return;
+        };
+        Some(token)
+    } else {
+        None
+    };
+    // Subscribe only after authorization succeeds, including multiplexed streams.
+    let mut subscriptions = Subscriptions::new(&state, channel);
+    let (mut sender, mut receiver) = socket.split();
+    if !send(
+        &mut sender,
+        WsMessage::Subscribed {
+            channel: channel.name().into(),
+        },
+    )
+    .await
+    {
+        return;
+    }
+    let mut auth_check = tokio::time::interval_at(
+        tokio::time::Instant::now() + state.auth_interval,
+        state.auth_interval,
+    );
+    auth_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    info!(channel = channel.name(), "WebSocket client connected");
     loop {
         tokio::select! {
-            // Handle incoming messages from client
-            Some(msg) = receiver.next() => {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(WsRequest::Ping) = serde_json::from_str::<WsRequest>(&text) {
-                            let pong = WsMessage::Pong;
-                            if let Ok(json) = serde_json::to_string(&pong) {
-                                let _ = sender.send(Message::Text(json)).await;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => {
-                        debug!("WebSocket client disconnected from orderbook");
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "WebSocket error");
-                        break;
-                    }
-                    _ => {}
-                }
+            _=auth_check.tick(),if token.is_some()=>{
+                if !authorized(&state,&token).await {policy_close(&mut sender).await;break}
             }
-            // Handle orderbook updates
-            result = orderbook_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::Orderbook(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Orderbook WebSocket client lagged by {n} messages, resuming");
-                        // Notify client about missed messages
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} orderbook updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+            incoming=receiver.next()=>match incoming {
+                Some(Ok(Message::Text(text)))=>{
+                    if matches!(serde_json::from_str::<WsRequest>(&text),Ok(WsRequest::Ping))
+                        && !send(&mut sender,WsMessage::Pong).await {break}
                 }
+                None|Some(Ok(Message::Close(_)))|Some(Err(_))=>break,
+                _=>{},
+            },
+            event=subscriptions.next()=>{
+                if !authorized(&state,&token).await {policy_close(&mut sender).await;break}
+                let message=match event {
+                    Ok(message)=>message,
+                    Err((stream,broadcast::error::RecvError::Lagged(n)))=>{
+                        warn!(channel=channel.name(),stream,missed=n,"WebSocket client lagged");
+                        WsMessage::Error{code:"LAGGED".into(),message:format!("Missed {n} {stream} updates")}
+                    }
+                    Err((_,broadcast::error::RecvError::Closed))=>break,
+                };
+                if !send(&mut sender,message).await {break}
             }
         }
     }
-
-    info!("WebSocket client disconnected from orderbook channel");
+    info!(channel = channel.name(), "WebSocket client disconnected");
 }
 
-async fn handle_positions_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut position_rx = state.subscribe_positions();
-
-    info!("WebSocket client connected to positions channel");
-
-    let msg = WsMessage::Subscribed {
-        channel: "positions".to_string(),
-    };
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = sender.send(Message::Text(json)).await;
-    }
-
-    loop {
-        tokio::select! {
-            Some(msg) = receiver.next() => {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(WsRequest::Ping) = serde_json::from_str(&text) {
-                            let pong = WsMessage::Pong;
-                            if let Ok(json) = serde_json::to_string(&pong) {
-                                let _ = sender.send(Message::Text(json)).await;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => break,
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
-            result = position_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::Position(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Positions WebSocket client lagged by {n} messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} position updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-
-    info!("WebSocket client disconnected from positions channel");
-}
-
-async fn handle_signals_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut signal_rx = state.subscribe_signals();
-
-    info!("WebSocket client connected to signals channel");
-
-    let msg = WsMessage::Subscribed {
-        channel: "signals".to_string(),
-    };
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = sender.send(Message::Text(json)).await;
-    }
-
-    loop {
-        tokio::select! {
-            Some(msg) = receiver.next() => {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(WsRequest::Ping) = serde_json::from_str(&text) {
-                            let pong = WsMessage::Pong;
-                            if let Ok(json) = serde_json::to_string(&pong) {
-                                let _ = sender.send(Message::Text(json)).await;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => break,
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
-            result = signal_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::Signal(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Signals WebSocket client lagged by {n} messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} signal updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-
-    info!("WebSocket client disconnected from signals channel");
-}
-
-async fn handle_all_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut orderbook_rx = state.subscribe_orderbook();
-    let mut position_rx = state.subscribe_positions();
-    let mut signal_rx = state.subscribe_signals();
-    let mut trade_flow_rx = state.subscribe_trade_events();
-
-    info!("WebSocket client connected to all channels");
-
-    let msg = WsMessage::Subscribed {
-        channel: "all".to_string(),
-    };
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = sender.send(Message::Text(json)).await;
-    }
-
-    loop {
-        tokio::select! {
-            Some(msg) = receiver.next() => {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(WsRequest::Ping) = serde_json::from_str(&text) {
-                            let pong = WsMessage::Pong;
-                            if let Ok(json) = serde_json::to_string(&pong) {
-                                let _ = sender.send(Message::Text(json)).await;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => break,
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
-            result = orderbook_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::Orderbook(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("All-channel WebSocket client lagged by {n} orderbook messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} orderbook updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            result = position_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::Position(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("All-channel WebSocket client lagged by {n} position messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} position updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            result = signal_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::Signal(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("All-channel WebSocket client lagged by {n} signal messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} signal updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            result = trade_flow_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::TradeFlow(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("All-channel WebSocket client lagged by {n} trade-flow messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} trade-flow updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-
-    info!("WebSocket client disconnected from all channels");
-}
-
-async fn handle_trade_flow_socket(socket: WebSocket, state: Arc<AppState>) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut trade_flow_rx = state.subscribe_trade_events();
-
-    info!("WebSocket client connected to trade-flow channel");
-
-    let msg = WsMessage::Subscribed {
-        channel: "trade-flow".to_string(),
-    };
-    if let Ok(json) = serde_json::to_string(&msg) {
-        let _ = sender.send(Message::Text(json)).await;
-    }
-
-    loop {
-        tokio::select! {
-            Some(msg) = receiver.next() => {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(WsRequest::Ping) = serde_json::from_str(&text) {
-                            let pong = WsMessage::Pong;
-                            if let Ok(json) = serde_json::to_string(&pong) {
-                                let _ = sender.send(Message::Text(json)).await;
-                            }
-                        }
-                    }
-                    Ok(Message::Close(_)) => break,
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
-            result = trade_flow_rx.recv() => {
-                match result {
-                    Ok(update) => {
-                        let msg = WsMessage::TradeFlow(update);
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            if sender.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Trade-flow WebSocket client lagged by {n} messages, resuming");
-                        let err_msg = WsMessage::Error {
-                            code: "LAGGED".to_string(),
-                            message: format!("Missed {n} trade-flow updates"),
-                        };
-                        if let Ok(json) = serde_json::to_string(&err_msg) {
-                            let _ = sender.send(Message::Text(json)).await;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-
-    info!("WebSocket client disconnected from trade-flow channel");
-}
+#[cfg(test)]
+#[path = "websocket/socket_tests.rs"]
+mod socket_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn private_stream_requires_valid_token_and_current_canonical_membership(
+        pool: sqlx::PgPool,
+    ) {
+        use sqlx::Executor;
+        pool.execute("CREATE TABLE workspaces (id UUID PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), trading_wallet_address TEXT, live_trading_enabled BOOLEAN DEFAULT true, exit_handler_enabled BOOLEAN DEFAULT false, arb_auto_execute BOOLEAN DEFAULT false); CREATE TABLE workspace_members (workspace_id UUID, user_id UUID, role TEXT)").await.unwrap();
+        let workspace = uuid::Uuid::new_v4();
+        let user = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO workspaces (id) VALUES ($1)")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let jwt = auth::jwt::JwtAuth::new(auth::jwt::JwtConfig {
+            secret: "stream-test-secret-with-at-least-32-bytes".into(),
+            expiry_hours: 1,
+            issuer: None,
+            audience: None,
+        });
+        pool.execute("CREATE TABLE users (id UUID PRIMARY KEY, role SMALLINT DEFAULT 0, auth_version BIGINT DEFAULT 0); CREATE TABLE revoked_sessions (jti TEXT)").await.unwrap();
+        sqlx::query("INSERT INTO users (id) VALUES ($1)")
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let token = jwt
+            .create_token(&user.to_string(), auth::UserRole::Viewer)
+            .unwrap();
+        assert!(authorize_stream_token(&pool, &jwt, "invalid")
+            .await
+            .is_err());
+        assert!(authorize_stream_token(&pool, &jwt, &token).await.is_err());
+        sqlx::query("INSERT INTO workspace_members VALUES ($1, $2, 'viewer')")
+            .bind(workspace)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(authorize_stream_token(&pool, &jwt, &token).await.is_ok());
+        // The joined query must enforce the same persistent revocations as HTTP.
+        for mutation in [
+            "UPDATE users SET auth_version=1",
+            "UPDATE users SET role=1",
+            "UPDATE workspace_members SET role='invalid'",
+        ] {
+            pool.execute(mutation).await.unwrap();
+            assert!(authorize_stream_token(&pool, &jwt, &token).await.is_err());
+            pool.execute("UPDATE users SET auth_version=0, role=0; UPDATE workspace_members SET role='viewer'")
+                .await.unwrap();
+            assert!(authorize_stream_token(&pool, &jwt, &token).await.is_ok());
+        }
+        let claims = jwt.validate_token(&token).unwrap();
+        sqlx::query("INSERT INTO revoked_sessions VALUES ($1)")
+            .bind(&claims.jti)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(authorize_stream_token(&pool, &jwt, &token).await.is_err());
+        pool.execute("DELETE FROM revoked_sessions").await.unwrap();
+        let expired = auth::Claims::new(user.to_string(), auth::UserRole::Viewer, -1);
+        assert!(authorize_stream_token(
+            &pool,
+            &jwt,
+            &jwt.create_token_with_claims(&expired).unwrap()
+        )
+        .await
+        .is_err());
+        pool.execute("DELETE FROM workspace_members").await.unwrap();
+        assert!(authorize_stream_token(&pool, &jwt, &token).await.is_err());
+        pool.execute("DELETE FROM users").await.unwrap();
+        assert!(authorize_stream_token(&pool, &jwt, &token).await.is_err());
+        assert!(serde_json::from_str::<AuthenticationFrame>(r#"{"action":"ping"}"#).is_err());
+    }
 
     #[test]
     fn test_ws_message_serialization() {
@@ -635,7 +537,7 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        let msg = WsMessage::TradeFlow(update);
+        let msg = WsMessage::TradeFlow(Box::new(update));
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("TradeFlow"));
         assert!(json.contains("signal_generated"));

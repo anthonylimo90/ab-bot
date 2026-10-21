@@ -299,7 +299,7 @@ pub async fn get_rotation_recommendations(
     }
 
     // Sort by urgency (high first) then by date
-    recommendations.sort_by(|a, b| b.urgency.cmp(&a.urgency));
+    recommendations.sort_by_key(|recommendation| std::cmp::Reverse(recommendation.urgency));
 
     // Apply limit
     recommendations.truncate(limit as usize);

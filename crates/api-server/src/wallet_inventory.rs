@@ -10,7 +10,6 @@ use polymarket_core::types::{MarketOrder, OrderSide};
 use rust_decimal::Decimal;
 use sqlx::FromRow;
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time;
 use tokio::sync::broadcast;
@@ -21,9 +20,11 @@ use risk_manager::circuit_breaker::CircuitBreaker;
 use trading_engine::OrderExecutor;
 
 use crate::state::AppState;
+mod refresh;
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
 use crate::workspace_scope::resolve_canonical_workspace_id;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct WalletInventoryConfig {
@@ -71,7 +72,7 @@ impl WalletInventoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WalletInventoryRefreshResult {
     pub wallet_address: String,
     pub candidate_tokens: usize,
@@ -108,11 +109,10 @@ struct WalletTradeCandidateRow {
 struct EffectiveOpenPositionRow {
     id: Uuid,
     market_id: String,
-    quantity: Decimal,
+    held_yes_qty: Decimal,
+    held_no_qty: Decimal,
     yes_entry_price: Decimal,
     no_entry_price: Decimal,
-    yes_exit_price: Option<Decimal>,
-    no_exit_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -164,19 +164,50 @@ pub async fn load_canonical_inventory_summary(
 pub async fn refresh_canonical_wallet_inventory(
     state: &AppState,
 ) -> anyhow::Result<Option<WalletInventoryRefreshResult>> {
+    refresh_inventory(state, time::Duration::from_secs(30)).await
+}
+
+pub async fn force_refresh_canonical_wallet_inventory(
+    state: &AppState,
+) -> anyhow::Result<Option<WalletInventoryRefreshResult>> {
+    refresh_inventory(state, time::Duration::ZERO).await
+}
+
+async fn refresh_inventory(
+    state: &AppState,
+    max_age: time::Duration,
+) -> anyhow::Result<Option<WalletInventoryRefreshResult>> {
     let Some(wallet_address) = resolve_canonical_wallet_address(state).await? else {
         return Ok(None);
     };
-
     if !state.order_executor.is_live_ready().await {
-        return Ok(Some(WalletInventoryRefreshResult {
-            wallet_address,
-            ..WalletInventoryRefreshResult::default()
-        }));
+        return Ok(None);
     }
+    refresh::coordinate(
+        &state.pool,
+        &state.inventory_refresh,
+        &wallet_address,
+        max_age,
+        || refresh_wallet_inventory(state, &wallet_address),
+    )
+    .await
+}
 
+pub(crate) async fn canonical_refresh_status(
+    state: &AppState,
+) -> anyhow::Result<Option<refresh::RefreshStatus>> {
+    let Some(wallet) = resolve_canonical_wallet_address(state).await? else {
+        return Ok(None);
+    };
+    refresh::status(&state.pool, &wallet).await
+}
+
+async fn refresh_wallet_inventory(
+    state: &AppState,
+    wallet_address: &str,
+) -> anyhow::Result<Option<WalletInventoryRefreshResult>> {
     let repo = WalletInventoryRepository::new(state.pool.clone());
-    let existing_entries = repo.list_wallet_entries(&wallet_address).await?;
+    let existing_entries = repo.list_wallet_entries(wallet_address).await?;
     let existing_by_token: HashMap<String, WalletInventoryEntry> = existing_entries
         .into_iter()
         .map(|entry| (entry.token_id.clone(), entry))
@@ -185,7 +216,7 @@ pub async fn refresh_canonical_wallet_inventory(
     let now = Utc::now();
     let mut candidates = HashMap::<String, InventoryCandidate>::new();
 
-    for token_id in repo.list_wallet_token_ids(&wallet_address).await? {
+    for token_id in repo.list_wallet_token_ids(wallet_address).await? {
         merge_candidate(
             &mut candidates,
             InventoryCandidate {
@@ -196,7 +227,7 @@ pub async fn refresh_canonical_wallet_inventory(
         );
     }
 
-    for trade in load_wallet_trade_candidates(&state.pool, &wallet_address).await? {
+    for trade in load_wallet_trade_candidates(&state.pool, wallet_address).await? {
         merge_candidate(
             &mut candidates,
             InventoryCandidate {
@@ -209,9 +240,33 @@ pub async fn refresh_canonical_wallet_inventory(
         );
     }
 
-    for position in load_effective_open_positions(&state.pool).await? {
-        let Some((yes_token_id, no_token_id)) =
-            resolve_market_tokens(state.clob_client.as_ref(), &position.market_id).await?
+    let manual: Vec<(String,String,Decimal)> = sqlx::query_as("SELECT market_id,outcome,cost_basis FROM manual_inventory WHERE execution_mode='live' AND wallet_address=LOWER($1) AND quantity>0")
+        .bind(wallet_address).fetch_all(&state.pool).await?;
+    let manual_keys: HashSet<(String, String)> = manual
+        .iter()
+        .map(|(market, outcome, _)| (market.clone(), outcome.clone()))
+        .collect();
+    for (market, outcome, basis) in manual {
+        if let Some((yes, no)) = state.market_catalog.hydrate_market(&market).await? {
+            merge_candidate(
+                &mut candidates,
+                InventoryCandidate {
+                    token_id: if outcome == "yes" { yes } else { no },
+                    condition_id: Some(market),
+                    outcome: Some(outcome),
+                    cost_basis: Some(basis),
+                    discovery_source: "manual_order".into(),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    for position in load_effective_open_positions(&state.pool, wallet_address).await? {
+        let Some((yes_token_id, no_token_id)) = state
+            .market_catalog
+            .hydrate_market(&position.market_id)
+            .await?
         else {
             continue;
         };
@@ -224,7 +279,7 @@ pub async fn refresh_canonical_wallet_inventory(
                     condition_id: Some(position.market_id.clone()),
                     outcome: Some("yes".to_string()),
                     linked_position_id: Some(position.id),
-                    cost_basis: Some(position.quantity * position.yes_entry_price),
+                    cost_basis: Some(position.held_yes_qty * position.yes_entry_price),
                     discovery_source: "open_position".to_string(),
                 },
             );
@@ -238,7 +293,7 @@ pub async fn refresh_canonical_wallet_inventory(
                     condition_id: Some(position.market_id.clone()),
                     outcome: Some("no".to_string()),
                     linked_position_id: Some(position.id),
-                    cost_basis: Some(position.quantity * position.no_entry_price),
+                    cost_basis: Some(position.held_no_qty * position.no_entry_price),
                     discovery_source: "open_position".to_string(),
                 },
             );
@@ -249,7 +304,7 @@ pub async fn refresh_canonical_wallet_inventory(
     let mut phase2_to_block = None;
     if let Some(polygon_client) = state.polygon_client.as_ref() {
         let inventory_config = WalletInventoryConfig::from_env();
-        match discover_phase2_token_ids(polygon_client, &repo, &wallet_address, &inventory_config)
+        match discover_phase2_token_ids(polygon_client, &repo, wallet_address, &inventory_config)
             .await
         {
             Ok(discovery) => {
@@ -278,7 +333,7 @@ pub async fn refresh_canonical_wallet_inventory(
 
     if candidates.is_empty() {
         return Ok(Some(WalletInventoryRefreshResult {
-            wallet_address,
+            wallet_address: wallet_address.to_owned(),
             phase2_from_block,
             phase2_to_block,
             ..WalletInventoryRefreshResult::default()
@@ -286,20 +341,21 @@ pub async fn refresh_canonical_wallet_inventory(
     }
 
     hydrate_condition_ids(&state.pool, &mut candidates).await?;
-    hydrate_outcomes(state.clob_client.as_ref(), &mut candidates).await?;
+    hydrate_outcomes(state.market_catalog.as_ref(), &mut candidates).await?;
     let market_prices = load_market_prices(&state.pool, &candidates).await?;
 
+    // Complete all reads before publishing any balances. A failed token read
+    // retains the previous snapshot, including previously observed zero balances.
+    let balances = refresh::balances(candidates.keys().cloned().collect(), |token| async move {
+        load_conditional_balance(state, &token).await
+    })
+    .await?;
     let mut rows = Vec::with_capacity(candidates.len());
-    let mut retained_tokens = Vec::with_capacity(candidates.len());
     let mut nonzero_tokens = 0_usize;
     let mut orphan_tokens = 0_usize;
 
     for (_, candidate) in candidates {
-        retained_tokens.push(candidate.token_id.clone());
-
-        let quantity = load_conditional_balance(state, &candidate.token_id)
-            .await
-            .unwrap_or(Decimal::ZERO);
+        let quantity = balances[&candidate.token_id];
         if quantity > Decimal::ZERO {
             nonzero_tokens += 1;
         }
@@ -314,7 +370,15 @@ pub async fn refresh_canonical_wallet_inventory(
                 _ => None,
             });
         let marked_value = current_price.map(|price| price * quantity);
-        let is_orphan = quantity > Decimal::ZERO && candidate.linked_position_id.is_none();
+        let is_manual = candidate
+            .condition_id
+            .as_ref()
+            .zip(candidate.outcome.as_ref())
+            .is_some_and(|(market, outcome)| {
+                manual_keys.contains(&(market.clone(), outcome.clone()))
+            });
+        let is_orphan =
+            quantity > Decimal::ZERO && candidate.linked_position_id.is_none() && !is_manual;
         if is_orphan {
             orphan_tokens += 1;
         }
@@ -333,7 +397,7 @@ pub async fn refresh_canonical_wallet_inventory(
         };
 
         rows.push(WalletInventoryUpsert {
-            wallet_address: wallet_address.clone(),
+            wallet_address: wallet_address.to_owned(),
             token_id: candidate.token_id.clone(),
             condition_id: candidate.condition_id.clone(),
             outcome: candidate.outcome.clone(),
@@ -355,12 +419,10 @@ pub async fn refresh_canonical_wallet_inventory(
     }
 
     repo.upsert_entries(&rows).await?;
-    repo.mark_missing_tokens_zero(&wallet_address, &retained_tokens, now)
-        .await?;
 
     Ok(Some(WalletInventoryRefreshResult {
-        wallet_address,
-        candidate_tokens: retained_tokens.len(),
+        wallet_address: wallet_address.to_owned(),
+        candidate_tokens: rows.len(),
         nonzero_tokens,
         orphan_tokens,
         phase2_from_block,
@@ -401,6 +463,7 @@ pub async fn load_canonical_orphan_inventory(
     Ok(repo.get_recoverable_orphans(&wallet_address, 0).await?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn recover_wallet_orphan_inventory(
     pool: &sqlx::PgPool,
     order_executor: &OrderExecutor,
@@ -415,6 +478,25 @@ pub async fn recover_wallet_orphan_inventory(
         return Ok(OrphanRecoveryResult::default());
     }
 
+    let mut recovery_fence = pool.begin().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('orphan-inventory-recovery'),hashtext(LOWER($1)))")
+        .bind(wallet_address).fetch_one(&mut *recovery_fence).await?;
+    if !acquired {
+        return Ok(OrphanRecoveryResult::default());
+    }
+    let observed = refresh::status(pool, wallet_address).await?;
+    let freshness = WalletInventoryConfig::from_env()
+        .interval_secs
+        .saturating_mul(2)
+        .max(60);
+    anyhow::ensure!(
+        observed.as_ref().is_some_and(|s| s.last_error.is_none()
+            && s.finished_at.is_some()
+            && s.completed_at.is_some_and(
+                |at| Utc::now().signed_duration_since(at).num_seconds() <= freshness as i64
+            )),
+        "Inventory must complete a successful refresh before orphan recovery"
+    );
     let repo = WalletInventoryRepository::new(pool.clone());
     let entries = repo
         .get_recoverable_orphans(wallet_address, retry_backoff_secs)
@@ -469,7 +551,10 @@ pub async fn recover_wallet_orphan_inventory(
         .with_expected_price(expected_price)
         .with_slippage(order_executor.default_slippage());
 
-        match order_executor.execute_market_order(order).await {
+        match order_executor
+            .execute_reserved_market_order(order, "live", Some(wallet_address))
+            .await
+        {
             Ok(report) if report.is_success() => {
                 repo.record_recovery_attempt(wallet_address, &entry.token_id, None)
                     .await?;
@@ -641,48 +726,10 @@ async fn load_wallet_trade_candidates(
 
 async fn load_effective_open_positions(
     pool: &sqlx::PgPool,
+    wallet: &str,
 ) -> anyhow::Result<Vec<EffectiveOpenPositionRow>> {
-    let rows = sqlx::query_as::<_, EffectiveOpenPositionRow>(
-        r#"
-        WITH active_positions AS (
-            SELECT
-                p.id,
-                p.market_id,
-                COALESCE(p.source, 0) AS source,
-                p.quantity,
-                p.yes_entry_price,
-                p.no_entry_price,
-                p.yes_exit_price,
-                p.no_exit_price,
-                COALESCE(p.last_updated, p.updated_at, p.entry_timestamp) AS sort_updated
-            FROM positions p
-            WHERE p.is_open = TRUE
-        ),
-        ranked_active AS (
-            SELECT
-                *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY market_id, source
-                    ORDER BY sort_updated DESC, id DESC
-                ) AS rn
-            FROM active_positions
-        )
-        SELECT
-            id,
-            market_id,
-            quantity,
-            yes_entry_price,
-            no_entry_price,
-            yes_exit_price,
-            no_exit_price
-        FROM ranked_active
-        WHERE rn = 1
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
+    Ok(sqlx::query_as("SELECT id,market_id,held_yes_qty,held_no_qty,yes_entry_price,no_entry_price FROM positions WHERE (held_yes_qty>0 OR held_no_qty>0) AND execution_mode<>'paper' AND (LOWER(wallet_address)=LOWER($1) OR execution_mode='unknown')")
+        .bind(wallet).fetch_all(pool).await?)
 }
 
 async fn discover_phase2_token_ids(
@@ -767,6 +814,7 @@ struct BackfillScanOutcome {
     completed: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn scan_phase2_forward_range(
     polygon_client: &PolygonClient,
     wallet_address: &str,
@@ -807,6 +855,7 @@ async fn scan_phase2_forward_range(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn scan_phase2_backfill_chunks(
     polygon_client: &PolygonClient,
     wallet_address: &str,
@@ -936,13 +985,14 @@ async fn hydrate_condition_ids(
 }
 
 async fn hydrate_outcomes(
-    clob_client: &ClobClient,
+    catalog: &crate::market_catalog::OutcomeTokenCache,
     candidates: &mut HashMap<String, InventoryCandidate>,
 ) -> anyhow::Result<()> {
     let market_ids = candidates
         .values()
+        .filter(|candidate| candidate.outcome.is_none())
         .filter_map(|candidate| candidate.condition_id.clone())
-        .collect::<Vec<_>>();
+        .collect::<HashSet<_>>();
     let mut market_cache = HashMap::<String, (String, String)>::new();
 
     for market_id in market_ids {
@@ -950,7 +1000,7 @@ async fn hydrate_outcomes(
             continue;
         }
 
-        if let Some(tokens) = resolve_market_tokens(clob_client, &market_id).await? {
+        if let Some(tokens) = catalog.hydrate_market(&market_id).await? {
             market_cache.insert(market_id, tokens);
         }
     }
@@ -1003,41 +1053,6 @@ async fn load_market_prices(
     Ok(rows.into_iter().map(|row| (row.id.clone(), row)).collect())
 }
 
-async fn resolve_market_tokens(
-    clob_client: &ClobClient,
-    market_id: &str,
-) -> anyhow::Result<Option<(String, String)>> {
-    let market = match clob_client.get_market_by_id(market_id).await {
-        Ok(market) => market,
-        Err(error) => {
-            warn!(
-                market_id = %market_id,
-                error = %error,
-                "Failed to resolve market tokens for wallet inventory"
-            );
-            return Ok(None);
-        }
-    };
-
-    if market.outcomes.len() != 2 {
-        return Ok(None);
-    }
-
-    let tokens = if market.outcomes[0].name.to_lowercase().contains("yes") {
-        (
-            market.outcomes[0].token_id.clone(),
-            market.outcomes[1].token_id.clone(),
-        )
-    } else {
-        (
-            market.outcomes[1].token_id.clone(),
-            market.outcomes[0].token_id.clone(),
-        )
-    };
-
-    Ok(Some(tokens))
-}
-
 async fn load_expected_sell_price(
     clob_client: &ClobClient,
     token_id: &str,
@@ -1053,11 +1068,11 @@ async fn load_conditional_balance(state: &AppState, token_id: &str) -> anyhow::R
     let snapshot = state
         .order_executor
         .get_live_balance_allowance("CONDITIONAL", Some(token_id))
-        .await;
-
-    Ok(snapshot
-        .and_then(|snapshot| parse_decimal_string(&snapshot.balance))
-        .unwrap_or(Decimal::ZERO))
+        .await
+        .with_context(|| format!("Balance unavailable for token {token_id}"))?;
+    snapshot
+        .balance_in_units()
+        .with_context(|| format!("Invalid balance for token {token_id}"))
 }
 
 fn merge_candidate(
@@ -1118,21 +1133,12 @@ fn normalize_outcome(outcome: Option<&str>) -> Option<String> {
     }
 }
 
-fn parse_decimal_string(raw: &str) -> Option<Decimal> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    Decimal::from_str(trimmed).ok()
-}
-
 fn holds_yes(position: &EffectiveOpenPositionRow) -> bool {
-    position.yes_entry_price > Decimal::ZERO && position.yes_exit_price.is_none()
+    position.held_yes_qty > Decimal::ZERO
 }
 
 fn holds_no(position: &EffectiveOpenPositionRow) -> bool {
-    position.no_entry_price > Decimal::ZERO && position.no_exit_price.is_none()
+    position.held_no_qty > Decimal::ZERO
 }
 
 fn looks_like_token_id(token_id: &str) -> bool {
