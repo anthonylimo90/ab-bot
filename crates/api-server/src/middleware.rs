@@ -15,6 +15,8 @@ use auth::jwt::{Claims, UserRole};
 use crate::error::ErrorResponse;
 use crate::state::AppState;
 
+#[path = "middleware/rate_limit.rs"]
+pub mod rate_limit;
 #[cfg(test)]
 #[path = "middleware/session_tests.rs"]
 mod session_tests;
@@ -27,10 +29,13 @@ fn role_number(role: UserRole) -> i32 {
     }
 }
 
+/// Claims for a freshly authenticated session. `expiry_hours` must come from the
+/// configured `JwtAuth` (`jwt.expiry_hours()`), not a literal.
 pub(crate) async fn session_claims(
     pool: &sqlx::PgPool,
     user: uuid::Uuid,
     role: UserRole,
+    expiry_hours: i64,
 ) -> crate::error::ApiResult<Claims> {
     let current: Option<(i64, i32)> =
         sqlx::query_as("SELECT auth_version, role::integer FROM users WHERE id=$1")
@@ -44,7 +49,7 @@ pub(crate) async fn session_claims(
             "Account role changed".into(),
         ));
     }
-    let mut claims = Claims::new(user.to_string(), role, 24);
+    let mut claims = Claims::new(user.to_string(), role, expiry_hours);
     claims.session_version = version;
     Ok(claims)
 }
@@ -54,7 +59,7 @@ pub(crate) async fn issue_session_token(
     user: uuid::Uuid,
     role: UserRole,
 ) -> crate::error::ApiResult<String> {
-    let claims = session_claims(&state.pool, user, role).await?;
+    let claims = session_claims(&state.pool, user, role, state.jwt_auth.expiry_hours()).await?;
     state
         .jwt_auth
         .create_token_with_claims(&claims)
@@ -148,16 +153,10 @@ pub async fn require_auth(
     // Log successful authentication
     tracing::debug!(user_id = %claims.sub, role = ?claims.role, "Authenticated request");
 
-    // Sync RBAC roles with JWT role
-    // This ensures RBAC permissions are available for fine-grained checks
-    let rbac_role = match claims.role {
-        UserRole::Viewer => "viewer",
-        UserRole::Trader => "trader",
-        UserRole::PlatformAdmin => "platform_admin",
-    };
-
-    // Assign the role to the user in RBAC (idempotent operation)
-    let _ = state.rbac.assign_role(&claims.sub, rbac_role).await;
+    // Authorization decisions use the validated claims (and the database state
+    // that `authorize_session` just re-checked), never `state.rbac`: nothing
+    // reads it, and writing to it on every request only grew its in-memory role
+    // lists under a global write lock.
 
     // Inject claims into request extensions
     request.extensions_mut().insert(claims);

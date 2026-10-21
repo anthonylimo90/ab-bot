@@ -1,9 +1,5 @@
 //! User management handlers for admin operations.
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Extension;
@@ -125,7 +121,7 @@ pub async fn list_users(
 ) -> ApiResult<Json<Vec<UserListItem>>> {
     let users: Vec<UserRow> = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         ORDER BY created_at DESC
         "#,
@@ -206,13 +202,8 @@ pub async fn create_user(
         return Err(ApiError::Conflict("Email already registered".into()));
     }
 
-    // Hash the password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.password.as_bytes(), &salt)
-        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?
-        .to_string();
+    // Hash the password (bounded, off the async executor)
+    let password_hash = crate::handlers::auth::hash_password(req.password.clone()).await?;
 
     // Create user
     let user_id = Uuid::new_v4();
@@ -286,7 +277,7 @@ pub async fn get_user(
 
     let user: Option<UserRow> = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         WHERE id = $1
         "#,
@@ -348,7 +339,7 @@ pub async fn update_user(
     // Check if user exists
     let user: Option<UserRow> = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         WHERE id = $1
         "#,
@@ -380,12 +371,7 @@ pub async fn update_user(
                 "Password must be at least 8 characters".into(),
             ));
         }
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?
-            .to_string();
+        let password_hash = crate::handlers::auth::hash_password(password.clone()).await?;
         updates.push(format!("password_hash = ${}", params.len() + 2));
         params.push(password_hash);
     }
@@ -443,7 +429,7 @@ pub async fn update_user(
     // Fetch updated user
     let updated_user: UserRow = sqlx::query_as(
         r#"
-        SELECT id, email, role, name, created_at, last_login
+        SELECT id, COALESCE(email, '') AS email, role, name, created_at, last_login
         FROM users
         WHERE id = $1
         "#,
@@ -490,10 +476,11 @@ pub async fn delete_user(
         .map_err(|_| ApiError::BadRequest("Invalid user ID format".into()))?;
 
     // Fetch user email before deletion for audit log
-    let user: Option<(String,)> = sqlx::query_as("SELECT email FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_optional(&state.pool)
-        .await?;
+    let user: Option<(String,)> =
+        sqlx::query_as("SELECT COALESCE(email, wallet_address, '') FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     let user_email = user
         .as_ref()

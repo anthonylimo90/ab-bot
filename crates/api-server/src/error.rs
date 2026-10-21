@@ -78,10 +78,26 @@ pub enum ApiError {
     JsonRejection(String),
 }
 
+/// PostgreSQL SQLSTATE for `unique_violation`.
+const PG_UNIQUE_VIOLATION: &str = "23505";
+
+/// Generic message returned for every 500; details only go to the server log.
+const INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
+/// Whether a database error is a unique-constraint violation.
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(e) if e.code().as_deref() == Some(PG_UNIQUE_VIOLATION)
+    )
+}
+
 impl ApiError {
     /// Get the HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
+            // A duplicate key is the caller's conflict, not a server fault.
+            ApiError::Database(e) if is_unique_violation(e) => StatusCode::CONFLICT,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
@@ -101,6 +117,7 @@ impl ApiError {
     /// Get the error code string.
     pub fn error_code(&self) -> &'static str {
         match self {
+            ApiError::Database(e) if is_unique_violation(e) => "CONFLICT",
             ApiError::NotFound(_) => "NOT_FOUND",
             ApiError::BadRequest(_) => "BAD_REQUEST",
             ApiError::Unauthorized(_) => "UNAUTHORIZED",
@@ -136,13 +153,21 @@ impl IntoResponse for ApiError {
                 error = %self,
                 "Internal server error"
             );
+        } else if let ApiError::Database(db_err) = &self {
+            // E.g. a unique violation answered with 409: keep the constraint name
+            // in the server log even though the client never sees it.
+            tracing::warn!(error = %db_err, "Database constraint error");
         }
 
         // Sanitize error messages for client responses:
         // - Database errors may contain table/column/constraint names — never expose these.
         // - Serialization errors may reveal internal type structure.
+        // - Internal errors wrap arbitrary upstream errors (sqlx, reqwest, redis, ...)
+        //   via `e.to_string()`; the detail was logged above, the client gets a
+        //   generic message.
         // - All other errors use their human-readable message.
         let client_message = match &self {
+            ApiError::Internal(_) => INTERNAL_ERROR_MESSAGE.to_string(),
             ApiError::Database(db_err) => {
                 // Map specific DB error codes to user-friendly messages
                 if let sqlx::Error::Database(ref e) = db_err {
@@ -170,3 +195,87 @@ impl IntoResponse for ApiError {
 
 /// Result type for API handlers.
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::{Executor, PgPool};
+
+    async fn render(error: ApiError) -> (StatusCode, serde_json::Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn internal_errors_return_a_generic_message() {
+        let (status, body) = render(ApiError::Internal(
+            "error sending request for url (https://rpc.example/v2/SECRETKEY): connection refused"
+                .into(),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "INTERNAL_ERROR");
+        assert_eq!(body["message"], "Internal server error");
+        assert!(!body.to_string().contains("SECRETKEY"));
+    }
+
+    #[tokio::test]
+    async fn deliberate_client_errors_keep_their_messages() {
+        for (error, status) in [
+            (ApiError::NotFound("No such thing".into()), 404),
+            (ApiError::BadRequest("Bad input".into()), 400),
+            (ApiError::Forbidden("Not allowed".into()), 403),
+            (ApiError::Conflict("Already there".into()), 409),
+            (ApiError::ServiceUnavailable("Busy".into()), 503),
+        ] {
+            let message = match &error {
+                ApiError::NotFound(m)
+                | ApiError::BadRequest(m)
+                | ApiError::Forbidden(m)
+                | ApiError::Conflict(m)
+                | ApiError::ServiceUnavailable(m) => m.clone(),
+                _ => unreachable!(),
+            };
+            let (actual, body) = render(error).await;
+            assert_eq!(actual.as_u16(), status);
+            assert!(body["message"].as_str().unwrap().ends_with(&message));
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn unique_violations_are_conflicts_that_hide_schema_names(pool: PgPool) {
+        pool.execute(
+            "CREATE TABLE accounts (name TEXT CONSTRAINT accounts_secret_name_key UNIQUE);
+             INSERT INTO accounts VALUES ('taken')",
+        )
+        .await
+        .unwrap();
+        let duplicate = sqlx::query("INSERT INTO accounts VALUES ('taken')")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        let (status, body) = render(ApiError::from(duplicate)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "CONFLICT");
+        let text = body.to_string();
+        assert!(
+            !text.contains("accounts") && !text.contains("secret_name"),
+            "{text}"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn other_database_errors_stay_500_and_hide_schema_names(pool: PgPool) {
+        let missing = sqlx::query("SELECT * FROM table_that_does_not_exist")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        let (status, body) = render(ApiError::from(missing)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.to_string().contains("table_that_does_not_exist"));
+    }
+}

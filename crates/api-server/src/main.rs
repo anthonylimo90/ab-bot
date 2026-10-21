@@ -151,24 +151,111 @@ async fn apply_pg_memory_tuning(pool: &sqlx::PgPool) {
     tracing::info!("PostgreSQL memory tuning applied (restart needed for shared_buffers)");
 }
 
+/// Secret the server library falls back to when `JWT_SECRET` is unset.
+const DEV_DEFAULT_JWT_SECRET: &str = "development-secret-change-in-production";
+
+/// Minimum JWT secret length.
+const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// A secret with fewer distinct characters than this is trivially guessable.
+const MIN_JWT_SECRET_DISTINCT_CHARS: usize = 10;
+
+/// Placeholder values that ship in `.env.example`, docs and defaults. Compared
+/// case-insensitively. Some are shorter than the minimum length; they are listed
+/// anyway so the more specific "placeholder" message wins.
+const PLACEHOLDER_JWT_SECRETS: &[&str] = &[
+    DEV_DEFAULT_JWT_SECRET,
+    "your-secure-random-secret-at-least-32-chars",
+    "change-me-in-production",
+    "your-secret-key",
+    "replace-me",
+    "changeme",
+];
+
+/// Fragments that mark a value as a template someone forgot to fill in.
+const PLACEHOLDER_JWT_MARKERS: &[&str] = &[
+    "your-secure",
+    "your-secret",
+    "change-me",
+    "changeme",
+    "replace-me",
+    "placeholder",
+    "secret-at-least",
+    "development-secret",
+];
+
+/// Why a secret is weak despite being long enough, if it is.
+fn weak_jwt_secret_reason(secret: &str) -> Option<&'static str> {
+    let lowered = secret.to_ascii_lowercase();
+    if PLACEHOLDER_JWT_SECRETS.contains(&lowered.as_str())
+        || PLACEHOLDER_JWT_MARKERS.iter().any(|m| lowered.contains(m))
+    {
+        return Some("it is a placeholder value from the example configuration");
+    }
+    let distinct = secret
+        .chars()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < MIN_JWT_SECRET_DISTINCT_CHARS {
+        return Some("it has too few distinct characters to be a random secret");
+    }
+    None
+}
+
+/// Whether `ENVIRONMENT` names a local development setup. Anything else,
+/// including unset, is treated as a real deployment.
+fn is_development_environment(environment: &str) -> bool {
+    matches!(
+        environment.trim().to_ascii_lowercase().as_str(),
+        "development" | "dev" | "local" | "test"
+    )
+}
+
+/// Validate `JWT_SECRET`.
+///
+/// Empty, default-valued and too-short secrets are always rejected. Placeholder
+/// and low-entropy secrets are rejected in staging/production (and when
+/// `ENVIRONMENT` is unset) and only reported as a warning in development.
+fn validate_jwt_secret(secret: &str, environment: &str) -> Result<Option<String>, String> {
+    if secret.is_empty() || secret == DEV_DEFAULT_JWT_SECRET {
+        return Err("JWT_SECRET must be set to a secure value (not the default)".to_string());
+    }
+    if secret.len() < MIN_JWT_SECRET_LEN {
+        return Err(format!(
+            "JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} characters long (current: {})",
+            secret.len()
+        ));
+    }
+    match weak_jwt_secret_reason(secret) {
+        None => Ok(None),
+        Some(reason) if is_development_environment(environment) => Ok(Some(format!(
+            "JWT_SECRET is weak ({reason}); acceptable only because ENVIRONMENT={environment}"
+        ))),
+        Some(reason) => Err(format!(
+            "JWT_SECRET is not acceptable: {reason} (ENVIRONMENT={environment:?}; \
+             only development tolerates this)"
+        )),
+    }
+}
+
 async fn run_server(pool: sqlx::PgPool) -> anyhow::Result<()> {
     tracing::info!("API Server starting up...");
 
     // Validate JWT_SECRET for security
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-    if jwt_secret.is_empty() || jwt_secret == "development-secret-change-in-production" {
-        tracing::error!("JWT_SECRET must be set to a secure value (not the default)");
-        tracing::error!("Generate a secure secret: openssl rand -base64 32");
-        anyhow::bail!("JWT_SECRET environment variable must be set to a secure value");
+    let environment = std::env::var("ENVIRONMENT").unwrap_or_default();
+    match validate_jwt_secret(&jwt_secret, &environment) {
+        Ok(Some(warning)) => {
+            tracing::warn!("{warning}");
+            tracing::info!("JWT secret validation passed (development: weak secret tolerated)");
+        }
+        Ok(None) => tracing::info!("JWT secret validation passed"),
+        Err(message) => {
+            tracing::error!("{message}");
+            tracing::error!("Generate a secure secret: openssl rand -base64 32");
+            anyhow::bail!("{message}");
+        }
     }
-    if jwt_secret.len() < 32 {
-        tracing::error!(
-            "JWT_SECRET must be at least 32 characters long (current: {})",
-            jwt_secret.len()
-        );
-        anyhow::bail!("JWT_SECRET must be at least 32 characters long");
-    }
-    tracing::info!("JWT secret validation passed");
 
     tracing::info!("Database connection established");
 
@@ -196,4 +283,82 @@ async fn run_server(pool: sqlx::PgPool) -> anyhow::Result<()> {
     server.run().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 44 characters of base64 from `openssl rand -base64 32`.
+    const GOOD: &str = "k3Vq9uYxT1mZb7PdLw0RhJ8sNcA4eGfU2oXyIvQ6tBE=";
+
+    #[test]
+    fn a_random_secret_is_accepted_everywhere() {
+        for environment in ["production", "staging", "development", ""] {
+            assert_eq!(validate_jwt_secret(GOOD, environment), Ok(None));
+        }
+    }
+
+    #[test]
+    fn empty_default_and_short_secrets_are_always_rejected() {
+        for environment in ["production", "development"] {
+            assert!(validate_jwt_secret("", environment).is_err());
+            assert!(validate_jwt_secret(DEV_DEFAULT_JWT_SECRET, environment).is_err());
+            let short = validate_jwt_secret("Ab1!Ab1!Ab1!", environment).unwrap_err();
+            assert!(short.contains("at least 32"), "{short}");
+        }
+    }
+
+    #[test]
+    fn the_env_example_placeholder_is_rejected_outside_development() {
+        let placeholder = "your-secure-random-secret-at-least-32-chars";
+        // It passes the length rule, which is how it used to slip through.
+        assert!(placeholder.len() >= MIN_JWT_SECRET_LEN);
+        for environment in ["production", "staging", "Production", "", "prod"] {
+            let err = validate_jwt_secret(placeholder, environment).unwrap_err();
+            assert!(err.contains("placeholder"), "{environment}: {err}");
+        }
+        // Obvious variants of it and the other shipped placeholders too.
+        for variant in [
+            "YOUR-SECURE-RANDOM-SECRET-AT-LEAST-32-CHARS",
+            "please-change-me-to-something-else-xyz-123",
+            "REPLACE-ME-with-a-real-secret-0123456789ab",
+        ] {
+            assert!(
+                validate_jwt_secret(variant, "production").is_err(),
+                "{variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn low_entropy_secrets_are_rejected_outside_development() {
+        for weak in [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "abababababababababababababababababababab",
+            "1234512345123451234512345123451234512345",
+            "abcdefgh-abcdefgh-abcdefgh-abcdefgh-abcdefgh-",
+        ] {
+            assert!(weak.len() >= MIN_JWT_SECRET_LEN);
+            let err = validate_jwt_secret(weak, "production").unwrap_err();
+            assert!(err.contains("distinct"), "{weak}: {err}");
+        }
+        // Exactly the minimum number of distinct characters is accepted.
+        let ten_distinct = "abcdefghij".repeat(4);
+        assert_eq!(validate_jwt_secret(&ten_distinct, "production"), Ok(None));
+    }
+
+    #[test]
+    fn development_only_warns_about_weak_secrets() {
+        for environment in ["development", "Development", "dev", "local", "test"] {
+            let warning =
+                validate_jwt_secret("your-secure-random-secret-at-least-32-chars", environment)
+                    .unwrap()
+                    .expect("a warning is reported");
+            assert!(warning.contains("placeholder"), "{warning}");
+            assert!(validate_jwt_secret(&"a".repeat(40), environment)
+                .unwrap()
+                .is_some());
+        }
+    }
 }

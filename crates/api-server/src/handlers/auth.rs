@@ -103,8 +103,10 @@ pub struct ResetPasswordResponse {
 #[derive(Debug, sqlx::FromRow)]
 struct UserRow {
     id: Uuid,
-    email: String,
-    password_hash: String,
+    /// NULL for wallet-only accounts (serialized as "" to keep the API shape).
+    email: Option<String>,
+    /// NULL for wallet-only accounts, which cannot sign in with a password.
+    password_hash: Option<String>,
     role: i16,
     name: Option<String>,
     created_at: DateTime<Utc>,
@@ -181,18 +183,8 @@ pub async fn register(
         return Err(ApiError::Conflict("Email already registered".into()));
     }
 
-    // Hash the password (offloaded to blocking thread to avoid starving the async executor)
-    let password_to_hash = req.password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        argon2
-            .hash_password(password_to_hash.as_bytes(), &salt)
-            .map(|h| h.to_string())
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
-    .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
+    // Hash the password (bounded, off the async executor)
+    let password_hash = hash_password(req.password.clone()).await?;
 
     // Create user
     let user_id = Uuid::new_v4();
@@ -279,30 +271,24 @@ pub async fn login(
     // was found. This prevents timing side-channels: a missing user takes the same
     // wall-clock time as a wrong password because Argon2 runs either way.
     let (user, password_valid) = match user {
-        Some(u) => {
-            let hash_str = u.password_hash.clone();
-            let password = req.password.clone();
-            let valid = tokio::task::spawn_blocking(move || {
-                PasswordHash::new(&hash_str).ok().is_some_and(|parsed| {
-                    Argon2::default()
-                        .verify_password(password.as_bytes(), &parsed)
-                        .is_ok()
-                })
-            })
-            .await
-            .unwrap_or(false);
-            (Some(u), valid)
-        }
+        Some(u) => match u.password_hash.clone() {
+            Some(hash_str) => {
+                let valid = verify_password(hash_str, req.password.clone()).await?;
+                (Some(u), valid)
+            }
+            None => {
+                // Wallet-only account: there is no password to check, so password
+                // login is always refused. Still pay for an Argon2 run so this
+                // case is not distinguishable by response time.
+                burn_dummy_hash(req.password.clone()).await?;
+                (Some(u), false)
+            }
+        },
         None => {
             // Perform a dummy Argon2 hash to equalize timing with the found-user path.
             // This prevents attackers from distinguishing "user not found" (~1ms) from
             // "wrong password" (~200ms) via response timing.
-            let dummy_password = req.password.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let salt = SaltString::generate(&mut OsRng);
-                let _ = Argon2::default().hash_password(dummy_password.as_bytes(), &salt);
-            })
-            .await;
+            burn_dummy_hash(req.password.clone()).await?;
             (None, false)
         }
     };
@@ -344,7 +330,7 @@ pub async fn login(
         token,
         user: UserInfo {
             id: user.id.to_string(),
-            email: user.email,
+            email: user.email.unwrap_or_default(),
             name: user.name,
             role,
             created_at: user.created_at,
@@ -398,7 +384,7 @@ pub async fn refresh_token(
         token,
         user: UserInfo {
             id: user.id.to_string(),
-            email: user.email,
+            email: user.email.unwrap_or_default(),
             name: user.name,
             role,
             created_at: user.created_at,
@@ -474,11 +460,100 @@ pub async fn get_current_user(
 
     Ok(Json(UserInfo {
         id: user.id.to_string(),
-        email: user.email,
+        email: user.email.unwrap_or_default(),
         name: user.name,
         role,
         created_at: user.created_at,
     }))
+}
+
+/// Default cap on concurrent Argon2 computations (`ARGON2_MAX_CONCURRENCY`).
+///
+/// Each default-parameter Argon2 run allocates ~19 MiB and burns a CPU core for
+/// tens of milliseconds, and `spawn_blocking` alone does not limit how many run
+/// at once, so a burst of login attempts could exhaust memory and starve the
+/// blocking pool shared with the rest of the server.
+const DEFAULT_ARGON2_MAX_CONCURRENCY: usize = 4;
+
+/// How long a request waits for an Argon2 slot before giving up with 503.
+const ARGON2_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn argon2_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let limit = std::env::var("ARGON2_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map(|limit| limit.max(1))
+            .unwrap_or(DEFAULT_ARGON2_MAX_CONCURRENCY);
+        Arc::new(tokio::sync::Semaphore::new(limit))
+    })
+}
+
+/// Run CPU-heavy password work on the blocking pool while holding one of the
+/// global Argon2 permits.
+async fn run_bounded<T, F>(work: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    run_bounded_on(argon2_permits(), ARGON2_QUEUE_TIMEOUT, work).await
+}
+
+async fn run_bounded_on<T, F>(
+    permits: &Arc<tokio::sync::Semaphore>,
+    queue_timeout: std::time::Duration,
+    work: F,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = tokio::time::timeout(queue_timeout, permits.clone().acquire_owned())
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable("Server is busy, please retry shortly".into()))?
+        .map_err(|_| ApiError::Internal("Password hashing is unavailable".into()))?;
+    tokio::task::spawn_blocking(move || {
+        // Held until the computation finishes, even if the request is cancelled.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Password task failed: {}", e)))
+}
+
+/// Hash a password with Argon2 (default parameters, random salt).
+pub(crate) async fn hash_password(password: String) -> ApiResult<String> {
+    run_bounded(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|hash| hash.to_string())
+    })
+    .await?
+    .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))
+}
+
+/// Check a password against a stored Argon2 hash; an unparseable hash never matches.
+async fn verify_password(stored_hash: String, password: String) -> ApiResult<bool> {
+    run_bounded(move || {
+        PasswordHash::new(&stored_hash).ok().is_some_and(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+    })
+    .await
+}
+
+/// Run (and discard) one Argon2 hash so a login that cannot succeed costs the
+/// same as one that can.
+async fn burn_dummy_hash(password: String) -> ApiResult<()> {
+    run_bounded(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        let _ = Argon2::default().hash_password(password.as_bytes(), &salt);
+    })
+    .await
 }
 
 /// Generate a secure random token for password reset.
@@ -680,18 +755,8 @@ pub async fn reset_password(
         }
     };
 
-    // Hash the new password (offloaded to blocking thread)
-    let password_to_hash = req.password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || {
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        argon2
-            .hash_password(password_to_hash.as_bytes(), &salt)
-            .map(|h| h.to_string())
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
-    .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
+    // Hash the new password (bounded, off the async executor)
+    let password_hash = hash_password(req.password.clone()).await?;
 
     // Update password and mark token as used in a transaction
     let mut tx = state.pool.begin().await?;
@@ -715,6 +780,16 @@ pub async fn reset_password(
             "Password reset token was already used".into(),
         ));
     }
+
+    // The password just changed: any other reset link issued earlier (e.g. by
+    // someone who could read the same mailbox) must not still work.
+    sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL",
+    )
+    .bind(Utc::now())
+    .bind(token_row.user_id)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -756,5 +831,163 @@ mod tests {
         assert!(argon2
             .verify_password(b"wrongpassword", &parsed_hash)
             .is_err());
+    }
+
+    async fn add_reset_token(pool: &sqlx::PgPool, user: Uuid, token: &str) {
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '1 hour')",
+        )
+        .bind(user)
+        .bind(hash_token(token))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn reset(app: &axum::Router, token: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        crate::workspace_scope::test_fixture::call(
+            app,
+            "POST",
+            "/reset",
+            None,
+            Some(serde_json::json!({"token": token, "password": "a brand new password"})),
+        )
+        .await
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_successful_reset_invalidates_the_other_outstanding_tokens(pool: sqlx::PgPool) {
+        use crate::workspace_scope::test_fixture as fx;
+        fx::real_schema(&pool).await;
+        let victim = fx::user(&pool, UserRole::Trader).await;
+        let bystander = fx::user(&pool, UserRole::Trader).await;
+        for token in ["first", "second", "third"] {
+            add_reset_token(&pool, victim, token).await;
+        }
+        add_reset_token(&pool, bystander, "bystander").await;
+        let app = axum::Router::new()
+            .route("/reset", axum::routing::post(reset_password))
+            .with_state(AppState::for_tests(pool.clone()));
+
+        let (status, body) = reset(&app, "second").await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        // The sibling links issued for the same account no longer work...
+        for token in ["first", "third", "second"] {
+            let (status, _) = reset(&app, token).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{token}");
+        }
+        let outstanding: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM password_reset_tokens WHERE user_id = $1 AND used_at IS NULL",
+        )
+        .bind(victim)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outstanding, 0);
+        // ...while another account's token is untouched.
+        let (status, _) = reset(&app, "bystander").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn reset_token_lookup_has_a_partial_index_on_the_hash(pool: sqlx::PgPool) {
+        crate::workspace_scope::test_fixture::real_schema(&pool).await;
+        let definition: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'password_reset_tokens' AND indexname = 'idx_password_reset_tokens_token_hash_unused'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(definition.contains("(token_hash)"), "{definition}");
+        assert!(definition.contains("used_at IS NULL"), "{definition}");
+        // With sequential scans disabled the planner can serve the exact lookup from it.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN SELECT id, user_id FROM password_reset_tokens WHERE token_hash = 'x' AND expires_at > NOW() AND used_at IS NULL",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_password_reset_tokens_token_hash_unused")),
+            "{plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_and_verify_round_trip_through_the_bounded_helpers() {
+        let hash = hash_password("correct horse".to_string()).await.unwrap();
+        assert!(verify_password(hash.clone(), "correct horse".into())
+            .await
+            .unwrap());
+        assert!(!verify_password(hash, "wrong horse".into()).await.unwrap());
+        // A stored value that is not an Argon2 hash never matches (and never panics).
+        assert!(!verify_password("not-a-hash".into(), "x".into())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn concurrent_argon2_work_never_exceeds_the_permit_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
+                tokio::spawn(async move {
+                    run_bounded_on(&permits, std::time::Duration::from_secs(30), move || {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(permits.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn requests_queued_too_long_get_503_and_slots_are_always_returned() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let slow = {
+            let permits = permits.clone();
+            tokio::spawn(async move {
+                run_bounded_on(&permits, std::time::Duration::from_secs(30), || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                })
+                .await
+            })
+        };
+        // Let the slow job take the only slot.
+        while permits.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        let busy = run_bounded_on(&permits, std::time::Duration::from_millis(20), || ()).await;
+        assert!(matches!(busy, Err(ApiError::ServiceUnavailable(_))));
+        slow.await.unwrap().unwrap();
+
+        // A panicking computation still gives its slot back.
+        let panicked = run_bounded_on(&permits, std::time::Duration::from_secs(5), || {
+            panic!("boom")
+        })
+        .await;
+        assert!(matches!(panicked, Err(ApiError::Internal(_))));
+        assert_eq!(permits.available_permits(), 1);
+        run_bounded_on(&permits, std::time::Duration::from_secs(5), || ())
+            .await
+            .unwrap();
     }
 }

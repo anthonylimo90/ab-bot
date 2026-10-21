@@ -1,9 +1,5 @@
 //! Workspace handlers for regular users.
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
@@ -28,7 +24,9 @@ use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::strategy_modes::{resolve_strategy_modes, StrategyModeInputs, StrategyModeStatus};
-use crate::workspace_scope::resolve_canonical_workspace_membership;
+use crate::workspace_scope::{
+    is_canonical_workspace, resolve_canonical_workspace_membership, CANONICAL_WORKSPACE_SQL,
+};
 
 #[derive(Debug, sqlx::FromRow)]
 struct WorkspaceAuditSnapshot {
@@ -252,7 +250,8 @@ struct InviteLookupRow {
 #[derive(Debug, sqlx::FromRow)]
 struct InviteAcceptUserRow {
     id: Uuid,
-    email: String,
+    /// NULL for wallet-only accounts, which can never match an invite email.
+    email: Option<String>,
 }
 
 fn generate_invite_token() -> String {
@@ -314,6 +313,32 @@ async fn get_user_role(
     .await?;
 
     Ok(role.map(|(r,)| r))
+}
+
+/// Authorize a write to global (non-workspace-scoped) configuration such as
+/// `dynamic_config`: platform admins, or owners/admins of the canonical workspace.
+/// Membership of any other workspace grants nothing.
+async fn require_global_config_writer(
+    pool: &sqlx::PgPool,
+    claims: &Claims,
+    user_id: Uuid,
+) -> ApiResult<()> {
+    if claims.role == UserRole::PlatformAdmin {
+        return Ok(());
+    }
+    match resolve_canonical_workspace_membership(pool, user_id)
+        .await?
+        .map(|membership| membership.role)
+    {
+        Some(role) if role == "owner" || role == "admin" => Ok(()),
+        Some(_) => Err(ApiError::Forbidden(
+            "Only canonical workspace owners/admins or platform admins can change global configuration"
+                .into(),
+        )),
+        None => Err(ApiError::Forbidden(
+            "Not a member of the canonical workspace".into(),
+        )),
+    }
 }
 
 async fn require_canonical_workspace_member(
@@ -487,7 +512,8 @@ pub async fn get_workspace(
         min_trades_30d: workspace.min_trades_30d,
         trading_wallet_address: workspace.trading_wallet_address,
         walletconnect_project_id: workspace.walletconnect_project_id,
-        polygon_rpc_url: workspace.polygon_rpc_url,
+        // Provider keys are embedded in the URL path, so only scheme and host are shown.
+        polygon_rpc_url: workspace.polygon_rpc_url.as_deref().map(mask_rpc_url),
         alchemy_api_key: masked_alchemy_key,
         arb_auto_execute: workspace.arb_auto_execute,
         live_trading_enabled: workspace.live_trading_enabled,
@@ -521,7 +547,7 @@ pub async fn update_workspace(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(workspace_id): Path<String>,
-    Json(req): Json<UpdateWorkspaceRequest>,
+    Json(mut req): Json<UpdateWorkspaceRequest>,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
@@ -566,6 +592,36 @@ pub async fn update_workspace(
     .bind(workspace_id)
     .fetch_one(&state.pool)
     .await?;
+
+    // The API only ever shows a masked RPC URL and the settings form sends back what it
+    // was shown. Echoing the current masked value means "unchanged"; any other masked
+    // value cannot be applied (it would replace the real URL with the mask).
+    if let Some(submitted) = req.polygon_rpc_url.as_deref() {
+        if is_masked_rpc_url(submitted) {
+            let current_mask = before_update.polygon_rpc_url.as_deref().map(mask_rpc_url);
+            if current_mask.as_deref() == Some(submitted.trim()) {
+                req.polygon_rpc_url = None;
+            } else {
+                return Err(ApiError::BadRequest(
+                    "Polygon RPC URL is masked; enter the full URL to change it".into(),
+                ));
+            }
+        }
+    }
+
+    // Runtime flags drive the single shared runtime (live trading, exit handler,
+    // arb executor) and feed the canonical-workspace election, so a workspace may
+    // only switch them on while it is already canonical. Switching them off is
+    // always allowed. The write below repeats this check atomically.
+    let enables_runtime_flag = (req.live_trading_enabled == Some(true)
+        && !before_update.live_trading_enabled)
+        || (req.exit_handler_enabled == Some(true) && !before_update.exit_handler_enabled)
+        || (req.arb_auto_execute == Some(true) && !before_update.arb_auto_execute);
+    if enables_runtime_flag && !is_canonical_workspace(&state.pool, workspace_id).await? {
+        return Err(ApiError::Forbidden(
+            "Runtime flags can only be enabled on the canonical workspace".into(),
+        ));
+    }
 
     // Validate WalletConnect project ID format if provided
     if let Some(ref project_id) = req.walletconnect_project_id {
@@ -659,9 +715,17 @@ pub async fn update_workspace(
     add_param!(exit_handler_enabled, "exit_handler_enabled");
     add_param!(inactivity_days, "inactivity_days");
 
+    // Enabling a runtime flag is only valid on the canonical workspace; re-check it in
+    // the statement itself so a concurrent election change cannot slip through.
+    let canonical_guard = if enables_runtime_flag {
+        format!(" AND id = ({CANONICAL_WORKSPACE_SQL})")
+    } else {
+        String::new()
+    };
     let query = format!(
-        "UPDATE workspaces SET {} WHERE id = $1",
-        set_parts.join(", ")
+        "UPDATE workspaces SET {} WHERE id = $1{}",
+        set_parts.join(", "),
+        canonical_guard
     );
 
     let mut q = sqlx::query(&query).bind(workspace_id).bind(now);
@@ -723,7 +787,12 @@ pub async fn update_workspace(
         q = q.bind(inactivity_days);
     }
 
-    q.execute(&state.pool).await?;
+    let update_result = q.execute(&state.pool).await?;
+    if enables_runtime_flag && update_result.rows_affected() == 0 {
+        return Err(ApiError::Forbidden(
+            "Runtime flags can only be enabled on the canonical workspace".into(),
+        ));
+    }
 
     // ── Propagate toggle changes to running services ──
     if req.arb_auto_execute.is_some()
@@ -780,7 +849,8 @@ pub async fn update_workspace(
         change_details.insert(
             "polygon_rpc_url".to_string(),
             serde_json::json!({
-                "from": before_update.polygon_rpc_url,
+                // Masked: the URL path carries the provider API key.
+                "from": before_update.polygon_rpc_url.as_deref().map(mask_rpc_url),
                 "changed": true,
             }),
         );
@@ -908,7 +978,7 @@ pub async fn list_members(
 
     let members: Vec<MemberRow> = sqlx::query_as(
         r#"
-        SELECT wm.user_id, u.email, u.name, wm.role, wm.joined_at
+        SELECT wm.user_id, COALESCE(u.email, '') AS email, u.name, wm.role, wm.joined_at
         FROM workspace_members wm
         INNER JOIN users u ON wm.user_id = u.id
         WHERE wm.workspace_id = $1
@@ -1130,10 +1200,11 @@ pub async fn create_workspace_invite(
         .fetch_one(&state.pool)
         .await?;
 
-    let inviter_email: (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")
-        .bind(user_id)
-        .fetch_one(&state.pool)
-        .await?;
+    let inviter_email: (String,) =
+        sqlx::query_as("SELECT COALESCE(email, '') FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await?;
 
     let token = generate_invite_token();
     let token_hash = hash_token(&token);
@@ -1304,7 +1375,7 @@ pub async fn get_invite_info(
             w.name AS workspace_name,
             wi.email,
             wi.role,
-            inviter.email AS inviter_email,
+            COALESCE(inviter.email, '') AS inviter_email,
             wi.expires_at,
             wi.accepted_at
         FROM workspace_invites wi
@@ -1381,7 +1452,7 @@ pub async fn accept_invite(
             w.name AS workspace_name,
             wi.email,
             wi.role,
-            inviter.email AS inviter_email,
+            COALESCE(inviter.email, '') AS inviter_email,
             wi.expires_at,
             wi.accepted_at
         FROM workspace_invites wi
@@ -1450,17 +1521,7 @@ pub async fn accept_invite(
             ));
         }
 
-        let password_to_hash = password.to_string();
-        let password_hash = tokio::task::spawn_blocking(move || {
-            let salt = SaltString::generate(&mut OsRng);
-            let argon2 = Argon2::default();
-            argon2
-                .hash_password(password_to_hash.as_bytes(), &salt)
-                .map(|hash| hash.to_string())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
-        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
+        let password_hash = crate::handlers::auth::hash_password(password.to_string()).await?;
 
         let user_id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -1481,8 +1542,12 @@ pub async fn accept_invite(
         .execute(&mut *tx)
         .await?;
 
-        let claims =
-            Claims::new(user_id.to_string(), UserRole::Trader, 24).with_email(&invite.email);
+        let claims = Claims::new(
+            user_id.to_string(),
+            UserRole::Trader,
+            state.jwt_auth.expiry_hours(),
+        )
+        .with_email(&invite.email);
         let token = state
             .jwt_auth
             .create_token_with_claims(&claims)
@@ -1513,7 +1578,11 @@ pub async fn accept_invite(
         .await?
         .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
-        if !user.email.eq_ignore_ascii_case(&invite.email) {
+        if !user
+            .email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(&invite.email))
+        {
             return Err(ApiError::Forbidden(
                 "This invite was sent to a different email address".into(),
             ));
@@ -1670,6 +1739,14 @@ pub async fn update_member_role(
         ));
     }
 
+    // Only owner can change an admin's role (an admin may not demote a peer), matching
+    // remove_member, which only lets the owner remove admins.
+    if target_role == "admin" && caller_role != "owner" {
+        return Err(ApiError::Forbidden(
+            "Only owner can change an admin's role".into(),
+        ));
+    }
+
     // Update role
     sqlx::query("UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3")
         .bind(&new_role)
@@ -1702,7 +1779,7 @@ pub async fn update_member_role(
 
     let member: MemberRow = sqlx::query_as(
         r#"
-        SELECT wm.user_id, u.email, u.name, wm.role, wm.joined_at
+        SELECT wm.user_id, COALESCE(u.email, '') AS email, u.name, wm.role, wm.joined_at
         FROM workspace_members wm
         INNER JOIN users u ON wm.user_id = u.id
         WHERE wm.workspace_id = $1 AND wm.user_id = $2
@@ -2729,24 +2806,11 @@ pub async fn update_opportunity_selection_settings(
 ) -> ApiResult<Json<OpportunitySelectionStatusResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
+    // Dynamic config is global (not workspace-scoped): the path workspace says
+    // nothing about who may change it, so only its format is validated.
+    Uuid::parse_str(&workspace_id)
         .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
-    if role != "owner" {
-        return Err(ApiError::Forbidden(
-            "Only workspace owner can update opportunity selection settings".into(),
-        ));
-    }
-
-    // Dynamic config is global (not workspace-scoped), so restrict to platform admins
-    if claims.role != auth::UserRole::PlatformAdmin && role != "owner" {
-        return Err(ApiError::Forbidden(
-            "Only platform admins or workspace owners can update global opportunity selection settings".into(),
-        ));
-    }
+    require_global_config_writer(&state.pool, &claims, user_id).await?;
 
     if req.aggressiveness.is_none()
         && req.exploration_slots.is_none()
@@ -3098,17 +3162,11 @@ pub async fn update_arb_executor_config(
 ) -> ApiResult<Json<ArbExecutorConfigResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
+    // Dynamic config is global (not workspace-scoped): the path workspace says
+    // nothing about who may change it, so only its format is validated.
+    Uuid::parse_str(&workspace_id)
         .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::Forbidden("Not a member of this workspace".into()))?;
-    if role != "owner" && role != "admin" {
-        return Err(ApiError::Forbidden(
-            "Only workspace owners/admins can update arb executor config".into(),
-        ));
-    }
+    require_global_config_writer(&state.pool, &claims, user_id).await?;
 
     if req.position_size.is_none()
         && req.min_net_profit.is_none()
@@ -3354,6 +3412,40 @@ async fn reconcile_runtime_service_toggles(state: &AppState) {
     crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
 }
 
+/// What replaces the secret-bearing part of a masked RPC URL.
+const MASKED_RPC_PATH: &str = "/***";
+
+/// Mask a provider RPC URL for responses and audit entries, keeping only scheme,
+/// host and port. Provider API keys live in the path (`/v2/<key>`) or query
+/// string, so those, plus any userinfo and fragment, are replaced with `/***`
+/// (omitted when there is nothing secret to hide). Idempotent.
+fn mask_rpc_url(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return "***".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "***".to_string();
+    };
+    let mut masked = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        masked.push_str(&format!(":{port}"));
+    }
+    let has_secret_part = !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some();
+    if has_secret_part {
+        masked.push_str(MASKED_RPC_PATH);
+    }
+    masked
+}
+
+/// Whether `url` is a masked URL as produced by [`mask_rpc_url`].
+fn is_masked_rpc_url(url: &str) -> bool {
+    Url::parse(url.trim()).is_ok_and(|parsed| parsed.path() == MASKED_RPC_PATH)
+}
+
 /// Validate WalletConnect project ID format.
 /// Expected: 32-character alphanumeric string (hex).
 fn is_valid_walletconnect_project_id(project_id: &str) -> bool {
@@ -3410,3 +3502,7 @@ fn is_private_host(host: &str) -> bool {
 
     false
 }
+
+#[cfg(test)]
+#[path = "workspaces/security_tests.rs"]
+mod security_tests;

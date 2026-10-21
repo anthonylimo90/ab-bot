@@ -126,6 +126,126 @@ impl UserRow {
     }
 }
 
+/// Chain id (Polygon mainnet) that every sign-in message must be bound to.
+const SIWE_CHAIN_ID: u64 = 137;
+
+/// What a sign-in message must say to be accepted by this deployment: the site
+/// that asked for the signature and the chain it is bound to. Without this a
+/// message (and signature) produced for any other site, or for another chain,
+/// would log in here as long as it carried a nonce we issued.
+struct SiteBinding {
+    /// `APP_DOMAIN`: the authority the message must name.
+    domain: String,
+    /// `APP_URI`: the URI the message must name.
+    uri: String,
+}
+
+impl SiteBinding {
+    fn from_env() -> Self {
+        Self {
+            domain: std::env::var("APP_DOMAIN").unwrap_or_else(|_| "localhost".to_string()),
+            uri: std::env::var("APP_URI").unwrap_or_else(|_| "http://localhost:3002".to_string()),
+        }
+    }
+
+    /// Reject messages that were not issued for this site and chain.
+    fn ensure_bound(&self, message: &Message) -> ApiResult<()> {
+        let domain_ok = message
+            .domain
+            .as_str()
+            .eq_ignore_ascii_case(self.domain.trim());
+        let uri_ok = normalize_uri(message.uri.as_str()) == normalize_uri(&self.uri);
+        let chain_ok = message.chain_id == SIWE_CHAIN_ID;
+        if domain_ok && uri_ok && chain_ok {
+            return Ok(());
+        }
+        tracing::warn!(
+            domain_ok,
+            uri_ok,
+            chain_ok,
+            message_domain = %message.domain,
+            message_uri = %message.uri,
+            message_chain_id = message.chain_id,
+            "Rejected SIWE message not issued for this site"
+        );
+        Err(ApiError::Unauthorized(
+            "Sign-in message was not issued for this site".into(),
+        ))
+    }
+
+    /// Verify the signature, the message's validity window and (again) its domain.
+    async fn verify_signature(
+        &self,
+        message: &Message,
+        signature: &[u8],
+    ) -> Result<(), siwe::VerificationError> {
+        let options = VerificationOpts {
+            domain: self.domain.trim().parse().ok(),
+            nonce: Some(message.nonce.clone()),
+            timestamp: Some(OffsetDateTime::now_utc()),
+        };
+        message.verify(signature, &options).await
+    }
+}
+
+/// Compare URIs ignoring scheme/host case and a trailing slash.
+fn normalize_uri(uri: &str) -> String {
+    let uri = uri.trim();
+    match url::Url::parse(uri) {
+        Ok(parsed) => parsed.as_str().trim_end_matches('/').to_string(),
+        Err(_) => uri.trim_end_matches('/').to_string(),
+    }
+}
+
+async fn find_wallet_user(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &str,
+) -> ApiResult<Option<UserRow>> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT id, email, wallet_address, role, name, created_at
+        FROM users
+        WHERE wallet_address = $1
+        "#,
+    )
+    .bind(address)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+/// Atomically consume a challenge nonce issued for `address`.
+///
+/// One statement checks and marks it, so of any number of concurrent attempts
+/// exactly one succeeds. Unknown, already used and expired nonces all yield 401.
+async fn consume_challenge(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    address: &str,
+    nonce: &str,
+) -> ApiResult<()> {
+    let consumed: Option<(Uuid,)> = sqlx::query_as(
+        r#"
+        UPDATE auth_challenges
+        SET used_at = NOW()
+        WHERE wallet_address = $1 AND nonce = $2
+          AND used_at IS NULL AND expires_at > NOW()
+        RETURNING id
+        "#,
+    )
+    .bind(address)
+    .bind(nonce)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match consumed {
+        Some(_) => Ok(()),
+        None => {
+            tracing::warn!(address = %address, "SIWE challenge unknown, used or expired");
+            Err(ApiError::Unauthorized(
+                "Invalid or expired challenge".into(),
+            ))
+        }
+    }
+}
+
 /// Generate a random nonce for SIWE.
 fn generate_nonce() -> String {
     let mut rng = rand::thread_rng();
@@ -141,9 +261,22 @@ fn validate_address(address: &str) -> bool {
     address[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Normalize address to lowercase with checksum.
+/// Normalize address to lowercase (the form stored in the database).
 fn normalize_address(address: &str) -> String {
     address.to_lowercase()
+}
+
+/// EIP-55 checksummed form of a validated address. SIWE requires it in the
+/// message body: a lowercase address makes `Message::from_str` fail, so a
+/// challenge containing one could never be verified.
+fn eip55_address(address: &str) -> String {
+    match hex::decode(address.trim_start_matches("0x"))
+        .ok()
+        .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+    {
+        Some(bytes) => siwe::eip55(&bytes),
+        None => address.to_string(),
+    }
 }
 
 /// Generate a SIWE challenge for wallet authentication.
@@ -203,8 +336,7 @@ pub async fn challenge(
     .await;
 
     // Build SIWE message
-    let domain = std::env::var("APP_DOMAIN").unwrap_or_else(|_| "localhost".to_string());
-    let uri = std::env::var("APP_URI").unwrap_or_else(|_| "http://localhost:3002".to_string());
+    let site = SiteBinding::from_env();
 
     let message = format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
@@ -212,13 +344,14 @@ pub async fn challenge(
         Sign in to AB-Bot Trading Platform\n\n\
         URI: {uri}\n\
         Version: 1\n\
-        Chain ID: 137\n\
+        Chain ID: {chain_id}\n\
         Nonce: {nonce}\n\
         Issued At: {issued_at}\n\
         Expiration Time: {expires_at}",
-        domain = domain,
-        address = address,
-        uri = uri,
+        domain = site.domain,
+        address = eip55_address(&address),
+        uri = site.uri,
+        chain_id = SIWE_CHAIN_ID,
         nonce = nonce,
         issued_at = now.to_rfc3339(),
         expires_at = expires_at.to_rfc3339(),
@@ -259,97 +392,49 @@ pub async fn verify(
     })?;
 
     let address = normalize_address(&format!("0x{}", hex::encode(message.address.as_ref())));
-    let nonce = message.nonce.clone();
 
-    // Check that the nonce exists and is not expired/used
-    #[derive(sqlx::FromRow)]
-    struct ChallengeRow {
-        id: Uuid,
-        expires_at: chrono::DateTime<Utc>,
-        used_at: Option<chrono::DateTime<Utc>>,
-    }
-
-    let challenge: Option<ChallengeRow> = sqlx::query_as(
-        r#"
-        SELECT id, expires_at, used_at
-        FROM auth_challenges
-        WHERE wallet_address = $1 AND nonce = $2
-        "#,
-    )
-    .bind(&address)
-    .bind(&nonce)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let challenge = match challenge {
-        Some(c) => c,
-        None => {
-            tracing::warn!(address = %address, "No matching challenge found");
-            return Err(ApiError::Unauthorized(
-                "Invalid or expired challenge".into(),
-            ));
-        }
-    };
-
-    if challenge.used_at.is_some() {
-        tracing::warn!(address = %address, "Challenge already used");
-        return Err(ApiError::Unauthorized("Challenge already used".into()));
-    }
-
-    if challenge.expires_at < Utc::now() {
-        tracing::warn!(address = %address, "Challenge expired");
-        return Err(ApiError::Unauthorized("Challenge expired".into()));
-    }
-
-    // Verify the signature
     let signature_bytes = hex::decode(req.signature.trim_start_matches("0x"))
         .map_err(|_| ApiError::BadRequest("Invalid signature format".into()))?;
 
-    let verification_opts = VerificationOpts {
-        domain: None, // Skip domain check (already validated in message)
-        nonce: Some(nonce.clone()),
-        timestamp: Some(OffsetDateTime::now_utc()),
-    };
+    // The signed message must have been issued for this site, not merely carry a
+    // valid signature and a nonce we handed out.
+    let site = SiteBinding::from_env();
+    site.ensure_bound(&message)?;
 
-    message
-        .verify(&signature_bytes, &verification_opts)
-        .await
-        .map_err(|e| {
-            tracing::warn!(address = %address, error = ?e, "Signature verification failed");
-            ApiError::Unauthorized("Signature verification failed".into())
-        })?;
+    // Consume the nonce before verifying, in one atomic statement: of any number
+    // of concurrent replays exactly one gets past this point.
+    let mut tx = state.pool.begin().await?;
+    consume_challenge(&mut tx, &address, &message.nonce).await?;
 
-    // Mark challenge as used
-    sqlx::query("UPDATE auth_challenges SET used_at = $1 WHERE id = $2")
-        .bind(Utc::now())
-        .bind(challenge.id)
-        .execute(&state.pool)
-        .await?;
+    if let Err(e) = site.verify_signature(&message, &signature_bytes).await {
+        tracing::warn!(address = %address, error = ?e, "Signature verification failed");
+        // A failed attempt still burns the nonce.
+        tx.commit().await?;
+        return Err(ApiError::Unauthorized(
+            "Signature verification failed".into(),
+        ));
+    }
 
-    // Find or create user
-    let existing_user: Option<UserRow> = sqlx::query_as(
-        r#"
-        SELECT id, email, wallet_address, role, name, created_at
-        FROM users
-        WHERE wallet_address = $1
-        "#,
-    )
-    .bind(&address)
-    .fetch_optional(&state.pool)
-    .await?;
-
+    // Find or create the user in the same transaction as the nonce consumption: if
+    // creating the account fails, the nonce is not burned and the sign-in can be
+    // retried.
+    let existing_user: Option<UserRow> = find_wallet_user(&mut tx, &address).await?;
     let (user, is_new_user) = match existing_user {
         Some(u) => (u, false),
         None => {
-            // Create new user with wallet
+            // Wallet-only account: no email or password (users.email and
+            // users.password_hash are nullable for wallet accounts).
             let user_id = Uuid::new_v4();
             let role: i16 = 1; // Trader by default
             let now = Utc::now();
 
-            sqlx::query(
+            // A concurrent first sign-in for the same wallet (with a different
+            // nonce) may win the insert; then we simply sign in as that user.
+            let inserted = sqlx::query(
                 r#"
                 INSERT INTO users (id, wallet_address, wallet_linked_at, role, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $5)
+                ON CONFLICT (wallet_address) DO NOTHING
                 "#,
             )
             .bind(user_id)
@@ -357,41 +442,37 @@ pub async fn verify(
             .bind(now)
             .bind(role)
             .bind(now)
-            .execute(&state.pool)
-            .await?;
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                == 1;
 
-            // Log user creation
-            let audit_event =
-                AuditEvent::builder(AuditAction::UserCreated, format!("user/{}", user_id))
-                    .user(user_id.to_string())
-                    .details(serde_json::json!({
-                        "wallet_address": &address,
-                        "role": "Trader",
-                        "source": "wallet_auth"
-                    }))
-                    .build();
-            state.audit_logger.log(audit_event);
-
-            (
-                UserRow {
-                    id: user_id,
-                    email: None,
-                    wallet_address: Some(address.clone()),
-                    role,
-                    name: None,
-                    created_at: now,
-                },
-                true,
-            )
+            let user = find_wallet_user(&mut tx, &address)
+                .await?
+                .ok_or_else(|| ApiError::Internal("Wallet user missing after insert".into()))?;
+            (user, inserted)
         }
     };
 
-    // Update last login
-    let _ = sqlx::query("UPDATE users SET last_login = $1 WHERE id = $2")
+    sqlx::query("UPDATE users SET last_login = $1 WHERE id = $2")
         .bind(Utc::now())
         .bind(user.id)
-        .execute(&state.pool)
-        .await;
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if is_new_user {
+        let audit_event =
+            AuditEvent::builder(AuditAction::UserCreated, format!("user/{}", user.id))
+                .user(user.id.to_string())
+                .details(serde_json::json!({
+                    "wallet_address": &address,
+                    "role": "Trader",
+                    "source": "wallet_auth"
+                }))
+                .build();
+        state.audit_logger.log(audit_event);
+    }
 
     // Log successful login
     state
@@ -402,9 +483,14 @@ pub async fn verify(
     let role = user.role_string();
     let user_role = user.user_role();
 
-    let claims = crate::middleware::session_claims(&state.pool, user.id, user_role)
-        .await?
-        .with_wallet_address(&address);
+    let claims = crate::middleware::session_claims(
+        &state.pool,
+        user.id,
+        user_role,
+        state.jwt_auth.expiry_hours(),
+    )
+    .await?
+    .with_wallet_address(&address);
     let claims = if let Some(ref email) = user.email {
         claims.with_email(email)
     } else {
@@ -481,73 +567,35 @@ pub async fn link_wallet(
     })?;
 
     let address = normalize_address(&format!("0x{}", hex::encode(message.address.as_ref())));
-    let nonce = message.nonce.clone();
 
-    // Check that the nonce exists and is not expired/used
-    #[derive(sqlx::FromRow)]
-    struct ChallengeRow {
-        id: Uuid,
-        expires_at: chrono::DateTime<Utc>,
-        used_at: Option<chrono::DateTime<Utc>>,
-    }
-
-    let challenge: Option<ChallengeRow> = sqlx::query_as(
-        r#"
-        SELECT id, expires_at, used_at
-        FROM auth_challenges
-        WHERE wallet_address = $1 AND nonce = $2
-        "#,
-    )
-    .bind(&address)
-    .bind(&nonce)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let challenge = match challenge {
-        Some(c) => c,
-        None => {
-            return Err(ApiError::Unauthorized(
-                "Invalid or expired challenge".into(),
-            ));
-        }
-    };
-
-    if challenge.used_at.is_some() {
-        return Err(ApiError::Unauthorized("Challenge already used".into()));
-    }
-
-    if challenge.expires_at < Utc::now() {
-        return Err(ApiError::Unauthorized("Challenge expired".into()));
-    }
-
-    // Verify the signature
     let signature_bytes = hex::decode(req.signature.trim_start_matches("0x"))
         .map_err(|_| ApiError::BadRequest("Invalid signature format".into()))?;
 
-    let verification_opts = VerificationOpts {
-        domain: None,
-        nonce: Some(nonce),
-        timestamp: Some(OffsetDateTime::now_utc()),
-    };
+    // Same site binding and atomic nonce consumption as `verify`.
+    let site = SiteBinding::from_env();
+    site.ensure_bound(&message)?;
 
-    message
-        .verify(&signature_bytes, &verification_opts)
+    let mut tx = state.pool.begin().await?;
+    consume_challenge(&mut tx, &address, &message.nonce).await?;
+
+    if site
+        .verify_signature(&message, &signature_bytes)
         .await
-        .map_err(|_| ApiError::Unauthorized("Signature verification failed".into()))?;
-
-    // Mark challenge as used
-    sqlx::query("UPDATE auth_challenges SET used_at = $1 WHERE id = $2")
-        .bind(Utc::now())
-        .bind(challenge.id)
-        .execute(&state.pool)
-        .await?;
+        .is_err()
+    {
+        // A failed attempt still burns the nonce.
+        tx.commit().await?;
+        return Err(ApiError::Unauthorized(
+            "Signature verification failed".into(),
+        ));
+    }
 
     // Check if wallet is already linked to another user
     let wallet_exists: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM users WHERE wallet_address = $1 AND id != $2")
             .bind(&address)
             .bind(user_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
     if wallet_exists.is_some() {
@@ -556,13 +604,22 @@ pub async fn link_wallet(
         ));
     }
 
-    // Link wallet to user
-    sqlx::query("UPDATE users SET wallet_address = $1, wallet_linked_at = $2 WHERE id = $3")
-        .bind(&address)
-        .bind(Utc::now())
-        .bind(user_id)
-        .execute(&state.pool)
-        .await?;
+    // Link the wallet in the same transaction as the nonce consumption, and only
+    // while the account has none (a concurrent link must not overwrite it).
+    let linked = sqlx::query(
+        "UPDATE users SET wallet_address = $1, wallet_linked_at = $2 WHERE id = $3 AND wallet_address IS NULL",
+    )
+    .bind(&address)
+    .bind(Utc::now())
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    if linked.rows_affected() != 1 {
+        return Err(ApiError::BadRequest(
+            "A wallet is already linked to this account".into(),
+        ));
+    }
+    tx.commit().await?;
 
     // Log wallet linking
     let audit_event = AuditEvent::builder(
@@ -622,3 +679,7 @@ mod tests {
         assert_ne!(nonce1, nonce2);
     }
 }
+
+#[cfg(test)]
+#[path = "wallet_auth/siwe_tests.rs"]
+mod siwe_tests;
