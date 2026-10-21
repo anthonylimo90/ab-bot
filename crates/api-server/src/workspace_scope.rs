@@ -13,6 +13,9 @@ use crate::state::AppState;
 #[cfg(test)]
 #[path = "workspace_scope/access_tests.rs"]
 mod access_tests;
+#[cfg(test)]
+#[path = "workspace_scope/test_fixture.rs"]
+pub(crate) mod test_fixture;
 
 /// Pool-only state used by the workspace authorization extractors.
 #[derive(Clone)]

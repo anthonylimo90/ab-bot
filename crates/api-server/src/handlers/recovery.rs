@@ -17,7 +17,6 @@ use auth::Claims;
 use crate::error::{ApiError, ApiResult};
 use crate::exit_handler::ExitHandlerConfig;
 use crate::position_service::EventContext;
-use crate::runtime_sync;
 use crate::state::AppState;
 use crate::wallet_inventory::{
     canonical_refresh_status, force_refresh_canonical_wallet_inventory,
@@ -100,6 +99,9 @@ struct RuntimeSnapshot {
     live_running: bool,
     live_ready: bool,
     exit_handler_running: bool,
+    /// Operator-controlled workspace flags, reported but never modified here.
+    live_trading_enabled: bool,
+    exit_handler_enabled: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -130,7 +132,14 @@ pub async fn preview_recovery(
     Path(_workspace_id): Path<String>,
     Query(query): Query<PreviewQuery>,
 ) -> ApiResult<Json<RecoveryPreviewResponse>> {
-    let workspace_id = parse_and_require_member(&state.pool, &claims).await?;
+    // Plain previews are read-only and stay available to every canonical member.
+    // A refresh triggers on-chain scans and writes, so it needs owner/admin.
+    let access = if query.refresh {
+        RecoveryAccess::OwnerOrAdmin
+    } else {
+        RecoveryAccess::AnyMember
+    };
+    let workspace_id = authorize_recovery(&state.pool, &claims, access).await?;
     if query.refresh {
         force_refresh_canonical_wallet_inventory(state.as_ref())
             .await
@@ -160,9 +169,11 @@ pub async fn run_recovery(
     Extension(claims): Extension<Claims>,
     Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<RecoveryRunResponse>> {
-    let workspace_id = parse_and_require_member(&state.pool, &claims).await?;
-    ensure_workspace_runtime_enabled(&state.pool, workspace_id).await?;
-    runtime_sync::reconcile_runtime_service_toggles(state.as_ref()).await;
+    // Recovery submits exit orders and mutates position state: owner/admin only.
+    // It must never change runtime flags (live trading / exit handler); those are
+    // operator decisions, so the runtime status is only reported back below.
+    let workspace_id =
+        authorize_recovery(&state.pool, &claims, RecoveryAccess::OwnerOrAdmin).await?;
 
     force_refresh_canonical_wallet_inventory(state.as_ref())
         .await
@@ -247,7 +258,17 @@ pub async fn run_recovery(
     if !runtime.live_ready {
         warnings.push("Live trading wallet/API credentials are not ready".to_string());
     }
-    if !runtime.exit_handler_running {
+    if !runtime.live_trading_enabled {
+        warnings.push(
+            "Live trading is disabled for this workspace; recovery does not enable it".to_string(),
+        );
+    }
+    if !runtime.exit_handler_enabled {
+        warnings.push(
+            "Exit handler is disabled for this workspace; recovery does not enable it, so requeued exits will not execute until an owner turns it on"
+                .to_string(),
+        );
+    } else if !runtime.exit_handler_running {
         warnings.push("Exit handler heartbeat is stale or the worker is not running".to_string());
     }
     if !allowance_cache_refreshed {
@@ -276,13 +297,37 @@ pub async fn run_recovery(
     }))
 }
 
-async fn parse_and_require_member(pool: &sqlx::PgPool, claims: &Claims) -> ApiResult<Uuid> {
+/// Minimum canonical-workspace role required for a recovery endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAccess {
+    /// Any member of the canonical workspace (read-only previews).
+    AnyMember,
+    /// Owner or admin of the canonical workspace (mutating operations).
+    OwnerOrAdmin,
+}
+
+/// Authorize against the canonical workspace and return its id.
+///
+/// The workspace id in the URL is intentionally not trusted: recovery always
+/// operates on the canonical workspace, so the caller's role there decides.
+async fn authorize_recovery(
+    pool: &sqlx::PgPool,
+    claims: &Claims,
+    access: RecoveryAccess,
+) -> ApiResult<Uuid> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    resolve_canonical_workspace_membership(pool, user_id)
+    let membership = resolve_canonical_workspace_membership(pool, user_id)
         .await?
-        .map(|workspace| workspace.id)
-        .ok_or_else(|| ApiError::Forbidden("Not a member of the canonical workspace".into()))
+        .ok_or_else(|| ApiError::Forbidden("Not a member of the canonical workspace".into()))?;
+    if access == RecoveryAccess::OwnerOrAdmin
+        && !matches!(membership.role.as_str(), "owner" | "admin")
+    {
+        return Err(ApiError::Forbidden(
+            "Workspace owner or admin role required for recovery".into(),
+        ));
+    }
+    Ok(membership.id)
 }
 
 async fn build_recovery_preview(
@@ -433,27 +478,9 @@ async fn runtime_snapshot(state: &AppState, workspace_id: Uuid) -> ApiResult<Run
         live_running: flags.live_trading_enabled && live_mode && live_ready,
         live_ready,
         exit_handler_running: flags.exit_handler_enabled && exit_handler_alive,
+        live_trading_enabled: flags.live_trading_enabled,
+        exit_handler_enabled: flags.exit_handler_enabled,
     })
-}
-
-async fn ensure_workspace_runtime_enabled(
-    pool: &sqlx::PgPool,
-    workspace_id: Uuid,
-) -> ApiResult<()> {
-    sqlx::query(
-        r#"
-        UPDATE workspaces
-        SET live_trading_enabled = TRUE,
-            exit_handler_enabled = TRUE,
-            updated_at = NOW()
-        WHERE id = $1
-        "#,
-    )
-    .bind(workspace_id)
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }
 
 async fn load_effective_positions(pool: &sqlx::PgPool) -> ApiResult<Vec<EffectivePositionRow>> {
@@ -600,4 +627,143 @@ fn classify_failure_message(message: &str) -> FailureBucket {
 
 fn map_anyhow(error: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_scope::test_fixture as fx;
+    use auth::UserRole;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::Router;
+    use sqlx::PgPool;
+
+    fn router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/workspaces/:workspace_id/recovery/preview",
+                post(preview_recovery),
+            )
+            .route(
+                "/api/v1/workspaces/:workspace_id/recovery/run",
+                post(run_recovery),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::middleware::require_trader,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::middleware::require_auth,
+            ))
+            .with_state(state)
+    }
+
+    struct Fixture {
+        state: Arc<AppState>,
+        app: Router,
+        workspace: Uuid,
+        tokens: Vec<(&'static str, String)>,
+    }
+
+    /// One canonical workspace with an operator-disabled runtime and one user
+    /// per workspace role, all with the Trader platform role (as the route requires).
+    async fn fixture(pool: &PgPool) -> Fixture {
+        fx::real_schema(pool).await;
+        let state = AppState::for_tests(pool.clone());
+        let workspace = fx::workspace(pool, "canonical", 100).await;
+        let mut tokens = Vec::new();
+        for role in ["owner", "admin", "member", "viewer"] {
+            let user = fx::member(pool, workspace, role, UserRole::Trader).await;
+            tokens.push((role, fx::token(&state, user, UserRole::Trader).await));
+        }
+        let app = router(state.clone());
+        Fixture {
+            state,
+            app,
+            workspace,
+            tokens,
+        }
+    }
+
+    impl Fixture {
+        fn token(&self, role: &str) -> &str {
+            &self.tokens.iter().find(|(r, _)| *r == role).unwrap().1
+        }
+        async fn post(&self, role: &str, path: &str) -> StatusCode {
+            let uri = format!("/api/v1/workspaces/{}/recovery/{path}", self.workspace);
+            fx::call(&self.app, "POST", &uri, Some(self.token(role)), None)
+                .await
+                .0
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn run_requires_canonical_owner_or_admin(pool: PgPool) {
+        let f = fixture(&pool).await;
+        for role in ["viewer", "member"] {
+            assert_eq!(
+                f.post(role, "run").await,
+                StatusCode::FORBIDDEN,
+                "{role} must not run recovery"
+            );
+            assert_eq!(
+                f.post(role, "preview?refresh=true").await,
+                StatusCode::FORBIDDEN,
+                "{role} must not refresh inventory"
+            );
+        }
+        // Owners and admins pass authorization. The test schema has no positions
+        // table, so the handler itself fails afterwards; only the guard matters here.
+        for role in ["owner", "admin"] {
+            assert_ne!(f.post(role, "run").await, StatusCode::FORBIDDEN, "{role}");
+            assert_ne!(
+                f.post(role, "preview?refresh=true").await,
+                StatusCode::FORBIDDEN,
+                "{role}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn plain_preview_stays_readable_by_every_member(pool: PgPool) {
+        let f = fixture(&pool).await;
+        for role in ["owner", "admin", "member", "viewer"] {
+            assert_ne!(
+                f.post(role, "preview").await,
+                StatusCode::FORBIDDEN,
+                "{role}"
+            );
+        }
+        // Non-members of the canonical workspace are still rejected.
+        let outsider = fx::user(&pool, UserRole::Trader).await;
+        let token = fx::token(&f.state, outsider, UserRole::Trader).await;
+        let uri = format!("/api/v1/workspaces/{}/recovery/preview", f.workspace);
+        let (status, _) = fx::call(&f.app, "POST", &uri, Some(&token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn recovery_never_changes_runtime_flags(pool: PgPool) {
+        let f = fixture(&pool).await;
+        assert_eq!(fx::flags(&pool, f.workspace).await, (false, false, false));
+        for role in ["viewer", "member", "admin", "owner"] {
+            f.post(role, "run").await;
+            f.post(role, "preview?refresh=true").await;
+            assert_eq!(
+                fx::flags(&pool, f.workspace).await,
+                (false, false, false),
+                "{role} run must not arm live trading or the exit handler"
+            );
+        }
+        // An operator who disabled only the exit handler keeps that choice too.
+        sqlx::query("UPDATE workspaces SET live_trading_enabled = TRUE WHERE id = $1")
+            .bind(f.workspace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        f.post("owner", "run").await;
+        assert_eq!(fx::flags(&pool, f.workspace).await, (true, false, false));
+    }
 }
