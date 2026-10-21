@@ -112,6 +112,9 @@ pub struct ServerConfig {
     pub port: u16,
     /// Enable CORS for all origins (development only).
     pub cors_permissive: bool,
+    /// Exact origins allowed by CORS (`CORS_ALLOWED_ORIGINS`, comma-separated).
+    /// When non-empty it takes precedence over `cors_permissive`.
+    pub cors_allowed_origins: Vec<String>,
     /// JWT secret for authentication.
     pub jwt_secret: String,
     /// WebSocket channel capacity.
@@ -124,10 +127,84 @@ impl Default for ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 3000,
             cors_permissive: true,
+            cors_allowed_origins: Vec::new(),
             jwt_secret: "development-secret-change-in-production".to_string(),
             ws_channel_capacity: 1000,
         }
     }
+}
+
+/// Split a comma-separated origin list, trimming blanks and trailing slashes
+/// (an Origin header never has a path).
+fn parse_origin_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|origin| origin.trim().trim_end_matches('/'))
+        .filter(|origin| !origin.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Build the CORS layer.
+///
+/// - `cors_allowed_origins` set: only those exact origins, the methods and
+///   headers the dashboard uses, and a 10 minute preflight cache.
+/// - otherwise `cors_permissive`: any origin (development).
+/// - otherwise: any origin as well, for backward compatibility, which makes
+///   `CORS_PERMISSIVE=false` a no-op; a startup warning says so.
+fn build_cors_layer(config: &ServerConfig) -> CorsLayer {
+    use axum::http::{header, HeaderValue, Method};
+
+    if !config.cors_allowed_origins.is_empty() {
+        let origins: Vec<HeaderValue> = config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|origin| {
+                if origin == "*" {
+                    tracing::warn!("CORS_ALLOWED_ORIGINS entry \"*\" ignored: list exact origins");
+                    return None;
+                }
+                match HeaderValue::from_str(origin) {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        tracing::warn!(origin = %origin, "Ignoring invalid CORS_ALLOWED_ORIGINS entry");
+                        None
+                    }
+                }
+            })
+            .collect();
+        if origins.is_empty() {
+            tracing::error!(
+                "CORS_ALLOWED_ORIGINS contains no usable origin; cross-origin requests will be refused"
+            );
+        } else {
+            info!(origins = ?config.cors_allowed_origins, "CORS restricted to configured origins");
+        }
+        return CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .max_age(std::time::Duration::from_secs(600));
+    }
+
+    if config.cors_permissive {
+        return CorsLayer::permissive();
+    }
+
+    tracing::warn!(
+        "CORS_PERMISSIVE=false but CORS_ALLOWED_ORIGINS is not set: all origins are still \
+         allowed. Set CORS_ALLOWED_ORIGINS to a comma-separated list of exact origins to restrict access."
+    );
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
 }
 
 impl ServerConfig {
@@ -144,6 +221,9 @@ impl ServerConfig {
             cors_permissive: std::env::var("CORS_PERMISSIVE")
                 .map(|v| v == "true")
                 .unwrap_or(true),
+            cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
+                .map(|raw| parse_origin_list(&raw))
+                .unwrap_or_default(),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
             ws_channel_capacity: std::env::var("WS_CHANNEL_CAPACITY")
@@ -283,14 +363,7 @@ impl ApiServer {
                     ),
             )
             .layer(DefaultBodyLimit::max(2 * 1024 * 1024)) // 2 MB
-            .layer(if self.config.cors_permissive {
-                CorsLayer::permissive()
-            } else {
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods(Any)
-                    .allow_headers(Any)
-            });
+            .layer(build_cors_layer(&self.config));
 
         // ── Spawn background tasks ──
 
@@ -519,5 +592,152 @@ impl ApiServer {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn config(permissive: bool, origins: &[&str]) -> ServerConfig {
+        ServerConfig {
+            cors_permissive: permissive,
+            cors_allowed_origins: origins.iter().map(|o| o.to_string()).collect(),
+            ..ServerConfig::default()
+        }
+    }
+
+    async fn send(
+        config: &ServerConfig,
+        method: Method,
+        origin: &str,
+        preflight_headers: bool,
+    ) -> axum::http::Response<Body> {
+        let app = axum::Router::new()
+            .route("/x", axum::routing::any(|| async { "ok" }))
+            .layer(build_cors_layer(config));
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/x")
+            .header(header::ORIGIN, origin);
+        if preflight_headers {
+            request = request
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "DELETE")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type",
+                );
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn allow_origin(response: &axum::http::Response<Body>) -> Option<String> {
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn origin_lists_are_trimmed() {
+        assert_eq!(
+            parse_origin_list(" https://a.example/ , ,https://b.example:8443,"),
+            vec!["https://a.example", "https://b.example:8443"]
+        );
+        assert!(parse_origin_list("  ").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_only_admits_exact_origins() {
+        let config = config(
+            false,
+            &["https://app.example", "https://admin.example:8443"],
+        );
+        for allowed in ["https://app.example", "https://admin.example:8443"] {
+            let response = send(&config, Method::GET, allowed, false).await;
+            assert_eq!(allow_origin(&response).as_deref(), Some(allowed));
+        }
+        for denied in [
+            "https://evil.example",
+            "https://app.example.evil.example",
+            "http://app.example",
+            "https://app.example:8443",
+            "null",
+        ] {
+            let response = send(&config, Method::GET, denied, false).await;
+            assert_eq!(allow_origin(&response), None, "{denied}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_is_used_even_when_cors_is_permissive() {
+        let config = config(true, &["https://app.example"]);
+        let response = send(&config, Method::GET, "https://evil.example", false).await;
+        assert_eq!(allow_origin(&response), None);
+    }
+
+    #[tokio::test]
+    async fn preflight_advertises_only_the_dashboard_methods_and_headers() {
+        let config = config(false, &["https://app.example"]);
+        let response = send(&config, Method::OPTIONS, "https://app.example", true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = |name| response.headers()[name].to_str().unwrap().to_string();
+        assert_eq!(
+            allow_origin(&response).as_deref(),
+            Some("https://app.example")
+        );
+        let methods = header(header::ACCESS_CONTROL_ALLOW_METHODS);
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {
+            assert!(methods.contains(method), "{methods}");
+        }
+        assert!(!methods.contains('*'));
+        let headers = header(header::ACCESS_CONTROL_ALLOW_HEADERS).to_ascii_lowercase();
+        assert!(headers.contains("authorization") && headers.contains("content-type"));
+        assert!(!headers.contains('*'), "{headers}");
+        assert_eq!(header(header::ACCESS_CONTROL_MAX_AGE), "600");
+    }
+
+    #[tokio::test]
+    async fn unusable_allowlist_entries_fail_closed() {
+        for entries in [&["*"][..], &["bad\norigin"][..], &["*", "bad\norigin"][..]] {
+            let config = config(true, entries);
+            let response = send(&config, Method::GET, "https://app.example", false).await;
+            assert_eq!(allow_origin(&response), None, "{entries:?}");
+        }
+        // A usable entry next to an unusable one still works.
+        let config = config(false, &["*", "https://app.example"]);
+        let response = send(&config, Method::GET, "https://app.example", false).await;
+        assert_eq!(
+            allow_origin(&response).as_deref(),
+            Some("https://app.example")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_allowlist_behaviour_is_unchanged() {
+        // CORS_PERMISSIVE=true: any origin.
+        let response = send(
+            &config(true, &[]),
+            Method::GET,
+            "https://any.example",
+            false,
+        )
+        .await;
+        assert!(allow_origin(&response).is_some());
+        // CORS_PERMISSIVE=false and no allowlist: still any origin (the old behaviour,
+        // now logged as a startup warning).
+        let response = send(
+            &config(false, &[]),
+            Method::GET,
+            "https://any.example",
+            false,
+        )
+        .await;
+        assert_eq!(allow_origin(&response).as_deref(), Some("*"));
     }
 }
