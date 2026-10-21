@@ -16,6 +16,7 @@ struct Fixture {
     canonical: Uuid,
     other: Uuid,
     tokens: std::collections::HashMap<&'static str, String>,
+    user_ids: std::collections::HashMap<&'static str, Uuid>,
 }
 
 impl Fixture {
@@ -42,6 +43,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
     for (name, workspace, role, platform) in [
         ("owner_a", canonical, "owner", UserRole::Trader),
         ("admin_a", canonical, "admin", UserRole::Trader),
+        ("admin_a2", canonical, "admin", UserRole::Trader),
         ("member_a", canonical, "member", UserRole::Trader),
         ("viewer_a", canonical, "viewer", UserRole::Trader),
         ("owner_b", other, "owner", UserRole::Trader),
@@ -60,13 +62,19 @@ async fn fixture(pool: &PgPool) -> Fixture {
         UserRole::PlatformAdmin,
     ));
     let mut tokens = std::collections::HashMap::new();
+    let mut user_ids = std::collections::HashMap::new();
     for (name, id, platform) in ids {
         tokens.insert(name, fx::token(&state, id, platform).await);
+        user_ids.insert(name, id);
     }
     let app = Router::new()
         .route(
             "/api/v1/workspaces/:workspace_id",
             put(update_workspace).get(get_workspace),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/members/:member_id",
+            put(update_member_role),
         )
         .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/opportunity-selection",
@@ -90,6 +98,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
         canonical,
         other,
         tokens,
+        user_ids,
     }
 }
 
@@ -441,4 +450,87 @@ async fn audit_entries_never_contain_the_previous_rpc_url_key(pool: PgPool) {
     assert!(!details.contains("SECRETKEY123"), "{details}");
     assert!(!details.contains("NEWKEY456"), "{details}");
     assert!(!details.contains("/v2/"), "{details}");
+}
+
+impl Fixture {
+    /// PUT the member's role as `who`; returns the status.
+    async fn set_role(&self, who: &str, member: &str, role: &str) -> StatusCode {
+        let uri = format!(
+            "/api/v1/workspaces/{}/members/{}",
+            self.canonical, self.user_ids[member]
+        );
+        fx::call(
+            &self.app,
+            "PUT",
+            &uri,
+            Some(&self.tokens[who]),
+            Some(json!({ "role": role })),
+        )
+        .await
+        .0
+    }
+
+    async fn role_of(&self, pool: &PgPool, member: &str) -> String {
+        sqlx::query_scalar(
+            "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        )
+        .bind(self.canonical)
+        .bind(self.user_ids[member])
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_the_owner_can_change_an_admins_role(pool: PgPool) {
+    let f = fixture(&pool).await;
+    // An admin cannot demote a peer admin (remove_member already forbids removing one)...
+    for role in ["member", "viewer"] {
+        assert_eq!(
+            f.set_role("admin_a", "admin_a2", role).await,
+            StatusCode::FORBIDDEN,
+            "{role}"
+        );
+    }
+    assert_eq!(f.role_of(&pool, "admin_a2").await, "admin");
+    // ...nor can anyone below admin.
+    assert_eq!(
+        f.set_role("member_a", "admin_a2", "viewer").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(f.role_of(&pool, "admin_a2").await, "admin");
+    // The owner can.
+    assert_eq!(
+        f.set_role("owner_a", "admin_a2", "member").await,
+        StatusCode::OK
+    );
+    assert_eq!(f.role_of(&pool, "admin_a2").await, "member");
+}
+
+#[sqlx::test(migrations = false)]
+async fn admins_can_still_manage_non_admin_members(pool: PgPool) {
+    let f = fixture(&pool).await;
+    assert_eq!(
+        f.set_role("admin_a", "member_a", "viewer").await,
+        StatusCode::OK
+    );
+    assert_eq!(f.role_of(&pool, "member_a").await, "viewer");
+    assert_eq!(
+        f.set_role("admin_a", "viewer_a", "member").await,
+        StatusCode::OK
+    );
+    // Promotion to admin and changing the owner stay as they were.
+    assert_eq!(
+        f.set_role("admin_a", "member_a", "admin").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.set_role("admin_a", "owner_a", "member").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.set_role("owner_a", "member_a", "admin").await,
+        StatusCode::OK
+    );
 }

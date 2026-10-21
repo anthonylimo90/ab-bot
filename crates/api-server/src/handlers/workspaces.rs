@@ -1739,6 +1739,14 @@ pub async fn update_member_role(
         ));
     }
 
+    // Only owner can change an admin's role (an admin may not demote a peer), matching
+    // remove_member, which only lets the owner remove admins.
+    if target_role == "admin" && caller_role != "owner" {
+        return Err(ApiError::Forbidden(
+            "Only owner can change an admin's role".into(),
+        ));
+    }
+
     // Update role
     sqlx::query("UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3")
         .bind(&new_role)
