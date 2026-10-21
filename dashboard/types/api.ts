@@ -817,17 +817,16 @@ export interface PaginatedResponse<T> {
   offset: number;
 }
 
-// WebSocket types
+// WebSocket types. These mirror crates/api-server/src/websocket.rs: the enums are
+// serialised with `rename_all = "snake_case"`, the envelope is
+// `#[serde(tag = "type", content = "data")]`, and Decimal fields arrive as strings
+// (lib/wire.ts normalizeWsMessage converts them before they reach consumers).
 export type PositionUpdateType =
-  | "Opened"
-  | "Updated"
-  | "Closed"
-  | "PriceChanged";
-export type SignalType =
-  | "Arbitrage"
-  | "StopLoss"
-  | "TakeProfit"
-  | "Alert";
+  | "opened"
+  | "updated"
+  | "closed"
+  | "price_changed";
+export type SignalType = "arbitrage" | "alert" | "quant_signal";
 
 export interface OrderbookUpdate {
   market_id: string;
@@ -890,9 +889,9 @@ export type WebSocketMessage =
   | { type: "Position"; data: PositionUpdate }
   | { type: "Signal"; data: SignalUpdate }
   | { type: "TradeFlow"; data: TradeFlowEvent }
-  | { type: "Subscribed"; channel: string }
-  | { type: "Unsubscribed"; channel: string }
-  | { type: "Error"; code: string; message: string }
+  | { type: "Subscribed"; data: { channel: string } }
+  | { type: "Unsubscribed"; data: { channel: string } }
+  | { type: "Error"; data: { code: string; message: string } }
   | { type: "Ping" }
   | { type: "Pong" };
 

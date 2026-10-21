@@ -1,8 +1,13 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import type { WebSocketMessage } from '@/types/api';
 import { useAuthStore } from '@/stores/auth-store';
+import { normalizeWsMessage } from '@/lib/wire';
+import {
+  createPositionBatcher,
+  type PositionUpdateAccumulator,
+} from '@/lib/position-batcher';
 
 export type ConnectionStatus =
   | 'connecting'
@@ -11,6 +16,19 @@ export type ConnectionStatus =
   | 'error';
 
 const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001';
+
+// Wire drift (a renamed variant, an unreadable price) would otherwise fail
+// silently, so say so once per message type instead of once per frame.
+const warnedMessageTypes = new Set<string>();
+function warnUnrecognisedMessage(parsed: unknown) {
+  const type =
+    typeof parsed === 'object' && parsed !== null && 'type' in parsed
+      ? String((parsed as { type: unknown }).type)
+      : 'unknown';
+  if (warnedMessageTypes.has(type)) return;
+  warnedMessageTypes.add(type);
+  console.warn(`Ignoring unrecognised or malformed WebSocket message (type: ${type})`);
+}
 
 export type WebSocketChannel =
   | 'orderbook'
@@ -155,17 +173,26 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
       };
 
       ws.onmessage = (event) => {
+        let parsed: unknown;
         try {
-          const data = JSON.parse(event.data) as WebSocketMessage;
-          if (data.type === 'Subscribed') {
-            setStatus('connected');
-            reconnectAttemptsRef.current = 0;
-            onConnectRef.current?.();
-          }
-          handleMessage(data);
+          parsed = JSON.parse(event.data);
         } catch {
           console.error('Failed to parse WebSocket message:', event.data);
+          return;
         }
+        // Validate the frame and convert Rust Decimal strings to numbers before any
+        // consumer (query cache, components) sees it.
+        const data = normalizeWsMessage(parsed);
+        if (!data) {
+          warnUnrecognisedMessage(parsed);
+          return;
+        }
+        if (data.type === 'Subscribed') {
+          setStatus('connected');
+          reconnectAttemptsRef.current = 0;
+          onConnectRef.current?.();
+        }
+        handleMessage(data);
       };
 
       ws.onclose = (event) => {
@@ -312,87 +339,24 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
 /**
  * Hook for batched position updates - processes multiple updates efficiently
  */
-interface PositionUpdateAccumulator {
-  updates: Map<string, { price: number; pnl: number; quantity: number }>;
-  opened: string[];
-  closed: string[];
-}
-
 export function useBatchedPositionUpdates(
   onUpdate: (accumulator: PositionUpdateAccumulator) => void,
   debounceMs = 200
 ) {
-  const accumulatorRef = useRef<PositionUpdateAccumulator>({
-    updates: new Map(),
-    opened: [],
-    closed: [],
-  });
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const flush = useCallback(() => {
-    if (
-      accumulatorRef.current.updates.size === 0 &&
-      accumulatorRef.current.opened.length === 0 &&
-      accumulatorRef.current.closed.length === 0
-    ) {
-      return;
-    }
-
-    onUpdate(accumulatorRef.current);
-
-    // Reset accumulator
-    accumulatorRef.current = {
-      updates: new Map(),
-      opened: [],
-      closed: [],
-    };
-    timeoutRef.current = null;
+  // The batcher outlives renders; route delivery through a ref so it always calls
+  // the latest callback without being recreated.
+  const onUpdateRef = useRef(onUpdate);
+  useEffect(() => {
+    onUpdateRef.current = onUpdate;
   }, [onUpdate]);
 
-  const addUpdate = useCallback(
-    (
-      positionId: string,
-      updateType: 'Opened' | 'Updated' | 'Closed' | 'PriceChanged',
-      data?: { price?: number; pnl?: number; quantity?: number }
-    ) => {
-      switch (updateType) {
-        case 'Opened':
-          accumulatorRef.current.opened.push(positionId);
-          break;
-        case 'Closed':
-          accumulatorRef.current.closed.push(positionId);
-          // Remove from updates if pending
-          accumulatorRef.current.updates.delete(positionId);
-          break;
-        case 'Updated':
-        case 'PriceChanged':
-          if (data) {
-            const existing = accumulatorRef.current.updates.get(positionId);
-            accumulatorRef.current.updates.set(positionId, {
-              price: data.price ?? existing?.price ?? 0,
-              pnl: data.pnl ?? existing?.pnl ?? 0,
-              quantity: data.quantity ?? existing?.quantity ?? 0,
-            });
-          }
-          break;
-      }
-
-      // Schedule flush if not already scheduled
-      if (!timeoutRef.current) {
-        timeoutRef.current = setTimeout(flush, debounceMs);
-      }
-    },
-    [flush, debounceMs]
+  const batcher = useMemo(
+    () => createPositionBatcher((accumulator) => onUpdateRef.current(accumulator), debounceMs),
+    [debounceMs]
   );
 
   // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-    };
-  }, []);
+  useEffect(() => () => batcher.dispose(), [batcher]);
 
-  return { addUpdate, flush };
+  return { addUpdate: batcher.addUpdate, flush: batcher.flush };
 }

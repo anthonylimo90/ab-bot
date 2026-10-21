@@ -19,12 +19,17 @@ import type {
   Market,
   Order,
   Orderbook,
+  OrderbookUpdate,
+  PositionUpdate,
   PositionUpdateType,
   PriceLevel,
   RecoveryState,
   RiskStatus,
+  SignalUpdate,
   StrategyConfig,
+  TradeFlowEvent,
   TradeLogEntry,
+  WebSocketMessage,
   Workspace,
 } from "@/types/api";
 
@@ -238,4 +243,132 @@ export function parseWorkspace(raw: Workspace): Workspace {
     min_sharpe: toNumber(raw.min_sharpe) ?? undefined,
     min_win_rate: toNumber(raw.min_win_rate) ?? undefined,
   };
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket messages
+// ---------------------------------------------------------------------------
+
+const POSITION_UPDATE_TYPES: readonly PositionUpdateType[] = [
+  "opened",
+  "updated",
+  "closed",
+  "price_changed",
+];
+
+export function isPositionUpdateType(value: unknown): value is PositionUpdateType {
+  return POSITION_UPDATE_TYPES.includes(value as PositionUpdateType);
+}
+
+const TRADE_FLOW_DECIMAL_KEYS = [
+  "expected_edge",
+  "observed_edge",
+  "requested_size_usd",
+  "filled_size_usd",
+  "fill_price",
+  "realized_pnl",
+  "unrealized_pnl",
+] as const;
+
+function normalizePositionUpdate(data: unknown): PositionUpdate | null {
+  if (!isRecord(data) || typeof data.position_id !== "string") return null;
+  if (!isPositionUpdateType(data.update_type)) return null;
+  const quantity = toNumber(data.quantity);
+  const currentPrice = toNumber(data.current_price);
+  const unrealizedPnl = toNumber(data.unrealized_pnl);
+  // A price or P&L we cannot read must never reach the query cache.
+  if (quantity === null || currentPrice === null || unrealizedPnl === null) return null;
+  return {
+    position_id: data.position_id,
+    market_id: typeof data.market_id === "string" ? data.market_id : "",
+    update_type: data.update_type,
+    quantity,
+    current_price: currentPrice,
+    unrealized_pnl: unrealizedPnl,
+    timestamp: typeof data.timestamp === "string" ? data.timestamp : "",
+  };
+}
+
+function normalizeOrderbookUpdate(data: unknown): OrderbookUpdate | null {
+  if (!isRecord(data) || typeof data.market_id !== "string") return null;
+  const yesBid = toNumber(data.yes_bid);
+  const yesAsk = toNumber(data.yes_ask);
+  const noBid = toNumber(data.no_bid);
+  const noAsk = toNumber(data.no_ask);
+  if (yesBid === null || yesAsk === null || noBid === null || noAsk === null) return null;
+  return {
+    market_id: data.market_id,
+    timestamp: typeof data.timestamp === "string" ? data.timestamp : "",
+    yes_bid: yesBid,
+    yes_ask: yesAsk,
+    no_bid: noBid,
+    no_ask: noAsk,
+    arb_spread: toNumber(data.arb_spread) ?? undefined,
+  };
+}
+
+function normalizeTradeFlowEvent(data: unknown): TradeFlowEvent | null {
+  if (!isRecord(data) || typeof data.id !== "string") return null;
+  const event = { ...data } as unknown as TradeFlowEvent;
+  for (const key of TRADE_FLOW_DECIMAL_KEYS) {
+    event[key] = toNumber(data[key]);
+  }
+  event.confidence = toNumber(data.confidence);
+  return event;
+}
+
+function normalizeSignalUpdate(data: unknown): SignalUpdate | null {
+  if (!isRecord(data) || typeof data.signal_id !== "string") return null;
+  return {
+    ...data,
+    confidence: toNumberOr(data.confidence),
+  } as unknown as SignalUpdate;
+}
+
+/**
+ * Validate a parsed WebSocket frame and convert its Decimal strings to numbers.
+ *
+ * Returns `null` for frames we do not recognise or whose numeric payload cannot be
+ * read, so a malformed price never reaches a cache or component. Envelope shape
+ * follows `WsMessage` in crates/api-server/src/websocket.rs:
+ * `{ "type": "Position", "data": { ... } }`, with unit variants (Ping/Pong) carrying
+ * no `data`.
+ */
+export function normalizeWsMessage(raw: unknown): WebSocketMessage | null {
+  if (!isRecord(raw) || typeof raw.type !== "string") return null;
+  const data = raw.data;
+  switch (raw.type) {
+    case "Position": {
+      const update = normalizePositionUpdate(data);
+      return update && { type: "Position", data: update };
+    }
+    case "Orderbook": {
+      const update = normalizeOrderbookUpdate(data);
+      return update && { type: "Orderbook", data: update };
+    }
+    case "Signal": {
+      const update = normalizeSignalUpdate(data);
+      return update && { type: "Signal", data: update };
+    }
+    case "TradeFlow": {
+      const event = normalizeTradeFlowEvent(data);
+      return event && { type: "TradeFlow", data: event };
+    }
+    case "Subscribed":
+    case "Unsubscribed":
+      return isRecord(data) && typeof data.channel === "string"
+        ? { type: raw.type, data: { channel: data.channel } }
+        : null;
+    case "Error":
+      return isRecord(data) &&
+        typeof data.code === "string" &&
+        typeof data.message === "string"
+        ? { type: "Error", data: { code: data.code, message: data.message } }
+        : null;
+    case "Ping":
+    case "Pong":
+      return { type: raw.type };
+    default:
+      return null;
+  }
 }
