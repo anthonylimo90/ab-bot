@@ -415,11 +415,13 @@ impl RbacManager {
         }
         drop(roles);
 
+        // Idempotent: assigning a role a user already holds changes nothing, so
+        // repeated assignment cannot grow the list without bound.
         let mut user_roles = self.user_roles.write().await;
-        user_roles
-            .entry(user_id.to_string())
-            .or_default()
-            .push(role_name.to_string());
+        let assigned = user_roles.entry(user_id.to_string()).or_default();
+        if !assigned.iter().any(|existing| existing == role_name) {
+            assigned.push(role_name.to_string());
+        }
         Ok(())
     }
 
@@ -536,6 +538,31 @@ pub struct PermissionCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn assign_role_is_idempotent() {
+        let manager = RbacManager::new();
+        for _ in 0..50 {
+            manager.assign_role("user-1", "trader").await.unwrap();
+        }
+        assert_eq!(manager.get_user_roles("user-1").await, vec!["trader"]);
+
+        // Distinct roles still accumulate, once each.
+        manager.assign_role("user-1", "viewer").await.unwrap();
+        manager.assign_role("user-1", "trader").await.unwrap();
+        assert_eq!(
+            manager.get_user_roles("user-1").await,
+            vec!["trader", "viewer"]
+        );
+
+        // A single revoke fully removes the role (no leftover duplicates).
+        manager.revoke_role("user-1", "trader").await.unwrap();
+        assert_eq!(manager.get_user_roles("user-1").await, vec!["viewer"]);
+
+        // Unknown roles are still rejected and recorded nowhere.
+        assert!(manager.assign_role("user-2", "nope").await.is_err());
+        assert!(manager.get_user_roles("user-2").await.is_empty());
+    }
 
     #[tokio::test]
     async fn test_default_roles() {

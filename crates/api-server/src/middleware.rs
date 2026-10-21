@@ -150,16 +150,10 @@ pub async fn require_auth(
     // Log successful authentication
     tracing::debug!(user_id = %claims.sub, role = ?claims.role, "Authenticated request");
 
-    // Sync RBAC roles with JWT role
-    // This ensures RBAC permissions are available for fine-grained checks
-    let rbac_role = match claims.role {
-        UserRole::Viewer => "viewer",
-        UserRole::Trader => "trader",
-        UserRole::PlatformAdmin => "platform_admin",
-    };
-
-    // Assign the role to the user in RBAC (idempotent operation)
-    let _ = state.rbac.assign_role(&claims.sub, rbac_role).await;
+    // Authorization decisions use the validated claims (and the database state
+    // that `authorize_session` just re-checked), never `state.rbac`: nothing
+    // reads it, and writing to it on every request only grew its in-memory role
+    // lists under a global write lock.
 
     // Inject claims into request extensions
     request.extensions_mut().insert(claims);
