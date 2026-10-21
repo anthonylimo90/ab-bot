@@ -622,7 +622,7 @@ class ApiClient {
 
   // Markets
   async getMarkets(params?: {
-  search?: string;
+    search?: string;
     category?: string;
     active?: boolean;
     min_volume?: number;
@@ -630,6 +630,9 @@ class ApiClient {
     offset?: number;
   }): Promise<Market[]> {
     const searchParams = new URLSearchParams();
+    // The backend trims and ignores a blank search, so only send a real term.
+    const search = params?.search?.trim();
+    if (search) searchParams.set("search", search);
     if (params?.category) searchParams.set("category", params.category);
     if (params?.active !== undefined)
       searchParams.set("active", String(params.active));
