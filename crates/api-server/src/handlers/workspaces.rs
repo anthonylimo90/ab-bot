@@ -1,9 +1,5 @@
 //! Workspace handlers for regular users.
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
@@ -1507,17 +1503,7 @@ pub async fn accept_invite(
             ));
         }
 
-        let password_to_hash = password.to_string();
-        let password_hash = tokio::task::spawn_blocking(move || {
-            let salt = SaltString::generate(&mut OsRng);
-            let argon2 = Argon2::default();
-            argon2
-                .hash_password(password_to_hash.as_bytes(), &salt)
-                .map(|hash| hash.to_string())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("Password hashing task failed: {}", e)))?
-        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?;
+        let password_hash = crate::handlers::auth::hash_password(password.to_string()).await?;
 
         let user_id = Uuid::new_v4();
         let created_at = Utc::now();

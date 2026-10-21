@@ -1,9 +1,5 @@
 //! User management handlers for admin operations.
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-    Argon2,
-};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Extension;
@@ -206,13 +202,8 @@ pub async fn create_user(
         return Err(ApiError::Conflict("Email already registered".into()));
     }
 
-    // Hash the password
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(req.password.as_bytes(), &salt)
-        .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?
-        .to_string();
+    // Hash the password (bounded, off the async executor)
+    let password_hash = crate::handlers::auth::hash_password(req.password.clone()).await?;
 
     // Create user
     let user_id = Uuid::new_v4();
@@ -380,12 +371,7 @@ pub async fn update_user(
                 "Password must be at least 8 characters".into(),
             ));
         }
-        let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
-            .map_err(|e| ApiError::Internal(format!("Password hashing failed: {}", e)))?
-            .to_string();
+        let password_hash = crate::handlers::auth::hash_password(password.clone()).await?;
         updates.push(format!("password_hash = ${}", params.len() + 2));
         params.push(password_hash);
     }
