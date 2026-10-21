@@ -512,7 +512,8 @@ pub async fn get_workspace(
         min_trades_30d: workspace.min_trades_30d,
         trading_wallet_address: workspace.trading_wallet_address,
         walletconnect_project_id: workspace.walletconnect_project_id,
-        polygon_rpc_url: workspace.polygon_rpc_url,
+        // Provider keys are embedded in the URL path, so only scheme and host are shown.
+        polygon_rpc_url: workspace.polygon_rpc_url.as_deref().map(mask_rpc_url),
         alchemy_api_key: masked_alchemy_key,
         arb_auto_execute: workspace.arb_auto_execute,
         live_trading_enabled: workspace.live_trading_enabled,
@@ -546,7 +547,7 @@ pub async fn update_workspace(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(workspace_id): Path<String>,
-    Json(req): Json<UpdateWorkspaceRequest>,
+    Json(mut req): Json<UpdateWorkspaceRequest>,
 ) -> ApiResult<Json<WorkspaceResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
@@ -591,6 +592,22 @@ pub async fn update_workspace(
     .bind(workspace_id)
     .fetch_one(&state.pool)
     .await?;
+
+    // The API only ever shows a masked RPC URL and the settings form sends back what it
+    // was shown. Echoing the current masked value means "unchanged"; any other masked
+    // value cannot be applied (it would replace the real URL with the mask).
+    if let Some(submitted) = req.polygon_rpc_url.as_deref() {
+        if is_masked_rpc_url(submitted) {
+            let current_mask = before_update.polygon_rpc_url.as_deref().map(mask_rpc_url);
+            if current_mask.as_deref() == Some(submitted.trim()) {
+                req.polygon_rpc_url = None;
+            } else {
+                return Err(ApiError::BadRequest(
+                    "Polygon RPC URL is masked; enter the full URL to change it".into(),
+                ));
+            }
+        }
+    }
 
     // Runtime flags drive the single shared runtime (live trading, exit handler,
     // arb executor) and feed the canonical-workspace election, so a workspace may
@@ -832,7 +849,8 @@ pub async fn update_workspace(
         change_details.insert(
             "polygon_rpc_url".to_string(),
             serde_json::json!({
-                "from": before_update.polygon_rpc_url,
+                // Masked: the URL path carries the provider API key.
+                "from": before_update.polygon_rpc_url.as_deref().map(mask_rpc_url),
                 "changed": true,
             }),
         );
@@ -3384,6 +3402,40 @@ fn decimal_to_f64(value: Decimal) -> f64 {
 
 async fn reconcile_runtime_service_toggles(state: &AppState) {
     crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
+}
+
+/// What replaces the secret-bearing part of a masked RPC URL.
+const MASKED_RPC_PATH: &str = "/***";
+
+/// Mask a provider RPC URL for responses and audit entries, keeping only scheme,
+/// host and port. Provider API keys live in the path (`/v2/<key>`) or query
+/// string, so those, plus any userinfo and fragment, are replaced with `/***`
+/// (omitted when there is nothing secret to hide). Idempotent.
+fn mask_rpc_url(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url.trim()) else {
+        return "***".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "***".to_string();
+    };
+    let mut masked = format!("{}://{}", parsed.scheme(), host);
+    if let Some(port) = parsed.port() {
+        masked.push_str(&format!(":{port}"));
+    }
+    let has_secret_part = !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some();
+    if has_secret_part {
+        masked.push_str(MASKED_RPC_PATH);
+    }
+    masked
+}
+
+/// Whether `url` is a masked URL as produced by [`mask_rpc_url`].
+fn is_masked_rpc_url(url: &str) -> bool {
+    Url::parse(url.trim()).is_ok_and(|parsed| parsed.path() == MASKED_RPC_PATH)
 }
 
 /// Validate WalletConnect project ID format.
