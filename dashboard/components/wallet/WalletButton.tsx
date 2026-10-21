@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useContext, useState, useEffect } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
-import { useAccount } from 'wagmi';
+import { useAccount, WagmiContext } from 'wagmi';
 import { Wallet, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useWalletAuth } from '@/hooks/useWalletAuth';
@@ -12,7 +12,27 @@ interface WalletLoginButtonProps {
   className?: string;
 }
 
-export function WalletLoginButton({ onSuccess, className }: WalletLoginButtonProps) {
+/**
+ * WalletProvider renders its children *without* WagmiProvider until the client has
+ * mounted and the workspace store has hydrated, and /login is a public route that
+ * renders immediately. Calling wagmi hooks outside the provider throws
+ * WagmiProviderNotFoundError (this broke server rendering of /login), so show an
+ * inert placeholder until the provider is in the tree.
+ */
+export function WalletLoginButton(props: WalletLoginButtonProps) {
+  const wagmiConfig = useContext(WagmiContext);
+  if (!wagmiConfig) {
+    return (
+      <Button variant="outline" className={props.className} disabled>
+        <Wallet className="mr-2 h-4 w-4" />
+        Connect Wallet
+      </Button>
+    );
+  }
+  return <WalletLoginButtonInner {...props} />;
+}
+
+function WalletLoginButtonInner({ onSuccess, className }: WalletLoginButtonProps) {
   const [isSigningIn, setIsSigningIn] = useState(false);
   const { isConnected, address } = useAccount();
   const { signIn, isLoading } = useWalletAuth();
