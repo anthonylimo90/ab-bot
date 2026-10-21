@@ -72,6 +72,17 @@ import type {
   CreateLearningRolloutRequest,
   UpdateLearningRolloutRequest,
 } from "@/types/api";
+import {
+  parseActivity,
+  parseBacktestResult,
+  parseCircuitBreakerConfig,
+  parseCircuitBreakerStatus,
+  parseMarket,
+  parseOrder,
+  parseOrderbook,
+  parseRiskStatus,
+  parseWorkspace,
+} from "@/lib/wire";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
@@ -627,15 +638,22 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Market[]>(`/api/v1/markets${query ? `?${query}` : ""}`);
+    const raw = await this.request<Market[]>(
+      `/api/v1/markets${query ? `?${query}` : ""}`,
+    );
+    return raw.map(parseMarket);
   }
 
   async getMarket(marketId: string): Promise<Market> {
-    return this.request<Market>(`/api/v1/markets/${marketId}`);
+    const raw = await this.request<Market>(`/api/v1/markets/${marketId}`);
+    return parseMarket(raw);
   }
 
   async getOrderbook(marketId: string): Promise<Orderbook> {
-    return this.request<Orderbook>(`/api/v1/markets/${marketId}/orderbook`);
+    const raw = await this.request<Orderbook>(
+      `/api/v1/markets/${marketId}/orderbook`,
+    );
+    return parseOrderbook(raw);
   }
 
   // Positions
@@ -691,28 +709,32 @@ class ApiClient {
   // Orders
   async placeOrder(params: PlaceOrderRequest): Promise<Order> {
     params.client_order_id ??= crypto.randomUUID();
-    return this.request<Order>("/api/v1/orders", {
+    const raw = await this.request<Order>("/api/v1/orders", {
       method: "POST",
       body: JSON.stringify(params),
     });
+    return parseOrder(raw);
   }
 
   async getOrder(orderId: string): Promise<Order> {
-    return this.request<Order>(`/api/v1/orders/${orderId}`);
+    const raw = await this.request<Order>(`/api/v1/orders/${orderId}`);
+    return parseOrder(raw);
   }
 
   async cancelOrder(orderId: string): Promise<Order> {
-    return this.request<Order>(`/api/v1/orders/${orderId}/cancel`, {
+    const raw = await this.request<Order>(`/api/v1/orders/${orderId}/cancel`, {
       method: "POST",
     });
+    return parseOrder(raw);
   }
 
   // Backtest
   async runBacktest(params: BacktestParams): Promise<BacktestResult> {
-    return this.request<BacktestResult>("/api/v1/backtest", {
+    const raw = await this.request<BacktestResult>("/api/v1/backtest", {
       method: "POST",
       body: JSON.stringify(params),
     });
+    return parseBacktestResult(raw);
   }
 
   async getBacktestResults(params?: {
@@ -728,13 +750,17 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<BacktestResult[]>(
+    const raw = await this.request<BacktestResult[]>(
       `/api/v1/backtest/results${query ? `?${query}` : ""}`,
     );
+    return raw.map(parseBacktestResult);
   }
 
   async getBacktestResult(resultId: string): Promise<BacktestResult> {
-    return this.request<BacktestResult>(`/api/v1/backtest/results/${resultId}`);
+    const raw = await this.request<BacktestResult>(
+      `/api/v1/backtest/results/${resultId}`,
+    );
+    return parseBacktestResult(raw);
   }
 
   async getMarketRegime(): Promise<MarketRegimeResponse> {
@@ -837,24 +863,32 @@ class ApiClient {
   async adminCreateWorkspace(
     params: CreateWorkspaceRequest,
   ): Promise<Workspace> {
-    return this.request<Workspace>("/api/v1/admin/workspaces", {
+    const raw = await this.request<Workspace>("/api/v1/admin/workspaces", {
       method: "POST",
       body: JSON.stringify(params),
     });
+    return parseWorkspace(raw);
   }
 
   async adminGetWorkspace(workspaceId: string): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`);
+    const raw = await this.request<Workspace>(
+      `/api/v1/admin/workspaces/${workspaceId}`,
+    );
+    return parseWorkspace(raw);
   }
 
   async adminUpdateWorkspace(
     workspaceId: string,
     params: UpdateWorkspaceRequest,
   ): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/admin/workspaces/${workspaceId}`, {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
+    const raw = await this.request<Workspace>(
+      `/api/v1/admin/workspaces/${workspaceId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseWorkspace(raw);
   }
 
   async adminDeleteWorkspace(workspaceId: string): Promise<void> {
@@ -917,21 +951,29 @@ class ApiClient {
   }
 
   async getCurrentWorkspace(): Promise<Workspace> {
-    return this.request<Workspace>("/api/v1/workspaces/current");
+    const raw = await this.request<Workspace>("/api/v1/workspaces/current");
+    return parseWorkspace(raw);
   }
 
   async getWorkspace(workspaceId: string): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`);
+    const raw = await this.request<Workspace>(
+      `/api/v1/workspaces/${workspaceId}`,
+    );
+    return parseWorkspace(raw);
   }
 
   async updateWorkspace(
     workspaceId: string,
     params: UpdateWorkspaceRequest,
   ): Promise<Workspace> {
-    return this.request<Workspace>(`/api/v1/workspaces/${workspaceId}`, {
-      method: "PUT",
-      body: JSON.stringify(params),
-    });
+    const raw = await this.request<Workspace>(
+      `/api/v1/workspaces/${workspaceId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(params),
+      },
+    );
+    return parseWorkspace(raw);
   }
 
   async switchWorkspace(workspaceId: string): Promise<void> {
@@ -1111,27 +1153,30 @@ class ApiClient {
 
   // Risk Monitoring
   async getRiskStatus(workspaceId: string): Promise<RiskStatus> {
-    return this.request<RiskStatus>(
+    const raw = await this.request<RiskStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/status`,
     );
+    return parseRiskStatus(raw);
   }
 
   async manualTripCircuitBreaker(
     workspaceId: string,
   ): Promise<CircuitBreakerStatus> {
-    return this.request<CircuitBreakerStatus>(
+    const raw = await this.request<CircuitBreakerStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/trip`,
       { method: "POST" },
     );
+    return parseCircuitBreakerStatus(raw);
   }
 
   async resetCircuitBreaker(
     workspaceId: string,
   ): Promise<CircuitBreakerStatus> {
-    return this.request<CircuitBreakerStatus>(
+    const raw = await this.request<CircuitBreakerStatus>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/reset`,
       { method: "POST" },
     );
+    return parseCircuitBreakerStatus(raw);
   }
 
   async updateCircuitBreakerConfig(
@@ -1144,10 +1189,11 @@ class ApiClient {
       enabled?: boolean;
     },
   ): Promise<CircuitBreakerConfig> {
-    return this.request<CircuitBreakerConfig>(
+    const raw = await this.request<CircuitBreakerConfig>(
       `/api/v1/workspaces/${workspaceId}/risk/circuit-breaker/config`,
       { method: "PUT", body: JSON.stringify(params) },
     );
+    return parseCircuitBreakerConfig(raw);
   }
 
   // Activity Feed
@@ -1159,9 +1205,10 @@ class ApiClient {
     if (params?.limit) searchParams.set("limit", String(params.limit));
     if (params?.offset) searchParams.set("offset", String(params.offset));
     const query = searchParams.toString();
-    return this.request<Activity[]>(
+    const raw = await this.request<Activity[]>(
       `/api/v1/activity${query ? `?${query}` : ""}`,
     );
+    return raw.map(parseActivity);
   }
 
   async getAccountSummary(workspaceId: string): Promise<AccountSummary> {

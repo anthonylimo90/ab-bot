@@ -6,7 +6,12 @@ import { Button } from "@/components/ui/button";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { BacktestChart } from "@/components/charts/BacktestChart";
 import { useBacktest } from "@/hooks/useBacktest";
-import { formatCurrency, cn, shortenAddress } from "@/lib/utils";
+import {
+  formatCurrencyOrDash,
+  formatFixed,
+  cn,
+  shortenAddress,
+} from "@/lib/utils";
 import type { StrategyConfig } from "@/types/api";
 import {
   Play,
@@ -27,6 +32,20 @@ const STRATEGY_LABELS: Record<StrategyType, string> = {
 };
 
 const TRADE_LOG_PAGE_SIZE = 20;
+
+// Backtest metrics are null when the backend could not represent a value (for
+// example a non-finite Sharpe ratio); they render as an em dash.
+const NO_VALUE = "\u2014";
+
+function formatSignedPercent(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return NO_VALUE;
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function returnTrend(value: number | null | undefined): "up" | "down" | "neutral" {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "neutral";
+  return value >= 0 ? "up" : "down";
+}
 
 export default function BacktestPage() {
   const {
@@ -175,10 +194,11 @@ export default function BacktestPage() {
   // Generate equity curve from results
   const backtestData = useMemo(() => {
     if (!results?.equity_curve) return [];
-    return results.equity_curve.map((point) => ({
-      time: point.timestamp,
-      value: point.value,
-    }));
+    return results.equity_curve.flatMap((point) =>
+      point.value == null
+        ? []
+        : [{ time: point.timestamp, value: point.value }],
+    );
   }, [results]);
 
   // Paginated trade log
@@ -567,43 +587,42 @@ export default function BacktestPage() {
           <div className="grid gap-4 md:grid-cols-4">
             <MetricCard
               title="Total Return"
-              value={`${results.total_return_pct >= 0 ? "+" : ""}${results.total_return_pct.toFixed(1)}%`}
-              changeLabel={formatCurrency(results.total_return)}
-              trend={results.total_return_pct >= 0 ? "up" : "down"}
+              value={formatSignedPercent(results.total_return_pct)}
+              changeLabel={formatCurrencyOrDash(results.total_return)}
+              trend={returnTrend(results.total_return_pct)}
             />
             <MetricCard
               title="Sharpe Ratio"
-              value={results.sharpe_ratio.toFixed(2)}
+              value={formatFixed(results.sharpe_ratio, 2)}
               trend="neutral"
             />
             <MetricCard
               title="Max Drawdown"
-              value={`${results.max_drawdown_pct.toFixed(1)}%`}
+              value={formatFixed(results.max_drawdown_pct, 1, "%")}
               trend="down"
             />
             <MetricCard
               title="Win Rate"
-              value={`${results.win_rate.toFixed(0)}%`}
+              value={formatFixed(results.win_rate, 0, "%")}
               changeLabel={`${results.total_trades} trades`}
               trend="neutral"
             />
           </div>
 
           {/* Extended metrics (if available) */}
-          {results.calmar_ratio != null && (
+          {(results.calmar_ratio != null ||
+            results.expectancy != null ||
+            results.var_95 != null ||
+            results.avg_trade_duration_hours != null) && (
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
               <MetricCard
                 title="Calmar Ratio"
-                value={results.calmar_ratio.toFixed(2)}
+                value={formatFixed(results.calmar_ratio, 2)}
                 trend="neutral"
               />
               <MetricCard
                 title="Expectancy"
-                value={
-                  results.expectancy != null
-                    ? formatCurrency(results.expectancy)
-                    : "\u2014"
-                }
+                value={formatCurrencyOrDash(results.expectancy)}
                 trend="neutral"
               />
               <MetricCard
@@ -651,37 +670,37 @@ export default function BacktestPage() {
                 <div>
                   <p className="text-sm text-muted-foreground">Final Value</p>
                   <p className="font-medium tabular-nums">
-                    {formatCurrency(results.final_value)}
+                    {formatCurrencyOrDash(results.final_value)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Total Fees</p>
                   <p className="font-medium tabular-nums text-loss">
-                    {formatCurrency(results.total_fees)}
+                    {formatCurrencyOrDash(results.total_fees)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Profit Factor</p>
                   <p className="font-medium tabular-nums">
-                    {results.profit_factor.toFixed(2)}
+                    {formatFixed(results.profit_factor, 2)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Sortino Ratio</p>
                   <p className="font-medium tabular-nums">
-                    {results.sortino_ratio.toFixed(2)}
+                    {formatFixed(results.sortino_ratio, 2)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Avg Win</p>
                   <p className="font-medium tabular-nums text-profit">
-                    {formatCurrency(results.avg_win)}
+                    {formatCurrencyOrDash(results.avg_win)}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-muted-foreground">Avg Loss</p>
                   <p className="font-medium tabular-nums text-loss">
-                    {formatCurrency(results.avg_loss)}
+                    {formatCurrencyOrDash(results.avg_loss)}
                   </p>
                 </div>
                 {results.best_trade_return != null && (
@@ -798,15 +817,17 @@ export default function BacktestPage() {
                             </span>
                           </td>
                           <td className="py-2 pr-4 text-right tabular-nums">
-                            ${trade.entry_price.toFixed(4)}
+                            {trade.entry_price != null
+                              ? `$${trade.entry_price.toFixed(4)}`
+                              : NO_VALUE}
                           </td>
                           <td className="py-2 pr-4 text-right tabular-nums">
                             {trade.exit_price != null
                               ? `$${trade.exit_price.toFixed(4)}`
-                              : "\u2014"}
+                              : NO_VALUE}
                           </td>
                           <td className="py-2 pr-4 text-right tabular-nums">
-                            {trade.quantity.toFixed(2)}
+                            {formatFixed(trade.quantity, 2)}
                           </td>
                           <td
                             className={cn(
@@ -817,7 +838,7 @@ export default function BacktestPage() {
                             )}
                           >
                             {trade.pnl != null
-                              ? formatCurrency(trade.pnl, { showSign: true })
+                              ? formatCurrencyOrDash(trade.pnl, { showSign: true })
                               : "\u2014"}
                           </td>
                           <td
@@ -926,13 +947,13 @@ export default function BacktestPage() {
                       <p
                         className={cn(
                           "font-medium tabular-nums",
-                          result.total_return_pct >= 0
+                          result.total_return_pct != null &&
+                            result.total_return_pct >= 0
                             ? "text-profit"
                             : "text-loss",
                         )}
                       >
-                        {result.total_return_pct >= 0 ? "+" : ""}
-                        {result.total_return_pct.toFixed(1)}%
+                        {formatSignedPercent(result.total_return_pct)}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {result.total_trades} trades
