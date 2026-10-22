@@ -21,6 +21,11 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 /// Minimum POL balance needed for approval transactions (~6 txns × 60k gas × ~50 gwei).
+/// How often, and how many times, an approval's on-chain state is re-read
+/// before it is reported as not in effect.
+const APPROVAL_CONFIRM_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 10 } else { 2000 });
+const APPROVAL_CONFIRM_POLLS: u32 = 60;
 const MIN_GAS_WEI: u128 = 20_000_000_000_000_000; // 0.02 POL
 
 /// Polygon chain ID.
@@ -106,13 +111,15 @@ fn rpc_result_hex<'a>(resp: &'a serde_json::Value, method: &str) -> Result<&'a s
         .with_context(|| format!("Missing result from {method}"))
 }
 
-/// Send a signed legacy transaction and return the tx hash.
+/// Send a signed legacy transaction: its hash when the node accepted it,
+/// `None` when the node's answer leaves open whether it was sent (the state
+/// it was meant to set then decides).
 async fn send_raw_tx(
     http: &reqwest::Client,
     rpc_url: &str,
     signer: &PrivateKeySigner,
     tx: TxLegacy,
-) -> Result<String> {
+) -> Result<Option<String>> {
     use alloy_consensus::transaction::RlpEcdsaTx;
     use alloy_network::TxSignerSync;
     use alloy_primitives::bytes::BytesMut;
@@ -135,12 +142,15 @@ async fn send_raw_tx(
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
 
-    if let Some(err) = resp.get("error") {
+    if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
         let msg = err["message"].as_str().unwrap_or("unknown");
-        // "already known" means the tx was already sent/mined — not a real error
+        // The node may hold this transaction (or a retry of it) already.
         if msg.contains("already known") || msg.contains("nonce too low") {
-            warn!(error = msg, "Transaction likely already mined, continuing");
-            return Ok("already_mined".to_string());
+            warn!(
+                error = msg,
+                "Approval send outcome unclear; checking the chain instead"
+            );
+            return Ok(None);
         }
         anyhow::bail!("eth_sendRawTransaction error: {}", msg);
     }
@@ -150,15 +160,37 @@ async fn send_raw_tx(
         .context("Missing tx hash in response")?
         .to_string();
 
-    Ok(tx_hash)
+    Ok(Some(tx_hash))
+}
+
+/// Wait for an approval to take effect: its receipt when the send was
+/// accepted, then the on-chain state itself, which alone proves it.
+async fn confirm_approval<F, Fut>(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    tx_hash: Option<&str>,
+    is_set: F,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    if let Some(hash) = tx_hash {
+        wait_for_receipt(http, rpc_url, hash).await?;
+    }
+    for attempt in 0..=APPROVAL_CONFIRM_POLLS {
+        if is_set().await? {
+            return Ok(());
+        }
+        if attempt < APPROVAL_CONFIRM_POLLS {
+            tokio::time::sleep(APPROVAL_CONFIRM_INTERVAL).await;
+        }
+    }
+    anyhow::bail!("Approval was not in effect on chain after its transaction; retry on restart")
 }
 
 /// Wait for a transaction to be mined (simple polling).
 async fn wait_for_receipt(http: &reqwest::Client, rpc_url: &str, tx_hash: &str) -> Result<()> {
-    if tx_hash == "already_mined" {
-        return Ok(());
-    }
-
     for _ in 0..60 {
         // poll every 2 seconds for up to 2 minutes
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -327,7 +359,6 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
         );
     }
 
-    let mut nonce = get_nonce(&http, rpc_url, &address).await?;
     let gas_price = get_gas_price(&http, rpc_url).await?;
     // Use 1.2x gas price for faster inclusion
     let gas_price = gas_price + gas_price / 5;
@@ -340,9 +371,11 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
         let threshold = U256::from(1_000_000_000_000u64); // 1M USDC in 6-decimal
         if allowance < threshold {
             info!(spender = %name, "Setting USDC.e approval");
+            // A fresh pending nonce each time: an unclear send may or may not
+            // have used the previous one.
             let tx = TxLegacy {
                 chain_id: Some(CHAIN_ID),
-                nonce,
+                nonce: get_nonce(&http, rpc_url, &address).await?,
                 gas_price,
                 gas_limit: 100_000, // USDC.e proxy uses ~67k gas
                 to: TxKind::Call(usdc),
@@ -350,9 +383,11 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
                 input: encode_approve(*spender),
             };
             let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
-            info!(tx_hash = %hash, spender = %name, "USDC.e approve tx sent");
-            wait_for_receipt(&http, rpc_url, &hash).await?;
-            nonce += 1;
+            info!(tx_hash = ?hash, spender = %name, "USDC.e approve tx sent");
+            confirm_approval(&http, rpc_url, hash.as_deref(), || async {
+                Ok(check_erc20_allowance(&http, rpc_url, &address, spender).await? >= threshold)
+            })
+            .await?;
             approvals_sent += 1;
         } else {
             info!(spender = %name, "USDC.e approval already set");
@@ -364,7 +399,7 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
             info!(spender = %name, "Setting CTF setApprovalForAll");
             let tx = TxLegacy {
                 chain_id: Some(CHAIN_ID),
-                nonce,
+                nonce: get_nonce(&http, rpc_url, &address).await?,
                 gas_price,
                 gas_limit: 100_000,
                 to: TxKind::Call(ctf),
@@ -372,9 +407,11 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
                 input: encode_set_approval_for_all(*spender),
             };
             let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
-            info!(tx_hash = %hash, spender = %name, "CTF setApprovalForAll tx sent");
-            wait_for_receipt(&http, rpc_url, &hash).await?;
-            nonce += 1;
+            info!(tx_hash = ?hash, spender = %name, "CTF setApprovalForAll tx sent");
+            confirm_approval(&http, rpc_url, hash.as_deref(), || {
+                check_erc1155_approval(&http, rpc_url, &address, spender)
+            })
+            .await?;
             approvals_sent += 1;
         } else {
             info!(spender = %name, "CTF approval already set");
@@ -388,4 +425,30 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
     );
 
     Ok(approvals_sent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test]
+    async fn an_unclear_send_counts_only_once_the_approval_is_in_effect() {
+        let http = reqwest::Client::new();
+        // Takes effect on the third look.
+        let looks = AtomicU32::new(0);
+        confirm_approval(&http, "http://127.0.0.1:1", None, || async {
+            Ok(looks.fetch_add(1, Ordering::SeqCst) >= 2)
+        })
+        .await
+        .unwrap();
+        assert_eq!(looks.load(Ordering::SeqCst), 3);
+
+        // Never takes effect: an error, not a success.
+        assert!(
+            confirm_approval(&http, "http://127.0.0.1:1", None, || async { Ok(false) })
+                .await
+                .is_err()
+        );
+    }
 }
