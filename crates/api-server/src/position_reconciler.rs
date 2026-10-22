@@ -85,7 +85,14 @@ pub(crate) async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                     ELSE p.current_price
                 END AS current_price,
                 ROUND(p.held_yes_qty * (COALESCE(m.yes_price, p.yes_entry_price) - p.yes_entry_price)
-                    + p.held_no_qty * (COALESCE(m.no_price, p.no_entry_price) - p.no_entry_price),
+                    + p.held_no_qty * (COALESCE(m.no_price, p.no_entry_price) - p.no_entry_price)
+                    -- The taker fees paid buying the shares still held, under
+                    -- the position's recorded fee terms (none without them).
+                    - COALESCE(p.taker_fee_rate * (
+                        p.held_yes_qty * power(p.yes_entry_price * (1 - p.yes_entry_price),
+                                               p.taker_fee_exponent)
+                        + p.held_no_qty * power(p.no_entry_price * (1 - p.no_entry_price),
+                                                p.taker_fee_exponent)), 0),
                     8) AS unrealized_pnl
             FROM positions p
             LEFT JOIN markets m ON m.id = p.market_id
@@ -169,7 +176,12 @@ mod tests {
             ExitStrategy::HoldToResolution,
         );
         failed.state = PositionState::EntryFailed;
-        for position in [&pair, &leg, &fractional, &failed] {
+        // An arbitrage pair priced under the highest published fee terms.
+        let mut taxed = pair.clone();
+        taxed.id = uuid::Uuid::new_v4();
+        taxed.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+        taxed.taker_fees = Some(polymarket_core::types::FeeSchedule::CONSERVATIVE);
+        for position in [&pair, &leg, &fractional, &failed, &taxed] {
             service.repo().insert(position).await.unwrap();
         }
         sqlx::query("UPDATE positions SET is_open = TRUE, unrealized_pnl = 1 WHERE id = $1")
@@ -178,7 +190,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 4);
+        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 5);
         let mark = |id| {
             let pool = pool.clone();
             async move {
@@ -196,6 +208,11 @@ mod tests {
         let (quantity, price, pnl) = mark(pair.id).await;
         assert_eq!(quantity * price, Decimal::TEN);
         assert_eq!(pnl, Decimal::new(20, 2));
+        // Less the fees its buys paid: 10 × 0.07 × (0.48 × 0.52 + 0.5 × 0.5).
+        assert_eq!(
+            mark(taxed.id).await.2,
+            Decimal::new(20, 2) - Decimal::new(34972, 5)
+        );
         // The leg's 4 shares are worth $2.20.
         let (quantity, price, pnl) = mark(leg.id).await;
         assert_eq!(quantity * price, Decimal::new(220, 2));
