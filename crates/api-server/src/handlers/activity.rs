@@ -1,5 +1,3 @@
-//! Activity feed handler — serves recent execution reports as activity items.
-
 use axum::extract::{Query, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -12,7 +10,6 @@ use uuid::Uuid;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// Activity item returned by the API.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ActivityResponse {
     pub id: String,
@@ -30,13 +27,10 @@ pub struct ActivityResponse {
     pub created_at: DateTime<Utc>,
 }
 
-/// Query parameters for the activity endpoint.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ActivityQuery {
-    /// Maximum results (default 50).
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// Offset for pagination.
     #[serde(default)]
     pub offset: i64,
 }
@@ -45,160 +39,134 @@ fn default_limit() -> i64 {
     50
 }
 
-fn source_label(source: i16) -> &'static str {
-    match source {
-        1 => "arbitrage",
-        2 => "legacy",
-        3 => "quant",
-        _ => "manual",
-    }
-}
+/// The most activity rows one request returns.
+const MAX_LIMIT: i64 = 200;
 
-fn classify_activity_type(source: i16, status: i16, side: i16) -> &'static str {
-    match source {
-        1 => match status {
-            3 => {
-                if side == 0 {
-                    "ARB_POSITION_OPENED"
-                } else {
-                    "ARB_POSITION_CLOSED"
-                }
-            }
-            4..=6 => {
-                if side == 0 {
-                    "ARB_EXECUTION_FAILED"
-                } else {
-                    "ARB_EXIT_FAILED"
-                }
-            }
-            _ => "ARBITRAGE_DETECTED",
-        },
-        3 => match status {
-            3 => {
-                if side == 0 {
-                    "POSITION_OPENED"
-                } else {
-                    "POSITION_CLOSED"
-                }
-            }
-            4..=6 => "TRADE_FAILED",
-            _ => "TRADE_PENDING",
-        },
-        _ => match status {
-            3 => {
-                if side == 0 {
-                    "POSITION_OPENED"
-                } else {
-                    "POSITION_CLOSED"
-                }
-            }
-            4..=6 => "TRADE_FAILED",
-            _ => "TRADE_PENDING",
-        },
-    }
-}
-
-fn build_activity_message(
-    source: i16,
-    status: i16,
-    side: i16,
-    market_short: &str,
-    filled_quantity: Decimal,
-    average_price: Decimal,
-    error_message: Option<&str>,
-) -> String {
-    let direction = if side == 0 { "buy" } else { "sell" };
-
-    match source {
-        1 => match status {
-            3 => {
-                if side == 0 {
-                    format!(
-                        "Arb position opened on {} qty={} @ ${}",
-                        market_short, filled_quantity, average_price
-                    )
-                } else {
-                    format!(
-                        "Arb position closed on {} qty={} @ ${}",
-                        market_short, filled_quantity, average_price
-                    )
-                }
-            }
-            4..=6 => {
-                let prefix = if side == 0 {
-                    "Arb execution failed"
-                } else {
-                    "Arb exit failed"
-                };
-                format!(
-                    "{} on {}{}",
-                    prefix,
-                    market_short,
-                    error_message
-                        .map(|error| format!(": {error}"))
-                        .unwrap_or_default(),
-                )
-            }
-            _ => format!("Arbitrage activity on {}", market_short),
-        },
-        3 => match status {
-            3 => {
-                if side == 0 {
-                    format!(
-                        "Quant position opened on {} qty={} @ ${}",
-                        market_short, filled_quantity, average_price
-                    )
-                } else {
-                    format!(
-                        "Quant position closed on {} qty={} @ ${}",
-                        market_short, filled_quantity, average_price
-                    )
-                }
-            }
-            4..=6 => format!(
-                "Quant trade failed on {}{}",
-                market_short,
-                error_message
-                    .map(|error| format!(": {error}"))
-                    .unwrap_or_default(),
-            ),
-            _ => format!("Quant trade pending on {}", market_short),
-        },
-        _ => match status {
-            3 => format!(
-                "{} {} qty={} @ ${}",
-                if side == 0 { "Opened" } else { "Closed" },
-                market_short,
-                filled_quantity,
-                average_price,
-            ),
-            4..=6 => format!(
-                "Failed {} {}{}",
-                direction,
-                market_short,
-                error_message
-                    .map(|error| format!(": {error}"))
-                    .unwrap_or_default(),
-            ),
-            _ => format!("Pending {} {}", direction, market_short),
-        },
-    }
-}
+/// The trade lifecycle events the activity feed shows.
+const ACTIVITY_EVENTS: [&str; 9] = [
+    "position_open",
+    "entry_filled",
+    "exit_fill",
+    "closed_via_exit",
+    "closed_via_resolution",
+    "position_closed",
+    "entry_failed",
+    "position_failed",
+    "exit_failed",
+];
 
 #[derive(Debug, sqlx::FromRow)]
-struct ExecutionReportRow {
+struct TradeEventRow {
     id: Uuid,
+    occurred_at: DateTime<Utc>,
+    strategy: String,
+    execution_mode: String,
     market_id: String,
-    side: i16,
-    status: i16,
-    filled_quantity: Decimal,
-    average_price: Decimal,
-    error_message: Option<String>,
-    source: i16,
-    executed_at: DateTime<Utc>,
+    position_id: Option<Uuid>,
+    event_type: String,
+    reason: Option<String>,
+    fill_price: Option<Decimal>,
+    filled_size_usd: Option<Decimal>,
+    realized_pnl: Option<Decimal>,
 }
 
-/// List recent activity from execution reports.
+/// The dashboard's activity type for a trade event of `strategy`.
+fn activity_type(strategy: &str, event_type: &str) -> &'static str {
+    let arb = strategy == "arb";
+    match event_type {
+        "position_open" if arb => "ARB_POSITION_OPENED",
+        "position_open" => "POSITION_OPENED",
+        "closed_via_exit" | "closed_via_resolution" | "position_closed" if arb => {
+            "ARB_POSITION_CLOSED"
+        }
+        "closed_via_exit" | "closed_via_resolution" | "position_closed" => "POSITION_CLOSED",
+        "entry_failed" | "position_failed" if arb => "ARB_EXECUTION_FAILED",
+        "exit_failed" if arb => "ARB_EXIT_FAILED",
+        "entry_failed" | "position_failed" | "exit_failed" => "TRADE_FAILED",
+        _ => "TRADE_EXECUTED",
+    }
+}
+
+fn activity_message(row: &TradeEventRow) -> String {
+    let market = if row.market_id.chars().count() > 20 {
+        format!("{}...", row.market_id.chars().take(20).collect::<String>())
+    } else {
+        row.market_id.clone()
+    };
+    let who = if row.strategy == "arb" {
+        "Arb".to_string()
+    } else {
+        format!("{} ({})", capitalized(&row.strategy), row.execution_mode)
+    };
+    let reason = row
+        .reason
+        .as_deref()
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    match row.event_type.as_str() {
+        "position_open" => format!("{who} position opened on {market}"),
+        "closed_via_exit" => format!("{who} position closed via exit on {market}"),
+        "closed_via_resolution" => format!("{who} position closed at resolution on {market}"),
+        "position_closed" => format!("{who} position closed on {market}"),
+        "entry_failed" | "position_failed" => format!("{who} entry failed on {market}{reason}"),
+        "exit_failed" => format!("{who} exit failed on {market}{reason}"),
+        "entry_filled" | "exit_fill" => {
+            let side = if row.event_type == "entry_filled" {
+                "bought"
+            } else {
+                "sold"
+            };
+            match (row.filled_size_usd, row.fill_price) {
+                (Some(size), Some(price)) => {
+                    format!("{who} {side} ${} on {market} @ {}", size.round_dp(2), price)
+                }
+                _ => format!("{who} {side} on {market}"),
+            }
+        }
+        other => format!("{who} {other} on {market}"),
+    }
+}
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn to_activity(row: TradeEventRow) -> ActivityResponse {
+    let activity_type = activity_type(&row.strategy, &row.event_type).to_string();
+    let message = activity_message(&row);
+    let failed = matches!(
+        row.event_type.as_str(),
+        "entry_failed" | "position_failed" | "exit_failed"
+    );
+    let closed = matches!(
+        row.event_type.as_str(),
+        "closed_via_exit" | "closed_via_resolution" | "position_closed"
+    );
+    ActivityResponse {
+        id: row.id.to_string(),
+        activity_type,
+        message,
+        skip_reason: None,
+        error_message: if failed { row.reason.clone() } else { None },
+        details: Some(serde_json::json!({
+            "market_id": row.market_id,
+            "position_id": row.position_id,
+            "event_type": row.event_type,
+            "strategy": row.strategy,
+            "execution_mode": row.execution_mode,
+            "source": if row.strategy == "arb" { "arbitrage" } else { "quant" },
+        })),
+        pnl: if closed { row.realized_pnl } else { None },
+        created_at: row.occurred_at,
+    }
+}
+
+/// List recent trading activity: positions opened and closed, fills and
+/// failures, from the canonical trade event log.
 #[utoipa::path(
     get,
     path = "/api/v1/activity",
@@ -214,65 +182,103 @@ pub async fn list_activity(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ActivityQuery>,
 ) -> ApiResult<Json<Vec<ActivityResponse>>> {
-    // TODO: copy_trade_history has been dropped; activity is now sourced from execution_reports.
-    let rows: Vec<ExecutionReportRow> = sqlx::query_as(
+    Ok(Json(
+        load_activity(&state.pool, query.limit, query.offset).await?,
+    ))
+}
+
+async fn load_activity(
+    pool: &sqlx::PgPool,
+    limit: i64,
+    offset: i64,
+) -> ApiResult<Vec<ActivityResponse>> {
+    let rows: Vec<TradeEventRow> = sqlx::query_as(
         r#"
-        SELECT
-            id, market_id, side, status, filled_quantity,
-            average_price, error_message, source, executed_at
-        FROM execution_reports
-        ORDER BY executed_at DESC
-        LIMIT $1 OFFSET $2
+        SELECT id, occurred_at, strategy, execution_mode, market_id, position_id,
+               event_type, reason, fill_price, filled_size_usd, realized_pnl
+        FROM trade_events
+        WHERE event_type = ANY($1)
+        ORDER BY occurred_at DESC, id
+        LIMIT $2 OFFSET $3
         "#,
     )
-    .bind(query.limit)
-    .bind(query.offset)
-    .fetch_all(&state.pool)
+    .bind(&ACTIVITY_EVENTS[..])
+    .bind(limit.clamp(1, MAX_LIMIT))
+    .bind(offset.max(0))
+    .fetch_all(pool)
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {}", e)))?;
+    Ok(rows.into_iter().map(to_activity).collect())
+}
 
-    let activities: Vec<ActivityResponse> = rows
-        .into_iter()
-        .map(|row| {
-            let error_message = row.error_message.clone();
-            let market_short = if row.market_id.len() > 20 {
-                format!("{}...", &row.market_id[..20])
-            } else {
-                row.market_id.clone()
-            };
-            let source_label = source_label(row.source);
-            let direction = if row.side == 0 { "buy" } else { "sell" };
-            let activity_type =
-                classify_activity_type(row.source, row.status, row.side).to_string();
-            let message = build_activity_message(
-                row.source,
-                row.status,
-                row.side,
-                &market_short,
-                row.filled_quantity,
-                row.average_price,
-                error_message.as_deref(),
-            );
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Executor;
 
-            let details = Some(serde_json::json!({
-                "market_id": row.market_id,
-                "direction": direction,
-                "source": source_label,
-                "status": row.status,
-            }));
+    #[sqlx::test(migrations = false)]
+    async fn activity_comes_from_the_trade_event_log(pool: sqlx::PgPool) {
+        let schema = include_str!("../../../../migrations/048_trade_events.sql")
+            .replace("uuid_generate_v4()", "gen_random_uuid()");
+        pool.execute(schema.as_str()).await.unwrap();
+        let position = Uuid::new_v4();
+        let event = |strategy: &'static str,
+                     event_type: &'static str,
+                     minutes_ago: i32,
+                     reason: Option<&'static str>,
+                     pnl: Option<Decimal>| {
+            sqlx::query(
+                "INSERT INTO trade_events (occurred_at, strategy, execution_mode, source, \
+                 market_id, position_id, event_type, reason, realized_pnl, fill_price, \
+                 filled_size_usd) \
+                 VALUES (NOW() - make_interval(mins => $1), $2, 'live', 'src', \
+                 '0x1234567890abcdef1234567890', $3, $4, $5, $6, 0.45, 4.5)",
+            )
+            .bind(minutes_ago)
+            .bind(strategy)
+            .bind(position)
+            .bind(event_type)
+            .bind(reason)
+            .bind(pnl)
+            .execute(&pool)
+        };
+        event("arb", "entry_requested", 30, None, None)
+            .await
+            .unwrap();
+        event("arb", "position_open", 29, None, None).await.unwrap();
+        event("flow", "entry_filled", 20, None, None).await.unwrap();
+        event("flow", "exit_failed", 10, Some("no bids"), None)
+            .await
+            .unwrap();
+        event(
+            "arb",
+            "closed_via_resolution",
+            1,
+            None,
+            Some(Decimal::new(42, 2)),
+        )
+        .await
+        .unwrap();
 
-            ActivityResponse {
-                id: row.id.to_string(),
-                activity_type,
-                message,
-                skip_reason: None,
-                error_message,
-                details,
-                pnl: None,
-                created_at: row.executed_at,
-            }
-        })
-        .collect();
-
-    Ok(Json(activities))
+        let feed = load_activity(&pool, 50, 0).await.unwrap();
+        // Requests are not activity; newest first.
+        let types: Vec<&str> = feed.iter().map(|a| a.activity_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "ARB_POSITION_CLOSED",
+                "TRADE_FAILED",
+                "TRADE_EXECUTED",
+                "ARB_POSITION_OPENED"
+            ]
+        );
+        assert_eq!(feed[0].pnl, Some(Decimal::new(42, 2)));
+        assert_eq!(feed[0].details.as_ref().unwrap()["source"], "arbitrage");
+        assert_eq!(feed[1].error_message.as_deref(), Some("no bids"));
+        assert!(feed[1].message.contains("Flow (live) exit failed"));
+        assert!(feed[2].message.contains("bought $4.50"));
+        // Paging, and out-of-range values no longer fail the request.
+        assert_eq!(load_activity(&pool, 2, 1).await.unwrap().len(), 2);
+        assert_eq!(load_activity(&pool, -5, -3).await.unwrap().len(), 1);
+    }
 }
