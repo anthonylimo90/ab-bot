@@ -242,6 +242,7 @@ async fn send_telegram(
     message: &str,
 ) -> Result<()> {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    // The URL carries the bot token: errors are reported without it.
     http.post(&url)
         .json(&serde_json::json!({
             "chat_id": chat_id,
@@ -249,18 +250,23 @@ async fn send_telegram(
             "parse_mode": "HTML"
         }))
         .send()
-        .await?;
+        .await
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| anyhow::anyhow!("Telegram request failed: {}", error.without_url()))?;
     debug!("Sent Telegram alert");
     Ok(())
 }
 
 async fn send_discord(http: &reqwest::Client, webhook_url: &str, message: &str) -> Result<()> {
+    // A webhook URL is a credential too.
     http.post(webhook_url)
         .json(&serde_json::json!({
             "content": message
         }))
         .send()
-        .await?;
+        .await
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| anyhow::anyhow!("Discord request failed: {}", error.without_url()))?;
     debug!("Sent Discord alert");
     Ok(())
 }

@@ -427,6 +427,27 @@ Startup rejects a change away from the saved trading wallet while positions are 
 
 Disconnecting a wallet in the vault is refused while the running server signs with it, and, for the saved trading wallet, while any exposure remains. Disconnecting the saved trading wallet once it is idle and flat also clears the saved selection, so the next start uses `TRADING_WALLET_ADDRESS` or `WALLET_PRIVATE_KEY` instead of looking for the erased key.
 
+### Withdrawals that do not resolve
+
+Every withdrawal is journaled (hash, nonce, signed bytes) before it is sent,
+and the reconciler settles it from the chain: confirmed or reverted on a final
+receipt, or failed when another transaction used its nonce (seen twice, five
+minutes apart). Until then it holds back its amount from live buys and, while
+it is still `submitting`, blocks further withdrawals from that wallet.
+
+- Before the first deploy of this journal, list older unresolved rows, which
+  the reconciler leaves to an operator because they carry no hash:
+  `SELECT id, wallet_address, amount, status, requested_at FROM wallet_withdrawals WHERE status IN ('pending','submitting','submitted') AND tx_hash IS NULL AND NOT (status = 'pending' AND journaled);`
+  Check each against the wallet's history on Polygonscan and set it to
+  `confirmed` or `failed` by hand.
+- A transfer the node keeps refusing (for example "transaction underpriced"
+  after a gas spike) is logged as "Node did not take a re-sent withdrawal"
+  with how long it has been unresolved. To release it, send any transaction
+  from the wallet at the same nonce (a zero-value transfer to itself at a
+  higher gas price); the reconciler then fails the stuck transfer once that
+  nonce is final. Never mark it `failed` by hand while its nonce is unused:
+  it can still be mined.
+
 The file vault replaces `VAULT_FILE_PATH` by writing a sibling file and renaming it over the old one. Mount a writable directory (for example a Railway volume) and point `VAULT_FILE_PATH` inside it; a bind mount of the single file cannot be replaced this way.
 
 ### Review fix migrations and client compatibility

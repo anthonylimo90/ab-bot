@@ -35,6 +35,8 @@ pub(crate) struct Chain {
     pub mine_on_send: bool,
     /// Raw transactions sent to the node.
     pub broadcasts: Vec<String>,
+    /// Receipt `status` values that replace the canonical "0x1"/"0x0".
+    pub raw_statuses: HashMap<String, Value>,
 }
 
 impl Default for Chain {
@@ -52,6 +54,7 @@ impl Default for Chain {
             send_error: None,
             mine_on_send: false,
             broadcasts: Vec::new(),
+            raw_statuses: HashMap::new(),
         }
     }
 }
@@ -87,9 +90,11 @@ pub(crate) async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
                 let hex = |value: u128| json!(format!("{value:#x}"));
                 let result = match request["method"].as_str().unwrap() {
                     "eth_getTransactionReceipt" => {
-                        match chain.receipts.get(params[0].as_str().unwrap()) {
+                        let hash = params[0].as_str().unwrap();
+                        match chain.receipts.get(hash) {
                             Some((ok, block)) => json!({
-                                "status": if *ok { "0x1" } else { "0x0" },
+                                "status": chain.raw_statuses.get(hash).cloned()
+                                    .unwrap_or_else(|| json!(if *ok { "0x1" } else { "0x0" })),
                                 "blockNumber": format!("{block:#x}"),
                                 "gasUsed": "0x5208"
                             }),
@@ -655,4 +660,36 @@ async fn a_dropped_spend_lock_frees_the_wallet(pool: PgPool) {
             .unwrap();
     assert!(free);
     again.release().await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_an_explicit_receipt_status_settles_a_transfer(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let chain = Arc::new(Mutex::new(Chain::default()));
+    let client = mock_node(chain.clone()).await;
+    let padded = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "submitted", Some("0xp1"), Some(1), 1),
+    )
+    .await;
+    let unreadable = insert(
+        &pool,
+        user,
+        workspace,
+        row(OTHER, "submitted", Some("0xp2"), Some(1), 1),
+    )
+    .await;
+    {
+        let mut chain = chain.lock().unwrap();
+        chain.mine("0xp1", true);
+        chain.mine("0xp2", true);
+        chain.raw_statuses.insert("0xp1".into(), json!("0x01"));
+        chain.raw_statuses.insert("0xp2".into(), Value::Null);
+    }
+    reconcile(&pool, &client).await;
+    assert_eq!(status(&pool, padded).await.0, "confirmed");
+    // A receipt without a readable status is not a revert: still unresolved.
+    assert_eq!(status(&pool, unreadable).await.0, "submitted");
 }

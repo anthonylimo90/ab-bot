@@ -1267,14 +1267,18 @@ async fn submit_withdrawal(
     .execute(lock.conn())
     .await;
     if !matches!(&journaled, Ok(result) if result.rows_affected() == 1) {
-        // Not journaled, so never sent. A `pending` row without a hash is
-        // failed by the reconciler.
+        // This request sends nothing. If the journal write committed despite
+        // the error, the reconciler sends the journaled transfer; otherwise a
+        // `pending` row without a hash is failed by it.
         lock.release().await;
         if let Err(error) = journaled {
-            warn!(withdrawal_id = %withdrawal_id, %error, "Could not journal a withdrawal; nothing was sent");
+            warn!(withdrawal_id = %withdrawal_id, %error, "Could not journal a withdrawal; not sending it");
         }
         return Err(ApiError::ServiceUnavailable(
-            "Could not record the transfer before sending it; nothing was sent".into(),
+            "Could not record the transfer, so this request did not send it. Check this \
+             withdrawal's status (retrying with the same client_request_id shows it) before \
+             starting another"
+                .into(),
         ));
     }
 

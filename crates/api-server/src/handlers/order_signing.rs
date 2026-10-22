@@ -182,6 +182,27 @@ struct PendingOrderRow {
     created_at: DateTime<Utc>,
 }
 
+/// Which outcome `token_id` is, under the catalog's YES/NO mapping, for the
+/// summary a user confirms before signing; "UNKNOWN" rather than a guess
+/// when the token is not in the catalog.
+async fn outcome_label(state: &AppState, token_id: &str) -> &'static str {
+    let condition: Option<String> =
+        sqlx::query_scalar("SELECT condition_id FROM token_condition_cache WHERE token_id = $1")
+            .bind(token_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+    let Some(condition) = condition else {
+        return "UNKNOWN";
+    };
+    match state.market_catalog.get(&condition).await {
+        Some((yes, _)) if yes == token_id => "YES",
+        Some((_, no)) if no == token_id => "NO",
+        _ => "UNKNOWN",
+    }
+}
+
 /// Generate a random salt for order uniqueness.
 fn generate_salt() -> String {
     ((Uuid::new_v4().as_u128() as u64) & ((1u64 << 53) - 1)).to_string()
@@ -426,11 +447,7 @@ pub async fn prepare_order(
 
     let summary = OrderSummary {
         side: side_str.clone(),
-        outcome: if req.token_id.ends_with("1") {
-            "YES".to_string()
-        } else {
-            "NO".to_string()
-        },
+        outcome: outcome_label(&state, &req.token_id).await.to_string(),
         price: format!("${:.2}", req.price),
         size: format!("{} shares", req.size),
         total_cost: format!("${:.2}", req.size * req.price),
@@ -752,6 +769,33 @@ fn recover_address(digest: &B256, r: &[u8; 32], s: &[u8; 32], v: u8) -> Result<A
 #[cfg(test)]
 mod amount_tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn the_signing_summary_names_the_outcome_from_the_catalog(pool: sqlx::PgPool) {
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/037_token_condition_cache.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Token ids carry no YES/NO meaning: this YES token ends in 0.
+        sqlx::query(
+            "INSERT INTO token_condition_cache (token_id, condition_id) VALUES \
+             ('7770', 'cond'), ('8881', 'cond'), ('9991', 'elsewhere')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::for_tests(pool);
+        state
+            .market_catalog
+            .alias("cond", &("7770".into(), "8881".into()))
+            .await;
+        assert_eq!(outcome_label(&state, "7770").await, "YES");
+        assert_eq!(outcome_label(&state, "8881").await, "NO");
+        assert_eq!(outcome_label(&state, "9991").await, "UNKNOWN");
+        assert_eq!(outcome_label(&state, "1231").await, "UNKNOWN");
+    }
     #[tokio::test]
     async fn browser_order_and_auth_signatures_match_shared_signing_for_both_domains() {
         let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();

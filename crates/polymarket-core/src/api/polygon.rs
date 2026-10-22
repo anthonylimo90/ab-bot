@@ -447,9 +447,25 @@ impl PolygonClient {
         if receipt.is_null() {
             return Ok(None);
         }
-        let status = receipt.get("status").and_then(|value| value.as_str());
+        // Only an explicit 1 or 0 decides success; anything else is an
+        // unreadable receipt, never a revert (which would settle a transfer
+        // as unsent).
+        let success = match receipt
+            .get("status")
+            .and_then(|value| value.as_str())
+            .and_then(parse_hex_u64)
+        {
+            Some(1) => true,
+            Some(0) => false,
+            _ => {
+                return Err(Error::Api {
+                    message: format!("Unreadable status in the receipt of {tx_hash}"),
+                    status: None,
+                })
+            }
+        };
         Ok(Some(MinedTransaction {
-            success: status == Some("0x1"),
+            success,
             block_number: receipt
                 .get("blockNumber")
                 .and_then(|value| value.as_str())

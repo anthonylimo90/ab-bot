@@ -1403,8 +1403,13 @@ impl BalanceAllowanceResponse {
         base_units_to_decimal(&self.balance)
     }
 
+    /// An unlimited approval (2^256 − 1 base units) is larger than a
+    /// `Decimal` holds; it reads as `Decimal::MAX` rather than as unknown.
     pub fn allowance_in_units(&self) -> Option<Decimal> {
-        base_units_to_decimal(&self.allowance)
+        let raw = self.allowance.trim();
+        base_units_to_decimal(raw).or_else(|| {
+            (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())).then_some(Decimal::MAX)
+        })
     }
 }
 
@@ -1424,6 +1429,20 @@ mod balance_unit_tests {
         for invalid in ["", "unavailable", "-1", "1.5"] {
             assert_eq!(base_units_to_decimal(invalid), None);
         }
+        let allowance = |allowance: &str| BalanceAllowanceResponse {
+            balance: "0".into(),
+            allowance: allowance.into(),
+        };
+        // An unlimited approval is known, not unreadable: no refresh per order.
+        let unlimited =
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        assert_eq!(
+            allowance(unlimited).allowance_in_units(),
+            Some(Decimal::MAX)
+        );
+        // A blank allowance is unknown: the preflight refreshes it.
+        assert_eq!(allowance("").allowance_in_units(), None);
+        assert_eq!(allowance("1.5").allowance_in_units(), None);
     }
 }
 

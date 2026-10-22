@@ -127,12 +127,11 @@ impl MarketMapper {
                 continue;
             };
 
-            // The YES price under the shared YES/NO mapping. A market without
-            // one is skipped: a made-up 0.50 would read as a real price.
-            let Some(yes_price) = polymarket_core::types::yes_no_indices(&market.outcomes)
-                .and_then(|(yes, _)| market.outcomes[yes].price)
-                .and_then(|price| price.to_f64())
-            else {
+            // The price of the outcome named Yes, which is what "above"/"below"
+            // questions resolve on. Markets with other outcome names (Up/Down)
+            // or no price are skipped: a guessed side or a made-up 0.50 would
+            // read as a real signal.
+            let Some(yes_price) = named_yes_price(&market.outcomes) else {
                 continue;
             };
 
@@ -174,6 +173,15 @@ impl MarketMapper {
 /// Parse a dollar price from a market question like:
 /// "Will BTC be above $70,000 on Jan 31?"
 /// "Bitcoin price higher than $68,500?"
+/// The price of the outcome literally named Yes, if it has one.
+fn named_yes_price(outcomes: &[polymarket_core::types::Outcome]) -> Option<f64> {
+    outcomes
+        .iter()
+        .find(|outcome| outcome.name.trim().eq_ignore_ascii_case("yes"))
+        .and_then(|outcome| outcome.price)
+        .and_then(|price| price.to_f64())
+}
+
 fn parse_price_from_question(question: &str) -> Option<f64> {
     let mut chars = question.chars().peekable();
     while let Some(c) = chars.next() {
@@ -204,6 +212,31 @@ fn parse_price_from_question(question: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_outcome_named_yes_gives_the_yes_price() {
+        use rust_decimal::Decimal;
+        let outcome = |name: &str, price: Option<i64>| polymarket_core::types::Outcome {
+            id: name.into(),
+            name: name.into(),
+            token_id: name.into(),
+            price: price.map(|p| Decimal::new(p, 2)),
+            winner: None,
+        };
+        assert_eq!(
+            named_yes_price(&[outcome("No", Some(30)), outcome("Yes", Some(70))]),
+            Some(0.7)
+        );
+        // Named outcomes say nothing about "above"; no price, no guess.
+        assert_eq!(
+            named_yes_price(&[outcome("Up", Some(30)), outcome("Down", Some(70))]),
+            None
+        );
+        assert_eq!(
+            named_yes_price(&[outcome("Yes", None), outcome("No", Some(70))]),
+            None
+        );
+    }
 
     #[test]
     fn test_parse_price_standard() {

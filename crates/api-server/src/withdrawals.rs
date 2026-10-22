@@ -381,6 +381,7 @@ struct UnresolvedWithdrawal {
     tx_hash: Option<String>,
     nonce: Option<i64>,
     raw_tx: Option<String>,
+    requested_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     superseded_seen_at: Option<DateTime<Utc>>,
 }
@@ -418,8 +419,8 @@ where
     // are left to an operator and must not crowd the others out. Unresolved
     // rows come before the failed ones watched for a late receipt.
     let rows: Vec<UnresolvedWithdrawal> = sqlx::query_as(
-        "SELECT id, user_id, wallet_address, status, tx_hash, nonce, raw_tx, updated_at, \
-                superseded_seen_at \
+        "SELECT id, user_id, wallet_address, status, tx_hash, nonce, raw_tx, requested_at, \
+                updated_at, superseded_seen_at \
          FROM wallet_withdrawals \
          WHERE (status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL) \
             OR (status = 'pending' AND journaled AND tx_hash IS NULL) \
@@ -583,12 +584,19 @@ async fn reconcile_on_chain(
                 info!(withdrawal_id = %row.id, "Re-sent an unresolved withdrawal")
             }
             Ok(BroadcastOutcome::Rejected(reason) | BroadcastOutcome::Uncertain(reason)) => {
-                warn!(withdrawal_id = %row.id, %reason, "Node did not take a re-sent withdrawal")
+                warn!(
+                    withdrawal_id = %row.id,
+                    %reason,
+                    unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
+                    "Node did not take a re-sent withdrawal; it stays unresolved and blocks \
+                     this wallet's withdrawals until mined or superseded (see DEPLOY.md)"
+                )
             }
             Err(error) => {
                 warn!(
                     withdrawal_id = %row.id,
                     error = %chain_error_message(&error),
+                    unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
                     "Re-sending a withdrawal failed"
                 )
             }
