@@ -950,3 +950,70 @@ async fn a_held_transfer_below_the_network_price_is_replaced_and_its_replacement
     assert_eq!(settled.0, tx_hash);
     assert_eq!(settled.1, vec![original.tx_hash]);
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_replacement_that_never_reached_the_node_is_sent_again(pool: PgPool) {
+    let chain = Arc::new(Mutex::new(Chain {
+        pol_wei: 1_000_000_000_000_000_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let (wallet, id, original) = waiting_transfer(&pool, &client, "submitted").await;
+    {
+        let mut chain = chain.lock().unwrap();
+        // The node holds the 36 gwei original; the network asks 50, and the
+        // replacement cannot be delivered (a transport error or a restart).
+        chain.known.insert(original.tx_hash.clone());
+        chain.gas_price = 50_000_000_000;
+        chain.send_error = Some("connection reset by peer".into());
+    }
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    let (replacement, replaced, _) = journal(&pool, id).await;
+    assert_eq!(replaced, vec![original.tx_hash.clone()]);
+    assert!(!chain.lock().unwrap().known.contains(&replacement));
+
+    // The node still holds only the original; the journaled replacement is
+    // sent again (once the re-send interval has passed).
+    chain.lock().unwrap().send_error = None;
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    assert!(!chain.lock().unwrap().known.contains(&replacement));
+    sqlx::query("UPDATE wallet_withdrawals SET updated_at = NOW() - INTERVAL '10 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    assert!(chain.lock().unwrap().known.contains(&replacement));
+    let (tx_hash, replaced, status) = journal(&pool, id).await;
+    assert_eq!(tx_hash, replacement);
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(status, "submitted");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_row_that_no_longer_matches_its_transaction_is_not_signed_again(pool: PgPool) {
+    let chain = Arc::new(Mutex::new(Chain {
+        pol_wei: 1_000_000_000_000_000_000,
+        gas_price: 30_000_000_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let (wallet, id, original) = waiting_transfer(&pool, &client, "submitted").await;
+    // The row was edited by hand after the transfer was signed.
+    sqlx::query(
+        "UPDATE wallet_withdrawals SET destination_address = \
+         '0x4444444444444444444444444444444444444444' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    {
+        let mut chain = chain.lock().unwrap();
+        chain.known.insert(original.tx_hash.clone());
+        chain.gas_price = 50_000_000_000;
+    }
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    let (tx_hash, replaced, _) = journal(&pool, id).await;
+    assert_eq!(tx_hash, original.tx_hash);
+    assert!(replaced.is_empty());
+}

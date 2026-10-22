@@ -20,7 +20,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use polymarket_core::api::polygon::{
-    legacy_nonce_and_gas_price, BroadcastOutcome, MinedTransaction,
+    legacy_call, legacy_nonce_and_gas_price, BroadcastOutcome, MinedTransaction,
 };
 use polymarket_core::api::PolygonClient;
 use rust_decimal::Decimal;
@@ -421,6 +421,18 @@ struct UnresolvedWithdrawal {
     superseded_seen_at: Option<DateTime<Utc>>,
 }
 
+/// The columns of an [`UnresolvedWithdrawal`].
+const UNRESOLVED_COLUMNS: &str = "id, user_id, wallet_address, destination_address, amount, \
+    status, tx_hash, replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, \
+    superseded_seen_at";
+
+/// The withdrawals the reconciler can decide, given `REVERTED_ERROR` as $1 and
+/// `SECOND_CHANCE_HOURS` as $2.
+const RECONCILABLE: &str = "(status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL) \
+    OR (status = 'pending' AND journaled AND tx_hash IS NULL) \
+    OR (status = 'failed' AND tx_hash IS NOT NULL AND error IS DISTINCT FROM $1 \
+        AND updated_at > NOW() - make_interval(hours => $2))";
+
 impl UnresolvedWithdrawal {
     /// Every transaction broadcast for the transfer, `tx_hash` (the latest)
     /// first: any one of them may be the one mined.
@@ -533,26 +545,33 @@ where
     // Only rows that can be decided: legacy rows sent without a recorded hash
     // are left to an operator and must not crowd the others out. Unresolved
     // rows come before the failed ones watched for a late receipt.
-    let rows: Vec<UnresolvedWithdrawal> = sqlx::query_as(
-        "SELECT id, user_id, wallet_address, destination_address, amount, status, tx_hash, \
-                replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, \
-                superseded_seen_at \
-         FROM wallet_withdrawals \
-         WHERE (status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL) \
-            OR (status = 'pending' AND journaled AND tx_hash IS NULL) \
-            OR (status = 'failed' AND tx_hash IS NOT NULL \
-                AND error IS DISTINCT FROM $1 \
-                AND updated_at > NOW() - make_interval(hours => $2)) \
-         ORDER BY status = 'failed', updated_at LIMIT 200",
-    )
+    let rows: Vec<UnresolvedWithdrawal> = sqlx::query_as(&format!(
+        "SELECT {UNRESOLVED_COLUMNS} FROM wallet_withdrawals WHERE {RECONCILABLE} \
+         ORDER BY status = 'failed', updated_at LIMIT 200"
+    ))
     .bind(REVERTED_ERROR)
     .bind(SECOND_CHANCE_HOURS)
     .fetch_all(pool)
     .await?;
 
-    for row in rows {
+    for listed in rows {
         // Never race the request that is signing or sending from this wallet.
-        let Some(mut lock) = SpendLock::try_acquire(pool, &row.wallet_address).await? else {
+        let Some(mut lock) = SpendLock::try_acquire(pool, &listed.wallet_address).await? else {
+            continue;
+        };
+        // Read it again under the lock: another replica may have settled it,
+        // or signed a replacement, since it was listed.
+        let row: Option<UnresolvedWithdrawal> = sqlx::query_as(&format!(
+            "SELECT {UNRESOLVED_COLUMNS} FROM wallet_withdrawals \
+             WHERE id = $3 AND ({RECONCILABLE})"
+        ))
+        .bind(REVERTED_ERROR)
+        .bind(SECOND_CHANCE_HOURS)
+        .bind(listed.id)
+        .fetch_optional(lock.conn())
+        .await?;
+        let Some(row) = row else {
+            lock.release().await;
             continue;
         };
         let result = match row.tx_hash.as_deref() {
@@ -652,14 +671,15 @@ async fn reconcile_on_chain(
         return Ok(false);
     }
 
-    let mut known = false;
-    for hash in &hashes {
+    // The first of its transactions (latest first) a node holds.
+    let mut held = None;
+    for (index, hash) in hashes.iter().enumerate() {
         if client.transaction_known(hash).await? {
-            known = true;
+            held = Some(index);
             break;
         }
     }
-    if known {
+    if let Some(index) = held {
         // A node holds one: it was sent, and its nonce is not used by another.
         sqlx::query(
             "UPDATE wallet_withdrawals SET status = 'submitted', superseded_seen_at = NULL, \
@@ -668,8 +688,13 @@ async fn reconcile_on_chain(
                                 OR (status = 'submitted' AND superseded_seen_at IS NOT NULL))",
         )
         .bind(row.id)
-        .execute(conn)
+        .execute(&mut *conn)
         .await?;
+        // Only an earlier one: the latest (a replacement journaled but never
+        // delivered) is sent again, at most once per interval, to replace it.
+        if index > 0 && row.updated_at < Utc::now() - Duration::seconds(REBROADCAST_AFTER_SECS) {
+            resend_latest(conn, client, row, tx_hash).await?;
+        }
         return Ok(true);
     }
     let Some(nonce) = row.nonce.and_then(|nonce| u64::try_from(nonce).ok()) else {
@@ -733,46 +758,62 @@ async fn reconcile_on_chain(
             .await?
             <= nonce
     {
-        let Some(raw) = row.raw_tx.as_deref() else {
+        if row.raw_tx.is_none() {
             return Ok(false);
-        };
-        let outcome = client.broadcast(raw, tx_hash).await;
-        let accepted = matches!(outcome, Ok(BroadcastOutcome::Accepted));
-        sqlx::query(
-            "UPDATE wallet_withdrawals SET updated_at = NOW(), \
-             status = CASE WHEN $2 THEN 'submitted' ELSE status END \
-             WHERE id = $1 AND status IN ('submitting', 'submitted')",
-        )
-        .bind(row.id)
-        .bind(accepted)
-        .execute(conn)
-        .await?;
-        match outcome {
-            Ok(BroadcastOutcome::Accepted) => {
-                info!(withdrawal_id = %row.id, "Re-sent an unresolved withdrawal")
-            }
-            Ok(BroadcastOutcome::Rejected(reason) | BroadcastOutcome::Uncertain(reason)) => {
-                warn!(
-                    withdrawal_id = %row.id,
-                    %reason,
-                    unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
-                    "Node did not take a re-sent withdrawal; its gas price is raised when the \
-                     network asks more, otherwise it blocks this wallet's withdrawals until \
-                     mined or superseded (see DEPLOY.md)"
-                )
-            }
-            Err(error) => {
-                warn!(
-                    withdrawal_id = %row.id,
-                    error = %chain_error_message(&error),
-                    unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
-                    "Re-sending a withdrawal failed"
-                )
-            }
         }
+        resend_latest(conn, client, row, tx_hash).await?;
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Send the transfer's latest transaction (`tx_hash`, journaled as `raw_tx`)
+/// again; an accepted one marks it `submitted`.
+async fn resend_latest(
+    conn: &mut PgConnection,
+    client: &PolygonClient,
+    row: &UnresolvedWithdrawal,
+    tx_hash: &str,
+) -> anyhow::Result<()> {
+    let Some(raw) = row.raw_tx.as_deref() else {
+        return Ok(());
+    };
+    let outcome = client.broadcast(raw, tx_hash).await;
+    let accepted = matches!(outcome, Ok(BroadcastOutcome::Accepted));
+    sqlx::query(
+        "UPDATE wallet_withdrawals SET updated_at = NOW(), \
+         status = CASE WHEN $2 THEN 'submitted' ELSE status END \
+         WHERE id = $1 AND tx_hash = $3 AND status IN ('submitting', 'submitted')",
+    )
+    .bind(row.id)
+    .bind(accepted)
+    .bind(tx_hash)
+    .execute(conn)
+    .await?;
+    match outcome {
+        Ok(BroadcastOutcome::Accepted) => {
+            info!(withdrawal_id = %row.id, "Re-sent an unresolved withdrawal")
+        }
+        Ok(BroadcastOutcome::Rejected(reason) | BroadcastOutcome::Uncertain(reason)) => {
+            warn!(
+                withdrawal_id = %row.id,
+                %reason,
+                unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
+                "Node did not take a re-sent withdrawal; its gas price is raised when the \
+                 network asks more, otherwise it blocks this wallet's withdrawals until \
+                 mined or superseded (see DEPLOY.md)"
+            )
+        }
+        Err(error) => {
+            warn!(
+                withdrawal_id = %row.id,
+                error = %chain_error_message(&error),
+                unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
+                "Re-sending a withdrawal failed"
+            )
+        }
+    }
+    Ok(())
 }
 
 /// Whether an unresolved transfer was signed long enough ago that, still
@@ -883,8 +924,16 @@ async fn bump_fee(
         min_gas_price = signed.gas_price + signed.gas_price / 10 + 1;
     }
     let Some(signed) = replacement else {
+        warn!(withdrawal_id = %row.id, "Could not sign a replacement distinct from earlier transactions");
         return Ok(());
     };
+    // It must be the same transfer as the transaction it replaces, whatever
+    // the row says.
+    let original = row.raw_tx.as_deref().and_then(legacy_call);
+    if original.is_none() || legacy_call(&signed.raw) != original {
+        warn!(withdrawal_id = %row.id, "Replacement would not repeat the journaled transfer; its gas price is not raised");
+        return Ok(());
+    }
 
     // Journal it before it can leave.
     let journaled = sqlx::query(

@@ -685,14 +685,30 @@ impl PolygonClient {
     }
 }
 
-/// The nonce and gas price (wei) of a signed legacy transaction, from its
-/// `0x`-prefixed raw encoding; `None` when it is not one.
-pub fn legacy_nonce_and_gas_price(raw: &str) -> Option<(u64, u128)> {
+/// A signed legacy transaction, from its `0x`-prefixed raw encoding; `None`
+/// when it is not one.
+fn decode_legacy(raw: &str) -> Option<TxLegacy> {
     use alloy_consensus::transaction::RlpEcdsaTx;
     let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(raw)).ok()?;
     let mut buf = bytes.as_slice();
     let (tx, _) = TxLegacy::rlp_decode_with_signature(&mut buf).ok()?;
-    buf.is_empty().then_some((tx.nonce, tx.gas_price))
+    buf.is_empty().then_some(tx)
+}
+
+/// The nonce and gas price (wei) of a signed legacy transaction, from its
+/// `0x`-prefixed raw encoding; `None` when it is not one.
+pub fn legacy_nonce_and_gas_price(raw: &str) -> Option<(u64, u128)> {
+    decode_legacy(raw).map(|tx| (tx.nonce, tx.gas_price))
+}
+
+/// What a signed legacy transaction does, apart from its nonce and gas: the
+/// contract it calls (lower-case hex), the value it sends and its call data.
+pub fn legacy_call(raw: &str) -> Option<(String, U256, Bytes)> {
+    let tx = decode_legacy(raw)?;
+    match tx.to {
+        TxKind::Call(address) => Some((format!("{address:#x}"), tx.value, tx.input)),
+        TxKind::Create => None,
+    }
 }
 
 /// Sign a legacy transaction and compute its hash locally.
@@ -951,7 +967,15 @@ mod tests {
             legacy_nonce_and_gas_price(&signed.raw),
             Some((7, 36_000_000_001))
         );
+        let (to, value, input) = legacy_call(&signed.raw).unwrap();
+        assert_eq!(to, POLYGON_USDC_ADDRESS.to_lowercase());
+        assert_eq!(value, U256::ZERO);
+        assert_eq!(
+            input,
+            encode_erc20_transfer(Address::ZERO, U256::from(5_000_000u64))
+        );
         assert_eq!(legacy_nonce_and_gas_price("0xraw01"), None);
+        assert_eq!(legacy_call("0xraw01"), None);
         assert_eq!(
             legacy_nonce_and_gas_price(&format!("{}00", signed.raw)),
             None
