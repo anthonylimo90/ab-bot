@@ -494,6 +494,40 @@ impl PositionService {
         Ok(())
     }
 
+    /// Writes off the part of a leg's holding the wallet does not have (see
+    /// [`Position::write_off_missing_shares`]). Records
+    /// "entry_fee_shares_written_off".
+    pub async fn write_off_missing_shares(
+        &self,
+        position: &mut Position,
+        leg: Leg,
+        quantity: Decimal,
+        ctx: &EventContext,
+    ) -> anyhow::Result<()> {
+        let written_off = position.write_off_missing_shares(leg == Leg::Yes, quantity);
+        if written_off.is_zero() {
+            return Ok(());
+        }
+        self.repo.update(position).await?;
+        self.events
+            .record_warn(
+                NewTradeEvent::new(
+                    &ctx.strategy,
+                    &ctx.execution_mode,
+                    &ctx.source_label,
+                    &position.market_id,
+                    "entry_fee_shares_written_off",
+                )
+                .with_position(position.id)
+                .with_metadata(serde_json::json!({
+                    "leg": leg.to_string(),
+                    "quantity": written_off.to_string(),
+                })),
+            )
+            .await;
+        Ok(())
+    }
+
     // ── Position close ─────────────────────────────────────────────
 
     /// Final close: computes PnL, sets state=Closed, records event.

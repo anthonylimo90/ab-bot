@@ -30,9 +30,12 @@ pub(crate) async fn setup(pool: &PgPool) -> PositionService {
     ))
     .await
     .unwrap();
-    pool.execute("CREATE TABLE manual_inventory(cost_basis NUMERIC)")
-        .await
-        .unwrap();
+    pool.execute(
+        "CREATE TABLE manual_inventory(execution_mode TEXT, wallet_address TEXT, market_id TEXT, \
+         outcome TEXT, quantity NUMERIC NOT NULL DEFAULT 0, cost_basis NUMERIC NOT NULL DEFAULT 0)",
+    )
+    .await
+    .unwrap();
     pool.execute(include_str!(
         "../../../../migrations/076_position_provenance.sql"
     ))
@@ -720,5 +723,228 @@ async fn an_unchanged_mark_is_not_rewritten_each_tick(pool: PgPool) {
         .unwrap();
     assert_eq!(version().await, before + 1, "the same mark is not");
     assert_eq!(candidate.position.state, PositionState::Open);
+    server.abort();
+}
+
+#[test]
+fn only_a_fee_sized_shortfall_is_written_off() {
+    let held = Decimal::from(100);
+    // 0.07 × (1 − 0.5) of the shares bought at 0.50.
+    assert_eq!(
+        super::fee_shortfall(held, Decimal::new(965, 1)),
+        Some(Decimal::new(35, 1))
+    );
+    assert_eq!(
+        super::fee_shortfall(held, Decimal::from(90)),
+        Some(Decimal::from(10))
+    );
+    // More missing than any fee keeps: a discrepancy, not a fee.
+    assert_eq!(super::fee_shortfall(held, Decimal::from(89)), None);
+    assert_eq!(super::fee_shortfall(held, Decimal::ZERO), None);
+    // Enough (or more) in the wallet: nothing to write off.
+    assert_eq!(super::fee_shortfall(held, held), None);
+    assert_eq!(super::fee_shortfall(held, Decimal::from(150)), None);
+}
+
+#[sqlx::test(migrations = false)]
+async fn fee_shares_written_off_lower_the_realized_pnl(pool: PgPool) {
+    let service = setup(&pool).await;
+    let mut p = position();
+    p.state = PositionState::Closing;
+    p.yes_entry_price = Decimal::new(50, 2);
+    p.held_yes_qty = Decimal::from(100);
+    p.quantity = Decimal::from(100);
+    service.repo().insert(&p).await.unwrap();
+    let ctx = context();
+
+    // The wallet held 96.5 of the 100 shares recorded; all 96.5 sold at 0.60.
+    service
+        .write_off_missing_shares(&mut p, Leg::Yes, Decimal::new(35, 1), &ctx)
+        .await
+        .unwrap();
+    service
+        .record_exit_fill(
+            &mut p,
+            Leg::Yes,
+            Decimal::new(60, 2),
+            Decimal::new(965, 1),
+            &ctx,
+            None,
+        )
+        .await
+        .unwrap();
+    service
+        .close_position(&mut p, CloseMethod::MarketExit { fee: Decimal::ZERO }, &ctx)
+        .await
+        .unwrap();
+    // 96.5 × 0.60 − 100 × 0.50 = 7.90, not 10 from the recorded 100 shares.
+    assert_eq!(p.realized_pnl, Some(Decimal::new(790, 2)));
+}
+
+/// An exit handler whose executor trades live as the wallet of private key 1
+/// against a mock exchange reporting `balance` (base units) for any token.
+async fn live_handler(
+    pool: &PgPool,
+    balance: Arc<std::sync::Mutex<String>>,
+) -> (ExitHandler, String, tokio::task::JoinHandle<()>) {
+    use axum::{extract::State, routing::get, routing::post, Json};
+    let app = axum::Router::new()
+        .route(
+            "/auth/api-key",
+            post(|| async {
+                Json(serde_json::json!({"apiKey": "key", "secret": "c2VjcmV0", "passphrase": "pass"}))
+            }),
+        )
+        .route(
+            "/balance-allowance",
+            get(
+                |State(balance): State<Arc<std::sync::Mutex<String>>>| async move {
+                    let balance = balance.lock().unwrap().clone();
+                    Json(serde_json::json!({"balance": balance, "allowance": "0"}))
+                },
+            ),
+        )
+        .with_state(balance);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut clob = ClobClient::new(Some(format!("http://{address}")), None);
+    clob.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let clob = Arc::new(clob);
+    let executor = Arc::new(OrderExecutor::new(
+        clob.clone(),
+        trading_engine::executor::ExecutorConfig {
+            live_trading: true,
+            ..Default::default()
+        },
+    ));
+    let wallet = executor
+        .reload_wallet(auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap())
+        .await
+        .unwrap();
+    let cache = Arc::new(OutcomeTokenCache::new(
+        clob.clone(),
+        Arc::new(RwLock::new(HashSet::new())),
+    ));
+    let h = ExitHandler::new(
+        Arc::new(RwLock::new(ExitHandlerConfig::default())),
+        executor,
+        Arc::new(CircuitBreaker::new(Default::default())),
+        clob,
+        broadcast::channel(32).0,
+        broadcast::channel(32).0,
+        pool.clone(),
+        Arc::new(RwLock::new(HashSet::new())),
+        Arc::new(AtomicI64::new(0)),
+        cache,
+    );
+    (h, wallet, server)
+}
+
+#[sqlx::test(migrations = false)]
+async fn fee_shares_are_written_off_only_once_the_token_has_settled(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, wallet, server) = live_handler(&pool, balance.clone()).await;
+    let set_balance = |shares: &str| {
+        *balance.lock().unwrap() =
+            (shares.parse::<Decimal>().unwrap() * Decimal::from(1_000_000)).to_string()
+    };
+    let ctx = context();
+    let live = |held: i64| {
+        let mut p = position();
+        p.state = PositionState::Closing;
+        p.execution_mode = "live".into();
+        p.wallet_address = Some(wallet.clone());
+        p.held_yes_qty = Decimal::from(held);
+        p
+    };
+    let mut p = live(100);
+    service.repo().insert(&p).await.unwrap();
+    let held = |p: &Position| p.held_yes_qty;
+
+    let intent = |side: &'static str, status: &'static str| {
+        sqlx::query(
+            "INSERT INTO execution_intents (id, market_id, signed_order, status) VALUES \
+             (gen_random_uuid(), 'market', jsonb_build_object('tokenId', 'yes', 'side', $1::text), $2)",
+        )
+        .bind(side)
+        .bind(status)
+        .execute(&pool)
+    };
+    // A buy on the token placed minutes ago may still be settling: the
+    // wallet can be short by shares on their way, so nothing is written off.
+    set_balance("96.5");
+    intent("BUY", "acknowledged").await.unwrap();
+    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(held(&p), Decimal::from(100));
+
+    // Once settled, a fee-sized shortfall is written off; a refused buy and
+    // an exit sell placed since bring no shares and do not hold it back.
+    pool.execute("UPDATE execution_intents SET created_at = NOW() - INTERVAL '31 minutes'")
+        .await
+        .unwrap();
+    intent("BUY", "rejected").await.unwrap();
+    intent("SELL", "acknowledged").await.unwrap();
+    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(held(&p), Decimal::new(965, 1));
+    assert_eq!(p.exited_yes_qty, Decimal::new(35, 1));
+
+    // An order whose outcome is unknown, even a sell, blocks it however old
+    // it is: a sale that went through may not be recorded yet.
+    let mut p = live(100);
+    service.repo().insert(&p).await.unwrap();
+    pool.execute(
+        "UPDATE execution_intents SET status = 'unknown' WHERE signed_order->>'side' = 'SELL'",
+    )
+    .await
+    .unwrap();
+    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(held(&p), Decimal::from(100));
+    pool.execute("UPDATE execution_intents SET status = 'reconciled' WHERE status = 'unknown'")
+        .await
+        .unwrap();
+
+    // Shares other positions and manual orders of the wallet hold are not
+    // this position's: beside the first position's 96.5, another holds 50
+    // and manual orders 20, so 263 in the wallet leaves this one 3.5 short.
+    let mut other = live(50);
+    other.id = uuid::Uuid::new_v4();
+    service.repo().insert(&other).await.unwrap();
+    sqlx::query("INSERT INTO manual_inventory VALUES ('live', LOWER($1), 'market', 'yes', 20, 10)")
+        .bind(&wallet)
+        .execute(&pool)
+        .await
+        .unwrap();
+    set_balance("263");
+    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(held(&p), Decimal::new(965, 1));
+
+    // A gap no fee explains is left for reconciliation: 80 of 100.
+    let mut p = live(100);
+    service.repo().insert(&p).await.unwrap();
+    set_balance("343");
+    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(held(&p), Decimal::from(100));
+
+    // A position of another wallet is never measured against this one.
+    let mut p = live(100);
+    p.wallet_address = Some("0x0000000000000000000000000000000000000002".into());
+    service.repo().insert(&p).await.unwrap();
+    set_balance("96.5");
+    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(held(&p), Decimal::from(100));
     server.abort();
 }

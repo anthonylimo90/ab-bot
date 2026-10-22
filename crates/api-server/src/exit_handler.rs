@@ -420,6 +420,13 @@ impl ExitHandler {
             }
         };
 
+        // Sell what the wallet has: a buy's fee is kept in shares, so a
+        // recorded holding can exceed the balance by that fee.
+        for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
+            self.align_leg_with_wallet(position, leg, token_id, &ctx)
+                .await?;
+        }
+
         // Market sells carry whole hundredths of a share; a smaller remainder
         // is written off below rather than retried forever.
         let (has_yes, has_no) = held_outcomes(position);
@@ -687,6 +694,95 @@ impl ExitHandler {
         Ok(())
     }
 
+    /// Before a live sale, write off the part of a leg's holding the wallet
+    /// does not hold, when it is no more than a buy fee could have kept (see
+    /// [`fee_shortfall`]). The balance is the wallet's, so what other live
+    /// positions and manual orders of this wallet hold of the token is set
+    /// aside first. Nothing is written off while an order on the token has an
+    /// unknown outcome or is recent enough to still be settling on chain: a
+    /// balance read then can be short by shares that are on their way. A
+    /// larger gap is left for reconciliation and the sale goes ahead as
+    /// recorded, for the balance preflight to refuse.
+    async fn align_leg_with_wallet(
+        &self,
+        position: &mut Position,
+        leg: Leg,
+        token_id: &str,
+        ctx: &EventContext,
+    ) -> anyhow::Result<()> {
+        let held = match leg {
+            Leg::Yes => position.held_yes_qty,
+            Leg::No => position.held_no_qty,
+        };
+        if position.execution_mode != "live" || held <= Decimal::ZERO {
+            return Ok(());
+        }
+        let Some(wallet) = position.wallet_address.clone() else {
+            return Ok(());
+        };
+        // The balance read below is the executor's wallet.
+        if self
+            .order_executor
+            .wallet_address()
+            .await
+            .is_none_or(|executor| !executor.eq_ignore_ascii_case(&wallet))
+        {
+            return Ok(());
+        }
+        let (others, unsettled): (Decimal, bool) = sqlx::query_as(OTHER_HOLDERS_SQL)
+            .bind(position.id)
+            .bind(&position.market_id)
+            .bind(&wallet)
+            .bind(leg.to_string())
+            .bind(token_id)
+            .bind(FEE_WRITE_OFF_SETTLE_MINUTES)
+            .fetch_one(&self.pool)
+            .await?;
+        if unsettled {
+            return Ok(());
+        }
+        let balance = match self
+            .order_executor
+            .get_live_balance_allowance("CONDITIONAL", Some(token_id))
+            .await
+        {
+            Ok(snapshot) => snapshot.balance_in_units(),
+            Err(error) => {
+                warn!(position_id = %position.id, %error, "Could not read the token balance before an exit");
+                None
+            }
+        };
+        let Some(balance) = balance else {
+            return Ok(());
+        };
+        let available = balance - others;
+        match fee_shortfall(held, available) {
+            Some(shortfall) => {
+                info!(
+                    position_id = %position.id,
+                    leg = %leg,
+                    %held,
+                    %available,
+                    "Writing off shares the exchange kept as fees"
+                );
+                self.position_service
+                    .write_off_missing_shares(position, leg, shortfall, ctx)
+                    .await
+            }
+            None if available < held => {
+                warn!(
+                    position_id = %position.id,
+                    leg = %leg,
+                    %held,
+                    %available,
+                    "Wallet holds far fewer shares than recorded; leaving it for reconciliation"
+                );
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
     async fn current_exit_bids(&self, position: &Position) -> anyhow::Result<ExitBidStatus> {
         let market_id = position.market_id.as_str();
         let Some((yes_token_id, no_token_id)) = self.resolve_market_tokens(market_id).await? else {
@@ -800,6 +896,19 @@ impl ExitHandler {
 
         let execution_mode = position.execution_mode.clone();
         let ctx = Self::event_context(&execution_mode, source, quant_ctx);
+        // The winning leg pays out what the wallet holds, not shares a buy's
+        // fee kept. (Without a winner the paired close needs equal legs, so
+        // they are left as recorded.)
+        if matches!(method, CloseMethod::ResolutionWithWinner { .. }) {
+            if let Some((yes_token_id, no_token_id)) =
+                self.resolve_market_tokens(&market_id).await?
+            {
+                for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
+                    self.align_leg_with_wallet(position, leg, token_id, &ctx)
+                        .await?;
+                }
+            }
+        }
         if let Err(e) = self
             .position_service
             .close_position(position, method, &ctx)
@@ -1869,6 +1978,40 @@ mod tests {
 
 fn held_outcomes(position: &Position) -> (bool, bool) {
     position.held_outcomes()
+}
+
+/// The most a buy's fee can keep of the shares bought: the fee is
+/// `rate × p(1 − p)` USDC per share, paid in shares worth `p`, so
+/// `rate × (1 − p)` of them, and no published rate exceeds 0.07.
+const MAX_FEE_SHARE_FRACTION: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
+
+/// Shares bought on a token within this window may still be settling on chain.
+const FEE_WRITE_OFF_SETTLE_MINUTES: i32 = 30;
+
+/// For a position, market, wallet, leg ('yes'/'no'), token and settling
+/// window: what the wallet's other live positions and manual orders hold of
+/// the leg, and whether an order on the token has an unknown outcome (or one
+/// of the position is not yet applied) or a buy not refused may still be
+/// settling. Sells are left out of the window: sold shares leave the wallet
+/// after the position records them, so they never make the balance look
+/// short, and a refused exit sell must not keep the write-off waiting.
+const OTHER_HOLDERS_SQL: &str = "SELECT \
+    COALESCE((SELECT SUM(CASE WHEN $4 = 'yes' THEN held_yes_qty ELSE held_no_qty END) FROM positions \
+        WHERE id <> $1 AND market_id = $2 AND execution_mode = 'live' AND LOWER(wallet_address) = LOWER($3)), 0) \
+    + COALESCE((SELECT SUM(quantity) FROM manual_inventory \
+        WHERE execution_mode = 'live' AND wallet_address = LOWER($3) AND market_id = $2 AND outcome = $4), 0), \
+    EXISTS(SELECT 1 FROM execution_intents WHERE signed_order->>'tokenId' = $5 \
+        AND (status IN ('submitting', 'unknown') \
+            OR (signed_order->>'side' = 'BUY' AND status <> 'rejected' \
+                AND created_at > NOW() - make_interval(mins => $6)))) \
+    OR EXISTS(SELECT 1 FROM position_order_links WHERE position_id = $1 AND NOT settled)";
+
+/// How much of `held` to write off as fee shares when the wallet holds only
+/// `balance` for it: the whole shortfall when a buy fee explains it,
+/// otherwise none.
+fn fee_shortfall(held: Decimal, balance: Decimal) -> Option<Decimal> {
+    let shortfall = held - balance.max(Decimal::ZERO);
+    (shortfall > Decimal::ZERO && shortfall <= held * MAX_FEE_SHARE_FRACTION).then_some(shortfall)
 }
 
 /// Winner of a resolved market from the YES leg's point of view. The YES leg

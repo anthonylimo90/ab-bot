@@ -463,6 +463,36 @@ impl Position {
         self.held_yes_qty > Decimal::ZERO || self.held_no_qty > Decimal::ZERO
     }
 
+    /// Write off `quantity` of the YES (or NO) holding that the wallet does
+    /// not have, such as shares the exchange kept as a buy fee: they count as
+    /// exited for no proceeds, so their cost lands in the realized P&L.
+    /// Returns the quantity written off (at most the holding).
+    pub fn write_off_missing_shares(&mut self, yes: bool, quantity: Decimal) -> Decimal {
+        let (held, exited, price) = if yes {
+            (
+                &mut self.held_yes_qty,
+                &mut self.exited_yes_qty,
+                &mut self.yes_exit_price,
+            )
+        } else {
+            (
+                &mut self.held_no_qty,
+                &mut self.exited_no_qty,
+                &mut self.no_exit_price,
+            )
+        };
+        let missing = quantity.max(Decimal::ZERO).min(*held);
+        if missing.is_zero() {
+            return Decimal::ZERO;
+        }
+        let proceeds = price.unwrap_or_default() * *exited;
+        *exited += missing;
+        *held -= missing;
+        *price = Some(proceeds / *exited);
+        self.last_updated = Utc::now();
+        missing
+    }
+
     /// Writes off per-leg remainders below the smallest sellable quantity.
     ///
     /// Market sells carry whole hundredths of a share, so a remainder such as
@@ -1435,5 +1465,45 @@ mod tests {
         let msg = pos.status_message();
         assert!(msg.contains("Exit failed"));
         assert!(msg.contains("retry 1/3"));
+    }
+
+    #[test]
+    fn shares_kept_as_fees_count_as_exited_for_nothing() {
+        let mut pos = Position::new(
+            "m".into(),
+            Decimal::new(50, 2),
+            Decimal::ZERO,
+            Decimal::from(100),
+            ExitStrategy::ExitOnCorrection,
+        );
+        pos.held_yes_qty = Decimal::from(100);
+        // An earlier partial sale of 10 at 0.60.
+        pos.held_yes_qty -= Decimal::from(10);
+        pos.exited_yes_qty = Decimal::from(10);
+        pos.yes_exit_price = Some(Decimal::new(60, 2));
+
+        let written_off = pos.write_off_missing_shares(true, Decimal::new(35, 1));
+        assert_eq!(written_off, Decimal::new(35, 1));
+        assert_eq!(pos.held_yes_qty, Decimal::new(865, 1));
+        assert_eq!(pos.exited_yes_qty, Decimal::new(135, 1));
+        // Proceeds unchanged (10 × 0.60 = 6), spread over the larger quantity.
+        assert_eq!(
+            (pos.yes_exit_price.unwrap() * pos.exited_yes_qty).round_dp(20),
+            Decimal::from(6)
+        );
+        // Never more than is held, never a negative amount, other leg untouched.
+        assert_eq!(
+            pos.write_off_missing_shares(true, Decimal::from(1000)),
+            Decimal::new(865, 1)
+        );
+        assert_eq!(pos.held_yes_qty, Decimal::ZERO);
+        assert_eq!(
+            pos.write_off_missing_shares(false, Decimal::ONE),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            pos.write_off_missing_shares(true, -Decimal::ONE),
+            Decimal::ZERO
+        );
     }
 }
