@@ -31,6 +31,16 @@ use tracing::{info, warn};
 const APPROVAL_CONFIRM_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(if cfg!(test) { 10 } else { 2000 });
 const APPROVAL_CONFIRM_POLLS: u32 = 60;
+/// How often an approval is checked for a receipt.
+const RECEIPT_POLL: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 5 } else { 2000 });
+/// An approval without a receipt after this many polls is signed again at
+/// its nonce for more gas, up to [`SEND_ROUNDS`] sends in all.
+const RESEND_AFTER_POLLS: u32 = 15;
+const SEND_ROUNDS: u32 = 4;
+/// The most an approval's gas price is raised to, as a multiple of what the
+/// network asks.
+const MAX_GAS_OVER_NETWORK: u128 = 3;
 /// Minimum POL balance needed for approval transactions (~8 txns × 60k gas × ~40 gwei).
 const MIN_GAS_WEI: u128 = 20_000_000_000_000_000; // 0.02 POL
 
@@ -101,6 +111,13 @@ async fn get_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
     Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
 
+/// What a new approval offers: a fifth more than the network asks now, for
+/// faster inclusion.
+async fn offered_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
+    let network = get_gas_price(http, rpc_url).await?;
+    Ok(network + network / 5)
+}
+
 /// Extract hex string from JSON-RPC result, surfacing provider errors explicitly.
 fn rpc_result_hex<'a>(resp: &'a serde_json::Value, method: &str) -> Result<&'a str> {
     if let Some(err) = resp.get("error") {
@@ -117,9 +134,9 @@ fn rpc_result_hex<'a>(resp: &'a serde_json::Value, method: &str) -> Result<&'a s
         .with_context(|| format!("Missing result from {method}"))
 }
 
-/// Send a signed legacy transaction: its hash when the node accepted it,
-/// `None` when the node's answer leaves open whether it was sent (the state
-/// it was meant to set then decides).
+/// Send a signed legacy transaction: its hash when the node accepted it or
+/// already holds it, `None` when its nonce is already used (the state it was
+/// meant to set then decides).
 async fn send_raw_tx(
     http: &reqwest::Client,
     rpc_url: &str,
@@ -138,6 +155,7 @@ async fn send_raw_tx(
     let mut encoded = BytesMut::new();
     tx.rlp_encode_signed(&sig, &mut encoded);
 
+    let tx_hash = format!("{:#x}", alloy_primitives::keccak256(&encoded));
     let raw_hex = format!("0x{}", hex::encode(&encoded));
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -150,8 +168,12 @@ async fn send_raw_tx(
 
     if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
         let msg = err["message"].as_str().unwrap_or("unknown");
-        // The node may hold this transaction (or a retry of it) already.
-        if msg.contains("already known") || msg.contains("nonce too low") {
+        // The node holds this very transaction already.
+        if msg.contains("already known") {
+            return Ok(Some(tx_hash));
+        }
+        // Mined already, or another transaction took the nonce.
+        if msg.contains("nonce too low") {
             warn!(
                 error = msg,
                 "Approval send outcome unclear; checking the chain instead"
@@ -160,30 +182,113 @@ async fn send_raw_tx(
         }
         anyhow::bail!("eth_sendRawTransaction error: {}", msg);
     }
-
-    let tx_hash = resp["result"]
+    resp["result"]
         .as_str()
-        .context("Missing tx hash in response")?
-        .to_string();
+        .context("Missing tx hash in response")?;
 
     Ok(Some(tx_hash))
 }
 
-/// Wait for an approval to take effect: its receipt when the send was
-/// accepted, then the on-chain state itself, which alone proves it.
-async fn confirm_approval<F, Fut>(
+/// Send an approval and wait for it to take effect. While it waits without
+/// a receipt it is signed again at its nonce for a tenth more gas (at least
+/// what the network asks now, never over [`MAX_GAS_OVER_NETWORK`] times it),
+/// so an underpriced approval does not hold the wallet's later transactions
+/// back. Whichever send is mined, the on-chain state alone proves it.
+async fn send_approval<F, Fut>(
     http: &reqwest::Client,
     rpc_url: &str,
-    tx_hash: Option<&str>,
+    signer: &PrivateKeySigner,
+    mut tx: TxLegacy,
     is_set: F,
 ) -> Result<()>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
 {
-    if let Some(hash) = tx_hash {
-        wait_for_receipt(http, rpc_url, hash).await?;
+    let Some(hash) = send_raw_tx(http, rpc_url, signer, tx.clone()).await? else {
+        return await_state(is_set).await;
+    };
+    info!(tx_hash = %hash, nonce = tx.nonce, "Approval sent");
+    let mut hashes = vec![hash];
+    for round in 1..=SEND_ROUNDS {
+        match any_receipt(http, rpc_url, &hashes).await {
+            Some((hash, true)) => {
+                info!(tx_hash = %hash, "Approval mined");
+                break;
+            }
+            Some((hash, false)) => anyhow::bail!("Approval transaction {hash} reverted"),
+            None if round == SEND_ROUNDS => {
+                warn!(hashes = ?hashes, "Approval not mined yet; checking the chain");
+            }
+            None => {
+                let network = match get_gas_price(http, rpc_url).await {
+                    Ok(price) => price,
+                    Err(error) => {
+                        warn!(%error, "Could not read the gas price to raise an approval's");
+                        continue;
+                    }
+                };
+                let price = (tx.gas_price + tx.gas_price / 10 + 1).max(network + network / 5);
+                if price > network.saturating_mul(MAX_GAS_OVER_NETWORK) {
+                    continue;
+                }
+                tx.gas_price = price;
+                match send_raw_tx(http, rpc_url, signer, tx.clone()).await {
+                    Ok(Some(hash)) => {
+                        info!(tx_hash = %hash, gas_price = price, "Raised an approval's gas price");
+                        hashes.push(hash);
+                    }
+                    // Its nonce is used: a receipt or the state decides.
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(%error, "Could not send an approval again for more gas")
+                    }
+                }
+            }
+        }
     }
+    await_state(is_set).await
+}
+
+/// The first receipt found for one of `hashes` (and whether it succeeded),
+/// polling for up to [`RESEND_AFTER_POLLS`].
+async fn any_receipt(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    hashes: &[String],
+) -> Option<(String, bool)> {
+    for _ in 0..RESEND_AFTER_POLLS {
+        tokio::time::sleep(RECEIPT_POLL).await;
+        for hash in hashes {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getTransactionReceipt",
+                "params": [hash]
+            });
+            let response: Result<serde_json::Value> =
+                async { Ok(http.post(rpc_url).json(&body).send().await?.json().await?) }.await;
+            match response {
+                Ok(response) => {
+                    if let Some(receipt) = response.get("result").filter(|r| !r.is_null()) {
+                        return Some((hash.clone(), receipt["status"].as_str() == Some("0x1")));
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, tx_hash = %hash, "Could not read an approval's receipt")
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Wait for an approval's on-chain state, which alone proves it took effect.
+async fn await_state<F, Fut>(is_set: F) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
     for attempt in 0..=APPROVAL_CONFIRM_POLLS {
         if is_set().await? {
             return Ok(());
@@ -193,36 +298,6 @@ where
         }
     }
     anyhow::bail!("Approval was not in effect on chain after its transaction; retry on restart")
-}
-
-/// Wait for a transaction to be mined (simple polling).
-async fn wait_for_receipt(http: &reqwest::Client, rpc_url: &str, tx_hash: &str) -> Result<()> {
-    for _ in 0..60 {
-        // poll every 2 seconds for up to 2 minutes
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getTransactionReceipt",
-            "params": [tx_hash]
-        });
-
-        let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
-
-        if let Some(receipt) = resp.get("result") {
-            if !receipt.is_null() {
-                let status = receipt["status"].as_str().unwrap_or("0x0");
-                if status == "0x1" {
-                    return Ok(());
-                } else {
-                    anyhow::bail!("Transaction {} reverted", tx_hash);
-                }
-            }
-        }
-    }
-
-    anyhow::bail!("Transaction {} not mined after 120s", tx_hash)
 }
 
 /// The allowance `owner` gives `spender` of `token`.
@@ -399,9 +474,6 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
         );
     }
 
-    let gas_price = get_gas_price(&http, rpc_url).await?;
-    // Use 1.2x gas price for faster inclusion
-    let gas_price = gas_price + gas_price / 5;
     let mut approvals_sent = 0u32;
     // Consider "sufficient" if allowance > 1M USDC (to avoid re-approving on every restart)
     let threshold = U256::from(1_000_000_000_000u64); // 1M in 6-decimal units
@@ -426,15 +498,13 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
         let tx = TxLegacy {
             chain_id: Some(CHAIN_ID),
             nonce: get_nonce(&http, rpc_url, &address).await?,
-            gas_price,
+            gas_price: offered_gas_price(&http, rpc_url).await?,
             gas_limit: 100_000, // a proxied token's approve uses ~67k gas
             to: TxKind::Call(token),
             value: U256::ZERO,
             input: encode_approve(spender),
         };
-        let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
-        info!(tx_hash = ?hash, token = token_name, spender = spender_name, "approve tx sent");
-        confirm_approval(&http, rpc_url, hash.as_deref(), || async {
+        send_approval(&http, rpc_url, signer, tx, || async {
             Ok(
                 check_erc20_allowance(&http, rpc_url, &token, &address, &spender).await?
                     >= threshold,
@@ -454,15 +524,13 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
         let tx = TxLegacy {
             chain_id: Some(CHAIN_ID),
             nonce: get_nonce(&http, rpc_url, &address).await?,
-            gas_price,
+            gas_price: offered_gas_price(&http, rpc_url).await?,
             gas_limit: 100_000,
             to: TxKind::Call(ctf),
             value: U256::ZERO,
             input: encode_set_approval_for_all(spender),
         };
-        let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
-        info!(tx_hash = ?hash, spender = %name, "CTF setApprovalForAll tx sent");
-        confirm_approval(&http, rpc_url, hash.as_deref(), || {
+        send_approval(&http, rpc_url, signer, tx, || {
             check_erc1155_approval(&http, rpc_url, &address, &spender)
         })
         .await?;
@@ -517,21 +585,172 @@ mod tests {
 
     #[tokio::test]
     async fn an_unclear_send_counts_only_once_the_approval_is_in_effect() {
-        let http = reqwest::Client::new();
         // Takes effect on the third look.
         let looks = AtomicU32::new(0);
-        confirm_approval(&http, "http://127.0.0.1:1", None, || async {
-            Ok(looks.fetch_add(1, Ordering::SeqCst) >= 2)
-        })
-        .await
-        .unwrap();
+        await_state(|| async { Ok(looks.fetch_add(1, Ordering::SeqCst) >= 2) })
+            .await
+            .unwrap();
         assert_eq!(looks.load(Ordering::SeqCst), 3);
 
         // Never takes effect: an error, not a success.
-        assert!(
-            confirm_approval(&http, "http://127.0.0.1:1", None, || async { Ok(false) })
-                .await
-                .is_err()
-        );
+        assert!(await_state(|| async { Ok(false) }).await.is_err());
+    }
+
+    /// A JSON-RPC node answering each request with `answer`, one connection
+    /// per request.
+    async fn mock_node<A>(answer: A) -> String
+    where
+        A: Fn(&serde_json::Value) -> serde_json::Value + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let answer = std::sync::Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let body = loop {
+                        let mut buffer = [0; 4096];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        if count == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                        let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            break bytes[end + 4..end + 4 + length].to_vec();
+                        }
+                    };
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let reply = serde_json::json!({"jsonrpc": "2.0", "id": 1})
+                        .as_object()
+                        .unwrap()
+                        .clone()
+                        .into_iter()
+                        .chain(answer(&request).as_object().unwrap().clone())
+                        .collect::<serde_json::Map<_, _>>();
+                    let reply = serde_json::Value::Object(reply).to_string();
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                reply.len(),
+                                reply
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn approval_tx(gas_price: u128) -> TxLegacy {
+        TxLegacy {
+            chain_id: Some(CHAIN_ID),
+            nonce: 4,
+            gas_price,
+            gas_limit: 100_000,
+            to: TxKind::Call(COLLATERAL_ADDRESS.parse().unwrap()),
+            value: U256::ZERO,
+            input: encode_approve(COLLATERAL_ONRAMP_ADDRESS.parse().unwrap()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_left_unmined_is_signed_again_at_its_nonce_for_more_gas() {
+        const NETWORK: u128 = 30_000_000_000;
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let node = {
+            let sent = sent.clone();
+            mock_node(move |request| {
+                let mut sent = sent.lock().unwrap();
+                match request["method"].as_str().unwrap() {
+                    "eth_gasPrice" => serde_json::json!({"result": format!("{NETWORK:#x}")}),
+                    "eth_sendRawTransaction" => {
+                        let raw = request["params"][0].as_str().unwrap().to_string();
+                        let hash = format!(
+                            "{:#x}",
+                            alloy_primitives::keccak256(
+                                hex::decode(raw.trim_start_matches("0x")).unwrap()
+                            )
+                        );
+                        sent.push(raw);
+                        serde_json::json!({"result": hash})
+                    }
+                    // Only the third send is mined.
+                    "eth_getTransactionReceipt" => {
+                        let mined = sent.get(2).map(|raw| {
+                            format!(
+                                "{:#x}",
+                                alloy_primitives::keccak256(
+                                    hex::decode(raw.trim_start_matches("0x")).unwrap()
+                                )
+                            )
+                        });
+                        if mined.as_deref() == request["params"][0].as_str() {
+                            serde_json::json!({"result": {"status": "0x1"}})
+                        } else {
+                            serde_json::json!({"result": null})
+                        }
+                    }
+                    other => panic!("unexpected RPC method {other}"),
+                }
+            })
+            .await
+        };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let signer: PrivateKeySigner = format!("{:064x}", 1).parse().unwrap();
+        let in_effect = || async { Ok(sent.lock().unwrap().len() >= 3) };
+        send_approval(&http, &node, &signer, approval_tx(NETWORK), in_effect)
+            .await
+            .unwrap();
+        let prices: Vec<u128> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|raw| {
+                let (nonce, price) = crate::api::polygon::legacy_nonce_and_gas_price(raw).unwrap();
+                assert_eq!(nonce, 4);
+                price
+            })
+            .collect();
+        assert_eq!(prices.len(), 3, "{prices:?}");
+        // At least a fifth over the network, then a tenth over the last.
+        assert_eq!(prices[1], NETWORK + NETWORK / 5);
+        assert_eq!(prices[2], prices[1] + prices[1] / 10 + 1);
+        assert!(prices.iter().all(|price| *price <= 3 * NETWORK));
+    }
+
+    #[tokio::test]
+    async fn a_reverted_approval_is_an_error() {
+        let node = mock_node(|request| match request["method"].as_str().unwrap() {
+            "eth_sendRawTransaction" => serde_json::json!({"result": "0x01"}),
+            "eth_getTransactionReceipt" => serde_json::json!({"result": {"status": "0x0"}}),
+            other => panic!("unexpected RPC method {other}"),
+        })
+        .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let signer: PrivateKeySigner = format!("{:064x}", 1).parse().unwrap();
+        let error = send_approval(&http, &node, &signer, approval_tx(1), || async { Ok(true) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reverted"), "{error}");
     }
 }

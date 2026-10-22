@@ -619,33 +619,27 @@ impl PolygonClient {
 
     /// A block deep enough not to be reorganized: the chain's `finalized`
     /// block, or 128 blocks below the head when the node does not report one.
+    /// Never past the block balances are read at ([`BALANCE_BLOCK_LAG`] below
+    /// the head), so a transfer counted final is in every balance read after.
     pub async fn safe_block_number(&self) -> Result<u64> {
-        if let Ok(block) = self
+        let head = self.get_block_number().await?;
+        let finalized = self
             .rpc_value(
                 "eth_getBlockByNumber",
                 serde_json::json!(["finalized", false]),
             )
             .await
-        {
-            if let Some(number) = block
-                .get("number")
-                .and_then(|value| value.as_str())
-                .and_then(parse_hex_u64)
-            {
-                return Ok(number);
-            }
-        }
-        let head = self
-            .rpc_value("eth_blockNumber", serde_json::json!([]))
-            .await?;
-        let head = head
-            .as_str()
-            .and_then(parse_hex_u64)
-            .ok_or_else(|| Error::Api {
-                message: "Unreadable eth_blockNumber result".to_string(),
-                status: None,
-            })?;
-        Ok(head.saturating_sub(128))
+            .ok()
+            .and_then(|block| {
+                block
+                    .get("number")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_hex_u64)
+            });
+        Ok(match finalized {
+            Some(block) => block.min(head.saturating_sub(BALANCE_BLOCK_LAG)),
+            None => head.saturating_sub(128),
+        })
     }
 
     /// Number of transactions sent by `address` and mined by block `block`.

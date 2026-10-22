@@ -293,15 +293,14 @@ async fn feed_circuit_breaker(
     // A stalled transfer mined since the reconciler last looked would read as
     // a loss too. Its receipt is read after the snapshot's balance was, so
     // one mined before that read is always found.
+    let client = crate::handlers::vault::canonical_polygon_client(state)
+        .await
+        .ok();
     if crate::withdrawals::stalled_transfer_mined(
         &state.pool,
         snapshot.workspace_id,
         WITHDRAWAL_SETTLE_WINDOW_MINUTES,
-        |user_id| async move {
-            crate::handlers::vault::resolve_polygon_client_for_user(state, user_id)
-                .await
-                .ok()
-        },
+        client.as_ref(),
     )
     .await?
     {

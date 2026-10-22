@@ -20,7 +20,9 @@ use auth::{AuditAction, AuditEvent};
 use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use crate::workspace_scope::resolve_canonical_workspace_membership;
+use crate::workspace_scope::{
+    resolve_canonical_workspace_id, resolve_canonical_workspace_membership,
+};
 use polymarket_core::api::polygon::{
     is_protocol_contract, BroadcastOutcome, WithdrawalSource, CALL_WOULD_FAIL,
 };
@@ -80,7 +82,24 @@ pub(crate) async fn resolve_polygon_client_for_user(
     let workspace_id = resolve_canonical_workspace_membership(&state.pool, user_id)
         .await?
         .map(|workspace| workspace.id);
+    workspace_polygon_client(state, workspace_id).await
+}
 
+/// The [`PolygonClient`] for work done for the canonical workspace rather
+/// than one user (reconciling withdrawals, feeding the circuit breaker): the
+/// same chain as [`resolve_polygon_client_for_user`], whoever is a member.
+pub(crate) async fn canonical_polygon_client(state: &AppState) -> Result<PolygonClient, ApiError> {
+    if let Some(client) = state.polygon_client.clone() {
+        return Ok(client);
+    }
+    let workspace_id = resolve_canonical_workspace_id(&state.pool).await?;
+    workspace_polygon_client(state, workspace_id).await
+}
+
+async fn workspace_polygon_client(
+    state: &AppState,
+    workspace_id: Option<Uuid>,
+) -> Result<PolygonClient, ApiError> {
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT w.polygon_rpc_url, w.alchemy_api_key

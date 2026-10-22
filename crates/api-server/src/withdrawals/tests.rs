@@ -329,17 +329,10 @@ async fn reconcile_signing(
     client: &PolygonClient,
     signer: Option<&auth::TradingWallet>,
 ) {
-    reconcile_with(
-        pool,
-        |_| {
-            let client = client.clone();
-            async move { Some(client) }
-        },
-        |_| {
-            let signer = signer.cloned();
-            async move { signer }
-        },
-    )
+    reconcile_with(pool, Some(client), |_| {
+        let signer = signer.cloned();
+        async move { signer }
+    })
     .await
     .unwrap();
 }
@@ -539,6 +532,25 @@ async fn every_unresolved_withdrawal_is_settled_from_the_chain(pool: PgPool) {
     assert_eq!(flows.len(), 2, "{flows:?}");
     assert!(flows.contains(&(confirmed, Decimal::from(-10))));
     assert!(flows.contains(&(unsettled, Decimal::from(-10))));
+}
+
+#[tokio::test]
+async fn a_safe_block_is_never_past_the_block_balances_are_read_at() {
+    let chain = Arc::new(Mutex::new(Chain {
+        finalized: Some(199),
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    // A node whose finalized block is ahead of another's head: a transfer is
+    // final only once balances read below the head include it.
+    assert_eq!(
+        client.safe_block_number().await.unwrap(),
+        200 - polymarket_core::api::polygon::BALANCE_BLOCK_LAG
+    );
+    chain.lock().unwrap().finalized = Some(100);
+    assert_eq!(client.safe_block_number().await.unwrap(), 100);
+    chain.lock().unwrap().finalized = None;
+    assert_eq!(client.safe_block_number().await.unwrap(), 72);
 }
 
 #[sqlx::test(migrations = false)]
@@ -813,13 +825,7 @@ async fn a_stalled_transfer_is_found_mined_before_the_reconciler_looks(pool: PgP
     let (user, workspace) = setup(&pool).await;
     let chain = Arc::new(Mutex::new(Chain::default()));
     let client = mock_node(chain.clone()).await;
-    let mined = || {
-        let client = client.clone();
-        stalled_transfer_mined(&pool, workspace, 30, move |_| {
-            let client = client.clone();
-            async move { Some(client) }
-        })
-    };
+    let mined = || stalled_transfer_mined(&pool, workspace, 30, Some(&client));
     let sent = |hash: &'static str, minutes: i32, trading: Option<bool>| {
         let pool = pool.clone();
         async move {

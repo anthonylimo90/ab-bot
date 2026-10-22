@@ -10,7 +10,9 @@
 //! wrap would plan on USDC.e the wrap is about to take, or wait on a nonce
 //! nothing fills should the wrap be dropped. Meanwhile every look sends the
 //! wrap again if the node dropped it and raises its gas when the network asks
-//! more or the node refuses it, until its nonce is used. After
+//! more or the node refuses it, until its nonce is used, but never while the
+//! node counts the nonce pending without holding the wrap: a transaction
+//! signed there once the lock let go is never pushed out. After
 //! [`MAX_HOLD`] the lock is let go (and said so); a restart lets go of it
 //! too. A withdrawal still waits while the node holds the wrap, and goes out
 //! once the node has mined or dropped it.
@@ -270,8 +272,9 @@ impl Sweeper {
             // Its nonce used, on checks that each read every one of its
             // receipts and found none, for long enough that no lagging node
             // explains it: another transaction took it.
-            match client.nonces(&wallet.address()).await {
-                Ok((mined, _)) if mined > wrap.nonce => {
+            let nonces = client.nonces(&wallet.address()).await;
+            match &nonces {
+                Ok((mined, _)) if *mined > wrap.nonce => {
                     let mut none_of_ours = true;
                     for hash in &wrap.hashes {
                         none_of_ours &= matches!(client.transaction_receipt(hash).await, Ok(None));
@@ -290,15 +293,31 @@ impl Sweeper {
                 }
                 Ok(_) => wrap.nonce_used_since = None,
                 Err(error) => {
-                    warn!(error = %chain_error_message(&error), "Could not read the wallet's nonce")
+                    warn!(error = %chain_error_message(error), "Could not read the wallet's nonce")
                 }
+            }
+            let latest_known = client.transaction_known(&wrap.latest.tx_hash).await;
+            let mut ours_held = matches!(latest_known, Ok(true));
+            if matches!(latest_known, Ok(false)) {
+                for hash in &wrap.hashes {
+                    if hash != &wrap.latest.tx_hash
+                        && matches!(client.transaction_known(hash).await, Ok(true))
+                    {
+                        ours_held = true;
+                        break;
+                    }
+                }
+            }
+            // The node holds none of the wrap's transactions, yet counts the
+            // nonce as pending (or it could not be read): another transaction
+            // (a withdrawal signed once the lock let go) may hold it. Sending
+            // the wrap again, or a replacement, would push that one out.
+            if !ours_held && !matches!(nonces, Ok((_, pending)) if pending <= wrap.nonce) {
+                continue;
             }
             // Dropped by the node: send it again. Refused again: raise its gas.
             let mut refused = false;
-            if matches!(
-                client.transaction_known(&wrap.latest.tx_hash).await,
-                Ok(false)
-            ) {
+            if matches!(latest_known, Ok(false)) {
                 // The node's refusal, not a transport failure.
                 refused = matches!(
                     client
@@ -736,6 +755,60 @@ mod tests {
             WrapOutcome::Superseded
         );
         sweeper.release().await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_wrap_never_pushes_out_a_transaction_holding_its_nonce(pool: PgPool) {
+        setup(&pool).await;
+        let chain = Arc::new(Mutex::new(Chain {
+            usdc_units: 5_000_000,
+            pol_wei: 1_000_000_000_000_000_000,
+            ..Default::default()
+        }));
+        let client = mock_node(chain.clone()).await;
+        let mut sweeper = Sweeper::default();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        // The lock let go; the node dropped the wrap and holds a withdrawal
+        // signed at the same nonce, while the network asks more gas.
+        sweeper.release().await;
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.known.clear();
+            chain.known.insert("0xw".into());
+            chain.pending_nonce = 1;
+            chain.gas_price *= 2;
+        }
+        let sent = chain.lock().unwrap().broadcasts.len();
+        assert_eq!(
+            sweeper
+                .follow_up(&client, &wallet(), 2 * CHECK_EVERY_POLLS)
+                .await
+                .unwrap(),
+            WrapOutcome::Unmined
+        );
+        assert_eq!(chain.lock().unwrap().broadcasts.len(), sent);
+
+        // The withdrawal is mined: the wrap is given up.
+        chain.lock().unwrap().latest_nonce = 1;
+        assert_eq!(
+            sweeper
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS)
+                .await
+                .unwrap(),
+            WrapOutcome::Unmined
+        );
+        tokio::time::sleep(NONCE_USED_CONFIRM).await;
+        assert_eq!(
+            sweeper
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS)
+                .await
+                .unwrap(),
+            WrapOutcome::Superseded
+        );
+        assert_eq!(chain.lock().unwrap().broadcasts.len(), sent);
     }
 
     #[sqlx::test(migrations = false)]

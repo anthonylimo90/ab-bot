@@ -560,7 +560,6 @@ pub(crate) async fn fail_unsent(
 #[derive(Debug, sqlx::FromRow)]
 struct UnresolvedWithdrawal {
     id: Uuid,
-    user_id: Uuid,
     wallet_address: String,
     status: String,
     tx_hash: Option<String>,
@@ -574,7 +573,7 @@ struct UnresolvedWithdrawal {
 }
 
 /// The columns of an [`UnresolvedWithdrawal`].
-const UNRESOLVED_COLUMNS: &str = "id, user_id, wallet_address, status, tx_hash, \
+const UNRESOLVED_COLUMNS: &str = "id, wallet_address, status, tx_hash, \
     replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, superseded_seen_at";
 
 /// The withdrawals the reconciler can decide, given `REVERTED_ERROR` as $1 and
@@ -608,21 +607,16 @@ pub fn spawn_withdrawal_reconciler(state: Arc<AppState>) {
 
 /// Resolve unresolved withdrawals from the chain.
 pub(crate) async fn reconcile_withdrawals(state: &AppState) -> anyhow::Result<()> {
-    reconcile_with(
-        &state.pool,
-        |user_id| async move {
-            crate::handlers::vault::resolve_polygon_client_for_user(state, user_id)
-                .await
-                .ok()
-        },
-        |address| async move {
-            state
-                .load_wallet_from_vault(&address)
-                .await
-                .map_err(|error| warn!(%error, "No signer to raise a withdrawal's gas price"))
-                .ok()
-        },
-    )
+    let client = crate::handlers::vault::canonical_polygon_client(state)
+        .await
+        .ok();
+    reconcile_with(&state.pool, client.as_ref(), |address| async move {
+        state
+            .load_wallet_from_vault(&address)
+            .await
+            .map_err(|error| warn!(%error, "No signer to raise a withdrawal's gas price"))
+            .ok()
+    })
     .await
 }
 
@@ -632,18 +626,17 @@ pub(crate) async fn reconcile_withdrawals(state: &AppState) -> anyhow::Result<()
 /// notices a mined transfer only on its next pass; a caller that read the
 /// wallet balance before calling this learns whether that balance may lack
 /// a transfer. A transfer whose chain cannot be read counts as unmined.
-pub(crate) async fn stalled_transfer_mined<F, Fut>(
+pub(crate) async fn stalled_transfer_mined(
     pool: &PgPool,
     workspace_id: Uuid,
     stalled_minutes: i32,
-    client_for: F,
-) -> anyhow::Result<bool>
-where
-    F: Fn(Uuid) -> Fut,
-    Fut: std::future::Future<Output = Option<PolygonClient>>,
-{
-    let stalled: Vec<(Uuid, Uuid, String, Vec<String>)> = sqlx::query_as(
-        "SELECT id, user_id, tx_hash, replaced_tx_hashes FROM wallet_withdrawals \
+    client: Option<&PolygonClient>,
+) -> anyhow::Result<bool> {
+    let Some(client) = client else {
+        return Ok(false);
+    };
+    let stalled: Vec<(Uuid, String, Vec<String>)> = sqlx::query_as(
+        "SELECT id, tx_hash, replaced_tx_hashes FROM wallet_withdrawals \
          WHERE workspace_id = $1 AND COALESCE(trading_wallet, TRUE) \
            AND status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL \
            AND mined_seen_at IS NULL \
@@ -654,10 +647,7 @@ where
     .bind(stalled_minutes)
     .fetch_all(pool)
     .await?;
-    for (id, user_id, tx_hash, replaced) in stalled {
-        let Some(client) = client_for(user_id).await else {
-            continue;
-        };
+    for (id, tx_hash, replaced) in stalled {
         for hash in std::iter::once(&tx_hash).chain(replaced.iter()) {
             match client.transaction_receipt(hash).await {
                 Ok(Some(_)) => {
@@ -680,16 +670,14 @@ where
     Ok(false)
 }
 
-/// [`reconcile_withdrawals`] with the chain client for each row's user
-/// supplied by `client_for`, and the signer of a wallet by `signer_for`.
-async fn reconcile_with<F, Fut, S, SFut>(
+/// [`reconcile_withdrawals`] reading the chain through `client`, with the
+/// signer of a wallet supplied by `signer_for`.
+async fn reconcile_with<S, SFut>(
     pool: &PgPool,
-    client_for: F,
+    client: Option<&PolygonClient>,
     signer_for: S,
 ) -> anyhow::Result<()>
 where
-    F: Fn(Uuid) -> Fut,
-    Fut: std::future::Future<Output = Option<PolygonClient>>,
     S: Fn(String) -> SFut,
     SFut: std::future::Future<Output = Option<auth::TradingWallet>>,
 {
@@ -735,17 +723,17 @@ where
         };
         let result = match row.tx_hash.as_deref() {
             None => fail_unsigned(lock.conn(), &row).await,
-            Some(tx_hash) => match client_for(row.user_id).await {
+            Some(tx_hash) => match client {
                 Some(client) => {
-                    match reconcile_on_chain(lock.conn(), &client, &row, tx_hash).await {
+                    match reconcile_on_chain(lock.conn(), client, &row, tx_hash).await {
                         // Waiting at its nonce: perhaps for a gas price it does not pay.
-                        Ok(true) if fee_bump_due(&row) => match underpriced(&client, &row).await {
+                        Ok(true) if fee_bump_due(&row) => match underpriced(client, &row).await {
                             Ok(Some(latest)) => {
                                 match signer_for(row.wallet_address.clone()).await {
                                     Some(wallet) => {
                                         bump_fee(
                                             lock.conn(),
-                                            &client,
+                                            client,
                                             &wallet,
                                             &row,
                                             tx_hash,

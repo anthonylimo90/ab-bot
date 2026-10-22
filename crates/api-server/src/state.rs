@@ -370,11 +370,36 @@ impl AppState {
 
                 if let Some(wallet) = approval_wallet {
                     let signer = wallet.signer();
-                    match polymarket_core::api::approvals::ensure_polymarket_approvals(
-                        signer, &rpc_url,
+                    // Under the wallet's spend lock, so an approval never takes
+                    // the nonce of a withdrawal or wrap another replica is
+                    // signing. Waited for briefly: past that, its holder keeps
+                    // it for a wrap the node holds, whose nonce the pending
+                    // count an approval is signed at already includes.
+                    let spend_lock = match crate::withdrawals::SpendLock::acquire_within(
+                        &pool,
+                        &wallet.address_string(),
+                        std::time::Duration::from_secs(30),
                     )
                     .await
                     {
+                        Ok(Some(lock)) => Some(lock),
+                        Ok(None) => {
+                            tracing::warn!("The trading wallet's spend lock stayed held; checking approvals without it");
+                            None
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Could not take the trading wallet's spend lock; checking approvals without it");
+                            None
+                        }
+                    };
+                    let approvals = polymarket_core::api::approvals::ensure_polymarket_approvals(
+                        signer, &rpc_url,
+                    )
+                    .await;
+                    if let Some(lock) = spend_lock {
+                        lock.release().await;
+                    }
+                    match approvals {
                         Ok(count) => {
                             if count > 0 {
                                 tracing::info!(
