@@ -169,7 +169,8 @@ impl ClobClient {
             order: signed_order,
             order_type,
             owner: credentials.api_key.clone(),
-            post_only: None,
+            defer_exec: false,
+            post_only: false,
         };
 
         let body = serde_json::to_string(&request)?;
@@ -248,31 +249,19 @@ impl ClobClient {
         ))
     }
 
-    pub async fn get_order_metadata(&self, token_id: &str) -> Result<(bool, u64)> {
+    /// Whether `token_id` trades on the neg-risk exchange, which decides the
+    /// contract its orders are signed for.
+    pub async fn get_neg_risk(&self, token_id: &str) -> Result<bool> {
         let neg: serde_json::Value = self
             .get_with_retry(&format!("{}/neg-risk?token_id={token_id}", self.base_url))
             .await?
             .json()
             .await?;
-        let fee: serde_json::Value = self
-            .get_with_retry(&format!("{}/fee-rate?token_id={token_id}", self.base_url))
-            .await?
-            .json()
-            .await?;
-        let neg = neg
-            .get("neg_risk")
+        neg.get("neg_risk")
             .and_then(|v| v.as_bool())
             .ok_or_else(|| Error::Order {
                 message: "Missing exchange contract metadata".into(),
-            })?;
-        let fee = ["base_fee", "baseFee", "fee", "fee_rate_bps", "feeRateBps"]
-            .iter()
-            .find_map(|key| fee.get(key).and_then(|v| v.as_u64()))
-            .or_else(|| fee.as_u64())
-            .ok_or_else(|| Error::Order {
-                message: "Missing exchange fee metadata".into(),
-            })?;
-        Ok((neg, fee))
+            })
     }
 
     /// Maximum retry attempts for API calls.
@@ -1373,17 +1362,20 @@ pub enum OrderType {
     Gtd,
 }
 
-/// Request body for posting an order.
+/// Request body for posting an order, as the official V2 clients send it.
 #[derive(Debug, Clone, Serialize)]
 pub struct PostOrderRequest {
     pub order: SignedOrder,
-    #[serde(rename = "orderType")]
-    pub order_type: OrderType,
     /// API key of the order owner.
     pub owner: String,
-    /// Post-only flag (default false). Omitted when None.
-    #[serde(rename = "postOnly", skip_serializing_if = "Option::is_none")]
-    pub post_only: Option<bool>,
+    #[serde(rename = "orderType")]
+    pub order_type: OrderType,
+    /// Whether matching may be deferred (it is not: the response reports fills).
+    #[serde(rename = "deferExec")]
+    pub defer_exec: bool,
+    /// Whether the order must rest on the book rather than take liquidity.
+    #[serde(rename = "postOnly")]
+    pub post_only: bool,
 }
 
 /// Response from the balance-allowance endpoint.
@@ -1530,8 +1522,6 @@ pub struct AuthenticatedClobClient {
     credentials: Option<ApiCredentials>,
     /// Cache for is_neg_risk lookups (token_id -> bool). Rarely changes per token.
     neg_risk_cache: Mutex<HashMap<String, bool>>,
-    /// Cache for fee_rate_bps lookups (token_id -> bps). Rarely changes per token.
-    fee_rate_cache: Mutex<HashMap<String, u64>>,
 }
 
 impl AuthenticatedClobClient {
@@ -1544,7 +1534,6 @@ impl AuthenticatedClobClient {
             neg_risk_signer,
             credentials: None,
             neg_risk_cache: Mutex::new(HashMap::new()),
-            fee_rate_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1561,7 +1550,6 @@ impl AuthenticatedClobClient {
             neg_risk_signer,
             credentials: Some(credentials),
             neg_risk_cache: Mutex::new(HashMap::new()),
-            fee_rate_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1738,59 +1726,6 @@ impl AuthenticatedClobClient {
         Ok(result.neg_risk)
     }
 
-    /// Query the CLOB API for the taker fee rate for a token.
-    /// Results are cached per token_id since fee rates rarely change.
-    async fn get_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
-        // Check cache first
-        if let Some(&cached) = self.fee_rate_cache.lock().unwrap().get(token_id) {
-            return Ok(cached);
-        }
-
-        let url = format!("{}/fee-rate?token_id={}", self.client.base_url, token_id);
-        let response = self.client.http_client.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            warn!(
-                token_id = token_id,
-                status = response.status().as_u16(),
-                "Failed to query fee-rate, defaulting to 0"
-            );
-            return Ok(0);
-        }
-
-        #[derive(Deserialize)]
-        struct FeeRateResponse {
-            #[serde(alias = "base_fee", alias = "baseFee", alias = "fee")]
-            fee: Option<u64>,
-            #[serde(alias = "fee_rate_bps", alias = "feeRateBps")]
-            fee_rate_bps: Option<u64>,
-        }
-
-        // Try to parse as structured response first, fall back to plain number
-        let text = response.text().await?;
-        let fee = if let Ok(resp) = serde_json::from_str::<FeeRateResponse>(&text) {
-            resp.fee_rate_bps.or(resp.fee).unwrap_or(0)
-        } else if let Ok(val) = text.trim().trim_matches('"').parse::<u64>() {
-            val
-        } else {
-            warn!(token_id = token_id, response = %text, "Could not parse fee-rate response");
-            0
-        };
-
-        // Store in cache
-        self.fee_rate_cache
-            .lock()
-            .unwrap()
-            .insert(token_id.to_string(), fee);
-
-        debug!(
-            token_id = token_id,
-            fee_rate_bps = fee,
-            "Fetched and cached fee rate"
-        );
-        Ok(fee)
-    }
-
     /// Query the CLOB's view of balance and allowance for the authenticated user.
     ///
     /// This checks what the CLOB server sees (on-chain) for the maker address.
@@ -1925,15 +1860,11 @@ impl AuthenticatedClobClient {
             &self.signer
         };
 
-        // Fetch the market's required fee rate
-        let fee_rate = self.get_fee_rate_bps(token_id).await.unwrap_or(0);
-
         info!(
             token_id = token_id,
             side = ?side,
             price = %price,
             size = %size,
-            fee_rate_bps = fee_rate,
             neg_risk = neg_risk,
             order_type = ?order_type,
             "Building order"
@@ -1944,8 +1875,7 @@ impl AuthenticatedClobClient {
             .token_id_str(token_id)
             .side(side)
             .price(price)
-            .size(size)
-            .fee_rate_bps(fee_rate);
+            .size(size);
 
         // Only GTD orders have a real expiration; GTC/FOK must be 0
         builder = match order_type {
@@ -2004,7 +1934,6 @@ impl AuthenticatedClobClient {
             &self.signer
         };
 
-        let fee_rate = self.get_fee_rate_bps(token_id).await.unwrap_or(0);
         let (maker_amount, taker_amount) = calculate_market_order_amounts(side, amount, price)?;
         let token_id = U256::from_str_radix(token_id, 10).map_err(|_| Error::Order {
             message: format!("Invalid token id: {token_id}"),
@@ -2015,25 +1944,23 @@ impl AuthenticatedClobClient {
             side = ?side,
             price = %price,
             amount = %amount,
-            fee_rate_bps = fee_rate,
             neg_risk = neg_risk,
             order_type = ?order_type,
             "Building market order"
         );
 
-        let mut order = OrderData::new(
+        let expiration = match order_type {
+            OrderType::Gtd => current_timestamp() + 3600,
+            _ => 0,
+        };
+        let order = OrderData::new(
             signer.address(),
             token_id,
             side,
             maker_amount,
             taker_amount,
-            0,
+            expiration,
         );
-        order.fee_rate_bps = U256::from(fee_rate);
-        order.expiration = match order_type {
-            OrderType::Gtd => U256::from(current_timestamp() + 3600),
-            _ => U256::ZERO,
-        };
 
         info!(
             maker_amount = %order.maker_amount,
@@ -2597,11 +2524,6 @@ mod authenticated_tests {
             .lock()
             .unwrap()
             .insert("12345".into(), false);
-        auth_client
-            .fee_rate_cache
-            .lock()
-            .unwrap()
-            .insert("12345".into(), 0);
 
         let signed = auth_client
             .create_order(
@@ -2616,6 +2538,86 @@ mod authenticated_tests {
 
         assert!(signed.signature.starts_with("0x"));
         assert_eq!(signed.side, "BUY");
+        assert_eq!(signed.expiration, "0");
+
+        // The body the official V2 clients post.
+        let body = serde_json::to_value(PostOrderRequest {
+            order: signed,
+            owner: "key".into(),
+            order_type: OrderType::Gtc,
+            defer_exec: false,
+            post_only: false,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "order": body["order"].clone(),
+                "owner": "key",
+                "orderType": "GTC",
+                "deferExec": false,
+                "postOnly": false,
+            })
+        );
+        assert!(body["order"].get("taker").is_none());
+        assert!(body["order"].get("nonce").is_none());
+        assert!(body["order"].get("feeRateBps").is_none());
+    }
+
+    #[tokio::test]
+    async fn orders_are_signed_for_the_v2_exchange_of_their_market() {
+        use crate::signing::Eip712Domain;
+        let auth_client = test_auth_client();
+        for (token, neg_risk, domain) in [
+            ("11", false, Eip712Domain::ctf_exchange()),
+            ("22", true, Eip712Domain::neg_risk_ctf_exchange()),
+        ] {
+            auth_client
+                .neg_risk_cache
+                .lock()
+                .unwrap()
+                .insert(token.into(), neg_risk);
+            let signed = auth_client
+                .create_order(
+                    token,
+                    crate::signing::OrderSide::Sell,
+                    Decimal::new(37, 2),
+                    Decimal::from(20),
+                    OrderType::Gtd,
+                )
+                .await
+                .unwrap();
+            let order = crate::signing::OrderData {
+                salt: U256::from(signed.salt),
+                maker: signed.maker.parse().unwrap(),
+                signer: signed.signer.parse().unwrap(),
+                token_id: U256::from_str_radix(&signed.token_id, 10).unwrap(),
+                maker_amount: U256::from_str_radix(&signed.maker_amount, 10).unwrap(),
+                taker_amount: U256::from_str_radix(&signed.taker_amount, 10).unwrap(),
+                side: 1,
+                signature_type: signed.signature_type,
+                timestamp: U256::from_str_radix(&signed.timestamp, 10).unwrap(),
+                metadata: signed.metadata.parse().unwrap(),
+                builder: signed.builder.parse().unwrap(),
+                expiration: U256::ZERO,
+            };
+            let digest = alloy_primitives::keccak256(
+                [
+                    &[0x19u8, 0x01][..],
+                    domain.separator().as_slice(),
+                    order.struct_hash().as_slice(),
+                ]
+                .concat(),
+            );
+            assert_eq!(signed.order_hash, Some(format!("{digest:#x}")));
+            let signature: alloy_primitives::PrimitiveSignature = signed.signature.parse().unwrap();
+            assert_eq!(
+                signature.recover_address_from_prehash(&digest).unwrap(),
+                auth_client.signer.address()
+            );
+            // A good-till-date order carries its expiry, unsigned.
+            assert!(signed.expiration.parse::<u64>().unwrap() > current_timestamp());
+        }
     }
 
     #[test]

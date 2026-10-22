@@ -33,6 +33,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/080_wallet_only_users.sql"),
     include_str!("../../../../migrations/081_password_reset_token_lookup.sql"),
     include_str!("../../../../migrations/090_restore_invites_and_wallet_orders.sql"),
+    include_str!("../../../../migrations/093_v2_wallet_orders.sql"),
 ];
 
 /// Create the production user/workspace/session schema in an empty test database.

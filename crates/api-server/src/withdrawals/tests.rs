@@ -28,6 +28,12 @@ pub(crate) struct Chain {
     /// The `finalized` block, when the node reports one.
     pub finalized: Option<u64>,
     pub usdc_units: u128,
+    /// The wallet's pUSD.
+    pub pusd_units: u128,
+    /// What `eth_estimateGas` answers; `None` reverts the call.
+    pub gas_estimate: Option<u64>,
+    /// Blocks `eth_call` was asked to read at.
+    pub call_blocks: Vec<String>,
     pub pol_wei: u128,
     /// What `eth_gasPrice` answers, in wei.
     pub gas_price: u128,
@@ -52,6 +58,9 @@ impl Default for Chain {
             head: 200,
             finalized: Some(100),
             usdc_units: 0,
+            pusd_units: 0,
+            gas_estimate: Some(120_000),
+            call_blocks: Vec::new(),
             pol_wei: 0,
             gas_price: 30_000_000_000,
             send_error: None,
@@ -123,7 +132,32 @@ pub(crate) async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
                         _ => Value::Null,
                     },
                     "eth_blockNumber" => hex(u128::from(chain.head)),
-                    "eth_call" => hex(chain.usdc_units),
+                    "eth_call" => {
+                        chain
+                            .call_blocks
+                            .push(params[1].as_str().unwrap().to_string());
+                        let token = params[0]["to"].as_str().unwrap().to_ascii_lowercase();
+                        if token
+                            == polymarket_core::signing::COLLATERAL_ADDRESS.to_ascii_lowercase()
+                        {
+                            hex(chain.pusd_units)
+                        } else {
+                            assert_eq!(
+                                token,
+                                polymarket_core::signing::USDC_ADDRESS.to_ascii_lowercase()
+                            );
+                            hex(chain.usdc_units)
+                        }
+                    }
+                    "eth_estimateGas" => match chain.gas_estimate {
+                        Some(gas) => hex(u128::from(gas)),
+                        None => {
+                            return Json(json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "error": {"code": 3, "message": "execution reverted"}
+                            }))
+                        }
+                    },
                     "eth_getBalance" => hex(chain.pol_wei),
                     "eth_gasPrice" => hex(chain.gas_price),
                     "eth_sendRawTransaction" => {
@@ -809,7 +843,7 @@ async fn waiting_transfer(
     let (user, workspace) = setup(pool).await;
     let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
     let signed = client
-        .prepare_usdc_transfer(wallet.signer(), DEST, 10_000_000, 0)
+        .prepare_withdrawal(wallet.signer(), DEST, 10_000_000, WithdrawalSource::Usdc, 0)
         .await
         .unwrap();
     assert_eq!((signed.nonce, signed.gas_price), (0, 36_000_000_000));
@@ -990,7 +1024,7 @@ async fn a_replacement_that_never_reached_the_node_is_sent_again(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn a_row_that_no_longer_matches_its_transaction_is_not_signed_again(pool: PgPool) {
+async fn a_replacement_repeats_the_journaled_transaction_whatever_the_row_says(pool: PgPool) {
     let chain = Arc::new(Mutex::new(Chain {
         pol_wei: 1_000_000_000_000_000_000,
         gas_price: 30_000_000_000,
@@ -998,10 +1032,11 @@ async fn a_row_that_no_longer_matches_its_transaction_is_not_signed_again(pool: 
     }));
     let client = mock_node(chain.clone()).await;
     let (wallet, id, original) = waiting_transfer(&pool, &client, "submitted").await;
-    // The row was edited by hand after the transfer was signed.
+    // The row was edited by hand after the transfer was signed: the edit
+    // cannot redirect what the transaction at this nonce does.
     sqlx::query(
         "UPDATE wallet_withdrawals SET destination_address = \
-         '0x4444444444444444444444444444444444444444' WHERE id = $1",
+         '0x4444444444444444444444444444444444444444', amount = 99 WHERE id = $1",
     )
     .bind(id)
     .execute(&pool)
@@ -1014,6 +1049,111 @@ async fn a_row_that_no_longer_matches_its_transaction_is_not_signed_again(pool: 
     }
     reconcile_signing(&pool, &client, Some(&wallet)).await;
     let (tx_hash, replaced, _) = journal(&pool, id).await;
-    assert_eq!(tx_hash, original.tx_hash);
-    assert!(replaced.is_empty());
+    assert_eq!(replaced, vec![original.tx_hash.clone()]);
+    let raw: String = sqlx::query_scalar("SELECT raw_tx FROM wallet_withdrawals WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(tx_hash, original.tx_hash);
+    assert_eq!(legacy_call(&raw), legacy_call(&original.raw));
+    assert_eq!(legacy_nonce_and_gas_price(&raw), Some((0, 60_000_000_000)));
+}
+
+#[test]
+fn a_withdrawal_draws_on_usdc_then_pusd_and_never_more_than_one_holds() {
+    let holds = WithdrawalHolds {
+        in_flight_withdrawals: Decimal::from(5),
+        reserved_for_open_buys: Decimal::from(10),
+        trading_wallet: true,
+        blocking_reasons: Vec::new(),
+    };
+    let cash = CashBalances {
+        usdc_units: 40_000_000,
+        pusd_units: 100_000_000,
+        block: 7,
+    };
+    // USDC.e covers 25 (40 less 15 held): a plain transfer.
+    let (capacity, source) = withdrawal_plan(&holds, &cash, Decimal::from(25));
+    assert_eq!(source, Some(WithdrawalSource::Usdc));
+    assert_eq!(capacity.available_usdc, Decimal::from(140));
+    assert_eq!(capacity.max_withdrawable, Decimal::from(85));
+    // 26 is more than USDC.e covers: pUSD, unwrapped to the recipient.
+    let (_, source) = withdrawal_plan(&holds, &cash, Decimal::from(26));
+    assert_eq!(source, Some(WithdrawalSource::Pusd));
+    assert_eq!(
+        withdrawal_plan(&holds, &cash, Decimal::from(85)).1,
+        Some(WithdrawalSource::Pusd)
+    );
+    // One withdrawal never draws on both, so 86 cannot leave at once.
+    let (capacity, source) = withdrawal_plan(&holds, &cash, Decimal::from(86));
+    assert_eq!(source, None);
+    assert_eq!(capacity.max_withdrawable, Decimal::from(85));
+}
+
+#[tokio::test]
+async fn cash_is_read_at_one_settled_block() {
+    let chain = Arc::new(Mutex::new(Chain {
+        head: 500,
+        usdc_units: 1_000_000,
+        pusd_units: 2_500_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let cash = client.get_cash_balances(TRADING).await.unwrap();
+    assert_eq!(
+        (cash.usdc_units, cash.pusd_units, cash.block),
+        (1_000_000, 2_500_000, 498)
+    );
+    assert_eq!(cash.total(), Decimal::new(35, 1));
+    assert_eq!(chain.lock().unwrap().call_blocks, ["0x1f2", "0x1f2"]);
+}
+
+#[tokio::test]
+async fn a_pusd_withdrawal_is_unwrapped_to_the_recipient_by_the_offramp() {
+    use alloy_primitives::{Address, U256};
+    let chain = Arc::new(Mutex::new(Chain {
+        pol_wei: 1_000_000_000_000_000_000,
+        pending_nonce: 4,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
+    let signed = client
+        .prepare_withdrawal(wallet.signer(), DEST, 7_500_000, WithdrawalSource::Pusd, 0)
+        .await
+        .unwrap();
+    let (to, value, input) = legacy_call(&signed.raw).unwrap();
+    assert_eq!(
+        to,
+        polymarket_core::signing::COLLATERAL_OFFRAMP_ADDRESS.to_ascii_lowercase()
+    );
+    assert_eq!(value, U256::ZERO);
+    // unwrap(USDC.e, DEST, 7.5 USDC)
+    let mut expected =
+        alloy_primitives::keccak256("unwrap(address,address,uint256)".as_bytes())[..4].to_vec();
+    for address in [polymarket_core::signing::USDC_ADDRESS, DEST] {
+        expected.extend_from_slice(&[0u8; 12]);
+        expected.extend_from_slice(address.parse::<Address>().unwrap().as_slice());
+    }
+    expected.extend_from_slice(&U256::from(7_500_000u64).to_be_bytes::<32>());
+    assert_eq!(input.to_vec(), expected);
+    assert_eq!(signed.nonce, 4);
+
+    // Its replacement makes the same call with the same gas.
+    let replacement = client
+        .prepare_replacement(wallet.signer(), &signed.raw, 4, signed.gas_price * 2)
+        .await
+        .unwrap();
+    assert_eq!(legacy_call(&replacement.raw), legacy_call(&signed.raw));
+    assert_eq!(replacement.nonce, 4);
+    assert_eq!(replacement.gas_price, signed.gas_price * 2);
+
+    // An unwrap the node expects to revert (no allowance, a paused Offramp)
+    // is never signed.
+    chain.lock().unwrap().gas_estimate = None;
+    assert!(client
+        .prepare_withdrawal(wallet.signer(), DEST, 7_500_000, WithdrawalSource::Pusd, 0)
+        .await
+        .is_err());
 }

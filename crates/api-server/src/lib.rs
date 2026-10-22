@@ -23,6 +23,7 @@ pub mod accounting_ledger;
 pub mod arb_executor;
 pub mod backtest_automation;
 pub mod cex;
+pub mod collateral;
 pub mod crypto;
 pub mod dynamic_tuner;
 pub mod email;

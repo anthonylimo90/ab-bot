@@ -1064,15 +1064,14 @@ export interface Eip712Order {
   salt: string;
   maker: string;
   signer: string;
-  taker: string;
   tokenId: string;
   makerAmount: string;
   takerAmount: string;
-  expiration: string;
-  nonce: string;
-  feeRateBps: string;
   side: number;
   signatureType: number;
+  timestamp: string;
+  metadata: string;
+  builder: string;
 }
 
 export interface Eip712TypedData {

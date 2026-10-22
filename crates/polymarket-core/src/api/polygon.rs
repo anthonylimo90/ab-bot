@@ -1,21 +1,20 @@
 //! Polygon RPC client for on-chain data.
 
-use crate::signing::CTF_ADDRESS;
+use crate::signing::{
+    COLLATERAL_ADDRESS, COLLATERAL_OFFRAMP_ADDRESS, COLLATERAL_ONRAMP_ADDRESS, CTF_ADDRESS,
+    USDC_ADDRESS as POLYGON_USDC_ADDRESS,
+};
 use crate::{Error, Result};
 use alloy_consensus::TxLegacy;
 use alloy_primitives::U256;
 use alloy_primitives::{Address, Bytes, TxKind};
 use alloy_signer_local::PrivateKeySigner;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// USDC.e contract on Polygon (PoS bridged, 6 decimals) — used by Polymarket.
-const POLYGON_USDC_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-
-/// Native USDC contract on Polygon (CCTP, 6 decimals) — NOT used by Polymarket.
-const POLYGON_NATIVE_USDC_ADDRESS: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 const ERC1155_TRANSFER_SINGLE_TOPIC: &str =
     "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
 const ERC1155_TRANSFER_BATCH_TOPIC: &str =
@@ -23,6 +22,46 @@ const ERC1155_TRANSFER_BATCH_TOPIC: &str =
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 const POLYGON_CHAIN_ID: u64 = 137;
 const DEFAULT_ERC20_TRANSFER_GAS_LIMIT: u64 = 100_000;
+/// The least gas a collateral wrap or unwrap is given, whatever the node
+/// estimates.
+const MIN_RAMP_GAS_LIMIT: u64 = 150_000;
+/// How far behind the head balances are read, so every node behind a load
+/// balancer already has the block.
+const BALANCE_BLOCK_LAG: u64 = 2;
+
+/// The cash a wallet holds: USDC.e, and pUSD (the exchange's collateral,
+/// redeemable 1:1 for USDC.e). Both are read at one block, so a wrap or
+/// unwrap mined between two reads can never be counted twice or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CashBalances {
+    /// USDC.e, in 6-decimal base units.
+    pub usdc_units: u128,
+    /// pUSD, in 6-decimal base units.
+    pub pusd_units: u128,
+    /// The block both were read at.
+    pub block: u64,
+}
+
+impl CashBalances {
+    pub fn total_units(&self) -> u128 {
+        self.usdc_units.saturating_add(self.pusd_units)
+    }
+
+    /// The total in USDC.
+    pub fn total(&self) -> Decimal {
+        Decimal::from_i128_with_scale(i128::try_from(self.total_units()).unwrap_or(i128::MAX), 6)
+    }
+}
+
+/// Where a withdrawal's USDC.e comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawalSource {
+    /// The wallet's USDC.e, sent with an ERC-20 transfer.
+    Usdc,
+    /// The wallet's pUSD, which the Collateral Offramp unwraps and pays to
+    /// the recipient as USDC.e.
+    Pusd,
+}
 
 /// Polygon RPC client for querying blockchain data.
 #[derive(Clone)]
@@ -181,13 +220,13 @@ impl PolygonClient {
     /// Get transaction logs for a contract with an explicit topics JSON filter.
     pub async fn get_logs_with_topics(
         &self,
-        contract_address: &str,
+        contract_addresses: &[&str],
         from_block: u64,
         to_block: u64,
         topics: serde_json::Value,
     ) -> Result<Vec<Log>> {
         let params = serde_json::json!([{
-            "address": contract_address,
+            "address": contract_addresses,
             "fromBlock": format!("0x{:x}", from_block),
             "toBlock": format!("0x{:x}", to_block),
             "topics": topics
@@ -243,7 +282,7 @@ impl PolygonClient {
         let mut token_ids = HashSet::new();
         for filter in filters {
             let logs = self
-                .get_logs_with_topics(CTF_ADDRESS, from_block, to_block, filter)
+                .get_logs_with_topics(&[CTF_ADDRESS], from_block, to_block, filter)
                 .await?;
             for log in logs {
                 for token_id in extract_ctf_token_ids(&log)? {
@@ -292,75 +331,43 @@ impl PolygonClient {
         Ok(merge_asset_transfers(per_direction))
     }
 
-    /// Get the USDC.e (PoS bridged) balance for a wallet — the token Polymarket uses.
-    pub async fn get_usdc_balance(&self, wallet_address: &str) -> Result<f64> {
-        self.get_erc20_balance(wallet_address, POLYGON_USDC_ADDRESS)
-            .await
-    }
-
-    /// Get the raw on-chain USDC.e balance (6 decimals) for a wallet.
-    pub async fn get_usdc_balance_units(&self, wallet_address: &str) -> Result<u128> {
-        self.get_erc20_balance_units(wallet_address, POLYGON_USDC_ADDRESS)
-            .await
-    }
-
-    /// Get the native USDC (CCTP) balance for a wallet — NOT used by Polymarket.
-    pub async fn get_native_usdc_balance(&self, wallet_address: &str) -> Result<f64> {
-        self.get_erc20_balance(wallet_address, POLYGON_NATIVE_USDC_ADDRESS)
-            .await
-    }
-
-    /// Get a 6-decimal ERC-20 balance for a wallet address (returns human-readable amount).
-    async fn get_erc20_balance(&self, wallet_address: &str, token_address: &str) -> Result<f64> {
-        let balance = self
-            .get_erc20_balance_units(wallet_address, token_address)
+    /// The wallet's USDC.e and pUSD, read at one recent block.
+    pub async fn get_cash_balances(&self, wallet_address: &str) -> Result<CashBalances> {
+        let block = self
+            .get_block_number()
+            .await?
+            .saturating_sub(BALANCE_BLOCK_LAG);
+        let at = format!("{block:#x}");
+        let usdc_units = self
+            .get_erc20_balance_units_at(wallet_address, POLYGON_USDC_ADDRESS, &at)
             .await?;
-
-        // USDC has 6 decimals
-        Ok(balance as f64 / 1_000_000.0)
+        let pusd_units = self
+            .get_erc20_balance_units_at(wallet_address, COLLATERAL_ADDRESS, &at)
+            .await?;
+        Ok(CashBalances {
+            usdc_units,
+            pusd_units,
+            block,
+        })
     }
 
-    /// Sign a USDC.e transfer at the sender's next pending nonce, paying at
-    /// least `min_gas_price` wei for gas, after checking it holds enough POL
-    /// for gas. Nothing is sent.
-    pub async fn prepare_usdc_transfer(
-        &self,
-        signer: &PrivateKeySigner,
-        to_address: &str,
-        amount_units: u128,
-        min_gas_price: u128,
-    ) -> Result<SignedTransaction> {
-        self.sign_usdc_transfer(signer, to_address, amount_units, None, min_gas_price)
+    /// The wallet's USDC.e balance now (6-decimal base units).
+    pub async fn get_usdc_balance_units(&self, wallet_address: &str) -> Result<u128> {
+        self.get_erc20_balance_units_at(wallet_address, POLYGON_USDC_ADDRESS, "latest")
             .await
     }
 
-    /// Sign a USDC.e transfer at exactly `nonce`, to replace a transaction
-    /// already signed at it: paying at least `min_gas_price` wei for gas, as
-    /// [`Self::prepare_usdc_transfer`] otherwise. Two transactions at one
-    /// nonce can never both be mined. Nothing is sent.
-    pub async fn prepare_usdc_replacement(
+    /// Sign a withdrawal of `amount_units` USDC.e to `to_address` from
+    /// `source`, at the sender's next pending nonce, paying at least
+    /// `min_gas_price` wei for gas, after checking it holds enough POL for
+    /// gas. An unwrap the node expects to fail is refused here. Nothing is
+    /// sent.
+    pub async fn prepare_withdrawal(
         &self,
         signer: &PrivateKeySigner,
         to_address: &str,
         amount_units: u128,
-        nonce: u64,
-        min_gas_price: u128,
-    ) -> Result<SignedTransaction> {
-        self.sign_usdc_transfer(signer, to_address, amount_units, Some(nonce), min_gas_price)
-            .await
-    }
-
-    /// The network's current gas price, in wei.
-    pub async fn gas_price_wei(&self) -> Result<u128> {
-        self.get_gas_price_wei().await
-    }
-
-    async fn sign_usdc_transfer(
-        &self,
-        signer: &PrivateKeySigner,
-        to_address: &str,
-        amount_units: u128,
-        nonce: Option<u64>,
+        source: WithdrawalSource,
         min_gas_price: u128,
     ) -> Result<SignedTransaction> {
         if amount_units == 0 {
@@ -369,14 +376,145 @@ impl PolygonClient {
                 status: None,
             });
         }
-
         let recipient = Address::from_str(to_address).map_err(|e| Error::Api {
             message: format!("Invalid recipient address: {}", e),
             status: None,
         })?;
         let usdc = Address::from_str(POLYGON_USDC_ADDRESS).expect("invalid USDC address");
-        let sender = signer.address();
+        let amount = U256::from(amount_units);
+        let (to, input, gas_limit) = match source {
+            WithdrawalSource::Usdc => (
+                usdc,
+                encode_erc20_transfer(recipient, amount),
+                DEFAULT_ERC20_TRANSFER_GAS_LIMIT,
+            ),
+            WithdrawalSource::Pusd => {
+                let offramp =
+                    Address::from_str(COLLATERAL_OFFRAMP_ADDRESS).expect("invalid Offramp address");
+                let input = encode_ramp_call("unwrap", usdc, recipient, amount);
+                let gas_limit = self
+                    .ramp_gas_limit(signer.address(), offramp, &input)
+                    .await?;
+                (offramp, input, gas_limit)
+            }
+        };
+        self.sign_call(signer, to, input, gas_limit, None, min_gas_price)
+            .await
+    }
 
+    /// Sign a wrap of `amount_units` of the wallet's USDC.e into pUSD for
+    /// itself, at exactly `nonce`. A wrap the node expects to fail (no
+    /// allowance, a paused Onramp) is refused here. Nothing is sent.
+    pub async fn prepare_wrap(
+        &self,
+        signer: &PrivateKeySigner,
+        amount_units: u128,
+        nonce: u64,
+    ) -> Result<SignedTransaction> {
+        let usdc = Address::from_str(POLYGON_USDC_ADDRESS).expect("invalid USDC address");
+        let onramp = Address::from_str(COLLATERAL_ONRAMP_ADDRESS).expect("invalid Onramp address");
+        let input = encode_ramp_call("wrap", usdc, signer.address(), U256::from(amount_units));
+        let gas_limit = self
+            .ramp_gas_limit(signer.address(), onramp, &input)
+            .await?;
+        self.sign_call(signer, onramp, input, gas_limit, Some(nonce), 0)
+            .await
+    }
+
+    /// Sign `original` again at exactly `nonce`, making the same call with
+    /// the same gas limit, paying at least `min_gas_price` wei for gas: a
+    /// replacement for it. Two transactions at one nonce can never both be
+    /// mined. Nothing is sent.
+    pub async fn prepare_replacement(
+        &self,
+        signer: &PrivateKeySigner,
+        original: &str,
+        nonce: u64,
+        min_gas_price: u128,
+    ) -> Result<SignedTransaction> {
+        let tx = decode_legacy(original)
+            .filter(|tx| tx.value.is_zero())
+            .ok_or_else(|| Error::Api {
+                message: "The transaction to replace is unreadable".to_string(),
+                status: None,
+            })?;
+        let TxKind::Call(to) = tx.to else {
+            return Err(Error::Api {
+                message: "The transaction to replace calls no contract".to_string(),
+                status: None,
+            });
+        };
+        self.sign_call(
+            signer,
+            to,
+            tx.input,
+            tx.gas_limit,
+            Some(nonce),
+            min_gas_price,
+        )
+        .await
+    }
+
+    /// The network's current gas price, in wei.
+    pub async fn gas_price_wei(&self) -> Result<u128> {
+        self.get_gas_price_wei().await
+    }
+
+    /// The sender's transaction count mined at the head, and with those still
+    /// pending: equal when nothing it sent waits to be mined.
+    pub async fn nonces(&self, address: &Address) -> Result<(u64, u64)> {
+        Ok((
+            self.get_nonce(address, "latest").await?,
+            self.get_nonce(address, "pending").await?,
+        ))
+    }
+
+    /// Gas for a collateral ramp call: half again the node's estimate, and
+    /// never less than [`MIN_RAMP_GAS_LIMIT`]. A call the node expects to
+    /// revert is an error.
+    async fn ramp_gas_limit(&self, from: Address, to: Address, input: &Bytes) -> Result<u64> {
+        let params = serde_json::json!([{
+            "from": format!("{from:#x}"),
+            "to": format!("{to:#x}"),
+            "data": format!("0x{}", hex::encode(input)),
+        }]);
+        let response = self.rpc_response("eth_estimateGas", params).await?;
+        if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            return Err(Error::Api {
+                message: format!(
+                    "The node expects the call to fail: {}",
+                    rpc_error_message(error)
+                ),
+                status: None,
+            });
+        }
+        let estimate = response
+            .get("result")
+            .and_then(|value| value.as_str())
+            .and_then(parse_hex_u64)
+            .ok_or_else(|| Error::Api {
+                message: "No gas estimate from eth_estimateGas".to_string(),
+                status: None,
+            })?;
+        Ok(estimate
+            .saturating_add(estimate / 2)
+            .max(MIN_RAMP_GAS_LIMIT))
+    }
+
+    /// Sign a call of `to` with `input`, at `nonce` (else the sender's next
+    /// pending nonce), paying the network's gas price plus a fifth and at
+    /// least `min_gas_price`, after checking the sender holds the POL its gas
+    /// may cost.
+    async fn sign_call(
+        &self,
+        signer: &PrivateKeySigner,
+        to: Address,
+        input: Bytes,
+        gas_limit: u64,
+        nonce: Option<u64>,
+        min_gas_price: u128,
+    ) -> Result<SignedTransaction> {
+        let sender = signer.address();
         let pol_balance = self.get_native_balance_wei(&sender).await?;
         // "pending" counts transactions still in the mempool, so a new
         // transfer never reuses (and replaces) the nonce of one not yet mined.
@@ -386,7 +524,7 @@ impl PolygonClient {
         };
         let gas_price = self.get_gas_price_wei().await?;
         let gas_price = (gas_price + gas_price / 5).max(min_gas_price);
-        let required_gas = gas_price.saturating_mul(DEFAULT_ERC20_TRANSFER_GAS_LIMIT as u128);
+        let required_gas = gas_price.saturating_mul(gas_limit as u128);
 
         if pol_balance < required_gas {
             return Err(Error::Api {
@@ -403,10 +541,10 @@ impl PolygonClient {
             chain_id: Some(POLYGON_CHAIN_ID),
             nonce,
             gas_price,
-            gas_limit: DEFAULT_ERC20_TRANSFER_GAS_LIMIT,
-            to: TxKind::Call(usdc),
+            gas_limit,
+            to: TxKind::Call(to),
             value: U256::ZERO,
-            input: encode_erc20_transfer(recipient, U256::from(amount_units)),
+            input,
         };
 
         sign_legacy_transaction(signer, tx)
@@ -580,10 +718,11 @@ impl PolygonClient {
         Ok(response.json().await?)
     }
 
-    async fn get_erc20_balance_units(
+    async fn get_erc20_balance_units_at(
         &self,
         wallet_address: &str,
         token_address: &str,
+        block: &str,
     ) -> Result<u128> {
         // balanceOf(address) selector = 0x70a08231 + 32-byte left-padded address
         let addr = wallet_address.trim_start_matches("0x");
@@ -591,12 +730,15 @@ impl PolygonClient {
 
         let params = serde_json::json!([
             { "to": token_address, "data": data },
-            "latest"
+            block
         ]);
 
         let response: JsonRpcResponse<String> = self.rpc_call("eth_call", params).await?;
         let hex_balance = response.result.ok_or_else(|| Error::Api {
-            message: "No result from eth_call".to_string(),
+            message: format!(
+                "No result from eth_call: {}",
+                response.error.map(|e| e.message).unwrap_or_default()
+            ),
             status: None,
         })?;
 
@@ -733,6 +875,20 @@ fn sign_legacy_transaction(signer: &PrivateKeySigner, tx: TxLegacy) -> Result<Si
         nonce: tx.nonce,
         gas_price: tx.gas_price,
     })
+}
+
+/// Call data of a Collateral Onramp `wrap` or Offramp `unwrap`:
+/// `name(address asset, address to, uint256 amount)`.
+fn encode_ramp_call(name: &str, asset: Address, to: Address, amount: U256) -> Bytes {
+    let signature = format!("{name}(address,address,uint256)");
+    let mut data = Vec::with_capacity(100);
+    data.extend_from_slice(&alloy_primitives::keccak256(signature.as_bytes())[..4]);
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(asset.as_slice());
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(to.as_slice());
+    data.extend_from_slice(&amount.to_be_bytes::<32>());
+    Bytes::from(data)
 }
 
 fn encode_erc20_transfer(recipient: Address, amount: U256) -> Bytes {
@@ -948,6 +1104,48 @@ mod tests {
         AssetTransfersResponse, Log, TransferDirection, ERC1155_TRANSFER_BATCH_TOPIC,
         ERC1155_TRANSFER_SINGLE_TOPIC,
     };
+
+    #[test]
+    fn ramp_calls_encode_as_the_collateral_ramps_declare_them() {
+        use super::*;
+        alloy_sol_types::sol! {
+            function wrap(address _asset, address _to, uint256 _amount) external;
+            function unwrap(address _asset, address _to, uint256 _amount) external;
+        }
+        use alloy_sol_types::SolCall;
+        let asset = Address::from_str(POLYGON_USDC_ADDRESS).unwrap();
+        let to = Address::repeat_byte(0x42);
+        let amount = U256::from(12_345_678u64);
+        assert_eq!(
+            encode_ramp_call("wrap", asset, to, amount).to_vec(),
+            wrapCall {
+                _asset: asset,
+                _to: to,
+                _amount: amount
+            }
+            .abi_encode()
+        );
+        assert_eq!(
+            encode_ramp_call("unwrap", asset, to, amount).to_vec(),
+            unwrapCall {
+                _asset: asset,
+                _to: to,
+                _amount: amount
+            }
+            .abi_encode()
+        );
+    }
+
+    #[test]
+    fn cash_is_both_tokens_in_usdc() {
+        let cash = super::CashBalances {
+            usdc_units: 1_500_000,
+            pusd_units: 2_250_001,
+            block: 9,
+        };
+        assert_eq!(cash.total_units(), 3_750_001);
+        assert_eq!(cash.total(), rust_decimal::Decimal::new(3_750_001, 6));
+    }
 
     #[test]
     fn a_signed_transfer_reads_back_its_nonce_and_gas_price() {

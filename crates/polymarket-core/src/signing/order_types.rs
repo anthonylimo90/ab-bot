@@ -10,9 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use super::domain::{OrderSide, SignatureType};
 
+/// The EIP-712 type of a CTF Exchange V2 order.
+pub const ORDER_TYPE: &str = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+
 /// Raw order data for EIP-712 signing.
 ///
-/// This matches the struct used by the CTF Exchange contract.
+/// The signed fields match the CTF Exchange V2 `Order` struct; `expiration`
+/// travels with the order but is not signed.
 #[derive(Debug, Clone)]
 pub struct OrderData {
     /// Random salt for uniqueness.
@@ -21,28 +25,28 @@ pub struct OrderData {
     pub maker: Address,
     /// Signer address (usually same as maker).
     pub signer: Address,
-    /// Taker address (zero for any taker).
-    pub taker: Address,
     /// Token ID of the outcome being traded.
     pub token_id: U256,
     /// Maker amount in base units.
     pub maker_amount: U256,
     /// Taker amount in base units.
     pub taker_amount: U256,
-    /// Order expiration timestamp (unix seconds).
-    pub expiration: U256,
-    /// Nonce for order management.
-    pub nonce: U256,
-    /// Fee rate in basis points.
-    pub fee_rate_bps: U256,
     /// Order side (0 = buy, 1 = sell).
     pub side: u8,
     /// Signature type.
     pub signature_type: u8,
+    /// Creation time in unix milliseconds.
+    pub timestamp: U256,
+    /// Metadata attached to the order (zero for none).
+    pub metadata: B256,
+    /// Builder code the order is attributed to (zero for none).
+    pub builder: B256,
+    /// Unix seconds after which a GTD order lapses, zero for none. Not signed.
+    pub expiration: U256,
 }
 
 impl OrderData {
-    /// Create a new order with generated salt.
+    /// Create a new order with generated salt, created now.
     pub fn new(
         maker: Address,
         token_id: U256,
@@ -51,56 +55,57 @@ impl OrderData {
         taker_amount: U256,
         expiration_secs: u64,
     ) -> Self {
-        // Generate random salt
-        let salt = U256::from(rand_salt() as u128);
-
         Self {
-            salt,
+            salt: U256::from(rand_salt()),
             maker,
             signer: maker,
-            taker: Address::ZERO,
             token_id,
             maker_amount,
             taker_amount,
-            expiration: U256::from(expiration_secs),
-            nonce: U256::ZERO,
-            fee_rate_bps: U256::ZERO,
             side: side.as_u8(),
             signature_type: SignatureType::Eoa.as_u8(),
+            timestamp: U256::from(now_millis()),
+            metadata: B256::ZERO,
+            builder: B256::ZERO,
+            expiration: U256::from(expiration_secs),
         }
     }
 
     /// Compute the EIP-712 struct hash for this order.
     pub fn struct_hash(&self) -> B256 {
-        let order_type_hash = alloy_primitives::keccak256(
-            b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)",
-        );
+        let order_type_hash = alloy_primitives::keccak256(ORDER_TYPE.as_bytes());
 
         // EIP-712 encodeData: all values must be padded to 32 bytes.
         // Addresses are left-padded from 20 bytes to 32 bytes.
         let maker_padded = B256::left_padding_from(self.maker.as_slice());
         let signer_padded = B256::left_padding_from(self.signer.as_slice());
-        let taker_padded = B256::left_padding_from(self.taker.as_slice());
 
         let encoded = (
             order_type_hash,
             self.salt,
             maker_padded,
             signer_padded,
-            taker_padded,
             self.token_id,
             self.maker_amount,
             self.taker_amount,
-            self.expiration,
-            self.nonce,
-            self.fee_rate_bps,
             U256::from(self.side),
             U256::from(self.signature_type),
+            self.timestamp,
+            self.metadata,
+            self.builder,
         )
             .abi_encode_packed();
 
         alloy_primitives::keccak256(&encoded)
     }
+}
+
+fn now_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 /// Generate a random salt for order uniqueness.
@@ -116,7 +121,7 @@ fn rand_salt() -> u64 {
     raw & ((1u64 << 53) - 1)
 }
 
-/// A signed order ready for submission.
+/// A signed order ready for submission, in the exchange's wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedOrder {
     /// Local reconciliation identity; excluded from the exchange payload.
@@ -128,8 +133,6 @@ pub struct SignedOrder {
     pub maker: String,
     /// Signer address as hex string.
     pub signer: String,
-    /// Taker address as hex string.
-    pub taker: String,
     /// Token ID as string.
     #[serde(rename = "tokenId")]
     pub token_id: String,
@@ -139,18 +142,19 @@ pub struct SignedOrder {
     /// Taker amount as string.
     #[serde(rename = "takerAmount")]
     pub taker_amount: String,
-    /// Expiration timestamp as string.
-    pub expiration: String,
-    /// Nonce as string.
-    pub nonce: String,
-    /// Fee rate in basis points.
-    #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps: String,
     /// Side ("BUY" or "SELL").
     pub side: String,
+    /// Expiration timestamp as string (not signed).
+    pub expiration: String,
     /// Signature type.
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
+    /// Creation time in unix milliseconds, as string.
+    pub timestamp: String,
+    /// Metadata as 0x-prefixed bytes32 hex.
+    pub metadata: String,
+    /// Builder code as 0x-prefixed bytes32 hex.
+    pub builder: String,
     /// EIP-712 signature as hex string.
     pub signature: String,
 }
@@ -165,15 +169,15 @@ impl SignedOrder {
             salt: order.salt.to::<u64>(),
             maker: format!("{:?}", order.maker),
             signer: format!("{:?}", order.signer),
-            taker: format!("{:?}", order.taker),
             token_id: format!("{}", order.token_id),
             maker_amount: format!("{}", order.maker_amount),
             taker_amount: format!("{}", order.taker_amount),
-            expiration: format!("{}", order.expiration),
-            nonce: format!("{}", order.nonce),
-            fee_rate_bps: format!("{}", order.fee_rate_bps),
             side: side.to_string(),
+            expiration: format!("{}", order.expiration),
             signature_type: order.signature_type,
+            timestamp: format!("{}", order.timestamp),
+            metadata: format!("{:#x}", order.metadata),
+            builder: format!("{:#x}", order.builder),
             signature,
         }
     }
@@ -188,8 +192,6 @@ pub struct OrderBuilder {
     price: Option<Decimal>,
     size: Option<Decimal>,
     expiration_secs: Option<u64>,
-    nonce: U256,
-    fee_rate_bps: U256,
 }
 
 impl OrderBuilder {
@@ -202,8 +204,6 @@ impl OrderBuilder {
             price: None,
             size: None,
             expiration_secs: None,
-            nonce: U256::ZERO,
-            fee_rate_bps: U256::ZERO,
         }
     }
 
@@ -260,18 +260,6 @@ impl OrderBuilder {
         self
     }
 
-    /// Set the nonce.
-    pub fn nonce(mut self, nonce: U256) -> Self {
-        self.nonce = nonce;
-        self
-    }
-
-    /// Set the fee rate in basis points.
-    pub fn fee_rate_bps(mut self, fee_rate: u64) -> Self {
-        self.fee_rate_bps = U256::from(fee_rate);
-        self
-    }
-
     /// Build the order data.
     ///
     /// Returns None if required fields are missing.
@@ -287,18 +275,14 @@ impl OrderBuilder {
         // For a SELL: maker provides tokens, receives USDC
         let (maker_amount, taker_amount) = calculate_amounts(self.side, price, size);
 
-        let mut order = OrderData::new(
+        Some(OrderData::new(
             maker,
             token_id,
             self.side,
             maker_amount,
             taker_amount,
             expiration,
-        );
-        order.nonce = self.nonce;
-        order.fee_rate_bps = self.fee_rate_bps;
-
-        Some(order)
+        ))
     }
 }
 
@@ -383,9 +367,12 @@ mod tests {
 
         assert_eq!(order.maker, maker);
         assert_eq!(order.signer, maker);
-        assert_eq!(order.taker, Address::ZERO);
         assert_eq!(order.token_id, token_id);
         assert_eq!(order.side, 0);
+        assert_eq!(order.metadata, B256::ZERO);
+        assert_eq!(order.builder, B256::ZERO);
+        // Milliseconds, not seconds.
+        assert!(order.timestamp > U256::from(1_700_000_000_000u64));
     }
 
     #[test]
@@ -428,10 +415,107 @@ mod tests {
         assert_eq!(signed.side, "BUY");
         assert_eq!(signed.signature, "0xsignature");
 
-        // Should serialize to JSON
-        let json = serde_json::to_string(&signed).unwrap();
-        assert!(json.contains("makerAmount"));
-        assert!(json.contains("tokenId"));
+        // The V2 wire format: what the official clients send, and no more.
+        let json = serde_json::to_value(&signed).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "builder",
+                "expiration",
+                "maker",
+                "makerAmount",
+                "metadata",
+                "salt",
+                "side",
+                "signature",
+                "signatureType",
+                "signer",
+                "takerAmount",
+                "timestamp",
+                "tokenId"
+            ]
+        );
+        assert!(json["salt"].is_u64());
+        assert_eq!(json["expiration"], "1700000000");
+        assert_eq!(json["metadata"], format!("0x{}", "0".repeat(64)));
+        assert_eq!(json["builder"], format!("0x{}", "0".repeat(64)));
+        assert_eq!(json["timestamp"], order.timestamp.to_string());
+    }
+
+    #[test]
+    fn the_order_type_hash_is_the_v2_exchanges() {
+        // ORDER_TYPEHASH in the CTF Exchange V2's Structs.sol.
+        assert_eq!(
+            format!("{:#x}", alloy_primitives::keccak256(ORDER_TYPE.as_bytes())),
+            "0xbb86318a2138f5fa8ae32fbe8e659f8fcf13cc6ae4014a707893055433818589"
+        );
+    }
+
+    #[test]
+    fn struct_hash_matches_an_independent_eip712_implementation() {
+        alloy_sol_types::sol! {
+            struct Order {
+                uint256 salt;
+                address maker;
+                address signer;
+                uint256 tokenId;
+                uint256 makerAmount;
+                uint256 takerAmount;
+                uint8 side;
+                uint8 signatureType;
+                uint256 timestamp;
+                bytes32 metadata;
+                bytes32 builder;
+            }
+        }
+        use alloy_sol_types::SolStruct;
+
+        let maker = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse::<Address>()
+            .unwrap();
+        let mut order = OrderData::new(
+            maker,
+            U256::from_str_radix(
+                "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                10,
+            )
+            .unwrap(),
+            OrderSide::Sell,
+            U256::from(25_000_000u64),
+            U256::from(12_250_000u64),
+            0,
+        );
+        order.salt = U256::from(479_249_096_354u64);
+        order.timestamp = U256::from(1_761_000_000_123u64);
+        order.metadata = B256::repeat_byte(0xab);
+        order.builder = B256::repeat_byte(0x01);
+
+        let reference = Order {
+            salt: order.salt,
+            maker,
+            signer: maker,
+            tokenId: order.token_id,
+            makerAmount: order.maker_amount,
+            takerAmount: order.taker_amount,
+            side: 1,
+            signatureType: 0,
+            timestamp: order.timestamp,
+            metadata: order.metadata,
+            builder: order.builder,
+        };
+        assert_eq!(Order::eip712_encode_type(), ORDER_TYPE);
+        assert_eq!(order.struct_hash(), reference.eip712_hash_struct());
+        // The expiration is not part of what is signed.
+        let mut lapsing = order.clone();
+        lapsing.expiration = U256::from(1_761_000_600u64);
+        assert_eq!(lapsing.struct_hash(), order.struct_hash());
     }
 
     #[test]

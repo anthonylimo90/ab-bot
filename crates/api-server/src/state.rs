@@ -405,6 +405,13 @@ impl AppState {
                             );
                         }
                     }
+                    // The exchange settles in pUSD: keep the wallet's USDC.e wrapped.
+                    crate::collateral::spawn_collateral_sweeper(
+                        pool.clone(),
+                        PolygonClient::new(rpc_url.clone()),
+                        wallet.clone(),
+                        order_executor.clone(),
+                    );
                 }
             }
 

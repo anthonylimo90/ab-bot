@@ -179,3 +179,56 @@ async fn a_withdrawal_over_capacity_sends_nothing(pool: PgPool) {
             .unwrap();
     assert!(free);
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_withdrawal_of_trading_collateral_pays_usdc_out_through_the_offramp(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    {
+        // The wallet's cash is now pUSD, as trading leaves it.
+        let mut chain = f.chain.lock().unwrap();
+        chain.usdc_units = 2_000_000;
+        chain.pusd_units = 100_000_000;
+    }
+    // Two USDC.e cover a withdrawal of one: a plain transfer.
+    let row = f.submit(1, Uuid::new_v4()).await.unwrap();
+    assert_eq!(status(&pool, row.id).await.0, "submitted");
+    let raw = f.chain.lock().unwrap().broadcasts[0].clone();
+    let (to, _, _) = polymarket_core::api::polygon::legacy_call(&raw).unwrap();
+    assert_eq!(
+        to,
+        polymarket_core::signing::USDC_ADDRESS.to_ascii_lowercase()
+    );
+
+    // Ten need the pUSD, unwrapped by the Offramp to the recipient.
+    let row = f.submit(10, Uuid::new_v4()).await.unwrap();
+    assert_eq!(status(&pool, row.id).await.0, "submitted");
+    let raw = f.chain.lock().unwrap().broadcasts[1].clone();
+    let (to, _, input) = polymarket_core::api::polygon::legacy_call(&raw).unwrap();
+    assert_eq!(
+        to,
+        polymarket_core::signing::COLLATERAL_OFFRAMP_ADDRESS.to_ascii_lowercase()
+    );
+    // The recipient, not the wallet, is paid.
+    assert!(hex::encode(&input).contains(&DEST.trim_start_matches("0x").to_ascii_lowercase()));
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_unwrap_the_node_expects_to_fail_sends_nothing(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    {
+        let mut chain = f.chain.lock().unwrap();
+        chain.usdc_units = 0;
+        chain.pusd_units = 100_000_000;
+        chain.gas_estimate = None;
+    }
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::ServiceUnavailable(_))
+    ));
+    assert_eq!(f.broadcasts(), 0);
+    let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM wallet_withdrawals")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(statuses, ["failed"]);
+}

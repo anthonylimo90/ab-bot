@@ -21,12 +21,12 @@ use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::workspace_scope::resolve_canonical_workspace_membership;
-use polymarket_core::api::polygon::BroadcastOutcome;
+use polymarket_core::api::polygon::{BroadcastOutcome, WithdrawalSource};
 use polymarket_core::api::PolygonClient;
 
 use crate::withdrawals::{
-    chain_error_message, fail_unsent, final_receipt, finalize_mined, hash_recorded, Receipt,
-    SpendLock, WithdrawalHolds,
+    chain_error_message, fail_unsent, final_receipt, finalize_mined, hash_recorded,
+    withdrawal_plan, Receipt, SpendLock, WithdrawalHolds,
 };
 
 #[cfg(test)]
@@ -821,11 +821,12 @@ async fn set_personal_primary_wallet(
 pub struct WalletBalanceResponse {
     /// Wallet address.
     pub address: String,
-    /// USDC balance (human-readable, 6 decimal places on-chain).
+    /// Cash balance in USDC: its USDC.e and its pUSD (the exchange's
+    /// collateral, redeemable 1:1 for USDC.e).
     pub usdc_balance: f64,
 }
 
-/// Get the on-chain USDC balance for a connected wallet.
+/// Get the on-chain cash balance (USDC.e and pUSD) of a connected wallet.
 #[utoipa::path(
     get,
     path = "/api/v1/vault/wallets/{address}/balance",
@@ -892,9 +893,15 @@ pub async fn get_wallet_balance(
     let polygon_client = resolve_polygon_client_for_user(&state, user_id).await?;
 
     let usdc_balance = polygon_client
-        .get_usdc_balance(&address)
+        .get_cash_balances(&address)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to fetch USDC balance: {}", e)))?;
+        .map_err(|e| {
+            warn!(error = %chain_error_message(&e), "Failed to fetch wallet balance");
+            ApiError::ServiceUnavailable("Could not read the wallet's balance".into())
+        })?
+        .total()
+        .to_f64()
+        .unwrap_or_default();
 
     Ok(Json(WalletBalanceResponse {
         address,
@@ -1096,6 +1103,7 @@ enum Reservation {
     Reserved {
         id: Uuid,
         requested_at: DateTime<Utc>,
+        source: WithdrawalSource,
     },
 }
 
@@ -1124,13 +1132,13 @@ async fn reserve_withdrawal(
     // Holds first, then the balance: a transfer settling in between can only
     // make the capacity look smaller.
     let holds = WithdrawalHolds::load(lock.conn(), &request.source).await?;
-    let balance_units = match tokio::time::timeout(
+    let cash = match tokio::time::timeout(
         WITHDRAWAL_BALANCE_TIMEOUT,
-        client.get_usdc_balance_units(&request.source),
+        client.get_cash_balances(&request.source),
     )
     .await
     {
-        Ok(Ok(units)) => units,
+        Ok(Ok(cash)) => cash,
         Ok(Err(e)) => {
             warn!(error = %chain_error_message(&e), "Failed to fetch source wallet balance");
             return Err(ApiError::ServiceUnavailable(
@@ -1143,21 +1151,16 @@ async fn reserve_withdrawal(
             ))
         }
     };
-    let capacity = holds.capacity(balance_units);
+    let (capacity, source) = withdrawal_plan(&holds, &cash, request.amount);
     if let Some(reason) = capacity.blocking_reasons.first() {
         return Err(ApiError::Conflict(reason.clone()));
     }
-    if request.amount > capacity.max_withdrawable {
-        return Err(ApiError::BadRequest(format!(
-            "Withdrawal of {} USDC exceeds the {} USDC that can leave this wallet \
-             (balance {}, unconfirmed withdrawals {}, open live buy orders {})",
+    let Some(source) = source else {
+        return Err(ApiError::BadRequest(exceeds_capacity(
             request.amount,
-            capacity.max_withdrawable,
-            capacity.available_usdc,
-            capacity.in_flight_withdrawals,
-            capacity.reserved_for_open_buys
+            &capacity,
         )));
-    }
+    };
 
     let id = Uuid::new_v4();
     let requested_at = Utc::now();
@@ -1208,7 +1211,25 @@ async fn reserve_withdrawal(
     }
     // The row now counts against capacity everywhere: entries may resume.
     lock.unlock_entries().await?;
-    Ok(Reservation::Reserved { id, requested_at })
+    Ok(Reservation::Reserved {
+        id,
+        requested_at,
+        source,
+    })
+}
+
+/// Why `amount` may not leave a wallet with `capacity`.
+fn exceeds_capacity(amount: Decimal, capacity: &crate::withdrawals::WithdrawalCapacity) -> String {
+    format!(
+        "Withdrawal of {} USDC exceeds the {} USDC that can leave this wallet in one \
+         withdrawal (balance {} in USDC.e and pUSD, drawn on one of them; unconfirmed \
+         withdrawals {}, open live buy orders {})",
+        amount,
+        capacity.max_withdrawable,
+        capacity.available_usdc,
+        capacity.in_flight_withdrawals,
+        capacity.reserved_for_open_buys
+    )
 }
 
 /// Reserve, sign, journal and send a withdrawal, then wait briefly for it to
@@ -1221,20 +1242,24 @@ async fn submit_withdrawal(
     request: WithdrawalRequest,
 ) -> ApiResult<WalletWithdrawalRow> {
     let mut lock = SpendLock::acquire(&state.pool, &request.source).await?;
-    let (withdrawal_id, requested_at) = match reserve_withdrawal(&mut lock, &client, &request).await
-    {
-        Ok(Reservation::Reserved { id, requested_at }) => (id, requested_at),
-        Ok(Reservation::Existing(row)) => {
-            lock.release().await;
-            return Ok(row);
-        }
-        Err(error) => {
-            lock.release().await;
-            return Err(error);
-        }
-    };
+    let (withdrawal_id, requested_at, source) =
+        match reserve_withdrawal(&mut lock, &client, &request).await {
+            Ok(Reservation::Reserved {
+                id,
+                requested_at,
+                source,
+            }) => (id, requested_at, source),
+            Ok(Reservation::Existing(row)) => {
+                lock.release().await;
+                return Ok(row);
+            }
+            Err(error) => {
+                lock.release().await;
+                return Err(error);
+            }
+        };
 
-    let signed = match sign_new_transfer(lock.conn(), &client, &wallet, &request).await {
+    let signed = match sign_new_transfer(lock.conn(), &client, &wallet, &request, source).await {
         Ok(signed) => signed,
         Err(error) => {
             // Nothing was signed for the chain to see: a certain non-transfer.
@@ -1436,14 +1461,16 @@ async fn sign_new_transfer(
     client: &PolygonClient,
     wallet: &auth::TradingWallet,
     request: &WithdrawalRequest,
+    source: WithdrawalSource,
 ) -> Result<polymarket_core::api::polygon::SignedTransaction, String> {
     let mut min_gas_price = 0;
     for _ in 0..3 {
         let signed = client
-            .prepare_usdc_transfer(
+            .prepare_withdrawal(
                 wallet.signer(),
                 &request.destination,
                 request.amount_units,
+                source,
                 min_gas_price,
             )
             .await
@@ -1481,7 +1508,7 @@ pub struct WithdrawalPreflightQuery {
 /// Response from the withdrawal preflight check.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WithdrawalPreflightResponse {
-    /// On-chain USDC balance of the source wallet (human-readable).
+    /// On-chain cash balance of the source wallet (USDC.e and pUSD, in USDC).
     pub available_usdc: Decimal,
     /// Withdrawals from this wallet not yet confirmed or rejected.
     pub in_flight_withdrawals: Decimal,
@@ -1489,7 +1516,8 @@ pub struct WithdrawalPreflightResponse {
     pub reserved_for_open_buys: Decimal,
     /// Market value of orphaned (untracked) inventory tokens.
     pub orphan_exposure: Decimal,
-    /// Maximum USDC that can leave the wallet now (what a withdrawal enforces).
+    /// Maximum USDC that one withdrawal can take from the wallet now (what a
+    /// withdrawal enforces: it draws on either its USDC.e or its pUSD).
     pub max_withdrawable: Decimal,
     /// Whether the wallet inventory data is considered fresh (< 10 minutes old).
     pub inventory_fresh: bool,
@@ -1546,21 +1574,20 @@ pub async fn withdrawal_preflight(
     let source_address =
         resolve_user_wallet_address(state.as_ref(), user_id, params.address.as_deref()).await?;
 
-    // Fetch on-chain USDC balance.
     // Holds first, then the balance, as a withdrawal reads them.
     let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
     let holds = {
         let mut conn = state.pool.acquire().await?;
         WithdrawalHolds::load(&mut conn, &source_address).await?
     };
-    let balance_units = polygon_client
-        .get_usdc_balance_units(&source_address)
+    let cash = polygon_client
+        .get_cash_balances(&source_address)
         .await
         .map_err(|e| {
             warn!(error = %chain_error_message(&e), "Failed to fetch source wallet balance");
             ApiError::ServiceUnavailable("Could not read the wallet's USDC balance".into())
         })?;
-    let capacity = holds.capacity(balance_units);
+    let (capacity, source) = withdrawal_plan(&holds, &cash, params.amount);
 
     // Query orphan exposure from wallet_inventory.
     let orphan_exposure: Decimal = sqlx::query_scalar(
@@ -1589,16 +1616,8 @@ pub async fn withdrawal_preflight(
         .unwrap_or(false);
 
     let mut blocking_reasons = capacity.blocking_reasons.clone();
-    if params.amount > capacity.max_withdrawable {
-        blocking_reasons.push(format!(
-            "Requested {} USDC exceeds the {} USDC that can leave this wallet \
-             (balance {}, unconfirmed withdrawals {}, open live buy orders {})",
-            params.amount,
-            capacity.max_withdrawable,
-            capacity.available_usdc,
-            capacity.in_flight_withdrawals,
-            capacity.reserved_for_open_buys
-        ));
+    if source.is_none() {
+        blocking_reasons.push(exceeds_capacity(params.amount, &capacity));
     }
     let can_withdraw = blocking_reasons.is_empty();
 

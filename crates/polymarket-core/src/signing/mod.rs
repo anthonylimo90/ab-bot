@@ -1,7 +1,9 @@
 //! Signing module for Polymarket CLOB orders.
 //!
 //! This module provides EIP-712 typed data signing for orders and
-//! authentication messages required by the Polymarket CLOB API.
+//! authentication messages required by the Polymarket CLOB API. Orders are
+//! signed for the CTF Exchange V2 (domain version "2"), the only exchange the
+//! CLOB accepts orders for since its V2 cutover of 2026-04-28.
 //!
 //! # Architecture
 //!
@@ -49,9 +51,10 @@ pub mod order_types;
 pub mod signer;
 
 pub use domain::{
-    ClobAuthDomain, Eip712Domain, OrderSide, SignatureType, CTF_ADDRESS, CTF_EXCHANGE_ADDRESS,
-    NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS, POLYGON_AMOY_CHAIN_ID,
-    POLYGON_CHAIN_ID, USDC_ADDRESS,
+    ClobAuthDomain, Eip712Domain, OrderSide, SignatureType, COLLATERAL_ADDRESS,
+    COLLATERAL_OFFRAMP_ADDRESS, COLLATERAL_ONRAMP_ADDRESS, CTF_ADDRESS, CTF_EXCHANGE_ADDRESS,
+    EXCHANGE_DOMAIN_VERSION, NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS,
+    POLYGON_AMOY_CHAIN_ID, POLYGON_CHAIN_ID, USDC_ADDRESS,
 };
 
 pub use order_types::{OrderBuilder, OrderData, SignedOrder};

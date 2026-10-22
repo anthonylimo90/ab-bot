@@ -1,18 +1,24 @@
 //! On-chain ERC-20 / ERC-1155 approval transactions for Polymarket.
 //!
-//! Sends the 6 approval transactions required before the CLOB can move
-//! funds on behalf of the maker wallet:
+//! Sends the approvals required before the CLOB (V2) can move funds on
+//! behalf of the maker wallet, and before its USDC.e can be wrapped into
+//! pUSD and pUSD paid out as USDC.e:
 //!
-//! 1. USDC.e  → approve(CTF Exchange,          MAX)
+//! 1. pUSD    → approve(CTF Exchange,           MAX)
 //! 2. CTF     → setApprovalForAll(CTF Exchange, true)
-//! 3. USDC.e  → approve(Neg Risk CTF Exchange,  MAX)
+//! 3. pUSD    → approve(Neg Risk CTF Exchange,  MAX)
 //! 4. CTF     → setApprovalForAll(Neg Risk CTF Exchange, true)
-//! 5. USDC.e  → approve(Neg Risk Adapter,       MAX)
+//! 5. pUSD    → approve(Neg Risk Adapter,       MAX)
 //! 6. CTF     → setApprovalForAll(Neg Risk Adapter, true)
+//! 7. USDC.e  → approve(Collateral Onramp,      MAX)
+//! 8. pUSD    → approve(Collateral Offramp,     MAX)
+//!
+//! The ramps only ever pull from their caller, so their approvals let no one
+//! else move the wallet's funds.
 
 use crate::signing::{
-    CTF_ADDRESS, CTF_EXCHANGE_ADDRESS, NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS,
-    USDC_ADDRESS,
+    COLLATERAL_ADDRESS, COLLATERAL_OFFRAMP_ADDRESS, COLLATERAL_ONRAMP_ADDRESS, CTF_ADDRESS,
+    CTF_EXCHANGE_ADDRESS, NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS, USDC_ADDRESS,
 };
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
@@ -20,12 +26,12 @@ use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-/// Minimum POL balance needed for approval transactions (~6 txns × 60k gas × ~50 gwei).
 /// How often, and how many times, an approval's on-chain state is re-read
 /// before it is reported as not in effect.
 const APPROVAL_CONFIRM_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(if cfg!(test) { 10 } else { 2000 });
 const APPROVAL_CONFIRM_POLLS: u32 = 60;
+/// Minimum POL balance needed for approval transactions (~8 txns × 60k gas × ~40 gwei).
 const MIN_GAS_WEI: u128 = 20_000_000_000_000_000; // 0.02 POL
 
 /// Polygon chain ID.
@@ -219,10 +225,11 @@ async fn wait_for_receipt(http: &reqwest::Client, rpc_url: &str, tx_hash: &str) 
     anyhow::bail!("Transaction {} not mined after 120s", tx_hash)
 }
 
-/// Check if a USDC.e allowance is already set for a spender.
+/// The allowance `owner` gives `spender` of `token`.
 async fn check_erc20_allowance(
     http: &reqwest::Client,
     rpc_url: &str,
+    token: &Address,
     owner: &Address,
     spender: &Address,
 ) -> Result<U256> {
@@ -238,7 +245,7 @@ async fn check_erc20_allowance(
         "id": 1,
         "method": "eth_call",
         "params": [
-            { "to": USDC_ADDRESS, "data": format!("0x{}", hex::encode(&data)) },
+            { "to": format!("{token:#x}"), "data": format!("0x{}", hex::encode(&data)) },
             "latest"
         ]
     });
@@ -303,19 +310,41 @@ async fn get_native_balance(
         .context("Failed to parse eth_getBalance result")
 }
 
-/// Ensure all 6 Polymarket approvals are set for the given wallet.
-///
-/// Checks existing approvals first and only sends transactions for missing ones.
-/// Returns the number of new approvals sent.
-pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &str) -> Result<u32> {
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("Failed to build HTTP client")?;
-    let address = signer.address();
+/// The ERC-20 approvals the wallet gives: (token name, token, spender name, spender).
+fn erc20_approvals() -> [(&'static str, Address, &'static str, Address); 5] {
+    let pusd: Address = COLLATERAL_ADDRESS.parse().expect("invalid pUSD address");
+    let usdc: Address = USDC_ADDRESS.parse().expect("invalid USDC address");
+    [
+        ("pUSD", pusd, "CTF Exchange", exchange_spenders()[0].1),
+        (
+            "pUSD",
+            pusd,
+            "Neg Risk CTF Exchange",
+            exchange_spenders()[1].1,
+        ),
+        ("pUSD", pusd, "Neg Risk Adapter", exchange_spenders()[2].1),
+        (
+            "USDC.e",
+            usdc,
+            "Collateral Onramp",
+            COLLATERAL_ONRAMP_ADDRESS
+                .parse()
+                .expect("invalid Onramp address"),
+        ),
+        (
+            "pUSD",
+            pusd,
+            "Collateral Offramp",
+            COLLATERAL_OFFRAMP_ADDRESS
+                .parse()
+                .expect("invalid Offramp address"),
+        ),
+    ]
+}
 
-    let spenders: [(&str, Address); 3] = [
+/// The contracts that settle trades, and so move the wallet's outcome tokens.
+fn exchange_spenders() -> [(&'static str, Address); 3] {
+    [
         (
             "CTF Exchange",
             CTF_EXCHANGE_ADDRESS
@@ -334,9 +363,20 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
                 .parse()
                 .expect("invalid Neg Risk Adapter address"),
         ),
-    ];
+    ]
+}
 
-    let usdc: Address = USDC_ADDRESS.parse().expect("invalid USDC address");
+/// Ensure every Polymarket approval is set for the given wallet.
+///
+/// Checks existing approvals first and only sends transactions for missing ones.
+/// Returns the number of new approvals sent.
+pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &str) -> Result<u32> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let address = signer.address();
     let ctf: Address = CTF_ADDRESS.parse().expect("invalid CTF address");
 
     // Check POL balance for gas before attempting any transactions
@@ -363,59 +403,70 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
     // Use 1.2x gas price for faster inclusion
     let gas_price = gas_price + gas_price / 5;
     let mut approvals_sent = 0u32;
+    // Consider "sufficient" if allowance > 1M USDC (to avoid re-approving on every restart)
+    let threshold = U256::from(1_000_000_000_000u64); // 1M in 6-decimal units
 
-    for (name, spender) in &spenders {
-        // 1. Check & set USDC.e approval
-        let allowance = check_erc20_allowance(&http, rpc_url, &address, spender).await?;
-        // Consider "sufficient" if allowance > 1M USDC (to avoid re-approving on every restart)
-        let threshold = U256::from(1_000_000_000_000u64); // 1M USDC in 6-decimal
-        if allowance < threshold {
-            info!(spender = %name, "Setting USDC.e approval");
-            // A fresh pending nonce each time: an unclear send may or may not
-            // have used the previous one.
-            let tx = TxLegacy {
-                chain_id: Some(CHAIN_ID),
-                nonce: get_nonce(&http, rpc_url, &address).await?,
-                gas_price,
-                gas_limit: 100_000, // USDC.e proxy uses ~67k gas
-                to: TxKind::Call(usdc),
-                value: U256::ZERO,
-                input: encode_approve(*spender),
-            };
-            let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
-            info!(tx_hash = ?hash, spender = %name, "USDC.e approve tx sent");
-            confirm_approval(&http, rpc_url, hash.as_deref(), || async {
-                Ok(check_erc20_allowance(&http, rpc_url, &address, spender).await? >= threshold)
-            })
-            .await?;
-            approvals_sent += 1;
-        } else {
-            info!(spender = %name, "USDC.e approval already set");
+    for (token_name, token, spender_name, spender) in erc20_approvals() {
+        let allowance = check_erc20_allowance(&http, rpc_url, &token, &address, &spender).await?;
+        if allowance >= threshold {
+            info!(
+                token = token_name,
+                spender = spender_name,
+                "Approval already set"
+            );
+            continue;
         }
+        info!(
+            token = token_name,
+            spender = spender_name,
+            "Setting approval"
+        );
+        // A fresh pending nonce each time: an unclear send may or may not
+        // have used the previous one.
+        let tx = TxLegacy {
+            chain_id: Some(CHAIN_ID),
+            nonce: get_nonce(&http, rpc_url, &address).await?,
+            gas_price,
+            gas_limit: 100_000, // a proxied token's approve uses ~67k gas
+            to: TxKind::Call(token),
+            value: U256::ZERO,
+            input: encode_approve(spender),
+        };
+        let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
+        info!(tx_hash = ?hash, token = token_name, spender = spender_name, "approve tx sent");
+        confirm_approval(&http, rpc_url, hash.as_deref(), || async {
+            Ok(
+                check_erc20_allowance(&http, rpc_url, &token, &address, &spender).await?
+                    >= threshold,
+            )
+        })
+        .await?;
+        approvals_sent += 1;
+    }
 
-        // 2. Check & set CTF setApprovalForAll
-        let approved = check_erc1155_approval(&http, rpc_url, &address, spender).await?;
-        if !approved {
-            info!(spender = %name, "Setting CTF setApprovalForAll");
-            let tx = TxLegacy {
-                chain_id: Some(CHAIN_ID),
-                nonce: get_nonce(&http, rpc_url, &address).await?,
-                gas_price,
-                gas_limit: 100_000,
-                to: TxKind::Call(ctf),
-                value: U256::ZERO,
-                input: encode_set_approval_for_all(*spender),
-            };
-            let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
-            info!(tx_hash = ?hash, spender = %name, "CTF setApprovalForAll tx sent");
-            confirm_approval(&http, rpc_url, hash.as_deref(), || {
-                check_erc1155_approval(&http, rpc_url, &address, spender)
-            })
-            .await?;
-            approvals_sent += 1;
-        } else {
+    for (name, spender) in exchange_spenders() {
+        let approved = check_erc1155_approval(&http, rpc_url, &address, &spender).await?;
+        if approved {
             info!(spender = %name, "CTF approval already set");
+            continue;
         }
+        info!(spender = %name, "Setting CTF setApprovalForAll");
+        let tx = TxLegacy {
+            chain_id: Some(CHAIN_ID),
+            nonce: get_nonce(&http, rpc_url, &address).await?,
+            gas_price,
+            gas_limit: 100_000,
+            to: TxKind::Call(ctf),
+            value: U256::ZERO,
+            input: encode_set_approval_for_all(spender),
+        };
+        let hash = send_raw_tx(&http, rpc_url, signer, tx).await?;
+        info!(tx_hash = ?hash, spender = %name, "CTF setApprovalForAll tx sent");
+        confirm_approval(&http, rpc_url, hash.as_deref(), || {
+            check_erc1155_approval(&http, rpc_url, &address, &spender)
+        })
+        .await?;
+        approvals_sent += 1;
     }
 
     info!(
@@ -431,6 +482,38 @@ pub async fn ensure_polymarket_approvals(signer: &PrivateKeySigner, rpc_url: &st
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn the_v2_exchanges_and_the_collateral_ramps_are_approved() {
+        let erc20: Vec<(String, String)> = erc20_approvals()
+            .iter()
+            .map(|(_, token, _, spender)| (format!("{token:#x}"), format!("{spender:#x}")))
+            .collect();
+        let lower = |address: &str| address.to_ascii_lowercase();
+        let pusd = lower(COLLATERAL_ADDRESS);
+        assert_eq!(
+            erc20,
+            [
+                (pusd.clone(), lower(CTF_EXCHANGE_ADDRESS)),
+                (pusd.clone(), lower(NEG_RISK_CTF_EXCHANGE_ADDRESS)),
+                (pusd.clone(), lower(NEG_RISK_ADAPTER_ADDRESS)),
+                (lower(USDC_ADDRESS), lower(COLLATERAL_ONRAMP_ADDRESS)),
+                (pusd, lower(COLLATERAL_OFFRAMP_ADDRESS)),
+            ]
+        );
+        let operators: Vec<String> = exchange_spenders()
+            .iter()
+            .map(|(_, spender)| format!("{spender:#x}"))
+            .collect();
+        assert_eq!(
+            operators,
+            [
+                lower(CTF_EXCHANGE_ADDRESS),
+                lower(NEG_RISK_CTF_EXCHANGE_ADDRESS),
+                lower(NEG_RISK_ADAPTER_ADDRESS)
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn an_unclear_send_counts_only_once_the_approval_is_in_effect() {

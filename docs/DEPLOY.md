@@ -534,7 +534,50 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   the highest published fee on top of their amount, so a buy cannot spend
   USDC held back for an unsettled withdrawal.
 
-Whether the exchange's `makingAmount`/`takingAmount` are before or after the
-fee is not documented. The accounting assumes before (the documented "pre-fee"
-order amount). To check on a deployment, compare one live sell's
-`takingAmount` with the USDC balance change it caused.
+The fee is charged apart from the fill amounts. The CTF Exchange V2 contract
+(`_settleTakerOrder` in Polymarket's ctf-exchange-v2 `Trading.sol`) pulls a
+taker buy's fee on top of the collateral the fill costs and deducts a taker
+sell's fee from its proceeds, and its `OrderFilled` event reports the fill
+amounts and the fee separately. The accounting books exactly that: fills at
+their pre-fee amounts, fees charged on top.
+
+### CLOB V2 and pUSD collateral (093)
+
+Polymarket moved the CLOB to V2 on 2026-04-28 and no longer accepts orders
+signed for the V1 exchange. Orders are now signed for the CTF Exchange V2
+(`0xE111180000d2663C0091e4f400237545B87B996B`) or, in neg-risk markets, the
+Neg Risk CTF Exchange V2 (`0xe2222d279d744050d28e00520010520000310F59`),
+with EIP-712 domain version `"2"`. The signed order carries a creation time
+in milliseconds, metadata and builder fields, and no longer a nonce, fee rate,
+taker or expiration (a good-till-date order still sends its expiration,
+unsigned). Fees are set by the exchange when an order matches.
+
+- The exchange's collateral is pUSD (`0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`),
+  backed 1:1 by USDC.e. At startup the API approves pUSD and the Conditional
+  Tokens for both V2 exchanges and the Neg Risk Adapter, USDC.e for the
+  Collateral Onramp and pUSD for the Collateral Offramp. Fund the wallet with
+  a little more POL than before (eight approvals on a fresh wallet).
+- The API then wraps the trading wallet's USDC.e into pUSD, at startup and
+  every five minutes, so deposits become tradable without a restart. A wrap
+  waits until no withdrawal from the wallet is unresolved and nothing it sent
+  is pending, and holds the wallet's spend lock until it is mined, raising its
+  gas price if the network asks more. A withdrawal request made during a wrap
+  waits for it (seconds, normally). The log says "Wrapping USDC.e into pUSD".
+- Cash, for equity, the circuit breaker and the vault balance, is the
+  wallet's USDC.e plus its pUSD, both read at one block.
+- A withdrawal still pays the recipient USDC.e: from the wallet's USDC.e with
+  a transfer when that covers it, otherwise from its pUSD through the
+  Offramp's `unwrap`, which pays the recipient directly. One withdrawal draws
+  on one of the two, so the most one can take is the larger capacity. An
+  unwrap the node expects to fail (for example while the Offramp is paused)
+  is refused before anything is signed. A withdrawal's gas bump re-signs its
+  journaled transaction exactly, whichever kind it is.
+- 093 drops browser-wallet orders prepared for the V1 exchange (they can no
+  longer be submitted) and stores the signed creation time of new ones.
+- The bot-scanner indexer now reads trades from both V2 exchanges.
+- Polymarket's documentation says a plain EOA trades on the CLOB "if your EOA
+  is allowlisted for trading". The bot signs as an EOA (signature type 0);
+  confirm the trading wallet is allowed before enabling live trading. Markets
+  of Polymarket Protocol V2 (position ids, ExchangeV3, domain version `"3"`)
+  are not traded by this bot; CTF markets, which it trades by token id, stay
+  on the exchanges above.

@@ -463,8 +463,10 @@ async fn persist_snapshot(pool: &PgPool, snapshot: &AccountSnapshotRecord) -> an
     Ok(())
 }
 
-/// Observed USDC balance of the trading wallet; `None` when no wallet or RPC
-/// client is configured, so the balance is unknown rather than zero.
+/// Observed cash of the trading wallet: its USDC.e and its pUSD (the
+/// exchange's collateral, redeemable 1:1), read at one block so a wrap
+/// between two reads is never counted twice or missed. `None` when no wallet
+/// or RPC client is configured, so the balance is unknown rather than zero.
 async fn load_wallet_balance(
     state: &AppState,
     wallet_address: Option<&str>,
@@ -477,14 +479,11 @@ async fn load_wallet_balance(
         return Ok(None);
     };
 
-    let balance = polygon_client
-        .get_usdc_balance(address)
+    let cash = polygon_client
+        .get_cash_balances(address)
         .await
-        .with_context(|| format!("failed to fetch USDC balance for {address}"))?;
-
-    Decimal::from_f64_retain(balance)
-        .context("failed to convert wallet balance into Decimal")
-        .map(Some)
+        .with_context(|| format!("failed to fetch the cash balance of {address}"))?;
+    Ok(Some(cash.total()))
 }
 
 async fn load_realized_pnl_24h(pool: &PgPool) -> anyhow::Result<Decimal> {

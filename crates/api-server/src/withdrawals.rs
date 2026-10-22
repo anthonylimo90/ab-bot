@@ -1,6 +1,10 @@
 //! On-chain USDC withdrawals: capacity checks, a durable submission journal and
 //! a reconciler that resolves every journaled transfer from the chain.
 //!
+//! The recipient always receives USDC.e: from the wallet's USDC.e with a
+//! transfer, or from its pUSD (the exchange's collateral) unwrapped by the
+//! Collateral Offramp straight to the recipient.
+//!
 //! A transfer moves through `pending` (row written, nothing signed) →
 //! `submitting` (signed; hash, nonce and raw bytes journaled before the
 //! broadcast) → `submitted` (a node holds it) → `confirmed` / `failed`.
@@ -20,7 +24,8 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use polymarket_core::api::polygon::{
-    legacy_call, legacy_nonce_and_gas_price, BroadcastOutcome, MinedTransaction,
+    legacy_call, legacy_nonce_and_gas_price, BroadcastOutcome, CashBalances, MinedTransaction,
+    WithdrawalSource,
 };
 use polymarket_core::api::PolygonClient;
 use rust_decimal::Decimal;
@@ -239,10 +244,34 @@ impl WithdrawalHolds {
     }
 }
 
+/// How much may leave a wallet holding `cash`, and what a withdrawal of
+/// `amount` draws on: its USDC.e when that covers it, else its pUSD. One
+/// withdrawal draws on one token, so the most that may leave is the larger
+/// of the two capacities. Each token's capacity is its balance less every
+/// hold (holds are not split by token), which never overstates it.
+pub(crate) fn withdrawal_plan(
+    holds: &WithdrawalHolds,
+    cash: &CashBalances,
+    amount: Decimal,
+) -> (WithdrawalCapacity, Option<WithdrawalSource>) {
+    let usdc = holds.capacity(cash.usdc_units);
+    let pusd = holds.capacity(cash.pusd_units);
+    let source = if amount <= usdc.max_withdrawable {
+        Some(WithdrawalSource::Usdc)
+    } else if amount <= pusd.max_withdrawable {
+        Some(WithdrawalSource::Pusd)
+    } else {
+        None
+    };
+    let mut capacity = holds.capacity(cash.total_units());
+    capacity.max_withdrawable = usdc.max_withdrawable.max(pusd.max_withdrawable);
+    (capacity, source)
+}
+
 /// How much may leave `source` now.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WithdrawalCapacity {
-    /// On-chain USDC balance.
+    /// On-chain cash balance (USDC.e and pUSD).
     pub available_usdc: Decimal,
     /// Withdrawals from this wallet not yet resolved (they may still be mined).
     pub in_flight_withdrawals: Decimal,
@@ -408,8 +437,6 @@ struct UnresolvedWithdrawal {
     id: Uuid,
     user_id: Uuid,
     wallet_address: String,
-    destination_address: String,
-    amount: Decimal,
     status: String,
     tx_hash: Option<String>,
     replaced_tx_hashes: Vec<String>,
@@ -422,9 +449,8 @@ struct UnresolvedWithdrawal {
 }
 
 /// The columns of an [`UnresolvedWithdrawal`].
-const UNRESOLVED_COLUMNS: &str = "id, user_id, wallet_address, destination_address, amount, \
-    status, tx_hash, replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, \
-    superseded_seen_at";
+const UNRESOLVED_COLUMNS: &str = "id, user_id, wallet_address, status, tx_hash, \
+    replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, superseded_seen_at";
 
 /// The withdrawals the reconciler can decide, given `REVERTED_ERROR` as $1 and
 /// `SECOND_CHANCE_HOURS` as $2.
@@ -832,22 +858,11 @@ fn fee_bump_due(row: &UnresolvedWithdrawal) -> bool {
             < Utc::now() - Duration::minutes(FEE_BUMP_AFTER_MINUTES)
 }
 
-/// `amount` USDC in base units (six decimals), when it is a positive whole
-/// number of them.
-fn usdc_units(amount: Decimal) -> Option<u128> {
-    use rust_decimal::prelude::ToPrimitive;
-    let units = amount * Decimal::from(1_000_000u64);
-    (units > Decimal::ZERO && units.fract().is_zero())
-        .then(|| units.to_u128())
-        .flatten()
-}
-
 /// A transfer's latest transaction, when the network now asks more for gas
 /// than it pays.
 struct Underpriced {
     nonce: u64,
     gas_price: u128,
-    amount_units: u128,
 }
 
 /// Whether the transfer's latest transaction (its journaled `raw_tx`) pays
@@ -870,26 +885,19 @@ async fn underpriced(
         warn!(withdrawal_id = %row.id, "Journaled withdrawal does not match its nonce; its gas price is not raised");
         return Ok(None);
     }
-    let Some(amount_units) = usdc_units(row.amount) else {
-        warn!(withdrawal_id = %row.id, amount = %row.amount, "Withdrawal amount is not whole USDC units; its gas price is not raised");
-        return Ok(None);
-    };
     let network_price = client
         .gas_price_wei()
         .await
         .map_err(|error| anyhow::anyhow!(chain_error_message(&error)))?;
-    Ok((network_price > gas_price).then_some(Underpriced {
-        nonce,
-        gas_price,
-        amount_units,
-    }))
+    Ok((network_price > gas_price).then_some(Underpriced { nonce, gas_price }))
 }
 
-/// Sign the underpriced transfer again at the same nonce, paying the
-/// network's price (with the margin new transfers carry) and at least a tenth
-/// more than before (what nodes require of a replacement). The new
-/// transaction is journaled, keeping every earlier hash, before it is sent:
-/// whichever one is mined settles the transfer, and only one can be.
+/// Sign the underpriced transfer again at the same nonce, making the same
+/// call with the same gas limit, paying the network's price (with the margin
+/// new transfers carry) and at least a tenth more than before (what nodes
+/// require of a replacement). The new transaction is journaled, keeping every
+/// earlier hash, before it is sent: whichever one is mined settles the
+/// transfer, and only one can be.
 async fn bump_fee(
     conn: &mut PgConnection,
     client: &PolygonClient,
@@ -898,11 +906,10 @@ async fn bump_fee(
     tx_hash: &str,
     latest: Underpriced,
 ) -> anyhow::Result<()> {
-    let Underpriced {
-        nonce,
-        gas_price,
-        amount_units,
-    } = latest;
+    let Underpriced { nonce, gas_price } = latest;
+    let Some(original) = row.raw_tx.as_deref() else {
+        return Ok(());
+    };
     if !wallet
         .address_string()
         .eq_ignore_ascii_case(&row.wallet_address)
@@ -915,13 +922,7 @@ async fn bump_fee(
     let mut replacement = None;
     for _ in 0..3 {
         let signed = client
-            .prepare_usdc_replacement(
-                wallet.signer(),
-                &row.destination_address,
-                amount_units,
-                nonce,
-                min_gas_price,
-            )
+            .prepare_replacement(wallet.signer(), original, nonce, min_gas_price)
             .await
             .map_err(|error| anyhow::anyhow!(chain_error_message(&error)))?;
         anyhow::ensure!(signed.nonce == nonce, "replacement signed at another nonce");
@@ -935,10 +936,9 @@ async fn bump_fee(
         warn!(withdrawal_id = %row.id, "Could not sign a replacement distinct from earlier transactions");
         return Ok(());
     };
-    // It must be the same transfer as the transaction it replaces, whatever
-    // the row says.
-    let original = row.raw_tx.as_deref().and_then(legacy_call);
-    if original.is_none() || legacy_call(&signed.raw) != original {
+    // It must be the same transfer as the transaction it replaces.
+    let replaced = legacy_call(original);
+    if replaced.is_none() || legacy_call(&signed.raw) != replaced {
         warn!(withdrawal_id = %row.id, "Replacement would not repeat the journaled transfer; its gas price is not raised");
         return Ok(());
     }

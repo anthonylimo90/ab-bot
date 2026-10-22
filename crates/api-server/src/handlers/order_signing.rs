@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use auth::Claims;
 use polymarket_core::signing::{
-    SignedOrder, CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS, POLYGON_CHAIN_ID,
+    SignedOrder, CTF_EXCHANGE_ADDRESS, EXCHANGE_DOMAIN_VERSION, NEG_RISK_CTF_EXCHANGE_ADDRESS,
+    POLYGON_CHAIN_ID,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -35,26 +36,27 @@ pub struct Eip712Domain {
     pub verifying_contract: String,
 }
 
-/// EIP-712 Order type for Polymarket CTF Exchange.
+/// EIP-712 Order type for the Polymarket CTF Exchange (V2).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct Eip712Order {
     pub salt: String,
     pub maker: String,
     pub signer: String,
-    pub taker: String,
     #[serde(rename = "tokenId")]
     pub token_id: String,
     #[serde(rename = "makerAmount")]
     pub maker_amount: String,
     #[serde(rename = "takerAmount")]
     pub taker_amount: String,
-    pub expiration: String,
-    pub nonce: String,
-    #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps: String,
     pub side: u8,
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
+    /// Creation time in unix milliseconds.
+    pub timestamp: String,
+    /// bytes32, zero.
+    pub metadata: String,
+    /// bytes32, zero.
+    pub builder: String,
 }
 
 /// Full EIP-712 typed data structure for signing.
@@ -162,16 +164,16 @@ pub struct SubmitOrderResponse {
 const INSERT_PENDING_ORDER: &str = r#"
     INSERT INTO pending_wallet_orders (
         id, user_id, maker_address, token_id, side,
-        maker_amount, taker_amount, salt, expiration, nonce,
-        fee_rate_bps, signature_type, neg_risk, expires_at, created_at
+        maker_amount, taker_amount, salt, expiration, order_timestamp,
+        signature_type, neg_risk, expires_at, created_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 "#;
 
 const SELECT_PENDING_ORDER: &str = r#"
     SELECT id, user_id, maker_address, token_id, side,
-           maker_amount, taker_amount, salt, expiration, nonce,
-           fee_rate_bps, signature_type, neg_risk, expires_at, created_at
+           maker_amount, taker_amount, salt, expiration, order_timestamp,
+           signature_type, neg_risk, expires_at, created_at
     FROM pending_wallet_orders
     WHERE id = $1 AND user_id = $2
 "#;
@@ -190,8 +192,8 @@ struct PendingOrderRow {
     taker_amount: String,
     salt: String,
     expiration: i64,
-    nonce: String,
-    fee_rate_bps: i32,
+    /// The signed creation time, in unix milliseconds.
+    order_timestamp: i64,
     signature_type: i16,
     neg_risk: bool,
     expires_at: DateTime<Utc>,
@@ -258,56 +260,25 @@ fn build_eip712_types() -> Eip712Types {
                 type_name: "address".to_string(),
             },
         ],
-        order: vec![
-            TypeDefinition {
-                name: "salt".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "maker".to_string(),
-                type_name: "address".to_string(),
-            },
-            TypeDefinition {
-                name: "signer".to_string(),
-                type_name: "address".to_string(),
-            },
-            TypeDefinition {
-                name: "taker".to_string(),
-                type_name: "address".to_string(),
-            },
-            TypeDefinition {
-                name: "tokenId".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "makerAmount".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "takerAmount".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "expiration".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "nonce".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "feeRateBps".to_string(),
-                type_name: "uint256".to_string(),
-            },
-            TypeDefinition {
-                name: "side".to_string(),
-                type_name: "uint8".to_string(),
-            },
-            TypeDefinition {
-                name: "signatureType".to_string(),
-                type_name: "uint8".to_string(),
-            },
-        ],
+        order: [
+            ("salt", "uint256"),
+            ("maker", "address"),
+            ("signer", "address"),
+            ("tokenId", "uint256"),
+            ("makerAmount", "uint256"),
+            ("takerAmount", "uint256"),
+            ("side", "uint8"),
+            ("signatureType", "uint8"),
+            ("timestamp", "uint256"),
+            ("metadata", "bytes32"),
+            ("builder", "bytes32"),
+        ]
+        .into_iter()
+        .map(|(name, type_name)| TypeDefinition {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+        })
+        .collect(),
     }
 }
 
@@ -365,12 +336,12 @@ pub async fn prepare_order(
     req.token_id
         .parse::<alloy_primitives::U256>()
         .map_err(|_| ApiError::BadRequest("Invalid token ID".into()))?;
-    let (neg_risk, fee_rate) = state
+    let neg_risk = state
         .clob_client
-        .get_order_metadata(&req.token_id)
+        .get_neg_risk(&req.token_id)
         .await
         .map_err(|_| {
-            ApiError::ServiceUnavailable("Exchange contract/fee metadata unavailable".into())
+            ApiError::ServiceUnavailable("Exchange contract metadata unavailable".into())
         })?;
 
     // Calculate expiration
@@ -383,6 +354,7 @@ pub async fn prepare_order(
     let now = Utc::now();
     let expires_at = now + Duration::seconds(expires_in_secs as i64);
     let expiration_timestamp = expires_at.timestamp() as u64;
+    let order_timestamp = now.timestamp_millis();
 
     // Generate salt and calculate amounts
     let salt = generate_salt();
@@ -402,11 +374,7 @@ pub async fn prepare_order(
         .bind(&taker_amount)
         .bind(&salt)
         .bind(expiration_timestamp as i64)
-        .bind("0") // nonce
-        .bind(
-            i32::try_from(fee_rate)
-                .map_err(|_| ApiError::ServiceUnavailable("Invalid fee rate".into()))?,
-        ) // fee_rate_bps
+        .bind(order_timestamp)
         .bind(0i16) // signature_type (EOA)
         .bind(neg_risk)
         .bind(expires_at)
@@ -426,7 +394,7 @@ pub async fn prepare_order(
         primary_type: "Order".to_string(),
         domain: Eip712Domain {
             name: "Polymarket CTF Exchange".to_string(),
-            version: "1".to_string(),
+            version: EXCHANGE_DOMAIN_VERSION.to_string(),
             chain_id: POLYGON_CHAIN_ID,
             verifying_contract: verifying_contract.to_string(),
         },
@@ -434,15 +402,14 @@ pub async fn prepare_order(
             salt: salt.clone(),
             maker: req.maker_address.clone(),
             signer: req.maker_address.clone(),
-            taker: "0x0000000000000000000000000000000000000000".to_string(),
             token_id: req.token_id.clone(),
             maker_amount: maker_amount.clone(),
             taker_amount: taker_amount.clone(),
-            expiration: expiration_timestamp.to_string(),
-            nonce: "0".to_string(),
-            fee_rate_bps: fee_rate.to_string(),
             side,
             signature_type: 0, // EOA
+            timestamp: order_timestamp.to_string(),
+            metadata: format!("{:#x}", B256::ZERO),
+            builder: format!("{:#x}", B256::ZERO),
         },
     };
 
@@ -581,18 +548,21 @@ pub async fn submit_order(
             "{:#x}",
             order_digest(&pending_order).map_err(ApiError::BadRequest)?
         )),
-        salt: pending_order.salt.parse::<u64>().unwrap_or(0),
+        salt: pending_order
+            .salt
+            .parse::<u64>()
+            .map_err(|_| ApiError::BadRequest("Invalid order salt".into()))?,
         maker: pending_order.maker_address.clone(),
         signer: pending_order.maker_address.clone(),
-        taker: "0x0000000000000000000000000000000000000000".to_string(),
         token_id: pending_order.token_id.clone(),
         maker_amount: pending_order.maker_amount.clone(),
         taker_amount: pending_order.taker_amount.clone(),
-        expiration: pending_order.expiration.to_string(),
-        nonce: pending_order.nonce.clone(),
-        fee_rate_bps: pending_order.fee_rate_bps.to_string(),
         side: side_str.to_string(),
+        expiration: pending_order.expiration.to_string(),
         signature_type: pending_order.signature_type as u8,
+        timestamp: pending_order.order_timestamp.to_string(),
+        metadata: format!("{:#x}", B256::ZERO),
+        builder: format!("{:#x}", B256::ZERO),
         signature: req.signature.clone(),
     };
 
@@ -701,19 +671,21 @@ fn order_digest(pending: &PendingOrderRow) -> Result<B256, String> {
         .maker_address
         .parse::<Address>()
         .map_err(|_| "Invalid maker")?;
+    let timestamp =
+        u64::try_from(pending.order_timestamp).map_err(|_| "Invalid order timestamp")?;
     let order = polymarket_core::signing::OrderData {
         salt: number(&pending.salt)?,
         maker,
         signer: maker,
-        taker: Address::ZERO,
         token_id: number(&pending.token_id)?,
         maker_amount: number(&pending.maker_amount)?,
         taker_amount: number(&pending.taker_amount)?,
-        expiration: U256::from(pending.expiration as u64),
-        nonce: number(&pending.nonce)?,
-        fee_rate_bps: U256::from(pending.fee_rate_bps as u64),
         side: pending.side as u8,
         signature_type: pending.signature_type as u8,
+        timestamp: U256::from(timestamp),
+        metadata: B256::ZERO,
+        builder: B256::ZERO,
+        expiration: U256::from(pending.expiration as u64),
     };
     let domain = if pending.neg_risk {
         polymarket_core::signing::Eip712Domain::neg_risk_ctf_exchange()
@@ -813,8 +785,7 @@ mod amount_tests {
             .bind("10000000")
             .bind("42")
             .bind(expires_at.timestamp())
-            .bind("0")
-            .bind(0i32)
+            .bind(Utc::now().timestamp_millis())
             .bind(0i16)
             .bind(true)
             .bind(expires_at)
@@ -872,8 +843,7 @@ mod amount_tests {
                 taker_amount: signed.taker_amount.clone(),
                 salt: signed.salt.to_string(),
                 expiration: now.timestamp() + 3600,
-                nonce: "0".into(),
-                fee_rate_bps: 0,
+                order_timestamp: signed.timestamp.parse().unwrap(),
                 signature_type: 0,
                 neg_risk: neg,
                 expires_at: now + Duration::hours(1),
@@ -911,6 +881,20 @@ mod amount_tests {
             now.timestamp()
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_browser_signs_the_v2_order_type() {
+        let types = build_eip712_types();
+        let fields: Vec<String> = types
+            .order
+            .iter()
+            .map(|field| format!("{} {}", field.type_name, field.name))
+            .collect();
+        assert_eq!(
+            format!("Order({})", fields.join(",")),
+            polymarket_core::signing::order_types::ORDER_TYPE
+        );
     }
 
     #[test]

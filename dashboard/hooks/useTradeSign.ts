@@ -2,7 +2,7 @@
 
 import { useState, useCallback } from 'react';
 import { useAccount, useSignTypedData } from 'wagmi';
-import api from '@/lib/api';
+import api, { ApiHttpError } from '@/lib/api';
 
 // EIP-712 type definitions matching backend
 interface Eip712Domain {
@@ -16,15 +16,14 @@ interface Eip712Order {
   salt: string;
   maker: string;
   signer: string;
-  taker: string;
   tokenId: string;
   makerAmount: string;
   takerAmount: string;
-  expiration: string;
-  nonce: string;
-  feeRateBps: string;
   side: number;
   signatureType: number;
+  timestamp: string;
+  metadata: string;
+  builder: string;
 }
 
 interface Eip712TypedData {
@@ -151,20 +150,20 @@ export function useTradeSign(): UseTradeSignReturn {
           verifyingContract: typed_data.domain.verifyingContract as `0x${string}`,
         };
 
+        // The CTF Exchange V2 order (the only one the exchange accepts).
         const types = {
           Order: [
             { name: 'salt', type: 'uint256' },
             { name: 'maker', type: 'address' },
             { name: 'signer', type: 'address' },
-            { name: 'taker', type: 'address' },
             { name: 'tokenId', type: 'uint256' },
             { name: 'makerAmount', type: 'uint256' },
             { name: 'takerAmount', type: 'uint256' },
-            { name: 'expiration', type: 'uint256' },
-            { name: 'nonce', type: 'uint256' },
-            { name: 'feeRateBps', type: 'uint256' },
             { name: 'side', type: 'uint8' },
             { name: 'signatureType', type: 'uint8' },
+            { name: 'timestamp', type: 'uint256' },
+            { name: 'metadata', type: 'bytes32' },
+            { name: 'builder', type: 'bytes32' },
           ],
         } as const;
 
@@ -172,15 +171,14 @@ export function useTradeSign(): UseTradeSignReturn {
           salt: BigInt(typed_data.message.salt),
           maker: typed_data.message.maker as `0x${string}`,
           signer: typed_data.message.signer as `0x${string}`,
-          taker: typed_data.message.taker as `0x${string}`,
           tokenId: BigInt(typed_data.message.tokenId),
           makerAmount: BigInt(typed_data.message.makerAmount),
           takerAmount: BigInt(typed_data.message.takerAmount),
-          expiration: BigInt(typed_data.message.expiration),
-          nonce: BigInt(typed_data.message.nonce),
-          feeRateBps: BigInt(typed_data.message.feeRateBps),
           side: typed_data.message.side,
           signatureType: typed_data.message.signatureType,
+          timestamp: BigInt(typed_data.message.timestamp),
+          metadata: typed_data.message.metadata as `0x${string}`,
+          builder: typed_data.message.builder as `0x${string}`,
         };
 
         signature = await signTypedDataAsync({
@@ -210,11 +208,21 @@ export function useTradeSign(): UseTradeSignReturn {
         });
         setState('submitting');
 
-        const submitResponse = await api.post<SubmitOrderResponse>('/api/v1/orders/submit', {
-          auth: { timestamp, nonce: 0, signature: authSignature },
-          pending_order_id: prepareResponse.pending_order_id,
-          signature,
-        });
+        let submitResponse: SubmitOrderResponse;
+        try {
+          submitResponse = await api.post<SubmitOrderResponse>('/api/v1/orders/submit', {
+            auth: { timestamp, nonce: 0, signature: authSignature },
+            pending_order_id: prepareResponse.pending_order_id,
+            signature,
+          });
+        } catch (submitError) {
+          // An expired or unknown pending order can never be submitted: forget
+          // it, so the next attempt prepares a new one instead of retrying it.
+          if (submitError instanceof ApiHttpError && (submitError.statusCode === 404 || submitError.statusCode === 410)) {
+            sessionStorage.removeItem(intentKey);
+          }
+          throw submitError;
+        }
 
         sessionStorage.removeItem(intentKey);
         if (!submitResponse.success) throw new Error('The exchange rejected this order.');

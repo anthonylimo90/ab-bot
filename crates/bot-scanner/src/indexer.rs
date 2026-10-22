@@ -14,30 +14,33 @@ use tracing::{debug, error, info, warn};
 
 /// Polymarket contract addresses for trade event monitoring.
 pub mod contracts {
-    /// CTF Exchange contract on Polygon.
-    pub const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+    pub use polymarket_core::signing::{CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS};
+
+    /// The exchanges whose trades are indexed: the CTF Exchange V2 for
+    /// standard markets and its neg-risk counterpart (trading moved to them
+    /// at the CLOB V2 cutover of 2026-04-28).
+    pub const EXCHANGES: [&str; 2] = [CTF_EXCHANGE_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS];
 }
 
-/// CTF Exchange event signatures that identify trading wallets.
+/// CTF Exchange V2 event signatures that identify trading wallets.
 ///
 /// ```solidity
 /// event OrderFilled(
 ///     bytes32 indexed orderHash, address indexed maker, address indexed taker,
-///     uint256 makerAssetId, uint256 takerAssetId,
-///     uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee);
+///     Side side, uint256 tokenId, uint256 makerAmountFilled,
+///     uint256 takerAmountFilled, uint256 fee, bytes32 builder, bytes32 metadata);
 /// event OrdersMatched(
 ///     bytes32 indexed takerOrderHash, address indexed takerOrderMaker,
-///     uint256 makerAssetId, uint256 takerAssetId,
-///     uint256 makerAmountFilled, uint256 takerAmountFilled);
+///     Side side, uint256 tokenId, uint256 makerAmountFilled,
+///     uint256 takerAmountFilled);
 /// ```
 ///
 /// In both events the first indexed parameter is an **order hash**, not an
 /// address; only the `address`-typed indexed parameters are wallets.
 pub mod events {
     pub const ORDER_FILLED: &str =
-        "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)";
-    pub const ORDERS_MATCHED: &str =
-        "OrdersMatched(bytes32,address,uint256,uint256,uint256,uint256)";
+        "OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)";
+    pub const ORDERS_MATCHED: &str = "OrdersMatched(bytes32,address,uint8,uint256,uint256,uint256)";
 }
 
 /// Largest block range requested from `eth_getLogs` in one poll.
@@ -86,9 +89,9 @@ impl TradeEventTopics {
     /// * Any other event, or a log whose topic count does not match the ABI,
     ///   yields nothing.
     ///
-    /// The zero address and the exchange contract itself (it appears as `taker`
-    /// when matching on behalf of the operator) are not trader wallets and are
-    /// dropped.
+    /// The zero address and the exchange contracts themselves (an exchange
+    /// appears as `taker` of the order it fills against makers) are not
+    /// trader wallets and are dropped.
     pub fn trader_addresses(&self, topics: &[String]) -> Vec<String> {
         let Some(signature) = topics.first() else {
             return Vec::new();
@@ -140,7 +143,9 @@ fn address_from_topic(topic: &str) -> Option<String> {
 
 fn is_non_trader(address: &str) -> bool {
     address == "0x0000000000000000000000000000000000000000"
-        || address.eq_ignore_ascii_case(contracts::CTF_EXCHANGE)
+        || contracts::EXCHANGES
+            .iter()
+            .any(|exchange| address.eq_ignore_ascii_case(exchange))
 }
 
 /// Bounded set of recently seen wallet addresses with least-recently-seen
@@ -281,12 +286,12 @@ impl TradeIndexer {
 
         debug!("Processing blocks {} to {}", from_block, to_block);
 
-        // Fetch only the exchange's trade events; other events (admin changes,
+        // Fetch only the exchanges' trade events; other events (admin changes,
         // token registration, ...) carry no trader wallets.
         let logs = self
             .polygon
             .get_logs_with_topics(
-                contracts::CTF_EXCHANGE,
+                &contracts::EXCHANGES,
                 from_block,
                 to_block,
                 self.topics.log_filter(),
@@ -383,16 +388,25 @@ mod tests {
     }
 
     #[test]
-    fn event_topic_hashes_match_the_deployed_exchange() {
-        // Topic0 values emitted by the Polymarket CTF Exchange on Polygon.
+    fn event_topic_hashes_are_the_v2_exchanges() {
         let topics = TradeEventTopics::new();
-        assert_eq!(
+        // Not the V1 exchange's topics, which no longer carry trades.
+        assert_ne!(
             topics.order_filled,
             "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
         );
-        assert_eq!(
+        assert_ne!(
             topics.orders_matched,
             "0x63bf4d16b7fa898ef4c4b2b6d90fd201e9c56313b65638af6088d149d2ce956c"
+        );
+        // The signatures the CTF Exchange V2 hashes into its topics.
+        assert_eq!(
+            topics.order_filled,
+            topic0("OrderFilled(bytes32,address,address,uint8,uint256,uint256,uint256,uint256,bytes32,bytes32)")
+        );
+        assert_eq!(
+            topics.orders_matched,
+            topic0("OrdersMatched(bytes32,address,uint8,uint256,uint256,uint256)")
         );
     }
 
@@ -478,10 +492,17 @@ mod tests {
         let log = vec![
             topics.order_filled.clone(),
             ORDER_HASH.to_string(),
-            topic_for(contracts::CTF_EXCHANGE),
+            topic_for(contracts::CTF_EXCHANGE_ADDRESS),
             topic_for("0x0000000000000000000000000000000000000000"),
         ];
         assert!(topics.trader_addresses(&log).is_empty());
+        let log = vec![
+            topics.order_filled.clone(),
+            ORDER_HASH.to_string(),
+            topic_for(MAKER),
+            topic_for(contracts::NEG_RISK_CTF_EXCHANGE_ADDRESS),
+        ];
+        assert_eq!(topics.trader_addresses(&log), vec![MAKER.to_string()]);
     }
 
     #[test]
