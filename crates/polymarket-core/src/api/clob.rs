@@ -1493,11 +1493,11 @@ fn base_units_to_decimal(raw: &str) -> Option<Decimal> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostOrderResponse {
     /// Order ID assigned by the CLOB (empty when it took no order).
-    #[serde(default, rename = "orderID")]
+    #[serde(default, rename = "orderID", deserialize_with = "null_as_default")]
     pub order_id: String,
     /// Status of the order (e.g. "matched", "delayed", "unmatched"). An
     /// empty one proves nothing: the order is reconciled from the exchange.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub status: String,
     #[serde(default, rename = "makingAmount")]
     pub making_amount: Option<String>,
@@ -1538,15 +1538,29 @@ impl PostOrderResponse {
     }
 
     /// Check if the order was explicitly not filled (FOK rejection), or not
-    /// taken at all (`success: false`) without a status saying it matched or
-    /// rests on the book.
+    /// taken at all.
     pub fn is_unfilled(&self) -> bool {
         let s = self.status.to_lowercase();
-        s == "unmatched"
-            || s == "rejected"
-            || (self.success == Some(false)
-                && !matches!(s.as_str(), "matched" | "live" | "delayed"))
+        s == "unmatched" || s == "rejected" || self.refused()
     }
+
+    /// Whether the exchange said it took no order (`success: false`) without
+    /// a status saying it matched or rests on the book.
+    pub fn refused(&self) -> bool {
+        self.success == Some(false)
+            && !matches!(
+                self.status.to_lowercase().as_str(),
+                "matched" | "live" | "delayed"
+            )
+    }
+}
+
+/// A string field the exchange may send as `null`: read as empty.
+fn null_as_default<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Confirmed exchange snapshot. Limit price is not an average execution price.
@@ -2722,7 +2736,14 @@ mod authenticated_tests {
         }))
         .unwrap();
         assert!(sparse.is_unfilled());
+        assert!(sparse.refused());
         assert_eq!(sparse.settlement_tx_hash(), None);
+        let nulls: PostOrderResponse = serde_json::from_value(serde_json::json!({
+            "success": true, "orderID": null, "status": null, "errorMsg": null
+        }))
+        .unwrap();
+        assert!(nulls.order_id.is_empty() && nulls.status.is_empty());
+        assert!(!nulls.is_unfilled() && !nulls.is_filled());
         // V1 responses read as before.
         let v1: PostOrderResponse = serde_json::from_value(serde_json::json!({
             "orderID": "0xabc", "status": "live", "transactionHash": "0xt"

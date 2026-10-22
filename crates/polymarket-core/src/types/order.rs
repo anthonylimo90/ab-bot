@@ -306,8 +306,11 @@ impl ExecutionReport {
         self
     }
 
+    /// Record the exchange's order id; an empty one records nothing.
     pub fn with_exchange_id(mut self, id: String) -> Self {
-        self.exchange_order_id = Some(id);
+        if !id.is_empty() {
+            self.exchange_order_id = Some(id);
+        }
         self
     }
 

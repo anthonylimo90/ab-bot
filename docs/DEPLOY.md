@@ -580,7 +580,8 @@ unsigned). Fees are set by the exchange when an order matches.
   that waits is looked after every 30 seconds: sent again if the node dropped
   it, its gas raised when the network asks more or the node refuses it (up
   to three times the network's price), until its nonce is used, by it or, as
-  two checks in a row find, by another transaction. After half an hour the
+  checks over two minutes find, by another transaction. A held lock whose
+  database session stops answering is taken again. After half an hour the
   lock is let go with a warning rather than hold withdrawals back without
   end; a restart lets go of it too. The log says "Wrapping USDC.e into pUSD";
   USDC.e left waiting for an hour is logged as a warning. The sweeper wraps

@@ -136,8 +136,15 @@ impl OrderExecutor {
 
         match operation().await {
             Ok(response) => {
-                sqlx::query("UPDATE execution_intents SET status = 'acknowledged', exchange_order_id = $2, response = $3, updated_at = NOW() WHERE id = $1")
-                    .bind(id).bind(&response.order_id).bind(serde_json::to_value(&response)?)
+                // An answer without an id keeps the order's own hash as its
+                // identity; one the exchange explicitly refused is rejected.
+                let status = if response.refused() {
+                    "rejected"
+                } else {
+                    "acknowledged"
+                };
+                sqlx::query("UPDATE execution_intents SET status = $4, exchange_order_id = COALESCE(NULLIF($2, ''), exchange_order_id), response = $3, updated_at = NOW() WHERE id = $1")
+                    .bind(id).bind(&response.order_id).bind(serde_json::to_value(&response)?).bind(status)
                     .execute(pool).await.map_err(|e| anyhow::anyhow!("{SUBMISSION_UNKNOWN}: acknowledgement persistence failed: {e}"))?;
                 Ok(response)
             }
@@ -248,6 +255,75 @@ mod tests {
                 .unwrap();
         assert_eq!(row.0, "unknown");
         assert_eq!(Some(row.1), signed.order_hash);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_answer_without_an_id_keeps_the_order_hash_and_a_refusal_is_rejected(
+        pool: sqlx::PgPool,
+    ) {
+        pool.execute(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute("CREATE TABLE position_order_links(id UUID,settled BOOLEAN)")
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE orders(id UUID,status TEXT)")
+            .await
+            .unwrap();
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(None, None)),
+            ExecutorConfig::default(),
+        )
+        .with_database(pool.clone());
+        let signer = OrderSigner::new(
+            TradingWallet::from_private_key(&format!("{:064x}", 1))
+                .unwrap()
+                .signer()
+                .clone(),
+        );
+        let answer = |json: serde_json::Value| {
+            serde_json::from_value::<polymarket_core::api::clob::PostOrderResponse>(json).unwrap()
+        };
+        for (json, status) in [
+            // Taken, but the answer names no order: still found by its hash.
+            (
+                serde_json::json!({"success": true, "status": "live"}),
+                "acknowledged",
+            ),
+            // Refused outright: nothing to reconcile, nothing reserved.
+            (
+                serde_json::json!({"success": false, "errorMsg": "not enough balance"}),
+                "rejected",
+            ),
+        ] {
+            let order = signer
+                .order_builder()
+                .token_id_str("1")
+                .side(SigningOrderSide::Buy)
+                .price(Decimal::new(5, 1))
+                .size(Decimal::ONE)
+                .expires_at(0)
+                .build()
+                .unwrap();
+            let signed = signer.sign_order(&order).await.unwrap();
+            let id = Uuid::new_v4();
+            let response = answer(json);
+            executor
+                .submit_once(id, "market", &signed, || async { Ok(response) })
+                .await
+                .unwrap();
+            let row: (String, String) = sqlx::query_as(
+                "SELECT status, exchange_order_id FROM execution_intents WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row.0, status);
+            assert_eq!(Some(row.1), signed.order_hash);
+        }
     }
 
     #[sqlx::test(migrations = false)]

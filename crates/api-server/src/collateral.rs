@@ -39,9 +39,14 @@ const FOLLOW_UP_POLLS: u32 = 10;
 /// Every this many polls a waiting wrap's nonce is checked, the wrap sent
 /// again if the node no longer knows it, and its gas raised if underpriced.
 const CHECK_EVERY_POLLS: u32 = 5;
-/// How many checks in a row must find the wrap's nonce used, without one of
-/// its receipts, before it counts as taken by another transaction.
-const NONCE_USED_CHECKS: u32 = 2;
+/// How long a wrap's nonce must have been found used, without one of its
+/// receipts, before it counts as taken by another transaction (a receipt can
+/// lag the nonce on another node).
+const NONCE_USED_CONFIRM: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(120)
+};
 /// The most a waiting wrap's gas price is raised to, as a multiple of what
 /// the network asks.
 const MAX_GAS_OVER_NETWORK: u128 = 3;
@@ -75,8 +80,8 @@ struct PendingWrap {
     latest: SignedTransaction,
     /// Every hash signed at the nonce: whichever is mined settles the wrap.
     hashes: Vec<String>,
-    /// Checks in a row that found the nonce used and none of its receipts.
-    nonce_used_checks: u32,
+    /// Since when checks have found the nonce used and none of its receipts.
+    nonce_used_since: Option<Instant>,
 }
 
 /// Wraps the wallet's idle USDC.e, remembering a wrap until it settles.
@@ -99,6 +104,15 @@ impl Sweeper {
         wallet: &TradingWallet,
     ) -> anyhow::Result<WrapOutcome> {
         let address = wallet.address_string();
+        // A held lock whose session no longer answers holds nothing.
+        if let Some(lock) = self.lock.as_mut() {
+            if !lock.is_alive().await {
+                warn!("The spend lock's database session stopped answering; taking it again");
+                if let Some(lock) = self.lock.take() {
+                    lock.abandon();
+                }
+            }
+        }
         let outcome = if let Some(wrap) = &self.pending {
             // Keep (or take back) the lock while it waits, within the bound.
             if self.lock.is_none() && wrap.sent_at.elapsed() < MAX_HOLD {
@@ -138,7 +152,9 @@ impl Sweeper {
 
     async fn release(&mut self) {
         if let Some(lock) = self.lock.take() {
-            lock.release().await;
+            // A session that does not answer is closed when the release is
+            // given up, which frees its locks as well.
+            let _ = tokio::time::timeout(Duration::from_secs(10), lock.release()).await;
         }
     }
 
@@ -208,7 +224,7 @@ impl Sweeper {
             sent_at: Instant::now(),
             hashes: vec![signed.tx_hash.clone()],
             latest: signed,
-            nonce_used_checks: 0,
+            nonce_used_since: None,
         });
         self.follow_up(client, wallet, NEW_WRAP_POLLS).await
     }
@@ -244,8 +260,9 @@ impl Sweeper {
             if poll % CHECK_EVERY_POLLS != 0 {
                 continue;
             }
-            // Its nonce used, on checks in a row that each read every one of
-            // its receipts and found none: another transaction took it.
+            // Its nonce used, on checks that each read every one of its
+            // receipts and found none, for long enough that no lagging node
+            // explains it: another transaction took it.
             match client.nonces(&wallet.address()).await {
                 Ok((mined, _)) if mined > wrap.nonce => {
                     let mut none_of_ours = true;
@@ -253,8 +270,8 @@ impl Sweeper {
                         none_of_ours &= matches!(client.transaction_receipt(hash).await, Ok(None));
                     }
                     if none_of_ours {
-                        wrap.nonce_used_checks += 1;
-                        if wrap.nonce_used_checks >= NONCE_USED_CHECKS {
+                        let since = *wrap.nonce_used_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= NONCE_USED_CONFIRM {
                             warn!(
                                 nonce = wrap.nonce,
                                 "A wrap's nonce was used by another transaction"
@@ -264,7 +281,7 @@ impl Sweeper {
                     }
                     continue;
                 }
-                Ok(_) => wrap.nonce_used_checks = 0,
+                Ok(_) => wrap.nonce_used_since = None,
                 Err(error) => {
                     warn!(error = %chain_error_message(&error), "Could not read the wallet's nonce")
                 }
@@ -275,19 +292,22 @@ impl Sweeper {
                 client.transaction_known(&wrap.latest.tx_hash).await,
                 Ok(false)
             ) {
-                refused = !matches!(
+                // The node's refusal, not a transport failure.
+                refused = matches!(
                     client
                         .broadcast(&wrap.latest.raw, &wrap.latest.tx_hash)
                         .await,
-                    Ok(BroadcastOutcome::Accepted)
+                    Ok(BroadcastOutcome::Rejected(_) | BroadcastOutcome::Uncertain(_))
                 );
             }
+            // A replacement must pay a tenth more; it never pays more than
+            // [`MAX_GAS_OVER_NETWORK`] times what the network asks.
+            let min_gas_price = wrap.latest.gas_price + wrap.latest.gas_price / 10 + 1;
             match client.gas_price_wei().await {
                 Ok(network)
                     if (network > wrap.latest.gas_price || refused)
-                        && wrap.latest.gas_price < network.saturating_mul(MAX_GAS_OVER_NETWORK) =>
+                        && min_gas_price <= network.saturating_mul(MAX_GAS_OVER_NETWORK) =>
                 {
-                    let min_gas_price = wrap.latest.gas_price + wrap.latest.gas_price / 10 + 1;
                     match client
                         .prepare_replacement(
                             wallet.signer(),
@@ -592,6 +612,45 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn a_held_lock_whose_session_died_is_taken_again(pool: PgPool) {
+        setup(&pool).await;
+        let chain = Arc::new(Mutex::new(Chain {
+            usdc_units: 5_000_000,
+            pol_wei: 1_000_000_000_000_000_000,
+            ..Default::default()
+        }));
+        let client = mock_node(chain.clone()).await;
+        let wallet = wallet();
+        let mut sweeper = Sweeper::default();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        // The session holding the lock is cut off (a proxy, a timeout).
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(sweeper.lock.as_mut().unwrap().conn())
+            .await
+            .unwrap();
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        // Held again, by a live session: withdrawals still wait for the wrap.
+        let mut lock = sweeper.lock.take().unwrap();
+        assert!(lock.is_alive().await);
+        assert!(SpendLock::try_acquire(&pool, &wallet.address_string())
+            .await
+            .unwrap()
+            .is_none());
+        lock.release().await;
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn a_wrap_the_node_keeps_refusing_is_signed_again_for_more_gas(pool: PgPool) {
         setup(&pool).await;
         let chain = Arc::new(Mutex::new(Chain {
@@ -630,7 +689,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn a_wrap_is_given_up_only_when_two_checks_find_its_nonce_used(pool: PgPool) {
+    async fn a_wrap_is_given_up_only_when_its_nonce_stays_used(pool: PgPool) {
         setup(&pool).await;
         let chain = Arc::new(Mutex::new(Chain {
             usdc_units: 5_000_000,
@@ -651,7 +710,7 @@ mod tests {
         }
         let wrap = sweeper.pending.clone().unwrap();
         sweeper.pending = Some(PendingWrap {
-            nonce_used_checks: 0,
+            nonce_used_since: None,
             ..wrap
         });
         let outcome = sweeper
@@ -659,8 +718,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, WrapOutcome::Unmined);
-        assert_eq!(sweeper.pending.as_ref().unwrap().nonce_used_checks, 1);
-        // A second look in a row: taken by another transaction.
+        assert!(sweeper.pending.as_ref().unwrap().nonce_used_since.is_some());
+        // Still used a while later: taken by another transaction.
+        tokio::time::sleep(NONCE_USED_CONFIRM).await;
         assert_eq!(
             sweeper
                 .follow_up(&client, &wallet(), CHECK_EVERY_POLLS)

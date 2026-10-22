@@ -161,8 +161,9 @@ pub struct SubmitOrderResponse {
     pub tx_hash: Option<String>,
 }
 
-/// The shortest lifetime an order may be prepared with.
-const MIN_ORDER_LIFETIME_SECS: u64 = 120;
+/// The shortest lifetime an order may be prepared with: time to sign it
+/// twice in the wallet and still keep [`GTD_MIN_REMAINING_SECS`].
+const MIN_ORDER_LIFETIME_SECS: u64 = 300;
 /// What must be left of an order's lifetime when it is submitted: the
 /// exchange refuses a good-till-date order expiring within a minute, and the
 /// submission itself (credentials, the order fence, the post) takes time.
@@ -367,7 +368,7 @@ pub async fn prepare_order(
     let expires_in_secs = req.expires_in_secs.unwrap_or(3600); // Default 1 hour
     if !(MIN_ORDER_LIFETIME_SECS..=86400).contains(&expires_in_secs) {
         return Err(ApiError::BadRequest(
-            "Order expiry must be between two minutes and one day".into(),
+            "Order expiry must be between five minutes and one day".into(),
         ));
     }
     let now = Utc::now();
@@ -520,7 +521,7 @@ pub async fn submit_order(
             .await?;
 
         return Err(ApiError::Gone(
-            "Order has expired or expires within a minute; prepare it again".into(),
+            "Order has expired or expires within a minute and a half; prepare it again".into(),
         ));
     }
 
@@ -640,7 +641,7 @@ fn wallet_submission_response(
     SubmitOrderResponse {
         success: !response.is_unfilled(),
         tx_hash: response.settlement_tx_hash(),
-        order_id: Some(response.order_id),
+        order_id: (!response.order_id.is_empty()).then_some(response.order_id),
         message: "Exchange response recorded; check order status for confirmed fills".into(),
     }
 }

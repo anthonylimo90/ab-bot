@@ -135,6 +135,27 @@ impl SpendLock {
             .map(drop)
     }
 
+    /// Whether the session holding the locks still answers, within a few
+    /// seconds: a connection a proxy dropped would hold nothing.
+    pub(crate) async fn is_alive(&mut self) -> bool {
+        matches!(
+            tokio::time::timeout(
+                StdDuration::from_secs(5),
+                sqlx::query("SELECT 1").execute(self.conn())
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    /// Give up locks whose session no longer answers: the connection is
+    /// closed, never returned to the pool.
+    pub(crate) fn abandon(mut self) {
+        if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
+    }
+
     /// Free every lock and return the connection to the pool.
     pub(crate) async fn release(mut self) {
         if let Some(mut conn) = self.conn.take() {
