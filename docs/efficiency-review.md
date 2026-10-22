@@ -157,6 +157,17 @@ metadata, inventory refresh status, and the exposure-candidate index. Existing
 migration-history and client compatibility instructions remain in
 [DEPLOY.md](DEPLOY.md). Changes are local and unpublished.
 
-Further candidates from the review remain separate: the unused snapshot batch
-insertion helper, bundle analysis for wallet/chart imports, and bounded worker
-read concurrency. They were not part of the nine-item implementation scope.
+Further candidates from the review, outside the nine items above:
+
+- Trade-flow journeys: the history lookup joined on a text expression and so
+  read all of `trade_events` on every poll; it now looks journeys up by their
+  signal and position uuid indexes (same rows, checked against the previous
+  query on randomized data), and the summary reads position history once.
+- Wallet bundle: wagmi, RainbowKit and WalletConnect load only on `/login`,
+  the one page with wallet sign-in; the root layout's scripts fell from 371 to
+  182 KiB gzipped for every other route. The chart library is already loaded
+  only by `/signals`, the one page that draws charts with it.
+- The unused snapshot batch insertion helper (and the other backtester data
+  writers, which nothing calls) are removed.
+- Worker reads: the only concurrent fan-out of reads, inventory balance
+  reads, is bounded to four; none is unbounded.

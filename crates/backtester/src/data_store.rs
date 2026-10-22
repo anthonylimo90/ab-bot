@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// A point-in-time snapshot of market orderbook state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,96 +247,6 @@ impl HistoricalDataStore {
     /// Create a new historical data store.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
-    }
-
-    /// Insert a market snapshot.
-    pub async fn insert_snapshot(&self, snapshot: &MarketSnapshot) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO orderbook_snapshots (
-                market_id, timestamp, yes_bid, yes_ask, no_bid, no_ask,
-                yes_bid_depth, yes_ask_depth, no_bid_depth, no_ask_depth,
-                yes_mid, no_mid, yes_spread, no_spread, volume_24h
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            ON CONFLICT (market_id, timestamp) DO UPDATE SET
-                yes_bid = EXCLUDED.yes_bid,
-                yes_ask = EXCLUDED.yes_ask,
-                no_bid = EXCLUDED.no_bid,
-                no_ask = EXCLUDED.no_ask,
-                yes_bid_depth = EXCLUDED.yes_bid_depth,
-                yes_ask_depth = EXCLUDED.yes_ask_depth,
-                no_bid_depth = EXCLUDED.no_bid_depth,
-                no_ask_depth = EXCLUDED.no_ask_depth,
-                yes_mid = EXCLUDED.yes_mid,
-                no_mid = EXCLUDED.no_mid,
-                yes_spread = EXCLUDED.yes_spread,
-                no_spread = EXCLUDED.no_spread,
-                volume_24h = EXCLUDED.volume_24h
-            "#,
-        )
-        .bind(&snapshot.market_id)
-        .bind(snapshot.timestamp)
-        .bind(snapshot.yes_bid)
-        .bind(snapshot.yes_ask)
-        .bind(snapshot.no_bid)
-        .bind(snapshot.no_ask)
-        .bind(snapshot.yes_bid_depth)
-        .bind(snapshot.yes_ask_depth)
-        .bind(snapshot.no_bid_depth)
-        .bind(snapshot.no_ask_depth)
-        .bind(snapshot.yes_mid)
-        .bind(snapshot.no_mid)
-        .bind(snapshot.yes_spread)
-        .bind(snapshot.no_spread)
-        .bind(snapshot.volume_24h)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Insert multiple snapshots in batch.
-    pub async fn insert_snapshots_batch(&self, snapshots: &[MarketSnapshot]) -> Result<usize> {
-        if snapshots.is_empty() {
-            return Ok(0);
-        }
-
-        let mut inserted = 0;
-        for snapshot in snapshots {
-            if self.insert_snapshot(snapshot).await.is_ok() {
-                inserted += 1;
-            }
-        }
-
-        info!(count = inserted, "Inserted orderbook snapshots");
-        Ok(inserted)
-    }
-
-    /// Insert a historical trade.
-    pub async fn insert_trade(&self, trade: &HistoricalTrade) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO historical_trades (
-                id, market_id, outcome_id, timestamp, price, quantity, side, fee
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(trade.id)
-        .bind(&trade.market_id)
-        .bind(&trade.outcome_id)
-        .bind(trade.timestamp)
-        .bind(trade.price)
-        .bind(trade.quantity)
-        .bind(match trade.side {
-            TradeSide::Buy => 0i16,
-            TradeSide::Sell => 1i16,
-        })
-        .bind(trade.fee)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
     }
 
     /// Query orderbook snapshots.
