@@ -421,9 +421,7 @@ async fn refresh_wallet_inventory(
             outcome: candidate.outcome.clone(),
             linked_position_id: candidate.linked_position_id,
             quantity,
-            cost_basis: candidate
-                .cost_basis
-                .or_else(|| previous.and_then(|entry| entry.cost_basis)),
+            cost_basis: kept_cost_basis(candidate.cost_basis, previous),
             current_price,
             marked_value,
             is_orphan,
@@ -1125,6 +1123,22 @@ fn merge_candidate(
     }
 }
 
+/// The cost basis an inventory row keeps: what is known of it now, else
+/// what the row had, unless that came from a position holding the token.
+/// That cost is the position's: its close counted it, so shares left over
+/// after it have no basis of their own, and selling them reports no P&L a
+/// second time (nor feeds it to the circuit breaker).
+fn kept_cost_basis(
+    known: Option<Decimal>,
+    previous: Option<&WalletInventoryEntry>,
+) -> Option<Decimal> {
+    known.or_else(|| {
+        previous
+            .filter(|entry| entry.linked_position_id.is_none())
+            .and_then(|entry| entry.cost_basis)
+    })
+}
+
 fn derive_recovery_status(
     previous: Option<&WalletInventoryEntry>,
     quantity: Decimal,
@@ -1168,4 +1182,53 @@ fn holds_no(position: &EffectiveOpenPositionRow) -> bool {
 
 fn looks_like_token_id(token_id: &str) -> bool {
     !token_id.is_empty() && token_id.chars().all(|ch| ch.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        linked_position_id: Option<Uuid>,
+        cost_basis: Option<Decimal>,
+    ) -> WalletInventoryEntry {
+        WalletInventoryEntry {
+            id: Uuid::new_v4(),
+            wallet_address: "0xwallet".into(),
+            token_id: "token".into(),
+            condition_id: Some("market".into()),
+            outcome: Some("yes".into()),
+            linked_position_id,
+            quantity: Decimal::TEN,
+            cost_basis,
+            current_price: None,
+            marked_value: None,
+            is_orphan: false,
+            discovery_source: "open_position".into(),
+            recovery_status: "none".into(),
+            last_exit_error: None,
+            last_exit_attempted_at: None,
+            first_observed_at: Utc::now(),
+            last_observed_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn shares_left_over_after_a_position_keep_none_of_its_cost() {
+        let four = Some(Decimal::from(4));
+        // What is known now wins.
+        assert_eq!(
+            kept_cost_basis(Some(Decimal::ONE), Some(&entry(None, four))),
+            Some(Decimal::ONE)
+        );
+        // An unlinked row keeps its own basis.
+        assert_eq!(kept_cost_basis(None, Some(&entry(None, four))), four);
+        // A position held it: its cost went with the position's close.
+        assert_eq!(
+            kept_cost_basis(None, Some(&entry(Some(Uuid::new_v4()), four))),
+            None
+        );
+        assert_eq!(kept_cost_basis(None, None), None);
+    }
 }
