@@ -242,6 +242,21 @@ This repository supports split credentials by environment variable:
 
 If your managed Redis tier does not support ACL users, keep all three URLs pointed at the same private Redis endpoint and enforce network isolation at the platform layer.
 
+## Local monitoring profile
+
+`docker compose --profile monitoring up -d` adds Prometheus and Grafana, both
+reachable from this machine only. Set `METRICS_TOKEN` (Prometheus scrapes the
+API's `/metrics` with it), `GRAFANA_PASSWORD` (Grafana's admin login; it
+refuses to start without one, or with "admin") and `GRAFANA_DB_PASSWORD`.
+
+Grafana's PostgreSQL datasource reads as `grafana_reader`, never as the
+database owner. On every start the one-shot `grafana-db-reader` service
+creates or updates that login from `docker/grafana/grafana-reader.sql`: read
+only (each transaction is read-only), with `SELECT` on the trading and
+analytics tables alone. Users, credentials, sessions, signed orders
+(`execution_intents`) and signed withdrawals (`wallet_withdrawals`) stay out of
+its reach. To chart another table, add it to that file's list.
+
 ## Railway config files
 
 Railway reads one config file per service, by default `railway.toml` at the
@@ -613,9 +628,9 @@ unsigned). Fees are set by the exchange when an order matches.
   with `success: false`, no order id and no status saying one was placed
   proves no order exists, and only `success` with `matched`, `live` or
   `delayed` proves one was taken. Any other answer (a refusal that names an
-  order, a missing or contradictory status, `unmatched`, which Polymarket
-  documents as an order placed on the book after a matching delay) leaves
-  the order unknown: the wallet's next live order waits until the reconciler
+  order, a missing or contradictory status, or `unmatched`: "marketable but
+  failed to delay. Placement still succeeded", per Polymarket's order
+  creation reference) leaves the order unknown: the wallet's next live order waits until the reconciler
   has read it from the exchange, under the order's own hash and any id the
   answer named, and a manual order it finds resting stops holding the
   wallet back (its row keeps the cash reserved). A fill-or-kill order that
@@ -628,6 +643,17 @@ unsigned). Fees are set by the exchange when an order matches.
   keeps no credentials for those wallets). One whose outcome is unknown
   holds back further orders from its wallet until ten minutes after its
   expiry (at most a day), and never the trading wallet's withdrawals.
+- A resolved position is closed only once both legs have been measured
+  against the wallet's balance (a buy whose fee the V1 exchange kept in
+  shares left the record above it): with a winner, the winning leg pays what
+  the wallet holds; without one, the pair pays a dollar only while its
+  measured legs are still equal, and otherwise waits for the winner. A live
+  position whose holding cannot be measured yet (an order on the market
+  still settling, the balance unreadable) waits for a later look.
+- Preparing a browser-wallet order reads the market's tick size and refuses
+  a price that is not a whole number of ticks, before the wallet signs.
+- The activity feed shows an exit that keeps failing for the same reason
+  once; a new reason shows again. The trade event log keeps every attempt.
 - 093 drops browser-wallet orders prepared for the V1 exchange (they can no
   longer be submitted) and stores the signed creation time of new ones.
 - The bot-scanner indexer now reads trades from both V2 exchanges.

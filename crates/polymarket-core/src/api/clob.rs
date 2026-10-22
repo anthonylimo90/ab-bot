@@ -277,6 +277,19 @@ impl ClobClient {
             })
     }
 
+    /// The smallest price step `token_id` trades at: the exchange refuses an
+    /// order whose price is not a whole number of steps.
+    pub async fn get_tick_size(&self, token_id: &str) -> Result<Decimal> {
+        let answer: serde_json::Value = self
+            .get_with_retry(&format!("{}/tick-size?token_id={token_id}", self.base_url))
+            .await?
+            .json()
+            .await?;
+        tick_size_from(&answer).ok_or_else(|| Error::Order {
+            message: "Missing market tick size".into(),
+        })
+    }
+
     /// Maximum retry attempts for API calls.
     const MAX_RETRIES: u32 = 3;
 
@@ -1545,10 +1558,11 @@ impl PostOrderResponse {
 
     /// Whether the answer leaves open if an order exists: it is neither a
     /// refusal nor an acceptance (`success` not false, and the order
-    /// matched, resting or in a matching delay). A missing status, one that
-    /// contradicts `success`, and `unmatched` (which Polymarket documents as
-    /// an order placed on the book after its matching delay, yet is no
-    /// documented answer to a post) are all read from the exchange instead.
+    /// matched, resting or in a matching delay). A missing status and one
+    /// that contradicts `success` are read from the exchange instead, and so
+    /// is `unmatched` ("marketable but failed to delay. Placement still
+    /// succeeded", Polymarket says of limit orders): where it rests, and how
+    /// much of it filled, is read from the exchange's record.
     pub fn unclear(&self) -> bool {
         let accepted = self.success != Some(false)
             && matches!(
@@ -1557,6 +1571,26 @@ impl PostOrderResponse {
             );
         !accepted && !self.refused()
     }
+}
+
+/// The `minimum_tick_size` of a tick-size answer, sent as a number or a
+/// string: a step strictly between 0 and 1.
+pub fn tick_size_from(answer: &serde_json::Value) -> Option<Decimal> {
+    let tick = match answer.get("minimum_tick_size")? {
+        serde_json::Value::String(text) => text.parse::<Decimal>().ok()?,
+        serde_json::Value::Number(number) => number.to_string().parse::<Decimal>().ok()?,
+        _ => return None,
+    };
+    (tick > Decimal::ZERO && tick < Decimal::ONE).then(|| tick.normalize())
+}
+
+/// Whether `price` is a whole number of `tick` steps, from one step to one
+/// step short of a dollar.
+pub fn price_on_tick(price: Decimal, tick: Decimal) -> bool {
+    tick > Decimal::ZERO
+        && price >= tick
+        && price <= Decimal::ONE - tick
+        && (price % tick).is_zero()
 }
 
 /// A string field the exchange may send as `null`: read as empty.
@@ -2803,6 +2837,32 @@ mod authenticated_tests {
         }));
         assert!(!v1.refused() && !v1.unclear());
         assert_eq!(v1.settlement_tx_hash().as_deref(), Some("0xt"));
+    }
+
+    #[test]
+    fn prices_are_checked_against_the_market_tick() {
+        let tick = |answer: serde_json::Value| tick_size_from(&answer);
+        assert_eq!(
+            tick(serde_json::json!({"minimum_tick_size": 0.01})),
+            Some(Decimal::new(1, 2))
+        );
+        assert_eq!(
+            tick(serde_json::json!({"minimum_tick_size": "0.0025"})),
+            Some(Decimal::new(25, 4))
+        );
+        assert_eq!(tick(serde_json::json!({"minimum_tick_size": 0})), None);
+        assert_eq!(tick(serde_json::json!({"minimum_tick_size": 1})), None);
+        assert_eq!(tick(serde_json::json!({})), None);
+        let d = |text: &str| text.parse::<Decimal>().unwrap();
+        assert!(price_on_tick(d("0.55"), d("0.01")));
+        assert!(!price_on_tick(d("0.555"), d("0.01")));
+        assert!(price_on_tick(d("0.505"), d("0.005")));
+        assert!(!price_on_tick(d("0.5025"), d("0.005")));
+        assert!(price_on_tick(d("0.5025"), d("0.0025")));
+        // Within one step of either end only.
+        assert!(price_on_tick(d("0.01"), d("0.01")) && price_on_tick(d("0.99"), d("0.01")));
+        assert!(!price_on_tick(d("0.005"), d("0.01")) && !price_on_tick(d("0.995"), d("0.01")));
+        assert!(price_on_tick(d("0.1"), d("0.1")) && price_on_tick(d("0.9"), d("0.1")));
     }
 
     #[test]

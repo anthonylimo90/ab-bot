@@ -12,9 +12,10 @@ datasources:
     type: postgres
     url: postgres:5432
     database: $POSTGRES_DB
-    user: $POSTGRES_USER
+    # Read-only on the trading and analytics tables (docker/grafana/grafana-reader.sql).
+    user: grafana_reader
     secureJsonData:
-      password: $POSTGRES_PASSWORD
+      password: $GRAFANA_DB_PASSWORD
     jsonData:
       sslmode: disable
       maxOpenConns: 5

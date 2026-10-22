@@ -369,6 +369,19 @@ pub async fn prepare_order(
         .map_err(|_| {
             ApiError::ServiceUnavailable("Exchange contract metadata unavailable".into())
         })?;
+    // The exchange refuses a price off the market's tick: say so before the
+    // wallet is asked to sign.
+    let tick = state
+        .clob_client
+        .get_tick_size(&req.token_id)
+        .await
+        .map_err(|_| ApiError::ServiceUnavailable("Market tick size unavailable".into()))?;
+    if !polymarket_core::api::clob::price_on_tick(req.price, tick) {
+        return Err(ApiError::BadRequest(format!(
+            "Price must be a multiple of the market's tick size {tick}, from {tick} to {}",
+            Decimal::ONE - tick
+        )));
+    }
 
     // Calculate expiration
     let expires_in_secs = req.expires_in_secs.unwrap_or(3600); // Default 1 hour

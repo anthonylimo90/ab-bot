@@ -162,9 +162,14 @@ async fn an_order_closed_by_the_exchange_keeps_its_fills_and_its_close(pool: PgP
         "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
         "INVALID",
     ] {
-        let (id, _) = reserve_order(&pool, &order(), true, Some("0xreview"), Decimal::from(1000))
-            .await
-            .unwrap();
+        // A row of its own each time: the same client id would replay one.
+        let mut request = order();
+        request.client_order_id = Some(format!("closed-{closed}"));
+        let (id, created) =
+            reserve_order(&pool, &request, true, Some("0xreview"), Decimal::from(1000))
+                .await
+                .unwrap();
+        assert!(created);
         sqlx::query("UPDATE orders SET exchange_order_id='exchange-id', status='open' WHERE id=$1")
             .bind(id)
             .execute(&pool)

@@ -328,7 +328,27 @@ async fn a_withdrawal_waits_behind_a_transaction_it_did_not_send(pool: PgPool) {
         f.submit(10, Uuid::new_v4()).await,
         Err(ApiError::ServiceUnavailable(message)) if message.contains("still pending")
     ));
+    // Nor one at a waiting nonce that the node no longer holds: what waits
+    // there was sent from elsewhere.
+    sqlx::query("UPDATE wallet_withdrawals SET nonce = 6 WHERE id = $1")
+        .bind(next.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next_hash = next.tx_hash.clone().unwrap();
+    f.chain.lock().unwrap().known.remove(&next_hash);
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::ServiceUnavailable(message)) if message.contains("still pending")
+    ));
     assert_eq!(f.broadcasts(), 2);
+    // Held by the node, it is the wallet's own: the next transfer follows it.
+    f.chain.lock().unwrap().known.insert(next_hash);
+    assert_eq!(
+        f.submit(10, Uuid::new_v4()).await.unwrap().status,
+        "submitted"
+    );
+    assert_eq!(f.broadcasts(), 3);
 }
 
 #[sqlx::test(migrations = false)]

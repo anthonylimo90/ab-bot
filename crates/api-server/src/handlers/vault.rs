@@ -1154,19 +1154,48 @@ async fn unexplained_pending_transaction(
     if pending <= mined {
         return Ok(());
     }
-    // Only those at the nonces still waiting count: one already mined, or
-    // above what the node holds, explains none of them.
-    let own: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT nonce) FROM wallet_withdrawals \
+    // A nonce still waiting is explained only by one of the wallet's own
+    // transfers signed at it that the node holds: one already mined, signed
+    // above what the node holds, or dropped by it, explains none of them.
+    let own: Vec<(i64, Option<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT nonce, tx_hash, replaced_tx_hashes FROM wallet_withdrawals \
          WHERE LOWER(wallet_address) = LOWER($1) AND status = 'submitted' \
            AND nonce >= $2 AND nonce < $3",
     )
     .bind(source)
     .bind(i64::try_from(mined).unwrap_or(i64::MAX))
     .bind(i64::try_from(pending).unwrap_or(i64::MAX))
-    .fetch_one(lock.conn())
+    .fetch_all(lock.conn())
     .await?;
-    if pending - mined > u64::try_from(own).unwrap_or(0) {
+    let mut explained = std::collections::HashSet::new();
+    for (nonce, tx_hash, replaced) in own {
+        if explained.contains(&nonce) {
+            continue;
+        }
+        for hash in tx_hash.into_iter().chain(replaced) {
+            match tokio::time::timeout(WITHDRAWAL_BALANCE_TIMEOUT, client.transaction_known(&hash))
+                .await
+            {
+                Ok(Ok(true)) => {
+                    explained.insert(nonce);
+                    break;
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %chain_error_message(&e), "Failed to look up a pending withdrawal");
+                    return Err(ApiError::ServiceUnavailable(
+                        "Could not read the wallet's pending transactions".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ApiError::ServiceUnavailable(
+                        "Reading the wallet's pending transactions timed out".into(),
+                    ))
+                }
+            }
+        }
+    }
+    if pending - mined > explained.len() as u64 {
         return Err(ApiError::ServiceUnavailable(
             "A transaction from this wallet is still pending; nothing was sent, retry shortly"
                 .into(),

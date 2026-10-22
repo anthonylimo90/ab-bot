@@ -200,8 +200,20 @@ async fn load_activity(
         r#"
         SELECT id, occurred_at, strategy, execution_mode, market_id, position_id,
                event_type, reason, fill_price, filled_size_usd, realized_pnl
-        FROM trade_events
+        FROM trade_events e
         WHERE event_type = ANY($1)
+          -- A retried exit that fails again for the same reason is one
+          -- failure to show, however often it is retried.
+          AND NOT (e.event_type = 'exit_failed' AND e.position_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM (
+                  SELECT p.event_type, p.reason FROM trade_events p
+                  WHERE p.position_id = e.position_id AND p.event_type = ANY($1)
+                    AND (p.occurred_at, p.id) < (e.occurred_at, e.id)
+                  ORDER BY p.occurred_at DESC, p.id DESC
+                  LIMIT 1
+              ) previous
+              WHERE previous.event_type = 'exit_failed'
+                AND previous.reason IS NOT DISTINCT FROM e.reason))
         ORDER BY occurred_at DESC, id
         LIMIT $2 OFFSET $3
         "#,
@@ -254,6 +266,15 @@ mod tests {
         event("flow", "exit_failed", 10, Some("no bids"), None)
             .await
             .unwrap();
+        // Retried and failed again for the same reason: not shown again.
+        for minutes_ago in [9, 8, 7] {
+            event("flow", "exit_recovery_requeued", minutes_ago, None, None)
+                .await
+                .unwrap();
+            event("flow", "exit_failed", minutes_ago, Some("no bids"), None)
+                .await
+                .unwrap();
+        }
         event(
             "arb",
             "closed_via_resolution",
@@ -276,6 +297,28 @@ mod tests {
                 "ARB_POSITION_OPENED"
             ]
         );
+        // A new reason is a new failure to show.
+        event("flow", "exit_failed", 5, Some("no token ids"), None)
+            .await
+            .unwrap();
+        let reasons: Vec<Option<String>> = load_activity(&pool, 50, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.activity_type == "TRADE_FAILED")
+            .map(|a| a.error_message)
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                Some("no token ids".to_string()),
+                Some("no bids".to_string())
+            ]
+        );
+        sqlx::query("DELETE FROM trade_events WHERE reason = 'no token ids'")
+            .execute(&pool)
+            .await
+            .unwrap();
         assert_eq!(feed[0].pnl, Some(Decimal::new(42, 2)));
         assert_eq!(feed[0].details.as_ref().unwrap()["source"], "arbitrage");
         assert_eq!(feed[1].error_message.as_deref(), Some("no bids"));

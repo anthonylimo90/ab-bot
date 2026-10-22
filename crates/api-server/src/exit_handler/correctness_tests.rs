@@ -994,6 +994,65 @@ async fn fee_shares_are_written_off_only_once_the_token_has_settled(pool: PgPool
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_pair_resolved_without_a_winner_pays_only_what_the_wallet_holds(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, wallet, server) = live_handler(&pool, balance.clone()).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let set_balance = |shares: &str| {
+        *balance.lock().unwrap() =
+            (shares.parse::<Decimal>().unwrap() * Decimal::from(1_000_000)).to_string()
+    };
+    let live_pair = || {
+        let mut p = position();
+        p.state = PositionState::Open;
+        p.execution_mode = "live".into();
+        p.wallet_address = Some(wallet.clone());
+        p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+        p.no_entry_price = Decimal::new(5, 1);
+        p.held_yes_qty = Decimal::from(100);
+        p.held_no_qty = Decimal::from(100);
+        p
+    };
+
+    // A V1 buy kept 3.5 shares of each leg as its fee: the pair pays 96.5,
+    // not the 100 recorded. Cost 0.40 + 0.50 a pair: 96.5 − 90 = 6.5.
+    let mut p = live_pair();
+    service.repo().insert(&p).await.unwrap();
+    set_balance("96.5");
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, None)
+        .await
+        .unwrap());
+    let stored = service.load(p.id).await.unwrap();
+    assert_eq!(stored.state, PositionState::Closed);
+    assert_eq!(stored.realized_pnl, Some(Decimal::new(65, 1)));
+
+    // While an order of the wallet on the token has an unknown outcome the
+    // holding cannot be measured: the close waits.
+    let mut p = live_pair();
+    p.id = uuid::Uuid::new_v4();
+    service.repo().insert(&p).await.unwrap();
+    sqlx::query(
+        "INSERT INTO execution_intents (id, market_id, signed_order, status) VALUES \
+         (gen_random_uuid(), 'market', jsonb_build_object('tokenId', 'yes', 'side', 'SELL', \
+          'maker', $1::text), 'unknown')",
+    )
+    .bind(&wallet)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(!h
+        .finalize_resolution_close(&mut p, 0, None, None)
+        .await
+        .unwrap());
+    assert_eq!(service.load(p.id).await.unwrap().state, PositionState::Open);
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn holders_of_one_token_each_answer_for_their_share_of_the_fees(pool: PgPool) {
     let service = setup(&pool).await;
     let balance = Arc::new(std::sync::Mutex::new(String::new()));

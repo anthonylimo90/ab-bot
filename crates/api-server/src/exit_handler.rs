@@ -756,23 +756,26 @@ impl ExitHandler {
     /// outcome or a buy may still be settling on chain: a balance read then
     /// can be short by shares that are on their way. A larger gap is left for
     /// reconciliation and the sale goes ahead as recorded, for the balance
-    /// preflight to refuse.
+    /// preflight to refuse. Answers whether the recorded holding now is what
+    /// the wallet holds: false while it could not be measured, or did not
+    /// match; true too where it is not measured (a paper position, one not
+    /// of the executor's wallet).
     async fn align_leg_with_wallet(
         &self,
         position: &mut Position,
         leg: Leg,
         token_id: &str,
         ctx: &EventContext,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let held = match leg {
             Leg::Yes => position.held_yes_qty,
             Leg::No => position.held_no_qty,
         };
         if position.execution_mode != "live" || held <= Decimal::ZERO {
-            return Ok(());
+            return Ok(true);
         }
         let Some(wallet) = position.wallet_address.clone() else {
-            return Ok(());
+            return Ok(true);
         };
         // The balance read below is the executor's wallet.
         if self
@@ -781,7 +784,7 @@ impl ExitHandler {
             .await
             .is_none_or(|executor| !executor.eq_ignore_ascii_case(&wallet))
         {
-            return Ok(());
+            return Ok(true);
         }
         let (others, unsettled): (Decimal, bool) = sqlx::query_as(OTHER_HOLDERS_SQL)
             .bind(position.id)
@@ -793,7 +796,7 @@ impl ExitHandler {
             .fetch_one(&self.pool)
             .await?;
         if unsettled {
-            return Ok(());
+            return Ok(false);
         }
         let balance = match self
             .order_executor
@@ -807,7 +810,7 @@ impl ExitHandler {
             }
         };
         let Some(balance) = balance else {
-            return Ok(());
+            return Ok(false);
         };
         let recorded = held + others.max(Decimal::ZERO);
         match fee_shortfall(recorded, balance) {
@@ -824,7 +827,8 @@ impl ExitHandler {
                 );
                 self.position_service
                     .write_off_missing_shares(position, leg, share, ctx)
-                    .await
+                    .await?;
+                Ok(true)
             }
             None if balance < recorded => {
                 warn!(
@@ -835,9 +839,9 @@ impl ExitHandler {
                     %balance,
                     "Wallet holds far fewer shares than recorded; leaving it for reconciliation"
                 );
-                Ok(())
+                Ok(false)
             }
-            None => Ok(()),
+            None => Ok(true),
         }
     }
 
@@ -938,35 +942,51 @@ impl ExitHandler {
         }
         let market_id = position.market_id.clone();
         let fee = Decimal::new(2, 2);
+        let execution_mode = position.execution_mode.clone();
+        let ctx = Self::event_context(&execution_mode, source, quant_ctx);
+
+        // Only the wallet's shares pay out: a buy whose fee the V1 exchange
+        // kept in shares left the recorded holding above them. Both legs are
+        // measured against the wallet first, winner or not; a live position
+        // whose holding cannot be checked now (an order on the market still
+        // settling, the balance unreadable) waits for a later look.
+        match self.resolve_market_tokens(&market_id).await? {
+            Some((yes_token_id, no_token_id)) => {
+                for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
+                    if !self
+                        .align_leg_with_wallet(position, leg, token_id, &ctx)
+                        .await?
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            None if position.execution_mode == "live" => {
+                warn!(
+                    position_id = %position.id,
+                    market_id = %market_id,
+                    "Resolved market's tokens are unknown; the live position waits to be measured against the wallet"
+                );
+                return Ok(false);
+            }
+            None => {}
+        }
 
         let method = if let Some(yes_wins) = resolved_yes_winner {
             CloseMethod::ResolutionWithWinner { yes_wins, fee }
-        } else if position.has_full_pair_exposure() {
+        } else if position.has_full_pair_exposure() && position.held_yes_qty == position.held_no_qty
+        {
+            // Equal legs pay one dollar a pair whichever side won.
             CloseMethod::ResolutionConservative { fee }
         } else {
             warn!(
                 position_id = %position.id,
                 market_id = %market_id,
-                "Resolved market is missing winner metadata; leaving non-paired exposure open to avoid mispricing"
+                "Resolved market is missing winner metadata; leaving unpaired exposure open to avoid mispricing"
             );
             return Ok(false);
         };
 
-        let execution_mode = position.execution_mode.clone();
-        let ctx = Self::event_context(&execution_mode, source, quant_ctx);
-        // The winning leg pays out what the wallet holds, not shares a buy's
-        // fee kept. (Without a winner the paired close needs equal legs, so
-        // they are left as recorded.)
-        if matches!(method, CloseMethod::ResolutionWithWinner { .. }) {
-            if let Some((yes_token_id, no_token_id)) =
-                self.resolve_market_tokens(&market_id).await?
-            {
-                for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
-                    self.align_leg_with_wallet(position, leg, token_id, &ctx)
-                        .await?;
-                }
-            }
-        }
         if let Err(e) = self
             .position_service
             .close_position(position, method, &ctx)

@@ -67,9 +67,8 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     // the server keeps no credentials for those wallets. One whose outcome
     // is unknown can no longer fill once its expiry has long passed, so it
     // stops fencing its wallet; nothing here depends on its outcome. The
-    // engine's own orders never match: they are signed by the trading
-    // wallet without an expiry (fill-or-kill or good-till-cancelled), and
-    // carry a position link or an order row.
+    // engine's own orders never match: every one is signed without an
+    // expiry (fill-or-kill or good-till-cancelled).
     let expired = sqlx::query("UPDATE execution_intents i SET status='reconciled',updated_at=NOW() WHERE i.status IN ('submitting','unknown') AND ($1::text IS NULL OR LOWER(i.signed_order->>'maker')<>LOWER($1)) AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.id=i.id) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AND (CASE WHEN i.signed_order->>'expiration' ~ '^[0-9]{1,15}$' THEN (i.signed_order->>'expiration')::bigint END) BETWEEN 1 AND EXTRACT(EPOCH FROM NOW())::bigint-$2")
         .bind(wallet.as_deref())
         .bind(EXPIRED_WALLET_ORDER_GRACE_SECS)
@@ -1062,6 +1061,27 @@ mod tests {
             ]
         );
         server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_expired_browser_order_is_released_with_no_trading_wallet_configured(pool: PgPool) {
+        crate::exit_handler::correctness_tests::setup(&pool).await;
+        let state = AppState::for_tests(pool.clone());
+        assert!(state.order_executor.wallet_address().await.is_none());
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_intents(id,market_id,exchange_order_id,signed_order,status) VALUES($1,'token','hash',$2,'unknown')")
+            .bind(id)
+            .bind(serde_json::json!({"maker": "0xbrowser", "tokenId": "token", "expiration": (Utc::now().timestamp() - 3600).to_string()}))
+            .execute(&pool)
+            .await
+            .unwrap();
+        reconcile(&state).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "reconciled");
     }
 
     #[sqlx::test(migrations = false)]

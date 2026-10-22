@@ -196,6 +196,35 @@ services:
     profiles:
       - monitoring
 
+  # Creates (or updates) the read-only login Grafana's PostgreSQL datasource
+  # uses, then exits; Grafana starts only once it has.
+  grafana-db-reader:
+    image: timescale/timescaledb:latest-pg16
+    container_name: ab-bot-grafana-db-reader
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-abbot}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-abbot_secret}
+      PGDATABASE: ${POSTGRES_DB:-ab_bot}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ -z "$$GRAFANA_DB_PASSWORD" ];
+        then echo 'Set GRAFANA_DB_PASSWORD for the grafana_reader database login' >&2; exit 1; fi;
+        exec psql -v ON_ERROR_STOP=1 -v pw="$$GRAFANA_DB_PASSWORD" -f /grafana-reader.sql
+    volumes:
+      - ./docker/grafana/grafana-reader.sql:/grafana-reader.sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - ab-bot-network
+    profiles:
+      - monitoring
+
   grafana:
     image: grafana/grafana:latest
     container_name: ab-bot-grafana
@@ -205,9 +234,8 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-}
       GF_USERS_ALLOW_SIGN_UP: false
-      # The PostgreSQL datasource uses the database's own credentials.
-      POSTGRES_USER: ${POSTGRES_USER:-abbot}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-abbot_secret}
+      # The PostgreSQL datasource reads as grafana_reader, never as the owner.
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-ab_bot}
     # Never start with Grafana's default admin password.
     entrypoint:
@@ -221,7 +249,10 @@ services:
       - grafana_data:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_started
+      grafana-db-reader:
+        condition: service_completed_successfully
     networks:
       - ab-bot-network
     profiles:
