@@ -1,0 +1,17 @@
+# Railway config for the dashboard service. Set the service's Railway Config
+# File to /railway/dashboard.toml (an absolute path).
+# Schema: https://railway.com/railway.schema.json
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.dashboard"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+numReplicas = 1
+
+[deploy.limitOverride.containers]
+memoryBytes = 2147483648

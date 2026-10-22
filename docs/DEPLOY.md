@@ -87,9 +87,11 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
 3. Rename the service to `api-server`
 4. Configure in **Settings** tab:
 
-   **Build Settings:**
-   - Builder: `Dockerfile`
-   - Dockerfile Path: `Dockerfile`
+   **Config-as-code:** set **Railway Config File** to `/railway/api-server.toml`
+   (an absolute path). It sets the Dockerfile, health check, restart policy,
+   a single replica and the 50s drain the graceful shutdown below needs.
+   Without it, set them by hand: Builder `Dockerfile`, Dockerfile Path
+   `Dockerfile`, healthcheck `/health`.
 
    **Watch Paths:** (optional)
    ```
@@ -136,9 +138,9 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
 3. Rename to `arb-monitor`
 4. Configure in **Settings** tab:
 
-   **Build Settings:**
-   - Builder: `Dockerfile`
-   - Dockerfile Path: `Dockerfile.arb-monitor`
+   **Config-as-code:** set **Railway Config File** to
+   `/railway/arb-monitor.toml` (or by hand: Builder `Dockerfile`, Dockerfile
+   Path `Dockerfile.arb-monitor`).
 
 5. Add **Variables**:
    ```
@@ -158,9 +160,8 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
 3. Rename to `dashboard`
 4. Configure in **Settings** tab:
 
-   **Build Settings:**
-   - Builder: `Dockerfile`
-   - Dockerfile Path: `Dockerfile.dashboard`
+   **Config-as-code:** set **Railway Config File** to `/railway/dashboard.toml`
+   (or by hand: Builder `Dockerfile`, Dockerfile Path `Dockerfile.dashboard`).
 
 5. Add **Variables**:
    ```
@@ -241,28 +242,22 @@ This repository supports split credentials by environment variable:
 
 If your managed Redis tier does not support ACL users, keep all three URLs pointed at the same private Redis endpoint and enforce network isolation at the platform layer.
 
-## railway.toml Configuration
+## Railway config files
 
-The repository includes `railway.toml` with service-specific settings:
+Railway reads one config file per service, by default `railway.toml` at the
+repository root, so a single root file would give every service the same
+Dockerfile. Each service has its own file under `railway/`, selected by the
+service's **Railway Config File** setting (an absolute path such as
+`/railway/api-server.toml`). The files follow
+[Railway's schema](https://railway.com/railway.schema.json); the root
+`railway.toml` this replaces used `[services.<name>]` tables, which the schema
+does not define, so none of its settings ever applied.
 
-```toml
-[services.api-server.build]
-builder = "dockerfile"
-dockerfilePath = "./Dockerfile"
-
-[services.api-server.deploy]
-healthcheckPath = "/health"
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
-
-[services.arb-monitor.build]
-builder = "dockerfile"
-dockerfilePath = "./Dockerfile.arb-monitor"
-
-[services.dashboard.build]
-builder = "dockerfile"
-dockerfilePath = "./Dockerfile.dashboard"
-```
+Railway has deprecated Config as Code: existing files keep working for legacy
+services until 2026-12-01
+([docs](https://docs.railway.com/reference/config-as-code)). Before then,
+`railway config migrate` turns these files into Infrastructure as Code
+(`.railway/railway.ts`; see [the CLI docs](https://docs.railway.com/cli/config)).
 
 ## Troubleshooting
 
@@ -290,9 +285,9 @@ The dashboard requires devDependencies for building.
 
 ### Service running wrong binary
 
-If using a shared Dockerfile for multiple services, ensure:
-1. Each service has the correct `dockerfilePath` in railway.toml
-2. Or use service-specific Dockerfiles (recommended)
+Each service builds its own Dockerfile. Check that the service's **Railway
+Config File** points at its file under `railway/` (or that its Dockerfile
+Path is set to its Dockerfile).
 
 ### Dashboard can't connect to API
 

@@ -1,0 +1,23 @@
+# Railway config for the api-server service. Railway reads one config file
+# per service: set the service's Railway Config File to /railway/api-server.toml
+# (an absolute path). Schema: https://railway.com/railway.schema.json
+# Config as Code is deprecated; `railway config migrate` turns these files
+# into Infrastructure as Code (.railway/railway.ts).
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+# One instance runs the trading loops.
+numReplicas = 1
+# SIGTERM to SIGKILL: open requests get 15s and started trading operations
+# (an arb between its legs) up to 40s to finish.
+drainingSeconds = 50
+
+[deploy.limitOverride.containers]
+memoryBytes = 2147483648

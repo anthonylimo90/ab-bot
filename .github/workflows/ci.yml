@@ -236,7 +236,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every image Railway deploys (see railway.toml).
+        # Every image Railway deploys (see railway/).
         dockerfile: [Dockerfile, Dockerfile.arb-monitor, Dockerfile.dashboard]
     steps:
       - uses: actions/checkout@v4
