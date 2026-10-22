@@ -1237,11 +1237,13 @@ impl OrderExecutor {
             OrderSide::Buy => order.quantity * price,
             OrderSide::Sell => order.quantity,
         };
-        // A buy must also leave room for withdrawals that may still take USDC
-        // from the wallet; that reserve is checked, never spent.
+        // A buy must also leave room for the taker fee charged on top of its
+        // amount and for withdrawals that may still take USDC from the
+        // wallet; that reserve is checked, never spent.
         let required_amount = match order.side {
             OrderSide::Buy => {
                 market_amount
+                    + taker_fee_allowance(order.quantity, price)
                     + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
             }
             OrderSide::Sell => market_amount,
@@ -1382,6 +1384,7 @@ impl OrderExecutor {
         let required_amount = match order.side {
             OrderSide::Buy => {
                 order.quantity * order.price
+                    + taker_fee_allowance(order.quantity, order.price)
                     + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
             }
             OrderSide::Sell => order.quantity,
@@ -1637,6 +1640,13 @@ impl OrderExecutor {
     }
 }
 
+/// The most taker fee a buy of `quantity` shares at `price` can be charged
+/// in USDC on top of its amount: the highest published rate (fee-free markets
+/// are charged none), as the executor does not know each market's terms.
+fn taker_fee_allowance(quantity: Decimal, price: Decimal) -> Decimal {
+    quantity * polymarket_core::types::FeeSchedule::CONSERVATIVE.fee_per_share(price)
+}
+
 impl Clone for ExecutionMetrics {
     fn clone(&self) -> Self {
         Self {
@@ -1850,6 +1860,23 @@ mod tests {
         let refused = executor.execute_live_market_order(&buy(), None).await;
         assert!(refused.is_err() || !refused.unwrap().is_success());
         assert_eq!(maker_amount(), None);
+
+        // 44.9 in flight leaves 5.1: enough for the 5 USDC amount but not for
+        // the taker fee it may pay on top (up to 10 × 0.07 × 0.25 = 0.175).
+        sqlx::query("UPDATE wallet_withdrawals SET amount = 44.9")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let refused = executor.execute_live_market_order(&buy(), None).await;
+        assert!(refused.is_err() || !refused.unwrap().is_success());
+        assert_eq!(maker_amount(), None);
+        // 44.8 leaves 5.2: amount and fee fit, and the amount signed is still 5.
+        sqlx::query("UPDATE wallet_withdrawals SET amount = 44.8")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = executor.execute_live_market_order(&buy(), None).await;
+        assert_eq!(maker_amount().as_deref(), Some("5000000"));
     }
 
     #[sqlx::test(migrations = false)]
