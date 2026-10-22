@@ -414,12 +414,7 @@ async fn settle_after_sale(
             ctx,
         )
         .await?;
-    crate::exit_handler::record_close_with_breaker(
-        &state.circuit_breaker,
-        &state.order_executor,
-        position,
-    )
-    .await;
+    crate::exit_handler::record_close_with_breaker(&state.circuit_breaker, position).await;
     Ok(())
 }
 

@@ -13,9 +13,10 @@
 //! more or the node refuses it, until its nonce is used, but never while the
 //! node counts the nonce pending without holding the wrap: a transaction
 //! signed there is never pushed out. After [`MAX_HOLD`] the lock is let go
-//! (and said so); a restart lets go of it too. Without the lock nothing is
-//! sent: the wrap is only watched, and one the node dropped is let go (a
-//! later look wraps afresh, at the same nonce while it is free). A
+//! (and said so) and taken only for a look: the wrap's gas is still raised
+//! while the node holds it, but one the node dropped is let go, never sent
+//! again (a later look wraps afresh, at the same nonce while it is free). A
+//! restart lets go of the lock too. Without the lock nothing is sent. A
 //! withdrawal still waits while the node holds the wrap, and goes out once
 //! the node has mined or dropped it.
 
@@ -75,9 +76,22 @@ pub(crate) enum WrapOutcome {
     Unmined,
     /// Another transaction used the wrap's nonce; the USDC.e was not wrapped.
     Superseded,
-    /// The node dropped the wrap while the lock was let go; a later look
-    /// wraps afresh.
+    /// The node dropped the wrap, past the hold or without the lock; a later
+    /// look wraps afresh.
     Dropped,
+}
+
+/// What a follow-up may send for a waiting wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sending {
+    /// Under the lock, within [`MAX_HOLD`]: sent again should the node drop
+    /// it, its gas raised when underpriced.
+    Full,
+    /// Under the lock past [`MAX_HOLD`]: its gas raised while the node holds
+    /// it; let go once dropped.
+    RaiseOnly,
+    /// Without the lock: only watched; let go once dropped.
+    Watch,
 }
 
 /// A wrap sent and not yet settled.
@@ -92,6 +106,11 @@ struct PendingWrap {
     hashes: Vec<String>,
     /// Since when checks have found the nonce used and none of its receipts.
     nonce_used_since: Option<Instant>,
+    /// Since when checks have found the node holding none of its
+    /// transactions and nothing pending at its nonce.
+    dropped_since: Option<Instant>,
+    /// Whether the lock was let go for having held it [`MAX_HOLD`].
+    hold_ended: bool,
 }
 
 /// Wraps the wallet's idle USDC.e, remembering a wrap until it settles.
@@ -129,12 +148,18 @@ impl Sweeper {
             }
         }
         let outcome = if let Some(wrap) = &self.pending {
-            // Keep (or take back) the lock while it waits, within the bound.
-            if self.lock.is_none() && wrap.sent_at.elapsed() < MAX_HOLD {
+            // Keep (or take back) the lock while it waits. Past the bound it
+            // is taken for the look only, and let go after it.
+            let past_hold = wrap.sent_at.elapsed() >= MAX_HOLD;
+            if self.lock.is_none() {
                 self.lock = SpendLock::try_acquire(pool, &address).await?;
             }
-            let may_send = self.lock.is_some();
-            self.follow_up(client, wallet, FOLLOW_UP_POLLS, may_send)
+            let sending = match (self.lock.is_some(), past_hold) {
+                (false, _) => Sending::Watch,
+                (true, false) => Sending::Full,
+                (true, true) => Sending::RaiseOnly,
+            };
+            self.follow_up(client, wallet, FOLLOW_UP_POLLS, sending)
                 .await
         } else {
             let Some(mut lock) = SpendLock::try_acquire(pool, &address).await? else {
@@ -144,14 +169,17 @@ impl Sweeper {
             self.lock = Some(lock);
             outcome
         };
-        match &self.pending {
+        match self.pending.as_mut() {
             None => self.release().await,
-            Some(wrap) if wrap.sent_at.elapsed() >= MAX_HOLD && self.lock.is_some() => {
-                warn!(
-                    nonce = wrap.nonce,
-                    "A wrap has waited half an hour; the spend lock is let go, and withdrawals \
-                     wait only while the node still holds the wrap"
-                );
+            Some(wrap) if wrap.sent_at.elapsed() >= MAX_HOLD => {
+                if !wrap.hold_ended {
+                    wrap.hold_ended = true;
+                    warn!(
+                        nonce = wrap.nonce,
+                        "A wrap has waited half an hour; the spend lock is let go, and withdrawals \
+                         wait only while the node still holds the wrap"
+                    );
+                }
                 self.release().await;
             }
             Some(_) => {}
@@ -241,21 +269,22 @@ impl Sweeper {
             hashes: vec![signed.tx_hash.clone()],
             latest: signed,
             nonce_used_since: None,
+            dropped_since: None,
+            hold_ended: false,
         });
         // Sent under the lock the caller holds.
-        self.follow_up(client, wallet, NEW_WRAP_POLLS, true).await
+        self.follow_up(client, wallet, NEW_WRAP_POLLS, Sending::Full)
+            .await
     }
 
-    /// Wait up to `polls` for the pending wrap to settle. While the spend
-    /// lock is held (`may_send`) it is sent again should the node drop it
-    /// and its gas raised when underpriced; without it nothing is sent, and
-    /// a wrap the node dropped is let go.
+    /// Wait up to `polls` for the pending wrap to settle, sending what
+    /// `sending` allows: see [`Sending`].
     async fn follow_up(
         &mut self,
         client: &PolygonClient,
         wallet: &TradingWallet,
         polls: u32,
-        may_send: bool,
+        sending: Sending,
     ) -> anyhow::Result<WrapOutcome> {
         let Some(mut wrap) = self.pending.take() else {
             return Ok(WrapOutcome::Nothing);
@@ -328,31 +357,42 @@ impl Sweeper {
                 }
             }
             let nonce_free = matches!(nonces, Ok((_, pending)) if pending <= wrap.nonce);
-            // Without the lock a withdrawal may be signed at any moment:
-            // nothing is sent. A wrap the node dropped, at a nonce still
-            // free, is let go; a later look wraps afresh under the lock, at
-            // the same nonce while it is free, so the two are never both
-            // mined.
-            if !may_send {
-                if none_held && nonce_free {
-                    warn!(
-                        nonce = wrap.nonce,
-                        "The node dropped a wrap while the spend lock was let go; it is let go too"
-                    );
-                    return Ok(WrapOutcome::Dropped);
+            // Past the hold, or without the lock, a wrap the node dropped at
+            // a nonce still free is let go, once checks over a while agree (a
+            // node behind a load balancer can miss it for a moment). A later
+            // look wraps afresh under the lock, at the same nonce while it is
+            // free, so the two are never both mined.
+            if none_held && nonce_free {
+                if sending != Sending::Full {
+                    let since = *wrap.dropped_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= NONCE_USED_CONFIRM {
+                        warn!(
+                            nonce = wrap.nonce,
+                            "The node dropped a wrap the spend lock no longer covers; it is let go"
+                        );
+                        return Ok(WrapOutcome::Dropped);
+                    }
+                    continue;
                 }
+            } else {
+                wrap.dropped_since = None;
+            }
+            // Without the lock a withdrawal may be signed at any moment:
+            // nothing is sent.
+            if sending == Sending::Watch {
                 continue;
             }
             // The node holds none of the wrap's transactions, yet counts the
             // nonce as pending (or it could not be read): another transaction
             // may hold it. Sending the wrap again, or a replacement, would
-            // push that one out.
-            if !ours_held && !nonce_free {
+            // push that one out. Past the hold only a wrap the node holds is
+            // raised.
+            if !ours_held && (!nonce_free || sending == Sending::RaiseOnly) {
                 continue;
             }
             // Dropped by the node: send it again. Refused again: raise its gas.
             let mut refused = false;
-            if matches!(latest_known, Ok(false)) {
+            if sending == Sending::Full && matches!(latest_known, Ok(false)) {
                 // The node's refusal, not a transport failure.
                 refused = matches!(
                     client
@@ -775,7 +815,7 @@ mod tests {
             ..wrap
         });
         let outcome = sweeper
-            .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, true)
+            .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Full)
             .await
             .unwrap();
         assert_eq!(outcome, WrapOutcome::Unmined);
@@ -784,7 +824,7 @@ mod tests {
         tokio::time::sleep(NONCE_USED_CONFIRM).await;
         assert_eq!(
             sweeper
-                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, true)
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Full)
                 .await
                 .unwrap(),
             WrapOutcome::Superseded
@@ -818,7 +858,7 @@ mod tests {
         let sent = chain.lock().unwrap().broadcasts.len();
         assert_eq!(
             sweeper
-                .follow_up(&client, &wallet(), 2 * CHECK_EVERY_POLLS, true)
+                .follow_up(&client, &wallet(), 2 * CHECK_EVERY_POLLS, Sending::Full)
                 .await
                 .unwrap(),
             WrapOutcome::Unmined
@@ -829,7 +869,7 @@ mod tests {
         chain.lock().unwrap().latest_nonce = 1;
         assert_eq!(
             sweeper
-                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, true)
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Full)
                 .await
                 .unwrap(),
             WrapOutcome::Unmined
@@ -837,7 +877,7 @@ mod tests {
         tokio::time::sleep(NONCE_USED_CONFIRM).await;
         assert_eq!(
             sweeper
-                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, true)
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Full)
                 .await
                 .unwrap(),
             WrapOutcome::Superseded
@@ -867,22 +907,102 @@ mod tests {
         let sent = chain.lock().unwrap().broadcasts.len();
         assert_eq!(
             sweeper
-                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, false)
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Watch)
                 .await
                 .unwrap(),
             WrapOutcome::Unmined
         );
-        // Dropped, at a nonce still free: let go, never sent again.
+        // Dropped, at a nonce still free: let go once a later check agrees,
+        // never sent again.
         chain.lock().unwrap().known.clear();
         assert_eq!(
             sweeper
-                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, false)
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Watch)
+                .await
+                .unwrap(),
+            WrapOutcome::Unmined
+        );
+        tokio::time::sleep(NONCE_USED_CONFIRM).await;
+        assert_eq!(
+            sweeper
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS, Sending::Watch)
                 .await
                 .unwrap(),
             WrapOutcome::Dropped
         );
         assert!(!sweeper.waiting());
         assert_eq!(chain.lock().unwrap().broadcasts.len(), sent);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn past_the_hold_a_wrap_is_raised_under_a_brief_lock_and_let_go_once_dropped(
+        pool: PgPool,
+    ) {
+        setup(&pool).await;
+        let chain = Arc::new(Mutex::new(Chain {
+            usdc_units: 5_000_000,
+            pol_wei: 1_000_000_000_000_000_000,
+            ..Default::default()
+        }));
+        let client = mock_node(chain.clone()).await;
+        let address = wallet().address_string();
+        let nonce_and_price =
+            |raw: &String| polymarket_core::api::polygon::legacy_nonce_and_gas_price(raw).unwrap();
+        let mut sweeper = Sweeper::default();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        sweeper.pending.as_mut().unwrap().sent_at = Instant::now() - MAX_HOLD;
+
+        // Half an hour on, the node holds the wrap and the network asks more:
+        // raised, under the lock taken for the look and let go after it.
+        let first = chain.lock().unwrap().broadcasts.len();
+        chain.lock().unwrap().gas_price *= 2;
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        let broadcasts = chain.lock().unwrap().broadcasts.clone();
+        assert!(broadcasts.len() > first);
+        let (nonce, price) = nonce_and_price(broadcasts.last().unwrap());
+        assert_eq!(nonce, 0);
+        assert!(price > nonce_and_price(&broadcasts[0]).1);
+        let free = SpendLock::try_acquire(&pool, &address).await.unwrap();
+        assert!(free.is_some());
+
+        // A withdrawal holds the lock: the wrap is only watched.
+        let held = free.unwrap();
+        chain.lock().unwrap().gas_price *= 2;
+        let sent = chain.lock().unwrap().broadcasts.len();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        assert_eq!(chain.lock().unwrap().broadcasts.len(), sent);
+        held.release().await;
+
+        // The node drops it, its nonce free: let go, never sent again...
+        chain.lock().unwrap().known.clear();
+        let mut outcome = WrapOutcome::Unmined;
+        for _ in 0..3 {
+            outcome = sweeper.look(&pool, &client, &wallet()).await.unwrap();
+            if outcome != WrapOutcome::Unmined {
+                break;
+            }
+            tokio::time::sleep(NONCE_USED_CONFIRM).await;
+        }
+        assert_eq!(outcome, WrapOutcome::Dropped);
+        assert_eq!(chain.lock().unwrap().broadcasts.len(), sent);
+        // ...and the next look wraps afresh, at the same nonce.
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        let broadcasts = chain.lock().unwrap().broadcasts.clone();
+        assert_eq!(broadcasts.len(), sent + 1);
+        assert_eq!(nonce_and_price(broadcasts.last().unwrap()).0, 0);
+        sweeper.release().await;
     }
 
     #[sqlx::test(migrations = false)]

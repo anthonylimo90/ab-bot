@@ -625,10 +625,12 @@ unsigned). Fees are set by the exchange when an order matches.
   whose release does not answer within ten seconds, is freed the same way.
   After half an hour the
   lock is let go with a warning; a restart lets go of it too. From then on
-  the wrap is only watched, never sent again: one the node drops is let go,
-  and a later look wraps afresh under the lock. A withdrawal still waits
-  (503) while the node holds the wrap, and goes out once the node has mined
-  or dropped it. The log says "Wrapping USDC.e into pUSD";
+  the lock is taken only for a look, when free: the wrap's gas is still
+  raised while the node holds it, but it is never sent again. One the node
+  drops (as checks over two minutes agree) is let go, and a later look wraps
+  afresh under the lock. Without the lock nothing is sent. A withdrawal
+  still waits (503) while the node holds the wrap, and goes out once the
+  node has mined or dropped it. The log says "Wrapping USDC.e into pUSD";
   USDC.e left waiting for an hour is logged as a warning. The sweeper wraps
   for the signer selected at startup.
 - Cash, for equity, the circuit breaker and the vault balance, is the
@@ -694,9 +696,11 @@ unsigned). Fees are set by the exchange when an order matches.
   (they stay in the wallet) and listed in its `closed_via_resolution` event
   (metadata `unpaired`).
 - A break-even close neither extends nor ends the circuit breaker's run of
-  losses. A live position's close always counts in the breaker, live trading
-  switched off or not; a paper position's counts only while the executor
-  does not trade live, and one of unknown provenance never.
+  losses. The breaker guards real money: only a live position's close counts
+  in it, live trading switched off or not. Paper results (and those of
+  unknown provenance) never do, so a paper win cannot end or offset a run
+  of live losses; paper trading no longer trips the breaker by its own
+  losses.
 - An arb signal is skipped while any position in its market is still active,
   read from the database (an entry still settling included), so a restart
   or a reconciled entry never lets a second pair into the same market.

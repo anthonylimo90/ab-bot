@@ -1161,7 +1161,7 @@ async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions
 }
 
 #[sqlx::test(migrations = false)]
-async fn live_results_always_reach_the_breaker_and_paper_ones_only_off_live(pool: PgPool) {
+async fn only_live_results_reach_the_breaker_live_trading_on_or_off(pool: PgPool) {
     let service = setup(&pool).await;
     let resolved = |mode: &str, wallet: Option<String>| {
         let mut p = position();
@@ -1172,7 +1172,8 @@ async fn live_results_always_reach_the_breaker_and_paper_ones_only_off_live(pool
         p.held_yes_qty = Decimal::TEN;
         p
     };
-    // Live trading switched off: a live position's loss still counts.
+    // Trading on paper (live trading switched off): a live position's loss
+    // still counts, a paper position's win does not end its run.
     let (h, server) = handler(&pool).await;
     let mut p = resolved("live", Some("0xlive".into()));
     service.repo().insert(&p).await.unwrap();
@@ -1180,13 +1181,21 @@ async fn live_results_always_reach_the_breaker_and_paper_ones_only_off_live(pool
         .finalize_resolution_close(&mut p, 0, None, Some(false))
         .await
         .unwrap());
+    let loss = p.realized_pnl.unwrap();
+    assert!(loss < Decimal::ZERO);
+    let mut won = resolved("paper", None);
+    service.repo().insert(&won).await.unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut won, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert!(won.realized_pnl.unwrap() > Decimal::ZERO);
     let breaker = h.circuit_breaker.state().await;
-    assert_eq!(breaker.daily_pnl, p.realized_pnl.unwrap());
-    assert!(breaker.daily_pnl < Decimal::ZERO);
+    assert_eq!(breaker.daily_pnl, loss);
     assert_eq!(breaker.consecutive_losses, 1);
     server.abort();
 
-    // Trading live: a paper position left over does not count.
+    // Trading live: a paper position left over does not count either.
     let balance = Arc::new(std::sync::Mutex::new(String::new()));
     let (h, _wallet, server) = live_handler(&pool, balance).await;
     h.token_cache

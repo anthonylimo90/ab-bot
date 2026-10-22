@@ -689,7 +689,7 @@ impl ExitHandler {
         let no_price = position.no_exit_price.unwrap_or(Decimal::ZERO);
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        record_close_with_breaker(&self.circuit_breaker, &self.order_executor, position).await;
+        record_close_with_breaker(&self.circuit_breaker, position).await;
 
         // Publish success signal
         let signal = SignalUpdate {
@@ -1185,7 +1185,7 @@ impl ExitHandler {
         }
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        record_close_with_breaker(&self.circuit_breaker, &self.order_executor, position).await;
+        record_close_with_breaker(&self.circuit_breaker, position).await;
 
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
@@ -2072,27 +2072,16 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
     current_deviation <= entry_deviation / Decimal::new(2, 0)
 }
 
-/// Feed a closed position's realized P&L to the circuit breaker. A live
-/// result always counts: live trading switched off for a while makes its
-/// losses no less real. A paper result counts only while the executor does
-/// not trade live (as positions are tagged): one closing after a switch to
-/// live says nothing about the risk the breaker guards. One of unknown
-/// provenance never counts.
-pub(crate) async fn record_close_with_breaker(
-    breaker: &CircuitBreaker,
-    executor: &OrderExecutor,
-    position: &Position,
-) {
-    let counts = match position.execution_mode.as_str() {
-        "live" => true,
-        "paper" => !executor.is_live_ready().await,
-        _ => false,
-    };
-    if !counts {
-        info!(
+/// Feed a closed position's realized P&L to the circuit breaker, which
+/// guards real money: only a live position's result counts, live trading
+/// switched off or not. A paper result (or one of unknown provenance) never
+/// does, so a paper win can never end a run of live losses or offset them.
+pub(crate) async fn record_close_with_breaker(breaker: &CircuitBreaker, position: &Position) {
+    if position.execution_mode != "live" {
+        debug!(
             position_id = %position.id,
             position_mode = %position.execution_mode,
-            "Close left out of the circuit breaker: not a result of the mode traded now"
+            "Close left out of the circuit breaker: not a live result"
         );
         return;
     }
