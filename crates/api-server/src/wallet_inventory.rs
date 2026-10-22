@@ -518,6 +518,9 @@ pub async fn recover_wallet_orphan_inventory(
             continue;
         }
 
+        let Some(_operation) = order_executor.begin_operation() else {
+            break;
+        };
         result.attempted += 1;
 
         let expected_price = match load_expected_sell_price(clob_client, &entry.token_id).await {

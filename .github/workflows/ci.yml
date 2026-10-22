@@ -116,7 +116,41 @@ jobs:
           shared-key: "rust-ci"
 
       - name: Run tests
-        run: cargo test --all --verbose
+        run: cargo test --workspace --locked
+
+  rust-migrations:
+    name: Migrations (TimescaleDB)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # The production database image: every migration must apply on it
+        # through sqlx, in order, inside its transactions.
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_PASSWORD: test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:test-only@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-ci"
+
+      - name: Apply the complete schema
+        run: cargo test -p api-server --lib --locked migration_tests::complete_schema -- --ignored
 
   rust-audit:
     name: Security Audit
@@ -196,10 +230,15 @@ jobs:
   # Docker Build
   # ==========================================================================
   docker-build:
-    name: Docker Build
+    name: Docker Build (${{ matrix.dockerfile }})
     needs: changes
-    if: needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.docker == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every image Railway deploys (see railway.toml).
+        dockerfile: [Dockerfile, Dockerfile.arb-monitor, Dockerfile.dashboard]
     steps:
       - uses: actions/checkout@v4
 
@@ -210,9 +249,10 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.dockerfile }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.dockerfile }}
 
   # ==========================================================================
   # All Checks Pass
@@ -224,6 +264,7 @@ jobs:
       - rust-format
       - rust-clippy
       - rust-test
+      - rust-migrations
       - rust-audit
       - dashboard-check
       - dashboard-build
@@ -233,10 +274,16 @@ jobs:
     steps:
       - name: Check all jobs passed
         run: |
+          # If change detection fails every job is skipped; that is a failure.
+          if [[ "${{ needs.changes.result }}" != "success" ]]; then
+            echo "Change detection did not succeed (got: ${{ needs.changes.result }})"
+            exit 1
+          fi
           results=(
             "${{ needs.rust-format.result }}"
             "${{ needs.rust-clippy.result }}"
             "${{ needs.rust-test.result }}"
+            "${{ needs.rust-migrations.result }}"
             "${{ needs.rust-audit.result }}"
             "${{ needs.dashboard-check.result }}"
             "${{ needs.dashboard-build.result }}"

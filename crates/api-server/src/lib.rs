@@ -595,14 +595,75 @@ impl ApiServer {
         info!(address = %addr, "Starting API server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        let stop_accepting = Arc::new(tokio::sync::Notify::new());
         // ConnectInfo gives the rate limiter the TCP peer address to fall back on.
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
+        let server = {
+            let stop_accepting = stop_accepting.clone();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { stop_accepting.notified().await })
+        };
+        let server = std::future::IntoFuture::into_future(server);
+        tokio::pin!(server);
 
+        tokio::select! {
+            result = &mut server => result?,
+            () = shutdown_signal() => {
+                // No new trading operation starts from here; started ones
+                // (an arb between its legs, an exit, a manual order) finish.
+                info!("Shutdown requested: draining requests and trading operations");
+                state.order_executor.begin_draining();
+                stop_accepting.notify_one();
+                if tokio::time::timeout(HTTP_DRAIN, &mut server).await.is_err() {
+                    tracing::warn!("Requests still open after the drain period; closing them");
+                }
+            }
+        }
+
+        if state.order_executor.drain(OPERATION_DRAIN).await {
+            info!("Trading operations finished; shutting down");
+        } else {
+            tracing::warn!(
+                "Trading operations still running at shutdown; their journaled orders are \
+                 reconciled on the next start"
+            );
+        }
         Ok(())
+    }
+}
+
+/// How long open HTTP requests may finish after a shutdown request.
+const HTTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long started trading operations may finish after that.
+const OPERATION_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve on SIGTERM (container stop, deploy) or Ctrl-C.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "Failed to listen for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "Failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
     }
 }
 

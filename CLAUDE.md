@@ -24,7 +24,7 @@ Next.js 15 + React 19 app with TanStack Query v5, Zustand v5, Tailwind, Recharts
 cargo build --all                # Build
 cargo test --all                 # Test
 cargo fmt --all                  # Format
-cargo clippy --all-targets --all-features -- -D warnings  # Lint
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings  # Lint
 cargo run -p arb-monitor         # Run specific crate
 docker compose up -d             # Start services
 cd dashboard && npm run dev      # Run dashboard (Next.js, port 3000)
@@ -45,10 +45,10 @@ cd dashboard && npm run dev      # Run dashboard (Next.js, port 3000)
 
 ## Dos and Don'ts
 
-- DO run `cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings` before committing
+- DO run `cargo fmt --all && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` before committing
 - DO use conventional commits
 - DO branch from `develop` for new work (`feature/`, `fix/`, `refactor/`)
-- DO regenerate `.sqlx/` cache after modifying queries
+- DO add a new numbered migration for schema changes; never edit an applied one
 - DON'T push directly to `main`
 - DON'T commit `.env` files or secrets
 - DON'T use interactive git flags (`-i`)
@@ -61,8 +61,10 @@ cd dashboard && npm run dev      # Run dashboard (Next.js, port 3000)
 - `crates/api-server/src/arb_executor.rs` - Arbitrage signal execution pipeline
 - `crates/api-server/src/handlers/workspaces.rs` - Workspace settings API (dynamic config bounds, circuit breaker overrides)
 - `crates/api-server/src/signals/` - Quant signal system (generators, resolution)
-- `migrations/` - SQLx migrations (44 files)
-- `docker-compose.yml` - Postgres (TimescaleDB), Redis, API, arb-monitor (profiles: `full`, `monitoring`)
+- `migrations/` - SQLx migrations, applied in order by the API server at startup (numbering has gaps)
+- `crates/api-server/src/intent_reconciler.rs` - Resolves journaled live orders (`execution_intents`)
+- `crates/api-server/src/withdrawals.rs` - Withdrawal capacity, journal and chain reconciler
+- `docker-compose.yml` - Postgres (TimescaleDB), Redis, API, arb-monitor (profiles: `full`, `monitoring`); the API applies migrations
 - `.env.example` - All environment variables with defaults
 
 ## Key Patterns
@@ -99,15 +101,16 @@ CLOB_MARKET_LIMIT=200000               # Market cache pagination limit
 ## CI
 
 GitHub Actions (`.github/workflows/ci.yml`) runs on push/PR to `main` and `develop`:
-format, clippy, test, audit, dashboard lint/build, docker build. Uses `SQLX_OFFLINE=true`.
+format, clippy, test (Postgres), full migration chain (TimescaleDB), audit,
+dashboard lint/test/build, and a build of every deployed Dockerfile.
 
-## SQLx Offline Mode
+## SQL
 
-After modifying SQL queries, regenerate the cache:
-
-```bash
-DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prepare --workspace
-```
+Queries are checked at runtime (`sqlx::query`, not the `query!` macros), so
+there is no `.sqlx` cache to regenerate. Database-backed tests use
+`#[sqlx::test(migrations = false)]` with the tables they need; run them with
+`DATABASE_URL` pointing at a disposable Postgres. The full-schema test
+(`migration_tests::complete_schema`, ignored by default) needs TimescaleDB.
 
 ## Troubleshooting
 

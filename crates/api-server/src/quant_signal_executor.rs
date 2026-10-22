@@ -1102,6 +1102,18 @@ impl QuantSignalExecutor {
             SignalDirection::BuyYes => (best_ask, Decimal::ZERO),
             SignalDirection::BuyNo => (Decimal::ZERO, best_ask),
         };
+        let Some(_operation) = self.order_executor.begin_operation() else {
+            self.update_signal_status(signal.id, "skipped", Some("shutting_down"))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("shutting_down"),
+            )
+            .await;
+            return Ok(());
+        };
         let ctx = EventContext {
             wallet_address: self.order_executor.wallet_address().await,
             execution_mode: execution_mode.clone(),

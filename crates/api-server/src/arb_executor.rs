@@ -1116,6 +1116,15 @@ impl ArbAutoExecutor {
             "Executing arb trade"
         );
 
+        // Admit the arb whole or not at all: a shutdown must never fall
+        // between its two legs.
+        let Some(_operation) = self.order_executor.begin_operation() else {
+            telemetry.finish_total(&process_started_at);
+            self.record_skip_event(&arb, execution_mode, "shutting_down", &telemetry)
+                .await;
+            return Ok(());
+        };
+
         // 8. Create position in PENDING state
         let ctx = EventContext {
             wallet_address: self.order_executor.wallet_address().await,

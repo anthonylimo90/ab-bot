@@ -10,7 +10,7 @@ use polymarket_core::types::{
     ExecutionReport, LimitOrder, MarketOrder, OrderBook, OrderSide, OrderStatus,
 };
 use rust_decimal::Decimal;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
@@ -147,6 +147,24 @@ pub struct OrderExecutor {
     auth_client: Arc<RwLock<Option<AuthenticatedClobClient>>>,
     /// Runtime-toggleable live mode flag (overrides config.live_trading).
     live_override: AtomicBool,
+    /// Set when the process shuts down: no new trading operation starts.
+    draining: Arc<AtomicBool>,
+    /// Trading operations started and not yet finished.
+    operations_in_flight: Arc<AtomicUsize>,
+    /// Live submissions between their journal entry and recorded outcome.
+    submissions_in_flight: AtomicUsize,
+}
+
+/// Admission of one unit of trading work that must not be cut in half by a
+/// shutdown: both legs of an arb, a position's exit sales, a manual order.
+/// Dropping it ends the operation.
+#[must_use = "the operation ends when the guard is dropped"]
+pub struct TradingOperation(Arc<AtomicUsize>);
+
+impl Drop for TradingOperation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl OrderExecutor {
@@ -163,6 +181,9 @@ impl OrderExecutor {
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
             auth_client: Arc::new(RwLock::new(None)),
             live_override: AtomicBool::new(live),
+            draining: Arc::new(AtomicBool::new(false)),
+            operations_in_flight: Arc::new(AtomicUsize::new(0)),
+            submissions_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -211,10 +232,51 @@ impl OrderExecutor {
             metrics: std::sync::RwLock::new(ExecutionMetrics::default()),
             auth_client: Arc::new(RwLock::new(Some(auth_client))),
             live_override: AtomicBool::new(live),
+            draining: Arc::new(AtomicBool::new(false)),
+            operations_in_flight: Arc::new(AtomicUsize::new(0)),
+            submissions_in_flight: AtomicUsize::new(0),
         }
     }
 
     /// Required for live submission so intent identity survives process failure.
+    /// Start a trading operation, or `None` once shutdown has begun: callers
+    /// must then not start the work (nothing has been sent for it yet).
+    pub fn begin_operation(&self) -> Option<TradingOperation> {
+        // Counted before the check, so a drain either refuses this operation
+        // or waits for it to finish.
+        self.operations_in_flight.fetch_add(1, Ordering::SeqCst);
+        let operation = TradingOperation(self.operations_in_flight.clone());
+        (!self.draining.load(Ordering::SeqCst)).then_some(operation)
+    }
+
+    /// Whether shutdown has begun.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Refuse new trading operations from now on; started ones continue.
+    pub fn begin_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// [`Self::begin_draining`], then wait up to `timeout` for started
+    /// operations and live submissions to finish. `true` when none is left.
+    pub async fn drain(&self, timeout: std::time::Duration) -> bool {
+        self.begin_draining();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.operations_in_flight.load(Ordering::SeqCst) == 0
+                && self.submissions_in_flight.load(Ordering::SeqCst) == 0
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     pub fn with_database(mut self, pool: sqlx::PgPool) -> Self {
         self.database = Some(pool);
         self

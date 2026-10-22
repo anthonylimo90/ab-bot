@@ -360,6 +360,11 @@ impl ExitHandler {
 
     /// Execute the sell orders for a single ExitReady position.
     async fn execute_exit(&self, position: &mut Position) -> anyhow::Result<()> {
+        // Sell every leg of the exit or none of it; a shutdown leaves the
+        // position ExitReady for the next process.
+        let Some(_operation) = self.order_executor.begin_operation() else {
+            return Ok(());
+        };
         self.order_executor
             .validate_position_execution(position)
             .await?;

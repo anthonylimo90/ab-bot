@@ -285,6 +285,12 @@ pub async fn place_order(
         request.time_in_force = "FOK".into();
     }
     validate_order_request(&request)?;
+    // Held until the order's outcome is recorded; refused once shutdown began.
+    let Some(_operation) = state.order_executor.begin_operation() else {
+        return Err(ApiError::ServiceUnavailable(
+            "The server is shutting down; nothing was sent".into(),
+        ));
+    };
     let wallet = state.order_executor.wallet_address().await;
     let max_exposure = if let Some(cfg) = &state.arb_executor_config {
         cfg.read().await.max_total_exposure

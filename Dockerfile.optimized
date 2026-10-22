@@ -59,7 +59,7 @@ RUN touch src/lib.rs \
 
 # Build only needed binaries (saves ~60% build time vs --workspace)
 RUN echo "Building api-server, arb-monitor, bot-scanner..." \
-    && cargo build --release -p api-server -p arb-monitor -p bot-scanner \
+    && cargo build --release -p api-server -p arb-monitor -p bot-scanner --locked \
     && echo "Build complete!"
 
 # Verify binaries were created

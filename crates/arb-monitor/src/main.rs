@@ -42,8 +42,35 @@ async fn main() -> Result<()> {
     // Initialize the monitor
     let mut monitor = monitor::ArbMonitor::new(config).await?;
 
-    // Run the monitoring loop
-    monitor.run().await?;
+    // Run the monitoring loop until it fails or the process is asked to stop.
+    // The monitor only publishes signals, so stopping needs no draining; as
+    // PID 1 in its container it must still handle SIGTERM itself.
+    tokio::select! {
+        result = monitor.run() => result?,
+        () = shutdown_signal() => info!("Shutdown requested; stopping arbitrage monitor"),
+    }
 
     Ok(())
+}
+
+/// Resolve on SIGTERM (container stop, deploy) or Ctrl-C.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
 }

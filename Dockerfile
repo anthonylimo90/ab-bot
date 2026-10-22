@@ -60,7 +60,7 @@ RUN touch src/lib.rs \
     && touch crates/wallet-tracker/src/lib.rs
 
 # Build all binaries in release mode (only workspace crates recompile)
-RUN cargo build --release --workspace
+RUN cargo build --release --workspace --locked
 
 # ==============================================================================
 # Stage 2: Runtime - Minimal production image

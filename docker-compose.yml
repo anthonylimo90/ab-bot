@@ -9,11 +9,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-abbot}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-abbot_secret}
       POSTGRES_DB: ${POSTGRES_DB:-ab_bot}
+    # Reachable from this machine only; containers use the internal network.
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    # The schema is applied by the API server's versioned migrations, never by
+    # init scripts: those run once, on an empty volume, and skip every later
+    # migration silently.
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations:/docker-entrypoint-initdb.d:ro
     mem_limit: 2g
     memswap_limit: 2g
     healthcheck:
@@ -74,7 +77,7 @@ services:
       # is trusted. Set it to the number of reverse proxies when behind them.
       TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
       RUST_LOG: ${RUST_LOG:-api_server=info,tower_http=info}
-      SKIP_MIGRATIONS: "true"
+      SKIP_MIGRATIONS: ${SKIP_MIGRATIONS:-false}
       # Workspace/runtime toggles
       COPY_TRADING_ENABLED: ${COPY_TRADING_ENABLED:-true}
       COPY_MIN_TRADE_VALUE: ${COPY_MIN_TRADE_VALUE:-5}
@@ -102,6 +105,8 @@ services:
       DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS: ${DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS:-20}
     ports:
       - "${API_PORT:-3000}:3000"
+    # Room for open requests and started trading operations to finish.
+    stop_grace_period: 30s
     mem_limit: 2g
     memswap_limit: 2g
     depends_on:
@@ -133,7 +138,8 @@ services:
       POLYMARKET_API_URL: ${POLYMARKET_API_URL:-https://clob.polymarket.com}
       POLLING_INTERVAL_MS: ${POLLING_INTERVAL_MS:-1000}
     depends_on:
-      postgres:
+      # The API server applies the schema this service reads.
+      api-server:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -160,7 +166,8 @@ services:
       RUST_LOG: ${RUST_LOG:-bot_scanner=info}
       POLYGON_RPC_URL: ${POLYGON_RPC_URL:-}
     depends_on:
-      postgres:
+      # The API server applies the schema this service writes.
+      api-server:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/healthy"]
@@ -181,7 +188,7 @@ services:
     image: prom/prometheus:latest
     container_name: ab-bot-prometheus
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -198,7 +205,7 @@ services:
     image: grafana/grafana:latest
     container_name: ab-bot-grafana
     ports:
-      - "${GRAFANA_PORT:-3001}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}

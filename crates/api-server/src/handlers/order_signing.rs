@@ -596,6 +596,11 @@ pub async fn submit_order(
         .map_err(|_| {
             ApiError::ServiceUnavailable("Wallet-specific exchange authentication failed".into())
         })?;
+    let Some(_operation) = state.order_executor.begin_operation() else {
+        return Err(ApiError::ServiceUnavailable(
+            "The server is shutting down; nothing was sent".into(),
+        ));
+    };
     let response = state
         .order_executor
         .submit_wallet_order(

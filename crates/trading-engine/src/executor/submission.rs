@@ -7,6 +7,22 @@ use polymarket_core::signing::SignedOrder;
 const FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const FENCE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Counts a live submission from admission until it is dropped.
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl OrderExecutor {
     pub(super) async fn submit_live_once(
         &self,
@@ -53,6 +69,8 @@ impl OrderExecutor {
             .database
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Live execution requires durable intent storage"))?;
+        // A shutdown waits for this submission's outcome to be recorded.
+        let _in_flight = InFlight::enter(&self.submissions_in_flight);
         // Another order for this wallet that is mid-POST resolves within
         // moments: wait briefly instead of failing every concurrent strategy.
         let wait_until = std::time::Instant::now() + FENCE_WAIT;
@@ -230,5 +248,82 @@ mod tests {
                 .unwrap();
         assert_eq!(row.0, "unknown");
         assert_eq!(Some(row.1), signed.order_hash);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_drain_refuses_new_operations_and_waits_for_started_ones(pool: sqlx::PgPool) {
+        pool.execute(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute("CREATE TABLE position_order_links(id UUID,settled BOOLEAN)")
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE orders(id UUID,status TEXT)")
+            .await
+            .unwrap();
+        let executor = Arc::new(
+            OrderExecutor::new(
+                Arc::new(ClobClient::new(None, None)),
+                ExecutorConfig::default(),
+            )
+            .with_database(pool.clone()),
+        );
+        let signer = OrderSigner::new(
+            TradingWallet::from_private_key(&format!("{:064x}", 2))
+                .unwrap()
+                .signer()
+                .clone(),
+        );
+        let order = signer
+            .order_builder()
+            .token_id_str("1")
+            .side(SigningOrderSide::Buy)
+            .price(Decimal::new(5, 1))
+            .size(Decimal::ONE)
+            .expires_at(0)
+            .build()
+            .unwrap();
+        let signed = signer.sign_order(&order).await.unwrap();
+
+        // An operation (say an arb) is between its two legs when shutdown begins.
+        let operation = executor
+            .begin_operation()
+            .expect("admitted before shutdown");
+        executor.begin_draining();
+        assert!(
+            executor.begin_operation().is_none(),
+            "no new operation starts"
+        );
+        assert!(
+            !executor.drain(std::time::Duration::from_millis(100)).await,
+            "the started operation is waited for"
+        );
+        // Its second leg is still sent while draining.
+        let (posting_tx, posting_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let second_leg = {
+            let executor = executor.clone();
+            tokio::spawn(async move {
+                let result = executor
+                    .submit_once(Uuid::new_v4(), "market", &signed, || async move {
+                        posting_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        Err(polymarket_core::Error::Api {
+                            message: "rejected".into(),
+                            status: Some(400),
+                        })
+                    })
+                    .await;
+                drop(operation);
+                result
+            })
+        };
+        posting_rx.await.unwrap();
+        assert!(!executor.drain(std::time::Duration::from_millis(100)).await);
+        release_tx.send(()).unwrap();
+        second_leg.await.unwrap().unwrap_err();
+        assert!(executor.drain(std::time::Duration::from_secs(5)).await);
     }
 }
