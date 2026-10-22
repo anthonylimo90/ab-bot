@@ -175,6 +175,16 @@ impl PositionRepository {
         self.update_on_connection(position, &mut connection).await
     }
 
+    /// Update several positions in one transaction: all of them, or none.
+    pub async fn update_all(&self, positions: &mut [Position]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for position in positions.iter_mut() {
+            self.update_on_connection(position, &mut tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Persist inventory and its durable fill receipt in the same transaction.
     pub async fn update_with_receipt(
         &self,

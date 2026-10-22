@@ -512,6 +512,49 @@ impl PositionService {
             return Ok(());
         }
         self.repo.update(position).await?;
+        self.record_shares_written_off(position, leg, written_off, ctx)
+            .await;
+        Ok(())
+    }
+
+    /// Write off what the wallet lacks from several positions at once: each
+    /// `(position, quantity, context)` is persisted with all the others or
+    /// none is, and each write-off is then told under its own context.
+    /// Returns the positions as written.
+    pub async fn write_off_missing_shares_together(
+        &self,
+        leg: Leg,
+        write_offs: Vec<(Position, Decimal, EventContext)>,
+    ) -> anyhow::Result<Vec<Position>> {
+        let mut positions = Vec::new();
+        let mut told = Vec::new();
+        for (mut position, quantity, ctx) in write_offs {
+            let written_off = position.write_off_missing_shares(leg == Leg::Yes, quantity);
+            if !written_off.is_zero() {
+                told.push((positions.len(), written_off, ctx));
+            }
+            positions.push(position);
+        }
+        let mut changed: Vec<Position> =
+            told.iter().map(|(i, _, _)| positions[*i].clone()).collect();
+        self.repo.update_all(&mut changed).await?;
+        for ((i, written_off, ctx), position) in told.into_iter().zip(changed) {
+            self.record_shares_written_off(&position, leg, written_off, &ctx)
+                .await;
+            positions[i] = position;
+        }
+        Ok(positions)
+    }
+
+    async fn record_shares_written_off(
+        &self,
+        position: &Position,
+        leg: Leg,
+        written_off: Decimal,
+        ctx: &EventContext,
+    ) {
+        // The position stays where it is: its state goes with the event.
+        let state = crate::handlers::positions::position_state_label(position.state);
         self.events
             .record_warn(
                 NewTradeEvent::new(
@@ -522,18 +565,18 @@ impl PositionService {
                     "entry_fee_shares_written_off",
                 )
                 .with_position(position.id)
+                .with_state(Some(state), Some(state))
                 .with_metadata(serde_json::json!({
                     "leg": leg.to_string(),
                     "quantity": written_off.to_string(),
                 })),
             )
             .await;
-        Ok(())
     }
 
     // ── Position close ─────────────────────────────────────────────
 
-    /// Records that a resolved position is closed at its recorded holding of
+    /// Records that a resolved position was closed at its recorded holding of
     /// `leg` because the wallet could not confirm it, and why.
     pub async fn record_resolution_unmeasured(
         &self,
@@ -552,6 +595,7 @@ impl PositionService {
                     "resolution_unmeasured",
                 )
                 .with_position(position.id)
+                .with_state(Some("closed"), Some("closed"))
                 .with_reason(Some(reason))
                 .with_metadata(serde_json::json!({ "leg": leg.to_string() })),
             )
@@ -629,12 +673,15 @@ impl PositionService {
                 "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
-                if !position.has_full_pair_exposure() {
-                    return Err(anyhow!("Winner required for a resolution without a pair"));
+                if !position.has_full_pair_exposure()
+                    || position.held_yes_qty != position.held_no_qty
+                {
+                    return Err(anyhow!(
+                        "Winner required for unequal remaining resolution holdings"
+                    ));
                 }
-                // Each full pair pays one dollar whichever side won; any
-                // excess of one leg is valued at nothing.
-                let pairs = position.held_yes_qty.min(position.held_no_qty);
+                // Each pair pays one dollar whichever side won.
+                let pairs = position.held_yes_qty;
                 let proceeds = position.yes_exit_price.unwrap_or_default()
                     * position.exited_yes_qty
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;

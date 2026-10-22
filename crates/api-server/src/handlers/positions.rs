@@ -242,7 +242,7 @@ fn position_state_name(state: i16) -> &'static str {
     }
 }
 
-fn position_state_label(state: PositionState) -> &'static str {
+pub(crate) fn position_state_label(state: PositionState) -> &'static str {
     match state {
         PositionState::Pending => "pending",
         PositionState::Open => "open",

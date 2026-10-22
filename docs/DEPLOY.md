@@ -650,14 +650,16 @@ unsigned). Fees are set by the exchange when an order matches.
 - Before a live position is sold or closed at resolution, the legs that pay
   (the winner's, or both without a winner) are measured against the
   wallet's balance: a buy whose fee the V1 exchange kept in shares left the
-  record above it. A small gap is shared out among all the wallet's
-  positions in that market at once, each by its holding. Without a winner,
-  a pair whose legs differ by no more than such fee shares pays a dollar per
-  full pair, the excess counting for nothing. A resolution close waits, and
-  logs why, only while an order of the wallet on the market may still
-  settle. A balance that cannot be read, or one far below the record
-  (shares redeemed or moved), leaves the record standing: the position
-  closes at it, with a warning and a `resolution_unmeasured` trade event.
+  record above it. A small gap is written off from all the wallet's
+  positions in that market at once (in one transaction), each by its
+  holding. A winner is taken only from one outcome flagged the winner; without
+  one, a pair pays a dollar a pair only while its measured legs are equal,
+  and otherwise waits for the winner. A resolution close waits, and logs
+  why, while an order of the wallet on the market may still settle, and for
+  up to an hour while the balance cannot be read. A balance far below the
+  record (shares redeemed or moved), or still unreadable after that hour,
+  leaves the record standing: the position closes at it, with a warning and
+  a `resolution_unmeasured` trade event.
 - Preparing a browser-wallet order reads the market's tick size and refuses
   a price outside one tick of either end or with more decimals than the
   tick has (as Polymarket's own clients round), before the wallet signs.

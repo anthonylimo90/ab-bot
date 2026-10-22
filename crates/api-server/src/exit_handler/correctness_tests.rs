@@ -1133,7 +1133,7 @@ async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions
 }
 
 #[sqlx::test(migrations = false)]
-async fn a_pair_without_a_winner_pays_its_full_pairs_and_an_unmeasured_one_still_closes(
+async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_its_grace(
     pool: PgPool,
 ) {
     let service = setup(&pool).await;
@@ -1155,35 +1155,71 @@ async fn a_pair_without_a_winner_pays_its_full_pairs_and_an_unmeasured_one_still
         p
     };
     // V1 buys kept a different number of shares of each leg: 95.8 YES and
-    // 97.1 NO remain. Without a winner the 95.8 full pairs pay a dollar
-    // each and the extra NO counts for nothing: 95.8 − 90.
+    // 97.1 NO remain. Measured, the legs differ, so without a winner the
+    // position waits rather than guess what the extra NO is worth.
     let mut p = live_pair();
     service.repo().insert(&p).await.unwrap();
     *balance.lock().unwrap() = "yes:95800000,no:97100000".into();
-    assert!(h
+    assert!(!h
         .finalize_resolution_close(&mut p, 0, None, None)
         .await
         .unwrap());
-    assert_eq!(p.realized_pnl, Some(Decimal::new(58, 1)));
+    let stored = service.load(p.id).await.unwrap();
+    assert_eq!(stored.state, PositionState::Open);
+    assert_eq!(
+        (stored.held_yes_qty, stored.held_no_qty),
+        (Decimal::new(958, 1), Decimal::new(971, 1))
+    );
+    // Once NO is named the winner it pays what the wallet holds: 97.1 − 90.
+    let mut p = stored;
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(false))
+        .await
+        .unwrap());
+    assert_eq!(p.realized_pnl, Some(Decimal::new(71, 1)));
 
-    // A balance that cannot be read leaves the record standing: the
-    // position closes, and the close is marked as not measured.
+    // A balance that cannot be read is waited for, then, past the grace,
+    // the record stands: the position closes, marked as not measured.
     let mut p = live_pair();
     service.repo().insert(&p).await.unwrap();
     *balance.lock().unwrap() = "unreadable".into();
+    assert!(!h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    h.balance_unreadable_since.lock().unwrap().insert(
+        p.id,
+        std::time::Instant::now() - super::UNREADABLE_BALANCE_GRACE,
+    );
     assert!(h
         .finalize_resolution_close(&mut p, 0, None, Some(true))
         .await
         .unwrap());
     assert_eq!(p.realized_pnl, Some(Decimal::from(10)));
-    let unmeasured: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM trade_events WHERE position_id = $1 AND event_type = 'resolution_unmeasured'",
+    let unmeasured: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT reason, state_to FROM trade_events WHERE position_id = $1 AND event_type = 'resolution_unmeasured'",
     )
     .bind(p.id)
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(unmeasured, 1);
+    assert_eq!(
+        unmeasured,
+        [(
+            Some(super::BALANCE_UNREADABLE.to_string()),
+            Some("closed".to_string())
+        )]
+    );
+
+    // One-legged without a winner: nothing to pay is known; it waits.
+    let mut p = live_pair();
+    p.held_no_qty = Decimal::ZERO;
+    service.repo().insert(&p).await.unwrap();
+    *balance.lock().unwrap() = "100000000".into();
+    assert!(!h
+        .finalize_resolution_close(&mut p, 0, None, None)
+        .await
+        .unwrap());
     server.abort();
 }
 
@@ -1234,7 +1270,20 @@ async fn holders_of_one_token_each_answer_for_their_share_of_the_fees(pool: PgPo
         .await
         .unwrap();
     assert_eq!(a.held_yes_qty, Decimal::new(937, 1));
-    // A sells its 93.7; B then finds its own 6.3 missing and can exit too.
+    // B's 6.3 is written off with A's, at once, and told as B's own, in
+    // the state it is in.
+    let mut b = service.repo().get(b.id).await.unwrap().unwrap();
+    assert_eq!(b.held_yes_qty, Decimal::new(937, 1));
+    let told: (String, Option<String>) = sqlx::query_as(
+        "SELECT metadata->>'quantity', state_to FROM trade_events \
+         WHERE position_id = $1 AND event_type = 'entry_fee_shares_written_off'",
+    )
+    .bind(b.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(told, ("6.3".to_string(), Some("closing".to_string())));
+    // A sells its 93.7; measuring B again finds nothing more missing.
     service
         .record_exit_fill(
             &mut a,
@@ -1246,7 +1295,6 @@ async fn holders_of_one_token_each_answer_for_their_share_of_the_fees(pool: PgPo
         )
         .await
         .unwrap();
-    let mut b = service.repo().get(b.id).await.unwrap().unwrap();
     set_balance("93.7");
     h.align_leg_with_wallet(&mut b, Leg::Yes, "yes", &ctx)
         .await
