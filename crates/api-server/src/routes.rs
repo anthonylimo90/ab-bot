@@ -9,7 +9,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    accounting, activity, admin_workspaces, auth, backtest, discover, health, markets,
+    accounting, activity, admin_workspaces, auth, backtest, discover, health, markets, metrics,
     order_signing, positions, recovery, risk, signals, strategy_health, trade_flow, trading, users,
     vault, wallet_auth, wallets, workspaces,
 };
@@ -378,6 +378,8 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
     let public_routes = Router::new()
         .route("/health", get(health::health_check))
         .route("/ready", get(health::readiness))
+        // Bearer-token protected inside the handler; off without METRICS_TOKEN.
+        .route("/metrics", get(metrics::metrics))
         // Discovery/demo endpoints (public for demo purposes)
         .route("/api/v1/discover/trades", get(discover::get_live_trades))
         .route("/api/v1/discover/wallets", get(discover::discover_wallets))

@@ -7,15 +7,13 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
+  # The API's trading metrics (circuit breaker, worker heartbeats, positions,
+  # unresolved orders and withdrawals). Needs METRICS_TOKEN set for both the
+  # API and this container; the entrypoint writes it to the file below.
   - job_name: 'api-server'
+    metrics_path: '/metrics'
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/metrics_token
     static_configs:
       - targets: ['api-server:3000']
-    metrics_path: '/metrics'
-
-  - job_name: 'postgres'
-    static_configs:
-      - targets: ['postgres:5432']
-
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis:6379']

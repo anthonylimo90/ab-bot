@@ -88,6 +88,9 @@ services:
       DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS: ${DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS:-100}
       DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES: ${DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES:-120}
       DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS: ${DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS:-20}
+      # Enables GET /metrics for this bearer token (16+ characters); the
+      # monitoring profile's Prometheus scrapes with it.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     ports:
       - "${API_PORT:-3000}:3000"
     # Room for open requests (15s) and, alongside them, started trading
@@ -177,10 +180,16 @@ services:
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    # Prometheus reads the API's bearer token from a file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        printf '%s' "$$METRICS_TOKEN" > /tmp/metrics_token &&
+        exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
+        --storage.tsdb.path=/prometheus --web.enable-lifecycle
     networks:
       - ab-bot-network
     profiles:
@@ -193,8 +202,16 @@ services:
       - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-}
       GF_USERS_ALLOW_SIGN_UP: false
+    # Never start with Grafana's default admin password.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        if [ -z "$$GF_SECURITY_ADMIN_PASSWORD" ] || [ "$$GF_SECURITY_ADMIN_PASSWORD" = admin ];
+        then echo 'Set GRAFANA_PASSWORD to start Grafana' >&2; exit 1; fi;
+        exec /run.sh
     volumes:
       - grafana_data:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
