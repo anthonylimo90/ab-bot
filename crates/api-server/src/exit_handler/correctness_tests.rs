@@ -15,6 +15,7 @@ pub(crate) async fn setup(pool: &PgPool) -> PositionService {
             retry_count INT, last_updated TIMESTAMPTZ, updated_at TIMESTAMPTZ,
             fee_model SMALLINT, resolution_payout_per_share NUMERIC,
             yes_entry_fee_shares NUMERIC, no_entry_fee_shares NUMERIC,
+            taker_fee_rate NUMERIC, taker_fee_exponent NUMERIC, fees_paid NUMERIC NOT NULL DEFAULT 0,
             held_yes_qty NUMERIC, held_no_qty NUMERIC, exited_yes_qty NUMERIC,
             exited_no_qty NUMERIC, resolution_winner TEXT, is_open BOOLEAN,
             opened_at TIMESTAMPTZ, source SMALLINT, source_signal_id UUID,
@@ -947,4 +948,121 @@ async fn fee_shares_are_written_off_only_once_the_token_has_settled(pool: PgPool
         .unwrap();
     assert_eq!(held(&p), Decimal::from(100));
     server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_arbitrage_position_pays_the_taker_fee_of_each_fill(pool: PgPool) {
+    let service = setup(&pool).await;
+    let mut p = position();
+    p.execution_mode = "paper".into();
+    p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    p.taker_fees = Some(polymarket_core::types::FeeSchedule::CONSERVATIVE);
+    service.repo().insert(&p).await.unwrap();
+    let ctx = context();
+
+    // 10 YES bought at 0.40: 10 × 0.07 × 0.40 × 0.60 = 0.168 USDC of fee.
+    service
+        .record_entry_fill(
+            &mut p,
+            Leg::Yes,
+            Decimal::new(40, 2),
+            Decimal::TEN,
+            &ctx,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(p.fees_paid, Decimal::new(168, 3));
+    let stored = service.repo().get(p.id).await.unwrap().unwrap();
+    assert_eq!(stored.fees_paid, Decimal::new(168, 3));
+    assert_eq!(stored.taker_fees, p.taker_fees);
+
+    // Marked at a 0.50 bid: 5 − 4, less the fee paid so far.
+    p.update_pnl(Decimal::new(50, 2), Decimal::ZERO, Decimal::new(2, 2));
+    assert_eq!(p.unrealized_pnl, Decimal::new(832, 3));
+
+    // Sold at 0.50: 10 × 0.07 × 0.25 = 0.175 more.
+    p.state = PositionState::Closing;
+    service
+        .record_exit_fill(
+            &mut p,
+            Leg::Yes,
+            Decimal::new(50, 2),
+            Decimal::TEN,
+            &ctx,
+            None,
+        )
+        .await
+        .unwrap();
+    service
+        .close_position(
+            &mut p,
+            CloseMethod::MarketExit {
+                fee: Decimal::new(2, 2),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+    // 5 − 4 − 0.343: the fees charged, not the flat 2% of quant positions.
+    assert_eq!(p.realized_pnl, Some(Decimal::new(657, 3)));
+
+    // Without fee terms (positions opened before they were recorded) nothing
+    // is charged.
+    let mut legacy = position();
+    legacy.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    service.repo().insert(&legacy).await.unwrap();
+    service
+        .record_entry_fill(
+            &mut legacy,
+            Leg::Yes,
+            Decimal::new(40, 2),
+            Decimal::TEN,
+            &ctx,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy.fees_paid, Decimal::ZERO);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_resolved_arbitrage_position_deducts_only_its_entry_fees(pool: PgPool) {
+    let service = setup(&pool).await;
+    let mut p = Position::new(
+        "market".into(),
+        Decimal::new(48, 2),
+        Decimal::new(46, 2),
+        Decimal::TEN,
+        ExitStrategy::HoldToResolution,
+    );
+    p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    p.taker_fees = Some(polymarket_core::types::FeeSchedule::CONSERVATIVE);
+    service.repo().insert(&p).await.unwrap();
+    let ctx = context();
+    for (leg, price) in [
+        (Leg::Yes, Decimal::new(48, 2)),
+        (Leg::No, Decimal::new(46, 2)),
+    ] {
+        service
+            .record_entry_fill(&mut p, leg, price, Decimal::TEN, &ctx, None)
+            .await
+            .unwrap();
+    }
+    // 10 × 0.07 × (0.48 × 0.52 + 0.46 × 0.54) = 0.34860
+    assert_eq!(p.fees_paid, Decimal::new(34860, 5));
+    p.state = PositionState::Open;
+    service
+        .close_position(
+            &mut p,
+            CloseMethod::ResolutionWithWinner {
+                yes_wins: true,
+                fee: Decimal::new(2, 2),
+            },
+            &ctx,
+        )
+        .await
+        .unwrap();
+    // The pair pays 10; it cost 9.40; redemption is not a trade, so no fee.
+    assert_eq!(p.realized_pnl, Some(Decimal::new(25140, 5)));
 }

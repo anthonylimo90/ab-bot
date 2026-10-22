@@ -210,6 +210,8 @@ impl PositionService {
 
         position.quantity = (position.held_yes_qty + position.exited_yes_qty)
             .max(position.held_no_qty + position.exited_no_qty);
+        // Market orders take liquidity: the fill pays the taker fee.
+        position.charge_taker_fee(fill_price, fill_qty);
         if let Some(id) = receipt {
             self.repo
                 .update_with_receipt(position, id, fill_qty)
@@ -428,6 +430,7 @@ impl PositionService {
         );
         *held -= fill_qty;
         *exited += fill_qty;
+        position.charge_taker_fee(fill_price, fill_qty);
         // A confirmed sale is progress: retry pacing restarts from the first step.
         position.retry_count = 0;
         position.last_updated = chrono::Utc::now();
@@ -563,12 +566,6 @@ impl PositionService {
 
         let event_type = match method {
             CloseMethod::MarketExit { fee } => {
-                let fee =
-                    if position.fee_model == polymarket_core::types::PositionFeeModel::ShareBased {
-                        Decimal::ZERO
-                    } else {
-                        fee
-                    };
                 if position.has_open_exposure() {
                     return Err(anyhow!("Cannot close while shares remain held"));
                 }
@@ -577,19 +574,14 @@ impl PositionService {
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
                 let basis = position.yes_entry_price * position.exited_yes_qty
                     + position.no_entry_price * position.exited_no_qty;
-                position.realized_pnl = Some(proceeds - basis - fee * (basis + proceeds));
+                position.realized_pnl =
+                    Some(proceeds - basis - position.fee_charges(fee, basis + proceeds));
                 position.unrealized_pnl = Decimal::ZERO;
                 position.state = PositionState::Closed;
                 position.exit_timestamp = Some(chrono::Utc::now());
                 "closed_via_exit"
             }
             CloseMethod::ResolutionWithWinner { yes_wins, fee } => {
-                let fee =
-                    if position.fee_model == polymarket_core::types::PositionFeeModel::ShareBased {
-                        Decimal::ZERO
-                    } else {
-                        fee
-                    };
                 let proceeds = position.yes_exit_price.unwrap_or_default()
                     * position.exited_yes_qty
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
@@ -599,7 +591,8 @@ impl PositionService {
                     position.held_no_qty
                 };
                 let basis = position.entry_cost();
-                position.realized_pnl = Some(proceeds + payout - basis - fee * (basis + proceeds));
+                position.realized_pnl =
+                    Some(proceeds + payout - basis - position.fee_charges(fee, basis + proceeds));
                 position.resolution_winner = Some(if yes_wins { "yes" } else { "no" }.into());
                 position.exited_yes_qty += position.held_yes_qty;
                 position.exited_no_qty += position.held_no_qty;
@@ -611,12 +604,6 @@ impl PositionService {
                 "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
-                let fee =
-                    if position.fee_model == polymarket_core::types::PositionFeeModel::ShareBased {
-                        Decimal::ZERO
-                    } else {
-                        fee
-                    };
                 if position.held_yes_qty != position.held_no_qty {
                     return Err(anyhow!(
                         "Winner required for unequal remaining resolution holdings"
@@ -626,8 +613,11 @@ impl PositionService {
                     * position.exited_yes_qty
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
                 let basis = position.entry_cost();
-                position.realized_pnl =
-                    Some(proceeds + position.held_yes_qty - basis - fee * (basis + proceeds));
+                position.realized_pnl = Some(
+                    proceeds + position.held_yes_qty
+                        - basis
+                        - position.fee_charges(fee, basis + proceeds),
+                );
                 position.exited_yes_qty += position.held_yes_qty;
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;

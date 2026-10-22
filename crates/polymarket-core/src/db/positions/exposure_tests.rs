@@ -10,6 +10,7 @@ async fn setup(pool: &PgPool) {
         no_entry_price NUMERIC DEFAULT 0, quantity NUMERIC DEFAULT 0, entry_timestamp TIMESTAMPTZ DEFAULT NOW(), exit_strategy SMALLINT,
         state SMALLINT DEFAULT 1, unrealized_pnl NUMERIC, failure_reason TEXT, retry_count INT, last_updated TIMESTAMPTZ,
         fee_model SMALLINT, resolution_payout_per_share NUMERIC, yes_entry_fee_shares NUMERIC, no_entry_fee_shares NUMERIC,
+            taker_fee_rate NUMERIC, taker_fee_exponent NUMERIC, fees_paid NUMERIC NOT NULL DEFAULT 0,
         held_yes_qty NUMERIC DEFAULT 0, held_no_qty NUMERIC DEFAULT 0, exited_yes_qty NUMERIC, exited_no_qty NUMERIC,
         resolution_winner TEXT, is_open BOOLEAN, opened_at TIMESTAMPTZ, source SMALLINT, source_signal_id UUID
     ); CREATE TABLE orders (quantity NUMERIC,filled_quantity NUMERIC,price NUMERIC,side TEXT,status TEXT,id UUID DEFAULT gen_random_uuid())").await.unwrap();

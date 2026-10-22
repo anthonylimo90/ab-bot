@@ -420,8 +420,8 @@ impl ExitHandler {
             }
         };
 
-        // Sell what the wallet has: a buy's fee is kept in shares, so a
-        // recorded holding can exceed the balance by that fee.
+        // Sell what the wallet has: should a buy's fee have been kept in
+        // shares, a recorded holding exceeds the balance by that fee.
         for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
             self.align_leg_with_wallet(position, leg, token_id, &ctx)
                 .await?;
@@ -1980,7 +1980,8 @@ fn held_outcomes(position: &Position) -> (bool, bool) {
     position.held_outcomes()
 }
 
-/// The most a buy's fee can keep of the shares bought: the fee is
+/// The most a buy's fee could keep of the shares bought, were it kept in
+/// shares (Polymarket documents it as charged in USDC on top): the fee is
 /// `rate × p(1 − p)` USDC per share, paid in shares worth `p`, so
 /// `rate × (1 − p)` of them, and no published rate exceeds 0.07.
 const MAX_FEE_SHARE_FRACTION: Decimal = Decimal::from_parts(10, 0, 0, false, 2);

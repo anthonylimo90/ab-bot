@@ -523,3 +523,23 @@ conservative basis rather than guessing their remaining lot allocation.
 `0.10` is 10%. Review existing overrides before enabling exits. Stop-loss and
 take-profit API order types now return a validation error; they are not durable
 protective orders. Dashboard development, CI and Docker use Node 24.
+
+### Restored tables, withdrawal and fee accounting (089–092)
+
+- 089 records when a withdrawal is first seen mined, so the circuit breaker
+  keeps holding its equity feed until the transfer's cash flow is applied.
+- 090 recreates `workspace_invites` and `pending_wallet_orders`, which 044
+  dropped although invites and browser-signed orders still use them.
+- 091 keeps every hash broadcast for a withdrawal (fee bumps, above).
+- 092 records an arbitrage position's taker fee terms and the fees charged to
+  its fills (`fees_paid`), which its P&L now deducts: Polymarket charges a
+  taker `C × rate × p(1 − p)` USDC per fill on top of the order amount.
+  Positions opened before 092 carry no terms and keep their previous P&L;
+  quant positions keep the flat 2% fee model. Live buys also keep room for
+  the highest published fee on top of their amount, so a buy cannot spend
+  USDC held back for an unsettled withdrawal.
+
+Whether the exchange's `makingAmount`/`takingAmount` are before or after the
+fee is not documented. The accounting assumes before (the documented "pre-fee"
+order amount). To check on a deployment, compare one live sell's
+`takingAmount` with the USDC balance change it caused.

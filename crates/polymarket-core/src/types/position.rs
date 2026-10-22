@@ -1,6 +1,6 @@
 //! Position tracking types for arbitrage positions.
 
-use super::market::ArbOpportunity;
+use super::market::{ArbOpportunity, FeeSchedule};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,14 @@ pub struct Position {
     pub yes_entry_fee_shares: Decimal,
     /// Buy-side fee charged in NO shares at entry.
     pub no_entry_fee_shares: Decimal,
+    /// Taker fee terms of the position's market, when known (arbitrage
+    /// positions record those they were priced with).
+    #[serde(default)]
+    pub taker_fees: Option<FeeSchedule>,
+    /// Taker fees (USDC) charged to the position's fills so far, under
+    /// `taker_fees`. Deducted from the P&L of share-based positions.
+    #[serde(default)]
+    pub fees_paid: Decimal,
     /// Quantity of YES tokens currently held (not yet exited).
     pub held_yes_qty: Decimal,
     /// Quantity of NO tokens currently held (not yet exited).
@@ -198,6 +206,8 @@ impl Position {
             resolution_payout_per_share: (Decimal::ONE - legacy_entry_fee_drag).max(Decimal::ZERO),
             yes_entry_fee_shares: Decimal::ZERO,
             no_entry_fee_shares: Decimal::ZERO,
+            taker_fees: None,
+            fees_paid: Decimal::ZERO,
             held_yes_qty: Decimal::ZERO,
             held_no_qty: Decimal::ZERO,
             exited_yes_qty: Decimal::ZERO,
@@ -223,6 +233,27 @@ impl Position {
         self.resolution_payout_per_share = arb.worst_case_payout.max(Decimal::ZERO);
         self.yes_entry_fee_shares = arb.yes_fee_shares.max(Decimal::ZERO);
         self.no_entry_fee_shares = arb.no_fee_shares.max(Decimal::ZERO);
+        self.taker_fees = arb.fee_schedule;
+    }
+
+    /// Charge the taker fee of a fill of `quantity` shares at `price` under
+    /// the position's fee terms (none when they are unknown). Returns it.
+    pub fn charge_taker_fee(&mut self, price: Decimal, quantity: Decimal) -> Decimal {
+        let fee = self
+            .taker_fees
+            .map(|terms| terms.fee_per_share(price) * quantity.max(Decimal::ZERO))
+            .unwrap_or_default();
+        self.fees_paid += fee;
+        fee
+    }
+
+    /// What is deducted from the P&L for fees: the fees charged to the fills
+    /// of a share-based position, or the flat `rate` on `volume` otherwise.
+    pub fn fee_charges(&self, rate: Decimal, volume: Decimal) -> Decimal {
+        match self.fee_model {
+            PositionFeeModel::ShareBased => self.fees_paid,
+            PositionFeeModel::LegacyFlat => rate * volume,
+        }
     }
 
     fn net_yes_shares(&self) -> Decimal {
@@ -246,10 +277,9 @@ impl Position {
                 }
                 ExitStrategy::HoldToResolution => self.held_yes_qty.min(self.held_no_qty),
             };
-            self.unrealized_pnl = proceeds + remaining - entry_cost;
-            if self.fee_model == PositionFeeModel::LegacyFlat {
-                self.unrealized_pnl -= fee * (entry_cost + proceeds + remaining);
-            }
+            self.unrealized_pnl = proceeds + remaining
+                - entry_cost
+                - self.fee_charges(fee, entry_cost + proceeds + remaining);
             self.last_updated = Utc::now();
             return;
         }
@@ -375,23 +405,6 @@ impl Position {
         Ok(())
     }
 
-    fn resolved_exit_prices(&self) -> std::result::Result<(Decimal, Decimal), String> {
-        let yes_exit_price = if self.yes_entry_price > Decimal::ZERO {
-            self.yes_exit_price
-                .ok_or_else(|| "YES leg has not been exited yet".to_string())?
-        } else {
-            Decimal::ZERO
-        };
-        let no_exit_price = if self.no_entry_price > Decimal::ZERO {
-            self.no_exit_price
-                .ok_or_else(|| "NO leg has not been exited yet".to_string())?
-        } else {
-            Decimal::ZERO
-        };
-
-        Ok((yes_exit_price, no_exit_price))
-    }
-
     pub fn held_outcomes(&self) -> (bool, bool) {
         if self.state == PositionState::Closed {
             return (false, false);
@@ -464,21 +477,25 @@ impl Position {
     }
 
     /// Write off `quantity` of the YES (or NO) holding that the wallet does
-    /// not have, such as shares the exchange kept as a buy fee: they count as
-    /// exited for no proceeds, so their cost lands in the realized P&L.
-    /// Returns the quantity written off (at most the holding).
+    /// not have, such as shares an exchange kept as a buy fee: they count as
+    /// exited for no proceeds, so their cost lands in the realized P&L. A fee
+    /// kept in shares was not also charged in USDC, so as much of
+    /// `fees_paid` as their cost is taken back. Returns the quantity written
+    /// off (at most the holding).
     pub fn write_off_missing_shares(&mut self, yes: bool, quantity: Decimal) -> Decimal {
-        let (held, exited, price) = if yes {
+        let (held, exited, price, entry_price) = if yes {
             (
                 &mut self.held_yes_qty,
                 &mut self.exited_yes_qty,
                 &mut self.yes_exit_price,
+                self.yes_entry_price,
             )
         } else {
             (
                 &mut self.held_no_qty,
                 &mut self.exited_no_qty,
                 &mut self.no_exit_price,
+                self.no_entry_price,
             )
         };
         let missing = quantity.max(Decimal::ZERO).min(*held);
@@ -489,6 +506,7 @@ impl Position {
         *exited += missing;
         *held -= missing;
         *price = Some(proceeds / *exited);
+        self.fees_paid -= (missing * entry_price).min(self.fees_paid);
         self.last_updated = Utc::now();
         missing
     }
@@ -555,130 +573,6 @@ impl Position {
         self.failure_reason = None;
         self.last_updated = Utc::now();
         true
-    }
-
-    /// Close the position using any previously recorded per-leg exit fills.
-    /// `fee` is only used for legacy flat-fee positions.
-    pub fn close_via_recorded_exit(&mut self, fee: Decimal) -> std::result::Result<(), String> {
-        if self.state == PositionState::Closed {
-            return Err("Position is already closed".to_string());
-        }
-        if self.state == PositionState::EntryFailed {
-            return Err("Cannot close a position that failed to enter".to_string());
-        }
-
-        let (yes_exit_price, no_exit_price) = self.resolved_exit_prices()?;
-
-        self.exit_timestamp = Some(Utc::now());
-        self.state = PositionState::Closed;
-
-        let exit_value = (yes_exit_price + no_exit_price) * self.quantity;
-        let entry_cost = self.entry_cost();
-        self.realized_pnl = Some(match self.fee_model {
-            PositionFeeModel::LegacyFlat => {
-                let entry_fees = fee * entry_cost;
-                let exit_fees = fee * exit_value;
-                exit_value - entry_cost - entry_fees - exit_fees
-            }
-            PositionFeeModel::ShareBased => {
-                let net_exit_value = (yes_exit_price * self.net_yes_shares())
-                    + (no_exit_price * self.net_no_shares());
-                net_exit_value - entry_cost
-            }
-        });
-        self.unrealized_pnl = Decimal::ZERO;
-        Ok(())
-    }
-
-    /// Close the position via market exit (selling both sides).
-    /// `fee` is only used for legacy flat-fee positions.
-    pub fn close_via_exit(
-        &mut self,
-        yes_exit_price: Decimal,
-        no_exit_price: Decimal,
-        fee: Decimal,
-    ) -> std::result::Result<(), String> {
-        if self.state == PositionState::Closed {
-            return Err("Position is already closed".to_string());
-        }
-        if self.state == PositionState::EntryFailed {
-            return Err("Cannot close a position that failed to enter".to_string());
-        }
-
-        let (has_yes, has_no) = self.held_outcomes();
-
-        if has_yes {
-            self.yes_exit_price = Some(yes_exit_price);
-        }
-        if has_no {
-            self.no_exit_price = Some(no_exit_price);
-        }
-
-        self.close_via_recorded_exit(fee)
-    }
-
-    /// Close the position using resolved per-leg payouts when the market winner is known.
-    /// `fee` is only used for legacy flat-fee positions.
-    pub fn close_via_resolution_with_winner(
-        &mut self,
-        yes_wins: bool,
-        fee: Decimal,
-    ) -> std::result::Result<(), String> {
-        if self.state == PositionState::Closed {
-            return Err("Position is already closed".to_string());
-        }
-        if self.state == PositionState::EntryFailed {
-            return Err("Cannot close a position that failed to enter".to_string());
-        }
-
-        if self.yes_entry_price > Decimal::ZERO && self.yes_exit_price.is_none() {
-            self.yes_exit_price = Some(if yes_wins {
-                Decimal::ONE
-            } else {
-                Decimal::ZERO
-            });
-        }
-        if self.no_entry_price > Decimal::ZERO && self.no_exit_price.is_none() {
-            self.no_exit_price = Some(if yes_wins {
-                Decimal::ZERO
-            } else {
-                Decimal::ONE
-            });
-        }
-
-        self.close_via_recorded_exit(fee)
-    }
-
-    /// Close the position via market resolution.
-    ///
-    /// This is a conservative fallback that assumes paired arb exposure and
-    /// uses the stored worst-case payout. Prefer `close_via_resolution_with_winner`
-    /// when the resolved winner is known.
-    /// `fee` is only used for legacy flat-fee positions.
-    pub fn close_via_resolution(&mut self, fee: Decimal) -> std::result::Result<(), String> {
-        if self.state == PositionState::Closed {
-            return Err("Position is already closed".to_string());
-        }
-        if self.state == PositionState::EntryFailed {
-            return Err("Cannot close a position that failed to enter".to_string());
-        }
-
-        self.exit_timestamp = Some(Utc::now());
-        self.state = PositionState::Closed;
-
-        let entry_cost = self.entry_cost();
-        self.realized_pnl = Some(match self.fee_model {
-            PositionFeeModel::LegacyFlat => {
-                let guaranteed_return = Decimal::ONE * self.quantity;
-                let entry_fees = fee * entry_cost;
-                guaranteed_return - entry_cost - entry_fees
-            }
-            PositionFeeModel::ShareBased => {
-                (self.resolution_payout_per_share * self.quantity) - entry_cost
-            }
-        });
-        self.unrealized_pnl = Decimal::ZERO;
-        Ok(())
     }
 
     /// Check if position is still active (not closed or permanently failed).
@@ -1037,17 +931,6 @@ mod tests {
 
         pos.mark_exit_ready().unwrap();
         assert_eq!(pos.state, PositionState::ExitReady);
-
-        pos.close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee)
-            .unwrap();
-        assert_eq!(pos.state, PositionState::Closed);
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(212, 2)));
-        assert!(!pos.is_active());
-
-        // Double-close should fail
-        assert!(pos
-            .close_via_exit(Decimal::new(50, 2), Decimal::new(50, 2), fee)
-            .is_err());
     }
 
     #[test]
@@ -1070,12 +953,6 @@ mod tests {
         // Entry fees: 0.02 * 94 = 1.88
         // Unrealized P&L: 100 - 94 - 1.88 = 4.12
         assert_eq!(pos.unrealized_pnl, Decimal::new(412, 2));
-
-        pos.close_via_resolution(fee).unwrap();
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(412, 2)));
-
-        // Double-close via resolution should fail
-        assert!(pos.close_via_resolution(fee).is_err());
     }
 
     #[test]
@@ -1111,49 +988,6 @@ mod tests {
         );
         assert_eq!(pos.fee_model, PositionFeeModel::ShareBased);
         assert_eq!(pos.unrealized_pnl, Decimal::new(400, 2));
-
-        pos.close_via_resolution(Decimal::new(99, 2)).unwrap();
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(400, 2)));
-    }
-
-    #[test]
-    fn test_resolution_with_winner_prices_one_legged_position_correctly() {
-        let mut pos = Position::new(
-            "market123".to_string(),
-            Decimal::new(48, 2),
-            Decimal::ZERO,
-            Decimal::new(100, 0),
-            ExitStrategy::HoldToResolution,
-        );
-        pos.mark_open().unwrap();
-        pos.mark_exit_ready().unwrap();
-
-        pos.close_via_resolution_with_winner(true, Decimal::new(2, 2))
-            .unwrap();
-
-        assert_eq!(pos.yes_exit_price, Some(Decimal::ONE));
-        assert_eq!(pos.no_exit_price, None);
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(4904, 2)));
-    }
-
-    #[test]
-    fn test_resolution_with_winner_prices_no_only_position_correctly() {
-        let mut pos = Position::new(
-            "market123".to_string(),
-            Decimal::ZERO,
-            Decimal::new(46, 2),
-            Decimal::new(100, 0),
-            ExitStrategy::HoldToResolution,
-        );
-        pos.mark_open().unwrap();
-        pos.mark_exit_ready().unwrap();
-
-        pos.close_via_resolution_with_winner(false, Decimal::new(2, 2))
-            .unwrap();
-
-        assert_eq!(pos.yes_exit_price, None);
-        assert_eq!(pos.no_exit_price, Some(Decimal::ONE));
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(5108, 2)));
     }
 
     #[test]
@@ -1209,14 +1043,6 @@ mod tests {
             Decimal::new(99, 2),
         );
         assert_eq!(pos.unrealized_pnl, Decimal::new(450, 2));
-
-        pos.close_via_exit(
-            Decimal::new(50, 2),
-            Decimal::new(50, 2),
-            Decimal::new(99, 2),
-        )
-        .unwrap();
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(450, 2)));
     }
 
     #[test]
@@ -1291,8 +1117,6 @@ mod tests {
             Decimal::new(100, 0),
             ExitStrategy::ExitOnCorrection,
         );
-        let fee = Decimal::new(2, 2);
-
         pos.mark_open().unwrap();
         pos.mark_exit_ready().unwrap();
         pos.mark_closing().unwrap();
@@ -1307,12 +1131,9 @@ mod tests {
         assert!(pos.attempt_exit_recovery());
         pos.mark_closing().unwrap();
         pos.record_no_exit_fill(Decimal::new(49, 2)).unwrap();
-        pos.close_via_recorded_exit(fee).unwrap();
 
-        assert_eq!(pos.state, PositionState::Closed);
         assert_eq!(pos.yes_exit_price, Some(Decimal::new(52, 2)));
         assert_eq!(pos.no_exit_price, Some(Decimal::new(49, 2)));
-        assert_eq!(pos.realized_pnl, Some(Decimal::new(310, 2)));
     }
 
     #[test]
@@ -1482,8 +1303,12 @@ mod tests {
         pos.exited_yes_qty = Decimal::from(10);
         pos.yes_exit_price = Some(Decimal::new(60, 2));
 
+        // A USDC fee was charged for the buy, which the shares kept replace.
+        pos.fees_paid = Decimal::from(2);
         let written_off = pos.write_off_missing_shares(true, Decimal::new(35, 1));
         assert_eq!(written_off, Decimal::new(35, 1));
+        // 3.5 shares at the 0.50 entry price: 1.75 of the fee taken back.
+        assert_eq!(pos.fees_paid, Decimal::new(25, 2));
         assert_eq!(pos.held_yes_qty, Decimal::new(865, 1));
         assert_eq!(pos.exited_yes_qty, Decimal::new(135, 1));
         // Proceeds unchanged (10 × 0.60 = 6), spread over the larger quantity.

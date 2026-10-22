@@ -122,11 +122,13 @@ impl PositionRepository {
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner,
-                is_open, opened_at, source, source_signal_id, execution_mode, wallet_address
+                is_open, opened_at, source, source_signal_id, execution_mode, wallet_address,
+                taker_fee_rate, taker_fee_exponent, fees_paid
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
+                $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+                $28, $29, $30
             )
             "#,
         )
@@ -157,6 +159,9 @@ impl PositionRepository {
         .bind(source_signal_id)
         .bind(&position.execution_mode)
         .bind(&position.wallet_address)
+        .bind(position.taker_fees.map(|terms| terms.rate))
+        .bind(position.taker_fees.map(|terms| terms.exponent))
+        .bind(position.fees_paid)
         .execute(&mut *tx)
         .await?;
 
@@ -230,6 +235,7 @@ impl PositionRepository {
                 resolution_winner = $19,
                 is_open = $20,
                 yes_entry_price = $21, no_entry_price = $22, quantity = $23,
+                taker_fee_rate = $27, taker_fee_exponent = $28, fees_paid = $29,
                 version = version + 1
             WHERE id = $1 AND version = $24
               AND execution_mode = $25 AND wallet_address IS NOT DISTINCT FROM $26
@@ -261,6 +267,9 @@ impl PositionRepository {
         .bind(position.version)
         .bind(&position.execution_mode)
         .bind(&position.wallet_address)
+        .bind(position.taker_fees.map(|terms| terms.rate))
+        .bind(position.taker_fees.map(|terms| terms.exponent))
+        .bind(position.fees_paid)
         .execute(connection)
         .await?;
 
@@ -288,6 +297,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE id = $1
@@ -360,6 +370,13 @@ impl PositionRepository {
             no_entry_fee_shares: r
                 .get::<Option<Decimal>, _>("no_entry_fee_shares")
                 .unwrap_or(Decimal::ZERO),
+            taker_fees: r
+                .get::<Option<Decimal>, _>("taker_fee_rate")
+                .zip(r.get::<Option<Decimal>, _>("taker_fee_exponent"))
+                .map(|(rate, exponent)| crate::types::FeeSchedule { rate, exponent }),
+            fees_paid: r
+                .get::<Option<Decimal>, _>("fees_paid")
+                .unwrap_or(Decimal::ZERO),
             held_yes_qty: r
                 .get::<Option<Decimal>, _>("held_yes_qty")
                 .unwrap_or(Decimal::ZERO),
@@ -387,6 +404,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state NOT IN (4, 5)
@@ -413,6 +431,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state NOT IN (4, 5)
@@ -438,6 +457,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state IN (6, 7)
@@ -460,6 +480,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state IN (6, 7)
@@ -485,6 +506,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state = 2
@@ -507,6 +529,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE exit_strategy = 0 AND state IN (1, 2)
@@ -531,6 +554,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state IN (1, 2, 6, 7)
@@ -554,6 +578,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version,
                 source, source_signal_id
             FROM positions
@@ -584,6 +609,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state = 6
@@ -607,6 +633,7 @@ impl PositionRepository {
                 realized_pnl, exit_timestamp, yes_exit_price, no_exit_price,
                 failure_reason, retry_count, last_updated, fee_model,
                 resolution_payout_per_share, yes_entry_fee_shares, no_entry_fee_shares,
+                taker_fee_rate, taker_fee_exponent, fees_paid,
                 held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty, resolution_winner, execution_mode, wallet_address, version
             FROM positions
             WHERE state = 5
