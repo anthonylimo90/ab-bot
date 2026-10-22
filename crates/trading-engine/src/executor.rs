@@ -1643,7 +1643,8 @@ impl OrderExecutor {
 /// The most taker fee a buy of `quantity` shares at `price` can be charged
 /// in USDC on top of its amount: the highest published rate (fee-free markets
 /// are charged none), as the executor does not know each market's terms.
-fn taker_fee_allowance(quantity: Decimal, price: Decimal) -> Decimal {
+/// Every live buy keeps this much room; a multi-leg preflight must too.
+pub fn taker_fee_allowance(quantity: Decimal, price: Decimal) -> Decimal {
     quantity * polymarket_core::types::FeeSchedule::CONSERVATIVE.fee_per_share(price)
 }
 

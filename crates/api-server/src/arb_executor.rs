@@ -79,6 +79,16 @@ impl Default for ArbExecutorConfig {
 /// Smallest pair notional worth sending (the exchange's minimum market buy).
 const MIN_PAIR_NOTIONAL: Decimal = Decimal::ONE;
 
+/// USDC a pair buy needs before its first leg is sent: what each leg's own
+/// capacity check will require, its amount at the best ask and room for the
+/// taker fee charged on top.
+fn pair_collateral(quantity: Decimal, yes_ask: Decimal, no_ask: Decimal) -> Decimal {
+    [yes_ask, no_ask]
+        .into_iter()
+        .map(|ask| quantity * ask + trading_engine::executor::taker_fee_allowance(quantity, ask))
+        .sum()
+}
+
 /// Re-prices an opportunity on fresh books under the fee terms it was
 /// detected with; `None` when it no longer clears `min_net_profit`.
 fn reprice_on_fresh_books(
@@ -1071,7 +1081,7 @@ impl ArbAutoExecutor {
                 return Ok(());
             };
 
-            let required_collateral = quantity * (yes_best_ask + no_best_ask);
+            let required_collateral = pair_collateral(quantity, yes_best_ask, no_best_ask);
             if let Err(error) = self
                 .order_executor
                 .ensure_live_buying_power(required_collateral)
@@ -1567,6 +1577,16 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_pair_preflight_requires_what_both_legs_will() {
+        // 100 at 0.49 on each side: 98 of amount, and up to
+        // 100 × 0.07 × 0.49 × 0.51 = 1.7493 of fee on top of each leg.
+        assert_eq!(
+            pair_collateral(Decimal::from(100), Decimal::new(49, 2), Decimal::new(49, 2)),
+            Decimal::new(1014986, 4)
+        );
     }
 
     fn signal(schedule: FeeSchedule) -> ArbOpportunity {
