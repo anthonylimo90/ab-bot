@@ -778,7 +778,8 @@ impl ExitHandler {
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
         match self.measure_leg(position, leg, token_id, ctx).await? {
-            Measured::Unmeasured(why) | Measured::Waiting(why @ BALANCE_UNREADABLE) => warn!(
+            Measured::Unmeasured(why)
+            | Measured::Waiting(why @ (BALANCE_UNREADABLE | SIGNER_NOT_LOADED)) => warn!(
                 position_id = %position.id,
                 leg = %leg,
                 reason = why,
@@ -822,9 +823,9 @@ impl ExitHandler {
         // can never be measured.
         match self.order_executor.wallet_address().await {
             None if self.order_executor.is_live() => {
-                return Ok(Measured::Waiting(BALANCE_UNREADABLE));
+                return Ok(Measured::Waiting(SIGNER_NOT_LOADED));
             }
-            None => return Ok(Measured::Unmeasured("no trading wallet is loaded")),
+            None => return Ok(Measured::Unmeasured(SIGNER_NOT_LOADED)),
             Some(executor) if !executor.eq_ignore_ascii_case(&wallet) => {
                 return Ok(Measured::Unmeasured(
                     "the position's wallet is not the trading wallet",
@@ -1060,7 +1061,7 @@ impl ExitHandler {
                 let mut waits = None;
                 for (leg, token_id) in legs {
                     let measured = self.measure_leg(position, leg, token_id, &ctx).await?;
-                    if !matches!(measured, Measured::Waiting(BALANCE_UNREADABLE)) {
+                    if !matches!(measured, Measured::Waiting(why) if waits_out_its_grace(why)) {
                         self.balance_read(position.id, leg);
                     }
                     match measured {
@@ -1068,11 +1069,12 @@ impl ExitHandler {
                         Measured::Unmeasured(why) => unmeasured.push((leg, why)),
                         // A balance that stays unreadable leaves the record
                         // standing once the grace has passed.
-                        Measured::Waiting(BALANCE_UNREADABLE)
-                            if self.unreadable_for(position.id, leg)
-                                >= UNREADABLE_BALANCE_GRACE =>
+                        Measured::Waiting(why)
+                            if waits_out_its_grace(why)
+                                && self.unreadable_for(position.id, leg)
+                                    >= UNREADABLE_BALANCE_GRACE =>
                         {
-                            unmeasured.push((leg, BALANCE_UNREADABLE))
+                            unmeasured.push((leg, why))
                         }
                         Measured::Waiting(why) => {
                             waits.get_or_insert(why);
@@ -2331,6 +2333,14 @@ const OTHER_HOLDERS_SQL: &str = "SELECT \
 
 /// Why a measurement waits when the wallet's balance could not be read.
 const BALANCE_UNREADABLE: &str = "the wallet's balance could not be read";
+/// Why it waits when a live executor's signer did not load (a restart may).
+const SIGNER_NOT_LOADED: &str = "no trading wallet is loaded";
+
+/// Whether a measurement that waits for `why` gives way, after the grace,
+/// to closing at the record: the balance stays out of reach, not in flux.
+fn waits_out_its_grace(why: &str) -> bool {
+    why == BALANCE_UNREADABLE || why == SIGNER_NOT_LOADED
+}
 /// How long a resolved position waits for a balance that cannot be read
 /// before it closes at its recorded holding.
 const UNREADABLE_BALANCE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);

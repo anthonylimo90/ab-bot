@@ -1330,6 +1330,7 @@ async fn a_live_executor_whose_signer_did_not_load_waits_its_grace(pool: PgPool)
         .finalize_resolution_close(&mut p, 0, None, Some(true))
         .await
         .unwrap());
+    assert_eq!(service.load(p.id).await.unwrap().state, PositionState::Open);
     assert!(h
         .balance_unreadable_since
         .lock()
@@ -1345,6 +1346,15 @@ async fn a_live_executor_whose_signer_did_not_load_waits_its_grace(pool: PgPool)
         .await
         .unwrap());
     assert_eq!(p.realized_pnl, Some(Decimal::from(60)));
+    // The close names the cause: no signer, not an unreadable balance.
+    let note: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM trade_events WHERE position_id = $1 AND event_type = 'closed_via_resolution'",
+    )
+    .bind(p.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(note["unmeasured"][0]["reason"], super::SIGNER_NOT_LOADED);
     server.abort();
 }
 
