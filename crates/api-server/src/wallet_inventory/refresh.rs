@@ -141,6 +141,20 @@ mod tests {
         assert_eq!((x.unwrap(), y.unwrap()), (7, 7));
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let completed = status(&pool, "wallet").await.unwrap().unwrap().completed_at;
+        assert!(completed.is_some());
+        // What the withdrawal preflight reports as the inventory's freshness.
+        assert_eq!(
+            crate::wallet_inventory::last_completed_scan(&pool, "WALLET")
+                .await
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            crate::wallet_inventory::last_completed_scan(&pool, "other")
+                .await
+                .unwrap(),
+            None
+        );
         let failure: anyhow::Result<i32> =
             coordinate(&pool, &a, "wallet", time::Duration::ZERO, || async {
                 anyhow::bail!("balance unavailable")

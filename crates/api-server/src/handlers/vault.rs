@@ -1576,18 +1576,12 @@ pub async fn withdrawal_preflight(
     .fetch_one(&state.pool)
     .await?;
 
-    // Query inventory freshness.
-    let inventory_synced_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        r#"
-        SELECT MAX(last_synced_at)
-        FROM wallet_inventory
-        WHERE wallet_address = $1
-        "#,
-    )
-    .bind(&source_address)
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(None);
+    // Inventory freshness: when it was last fully scanned (a wallet that is
+    // not the trading wallet has no inventory and is never fresh).
+    let inventory_synced_at =
+        crate::wallet_inventory::last_completed_scan(&state.pool, &source_address)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Failed to read inventory status: {e}")))?;
 
     let inventory_fresh = inventory_synced_at
         .map(|synced_at| {

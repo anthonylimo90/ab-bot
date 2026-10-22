@@ -201,6 +201,16 @@ async fn refresh_inventory(
     .await
 }
 
+/// When the inventory of `wallet` was last fully and successfully scanned.
+pub(crate) async fn last_completed_scan(
+    pool: &sqlx::PgPool,
+    wallet: &str,
+) -> anyhow::Result<Option<chrono::DateTime<Utc>>> {
+    Ok(refresh::status(pool, wallet)
+        .await?
+        .and_then(|status| status.completed_at))
+}
+
 pub(crate) async fn canonical_refresh_status(
     state: &AppState,
 ) -> anyhow::Result<Option<refresh::RefreshStatus>> {
