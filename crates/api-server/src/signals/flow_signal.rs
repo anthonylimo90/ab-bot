@@ -62,7 +62,9 @@ pub struct FlowSignalConfig {
     pub calibration_lookback_days: i64,
     /// Minimum recent closed trades required to use calibrated edges.
     pub calibration_min_closed_trades: i64,
-    /// Whether to suppress signals until calibration data exists.
+    /// Whether signals need calibration from closed flow trades before they
+    /// may trade live. Uncalibrated signals are still emitted, marked
+    /// `uncalibrated`, so paper trading can build the calibration.
     pub require_calibration: bool,
 }
 
@@ -304,6 +306,10 @@ fn agreed_flow_direction(
         .then(|| direction_from_imbalance(imbalance_ratio))
 }
 
+/// Metadata flag of a flow signal emitted without the calibration its
+/// configuration requires: it may be paper traded, never traded live.
+pub(crate) const UNCALIBRATED_METADATA_KEY: &str = "uncalibrated";
+
 async fn scan_and_emit(
     config: &FlowSignalConfig,
     pool: &PgPool,
@@ -317,12 +323,13 @@ async fn scan_and_emit(
     if config.require_calibration
         && !calibration.has_usable_data(config.calibration_min_closed_trades)
     {
-        warn!(
+        // Calibration comes from closed flow trades, which only signals can
+        // open: emit them marked uncalibrated, for paper trading only.
+        info!(
             lookback_days = config.calibration_lookback_days,
             min_closed_trades = config.calibration_min_closed_trades,
-            "Flow calibration unavailable, suppressing signal emission"
+            "Flow calibration unavailable; signals are emitted for paper trading only"
         );
-        return Ok(0);
     }
 
     // Query the most recent flow features for the configured window size
@@ -530,14 +537,12 @@ async fn scan_and_emit(
             continue;
         };
 
-        let Some(calibration_stats) = calibration
-            .usable_for(direction, config.calibration_min_closed_trades)
-            .or_else(|| (!config.require_calibration).then_some(FlowCalibrationStats::default()))
-        else {
-            continue;
-        };
-
-        let calibrated_expected_edge_bps = if config.require_calibration {
+        let usable = calibration.usable_for(direction, config.calibration_min_closed_trades);
+        // Without usable calibration a required one is missing: the raw edge
+        // stands, and the signal may only be paper traded.
+        let uncalibrated = config.require_calibration && usable.is_none();
+        let calibration_stats = usable.unwrap_or_default();
+        let calibrated_expected_edge_bps = if config.require_calibration && !uncalibrated {
             calibrate_expected_edge_bps(expected_edge_bps, calibration_stats)
         } else {
             expected_edge_bps
@@ -590,6 +595,7 @@ async fn scan_and_emit(
             "calibration_win_rate": calibration_stats.win_rate,
             "calibration_avg_realized_return_bps": calibration_stats.avg_realized_return_bps,
             "calibration_edge_capture_ratio": calibration_stats.edge_capture_ratio,
+            UNCALIBRATED_METADATA_KEY: uncalibrated,
             "window_minutes": config.window_minutes,
         }));
 
@@ -942,11 +948,25 @@ mod tests {
         let signal = rx.try_recv().unwrap();
         assert_eq!(signal.condition_id, "0xgood");
         assert_eq!(signal.direction, SignalDirection::BuyYes);
+        assert_eq!(signal.metadata["uncalibrated"], serde_json::json!(false));
         let reference = signal.reference.unwrap();
         assert_eq!(reference.yes_price, Decimal::new(55, 2));
         assert_eq!(
             reference.observed_at.timestamp_micros(),
             bar.timestamp_micros()
+        );
+
+        // Calibration required but no closed flow trades yet: the signal is
+        // still emitted, at its raw edge, marked for paper trading only, so
+        // the calibration can ever exist.
+        config.require_calibration = true;
+        assert_eq!(scan_and_emit(&config, &pool, &tx).await.unwrap(), 1);
+        let signal = rx.try_recv().unwrap();
+        assert_eq!(signal.condition_id, "0xgood");
+        assert_eq!(signal.metadata["uncalibrated"], serde_json::json!(true));
+        assert_eq!(
+            signal.metadata["expected_edge_bps"],
+            signal.metadata["raw_expected_edge_bps"]
         );
     }
 }

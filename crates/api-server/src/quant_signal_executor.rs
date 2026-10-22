@@ -667,6 +667,22 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
+        // Step 1b: a flow signal emitted without the calibration it requires
+        // builds that calibration in paper trading; it never trades live.
+        if is_paper_only(&signal) && execution_mode == "live" {
+            debug!(signal_id = %signal.id, "Uncalibrated signal is for paper trading only");
+            self.update_signal_status(signal.id, "skipped", Some("uncalibrated"))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("uncalibrated"),
+            )
+            .await;
+            return Ok(());
+        }
+
         // Step 2: Freshness check
         let age_secs = Utc::now()
             .signed_duration_since(signal.generated_at)
@@ -1577,6 +1593,16 @@ impl TradeEventBuilderExt for NewTradeEvent {
     }
 }
 
+/// Whether `signal` was emitted without the calibration its generator
+/// requires, which makes it fit for paper trading only.
+fn is_paper_only(signal: &QuantSignal) -> bool {
+    signal
+        .metadata
+        .get(crate::signals::flow_signal::UNCALIBRATED_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 /// Why a signal must not be executed against `book` (the book of the token it
 /// buys), or `None` when its reference price is recent and the token's live
 /// price — the mid when both sides are quoted, otherwise the ask — and its
@@ -1944,6 +1970,29 @@ mod tests {
         );
         executor.process_signal(fresh).await.unwrap();
         assert!(events().await > 0);
+    }
+
+    #[test]
+    fn only_signals_marked_uncalibrated_are_paper_only() {
+        let signal = |metadata: serde_json::Value| {
+            QuantSignal::new(
+                QuantSignalKind::Flow,
+                "0x1".to_string(),
+                SignalDirection::BuyYes,
+                0.8,
+                Decimal::TEN,
+                Utc::now() + chrono::Duration::minutes(15),
+            )
+            .with_metadata(metadata)
+        };
+        assert!(is_paper_only(&signal(
+            serde_json::json!({"uncalibrated": true})
+        )));
+        assert!(!is_paper_only(&signal(
+            serde_json::json!({"uncalibrated": false})
+        )));
+        assert!(!is_paper_only(&signal(serde_json::json!({}))));
+        assert!(!is_paper_only(&signal(serde_json::Value::Null)));
     }
 
     #[test]
