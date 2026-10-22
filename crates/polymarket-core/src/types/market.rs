@@ -101,7 +101,10 @@ impl FeeSchedule {
         let curve = if self.exponent == Decimal::ONE {
             base
         } else if self.exponent.fract().is_zero() && self.exponent >= Decimal::ZERO {
-            (0..self.exponent.to_u32().unwrap_or(1)).fold(Decimal::ONE, |acc, _| acc * base)
+            // p(1 − p) ≤ 1/4, so 64 factors are already below what a Decimal
+            // holds: a larger published exponent must not spin the loop.
+            let steps = self.exponent.to_u32().unwrap_or(u32::MAX).min(64);
+            (0..steps).fold(Decimal::ONE, |acc, _| acc * base)
         } else {
             base.to_f64()
                 .zip(self.exponent.to_f64())
@@ -601,6 +604,17 @@ mod tests {
         };
         market.fee_schedule = Some(zero);
         assert_eq!(market.effective_fee_schedule(), zero);
+    }
+
+    #[test]
+    fn a_huge_exponent_is_priced_at_once() {
+        let schedule = FeeSchedule {
+            rate: Decimal::new(7, 2),
+            exponent: Decimal::from(1_000_000_000u64),
+        };
+        let started = std::time::Instant::now();
+        assert!(schedule.fee_per_share(Decimal::new(5, 1)) < Decimal::new(1, 20));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 
     #[test]
