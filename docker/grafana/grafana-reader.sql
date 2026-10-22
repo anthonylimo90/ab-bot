@@ -2,12 +2,22 @@
 -- trading and analytics tables an operator charts. Users, credentials,
 -- sessions, signed orders and signed transactions stay out of reach.
 -- Run by the monitoring profile's grafana-db-reader service on every start
--- (idempotent), as the database owner, with psql variable `pw` set.
+-- (idempotent), as the database owner, once the API has applied migrations.
+-- The password comes from the environment, never the command line, and the
+-- statement that sets it is kept out of the server log.
+\getenv pw GRAFANA_DB_PASSWORD
+SET log_statement = 'none';
+SET log_min_error_statement = 'panic';
+
 SELECT 'CREATE ROLE grafana_reader LOGIN'
 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'grafana_reader')\gexec
 
-ALTER ROLE grafana_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'pw';
+ALTER ROLE grafana_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT 5 PASSWORD :'pw';
 ALTER ROLE grafana_reader SET default_transaction_read_only = on;
+ALTER ROLE grafana_reader SET statement_timeout = '30s';
+
+-- Exactly the tables below: one taken off the list loses its grant.
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM grafana_reader;
 
 DO $$
 DECLARE

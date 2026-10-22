@@ -378,7 +378,7 @@ pub async fn prepare_order(
         .map_err(|_| ApiError::ServiceUnavailable("Market tick size unavailable".into()))?;
     if !polymarket_core::api::clob::price_on_tick(req.price, tick) {
         return Err(ApiError::BadRequest(format!(
-            "Price must be a multiple of the market's tick size {tick}, from {tick} to {}",
+            "Price must fit the market's tick size {tick}: from {tick} to {}, with no more decimals",
             Decimal::ONE - tick
         )));
     }

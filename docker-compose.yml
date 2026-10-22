@@ -213,11 +213,12 @@ services:
       - >-
         if [ -z "$$GRAFANA_DB_PASSWORD" ];
         then echo 'Set GRAFANA_DB_PASSWORD for the grafana_reader database login' >&2; exit 1; fi;
-        exec psql -v ON_ERROR_STOP=1 -v pw="$$GRAFANA_DB_PASSWORD" -f /grafana-reader.sql
+        exec psql -v ON_ERROR_STOP=1 -f /grafana-reader.sql
     volumes:
       - ./docker/grafana/grafana-reader.sql:/grafana-reader.sql:ro
+    # The tables it grants exist once the API has applied the migrations.
     depends_on:
-      postgres:
+      api-server:
         condition: service_healthy
     restart: "no"
     networks:

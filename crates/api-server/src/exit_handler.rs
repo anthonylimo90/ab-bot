@@ -756,26 +756,23 @@ impl ExitHandler {
     /// outcome or a buy may still be settling on chain: a balance read then
     /// can be short by shares that are on their way. A larger gap is left for
     /// reconciliation and the sale goes ahead as recorded, for the balance
-    /// preflight to refuse. Answers whether the recorded holding now is what
-    /// the wallet holds: false while it could not be measured, or did not
-    /// match; true too where it is not measured (a paper position, one not
-    /// of the executor's wallet).
+    /// preflight to refuse.
     async fn align_leg_with_wallet(
         &self,
         position: &mut Position,
         leg: Leg,
         token_id: &str,
         ctx: &EventContext,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         let held = match leg {
             Leg::Yes => position.held_yes_qty,
             Leg::No => position.held_no_qty,
         };
         if position.execution_mode != "live" || held <= Decimal::ZERO {
-            return Ok(true);
+            return Ok(());
         }
         let Some(wallet) = position.wallet_address.clone() else {
-            return Ok(true);
+            return Ok(());
         };
         // The balance read below is the executor's wallet.
         if self
@@ -784,7 +781,7 @@ impl ExitHandler {
             .await
             .is_none_or(|executor| !executor.eq_ignore_ascii_case(&wallet))
         {
-            return Ok(true);
+            return Ok(());
         }
         let (others, unsettled): (Decimal, bool) = sqlx::query_as(OTHER_HOLDERS_SQL)
             .bind(position.id)
@@ -796,7 +793,7 @@ impl ExitHandler {
             .fetch_one(&self.pool)
             .await?;
         if unsettled {
-            return Ok(false);
+            return Ok(());
         }
         let balance = match self
             .order_executor
@@ -810,7 +807,7 @@ impl ExitHandler {
             }
         };
         let Some(balance) = balance else {
-            return Ok(false);
+            return Ok(());
         };
         let recorded = held + others.max(Decimal::ZERO);
         match fee_shortfall(recorded, balance) {
@@ -827,8 +824,7 @@ impl ExitHandler {
                 );
                 self.position_service
                     .write_off_missing_shares(position, leg, share, ctx)
-                    .await?;
-                Ok(true)
+                    .await
             }
             None if balance < recorded => {
                 warn!(
@@ -839,10 +835,117 @@ impl ExitHandler {
                     %balance,
                     "Wallet holds far fewer shares than recorded; leaving it for reconciliation"
                 );
-                Ok(false)
+                Ok(())
             }
-            None => Ok(true),
+            None => Ok(()),
         }
+    }
+
+    /// Measure a resolved market's `leg` against the wallet before `position`
+    /// is closed, writing off what V1 buy fees kept in shares: the gap
+    /// between what the wallet's live positions and manual orders record of
+    /// the token and what it holds, when small (see [`fee_shortfall`]), is
+    /// shared out among all its positions in the market at once, so closing
+    /// one never hides another's part. A far larger gap means the shares
+    /// were redeemed or moved, and the record stands.
+    async fn measure_resolved_leg(
+        &self,
+        position: &mut Position,
+        leg: Leg,
+        token_id: &str,
+        ctx: &EventContext,
+    ) -> anyhow::Result<Measured> {
+        let held = match leg {
+            Leg::Yes => position.held_yes_qty,
+            Leg::No => position.held_no_qty,
+        };
+        if position.execution_mode != "live" || held <= Decimal::ZERO {
+            return Ok(Measured::Matches);
+        }
+        let Some(wallet) = position.wallet_address.clone() else {
+            return Ok(Measured::Matches);
+        };
+        if self
+            .order_executor
+            .wallet_address()
+            .await
+            .is_none_or(|executor| !executor.eq_ignore_ascii_case(&wallet))
+        {
+            return Ok(Measured::Matches);
+        }
+        let (others, unsettled): (Decimal, bool) = sqlx::query_as(OTHER_HOLDERS_SQL)
+            .bind(position.id)
+            .bind(&position.market_id)
+            .bind(&wallet)
+            .bind(leg.to_string())
+            .bind(token_id)
+            .bind(FEE_WRITE_OFF_SETTLE_MINUTES)
+            .fetch_one(&self.pool)
+            .await?;
+        if unsettled {
+            return Ok(Measured::Waiting(
+                "an order of the wallet on the market may still settle",
+            ));
+        }
+        let balance = match self
+            .order_executor
+            .get_live_balance_allowance("CONDITIONAL", Some(token_id))
+            .await
+        {
+            Ok(snapshot) => snapshot.balance_in_units(),
+            Err(error) => {
+                warn!(position_id = %position.id, %error, "Could not read the token balance of a resolved market");
+                None
+            }
+        };
+        let Some(balance) = balance else {
+            return Ok(Measured::Waiting("the wallet's balance could not be read"));
+        };
+        let recorded = held + others.max(Decimal::ZERO);
+        let Some(shortfall) = fee_shortfall(recorded, balance) else {
+            return Ok(if balance < recorded {
+                Measured::Short
+            } else {
+                Measured::Matches
+            });
+        };
+        let siblings: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM positions WHERE id <> $1 AND market_id = $2 AND execution_mode = 'live' \
+             AND LOWER(wallet_address) = LOWER($3) \
+             AND CASE WHEN $4 = 'yes' THEN held_yes_qty ELSE held_no_qty END > 0",
+        )
+        .bind(position.id)
+        .bind(&position.market_id)
+        .bind(&wallet)
+        .bind(leg.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        for id in siblings {
+            let mut sibling = self.position_service.load(id).await?;
+            let sibling_held = match leg {
+                Leg::Yes => sibling.held_yes_qty,
+                Leg::No => sibling.held_no_qty,
+            };
+            self.position_service
+                .write_off_missing_shares(
+                    &mut sibling,
+                    leg,
+                    shortfall * sibling_held / recorded,
+                    ctx,
+                )
+                .await?;
+        }
+        info!(
+            position_id = %position.id,
+            leg = %leg,
+            %recorded,
+            %balance,
+            "Writing off shares the wallet lacks before a resolution close"
+        );
+        self.position_service
+            .write_off_missing_shares(position, leg, shortfall * held / recorded, ctx)
+            .await?;
+        Ok(Measured::Matches)
     }
 
     async fn current_exit_bids(&self, position: &Position) -> anyhow::Result<ExitBidStatus> {
@@ -946,29 +1049,48 @@ impl ExitHandler {
         let ctx = Self::event_context(&execution_mode, source, quant_ctx);
 
         // Only the wallet's shares pay out: a buy whose fee the V1 exchange
-        // kept in shares left the recorded holding above them. Both legs are
-        // measured against the wallet first, winner or not; a live position
-        // whose holding cannot be checked now (an order on the market still
-        // settling, the balance unreadable) waits for a later look.
-        match self.resolve_market_tokens(&market_id).await? {
+        // kept in shares left the recorded holding above them. The legs that
+        // pay are measured against the wallet first: the winner's, or both
+        // without one (a loser pays nothing either way). While that cannot be
+        // done (an order on the market still settling, the balance
+        // unreadable) the close waits for a later look.
+        let tokens = self.resolve_market_tokens(&market_id).await?;
+        match &tokens {
             Some((yes_token_id, no_token_id)) => {
-                for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
-                    if !self
-                        .align_leg_with_wallet(position, leg, token_id, &ctx)
+                let legs = match resolved_yes_winner {
+                    Some(true) => vec![(Leg::Yes, yes_token_id)],
+                    Some(false) => vec![(Leg::No, no_token_id)],
+                    None => vec![(Leg::Yes, yes_token_id), (Leg::No, no_token_id)],
+                };
+                for (leg, token_id) in legs {
+                    match self
+                        .measure_resolved_leg(position, leg, token_id, &ctx)
                         .await?
                     {
-                        return Ok(false);
+                        Measured::Matches => {}
+                        Measured::Short => warn!(
+                            position_id = %position.id,
+                            leg = %leg,
+                            "The wallet holds far fewer shares of a resolved market than recorded \
+                             (redeemed or moved); closing at the recorded holding"
+                        ),
+                        Measured::Waiting(why) => {
+                            warn!(
+                                position_id = %position.id,
+                                market_id = %market_id,
+                                reason = why,
+                                "A resolved position waits to be measured against the wallet"
+                            );
+                            return Ok(false);
+                        }
                     }
                 }
             }
-            None if position.execution_mode == "live" => {
-                warn!(
-                    position_id = %position.id,
-                    market_id = %market_id,
-                    "Resolved market's tokens are unknown; the live position waits to be measured against the wallet"
-                );
-                return Ok(false);
-            }
+            None if position.execution_mode == "live" => warn!(
+                position_id = %position.id,
+                market_id = %market_id,
+                "Resolved market's tokens are unknown; closing at the recorded holding"
+            ),
             None => {}
         }
 
@@ -982,7 +1104,7 @@ impl ExitHandler {
             warn!(
                 position_id = %position.id,
                 market_id = %market_id,
-                "Resolved market is missing winner metadata; leaving unpaired exposure open to avoid mispricing"
+                "Resolved market has no winner yet and the position's legs differ; waiting for the winner"
             );
             return Ok(false);
         };
@@ -2088,6 +2210,17 @@ const OTHER_HOLDERS_SQL: &str = "SELECT \
                 AND created_at > NOW() - make_interval(mins => $6)))) \
     OR EXISTS(SELECT 1 FROM position_order_links l JOIN positions p ON p.id = l.position_id \
         WHERE NOT l.settled AND p.market_id = $2 AND LOWER(p.wallet_address) = LOWER($3))";
+
+/// What measuring a resolved market's leg against the wallet found.
+enum Measured {
+    /// The record is what the wallet holds (any fee shares written off), or
+    /// is not measured (paper, another wallet's position).
+    Matches,
+    /// The wallet holds far fewer shares: redeemed or moved; the record stands.
+    Short,
+    /// It cannot be measured now, for this reason.
+    Waiting(&'static str),
+}
 
 /// How much of `held` to write off when the wallet holds only `balance` for
 /// it: the whole shortfall when it is no more than V1 buy fees kept in shares

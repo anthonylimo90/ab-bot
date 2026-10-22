@@ -1584,13 +1584,14 @@ pub fn tick_size_from(answer: &serde_json::Value) -> Option<Decimal> {
     (tick > Decimal::ZERO && tick < Decimal::ONE).then(|| tick.normalize())
 }
 
-/// Whether `price` is a whole number of `tick` steps, from one step to one
-/// step short of a dollar.
+/// Whether `price` fits a market of `tick`, as Polymarket's own clients
+/// price orders: from one tick to one tick short of a dollar, with no more
+/// decimals than the tick has (two at 0.01, three at 0.005, four at 0.0025).
 pub fn price_on_tick(price: Decimal, tick: Decimal) -> bool {
     tick > Decimal::ZERO
         && price >= tick
         && price <= Decimal::ONE - tick
-        && (price % tick).is_zero()
+        && price.normalize().scale() <= tick.normalize().scale()
 }
 
 /// A string field the exchange may send as `null`: read as empty.
@@ -2855,10 +2856,14 @@ mod authenticated_tests {
         assert_eq!(tick(serde_json::json!({})), None);
         let d = |text: &str| text.parse::<Decimal>().unwrap();
         assert!(price_on_tick(d("0.55"), d("0.01")));
+        assert!(price_on_tick(d("0.5500"), d("0.01")));
         assert!(!price_on_tick(d("0.555"), d("0.01")));
+        // The clients round to the tick's decimals, no further.
         assert!(price_on_tick(d("0.505"), d("0.005")));
+        assert!(price_on_tick(d("0.503"), d("0.005")));
         assert!(!price_on_tick(d("0.5025"), d("0.005")));
         assert!(price_on_tick(d("0.5025"), d("0.0025")));
+        assert!(!price_on_tick(d("0.50251"), d("0.0025")));
         // Within one step of either end only.
         assert!(price_on_tick(d("0.01"), d("0.01")) && price_on_tick(d("0.99"), d("0.01")));
         assert!(!price_on_tick(d("0.005"), d("0.01")) && !price_on_tick(d("0.995"), d("0.01")));

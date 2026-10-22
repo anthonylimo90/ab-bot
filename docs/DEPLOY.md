@@ -250,12 +250,14 @@ API's `/metrics` with it), `GRAFANA_PASSWORD` (Grafana's admin login; it
 refuses to start without one, or with "admin") and `GRAFANA_DB_PASSWORD`.
 
 Grafana's PostgreSQL datasource reads as `grafana_reader`, never as the
-database owner. On every start the one-shot `grafana-db-reader` service
-creates or updates that login from `docker/grafana/grafana-reader.sql`: read
-only (each transaction is read-only), with `SELECT` on the trading and
-analytics tables alone. Users, credentials, sessions, signed orders
-(`execution_intents`) and signed withdrawals (`wallet_withdrawals`) stay out of
-its reach. To chart another table, add it to that file's list.
+database owner. On every start, once the API is healthy (its migrations
+applied), the one-shot `grafana-db-reader` service creates or updates that
+login from `docker/grafana/grafana-reader.sql`: read only (each transaction is
+read-only, 30 s per statement, 5 connections), with `SELECT` on exactly the
+listed trading and analytics tables. Users, credentials, sessions, signed
+orders (`execution_intents`) and signed withdrawals (`wallet_withdrawals`)
+stay out of its reach. To chart another table, add it to that file's list;
+one taken off the list loses its grant on the next start.
 
 ## Railway config files
 
@@ -643,15 +645,19 @@ unsigned). Fees are set by the exchange when an order matches.
   keeps no credentials for those wallets). One whose outcome is unknown
   holds back further orders from its wallet until ten minutes after its
   expiry (at most a day), and never the trading wallet's withdrawals.
-- A resolved position is closed only once both legs have been measured
-  against the wallet's balance (a buy whose fee the V1 exchange kept in
-  shares left the record above it): with a winner, the winning leg pays what
-  the wallet holds; without one, the pair pays a dollar only while its
-  measured legs are still equal, and otherwise waits for the winner. A live
-  position whose holding cannot be measured yet (an order on the market
-  still settling, the balance unreadable) waits for a later look.
+- Before a resolved position closes, the legs that pay (the winner's, or
+  both without a winner) are measured against the wallet's balance: a buy
+  whose fee the V1 exchange kept in shares left the record above it. The
+  gap is shared out among all the wallet's positions in that market at once.
+  Without a winner, a pair pays a dollar only while its measured legs are
+  still equal, and otherwise waits for the winner. While the balance cannot
+  be measured (an order on the market still settling, the balance
+  unreadable) the close waits and says so in the log. A wallet holding far
+  fewer shares than recorded has had them redeemed or moved: the position
+  closes at its recorded holding, with a warning.
 - Preparing a browser-wallet order reads the market's tick size and refuses
-  a price that is not a whole number of ticks, before the wallet signs.
+  a price outside one tick of either end or with more decimals than the
+  tick has (as Polymarket's own clients round), before the wallet signs.
 - The activity feed shows an exit that keeps failing for the same reason
   once; a new reason shows again. The trade event log keeps every attempt.
 - 093 drops browser-wallet orders prepared for the V1 exchange (they can no

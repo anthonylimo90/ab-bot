@@ -1053,6 +1053,72 @@ async fn a_pair_resolved_without_a_winner_pays_only_what_the_wallet_holds(pool: 
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, wallet, server) = live_handler(&pool, balance.clone()).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let set_balance = |shares: &str| {
+        *balance.lock().unwrap() =
+            (shares.parse::<Decimal>().unwrap() * Decimal::from(1_000_000)).to_string()
+    };
+    let live_yes = || {
+        let mut p = position();
+        p.id = uuid::Uuid::new_v4();
+        p.state = PositionState::Open;
+        p.execution_mode = "live".into();
+        p.wallet_address = Some(wallet.clone());
+        p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+        p.held_yes_qty = Decimal::from(100);
+        p
+    };
+    // Two positions of 100 YES at 0.40; V1 buys kept 7 shares between them.
+    let mut a = live_yes();
+    let b = live_yes();
+    service.repo().insert(&a).await.unwrap();
+    service.repo().insert(&b).await.unwrap();
+    set_balance("193");
+    assert!(h
+        .finalize_resolution_close(&mut a, 0, None, Some(true))
+        .await
+        .unwrap());
+    // A pays 96.5 − 40; its sibling was measured at the same time, so its
+    // own close, with A's shares still in the wallet, pays 96.5 too.
+    assert_eq!(a.realized_pnl, Some(Decimal::new(565, 1)));
+    let mut b = service.load(b.id).await.unwrap();
+    assert_eq!(b.held_yes_qty, Decimal::new(965, 1));
+    assert!(h
+        .finalize_resolution_close(&mut b, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert_eq!(b.realized_pnl, Some(Decimal::new(565, 1)));
+
+    // Already redeemed (or moved): the wallet holds none; the record stands
+    // and the position closes rather than waiting for ever: 100 − 40.
+    let mut c = live_yes();
+    service.repo().insert(&c).await.unwrap();
+    set_balance("0");
+    assert!(h
+        .finalize_resolution_close(&mut c, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert_eq!(c.realized_pnl, Some(Decimal::from(60)));
+
+    // The losing leg is never measured: it pays nothing either way.
+    let mut d = live_yes();
+    d.held_no_qty = Decimal::from(100);
+    service.repo().insert(&d).await.unwrap();
+    set_balance("0");
+    assert!(h
+        .finalize_resolution_close(&mut d, 0, None, Some(false))
+        .await
+        .unwrap());
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn holders_of_one_token_each_answer_for_their_share_of_the_fees(pool: PgPool) {
     let service = setup(&pool).await;
     let balance = Arc::new(std::sync::Mutex::new(String::new()));
