@@ -396,7 +396,7 @@ async fn execute_reserved_order(
                     origin.wallet_address.as_deref(),
                 )
                 .await
-                .map_err(|e| ApiError::Internal(format!("Execution error: {}", e)))?
+                .map_err(manual_execution_error)?
         }
         OrderType::Limit => {
             let price = request
@@ -421,7 +421,7 @@ async fn execute_reserved_order(
                     origin.wallet_address.as_deref(),
                 )
                 .await
-                .map_err(|e| ApiError::Internal(format!("Execution error: {}", e)))?
+                .map_err(manual_execution_error)?
         }
         OrderType::StopLoss | OrderType::TakeProfit => {
             return Err(ApiError::BadRequest(
@@ -936,9 +936,77 @@ pub(crate) async fn reconcile_manual_intent(
     Ok(())
 }
 
+/// A client-safe error for a manual order the executor did not complete. The
+/// caller must be able to tell an order whose outcome is unknown (never resend
+/// it) from one that was certainly not sent; internal detail stays in the log.
+fn manual_execution_error(error: anyhow::Error) -> ApiError {
+    let text = error.to_string();
+    tracing::warn!(error = %text, "Manual order execution failed");
+    if text.contains("submission_requires_reconciliation") {
+        ApiError::ServiceUnavailable(
+            "The order's outcome is not yet known and will be reconciled automatically; \
+             do not resubmit it, check its status instead"
+                .into(),
+        )
+    } else if text.contains("live_submission_fence_busy") || text.contains("nothing was sent") {
+        ApiError::ServiceUnavailable(
+            "Another live order is still being submitted; nothing was sent, retry shortly".into(),
+        )
+    } else if text.starts_with("Insufficient ") {
+        // Our own balance/allowance preflight: amounts of the caller's wallet.
+        ApiError::Validation(text)
+    } else if let Some((_, reason)) = text.split_once("Failed to post order: ") {
+        // The exchange's rejection of the order (nothing was filled).
+        let reason: String = reason.chars().take(300).collect();
+        ApiError::Validation(format!("The exchange rejected the order: {reason}"))
+    } else if text.contains("Live trading not initialized")
+        || text.contains("Live client unavailable")
+        || text.contains("No authenticated client")
+        || text.contains("not initialized for collateral preflight")
+        || text.contains("balance preflight unavailable")
+    {
+        ApiError::ServiceUnavailable("Live trading is not available right now".into())
+    } else {
+        ApiError::Internal(format!("Execution error: {text}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_execution_errors_tell_unknown_outcomes_from_unsent_orders() {
+        let map = |text: &str| manual_execution_error(anyhow::anyhow!(text.to_string()));
+        let unknown = map("submission_requires_reconciliation: network lost response");
+        assert_eq!(
+            unknown.status_code(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(unknown.to_string().contains("do not resubmit"));
+
+        let busy = map("live_submission_fence_busy: another live order is still being posted; nothing was sent");
+        assert!(busy.to_string().contains("nothing was sent"));
+
+        let funds = map("Insufficient USDC balance for live order: available 3, required 5");
+        assert_eq!(
+            funds.status_code(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(funds.to_string().contains("required 5"));
+
+        let rejected =
+            map("refreshable_balance_allowance: Failed to post order: not enough balance");
+        assert!(rejected
+            .to_string()
+            .contains("The exchange rejected the order: not enough balance"));
+
+        let unexpected = map("Failed to derive API credentials: secret detail");
+        assert_eq!(
+            unexpected.status_code(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn test_order_request_serialization() {

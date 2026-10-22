@@ -6,7 +6,7 @@
 //! address they observed to the *right* of the header, so only entries counted
 //! from the right can be trusted, and only as far as there are trusted proxies.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -48,7 +48,15 @@ impl TrustedProxyKeyExtractor {
                 );
                 DEFAULT_TRUSTED_PROXY_HOPS
             }),
-            Err(_) => DEFAULT_TRUSTED_PROXY_HOPS,
+            Err(_) => {
+                tracing::warn!(
+                    default = DEFAULT_TRUSTED_PROXY_HOPS,
+                    "TRUSTED_PROXY_HOPS is unset: trusting one reverse proxy's X-Forwarded-For. \
+                     If clients reach this server directly, set TRUSTED_PROXY_HOPS=0 or they \
+                     can choose their own rate-limit key"
+                );
+                DEFAULT_TRUSTED_PROXY_HOPS
+            }
         };
         Self::new(hops)
     }
@@ -73,9 +81,28 @@ impl KeyExtractor for TrustedProxyKeyExtractor {
 /// not served with `ConnectInfo`) shares one fallback bucket instead of
 /// producing a 500.
 pub fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted_hops: usize) -> IpAddr {
-    forwarded_client(headers, trusted_hops)
-        .or(peer)
-        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+    rate_limit_key(
+        forwarded_client(headers, trusted_hops)
+            .or(peer)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+    )
+}
+
+/// The bucket an address is limited in. One IPv6 client normally holds a
+/// whole /64, so its addresses share a bucket; IPv4-mapped addresses count as
+/// the IPv4 address they carry.
+fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut segments = v6.segments();
+                segments[4..].fill(0);
+                IpAddr::V6(Ipv6Addr::from(segments))
+            }
+        },
+        v4 => v4,
+    }
 }
 
 /// The entry `trusted_hops` places from the right of the combined
@@ -204,7 +231,7 @@ mod tests {
         assert_eq!(client_ip(&none, Some(ip("192.0.2.5")), 1), ip("192.0.2.5"));
         assert_eq!(
             client_ip(&none, Some(ip("2001:db8::1")), 1),
-            ip("2001:db8::1")
+            ip("2001:db8::")
         );
         // No peer either: a shared fallback bucket rather than an error.
         assert_eq!(client_ip(&none, None, 1), ip("0.0.0.0"));
@@ -240,11 +267,35 @@ mod tests {
         );
         assert_eq!(
             client_ip(&headers(&["[2001:db8::7]:99"]), peer, 1),
-            ip("2001:db8::7")
+            ip("2001:db8::")
         );
         assert_eq!(
             client_ip(&headers(&["2001:db8::7"]), peer, 1),
-            ip("2001:db8::7")
+            ip("2001:db8::")
+        );
+    }
+
+    #[test]
+    fn an_ipv6_client_is_limited_per_slash_64() {
+        let peer = None;
+        // Rotating addresses inside one /64 does not buy fresh buckets...
+        assert_eq!(
+            client_ip(&headers(&["2001:db8:1:2:aaaa::1"]), peer, 1),
+            client_ip(&headers(&["2001:db8:1:2:ffff:1:2:3"]), peer, 1)
+        );
+        // ...while different /64s stay apart.
+        assert_ne!(
+            client_ip(&headers(&["2001:db8:1:2::1"]), peer, 1),
+            client_ip(&headers(&["2001:db8:1:3::1"]), peer, 1)
+        );
+        // IPv4-mapped addresses count as the IPv4 address.
+        assert_eq!(
+            client_ip(&headers(&["::ffff:203.0.113.9"]), peer, 1),
+            ip("203.0.113.9")
+        );
+        assert_eq!(
+            client_ip(&HeaderMap::new(), Some(ip("2001:db8::9")), 0),
+            ip("2001:db8::")
         );
     }
 

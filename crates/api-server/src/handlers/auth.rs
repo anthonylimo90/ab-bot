@@ -610,6 +610,21 @@ pub async fn forgot_password(
             .to_string(),
     };
 
+    // The lookup, token and email happen in the background so the response
+    // takes the same time whether or not the address has an account.
+    let email = req.email.clone();
+    tokio::spawn(async move {
+        if let Err(error) = issue_password_reset(&state, &email).await {
+            tracing::error!(%error, "Password reset request failed");
+        }
+    });
+
+    Ok(Json(response))
+}
+
+/// Issue a reset token for `email` and send it, if the address has an account
+/// and has not asked too often. Nothing is revealed to the requester.
+async fn issue_password_reset(state: &AppState, email: &str) -> ApiResult<()> {
     // Find user by email
     let user: Option<UserRow> = sqlx::query_as(
         r#"
@@ -618,7 +633,7 @@ pub async fn forgot_password(
         WHERE email = $1
         "#,
     )
-    .bind(&req.email)
+    .bind(email)
     .fetch_optional(&state.pool)
     .await?;
 
@@ -626,8 +641,8 @@ pub async fn forgot_password(
         Some(u) => u,
         None => {
             // Log attempt but don't reveal user existence
-            tracing::info!(email = %req.email, "Password reset requested for non-existent email");
-            return Ok(Json(response));
+            tracing::info!(%email, "Password reset requested for non-existent email");
+            return Ok(());
         }
     };
 
@@ -645,7 +660,7 @@ pub async fn forgot_password(
     if recent_count.0 >= 3 {
         tracing::warn!(user_id = %user.id, "Password reset rate limit exceeded");
         // Still return success to prevent enumeration
-        return Ok(Json(response));
+        return Ok(());
     }
 
     // Generate token and hash
@@ -673,14 +688,14 @@ pub async fn forgot_password(
     )
     .user(user.id.to_string())
     .details(serde_json::json!({
-        "email": &req.email,
+        "email": email,
     }))
     .build();
     state.audit_logger.log(audit_event);
 
     // Send email if email client is configured
     if let Some(email_client) = &state.email_client {
-        if let Err(e) = email_client.send_password_reset(&req.email, &token).await {
+        if let Err(e) = email_client.send_password_reset(email, &token).await {
             tracing::error!(error = %e, "Failed to send password reset email");
             // Don't fail the request, just log the error
         } else {
@@ -689,12 +704,12 @@ pub async fn forgot_password(
     } else {
         tracing::warn!("Email client not configured, password reset token generated but not sent");
         // In development, log the token for testing
-        if std::env::var("ENVIRONMENT").unwrap_or_default() == "development" {
+        if crate::is_development_environment(&std::env::var("ENVIRONMENT").unwrap_or_default()) {
             tracing::info!(token = %token, "Development mode: password reset token");
         }
     }
 
-    Ok(Json(response))
+    Ok(())
 }
 
 /// Reset password using a token.

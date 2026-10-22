@@ -133,7 +133,8 @@ const SIWE_CHAIN_ID: u64 = 137;
 /// that asked for the signature and the chain it is bound to. Without this a
 /// message (and signature) produced for any other site, or for another chain,
 /// would log in here as long as it carried a nonce we issued.
-struct SiteBinding {
+#[derive(Debug, Clone)]
+pub struct SiteBinding {
     /// `APP_DOMAIN`: the authority the message must name.
     domain: String,
     /// `APP_URI`: the URI the message must name.
@@ -141,10 +142,33 @@ struct SiteBinding {
 }
 
 impl SiteBinding {
-    fn from_env() -> Self {
+    /// The local dashboard (`localhost`, `http://localhost:3002`).
+    pub fn development() -> Self {
         Self {
-            domain: std::env::var("APP_DOMAIN").unwrap_or_else(|_| "localhost".to_string()),
-            uri: std::env::var("APP_URI").unwrap_or_else(|_| "http://localhost:3002".to_string()),
+            domain: "localhost".to_string(),
+            uri: "http://localhost:3002".to_string(),
+        }
+    }
+
+    /// `APP_DOMAIN` and `APP_URI`. Outside development both are required:
+    /// `None` disables wallet sign-in rather than binding it to `localhost`,
+    /// which any phishing page could ask a victim to sign for.
+    pub fn from_env() -> Option<Self> {
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        let environment = std::env::var("ENVIRONMENT").unwrap_or_default();
+        Self::resolve(var("APP_DOMAIN"), var("APP_URI"), &environment)
+    }
+
+    fn resolve(domain: Option<String>, uri: Option<String>, environment: &str) -> Option<Self> {
+        match (domain, uri) {
+            (Some(domain), Some(uri)) => Some(Self { domain, uri }),
+            _ if crate::is_development_environment(environment) => Some(Self::development()),
+            _ => None,
         }
     }
 
@@ -279,6 +303,15 @@ fn eip55_address(address: &str) -> String {
     }
 }
 
+/// The site binding this deployment signs in for; wallet sign-in is
+/// unavailable when it is not configured.
+fn configured_site(state: &AppState) -> ApiResult<&SiteBinding> {
+    state.siwe_site.as_ref().ok_or_else(|| {
+        tracing::error!("Wallet sign-in requested but APP_DOMAIN/APP_URI are not configured");
+        ApiError::ServiceUnavailable("Wallet sign-in is not configured".into())
+    })
+}
+
 /// Generate a SIWE challenge for wallet authentication.
 #[utoipa::path(
     post,
@@ -306,6 +339,7 @@ pub async fn challenge(
     }
 
     let address = normalize_address(&req.address);
+    let site = configured_site(&state)?;
     let nonce = generate_nonce();
     let now = Utc::now();
     let expires_at = now + Duration::minutes(5);
@@ -336,7 +370,6 @@ pub async fn challenge(
     .await;
 
     // Build SIWE message
-    let site = SiteBinding::from_env();
 
     let message = format!(
         "{domain} wants you to sign in with your Ethereum account:\n\
@@ -398,7 +431,7 @@ pub async fn verify(
 
     // The signed message must have been issued for this site, not merely carry a
     // valid signature and a nonce we handed out.
-    let site = SiteBinding::from_env();
+    let site = configured_site(&state)?;
     site.ensure_bound(&message)?;
 
     // Consume the nonce before verifying, in one atomic statement: of any number
@@ -572,7 +605,7 @@ pub async fn link_wallet(
         .map_err(|_| ApiError::BadRequest("Invalid signature format".into()))?;
 
     // Same site binding and atomic nonce consumption as `verify`.
-    let site = SiteBinding::from_env();
+    let site = configured_site(&state)?;
     site.ensure_bound(&message)?;
 
     let mut tx = state.pool.begin().await?;

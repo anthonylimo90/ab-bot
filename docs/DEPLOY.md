@@ -107,9 +107,18 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
    JWT_SECRET=<generate-32-char-secret>
    RUST_LOG=info,api_server=debug
-   CORS_PERMISSIVE=false
+   ENVIRONMENT=production
+   CORS_ALLOWED_ORIGINS=https://<your-dashboard-domain>
+   APP_DOMAIN=<your-dashboard-domain>
+   APP_URI=https://<your-dashboard-domain>
+   TRUSTED_PROXY_HOPS=1
    SKIP_MIGRATIONS=false
    ```
+
+   `CORS_ALLOWED_ORIGINS` is what restricts cross-origin access; without it all
+   origins are allowed whatever `CORS_PERMISSIVE` says. Wallet sign-in stays
+   disabled outside development until `APP_DOMAIN` and `APP_URI` are set.
+   Railway puts one proxy in front of the service, hence `TRUSTED_PROXY_HOPS=1`.
 
 6. In **Networking**, click **"Generate Domain"** for public URL
 
@@ -185,7 +194,10 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 | `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
 | `JWT_SECRET` | JWT signing key (32+ chars) | `your-secret-key` |
 | `RUST_LOG` | Log level | `info,api_server=debug` |
-| `CORS_PERMISSIVE` | Allow all CORS origins | `false` |
+| `ENVIRONMENT` | `production` enables the strict secret and sign-in checks | `production` |
+| `CORS_ALLOWED_ORIGINS` | Exact origins allowed to call the API (unset: all origins) | `https://app.example.com` |
+| `APP_DOMAIN` / `APP_URI` | Site wallet sign-in messages are bound to (required for wallet sign-in outside development) | `app.example.com` / `https://app.example.com` |
+| `TRUSTED_PROXY_HOPS` | Reverse proxies in front of the API (0 when exposed directly) | `1` |
 | `SKIP_MIGRATIONS` | Skip auto-migrations | `false` |
 | `API_PORT` | Server port | `3000` (default) |
 

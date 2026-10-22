@@ -5,7 +5,7 @@
 use super::*;
 use crate::workspace_scope::{resolve_canonical_workspace_id, test_fixture as fx};
 use axum::http::StatusCode;
-use axum::routing::put;
+use axum::routing::{get, put};
 use axum::Router;
 use serde_json::json;
 use sqlx::PgPool;
@@ -83,6 +83,14 @@ async fn fixture(pool: &PgPool) -> Fixture {
         .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/arb-executor",
             put(update_arb_executor_config),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/status",
+            get(get_dynamic_tuner_status),
+        )
+        .route(
+            "/api/v1/workspaces/:workspace_id/dynamic-tuning/history",
+            get(get_dynamic_tuning_history),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -256,6 +264,23 @@ async fn global_dynamic_config_needs_canonical_admin_or_platform_admin(pool: PgP
                 .execute(&pool)
                 .await
                 .unwrap();
+        }
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn global_tuning_is_visible_only_to_canonical_members(pool: PgPool) {
+    let f = fixture(&pool).await;
+    for suffix in ["/dynamic-tuning/status", "/dynamic-tuning/history"] {
+        for workspace in [f.other, f.canonical] {
+            let uri = format!("/api/v1/workspaces/{workspace}{suffix}");
+            // Owning another workspace grants no view of global state...
+            let (status, _) = fx::call(&f.app, "GET", &uri, Some(&f.tokens["owner_b"]), None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "owner_b {uri}");
+            // ...while canonical members see it whichever id the path names.
+            let (status, _) =
+                fx::call(&f.app, "GET", &uri, Some(&f.tokens["viewer_a"]), None).await;
+            assert_eq!(status, StatusCode::OK, "viewer_a {uri}");
         }
     }
 }

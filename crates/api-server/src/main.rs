@@ -3,7 +3,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use api_server::{ApiServer, ServerConfig};
+use api_server::{is_development_environment, ApiServer, ServerConfig};
 use clap::{Parser, Subcommand};
 use polymarket_core::config::DatabaseConfig;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -200,15 +200,6 @@ fn weak_jwt_secret_reason(secret: &str) -> Option<&'static str> {
         return Some("it has too few distinct characters to be a random secret");
     }
     None
-}
-
-/// Whether `ENVIRONMENT` names a local development setup. Anything else,
-/// including unset, is treated as a real deployment.
-fn is_development_environment(environment: &str) -> bool {
-    matches!(
-        environment.trim().to_ascii_lowercase().as_str(),
-        "development" | "dev" | "local" | "test"
-    )
 }
 
 /// Validate `JWT_SECRET`.

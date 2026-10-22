@@ -148,7 +148,7 @@ impl Fixture {
 
 /// The ways a message can claim to be for somebody else.
 fn tampered_messages(message: &str) -> Vec<(&'static str, String)> {
-    let site = SiteBinding::from_env();
+    let site = SiteBinding::development();
     vec![
         ("domain", message.replacen(&site.domain, "evil.example", 1)),
         (
@@ -585,4 +585,22 @@ async fn user_and_member_listings_tolerate_accounts_without_email(pool: PgPool) 
     .await;
     assert_eq!(status, StatusCode::OK, "{members}");
     assert_eq!(members[0]["email"], "");
+}
+
+#[test]
+fn site_binding_is_required_outside_development() {
+    let some = |value: &str| Some(value.to_string());
+    let configured =
+        SiteBinding::resolve(some("app.example.com"), some("https://app.example.com"), "");
+    assert_eq!(configured.unwrap().domain, "app.example.com");
+    // Unset (or half-set) binding: never fall back to localhost in a deployment.
+    assert!(SiteBinding::resolve(None, None, "production").is_none());
+    assert!(SiteBinding::resolve(None, None, "").is_none());
+    assert!(SiteBinding::resolve(some("app.example.com"), None, "staging").is_none());
+    assert_eq!(
+        SiteBinding::resolve(None, None, "development")
+            .unwrap()
+            .domain,
+        "localhost"
+    );
 }

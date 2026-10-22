@@ -212,6 +212,9 @@ pub struct AppState {
     pub exit_handler_heartbeat: Arc<AtomicI64>,
     /// Heartbeat timestamp (epoch secs) from quant signal executor — 0 means never updated.
     pub quant_executor_heartbeat: Arc<AtomicI64>,
+    /// Site that wallet (SIWE) sign-in messages are bound to; `None` disables
+    /// wallet sign-in (not configured outside development).
+    pub siwe_site: Option<crate::handlers::wallet_auth::SiteBinding>,
 }
 
 impl AppState {
@@ -608,6 +611,14 @@ impl AppState {
             .with_pool(pool.clone()),
         );
 
+        let siwe_site = crate::handlers::wallet_auth::SiteBinding::from_env();
+        if siwe_site.is_none() {
+            tracing::error!(
+                "APP_DOMAIN and APP_URI are not set: wallet sign-in is disabled until they name \
+                 the dashboard's domain and URI"
+            );
+        }
+
         Ok(Self {
             market_catalog,
             inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -644,6 +655,7 @@ impl AppState {
             arb_dedup: Arc::new(RwLock::new(HashSet::new())),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+            siwe_site,
         })
     }
 
@@ -727,6 +739,7 @@ impl AppState {
             arb_dedup: Arc::new(RwLock::new(HashSet::new())),
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
+            siwe_site: Some(crate::handlers::wallet_auth::SiteBinding::development()),
         })
     }
 

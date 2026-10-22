@@ -1499,15 +1499,23 @@ pub async fn accept_invite(
     let auth_user: Option<crate::handlers::auth::UserInfo>;
     let accepted_by_user_id: Uuid;
 
+    // Hash before opening the transaction: the hash may wait for an Argon2
+    // permit, and a connection must not sit idle in a transaction meanwhile.
+    let new_password_hash = match requested_password {
+        Some(password) => {
+            if password.len() < 8 {
+                return Err(ApiError::BadRequest(
+                    "Password must be at least 8 characters".into(),
+                ));
+            }
+            Some(crate::handlers::auth::hash_password(password.to_string()).await?)
+        }
+        None => None,
+    };
+
     let mut tx = state.pool.begin().await?;
 
-    if let Some(password) = requested_password {
-        if password.len() < 8 {
-            return Err(ApiError::BadRequest(
-                "Password must be at least 8 characters".into(),
-            ));
-        }
-
+    if let Some(password_hash) = new_password_hash {
         let existing_user: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM users WHERE email = $1")
                 .bind(&invite.email)
@@ -1520,8 +1528,6 @@ pub async fn accept_invite(
                     .into(),
             ));
         }
-
-        let password_hash = crate::handlers::auth::hash_password(password.to_string()).await?;
 
         let user_id = Uuid::new_v4();
         let created_at = Utc::now();
@@ -2283,18 +2289,13 @@ pub struct DynamicConfigHistoryEntryResponse {
 pub async fn get_service_status(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<ServiceStatusResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    // Verify membership
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
-    }
+    // Runtime status is global: it is shown for the canonical workspace,
+    // whose flags drive it, and only to its members.
+    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
 
     #[derive(sqlx::FromRow)]
     struct WorkspaceServiceFlags {
@@ -2464,17 +2465,12 @@ pub async fn get_service_status(
 pub async fn get_dynamic_tuner_status(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
 ) -> ApiResult<Json<DynamicTunerStatusResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
-    }
+    // Tuning is global; only members of the canonical workspace see it.
+    require_canonical_workspace_member(&state.pool, user_id).await?;
 
     let rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
         r#"
@@ -3003,18 +2999,13 @@ pub async fn update_opportunity_selection_settings(
 pub async fn get_dynamic_tuning_history(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    Path(workspace_id): Path<String>,
+    Path(_workspace_id): Path<String>,
     Query(query): Query<DynamicHistoryQuery>,
 ) -> ApiResult<Json<Vec<DynamicConfigHistoryEntryResponse>>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let workspace_id = Uuid::parse_str(&workspace_id)
-        .map_err(|_| ApiError::BadRequest("Invalid workspace ID format".into()))?;
-
-    let role = get_user_role(&state.pool, workspace_id, user_id).await?;
-    if role.is_none() {
-        return Err(ApiError::Forbidden("Not a member of this workspace".into()));
-    }
+    // Tuning is global; only members of the canonical workspace see it.
+    require_canonical_workspace_member(&state.pool, user_id).await?;
 
     let limit = query.limit.clamp(1, 200);
     let offset = query.offset.max(0);

@@ -143,6 +143,15 @@ fn parse_origin_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `ENVIRONMENT` names a local development setup. Anything else,
+/// including unset, is treated as a real deployment.
+pub fn is_development_environment(environment: &str) -> bool {
+    matches!(
+        environment.trim().to_ascii_lowercase().as_str(),
+        "development" | "dev" | "local" | "test"
+    )
+}
+
 /// Build the CORS layer.
 ///
 /// - `cors_allowed_origins` set: only those exact origins, the methods and
