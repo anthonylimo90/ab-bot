@@ -186,13 +186,11 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
                 // The exchange holds the order, so it is no longer in doubt:
                 // a manual order, whose row keeps its cash reserved, stops
                 // fencing the wallet and is followed like any resting order.
-                if intent.has_order
-                    && intent.position_id.is_none()
-                    && matches!(intent.status.as_str(), "submitting" | "unknown")
-                {
-                    // The order row takes the exchange's id too, so the order
-                    // can be refreshed and cancelled by it.
-                    sqlx::query("WITH promoted AS (UPDATE execution_intents SET status='acknowledged',exchange_order_id=$2,updated_at=NOW() WHERE id=$1 AND status IN ('submitting','unknown') RETURNING id) UPDATE orders SET exchange_order_id=$2,updated_at=NOW() WHERE id IN (SELECT id FROM promoted)")
+                // Its row takes the exchange's id too (as does one whose
+                // request stopped before saving it), so the order can be
+                // refreshed and cancelled by it.
+                if intent.has_order && intent.position_id.is_none() {
+                    sqlx::query("WITH promoted AS (UPDATE execution_intents SET status='acknowledged',exchange_order_id=$2,updated_at=NOW() WHERE id=$1 AND status IN ('submitting','unknown') RETURNING id) UPDATE orders SET exchange_order_id=$2,updated_at=NOW() WHERE id=$1 AND (exchange_order_id IS NULL OR EXISTS(SELECT 1 FROM promoted))")
                         .bind(intent.id)
                         .bind(&snapshot.id)
                         .execute(&state.pool)
@@ -380,7 +378,6 @@ async fn settle_after_purchase(
                 ctx,
             )
             .await?;
-        state.arb_dedup.write().await.remove(&position.market_id);
     } else if entry_complete(position) {
         if position.state == PositionState::Pending {
             service.mark_open(position, ctx).await?;
@@ -417,15 +414,12 @@ async fn settle_after_sale(
             ctx,
         )
         .await?;
-    let realized_pnl = position.realized_pnl.unwrap_or_default();
-    if let Err(error) = state
-        .circuit_breaker
-        .record_trade(realized_pnl, realized_pnl > Decimal::ZERO)
-        .await
-    {
-        tracing::warn!(%error, "Failed to record reconciled close with circuit breaker");
-    }
-    state.arb_dedup.write().await.remove(&position.market_id);
+    crate::exit_handler::record_close_with_breaker(
+        &state.circuit_breaker,
+        &state.order_executor,
+        position,
+    )
+    .await;
     Ok(())
 }
 
@@ -888,6 +882,13 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // Answered, but its request stopped before its row took the id.
+        let unsaved = journal(&pool, &maker, None, "acknowledged", 1).await;
+        sqlx::query("INSERT INTO orders(id,status,execution_mode,quantity,filled_quantity) VALUES($1,'pending','live',10,0)")
+            .bind(unsaved)
+            .execute(&pool)
+            .await
+            .unwrap();
         // Nothing reserves for these: they keep fencing until they close.
         let orphan = journal(&pool, &maker, None, "unknown", 1).await;
         let position = live_position(&state, &maker, 48, 0).await;
@@ -902,6 +903,7 @@ mod tests {
         reconcile(&state).await.unwrap();
         for (id, expected) in [
             (manual, "acknowledged"),
+            (unsaved, "acknowledged"),
             (orphan, "unknown"),
             (linked, "unknown"),
         ] {
@@ -920,6 +922,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, ("exchange".to_string(), "exchange".to_string()));
+        let unsaved_id: Option<String> =
+            sqlx::query_scalar("SELECT exchange_order_id FROM orders WHERE id=$1")
+                .bind(unsaved)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unsaved_id.as_deref(), Some("exchange"));
         server.abort();
     }
 
@@ -1101,7 +1110,6 @@ mod tests {
             .update(&mut position)
             .await
             .unwrap();
-        state.arb_dedup.write().await.insert("market".into());
         journal(
             &pool,
             &maker,
@@ -1110,6 +1118,12 @@ mod tests {
             1,
         )
         .await;
+        let repo = state.position_service.repo();
+        // An exit in flight keeps its market from another arb entry.
+        assert!(repo
+            .has_active_in_market(&position.market_id)
+            .await
+            .unwrap());
 
         reconcile(&state).await.unwrap();
 
@@ -1119,7 +1133,10 @@ mod tests {
         let breaker = state.circuit_breaker.state().await;
         assert_eq!(breaker.consecutive_losses, 1);
         assert!(breaker.daily_pnl < Decimal::ZERO);
-        assert!(!state.arb_dedup.read().await.contains("market"));
+        assert!(!repo
+            .has_active_in_market(&position.market_id)
+            .await
+            .unwrap());
         server.abort();
     }
 

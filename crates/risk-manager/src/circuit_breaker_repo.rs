@@ -263,10 +263,7 @@ mod tests {
             .update_portfolio_value(Decimal::new(1000, 0))
             .await
             .unwrap();
-        breaker
-            .record_trade(Decimal::new(-10, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-10, 0)).await.unwrap();
         breaker
             .update_portfolio_value(Decimal::new(500, 0))
             .await
@@ -328,10 +325,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..3 {
-            breaker
-                .record_trade(Decimal::NEGATIVE_ONE, false)
-                .await
-                .unwrap();
+            breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
         }
         assert!(breaker.can_trade().await);
         assert!(breaker.is_in_recovery().await);

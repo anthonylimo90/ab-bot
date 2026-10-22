@@ -2,7 +2,6 @@
 
 use crate::types::{
     ArbOpportunity, ExitStrategy, FailureReason, Position, PositionFeeModel, PositionState,
-    PositionStats,
 };
 use crate::Result;
 use chrono::Utc;
@@ -405,6 +404,20 @@ impl PositionRepository {
 
     /// Get all active (non-closed, non-entry-failed) positions.
     /// This includes positions needing recovery (ExitFailed, Stalled).
+    /// Whether a position in `market_id` is still active: in any state but
+    /// closed or entry failed, or still holding shares (an entry that failed
+    /// after one leg filled, waiting to be flattened).
+    pub async fn has_active_in_market(&self, market_id: &str) -> Result<bool> {
+        let active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM positions WHERE market_id = $1 \
+             AND (state NOT IN (4, 5) OR held_yes_qty > 0 OR held_no_qty > 0))",
+        )
+        .bind(market_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(active)
+    }
+
     pub async fn get_active(&self) -> Result<Vec<Position>> {
         let rows = sqlx::query(
             r#"
@@ -659,39 +672,6 @@ impl PositionRepository {
             .map(Self::row_to_position)
             .filter(Position::is_one_legged_entry_fail)
             .collect())
-    }
-
-    /// Get position statistics.
-    pub async fn get_stats(&self) -> Result<PositionStats> {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                COUNT(*) as total,
-                COUNT(*) FILTER (WHERE state < 4) as open,
-                COUNT(*) FILTER (WHERE state = 4) as closed,
-                COALESCE(SUM(realized_pnl), 0) as total_realized,
-                COALESCE(SUM(unrealized_pnl) FILTER (WHERE state < 4), 0) as total_unrealized,
-                COUNT(*) FILTER (WHERE realized_pnl > 0) as wins,
-                COUNT(*) FILTER (WHERE realized_pnl <= 0 AND state = 4) as losses
-            FROM positions
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(PositionStats {
-            total_positions: row.get::<Option<i64>, _>("total").unwrap_or(0) as u64,
-            open_positions: row.get::<Option<i64>, _>("open").unwrap_or(0) as u64,
-            closed_positions: row.get::<Option<i64>, _>("closed").unwrap_or(0) as u64,
-            total_realized_pnl: row
-                .get::<Option<Decimal>, _>("total_realized")
-                .unwrap_or_default(),
-            total_unrealized_pnl: row
-                .get::<Option<Decimal>, _>("total_unrealized")
-                .unwrap_or_default(),
-            win_count: row.get::<Option<i64>, _>("wins").unwrap_or(0) as u64,
-            loss_count: row.get::<Option<i64>, _>("losses").unwrap_or(0) as u64,
-        })
     }
 
     /// Returns true when a source already has an active position in the market.

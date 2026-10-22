@@ -14,7 +14,6 @@ use polymarket_core::types::{
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -329,9 +328,6 @@ pub struct ArbAutoExecutor {
     trade_event_recorder: TradeEventRecorder,
     shadow_prediction_recorder: ShadowPredictionRecorder,
     rollout_controller: LearningRolloutController,
-    /// Set of market IDs with active positions (for deduplication).
-    /// Shared with ExitHandler so closed positions unblock their markets.
-    active_markets: Arc<RwLock<HashSet<String>>>,
     /// Heartbeat timestamp (epoch secs) — updated every loop iteration to prove liveness.
     heartbeat: Arc<AtomicI64>,
     /// Shared executor runtime status for dashboard/API inspection.
@@ -349,7 +345,6 @@ impl ArbAutoExecutor {
         order_executor: Arc<OrderExecutor>,
         circuit_breaker: Arc<CircuitBreaker>,
         pool: PgPool,
-        active_markets: Arc<RwLock<HashSet<String>>>,
         token_cache: Arc<OutcomeTokenCache>,
         heartbeat: Arc<AtomicI64>,
         runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
@@ -370,7 +365,6 @@ impl ArbAutoExecutor {
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             shadow_prediction_recorder: ShadowPredictionRecorder::new(pool.clone()),
             rollout_controller: LearningRolloutController::new(pool.clone()),
-            active_markets,
             heartbeat,
             runtime_status,
         }
@@ -464,15 +458,6 @@ impl ArbAutoExecutor {
             }
             Ok(_) => {}
             Err(e) => warn!(error = %e, "Failed to clean up stale positions"),
-        }
-
-        // Load active positions for dedup (fast DB query, do this first)
-        if let Ok(active) = self.position_repo.get_active().await {
-            let mut set = self.active_markets.write().await;
-            for pos in &active {
-                set.insert(pos.market_id.clone());
-            }
-            info!(active_positions = %active.len(), "Loaded active positions for dedup");
         }
 
         // Initial token cache load — can take minutes with 190k+ markets and rate limiting.
@@ -766,21 +751,18 @@ impl ArbAutoExecutor {
             return Ok(());
         }
 
-        // 3. Dedup — skip if we already have an active position in this market
-        {
-            let active = self.active_markets.read().await;
-            if active.contains(market_id) {
-                let mut runtime = self.runtime_status.write().await;
-                runtime.active_position_skips = runtime.active_position_skips.saturating_add(1);
-                runtime.record_decision(market_id, "skipped: active position exists");
-                info!(market_id = %market_id, "Active position exists, skipping");
-                telemetry.finish_total(&process_started_at);
-                drop(runtime);
-                drop(active);
-                self.record_skip_event(&arb, execution_mode, "active_position_exists", &telemetry)
-                    .await;
-                return Ok(());
-            }
+        // 3. Dedup — skip if a position in this market is still active, its
+        // entry unresolved included (signals are handled one at a time).
+        if self.position_repo.has_active_in_market(market_id).await? {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.active_position_skips = runtime.active_position_skips.saturating_add(1);
+            runtime.record_decision(market_id, "skipped: active position exists");
+            info!(market_id = %market_id, "Active position exists, skipping");
+            telemetry.finish_total(&process_started_at);
+            drop(runtime);
+            self.record_skip_event(&arb, execution_mode, "active_position_exists", &telemetry)
+                .await;
+            return Ok(());
         }
 
         // 4. Circuit breaker check
@@ -1329,10 +1311,6 @@ impl ArbAutoExecutor {
                     .position_service
                     .transition_one_legged_to_exit_ready(&mut position, "yes", &failure_msg, &ctx)
                     .await;
-                self.active_markets
-                    .write()
-                    .await
-                    .insert(market_id.to_string());
                 self.publish_failure_signal(market_id, "One-legged position moved to exit queue");
                 return Ok(());
             }
@@ -1365,10 +1343,6 @@ impl ArbAutoExecutor {
                 .position_service
                 .transition_one_legged_to_exit_ready(&mut position, "yes", &failure_msg, &ctx)
                 .await;
-            self.active_markets
-                .write()
-                .await
-                .insert(market_id.to_string());
             self.publish_failure_signal(market_id, "One-legged position moved to exit queue");
             return Ok(());
         }
@@ -1413,9 +1387,6 @@ impl ArbAutoExecutor {
         }
         telemetry.request_to_open_ms = Some(process_started_at.elapsed().as_millis() as i64);
         telemetry.finish_total(&process_started_at);
-
-        // Add to dedup set
-        self.active_markets.write().await.insert(market_id.clone());
 
         // 14. Publish success signal
         let estimated_pnl = arb.net_profit * quantity;
@@ -1522,7 +1493,6 @@ pub fn spawn_arb_auto_executor(
     circuit_breaker: Arc<CircuitBreaker>,
     token_cache: Arc<OutcomeTokenCache>,
     pool: PgPool,
-    active_markets: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
     runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
 ) {
@@ -1534,7 +1504,6 @@ pub fn spawn_arb_auto_executor(
         order_executor,
         circuit_breaker,
         pool,
-        active_markets,
         token_cache,
         heartbeat,
         runtime_status,

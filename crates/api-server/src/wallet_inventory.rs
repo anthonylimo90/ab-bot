@@ -623,9 +623,7 @@ pub async fn recover_wallet_orphan_inventory(
                 }
 
                 if let (Some(cb), Some(realized_pnl)) = (circuit_breaker, realized_pnl) {
-                    let _ = cb
-                        .record_trade(realized_pnl, realized_pnl > Decimal::ZERO)
-                        .await;
+                    let _ = cb.record_trade(realized_pnl).await;
                 }
 
                 if let Some(tx) = signal_tx {

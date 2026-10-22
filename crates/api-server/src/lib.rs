@@ -395,9 +395,6 @@ impl ApiServer {
             state.arb_entry_tx.clone(),
         );
 
-        // Shared dedup set for arb executor, exit handler and intent reconciler
-        let arb_dedup = state.arb_dedup.clone();
-
         // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
         // It and the exit handler share the one market catalog.
         spawn_arb_auto_executor(
@@ -409,7 +406,6 @@ impl ApiServer {
             state.circuit_breaker.clone(),
             state.market_catalog.clone(),
             state.pool.clone(),
-            arb_dedup.clone(),
             state.arb_executor_heartbeat.clone(),
             state.arb_executor_status.clone(),
         );
@@ -426,7 +422,6 @@ impl ApiServer {
             state.signal_tx.clone(),
             state.trade_event_tx.clone(),
             state.pool.clone(),
-            arb_dedup.clone(),
             state.exit_handler_heartbeat.clone(),
             state.market_catalog.clone(),
         );

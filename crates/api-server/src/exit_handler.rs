@@ -5,9 +5,6 @@
 //! - **ExitOnCorrection**: mark an open position `ExitReady` once its spread
 //!   normalizes, then sell its holdings
 //! - **HoldToResolution**: wait for market to resolve ($1 payout)
-//!
-//! Shares the `active_markets` dedup set with `ArbAutoExecutor` via `Arc<RwLock<>>`
-//! so closed positions unblock their markets for future trades.
 
 use chrono::Utc;
 use polymarket_core::api::ClobClient;
@@ -28,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
 use crate::position_service::{CloseMethod, EventContext, Leg};
-use crate::trade_events::TradeEventRecorder;
+use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::wallet_inventory::recover_wallet_orphan_inventory;
 use crate::websocket::{SignalType, SignalUpdate};
 
@@ -121,8 +118,6 @@ pub struct ExitHandler {
     clob_client: Arc<ClobClient>,
     signal_tx: broadcast::Sender<SignalUpdate>,
     token_cache: Arc<OutcomeTokenCache>,
-    /// Shared dedup set with ArbAutoExecutor.
-    arb_dedup: Arc<RwLock<HashSet<String>>>,
     trade_event_recorder: TradeEventRecorder,
     /// Centralized service for position state mutations.
     position_service: crate::position_service::PositionService,
@@ -152,7 +147,6 @@ impl ExitHandler {
         signal_tx: broadcast::Sender<SignalUpdate>,
         trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
         pool: PgPool,
-        arb_dedup: Arc<RwLock<HashSet<String>>>,
         heartbeat: Arc<AtomicI64>,
         token_cache: Arc<OutcomeTokenCache>,
     ) -> Self {
@@ -167,7 +161,6 @@ impl ExitHandler {
             clob_client: clob_client.clone(),
             signal_tx,
             token_cache,
-            arb_dedup,
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             position_service,
             heartbeat,
@@ -695,19 +688,8 @@ impl ExitHandler {
         let yes_price = position.yes_exit_price.unwrap_or(Decimal::ZERO);
         let no_price = position.no_exit_price.unwrap_or(Decimal::ZERO);
 
-        // Record with circuit breaker
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        let is_win = realized_pnl > Decimal::ZERO;
-        if let Err(e) = self
-            .circuit_breaker
-            .record_trade(realized_pnl, is_win)
-            .await
-        {
-            warn!(error = %e, "Failed to record exit trade with circuit breaker");
-        }
-
-        // Remove from dedup
-        self.arb_dedup.write().await.remove(&market_id);
+        record_close_with_breaker(&self.circuit_breaker, &self.order_executor, position).await;
 
         // Publish success signal
         let signal = SignalUpdate {
@@ -1028,9 +1010,6 @@ impl ExitHandler {
         quant_ctx: Option<&QuantExitContext>,
         resolved_yes_winner: Option<bool>,
     ) -> anyhow::Result<bool> {
-        if position.execution_mode == "unknown" {
-            return Ok(false);
-        }
         let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM position_order_links WHERE position_id=$1 AND NOT settled)")
             .bind(position.id).fetch_one(&self.pool).await?;
         if pending {
@@ -1109,31 +1088,77 @@ impl ExitHandler {
             }
             None => {}
         }
+        // A position from before execution provenance was recorded sends no
+        // order, but settles at its record once its market resolves: no
+        // wallet is known to measure it against.
+        if position.execution_mode == "unknown" {
+            let held = |leg: &Leg| match leg {
+                Leg::Yes => position.held_yes_qty > Decimal::ZERO,
+                Leg::No => position.held_no_qty > Decimal::ZERO,
+            };
+            let paying = match resolved_yes_winner {
+                Some(true) => vec![Leg::Yes],
+                Some(false) => vec![Leg::No],
+                None => vec![Leg::Yes, Leg::No],
+            };
+            unmeasured.extend(
+                paying
+                    .into_iter()
+                    .filter(held)
+                    .map(|leg| (leg, "the position's execution provenance is unknown")),
+            );
+        }
 
+        let mut note = serde_json::Map::new();
         let method = if let Some(yes_wins) = resolved_yes_winner {
             CloseMethod::ResolutionWithWinner { yes_wins, fee }
         } else if position.has_full_pair_exposure() && position.held_yes_qty == position.held_no_qty
         {
             // Equal legs pay one dollar a pair whichever side won.
             CloseMethod::ResolutionConservative { fee }
-        } else {
+        } else if self.waited_for_winner(position, &ctx).await? < NO_WINNER_GRACE {
             warn!(
                 position_id = %position.id,
                 market_id = %market_id,
                 "Resolved market has no winner yet and the position's legs differ; waiting for the winner"
             );
             return Ok(false);
+        } else {
+            // Still no winner: closed at the least it can pay, a dollar a
+            // pair, and the shares without a pair (valued at nothing, still
+            // in the wallet) named.
+            let pairs = position.held_yes_qty.min(position.held_no_qty);
+            let unpaired: Vec<_> = [
+                (Leg::Yes, position.held_yes_qty - pairs),
+                (Leg::No, position.held_no_qty - pairs),
+            ]
+            .into_iter()
+            .filter(|(_, quantity)| *quantity > Decimal::ZERO)
+            .map(|(leg, quantity)| {
+                serde_json::json!({"leg": leg.to_string(), "quantity": quantity.normalize().to_string()})
+            })
+            .collect();
+            warn!(
+                position_id = %position.id,
+                market_id = %market_id,
+                unpaired = ?unpaired,
+                "Resolved market named no winner for a day; closing at a dollar a pair, unpaired shares valued at nothing"
+            );
+            note.insert("unpaired".into(), serde_json::Value::Array(unpaired));
+            CloseMethod::ResolutionConservative { fee }
         };
 
         // Where the wallet could not confirm the record, the close says so.
-        let note = (!unmeasured.is_empty()).then(|| {
-            serde_json::json!({
-                "unmeasured": unmeasured
+        if !unmeasured.is_empty() {
+            note.insert(
+                "unmeasured".into(),
+                unmeasured
                     .iter()
                     .map(|(leg, why)| serde_json::json!({"leg": leg.to_string(), "reason": why}))
-                    .collect::<Vec<_>>(),
-            })
-        });
+                    .collect(),
+            );
+        }
+        let note = (!note.is_empty()).then_some(serde_json::Value::Object(note));
         if let Err(e) = self
             .position_service
             .close_position_noting(position, method, &ctx, note)
@@ -1160,19 +1185,7 @@ impl ExitHandler {
         }
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        let is_win = realized_pnl > Decimal::ZERO;
-        if let Err(error) = self
-            .circuit_breaker
-            .record_trade(realized_pnl, is_win)
-            .await
-        {
-            warn!(
-                error = %error,
-                "Failed to record resolution fallback trade with circuit breaker"
-            );
-        }
-
-        self.arb_dedup.write().await.remove(&market_id);
+        record_close_with_breaker(&self.circuit_breaker, &self.order_executor, position).await;
 
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
@@ -1501,6 +1514,47 @@ impl ExitHandler {
         Ok(strategy_exit)
     }
 
+    /// How long a resolved position has waited for its market to name a
+    /// winner, from the first look that found none (recorded as a trade
+    /// event, so the wait survives a restart).
+    async fn waited_for_winner(
+        &self,
+        position: &Position,
+        ctx: &EventContext,
+    ) -> anyhow::Result<chrono::Duration> {
+        let since: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT MIN(occurred_at) FROM trade_events \
+             WHERE position_id = $1 AND event_type = $2",
+        )
+        .bind(position.id)
+        .bind(WAITING_FOR_WINNER)
+        .fetch_one(&self.pool)
+        .await?;
+        if let Some(since) = since {
+            return Ok(Utc::now() - since);
+        }
+        self.trade_event_recorder
+            .record(NewTradeEvent {
+                position_id: Some(position.id),
+                reason: Some(
+                    "The market resolved without naming a winner and the legs differ".into(),
+                ),
+                metadata: serde_json::json!({
+                    "held_yes": position.held_yes_qty.to_string(),
+                    "held_no": position.held_no_qty.to_string(),
+                }),
+                ..NewTradeEvent::new(
+                    &ctx.strategy,
+                    &ctx.execution_mode,
+                    &ctx.source_label,
+                    &position.market_id,
+                    WAITING_FOR_WINNER,
+                )
+            })
+            .await?;
+        Ok(chrono::Duration::zero())
+    }
+
     /// Settle every position still holding shares in a resolved market,
     /// including exits that failed or stalled, whatever their exit strategy.
     async fn check_market_resolutions(&self) -> anyhow::Result<()> {
@@ -1745,8 +1799,6 @@ impl ExitHandler {
                 );
                 continue;
             }
-
-            self.arb_dedup.write().await.insert(market_id.clone());
 
             if let Err(error) = self.execute_exit(&mut position).await {
                 warn!(
@@ -2020,6 +2072,33 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
     current_deviation <= entry_deviation / Decimal::new(2, 0)
 }
 
+/// Feed a closed position's realized P&L to the circuit breaker, unless it
+/// was traded in the other mode than the executor runs in now: a paper
+/// position closing after a switch to live (or the reverse) says nothing
+/// about the risk the breaker guards.
+pub(crate) async fn record_close_with_breaker(
+    breaker: &CircuitBreaker,
+    executor: &OrderExecutor,
+    position: &Position,
+) {
+    let mode = if executor.is_live() { "live" } else { "paper" };
+    if position.execution_mode != mode {
+        info!(
+            position_id = %position.id,
+            position_mode = %position.execution_mode,
+            executor_mode = mode,
+            "Close left out of the circuit breaker: traded in the other mode"
+        );
+        return;
+    }
+    if let Err(error) = breaker
+        .record_trade(position.realized_pnl.unwrap_or_default())
+        .await
+    {
+        warn!(%error, position_id = %position.id, "Failed to record a close with the circuit breaker");
+    }
+}
+
 /// Spawn the exit handler as a background task.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_exit_handler(
@@ -2030,7 +2109,6 @@ pub(crate) fn spawn_exit_handler(
     signal_tx: broadcast::Sender<SignalUpdate>,
     trade_event_tx: broadcast::Sender<crate::trade_events::TradeEventUpdate>,
     pool: PgPool,
-    arb_dedup: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
     token_cache: Arc<OutcomeTokenCache>,
 ) {
@@ -2042,7 +2120,6 @@ pub(crate) fn spawn_exit_handler(
         signal_tx,
         trade_event_tx,
         pool,
-        arb_dedup,
         heartbeat,
         token_cache,
     );
@@ -2344,6 +2421,11 @@ fn waits_out_its_grace(why: &str) -> bool {
 /// How long a resolved position waits for a balance that cannot be read
 /// before it closes at its recorded holding.
 const UNREADABLE_BALANCE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// How long a resolved position whose legs differ waits for its market to
+/// name a winner before it closes at the least it can pay.
+const NO_WINNER_GRACE: chrono::Duration = chrono::Duration::hours(24);
+/// The trade event marking the first look that found no winner.
+const WAITING_FOR_WINNER: &str = "resolution_waiting_for_winner";
 
 /// What measuring a position's leg against the wallet found.
 enum Measured {

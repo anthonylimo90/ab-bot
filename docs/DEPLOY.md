@@ -519,7 +519,20 @@ FROM execution_intents WHERE status IN ('submitting', 'unknown');
 
 Verify historical position mode and wallet against saved trade events, signed
 orders and wallet inventory before explicitly assigning provenance. Do not relabel
-all rows from the current runtime mode. Historical manual orders with missing
+all rows from the current runtime mode. Assign each verified position in its own
+statement, bumping its version so a stale writer cannot overwrite it:
+
+```sql
+UPDATE positions SET execution_mode = 'live', wallet_address = '<verified wallet>',
+    version = version + 1
+WHERE id = '<position id>' AND execution_mode = 'unknown';
+```
+
+A position left `unknown` still settles at its record once its market resolves
+(no order is sent): its `closed_via_resolution` event notes the provenance as
+unknown, and its result is left out of the circuit breaker.
+
+Historical manual orders with missing
 wallet identity require matching their order history and ledger to the verified
 wallet in one transaction; their conservative exposure remains reserved meanwhile.
 Unlinked historical uncertain intents need verified position/leg or manual-order
@@ -653,8 +666,8 @@ unsigned). Fees are set by the exchange when an order matches.
   record above it. A small gap is written off from all the wallet's
   positions in that market at once (in one transaction), each by its
   holding. A winner is taken only from one outcome flagged the winner; without
-  one, a pair pays a dollar a pair only while its measured legs are equal,
-  and otherwise waits for the winner. A resolution close waits, and logs
+  one, a pair pays a dollar a pair while its measured legs are equal, and
+  otherwise waits for the winner. A resolution close waits, and logs
   why, while an order of the wallet on the market may still settle, and for
   up to an hour while the balance cannot be read (a live executor whose
   signer failed to load counts as unreadable: a restart may load it). A
@@ -666,8 +679,19 @@ unsigned). Fees are set by the exchange when an order matches.
   (metadata `unmeasured`). The hour counts only an unbroken run of
   unreadable balances. A position whose market resolved with no single
   winner flagged and whose legs differ (a split payout, or flags not yet
-  set) is never booked at a guessed payout: it waits for the winner, with a
-  warning at each look, for an operator to settle if none comes.
+  set) is never booked at a guessed payout: it waits a day for the winner,
+  from the first look that found none (a `resolution_waiting_for_winner`
+  trade event, so restarts keep the count), then closes at the least it can
+  pay: a dollar a pair held, the shares without a pair valued at nothing
+  (they stay in the wallet) and listed in its `closed_via_resolution` event
+  (metadata `unpaired`).
+- A break-even close neither extends nor ends the circuit breaker's run of
+  losses. A position traded in the other mode than the executor runs in now
+  (paper left over after a switch to live, or the reverse) is left out of
+  the breaker when it closes.
+- An arb signal is skipped while any position in its market is still active,
+  read from the database (an entry still settling included), so a restart
+  or a reconciled entry never lets a second pair into the same market.
 - Preparing a browser-wallet order reads the market's tick size and refuses
   a price outside one tick of either end or with more decimals than the
   tick has (as Polymarket's own clients round), before the wallet signs.

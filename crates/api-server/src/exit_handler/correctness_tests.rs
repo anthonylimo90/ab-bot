@@ -124,7 +124,6 @@ async fn handler_with(
         broadcast::channel(32).0,
         broadcast::channel(32).0,
         pool.clone(),
-        Arc::new(RwLock::new(HashSet::new())),
         Arc::new(AtomicI64::new(0)),
         cache,
     );
@@ -889,7 +888,6 @@ async fn live_handler_with(
         broadcast::channel(32).0,
         broadcast::channel(32).0,
         pool.clone(),
-        Arc::new(RwLock::new(HashSet::new())),
         Arc::new(AtomicI64::new(0)),
         cache,
     );
@@ -1163,6 +1161,62 @@ async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_market_stays_taken_while_a_position_in_it_is_active_or_holds_shares(pool: PgPool) {
+    let service = setup(&pool).await;
+    let repo = service.repo();
+    assert!(!repo.has_active_in_market("market").await.unwrap());
+    // An entry still settling.
+    let mut p = position();
+    p.state = PositionState::Pending;
+    repo.insert(&p).await.unwrap();
+    assert!(repo.has_active_in_market("market").await.unwrap());
+    // An entry that failed after one leg filled, not flattened yet.
+    p.state = PositionState::EntryFailed;
+    p.held_yes_qty = Decimal::TEN;
+    repo.update(&mut p).await.unwrap();
+    assert!(repo.has_active_in_market("market").await.unwrap());
+    // Failed with nothing held: the market is free.
+    p.held_yes_qty = Decimal::ZERO;
+    repo.update(&mut p).await.unwrap();
+    assert!(!repo.has_active_in_market("market").await.unwrap());
+    assert!(!repo.has_active_in_market("other").await.unwrap());
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_position_of_unknown_provenance_settles_at_its_record_once_resolved(pool: PgPool) {
+    let service = setup(&pool).await;
+    let (h, server) = handler(&pool).await;
+    let mut p = position();
+    p.state = PositionState::Open;
+    p.execution_mode = "unknown".into();
+    p.held_yes_qty = Decimal::TEN;
+    service.repo().insert(&p).await.unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert_eq!(p.state, PositionState::Closed);
+    let note: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM trade_events WHERE position_id = $1 AND event_type = 'closed_via_resolution'",
+    )
+    .bind(p.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        note,
+        serde_json::json!({"unmeasured": [
+            {"leg": "yes", "reason": "the position's execution provenance is unknown"}
+        ]})
+    );
+    // Neither a paper nor a live result: the breaker is not told.
+    let breaker = h.circuit_breaker.state().await;
+    assert_eq!(breaker.daily_pnl, Decimal::ZERO);
+    assert_eq!(breaker.consecutive_losses, 0);
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_its_grace(
     pool: PgPool,
 ) {
@@ -1207,6 +1261,51 @@ async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_it
         .await
         .unwrap());
     assert_eq!(p.realized_pnl, Some(Decimal::new(71, 1)));
+
+    // Still no winner a day after the first look found none: it closes at
+    // the least it can pay, a dollar a pair (95.8 − 90), and names the NO
+    // shares without a pair, valued at nothing.
+    let mut q = live_pair();
+    service.repo().insert(&q).await.unwrap();
+    assert!(!h
+        .finalize_resolution_close(&mut q, 0, None, None)
+        .await
+        .unwrap());
+    let mut q = service.load(q.id).await.unwrap();
+    assert!(!h
+        .finalize_resolution_close(&mut q, 0, None, None)
+        .await
+        .unwrap());
+    let waits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trade_events WHERE position_id = $1 AND event_type = 'resolution_waiting_for_winner'",
+    )
+    .bind(q.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(waits, 1);
+    sqlx::query("UPDATE trade_events SET occurred_at = occurred_at - INTERVAL '25 hours' WHERE position_id = $1")
+        .bind(q.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut q, 0, None, None)
+        .await
+        .unwrap());
+    assert_eq!(q.state, PositionState::Closed);
+    assert_eq!(q.realized_pnl, Some(Decimal::new(58, 1)));
+    let note: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM trade_events WHERE position_id = $1 AND event_type = 'closed_via_resolution'",
+    )
+    .bind(q.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        note,
+        serde_json::json!({"unpaired": [{"leg": "no", "quantity": "1.3"}]})
+    );
 
     // A balance that cannot be read is waited for, then, past the grace,
     // the record stands: the position closes, marked as not measured.

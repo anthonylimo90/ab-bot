@@ -480,7 +480,7 @@ impl CircuitBreaker {
     ///
     /// Realized P&L never moves the equity values: drawdown is evaluated only
     /// from equity snapshots in [`Self::update_portfolio_value`].
-    pub async fn record_trade(&self, pnl: Decimal, is_win: bool) -> Result<Option<TripReason>> {
+    pub async fn record_trade(&self, pnl: Decimal) -> Result<Option<TripReason>> {
         let config = self.config.read().await.clone();
         if !config.enabled {
             return Ok(None);
@@ -490,9 +490,12 @@ impl CircuitBreaker {
         state.roll_daily_counters(Utc::now().date_naive());
 
         state.daily_pnl += pnl;
+        // A loss extends the streak and a win ends it; a break-even trade
+        // does neither.
+        let is_win = pnl > Decimal::ZERO;
         if is_win {
             state.consecutive_losses = 0;
-        } else {
+        } else if pnl < Decimal::ZERO {
             state.consecutive_losses += 1;
         }
 
@@ -825,20 +828,30 @@ mod tests {
 
         // Record losses up to limit
         for _ in 0..9 {
-            let reason = breaker
-                .record_trade(Decimal::new(-10, 0), false)
-                .await
-                .unwrap();
+            let reason = breaker.record_trade(Decimal::new(-10, 0)).await.unwrap();
             assert!(reason.is_none());
         }
 
         // This should trip
-        let reason = breaker
-            .record_trade(Decimal::new(-10, 0), false)
-            .await
-            .unwrap();
+        let reason = breaker.record_trade(Decimal::new(-10, 0)).await.unwrap();
         assert_eq!(reason, Some(TripReason::DailyLossLimit));
         assert!(breaker.is_tripped());
+    }
+
+    #[tokio::test]
+    async fn a_break_even_trade_neither_extends_nor_ends_a_losing_streak() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            max_consecutive_losses: 2,
+            max_daily_loss: Decimal::new(100000, 0),
+            enabled: true,
+            ..Default::default()
+        });
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        breaker.record_trade(Decimal::ZERO).await.unwrap();
+        assert_eq!(breaker.state().await.consecutive_losses, 1);
+        assert!(!breaker.is_tripped());
+        breaker.record_trade(Decimal::ONE).await.unwrap();
+        assert_eq!(breaker.state().await.consecutive_losses, 0);
     }
 
     #[tokio::test]
@@ -852,21 +865,12 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // 2 losses - no trip
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         assert!(!breaker.is_tripped());
 
         // 3rd loss - trip
-        let reason = breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        let reason = breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         assert_eq!(reason, Some(TripReason::ConsecutiveLosses));
     }
 
@@ -880,30 +884,15 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // 2 losses
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
 
         // 1 win - resets counter
-        breaker
-            .record_trade(Decimal::new(1, 0), true)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(1, 0)).await.unwrap();
 
         // 2 more losses - should not trip yet
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         assert!(!breaker.is_tripped());
     }
 
@@ -964,10 +953,7 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // Should not trip when disabled
-        breaker
-            .record_trade(Decimal::new(-1000, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1000, 0)).await.unwrap();
         assert!(!breaker.is_tripped());
         assert!(breaker.can_trade().await);
     }
@@ -998,14 +984,8 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // Trip the breaker
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        let reason = breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        let reason = breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         assert_eq!(reason, Some(TripReason::ConsecutiveLosses));
         assert!(breaker.is_tripped());
 
@@ -1034,14 +1014,8 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // Trip and enter recovery
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         breaker.can_trade().await;
 
         // Advance through stages
@@ -1074,14 +1048,8 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // Trip and enter recovery
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         breaker.can_trade().await;
 
         // Cannot advance without profit
@@ -1089,10 +1057,7 @@ mod tests {
         assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
 
         // Record a winning trade
-        breaker
-            .record_trade(Decimal::new(1, 0), true)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(1, 0)).await.unwrap();
 
         // Now can advance
         assert!(breaker.try_advance_recovery().await);
@@ -1116,10 +1081,7 @@ mod tests {
 
         // Trigger initial trip via daily loss
         for _ in 0..10 {
-            breaker
-                .record_trade(Decimal::new(-10, 0), false)
-                .await
-                .unwrap();
+            breaker.record_trade(Decimal::new(-10, 0)).await.unwrap();
         }
         assert!(breaker.is_tripped());
 
@@ -1130,10 +1092,7 @@ mod tests {
         // At stage 1 (25% capacity), scaled limit is $25
         // Current daily P&L is -$100, which exceeds the scaled limit
         // But the check happens on new trades, so record another loss
-        let reason = breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        let reason = breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
 
         // Should re-trip
         assert_eq!(reason, Some(TripReason::DailyLossLimit));
@@ -1157,14 +1116,8 @@ mod tests {
         let breaker = CircuitBreaker::new(config);
 
         // Trip and enter recovery
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::new(-1, 0), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
         breaker.can_trade().await;
         assert!(breaker.is_in_recovery().await);
 
@@ -1257,14 +1210,8 @@ mod tests {
     }
 
     async fn enter_recovery(breaker: &CircuitBreaker) {
-        breaker
-            .record_trade(Decimal::NEGATIVE_ONE, false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::NEGATIVE_ONE, false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
         assert!(breaker.is_tripped());
         assert!(breaker.can_trade().await);
         assert!(breaker.is_in_recovery().await);
@@ -1305,14 +1252,8 @@ mod tests {
         assert!(!breaker.can_trade().await);
 
         // A milder breach cannot downgrade the latch to an auto-resuming trip.
-        breaker
-            .record_trade(Decimal::NEGATIVE_ONE, false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::NEGATIVE_ONE, false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
         assert_eq!(breaker.state().await.trip_reason, Some(TripReason::Manual));
         assert!(!breaker.can_trade().await);
 
@@ -1405,14 +1346,8 @@ mod tests {
             .update_portfolio_value(Decimal::new(770, 0))
             .await
             .unwrap();
-        breaker
-            .record_trade(Decimal::NEGATIVE_ONE, false)
-            .await
-            .unwrap();
-        breaker
-            .record_trade(Decimal::NEGATIVE_ONE, false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
         let later = breaker.state().await;
 
         assert_eq!(later.trip_reason, Some(TripReason::MaxDrawdown));
@@ -1537,14 +1472,8 @@ mod tests {
             max_consecutive_losses: 100,
             ..latching_config()
         });
-        breaker
-            .record_trade(Decimal::new(5, 1), true)
-            .await
-            .unwrap();
-        let reason = breaker
-            .record_trade(Decimal::new(-2, 1), false)
-            .await
-            .unwrap();
+        breaker.record_trade(Decimal::new(5, 1)).await.unwrap();
+        let reason = breaker.record_trade(Decimal::new(-2, 1)).await.unwrap();
         assert_eq!(reason, None);
         assert!(breaker.can_trade().await);
         let state = breaker.state().await;

@@ -823,29 +823,6 @@ impl Position {
     }
 }
 
-/// Summary statistics for position performance.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PositionStats {
-    pub total_positions: u64,
-    pub open_positions: u64,
-    pub closed_positions: u64,
-    pub total_realized_pnl: Decimal,
-    pub total_unrealized_pnl: Decimal,
-    pub win_count: u64,
-    pub loss_count: u64,
-}
-
-impl PositionStats {
-    pub fn win_rate(&self) -> Option<f64> {
-        let total = self.win_count + self.loss_count;
-        if total == 0 {
-            None
-        } else {
-            Some(self.win_count as f64 / total as f64)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

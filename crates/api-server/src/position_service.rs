@@ -42,7 +42,9 @@ pub enum CloseMethod {
     MarketExit { fee: Decimal },
     /// Market resolved; winner is known.
     ResolutionWithWinner { yes_wins: bool, fee: Decimal },
-    /// Market resolved; winner unknown (conservative paired-arb payout).
+    /// Market resolved; winner unknown. Each pair held pays one dollar
+    /// whichever side won; shares without a pair are valued at nothing, the
+    /// least they can pay.
     ResolutionConservative { fee: Decimal },
 }
 
@@ -659,15 +661,7 @@ impl PositionService {
                 "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
-                if !position.has_full_pair_exposure()
-                    || position.held_yes_qty != position.held_no_qty
-                {
-                    return Err(anyhow!(
-                        "Winner required for unequal remaining resolution holdings"
-                    ));
-                }
-                // Each pair pays one dollar whichever side won.
-                let pairs = position.held_yes_qty;
+                let pairs = position.held_yes_qty.min(position.held_no_qty);
                 let proceeds = position.yes_exit_price.unwrap_or_default()
                     * position.exited_yes_qty
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;

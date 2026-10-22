@@ -1351,15 +1351,28 @@ impl OrderExecutor {
             &response,
         );
         if report.status == OrderStatus::Pending {
-            // FOK acceptance without fill amounts cannot release its reservation.
-            if let Some(pool) = &self.database {
-                sqlx::query("UPDATE execution_intents SET status='unknown' WHERE id=$1")
-                    .bind(order.id)
-                    .execute(pool)
-                    .await.map_err(|error| anyhow::anyhow!("{SUBMISSION_UNKNOWN}: failed to persist unresolved acceptance: {error}"))?;
-            }
+            self.mark_fok_acceptance_unresolved(order.id).await?;
         }
         Ok(report)
+    }
+
+    /// A fill-or-kill order the exchange accepted without its fill amounts
+    /// has filled or been killed, which only its record can tell: its
+    /// submission stays unresolved (fencing the wallet) until reconciled,
+    /// rather than resting as an acknowledged order that may never be found.
+    async fn mark_fok_acceptance_unresolved(&self, order_id: Uuid) -> Result<()> {
+        if let Some(pool) = &self.database {
+            sqlx::query("UPDATE execution_intents SET status='unknown' WHERE id=$1")
+                .bind(order_id)
+                .execute(pool)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "{SUBMISSION_UNKNOWN}: failed to persist unresolved acceptance: {error}"
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     async fn execute_live_limit_order(
@@ -1474,14 +1487,18 @@ impl OrderExecutor {
             "Live limit order submitted"
         );
 
-        Ok(self.report_from_exchange_response(
+        let report = self.report_from_exchange_response(
             order.id,
             &order.market_id,
             &order.outcome_id,
             order.side,
             order.quantity,
             &response,
-        ))
+        );
+        if kind == OrderType::Fok && report.status == OrderStatus::Pending {
+            self.mark_fok_acceptance_unresolved(order.id).await?;
+        }
+        Ok(report)
     }
 
     async fn simulate_market_order(&self, order: &MarketOrder) -> Result<ExecutionReport> {
@@ -1904,6 +1921,115 @@ mod tests {
             .unwrap();
         let _ = executor.execute_live_market_order(&buy(), None).await;
         assert_eq!(maker_amount().as_deref(), Some("5000000"));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_fill_or_kill_limit_order_accepted_without_amounts_stays_unresolved(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use sqlx::Executor;
+
+        // The exchange accepts every order as "delayed", without amounts.
+        let app = Router::new()
+            .route(
+                "/balance-allowance",
+                get(|| async {
+                    Json(serde_json::json!({"balance": "50000000", "allowance": "50000000"}))
+                }),
+            )
+            .route(
+                "/balance-allowance/update",
+                get(|| async { Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/neg-risk",
+                get(|| async { Json(serde_json::json!({"neg_risk": false})) }),
+            )
+            .route(
+                "/order",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    let hash = body["order"]["hash"].clone();
+                    Json(serde_json::json!({
+                        "success": true, "orderID": hash, "status": "delayed"
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let wallet = TradingWallet::from_private_key(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let client = AuthenticatedClobClient::with_credentials(
+            ClobClient::new(Some(url.clone()), None),
+            OrderSigner::new(wallet.into_signer()),
+            polymarket_core::api::clob::ApiCredentials {
+                api_key: "key".into(),
+                api_secret: "c2VjcmV0".into(),
+                api_passphrase: "pass".into(),
+            },
+        );
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(Some(url), None)),
+            ExecutorConfig {
+                live_trading: true,
+                ..ExecutorConfig::default()
+            },
+        )
+        .with_database(pool.clone());
+        *executor.auth_client.write().await = Some(client);
+        pool.execute(include_str!(
+            "../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TABLE position_order_links (id UUID, settled BOOLEAN); \
+             CREATE TABLE orders (id UUID, status TEXT); \
+             CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT)",
+        )
+        .await
+        .unwrap();
+
+        let status_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM execution_intents WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        let order = || {
+            LimitOrder::new(
+                "m".into(),
+                "1".into(),
+                OrderSide::Buy,
+                Decimal::new(5, 1),
+                Decimal::TEN,
+            )
+        };
+        // Filled or killed, only its record can tell: it keeps fencing.
+        let fok = order().fok();
+        let report = executor.execute_live_limit_order(&fok, None).await.unwrap();
+        assert_eq!(report.status, OrderStatus::Pending);
+        assert_eq!(status_of(fok.id).await, "unknown");
+        sqlx::query("UPDATE execution_intents SET status='reconciled'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A resting order is acknowledged and followed as such.
+        let gtc = order().gtc();
+        let report = executor.execute_live_limit_order(&gtc, None).await.unwrap();
+        assert_eq!(report.status, OrderStatus::Pending);
+        assert_eq!(status_of(gtc.id).await, "acknowledged");
     }
 
     #[sqlx::test(migrations = false)]
