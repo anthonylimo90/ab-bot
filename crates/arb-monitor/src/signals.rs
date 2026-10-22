@@ -21,8 +21,62 @@ const RUNTIME_STATS_TTL_SECS: u64 = 300;
 /// Publishes arbitrage signals to Redis and external alerting services.
 pub struct SignalPublisher {
     redis: redis::aio::ConnectionManager,
-    alerts_config: AlertsConfig,
+    alerts: Alerter,
+}
+
+/// Alerts being sent at once; more are dropped rather than queued behind a
+/// slow webhook.
+const MAX_ALERTS_IN_FLIGHT: usize = 4;
+
+/// Sends alerts to Telegram and Discord in the background, so a slow or
+/// hung webhook never holds up the order book loop that raises them.
+struct Alerter {
+    config: AlertsConfig,
     http_client: reqwest::Client,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Alerter {
+    fn new(config: AlertsConfig) -> Result<Self> {
+        Ok(Self {
+            config,
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_ALERTS_IN_FLIGHT)),
+        })
+    }
+
+    /// Start sending `message` to every configured service; returns at once.
+    fn send(&self, message: String) {
+        let telegram = self
+            .config
+            .telegram_bot_token
+            .clone()
+            .zip(self.config.telegram_chat_id.clone());
+        let discord = self.config.discord_webhook_url.clone();
+        if telegram.is_none() && discord.is_none() {
+            return;
+        }
+        let Ok(slot) = self.slots.clone().try_acquire_owned() else {
+            warn!("Dropping an alert: earlier alerts are still being sent");
+            return;
+        };
+        let http = self.http_client.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            if let Some((token, chat_id)) = telegram {
+                if let Err(e) = send_telegram(&http, &token, &chat_id, &message).await {
+                    warn!("Failed to send Telegram alert: {}", e);
+                }
+            }
+            if let Some(webhook_url) = discord {
+                if let Err(e) = send_discord(&http, &webhook_url, &message).await {
+                    warn!("Failed to send Discord alert: {}", e);
+                }
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -132,12 +186,7 @@ impl SignalPublisher {
         let redis = redis::aio::ConnectionManager::new(redis_client).await?;
         Ok(Self {
             redis,
-            alerts_config,
-            // Alerts are sent from the order book loop: a hung webhook must
-            // not stall market data.
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?,
+            alerts: Alerter::new(alerts_config)?,
         })
     }
 
@@ -161,11 +210,10 @@ impl SignalPublisher {
         );
 
         // Send external alerts if configured
-        self.send_alerts(&format!(
+        self.alerts.send(format!(
             "ARB ENTRY: {} | Cost: {:.4} | Profit: {:.4}",
             entry_signal.market_id, entry_signal.total_cost, entry_signal.net_profit
-        ))
-        .await?;
+        ));
 
         Ok(())
     }
@@ -185,56 +233,84 @@ impl SignalPublisher {
         let _: () = self.redis.publish(channels::RUNTIME_STATS, payload).await?;
         Ok(())
     }
+}
 
-    /// Send alerts to configured external services.
-    async fn send_alerts(&self, message: &str) -> Result<()> {
-        // Telegram
-        if let (Some(token), Some(chat_id)) = (
-            &self.alerts_config.telegram_bot_token,
-            &self.alerts_config.telegram_chat_id,
-        ) {
-            if let Err(e) = self.send_telegram(token, chat_id, message).await {
-                warn!("Failed to send Telegram alert: {}", e);
+async fn send_telegram(
+    http: &reqwest::Client,
+    token: &str,
+    chat_id: &str,
+    message: &str,
+) -> Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    http.post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML"
+        }))
+        .send()
+        .await?;
+    debug!("Sent Telegram alert");
+    Ok(())
+}
+
+async fn send_discord(http: &reqwest::Client, webhook_url: &str, message: &str) -> Result<()> {
+    http.post(webhook_url)
+        .json(&serde_json::json!({
+            "content": message
+        }))
+        .send()
+        .await?;
+    debug!("Sent Discord alert");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_slow_webhook_never_holds_up_the_caller() {
+        // A webhook that answers after two seconds and counts deliveries.
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let counter = delivered.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                        .await;
+                });
             }
+        });
+        let alerter = Alerter::new(AlertsConfig {
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            discord_webhook_url: Some(url),
+        })
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        for n in 0..MAX_ALERTS_IN_FLIGHT + 2 {
+            alerter.send(format!("alert {n}"));
         }
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
 
-        // Discord
-        if let Some(webhook_url) = &self.alerts_config.discord_webhook_url {
-            if let Err(e) = self.send_discord(webhook_url, message).await {
-                warn!("Failed to send Discord alert: {}", e);
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn send_telegram(&self, token: &str, chat_id: &str, message: &str) -> Result<()> {
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-
-        self.http_client
-            .post(&url)
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML"
-            }))
-            .send()
-            .await?;
-
-        debug!("Sent Telegram alert");
-        Ok(())
-    }
-
-    async fn send_discord(&self, webhook_url: &str, message: &str) -> Result<()> {
-        self.http_client
-            .post(webhook_url)
-            .json(&serde_json::json!({
-                "content": message
-            }))
-            .send()
-            .await?;
-
-        debug!("Sent Discord alert");
-        Ok(())
+        // The ones that fit were delivered; the overflow was dropped.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            delivered.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_ALERTS_IN_FLIGHT
+        );
     }
 }

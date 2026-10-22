@@ -15,6 +15,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -276,7 +277,7 @@ struct RankedMarket {
 /// Main arbitrage monitor service.
 pub struct ArbMonitor {
     clob_client: ClobClient,
-    gamma_client: GammaClient,
+    gamma_client: Arc<GammaClient>,
     position_tracker: PositionTracker,
     signal_publisher: SignalPublisher,
     /// Current order books by (market_id, outcome_id).
@@ -339,6 +340,17 @@ pub struct ArbMonitor {
     allowed_dynamic_sources: HashSet<String>,
 }
 
+/// Fetch the tradable markets from Gamma, which is authoritative for active
+/// discovery: CLOB `/markets?active=true` includes many closed historical
+/// markets and starves the websocket selection.
+async fn fetch_universe(gamma: &GammaClient) -> Result<Vec<polymarket_core::types::Market>> {
+    let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(200);
+    Ok(gamma.get_all_tradable_markets(gamma_page_size).await?)
+}
+
 impl ArbMonitor {
     /// Create a new arbitrage monitor.
     pub async fn new(config: Config) -> Result<Self> {
@@ -350,7 +362,7 @@ impl ArbMonitor {
 
         // Create CLOB client
         let clob_client = ClobClient::new(config.polymarket.clob_url, config.polymarket.ws_url);
-        let gamma_client = GammaClient::new(None);
+        let gamma_client = Arc::new(GammaClient::new(None));
 
         // Create position tracker
         let position_tracker = PositionTracker::new(pool.clone());
@@ -478,17 +490,13 @@ impl ArbMonitor {
     /// Load the tradable binary-market universe from Gamma, replacing the
     /// previous one so new markets are watched and closed ones dropped.
     async fn load_universe(&mut self) -> Result<()> {
-        // Fetch tradable markets from Gamma, which is authoritative for active
-        // discovery. CLOB `/markets?active=true` currently includes many closed
-        // historical markets and starves the websocket selection.
-        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(200);
-        let markets = self
-            .gamma_client
-            .get_all_tradable_markets(gamma_page_size)
-            .await?;
+        let markets = fetch_universe(&self.gamma_client).await?;
+        self.apply_universe(markets);
+        Ok(())
+    }
+
+    /// Replace the market universe with `markets`.
+    fn apply_universe(&mut self, markets: Vec<polymarket_core::types::Market>) {
         let binary_markets: Vec<_> = markets.iter().filter(|m| m.outcomes.len() == 2).collect();
 
         let mut profiles = HashMap::new();
@@ -517,7 +525,6 @@ impl ArbMonitor {
             let score_b = baseline_profile_score(self.market_profiles.get(b));
             compare_f64_desc(score_a, score_b)
         });
-        Ok(())
     }
 
     /// Run the monitoring loop.
@@ -525,6 +532,11 @@ impl ArbMonitor {
         info!("Fetching active markets...");
         self.load_universe().await?;
         let mut last_universe_refresh = tokio::time::Instant::now();
+        // A refresh downloads the whole universe; it runs on its own task so
+        // this loop keeps draining order book updates meanwhile.
+        let mut universe_fetch: Option<
+            tokio::task::JoinHandle<Result<Vec<polymarket_core::types::Market>>>,
+        > = None;
         let universe_refresh_interval = StdDuration::from_secs(
             std::env::var("ARB_UNIVERSE_REFRESH_SECS")
                 .ok()
@@ -655,6 +667,19 @@ impl ArbMonitor {
             }
 
             tokio::select! {
+                fetched = async { universe_fetch.as_mut().expect("guarded by the condition").await },
+                    if universe_fetch.is_some() =>
+                {
+                    universe_fetch = None;
+                    match fetched {
+                        Ok(Ok(markets)) => {
+                            self.apply_universe(markets);
+                            info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe");
+                        }
+                        Ok(Err(e)) => warn!(error = %e, "Failed to refresh arb market universe; keeping previous set"),
+                        Err(e) => warn!(error = %e, "Arb market universe refresh task failed; keeping previous set"),
+                    }
+                }
                 maybe_cfg = self.dynamic_config_rx.recv() => {
                     if let Some(update) = maybe_cfg {
                         let outcome = self.apply_dynamic_update(update);
@@ -809,12 +834,13 @@ impl ArbMonitor {
                     if ob_evicted > 0 {
                         debug!(evicted = ob_evicted, remaining = self.order_books.len(), "Pruned stale order books");
                     }
-                    if last_universe_refresh.elapsed() >= universe_refresh_interval {
+                    if universe_fetch.is_none()
+                        && last_universe_refresh.elapsed() >= universe_refresh_interval
+                    {
                         last_universe_refresh = tokio::time::Instant::now();
-                        match self.load_universe().await {
-                            Ok(()) => info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe"),
-                            Err(e) => warn!(error = %e, "Failed to refresh arb market universe; keeping previous set"),
-                        }
+                        let gamma = self.gamma_client.clone();
+                        universe_fetch =
+                            Some(tokio::spawn(async move { fetch_universe(&gamma).await }));
                     }
                     // Keep markets that hold positions subscribed as positions open and close.
                     if let Err(e) = self.position_tracker.load_active_positions().await {

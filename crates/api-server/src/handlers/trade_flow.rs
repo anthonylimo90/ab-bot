@@ -1349,36 +1349,33 @@ async fn load_learning_dataset_readiness(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<LearningDatasetReadiness, sqlx::Error> {
+    // Each canonical view aggregates its whole history, so it is read once
+    // and counted with filters rather than once per count.
     let row: LearningDatasetReadinessRow = sqlx::query_as(
         r#"
+        WITH arb AS (
+            SELECT
+                COUNT(*)::bigint AS attempts,
+                COUNT(*) FILTER (WHERE realized_pnl IS NOT NULL)::bigint AS realized,
+                COUNT(*) FILTER (WHERE outcome = 'failed' AND one_legged = TRUE)::bigint
+                    AS one_legged_failures
+            FROM canonical_arb_learning_attempts
+            WHERE attempt_time >= $1 AND attempt_time <= $2
+        ), quant AS (
+            SELECT
+                COUNT(*)::bigint AS decisions,
+                COUNT(*) FILTER (WHERE realized_pnl IS NOT NULL)::bigint AS realized,
+                COUNT(*) FILTER (WHERE execution_status = 'executed')::bigint AS executed
+            FROM canonical_quant_learning_decisions
+            WHERE decision_time >= $1 AND decision_time <= $2
+        )
         SELECT
-            (SELECT COUNT(*)::bigint
-             FROM canonical_arb_learning_attempts
-             WHERE attempt_time >= $1 AND attempt_time <= $2) AS arb_attempts,
-            (SELECT COUNT(*)::bigint
-             FROM canonical_arb_learning_attempts
-             WHERE attempt_time >= $1
-               AND attempt_time <= $2
-               AND realized_pnl IS NOT NULL) AS arb_realized_outcomes,
-            (SELECT COUNT(*)::bigint
-             FROM canonical_arb_learning_attempts
-             WHERE attempt_time >= $1
-               AND attempt_time <= $2
-               AND outcome = 'failed'
-               AND one_legged = TRUE) AS arb_one_legged_failures,
-            (SELECT COUNT(*)::bigint
-             FROM canonical_quant_learning_decisions
-             WHERE decision_time >= $1 AND decision_time <= $2) AS quant_decisions,
-            (SELECT COUNT(*)::bigint
-             FROM canonical_quant_learning_decisions
-             WHERE decision_time >= $1
-               AND decision_time <= $2
-               AND realized_pnl IS NOT NULL) AS quant_realized_outcomes,
-            (SELECT COUNT(*)::bigint
-             FROM canonical_quant_learning_decisions
-             WHERE decision_time >= $1
-               AND decision_time <= $2
-               AND execution_status = 'executed') AS quant_executed_decisions,
+            arb.attempts AS arb_attempts,
+            arb.realized AS arb_realized_outcomes,
+            arb.one_legged_failures AS arb_one_legged_failures,
+            quant.decisions AS quant_decisions,
+            quant.realized AS quant_realized_outcomes,
+            quant.executed AS quant_executed_decisions,
             (SELECT COUNT(*)::bigint
              FROM learning_shadow_predictions
              WHERE predicted_at >= $1 AND predicted_at <= $2) AS shadow_predictions,
@@ -1387,6 +1384,7 @@ async fn load_learning_dataset_readiness(
              WHERE status = 'active'
                AND started_at <= $2
                AND (ended_at IS NULL OR ended_at >= $1)) AS active_rollouts
+        FROM arb, quant
         "#,
     )
     .bind(from)
@@ -3744,6 +3742,52 @@ pub async fn complete_learning_rollout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn dataset_readiness_counts_each_view_in_one_pass(pool: sqlx::PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE canonical_arb_learning_attempts (attempt_time TIMESTAMPTZ, \
+                 realized_pnl NUMERIC, outcome TEXT, one_legged BOOLEAN); \
+             CREATE TABLE canonical_quant_learning_decisions (decision_time TIMESTAMPTZ, \
+                 realized_pnl NUMERIC, execution_status TEXT); \
+             CREATE TABLE learning_shadow_predictions (predicted_at TIMESTAMPTZ); \
+             CREATE TABLE learning_model_rollouts (status TEXT, started_at TIMESTAMPTZ, \
+                 ended_at TIMESTAMPTZ); \
+             INSERT INTO canonical_arb_learning_attempts VALUES \
+                 (NOW(), 1, 'filled', FALSE), (NOW(), NULL, 'failed', TRUE), \
+                 (NOW(), NULL, 'failed', NULL), (NOW() - INTERVAL '30 days', 1, 'failed', TRUE); \
+             INSERT INTO canonical_quant_learning_decisions VALUES \
+                 (NOW(), 2, 'executed'), (NOW(), NULL, 'skipped'), \
+                 (NOW() - INTERVAL '30 days', 2, 'executed'); \
+             INSERT INTO learning_shadow_predictions VALUES (NOW()), (NOW() - INTERVAL '30 days'); \
+             INSERT INTO learning_model_rollouts VALUES ('active', NOW() - INTERVAL '40 days', NULL), \
+                 ('active', NOW() - INTERVAL '40 days', NOW() - INTERVAL '35 days'), \
+                 ('retired', NOW(), NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let readiness = load_learning_dataset_readiness(
+            &pool,
+            Utc::now() - chrono::Duration::days(7),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                readiness.arb_attempts,
+                readiness.arb_realized_outcomes,
+                readiness.arb_one_legged_failures,
+                readiness.quant_decisions,
+                readiness.quant_realized_outcomes,
+                readiness.quant_executed_decisions,
+                readiness.shadow_predictions,
+                readiness.active_rollouts,
+            ),
+            (3, 1, 1, 2, 1, 1, 1, 1)
+        );
+    }
 
     #[test]
     fn state_name_maps_known_values() {
