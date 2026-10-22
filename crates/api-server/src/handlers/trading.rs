@@ -778,10 +778,11 @@ async fn apply_exchange_snapshot(
             "Exchange order does not match stored intent".into(),
         ));
     }
-    let status = match snapshot.status.to_ascii_lowercase().as_str() {
+    let state = snapshot.state();
+    let status = match state.as_str() {
         _ if filled == row.quantity => "filled",
-        "canceled" | "cancelled" => "cancelled",
         "expired" => "expired",
+        _ if snapshot.is_closed() => "cancelled",
         _ if filled > Decimal::ZERO => "partially_filled",
         "live" | "matched" | "delayed" | "unmatched" => "open",
         _ => {

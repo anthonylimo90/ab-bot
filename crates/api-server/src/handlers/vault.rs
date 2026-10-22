@@ -1154,12 +1154,16 @@ async fn unexplained_pending_transaction(
     if pending <= mined {
         return Ok(());
     }
+    // Only those at the nonces still waiting count: one already mined, or
+    // above what the node holds, explains none of them.
     let own: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT nonce) FROM wallet_withdrawals \
-         WHERE LOWER(wallet_address) = LOWER($1) AND status = 'submitted' AND nonce >= $2",
+         WHERE LOWER(wallet_address) = LOWER($1) AND status = 'submitted' \
+           AND nonce >= $2 AND nonce < $3",
     )
     .bind(source)
     .bind(i64::try_from(mined).unwrap_or(i64::MAX))
+    .bind(i64::try_from(pending).unwrap_or(i64::MAX))
     .fetch_one(lock.conn())
     .await?;
     if pending - mined > u64::try_from(own).unwrap_or(0) {

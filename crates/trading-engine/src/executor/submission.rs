@@ -69,6 +69,11 @@ impl OrderExecutor {
             .database
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Live execution requires durable intent storage"))?;
+        // The order's own hash is how an answer that names no order, or an
+        // unclear one, is found again on the exchange.
+        if signed.order_hash.as_deref().is_none_or(str::is_empty) {
+            anyhow::bail!("The signed order carries no hash; nothing was sent");
+        }
         // A shutdown waits for this submission's outcome to be recorded.
         let _in_flight = InFlight::enter(&self.submissions_in_flight);
         // Another order for this wallet that is mid-POST resolves within
@@ -403,6 +408,55 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_order_without_its_hash_is_never_sent(pool: sqlx::PgPool) {
+        pool.execute(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(None, None)),
+            ExecutorConfig::default(),
+        )
+        .with_database(pool.clone());
+        let signer = OrderSigner::new(
+            TradingWallet::from_private_key(&format!("{:064x}", 1))
+                .unwrap()
+                .signer()
+                .clone(),
+        );
+        let order = signer
+            .order_builder()
+            .token_id_str("1")
+            .side(SigningOrderSide::Buy)
+            .price(Decimal::new(5, 1))
+            .size(Decimal::ONE)
+            .expires_at(0)
+            .build()
+            .unwrap();
+        let mut signed = signer.sign_order(&order).await.unwrap();
+        signed.order_hash = None;
+        let posts = AtomicUsize::new(0);
+        let error = executor
+            .submit_once(Uuid::new_v4(), "market", &signed, || async {
+                posts.fetch_add(1, Ordering::SeqCst);
+                Err(polymarket_core::Error::Api {
+                    message: "unreachable".into(),
+                    status: None,
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("nothing was sent"));
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let journaled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_intents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journaled, 0);
     }
 
     #[sqlx::test(migrations = false)]

@@ -616,10 +616,14 @@ unsigned). Fees are set by the exchange when an order matches.
   order, a missing or contradictory status, `unmatched`, which Polymarket
   documents as an order placed on the book after a matching delay) leaves
   the order unknown: the wallet's next live order waits until the reconciler
-  has read it from the exchange under the order's own hash, and an order it
-  finds resting stops holding the wallet back unless a position waits on
-  it. A fill-or-kill order that cannot fill is expected to be refused with
-  an HTTP error, as V1 did.
+  has read it from the exchange, under the order's own hash and any id the
+  answer named, and a manual order it finds resting stops holding the
+  wallet back (its row keeps the cash reserved). A fill-or-kill order that
+  cannot fill is expected to be refused with an HTTP error, as V1 did. An
+  order the exchange reports `CANCELED`, `CANCELED_MARKET_RESOLVED` (its
+  unfilled rest cancelled when the market resolved) or `INVALID`, with or
+  without the `ORDER_STATUS_` prefix, is closed: its confirmed fills are
+  applied and nothing more is waited for.
 - Browser-wallet orders cannot be read back from the exchange (the server
   keeps no credentials for those wallets). One whose outcome is unknown
   holds back further orders from its wallet until ten minutes after its

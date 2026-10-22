@@ -1578,6 +1578,34 @@ pub struct ExchangeOrder {
     pub size_matched: String,
 }
 
+impl ExchangeOrder {
+    /// The order's status, lowercase and without the `ORDER_STATUS_` prefix
+    /// some answers carry: `live`, `matched`, `canceled`,
+    /// `canceled_market_resolved` or `invalid`.
+    pub fn state(&self) -> String {
+        let status = self.status.to_ascii_lowercase();
+        match status.strip_prefix("order_status_") {
+            Some(state) => state.to_string(),
+            None => status,
+        }
+    }
+
+    /// Whether the exchange will match no more of the order: cancelled (by
+    /// its owner, or with its unfilled rest when the market resolved),
+    /// invalid or expired. A fully matched order is told by its sizes.
+    pub fn is_closed(&self) -> bool {
+        matches!(
+            self.state().as_str(),
+            "canceled"
+                | "cancelled"
+                | "canceled_market_resolved"
+                | "invalid"
+                | "expired"
+                | "rejected"
+        )
+    }
+}
+
 /// Open order information.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenOrder {
@@ -2775,6 +2803,39 @@ mod authenticated_tests {
         }));
         assert!(!v1.refused() && !v1.unclear());
         assert_eq!(v1.settlement_tx_hash().as_deref(), Some("0xt"));
+    }
+
+    #[test]
+    fn closed_exchange_orders_are_told_in_every_spelling() {
+        let order = |status: &str| ExchangeOrder {
+            associate_trades: Vec::new(),
+            id: "0xabc".into(),
+            status: status.into(),
+            original_size: "10".into(),
+            size_matched: "4".into(),
+        };
+        for closed in [
+            "CANCELED",
+            "canceled",
+            "CANCELED_MARKET_RESOLVED",
+            "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+            "INVALID",
+            "ORDER_STATUS_INVALID",
+            "expired",
+        ] {
+            assert!(order(closed).is_closed(), "{closed}");
+        }
+        for open in [
+            "LIVE",
+            "ORDER_STATUS_LIVE",
+            "MATCHED",
+            "delayed",
+            "unmatched",
+            "",
+        ] {
+            assert!(!order(open).is_closed(), "{open}");
+        }
+        assert_eq!(order("ORDER_STATUS_LIVE").state(), "live");
     }
 
     #[test]
