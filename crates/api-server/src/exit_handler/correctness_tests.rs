@@ -1262,6 +1262,30 @@ async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_it
         super::BALANCE_UNREADABLE
     );
 
+    // A pair with both balances unreadable: each leg's grace starts at the
+    // same look, so it closes once one hour has passed, not two.
+    let mut pair = live_pair();
+    service.repo().insert(&pair).await.unwrap();
+    *balance.lock().unwrap() = "unreadable".into();
+    assert!(!h
+        .finalize_resolution_close(&mut pair, 0, None, None)
+        .await
+        .unwrap());
+    {
+        let mut since = h.balance_unreadable_since.lock().unwrap();
+        assert!(since.contains_key(&(pair.id, true)) && since.contains_key(&(pair.id, false)));
+        for leg in [true, false] {
+            since.insert(
+                (pair.id, leg),
+                std::time::Instant::now() - super::UNREADABLE_BALANCE_GRACE,
+            );
+        }
+    }
+    assert!(h
+        .finalize_resolution_close(&mut pair, 0, None, None)
+        .await
+        .unwrap());
+
     // One-legged without a winner: nothing to pay is known; it waits.
     let mut p = live_pair();
     p.held_no_qty = Decimal::ZERO;
@@ -1271,6 +1295,40 @@ async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_it
         .finalize_resolution_close(&mut p, 0, None, None)
         .await
         .unwrap());
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn with_no_trading_wallet_loaded_a_resolution_closes_at_its_record_noted(pool: PgPool) {
+    let service = setup(&pool).await;
+    // The paper handler's executor has no wallet loaded.
+    let (h, server) = handler(&pool).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let mut p = position();
+    p.state = PositionState::Open;
+    p.execution_mode = "live".into();
+    p.wallet_address = Some("0x0000000000000000000000000000000000000001".into());
+    p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    p.held_yes_qty = Decimal::from(100);
+    service.repo().insert(&p).await.unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert_eq!(p.realized_pnl, Some(Decimal::from(60)));
+    let note: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM trade_events WHERE position_id = $1 AND event_type = 'closed_via_resolution'",
+    )
+    .bind(p.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        note["unmeasured"][0]["reason"],
+        "no trading wallet is loaded"
+    );
     server.abort();
 }
 

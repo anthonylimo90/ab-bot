@@ -656,10 +656,10 @@ unsigned). Fees are set by the exchange when an order matches.
   one, a pair pays a dollar a pair only while its measured legs are equal,
   and otherwise waits for the winner. A resolution close waits, and logs
   why, while an order of the wallet on the market may still settle, and for
-  up to an hour while the balance cannot be read (or no trading wallet is
-  loaded). A balance far below the record (shares redeemed or moved), one
-  still unreadable after that hour, or a position of another wallet than
-  the trading wallet leaves the record standing: the position closes at it, with a warning,
+  up to an hour while the balance cannot be read. A balance far below the
+  record (shares redeemed or moved), one still unreadable after that hour,
+  a position of another wallet than the trading wallet, or no trading
+  wallet loaded at all leaves the record standing: the position closes at it, with a warning,
   and its `closed_via_resolution` event lists the legs not measured and why
   (metadata `unmeasured`). The hour counts only an unbroken run of
   unreadable balances. A position whose market resolved with no single

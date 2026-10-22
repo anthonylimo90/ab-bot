@@ -815,10 +815,10 @@ impl ExitHandler {
         let Some(wallet) = position.wallet_address.clone() else {
             return Ok(Measured::Matches);
         };
-        // The balance read below is the executor's wallet: with none loaded
-        // nothing can be read yet; another wallet's holding never can be.
+        // The balance read below is the executor's wallet, which is loaded
+        // only at startup: with none, or another, it cannot be measured.
         match self.order_executor.wallet_address().await {
-            None => return Ok(Measured::Waiting(BALANCE_UNREADABLE)),
+            None => return Ok(Measured::Unmeasured("no trading wallet is loaded")),
             Some(executor) if !executor.eq_ignore_ascii_case(&wallet) => {
                 return Ok(Measured::Unmeasured(
                     "the position's wallet is not the trading wallet",
@@ -1049,6 +1049,9 @@ impl ExitHandler {
                     Some(false) => vec![(Leg::No, no_token_id)],
                     None => vec![(Leg::Yes, yes_token_id), (Leg::No, no_token_id)],
                 };
+                // Every leg is looked at before waiting, so each unreadable
+                // leg's grace runs from the same look.
+                let mut waits = None;
                 for (leg, token_id) in legs {
                     let measured = self.measure_leg(position, leg, token_id, &ctx).await?;
                     if !matches!(measured, Measured::Waiting(BALANCE_UNREADABLE)) {
@@ -1066,15 +1069,18 @@ impl ExitHandler {
                             unmeasured.push((leg, BALANCE_UNREADABLE))
                         }
                         Measured::Waiting(why) => {
-                            warn!(
-                                position_id = %position.id,
-                                market_id = %market_id,
-                                reason = why,
-                                "A resolved position waits to be measured against the wallet"
-                            );
-                            return Ok(false);
+                            waits.get_or_insert(why);
                         }
                     }
+                }
+                if let Some(why) = waits {
+                    warn!(
+                        position_id = %position.id,
+                        market_id = %market_id,
+                        reason = why,
+                        "A resolved position waits to be measured against the wallet"
+                    );
+                    return Ok(false);
                 }
             }
             None if position.execution_mode == "live" => {
@@ -2326,7 +2332,8 @@ const UNREADABLE_BALANCE_GRACE: std::time::Duration = std::time::Duration::from_
 /// What measuring a position's leg against the wallet found.
 enum Measured {
     /// The record is what the wallet holds (any fee shares written off), or
-    /// is not measured at all (a paper position, or nothing held).
+    /// is not measured at all (a paper position, one with no wallet
+    /// recorded, or nothing held).
     Matches,
     /// It could not be measured, for this reason; the record stands.
     Unmeasured(&'static str),
