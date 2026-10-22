@@ -1495,8 +1495,9 @@ pub struct PostOrderResponse {
     /// Order ID assigned by the CLOB (empty when it took no order).
     #[serde(default, rename = "orderID", deserialize_with = "null_as_default")]
     pub order_id: String,
-    /// Status of the order (e.g. "matched", "delayed", "unmatched"). An
-    /// empty one proves nothing: the order is reconciled from the exchange.
+    /// Status of the order: "matched", "live" (resting), "delayed" (in a
+    /// matching delay) or "unmatched" (on the book after one). An empty one
+    /// proves nothing: the order is reconciled from the exchange.
     #[serde(default, deserialize_with = "null_as_default")]
     pub status: String,
     #[serde(default, rename = "makingAmount")]
@@ -1530,28 +1531,27 @@ impl PostOrderResponse {
             .or_else(|| self.transactions_hashes.as_ref()?.first().cloned())
     }
 
-    /// Check if the order was successfully matched/filled.
-    /// FOK orders that fail return status "unmatched".
-    pub fn is_filled(&self) -> bool {
-        let s = self.status.to_lowercase();
-        s == "matched"
-    }
-
-    /// Check if the order was explicitly not filled (FOK rejection), or not
-    /// taken at all.
-    pub fn is_unfilled(&self) -> bool {
-        let s = self.status.to_lowercase();
-        s == "unmatched" || s == "rejected" || self.refused()
-    }
-
-    /// Whether the exchange said it took no order (`success: false`) without
-    /// a status saying it matched or rests on the book.
+    /// Whether the exchange took no order: it said so (`success: false`),
+    /// named none, and gave no status saying one was placed. Only this
+    /// answer proves nothing can fill.
     pub fn refused(&self) -> bool {
-        self.success == Some(false)
-            && !matches!(
-                self.status.to_lowercase().as_str(),
-                "matched" | "live" | "delayed"
-            )
+        self.success == Some(false) && self.order_id.is_empty() && !self.placed()
+    }
+
+    /// Whether the exchange said it took no order (`success: false`) yet
+    /// named one, with no status saying it was placed: whether that order
+    /// exists is unknown until the exchange's record is read.
+    pub fn unclear(&self) -> bool {
+        self.success == Some(false) && !self.order_id.is_empty() && !self.placed()
+    }
+
+    /// A status saying the order was placed. `unmatched` is a marketable
+    /// order put on the book after its matching delay expired, not a kill.
+    fn placed(&self) -> bool {
+        matches!(
+            self.status.to_lowercase().as_str(),
+            "matched" | "live" | "delayed" | "unmatched"
+        )
     }
 }
 
@@ -2720,36 +2720,52 @@ mod authenticated_tests {
             "transactionsHashes": ["0xt1", "0xt2"], "tradeIDs": ["t"]
         }))
         .unwrap();
-        assert!(response.is_filled());
-        assert!(!response.is_unfilled());
+        assert!(!response.refused() && !response.unclear());
         assert_eq!(response.settlement_tx_hash().as_deref(), Some("0xt1"));
-        // Not taken: not filled, whatever the status is missing or says.
-        let refused: PostOrderResponse = serde_json::from_value(serde_json::json!({
+        let answer = |json: serde_json::Value| -> PostOrderResponse {
+            serde_json::from_value(json).unwrap()
+        };
+        // Not taken and no order named: refused, whatever the status is
+        // missing or empty.
+        let refused = answer(serde_json::json!({
             "success": false, "errorMsg": "not enough balance", "orderID": "", "status": ""
-        }))
-        .unwrap();
-        assert!(refused.is_unfilled());
+        }));
+        assert!(refused.refused() && !refused.unclear());
         // An answer is never unreadable for a field the clients treat as
         // optional: missing, null or empty alike.
-        let sparse: PostOrderResponse = serde_json::from_value(serde_json::json!({
+        let sparse = answer(serde_json::json!({
             "success": false, "errorMsg": "not enough balance", "transactionsHashes": null
-        }))
-        .unwrap();
-        assert!(sparse.is_unfilled());
+        }));
         assert!(sparse.refused());
         assert_eq!(sparse.settlement_tx_hash(), None);
-        let nulls: PostOrderResponse = serde_json::from_value(serde_json::json!({
+        let nulls = answer(serde_json::json!({
             "success": true, "orderID": null, "status": null, "errorMsg": null
-        }))
-        .unwrap();
+        }));
         assert!(nulls.order_id.is_empty() && nulls.status.is_empty());
-        assert!(!nulls.is_unfilled() && !nulls.is_filled());
+        assert!(!nulls.refused() && !nulls.unclear());
+        // A refusal that names an order does not prove there is none.
+        let named = answer(serde_json::json!({
+            "success": false, "errorMsg": "timeout", "orderID": "0xabc", "status": ""
+        }));
+        assert!(named.unclear() && !named.refused());
+        // A placed order is neither, whatever `success` says: `unmatched`
+        // rests on the book after a matching delay.
+        for status in ["matched", "live", "delayed", "unmatched", "UNMATCHED"] {
+            for (success, id) in [(false, ""), (false, "0xabc"), (true, "0xabc")] {
+                let placed = answer(serde_json::json!({
+                    "success": success, "orderID": id, "status": status
+                }));
+                assert!(
+                    !placed.refused() && !placed.unclear(),
+                    "{status} {success} {id}"
+                );
+            }
+        }
         // V1 responses read as before.
-        let v1: PostOrderResponse = serde_json::from_value(serde_json::json!({
+        let v1 = answer(serde_json::json!({
             "orderID": "0xabc", "status": "live", "transactionHash": "0xt"
-        }))
-        .unwrap();
-        assert!(!v1.is_unfilled());
+        }));
+        assert!(!v1.refused() && !v1.unclear());
         assert_eq!(v1.settlement_tx_hash().as_deref(), Some("0xt"));
     }
 

@@ -65,9 +65,54 @@ pub(crate) fn wallet_lock_key(address: &str) -> String {
 /// Work done under the locks goes through [`SpendLock::conn`], so it never
 /// waits for another pool connection while holding them. Dropping the lock
 /// without [`SpendLock::release`] (an early return, a panic, a cancelled
-/// task) closes that connection, which frees its locks: they cannot leak.
+/// task) closes that connection, which frees its locks. A session cut off
+/// on the way (a proxy, a network fault) may live on at the server holding
+/// them, so whenever the connection is given up its session is also ended
+/// from another one.
 pub(crate) struct SpendLock {
     conn: Option<PoolConnection<Postgres>>,
+    pool: PgPool,
+    session: Session,
+}
+
+/// A database session: its process id and start time, which together name
+/// it even once the process id is reused.
+#[derive(Debug, Clone, Copy)]
+struct Session {
+    pid: i32,
+    started: Option<DateTime<Utc>>,
+}
+
+impl Session {
+    async fn of(conn: &mut PgConnection) -> Result<Self, sqlx::Error> {
+        let (pid, started) = sqlx::query_as(
+            "SELECT pid, backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+        )
+        .fetch_one(conn)
+        .await?;
+        Ok(Self { pid, started })
+    }
+
+    /// End the session from another connection, if it still runs.
+    async fn end(self, pool: PgPool) {
+        let ended = tokio::time::timeout(
+            StdDuration::from_secs(10),
+            sqlx::query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE pid = $1 AND backend_start IS NOT DISTINCT FROM $2",
+            )
+            .bind(self.pid)
+            .bind(self.started)
+            .execute(&pool),
+        )
+        .await;
+        if !matches!(ended, Ok(Ok(_))) {
+            warn!(
+                pid = self.pid,
+                "Could not end a spend lock's database session; its locks are freed when the server drops it"
+            );
+        }
+    }
 }
 
 impl SpendLock {
@@ -79,7 +124,11 @@ impl SpendLock {
             .bind(wallet_lock_key(wallet))
             .execute(&mut *conn)
             .await?;
-        Ok(Self { conn: Some(conn) })
+        Ok(Self {
+            session: Session::of(&mut conn).await?,
+            conn: Some(conn),
+            pool: pool.clone(),
+        })
     }
 
     /// The spend lock of `wallet`, waiting up to `wait` for another holder
@@ -107,12 +156,32 @@ impl SpendLock {
         wallet: &str,
     ) -> Result<Option<Self>, sqlx::Error> {
         let mut conn = pool.acquire().await?;
-        let locked: bool =
-            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-                .bind(wallet_lock_key(wallet))
-                .fetch_one(&mut *conn)
-                .await?;
-        Ok(locked.then_some(Self { conn: Some(conn) }))
+        let locked = async {
+            let locked: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+                    .bind(wallet_lock_key(wallet))
+                    .fetch_one(&mut *conn)
+                    .await?;
+            match locked {
+                true => Session::of(&mut conn).await.map(Some),
+                false => Ok(None),
+            }
+        }
+        .await;
+        match locked {
+            Ok(Some(session)) => Ok(Some(Self {
+                conn: Some(conn),
+                pool: pool.clone(),
+                session,
+            })),
+            // Holding nothing, the connection goes back to the pool.
+            Ok(None) => Ok(None),
+            Err(error) => {
+                // It may hold the lock: closed, never pooled, so it frees it.
+                drop(conn.detach());
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn conn(&mut self) -> &mut PgConnection {
@@ -136,7 +205,7 @@ impl SpendLock {
     }
 
     /// Whether the session holding the locks still answers, within a few
-    /// seconds: a connection a proxy dropped would hold nothing.
+    /// seconds.
     pub(crate) async fn is_alive(&mut self) -> bool {
         matches!(
             tokio::time::timeout(
@@ -149,23 +218,28 @@ impl SpendLock {
     }
 
     /// Give up locks whose session no longer answers: the connection is
-    /// closed, never returned to the pool.
-    pub(crate) fn abandon(mut self) {
+    /// closed, never returned to the pool, and the session ended.
+    pub(crate) async fn abandon(mut self) {
         if let Some(conn) = self.conn.take() {
             drop(conn.detach());
+            self.session.end(self.pool.clone()).await;
         }
     }
 
-    /// Free every lock and return the connection to the pool.
+    /// Free every lock and return the connection to the pool; a session that
+    /// does not answer within seconds is abandoned instead.
     pub(crate) async fn release(mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            if sqlx::query("SELECT pg_advisory_unlock_all()")
-                .execute(&mut *conn)
-                .await
-                .is_err()
-            {
-                drop(conn.detach());
-            }
+        let Some(mut conn) = self.conn.take() else {
+            return;
+        };
+        let unlocked = tokio::time::timeout(
+            StdDuration::from_secs(10),
+            sqlx::query("SELECT pg_advisory_unlock_all()").execute(&mut *conn),
+        )
+        .await;
+        if !matches!(unlocked, Ok(Ok(_))) {
+            drop(conn.detach());
+            self.session.end(self.pool.clone()).await;
         }
     }
 }
@@ -175,6 +249,9 @@ impl Drop for SpendLock {
         if let Some(conn) = self.conn.take() {
             // Closing the session is what releases session-level locks.
             drop(conn.detach());
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(self.session.end(self.pool.clone()));
+            }
         }
     }
 }

@@ -280,3 +280,31 @@ fn protocol_contracts_are_not_withdrawal_destinations() {
     }
     assert!(!is_protocol_contract(DEST));
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_withdrawal_waits_behind_a_transaction_it_did_not_send(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    // Something else the wallet sent (a wrap, an approval) waits to be mined.
+    f.chain.lock().unwrap().pending_nonce = 4;
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::ServiceUnavailable(message)) if message.contains("still pending")
+    ));
+    assert_eq!(f.broadcasts(), 0);
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallet_withdrawals")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+
+    // Once it is mined, the withdrawal goes out at the next nonce.
+    f.chain.lock().unwrap().latest_nonce = 4;
+    let sent = f.submit(10, Uuid::new_v4()).await.unwrap();
+    assert_eq!(sent.status, "submitted");
+    // Its own transfer waiting to be mined is accounted for: another may
+    // follow it at the nonce after.
+    f.chain.lock().unwrap().pending_nonce = 5;
+    let next = f.submit(10, Uuid::new_v4()).await.unwrap();
+    assert_eq!(next.status, "submitted");
+    assert_eq!(f.broadcasts(), 2);
+}

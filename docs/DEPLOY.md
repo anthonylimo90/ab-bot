@@ -581,7 +581,11 @@ unsigned). Fees are set by the exchange when an order matches.
   it, its gas raised when the network asks more or the node refuses it (up
   to three times the network's price), until its nonce is used, by it or, as
   checks over two minutes find, by another transaction. A held lock whose
-  database session stops answering is taken again. After half an hour the
+  database session stops answering is given up, that session is ended from
+  another connection (a proxy can keep it alive at the server, holding the
+  lock), and the lock is taken again. Any spend lock given up this way, or
+  whose release does not answer within ten seconds, is freed the same way.
+  After half an hour the
   lock is let go with a warning rather than hold withdrawals back without
   end; a restart lets go of it too. The log says "Wrapping USDC.e into pUSD";
   USDC.e left waiting for an hour is logged as a warning. The sweeper wraps
@@ -595,13 +599,24 @@ unsigned). Fees are set by the exchange when an order matches.
   withdrawal is simulated before it is signed: one the node expects to fail
   (the token already wrapped, the Offramp paused) is refused with 409 and
   nothing is sent. Destinations that are token or Polymarket contracts are
-  refused. A withdrawal's gas bump re-signs its journaled transaction
-  exactly, whichever kind it is.
+  refused. While the wallet has a transaction waiting to be mined that is
+  not one of its own sent withdrawals (a wrap, an approval, anything sent
+  from elsewhere), a withdrawal answers 503 to retry and nothing is sent.
+  A withdrawal's gas bump re-signs its journaled transaction exactly,
+  whichever kind it is.
 - Which exchange a token's orders are signed for is looked up from the CLOB
   and cached; a failed lookup fails the order instead of guessing, and an
   arbitrage looks up both legs before buying either. The CLOB's V2
   balance-allowance answer (an allowance per spender) and order answer
-  (`success`, `errorMsg`, `transactionsHashes`) are read.
+  (`success`, `errorMsg`, `transactionsHashes`) are read. Only an answer
+  with `success: false`, no order id and no placed status proves no order
+  exists; one that names an order is reconciled from the exchange before
+  the wallet trades again. `unmatched` is an order placed on the book after
+  a matching delay (Polymarket's order lifecycle), so it is tracked like a
+  resting order, not released as a kill. A fill-or-kill order that cannot
+  fill is expected to be refused with an HTTP error, as V1 did; should the
+  exchange answer `unmatched` for one instead, the wallet's next live order
+  waits until the reconciler has read that order from the exchange.
 - 093 drops browser-wallet orders prepared for the V1 exchange (they can no
   longer be submitted) and stores the signed creation time of new ones.
 - The bot-scanner indexer now reads trades from both V2 exchanges.

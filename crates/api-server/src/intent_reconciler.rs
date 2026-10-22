@@ -58,6 +58,10 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         .await?;
     sqlx::query("UPDATE position_order_links l SET settled=TRUE WHERE NOT settled AND created_at<NOW()-INTERVAL '5 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=l.id)")
         .execute(&mut *tx).await?;
+    // An order the exchange refused holds nothing: settle its link, as the
+    // submitter would have had it not stopped first.
+    sqlx::query("UPDATE position_order_links l SET settled=TRUE FROM execution_intents i WHERE i.id=l.id AND i.status='rejected' AND NOT l.settled")
+        .execute(&mut *tx).await?;
     sqlx::query("UPDATE orders o SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='live' AND created_at<NOW()-INTERVAL '10 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=o.id)")
         .execute(&mut *tx).await?;
     tx.commit().await?;
@@ -700,6 +704,42 @@ mod tests {
         assert_eq!(row, ("rejected".into(), Decimal::ZERO, true));
         let stored = state.position_service.load(position.id).await.unwrap();
         assert_eq!(stored.state, PositionState::EntryFailed);
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_refused_order_left_unsettled_releases_its_position(pool: PgPool) {
+        let (clob, server) = exchange(None, serde_json::json!([])).await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let position = live_position(&state, &maker, 48, 0).await;
+        // The submitter stopped between the refusal and settling its link.
+        let refused = journal(
+            &pool,
+            &maker,
+            Some((position.id, "yes", "buy")),
+            "rejected",
+            0,
+        )
+        .await;
+        let other = live_position(&state, &maker, 48, 0).await;
+        let resting = journal(
+            &pool,
+            &maker,
+            Some((other.id, "yes", "buy")),
+            "acknowledged",
+            0,
+        )
+        .await;
+        reconcile(&state).await.unwrap();
+        for (id, settled) in [(refused, true), (resting, false)] {
+            let row: bool =
+                sqlx::query_scalar("SELECT settled FROM position_order_links WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(row, settled);
+        }
         server.abort();
     }
 

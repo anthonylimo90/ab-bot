@@ -500,7 +500,9 @@ pub async fn submit_order(
             .fetch_optional(&state.pool)
             .await?;
     if let Some((status, response)) = previous {
-        if status == "acknowledged" {
+        // A retry of an order the exchange answered gets that answer again,
+        // whether it took the order or refused it.
+        if matches!(status.as_str(), "acknowledged" | "rejected") {
             if let Some(response) = response {
                 let response: polymarket_core::api::clob::PostOrderResponse =
                     serde_json::from_value(response)?;
@@ -639,7 +641,7 @@ fn wallet_submission_response(
     response: polymarket_core::api::clob::PostOrderResponse,
 ) -> SubmitOrderResponse {
     SubmitOrderResponse {
-        success: !response.is_unfilled(),
+        success: !response.refused(),
         tx_hash: response.settlement_tx_hash(),
         order_id: (!response.order_id.is_empty()).then_some(response.order_id),
         message: "Exchange response recorded; check order status for confirmed fills".into(),
@@ -831,6 +833,86 @@ mod amount_tests {
             .unwrap();
         assert!(other.is_none());
     }
+    #[sqlx::test(migrations = false)]
+    async fn a_retry_of_an_answered_order_gets_the_recorded_answer(pool: sqlx::PgPool) {
+        crate::workspace_scope::test_fixture::real_schema(&pool).await;
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let user = crate::workspace_scope::test_fixture::user(&pool, auth::UserRole::Trader).await;
+        let state = AppState::for_tests(pool.clone());
+        let expires_at = Utc::now() + Duration::hours(1);
+        let submit = |id: Uuid| {
+            let state = state.clone();
+            async move {
+                submit_order(
+                    State(state),
+                    Extension(Claims::new(user.to_string(), auth::UserRole::Trader, 1)),
+                    Json(SubmitOrderRequest {
+                        auth: WalletAuthProof {
+                            timestamp: 0,
+                            nonce: 0,
+                            signature: String::new(),
+                        },
+                        pending_order_id: id.to_string(),
+                        signature: String::new(),
+                    }),
+                )
+                .await
+            }
+        };
+        for (status, response, success) in [
+            (
+                "acknowledged",
+                Some(serde_json::json!({"success": true, "orderID": "0xabc", "status": "live"})),
+                Some(true),
+            ),
+            (
+                "rejected",
+                Some(serde_json::json!({"success": false, "errorMsg": "not enough balance"})),
+                Some(false),
+            ),
+            // Refused before any answer, or still unresolved: nothing to replay.
+            ("rejected", None, None),
+            ("unknown", None, None),
+        ] {
+            let id = Uuid::new_v4();
+            sqlx::query(INSERT_PENDING_ORDER)
+                .bind(id)
+                .bind(user)
+                .bind("0x0000000000000000000000000000000000000001")
+                .bind("123")
+                .bind(0i16)
+                .bind("4000000")
+                .bind("10000000")
+                .bind("42")
+                .bind(expires_at.timestamp())
+                .bind(Utc::now().timestamp_millis())
+                .bind(0i16)
+                .bind(false)
+                .bind(expires_at)
+                .bind(Utc::now())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO execution_intents (id, market_id, signed_order, status, response) VALUES ($1, '123', '{}', $2, $3)")
+                .bind(id)
+                .bind(status)
+                .bind(response)
+                .execute(&pool)
+                .await
+                .unwrap();
+            match (submit(id).await, success) {
+                (Ok(Json(answer)), Some(success)) => assert_eq!(answer.success, success),
+                (Err(ApiError::Conflict(_)), None) => {}
+                (other, _) => panic!("{status}: {:?}", other.map(|answer| answer.0)),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn browser_order_and_auth_signatures_match_shared_signing_for_both_domains() {
         let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();

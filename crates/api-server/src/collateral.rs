@@ -52,6 +52,8 @@ const NONCE_USED_CONFIRM: Duration = if cfg!(test) {
 const MAX_GAS_OVER_NETWORK: u128 = 3;
 /// How long the spend lock is kept for a wrap that is not mined.
 const MAX_HOLD: Duration = Duration::from_secs(1800);
+/// How long the spend lock is waited for after its session was ended.
+const RETAKE_WAIT: Duration = Duration::from_secs(5);
 /// How long the sweeper may be kept from wrapping before it says so.
 const STARVED_AFTER: Duration = Duration::from_secs(3600);
 
@@ -104,12 +106,17 @@ impl Sweeper {
         wallet: &TradingWallet,
     ) -> anyhow::Result<WrapOutcome> {
         let address = wallet.address_string();
-        // A held lock whose session no longer answers holds nothing.
+        // A held lock whose session no longer answers may hold nothing, or
+        // live on at the server: that session is ended and the lock taken
+        // again, waiting a moment for the server to let go of it.
         if let Some(lock) = self.lock.as_mut() {
             if !lock.is_alive().await {
                 warn!("The spend lock's database session stopped answering; taking it again");
                 if let Some(lock) = self.lock.take() {
-                    lock.abandon();
+                    lock.abandon().await;
+                }
+                if self.pending.is_some() {
+                    self.lock = SpendLock::acquire_within(pool, &address, RETAKE_WAIT).await?;
                 }
             }
         }
@@ -152,9 +159,7 @@ impl Sweeper {
 
     async fn release(&mut self) {
         if let Some(lock) = self.lock.take() {
-            // A session that does not answer is closed when the release is
-            // given up, which frees its locks as well.
-            let _ = tokio::time::timeout(Duration::from_secs(10), lock.release()).await;
+            lock.release().await;
         }
     }
 

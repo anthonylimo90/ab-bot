@@ -1118,6 +1118,47 @@ enum Reservation {
     },
 }
 
+/// Refuse while the wallet has a transaction waiting to be mined other than
+/// its own withdrawals sent and not yet settled (a collateral wrap, an
+/// approval, anything sent from elsewhere): a transfer signed behind it
+/// would plan on balances it is about to change, or wait on a nonce nothing
+/// fills should it be dropped. The spend lock keeps the sweeper's wraps out;
+/// this holds should that lock have been lost.
+async fn unexplained_pending_transaction(
+    lock: &mut SpendLock,
+    client: &PolygonClient,
+    source: &str,
+) -> ApiResult<()> {
+    let address = source
+        .parse::<alloy_primitives::Address>()
+        .map_err(|_| ApiError::BadRequest("Invalid source wallet address".into()))?;
+    let submitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wallet_withdrawals \
+         WHERE LOWER(wallet_address) = LOWER($1) AND status = 'submitted'",
+    )
+    .bind(source)
+    .fetch_one(lock.conn())
+    .await?;
+    match tokio::time::timeout(WITHDRAWAL_BALANCE_TIMEOUT, client.nonces(&address)).await {
+        Ok(Ok((mined, pending))) if pending.saturating_sub(mined) > submitted as u64 => {
+            Err(ApiError::ServiceUnavailable(
+                "A transaction from this wallet is still pending; nothing was sent, retry shortly"
+                    .into(),
+            ))
+        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            warn!(error = %chain_error_message(&e), "Failed to read the source wallet's nonces");
+            Err(ApiError::ServiceUnavailable(
+                "Could not read the wallet's pending transactions".into(),
+            ))
+        }
+        Err(_) => Err(ApiError::ServiceUnavailable(
+            "Reading the wallet's pending transactions timed out".into(),
+        )),
+    }
+}
+
 /// Check capacity and write the `pending` row, under the wallet's spend lock
 /// and, while deciding, the entries lock. Nothing is signed yet.
 async fn reserve_withdrawal(
@@ -1143,6 +1184,7 @@ async fn reserve_withdrawal(
     // Holds first, then the balance: a transfer settling in between can only
     // make the capacity look smaller.
     let holds = WithdrawalHolds::load(lock.conn(), &request.source).await?;
+    unexplained_pending_transaction(lock, client, &request.source).await?;
     let cash = match tokio::time::timeout(
         WITHDRAWAL_BALANCE_TIMEOUT,
         client.get_cash_balances(&request.source),

@@ -735,6 +735,48 @@ async fn a_dropped_spend_lock_frees_the_wallet(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_lock_whose_session_lives_on_unreachable_is_freed_when_given_up(pool: PgPool) {
+    // The session holding the lock lives on at the server, but the
+    // connection to it no longer reaches it (a proxy kept the server side).
+    let mut holder = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(wallet_lock_key(TRADING))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let session = Session::of(&mut holder).await.unwrap();
+    let cut_off = SpendLock {
+        conn: Some(pool.acquire().await.unwrap()),
+        pool: pool.clone(),
+        session,
+    };
+    assert!(SpendLock::try_acquire(&pool, TRADING)
+        .await
+        .unwrap()
+        .is_none());
+    cut_off.abandon().await;
+    let again = SpendLock::acquire_within(&pool, TRADING, StdDuration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("the unreachable session was ended");
+    assert!(sqlx::query("SELECT 1").execute(&mut *holder).await.is_err());
+    drop(holder.detach());
+    again.release().await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_the_lock_session_itself_is_ended(pool: PgPool) {
+    // Another session that came to have the same process id is left alone.
+    let mut other = pool.acquire().await.unwrap();
+    let mut session = Session::of(&mut other).await.unwrap();
+    session.started = session
+        .started
+        .map(|started| started - Duration::seconds(1));
+    session.end(pool.clone()).await;
+    assert!(sqlx::query("SELECT 1").execute(&mut *other).await.is_ok());
+}
+
+#[sqlx::test(migrations = false)]
 async fn only_an_explicit_receipt_status_settles_a_transfer(pool: PgPool) {
     let (user, workspace) = setup(&pool).await;
     let chain = Arc::new(Mutex::new(Chain::default()));

@@ -485,7 +485,7 @@ impl OrderExecutor {
                 .as_ref()
                 .is_ok_and(|report| report.status == OrderStatus::Rejected)
             {
-                sqlx::query("UPDATE position_order_links SET settled=TRUE WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM execution_intents WHERE id=$1 AND NOT (status='rejected' OR (status='acknowledged' AND LOWER(response->>'status') IN ('unmatched','rejected'))))")
+                sqlx::query("UPDATE position_order_links SET settled=TRUE WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM execution_intents WHERE id=$1 AND status<>'rejected')")
                     .bind(id).execute(pool).await?;
             }
         }
@@ -1330,15 +1330,17 @@ impl OrderExecutor {
             "Live market order submitted"
         );
 
-        if response.is_unfilled() {
+        if response.refused() {
             return Ok(ExecutionReport::rejected(
                 order.id,
                 order.market_id.clone(),
                 order.outcome_id.clone(),
                 order.side,
-                format!("FOK order rejected: {}", response.status),
-            )
-            .with_exchange_id(response.order_id));
+                format!(
+                    "FOK order refused: {}",
+                    response.error_msg.as_deref().unwrap_or_default()
+                ),
+            ));
         }
         let report = self.report_from_exchange_response(
             order.id,
@@ -1609,7 +1611,7 @@ impl OrderExecutor {
         )
         .with_exchange_id(response.order_id.clone());
         report.requested_quantity = quantity;
-        if response.is_unfilled() {
+        if response.refused() {
             report.status = OrderStatus::Rejected;
             return report;
         }
@@ -1805,9 +1807,13 @@ mod tests {
                 post(
                     |State(posted): State<Posted>, Json(body): Json<serde_json::Value>| async move {
                         *posted.lock().unwrap() = Some(body);
-                        Json(serde_json::json!({
-                            "success": true, "orderID": "ex1", "status": "unmatched"
-                        }))
+                        // A fill-or-kill order that cannot fill is killed.
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "order couldn't be fully filled. FOK orders are fully filled or killed."
+                            })),
+                        )
                     },
                 ),
             )
