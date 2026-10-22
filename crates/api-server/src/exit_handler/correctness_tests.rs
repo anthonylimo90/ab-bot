@@ -1015,6 +1015,23 @@ async fn holders_of_one_token_each_answer_for_their_share_of_the_fees(pool: PgPo
     service.repo().insert(&a).await.unwrap();
     service.repo().insert(&b).await.unwrap();
     set_balance("187.4");
+    // While B has an order not yet applied (a sale it made but has not
+    // recorded would make its holding look larger), nothing is written off.
+    sqlx::query(
+        "INSERT INTO position_order_links (id, position_id, leg, side, requested_quantity) \
+         VALUES (gen_random_uuid(), $1, 'yes', 'sell', 5)",
+    )
+    .bind(b.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    h.align_leg_with_wallet(&mut a, Leg::Yes, "yes", &ctx)
+        .await
+        .unwrap();
+    assert_eq!(a.held_yes_qty, Decimal::from(100));
+    pool.execute("UPDATE position_order_links SET settled = TRUE")
+        .await
+        .unwrap();
     h.align_leg_with_wallet(&mut a, Leg::Yes, "yes", &ctx)
         .await
         .unwrap();

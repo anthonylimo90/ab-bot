@@ -561,7 +561,7 @@ where
         };
         // Read it again under the lock: another replica may have settled it,
         // or signed a replacement, since it was listed.
-        let row: Option<UnresolvedWithdrawal> = sqlx::query_as(&format!(
+        let row: Result<Option<UnresolvedWithdrawal>, sqlx::Error> = sqlx::query_as(&format!(
             "SELECT {UNRESOLVED_COLUMNS} FROM wallet_withdrawals \
              WHERE id = $3 AND ({RECONCILABLE})"
         ))
@@ -569,10 +569,18 @@ where
         .bind(SECOND_CHANCE_HOURS)
         .bind(listed.id)
         .fetch_optional(lock.conn())
-        .await?;
-        let Some(row) = row else {
-            lock.release().await;
-            continue;
+        .await;
+        let row = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                lock.release().await;
+                continue;
+            }
+            Err(error) => {
+                lock.release().await;
+                warn!(withdrawal_id = %listed.id, %error, "Could not re-read a withdrawal; trying the others");
+                continue;
+            }
         };
         let result = match row.tx_hash.as_deref() {
             None => fail_unsigned(lock.conn(), &row).await,

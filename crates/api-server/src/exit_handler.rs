@@ -1998,8 +1998,10 @@ const FEE_WRITE_OFF_SETTLE_MINUTES: i32 = 30;
 /// For a position, market, wallet, leg ('yes'/'no'), token and settling
 /// window: what the wallet's other live positions and manual orders hold of
 /// the leg, and whether an order of the wallet on the token has an unknown
-/// outcome (or one of the position is not yet applied) or a buy of it not
-/// refused may still be settling. Sells are left out of the window: sold shares leave the wallet
+/// outcome, or a position of the wallet in the market has an order not yet
+/// applied (a sale another position has made but not recorded makes its
+/// holding look larger than it is), or a buy of the wallet not refused may
+/// still be settling. Sells are left out of the window: sold shares leave the wallet
 /// after the position records them, so they never make the balance look
 /// short, and a refused exit sell must not keep the write-off waiting.
 const OTHER_HOLDERS_SQL: &str = "SELECT \
@@ -2012,7 +2014,8 @@ const OTHER_HOLDERS_SQL: &str = "SELECT \
         AND (status IN ('submitting', 'unknown') \
             OR (signed_order->>'side' = 'BUY' AND status <> 'rejected' \
                 AND created_at > NOW() - make_interval(mins => $6)))) \
-    OR EXISTS(SELECT 1 FROM position_order_links WHERE position_id = $1 AND NOT settled)";
+    OR EXISTS(SELECT 1 FROM position_order_links l JOIN positions p ON p.id = l.position_id \
+        WHERE NOT l.settled AND p.market_id = $2 AND LOWER(p.wallet_address) = LOWER($3))";
 
 /// How much of `held` to write off as fee shares when the wallet holds only
 /// `balance` for it: the whole shortfall when a buy fee explains it,

@@ -89,9 +89,11 @@ pub(crate) async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                     -- The taker fees paid buying the shares still held, under
                     -- the position's recorded fee terms (none without them).
                     - COALESCE(p.taker_fee_rate * (
-                        p.held_yes_qty * power(p.yes_entry_price * (1 - p.yes_entry_price),
+                        p.held_yes_qty * power(GREATEST(0, LEAST(1, p.yes_entry_price))
+                                               * (1 - GREATEST(0, LEAST(1, p.yes_entry_price))),
                                                p.taker_fee_exponent)
-                        + p.held_no_qty * power(p.no_entry_price * (1 - p.no_entry_price),
+                        + p.held_no_qty * power(GREATEST(0, LEAST(1, p.no_entry_price))
+                                                * (1 - GREATEST(0, LEAST(1, p.no_entry_price))),
                                                 p.taker_fee_exponent)), 0),
                     8) AS unrealized_pnl
             FROM positions p
@@ -181,7 +183,16 @@ mod tests {
         taxed.id = uuid::Uuid::new_v4();
         taxed.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
         taxed.taker_fees = Some(polymarket_core::types::FeeSchedule::CONSERVATIVE);
-        for position in [&pair, &leg, &fractional, &failed, &taxed] {
+        // An out-of-range entry price under a fractional exponent must not
+        // fail the pass (a negative base has no real fractional power).
+        let mut odd = taxed.clone();
+        odd.id = uuid::Uuid::new_v4();
+        odd.yes_entry_price = Decimal::new(102, 2);
+        odd.taker_fees = Some(polymarket_core::types::FeeSchedule {
+            rate: Decimal::new(7, 2),
+            exponent: Decimal::new(15, 1),
+        });
+        for position in [&pair, &leg, &fractional, &failed, &taxed, &odd] {
             service.repo().insert(position).await.unwrap();
         }
         sqlx::query("UPDATE positions SET is_open = TRUE, unrealized_pnl = 1 WHERE id = $1")
@@ -190,7 +201,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 5);
+        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 6);
         let mark = |id| {
             let pool = pool.clone();
             async move {
