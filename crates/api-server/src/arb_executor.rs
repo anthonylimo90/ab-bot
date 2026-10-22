@@ -1081,6 +1081,25 @@ impl ArbAutoExecutor {
                 return Ok(());
             };
 
+            // Both legs' exchanges before either is bought: a lookup failing
+            // only for the second leg would leave the first one alone.
+            if let Err(error) = self
+                .order_executor
+                .resolve_exchanges(&[yes_token_id.as_str(), no_token_id.as_str()])
+                .await
+            {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+                runtime.record_decision(market_id, format!("skipped: {error}"));
+                telemetry.failure_stage = Some("exchange_lookup".to_string());
+                telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
+                telemetry.finish_total(&process_started_at);
+                drop(runtime);
+                self.record_skip_event(&arb, execution_mode, "exchange_lookup_failed", &telemetry)
+                    .await;
+                return Ok(());
+            }
+
             let required_collateral = pair_collateral(quantity, yes_best_ask, no_best_ask);
             if let Err(error) = self
                 .order_executor

@@ -342,6 +342,22 @@ impl OrderExecutor {
         Ok(address)
     }
 
+    /// Look up, and cache, which exchange each token's orders are signed for,
+    /// so orders on them never wait on (or fail at) that lookup. An error
+    /// when a lookup fails. Nothing to do outside live trading.
+    pub async fn resolve_exchanges(&self, token_ids: &[&str]) -> Result<()> {
+        let slot = self.auth_client.read().await;
+        let Some(client) = slot.as_ref() else {
+            return Ok(());
+        };
+        for token_id in token_ids {
+            client.is_neg_risk(token_id).await.map_err(|error| {
+                anyhow::anyhow!("Could not tell which exchange token {token_id} trades on: {error}")
+            })?;
+        }
+        Ok(())
+    }
+
     /// Tell the CLOB to re-read on-chain balance/allowance state.
     ///
     /// Call this after setting on-chain approvals so the CLOB picks up the new values.
@@ -1630,7 +1646,7 @@ impl OrderExecutor {
                 }
             }
         }
-        report.transaction_hash = response.transaction_hash.clone();
+        report.transaction_hash = response.settlement_tx_hash();
         report
     }
 
@@ -1779,6 +1795,10 @@ mod tests {
             .route(
                 "/balance-allowance/update",
                 get(|| async { Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/neg-risk",
+                get(|| async { Json(serde_json::json!({"neg_risk": false})) }),
             )
             .route(
                 "/order",

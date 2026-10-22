@@ -486,7 +486,7 @@ export default function SettingsPage() {
             <div className="mb-4">
               <p className="flex items-center gap-2 font-medium">
                 <span>Withdraw USDC</span>
-                <InfoTooltip content="This sends a real on-chain Polygon USDC.e transfer from your primary wallet. It only moves free USDC, not open position inventory." />
+                <InfoTooltip content="This sends real USDC.e on Polygon from your primary wallet: its USDC.e, or its pUSD trading collateral unwrapped to the recipient. It only moves free USDC, not open position inventory." />
               </p>
               <p className="text-sm text-muted-foreground">
                 Send settled USDC from your primary wallet to another Polygon address, such as a different MetaMask wallet.

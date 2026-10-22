@@ -1159,6 +1159,17 @@ async fn a_position_opened_without_fee_terms_pays_its_markets_fees_on_exit(pool:
             exponent: Decimal::ONE
         })
     );
+    // Recorded at once, for a sale another path settles.
+    assert_eq!(
+        service
+            .repo()
+            .get(legacy.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .taker_fees,
+        legacy.taker_fees
+    );
     // Sold at 0.50: 10 × 0.07 × 0.25 = 0.175, and the terms are kept.
     service
         .record_exit_fill(

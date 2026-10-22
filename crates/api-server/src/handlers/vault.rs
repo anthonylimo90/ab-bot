@@ -21,7 +21,9 @@ use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::workspace_scope::resolve_canonical_workspace_membership;
-use polymarket_core::api::polygon::{BroadcastOutcome, WithdrawalSource};
+use polymarket_core::api::polygon::{
+    is_protocol_contract, BroadcastOutcome, WithdrawalSource, CALL_WOULD_FAIL,
+};
 use polymarket_core::api::PolygonClient;
 
 use crate::withdrawals::{
@@ -1033,6 +1035,12 @@ pub async fn create_withdrawal(
             "Destination matches the source wallet. If this address is already in MetaMask, no withdrawal is needed.".into(),
         ));
     }
+    if is_protocol_contract(&destination_address) {
+        return Err(ApiError::BadRequest(
+            "Destination is a token or Polymarket contract; funds sent there cannot be recovered"
+                .into(),
+        ));
+    }
 
     let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
     let wallet = state
@@ -1091,6 +1099,9 @@ impl WithdrawalRequest {
     }
 }
 
+/// How long a withdrawal waits for another spend from the wallet (another
+/// withdrawal, or a collateral wrap being mined) before it is refused.
+const SPEND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long the balance read may hold up entries, which wait on the lock.
 const WITHDRAWAL_BALANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How many times, two seconds apart, a request looks for its transfer's
@@ -1241,7 +1252,14 @@ async fn submit_withdrawal(
     wallet: auth::TradingWallet,
     request: WithdrawalRequest,
 ) -> ApiResult<WalletWithdrawalRow> {
-    let mut lock = SpendLock::acquire(&state.pool, &request.source).await?;
+    let Some(mut lock) =
+        SpendLock::acquire_within(&state.pool, &request.source, SPEND_LOCK_WAIT).await?
+    else {
+        return Err(ApiError::ServiceUnavailable(
+            "Another transaction from this wallet is being sent; nothing was sent, retry shortly"
+                .into(),
+        ));
+    };
     let (withdrawal_id, requested_at, source) =
         match reserve_withdrawal(&mut lock, &client, &request).await {
             Ok(Reservation::Reserved {
@@ -1269,8 +1287,12 @@ async fn submit_withdrawal(
             }
             lock.release().await;
             request.audit(&state, withdrawal_id, "failed", Some(error.clone()));
-            return Err(if error.starts_with("Insufficient POL") {
+            return Err(if error.contains("Insufficient POL") {
                 ApiError::BadRequest(error)
+            } else if error.contains(CALL_WOULD_FAIL) {
+                ApiError::Conflict(format!(
+                    "The transfer would fail on chain now, so nothing was sent ({error})"
+                ))
             } else {
                 ApiError::ServiceUnavailable(
                     "Could not prepare the transfer; nothing was sent".into(),

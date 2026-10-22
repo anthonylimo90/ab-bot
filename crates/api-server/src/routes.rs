@@ -307,7 +307,7 @@ use crate::websocket;
         (name = "admin_workspaces", description = "Workspace management (platform admin only)"),
         (name = "workspaces", description = "User workspace operations"),
         (name = "order_signing", description = "MetaMask/wallet-based order signing"),
-        (name = "activity", description = "Activity feed from execution reports"),
+        (name = "activity", description = "Activity feed from the trade event log"),
         (name = "trade_flow", description = "Derived trade lifecycle and conversion analytics"),
         (name = "risk", description = "Risk monitoring and circuit breaker management"),
         (name = "signals", description = "Quant signal system: flow features, performance, and recent signals"),

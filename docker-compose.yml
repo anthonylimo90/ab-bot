@@ -182,12 +182,13 @@ services:
       - prometheus_data:/prometheus
     environment:
       METRICS_TOKEN: ${METRICS_TOKEN:-}
-    # Prometheus reads the API's bearer token from a file.
+    # Prometheus reads the API's bearer token from a file, kept in its data
+    # directory (the one place its unprivileged user may write).
     entrypoint:
       - /bin/sh
       - -c
       - >-
-        printf '%s' "$$METRICS_TOKEN" > /tmp/metrics_token &&
+        printf '%s' "$$METRICS_TOKEN" > /prometheus/.metrics_token &&
         exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml
         --storage.tsdb.path=/prometheus --web.enable-lifecycle
     networks:
@@ -204,6 +205,10 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-}
       GF_USERS_ALLOW_SIGN_UP: false
+      # The PostgreSQL datasource uses the database's own credentials.
+      POSTGRES_USER: ${POSTGRES_USER:-abbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-abbot_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-ab_bot}
     # Never start with Grafana's default admin password.
     entrypoint:
       - /bin/sh

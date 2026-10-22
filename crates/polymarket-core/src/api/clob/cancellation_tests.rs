@@ -148,3 +148,56 @@ async fn signed_wallet_submission_uses_wallet_credentials_and_exact_l2_body() {
     assert_eq!(body["orderType"], "GTD");
     assert!(body["order"].get("order_hash").is_none());
 }
+
+/// A node answering every request with `status` and `body`.
+async fn answer_all(status: &'static str, body: &'static str) -> ClobClient {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            let _ = socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+        }
+    });
+    let mut base = ClobClient::new(Some(format!("http://{address}")), None);
+    base.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    base
+}
+
+#[tokio::test]
+async fn an_order_is_never_signed_for_a_guessed_exchange() {
+    let signer = || OrderSigner::new(format!("{:064x}", 1).parse().unwrap());
+    // The lookup fails: no order, rather than one for the wrong exchange.
+    let client = AuthenticatedClobClient::new(answer_all("404 Not Found", "{}").await, signer());
+    assert!(client
+        .create_order(
+            "77",
+            crate::signing::OrderSide::Buy,
+            Decimal::new(5, 1),
+            Decimal::TEN,
+            OrderType::Gtc,
+        )
+        .await
+        .is_err());
+    assert!(client.neg_risk_cache.lock().unwrap().is_empty());
+
+    // A standard market: signed for the CTF Exchange, and remembered.
+    let client = AuthenticatedClobClient::new(
+        answer_all("200 OK", r#"{"neg_risk": false}"#).await,
+        signer(),
+    );
+    assert!(!client.is_neg_risk("77").await.unwrap());
+    assert_eq!(
+        client.neg_risk_cache.lock().unwrap().get("77"),
+        Some(&false)
+    );
+}

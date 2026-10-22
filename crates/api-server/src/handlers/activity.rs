@@ -118,7 +118,11 @@ fn activity_message(row: &TradeEventRow) -> String {
             };
             match (row.filled_size_usd, row.fill_price) {
                 (Some(size), Some(price)) => {
-                    format!("{who} {side} ${} on {market} @ {}", size.round_dp(2), price)
+                    format!(
+                        "{who} {side} ${} on {market} @ {}",
+                        size.round_dp(2),
+                        price.normalize()
+                    )
                 }
                 _ => format!("{who} {side} on {market}"),
             }
@@ -277,6 +281,8 @@ mod tests {
         assert_eq!(feed[1].error_message.as_deref(), Some("no bids"));
         assert!(feed[1].message.contains("Flow (live) exit failed"));
         assert!(feed[2].message.contains("bought $4.50"));
+        // At the price's own precision, not the column's ten places.
+        assert!(feed[2].message.ends_with("@ 0.45"), "{}", feed[2].message);
         // Paging, and out-of-range values no longer fail the request.
         assert_eq!(load_activity(&pool, 2, 1).await.unwrap().len(), 2);
         assert_eq!(load_activity(&pool, -5, -3).await.unwrap().len(), 1);

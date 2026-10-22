@@ -220,8 +220,12 @@ impl OrderBuilder {
     }
 
     /// Set the token ID from a string.
+    /// Set the token ID from a string; one that is not a decimal integer
+    /// leaves it unset, so the order cannot be built.
     pub fn token_id_str(mut self, token_id: &str) -> Self {
-        self.token_id = Some(U256::from_str_radix(token_id, 10).unwrap_or_default());
+        self.token_id = (!token_id.is_empty() && token_id.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| U256::from_str_radix(token_id, 10).ok())
+            .flatten();
         self
     }
 
@@ -317,30 +321,19 @@ fn to_fixed_u128(d: Decimal, scale: u32) -> u128 {
 /// - BUY:  taker_amount = size, maker_amount = size * price
 /// - SELL: maker_amount = size, taker_amount = size * price
 ///
-/// Token amounts (size) are truncated to LOT_SIZE_SCALE (2) decimals.
-/// USDC amounts (cost) are truncated to LOT_SIZE_SCALE + tick_decimals decimals.
-/// Default tick_decimals = 2 (for tick_size 0.01), giving 4 decimal USDC precision.
+/// The size is truncated to whole hundredths of a share (the lot size) first,
+/// and the USDC amount is the exact cost of those shares at the price: with
+/// a price on any market tick (at most four decimals) that is at most six
+/// decimals, so the order's implied price is exactly the price asked.
 fn calculate_amounts(side: OrderSide, price: Decimal, size: Decimal) -> (U256, U256) {
-    let raw_cost = size * price;
-
-    // Token amounts: max 2 decimal places (lot size)
-    let token_scale = LOT_SIZE_SCALE;
-    // USDC amounts: lot_size + tick_size decimals (default 2+2=4)
-    let cost_scale = LOT_SIZE_SCALE + LOT_SIZE_SCALE;
-
+    let shares = size.trunc_with_scale(LOT_SIZE_SCALE);
+    let shares_units = U256::from(to_fixed_u128(shares, LOT_SIZE_SCALE));
+    let cost_units = U256::from(to_fixed_u128(shares * price, USDC_DECIMALS));
     match side {
-        OrderSide::Buy => {
-            // BUY: maker pays USDC (size * price), taker provides tokens (size)
-            let maker_amount = U256::from(to_fixed_u128(raw_cost, cost_scale));
-            let taker_amount = U256::from(to_fixed_u128(size, token_scale));
-            (maker_amount, taker_amount)
-        }
-        OrderSide::Sell => {
-            // SELL: maker provides tokens (size), taker pays USDC (size * price)
-            let maker_amount = U256::from(to_fixed_u128(size, token_scale));
-            let taker_amount = U256::from(to_fixed_u128(raw_cost, cost_scale));
-            (maker_amount, taker_amount)
-        }
+        // BUY: maker pays USDC, taker provides tokens.
+        OrderSide::Buy => (cost_units, shares_units),
+        // SELL: maker provides tokens, taker pays USDC.
+        OrderSide::Sell => (shares_units, cost_units),
     }
 }
 
@@ -550,6 +543,44 @@ mod tests {
         assert_eq!(maker_amount, U256::from(50_000_000u64));
         // BUY: taker provides tokens (size = 100 tokens = 100_000_000)
         assert_eq!(taker_amount, U256::from(100_000_000u64));
+    }
+
+    #[test]
+    fn amounts_are_the_exact_cost_of_whole_lots_on_any_tick() {
+        // A 0.001-tick price: 10.37 × 0.123 = 1.27551, not cut to 1.2755.
+        assert_eq!(
+            calculate_amounts(OrderSide::Buy, Decimal::new(123, 3), Decimal::new(1037, 2)),
+            (U256::from(1_275_510u64), U256::from(10_370_000u64))
+        );
+        // The size is cut to whole lots before the cost is taken.
+        assert_eq!(
+            calculate_amounts(OrderSide::Sell, Decimal::new(5, 1), Decimal::new(10378, 3)),
+            (U256::from(10_370_000u64), U256::from(5_185_000u64))
+        );
+        // A 0.0001-tick price.
+        assert_eq!(
+            calculate_amounts(OrderSide::Buy, Decimal::new(9991, 4), Decimal::new(333, 2)),
+            (U256::from(3_327_003u64), U256::from(3_330_000u64))
+        );
+    }
+
+    #[test]
+    fn an_unreadable_token_id_builds_no_order() {
+        let maker = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse::<Address>()
+            .unwrap();
+        let build = |token: &str| {
+            OrderBuilder::new()
+                .maker(maker)
+                .token_id_str(token)
+                .price(Decimal::new(5, 1))
+                .size(Decimal::TEN)
+                .expires_at(0)
+                .build()
+        };
+        assert!(build("12345").is_some());
+        assert!(build("not-a-token").is_none());
+        assert!(build("").is_none());
     }
 
     #[test]

@@ -306,13 +306,7 @@ pub async fn list_positions(
     let positions: Vec<PositionResponse> = rows
         .into_iter()
         .map(|row| {
-            let entry_value = row.entry_price * row.quantity;
-            let current_value = row.current_price * row.quantity;
-            let pnl_pct = if entry_value > Decimal::ZERO {
-                (current_value - entry_value) / entry_value * Decimal::new(100, 0)
-            } else {
-                Decimal::ZERO
-            };
+            let pnl_pct = unrealized_pct(row.unrealized_pnl, row.entry_price, row.quantity);
 
             PositionResponse {
                 id: row.id,
@@ -581,13 +575,7 @@ pub async fn get_position(
 
     match row {
         Some(row) => {
-            let entry_value = row.entry_price * row.quantity;
-            let current_value = row.current_price * row.quantity;
-            let pnl_pct = if entry_value > Decimal::ZERO {
-                (current_value - entry_value) / entry_value * Decimal::new(100, 0)
-            } else {
-                Decimal::ZERO
-            };
+            let pnl_pct = unrealized_pct(row.unrealized_pnl, row.entry_price, row.quantity);
 
             Ok(Json(PositionResponse {
                 id: row.id,
@@ -780,13 +768,7 @@ pub async fn close_position(
     };
     let _ = state.publish_position(update);
 
-    let entry_value = row.entry_price * row.quantity;
-    let current_value = row.current_price * row.quantity;
-    let pnl_pct = if entry_value > Decimal::ZERO {
-        (current_value - entry_value) / entry_value * Decimal::new(100, 0)
-    } else {
-        Decimal::ZERO
-    };
+    let pnl_pct = unrealized_pct(position.unrealized_pnl, row.entry_price, row.quantity);
 
     Ok(Json(PositionResponse {
         id: row.id,
@@ -846,6 +828,33 @@ async fn load_closeable_position(
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     Ok(row)
+}
+
+/// Unrealized P&L as a percentage of the position's cost: the stored P&L,
+/// net of the fees its buys paid, so the two figures always agree.
+fn unrealized_pct(unrealized_pnl: Decimal, entry_price: Decimal, quantity: Decimal) -> Decimal {
+    let cost = entry_price * quantity;
+    if cost > Decimal::ZERO {
+        unrealized_pnl / cost * Decimal::new(100, 0)
+    } else {
+        Decimal::ZERO
+    }
+}
+
+#[cfg(test)]
+mod unrealized_pct_tests {
+    use super::*;
+
+    #[test]
+    fn the_percentage_is_the_stored_pnl_over_cost() {
+        // 10 shares bought at 0.40 ($4), marked at 0.50, less 0.168 of fees.
+        let pct = unrealized_pct(Decimal::new(832, 3), Decimal::new(40, 2), Decimal::TEN);
+        assert_eq!(pct, Decimal::new(208, 1));
+        assert_eq!(
+            unrealized_pct(Decimal::ONE, Decimal::ZERO, Decimal::TEN),
+            Decimal::ZERO
+        );
+    }
 }
 
 #[cfg(test)]

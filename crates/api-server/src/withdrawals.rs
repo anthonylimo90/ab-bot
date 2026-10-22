@@ -72,6 +72,7 @@ pub(crate) struct SpendLock {
 
 impl SpendLock {
     /// Wait for the spend lock of `wallet`.
+    #[cfg(test)]
     pub(crate) async fn acquire(pool: &PgPool, wallet: &str) -> Result<Self, sqlx::Error> {
         let mut conn = pool.acquire().await?;
         sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
@@ -79,6 +80,25 @@ impl SpendLock {
             .execute(&mut *conn)
             .await?;
         Ok(Self { conn: Some(conn) })
+    }
+
+    /// The spend lock of `wallet`, waiting up to `wait` for another holder
+    /// to release it; `None` when it does not.
+    pub(crate) async fn acquire_within(
+        pool: &PgPool,
+        wallet: &str,
+        wait: StdDuration,
+    ) -> Result<Option<Self>, sqlx::Error> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::try_acquire(pool, wallet).await? {
+                return Ok(Some(lock));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(StdDuration::from_millis(200)).await;
+        }
     }
 
     /// The spend lock of `wallet`, or `None` while another holder has it.

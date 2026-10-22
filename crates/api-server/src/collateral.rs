@@ -3,18 +3,20 @@
 //! wrapped into pUSD by the Collateral Onramp (1:1, and redeemable through
 //! the Offramp, which is how withdrawals pay it out).
 //!
-//! A wrap spends one of the wallet's nonces. It is sent only under the
+//! A wrap spends one of the wallet's nonces. A new one is sent only under the
 //! wallet's spend lock, while no withdrawal from it is unresolved and nothing
-//! else it sent waits to be mined, and the lock is held until the wrap is
-//! mined (its gas raised meanwhile when the network asks more): no withdrawal
-//! is signed behind a wrap that might yet be dropped, which would leave it
-//! waiting on a nonce nothing fills.
+//! else it sent waits to be mined, and the lock is held while it is mined
+//! (normally seconds) and until balance reads include it. A wrap still
+//! unmined when the lock is let go is kept: every later look sends it again
+//! should the node have dropped it, and raises its gas when the network asks
+//! more, until its nonce is used. So a withdrawal signed behind it never
+//! waits on a nonce nothing fills (unless the process restarts meanwhile).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use auth::TradingWallet;
-use polymarket_core::api::polygon::BroadcastOutcome;
+use polymarket_core::api::polygon::{BroadcastOutcome, SignedTransaction, BALANCE_BLOCK_LAG};
 use polymarket_core::api::PolygonClient;
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -23,14 +25,20 @@ use crate::withdrawals::{chain_error_message, SpendLock, UNRESOLVED_STATUSES};
 
 /// How often the trading wallet is checked for USDC.e to wrap.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+/// How often a wrap still unmined is looked after.
+const FOLLOW_UP_INTERVAL: Duration = Duration::from_secs(30);
 /// Less USDC.e than this (one dollar) is left as it is.
 const MIN_WRAP_UNITS: u128 = 1_000_000;
-/// How often a sent wrap is checked for a receipt, and how many times.
+/// How often a wrap is checked for a receipt while the lock is held.
 const RECEIPT_POLL: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 2000 });
-const RECEIPT_POLLS: u32 = 150;
-/// Every this many polls, an unmined wrap paying less than the network asks
-/// is signed again at its nonce for more.
-const BUMP_EVERY_POLLS: u32 = 30;
+/// How many polls a new wrap is waited for, and a waiting one on a later look.
+const NEW_WRAP_POLLS: u32 = 45;
+const FOLLOW_UP_POLLS: u32 = 10;
+/// Every this many polls a waiting wrap's nonce is checked, the wrap sent
+/// again if the node no longer knows it, and its gas raised if underpriced.
+const CHECK_EVERY_POLLS: u32 = 5;
+/// How long the sweeper may be kept from wrapping before it says so.
+const STARVED_AFTER: Duration = Duration::from_secs(3600);
 
 /// What one look at the wallet did.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,95 +49,209 @@ pub(crate) enum WrapOutcome {
     Nothing,
     /// This many USDC.e base units were wrapped into pUSD.
     Wrapped(u128),
-    /// The wrap was sent but not mined in time; the chain settles it.
+    /// The wrap was sent but is not mined yet; later looks follow it up.
     Unmined,
+    /// Another transaction used the wrap's nonce; the USDC.e was not wrapped.
+    Superseded,
 }
 
-/// Wrap the wallet's USDC.e into pUSD, if it holds any and nothing else
-/// spends from it now.
-pub(crate) async fn wrap_idle_usdc(
-    pool: &PgPool,
-    client: &PolygonClient,
-    wallet: &TradingWallet,
-) -> anyhow::Result<WrapOutcome> {
-    let address = wallet.address_string();
-    let Some(mut lock) = SpendLock::try_acquire(pool, &address).await? else {
-        return Ok(WrapOutcome::Busy);
-    };
-    let outcome = wrap_under_lock(&mut lock, client, wallet).await;
-    lock.release().await;
-    outcome
+/// A wrap sent and not yet settled.
+#[derive(Debug, Clone)]
+struct PendingWrap {
+    nonce: u64,
+    units: u128,
+    /// The transaction last signed at the nonce.
+    latest: SignedTransaction,
+    /// Every hash signed at the nonce: whichever is mined settles the wrap.
+    hashes: Vec<String>,
 }
 
-async fn wrap_under_lock(
-    lock: &mut SpendLock,
-    client: &PolygonClient,
-    wallet: &TradingWallet,
-) -> anyhow::Result<WrapOutcome> {
-    let address = wallet.address_string();
-    let unresolved: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM wallet_withdrawals \
-         WHERE LOWER(wallet_address) = LOWER($1) AND status = ANY($2))",
-    )
-    .bind(&address)
-    .bind(&UNRESOLVED_STATUSES[..])
-    .fetch_one(lock.conn())
-    .await?;
-    if unresolved {
-        return Ok(WrapOutcome::Busy);
-    }
-    let chain = |error: polymarket_core::Error| anyhow::anyhow!(chain_error_message(&error));
-    let (mined, pending) = client.nonces(&wallet.address()).await.map_err(chain)?;
-    if mined != pending {
-        return Ok(WrapOutcome::Busy);
-    }
-    let units = client
-        .get_usdc_balance_units(&address)
-        .await
-        .map_err(chain)?;
-    if units < MIN_WRAP_UNITS {
-        return Ok(WrapOutcome::Nothing);
+/// Wraps the wallet's idle USDC.e, remembering a wrap until it settles.
+#[derive(Debug, Default)]
+pub(crate) struct Sweeper {
+    pending: Option<PendingWrap>,
+    /// Since when every look has found the wallet busy.
+    busy_since: Option<Instant>,
+}
+
+impl Sweeper {
+    /// Follow up a waiting wrap, or wrap the wallet's USDC.e if it holds any
+    /// and nothing else spends from it now.
+    pub(crate) async fn look(
+        &mut self,
+        pool: &PgPool,
+        client: &PolygonClient,
+        wallet: &TradingWallet,
+    ) -> anyhow::Result<WrapOutcome> {
+        let address = wallet.address_string();
+        let Some(mut lock) = SpendLock::try_acquire(pool, &address).await? else {
+            return Ok(self.busy());
+        };
+        let outcome = match self.pending.is_some() {
+            true => self.follow_up(client, wallet, FOLLOW_UP_POLLS).await,
+            false => self.wrap(&mut lock, client, wallet).await,
+        };
+        lock.release().await;
+        if matches!(outcome, Ok(WrapOutcome::Busy)) {
+            return Ok(self.busy());
+        }
+        self.busy_since = None;
+        outcome
     }
 
-    let mut latest = client
-        .prepare_wrap(wallet.signer(), units, mined)
-        .await
-        .map_err(chain)?;
-    if let Ok(BroadcastOutcome::Rejected(reason)) =
-        client.broadcast(&latest.raw, &latest.tx_hash).await
-    {
-        anyhow::bail!("the node refused the wrap: {reason}");
+    /// Whether a wrap is waiting to be mined.
+    pub(crate) fn waiting(&self) -> bool {
+        self.pending.is_some()
     }
-    info!(wallet = %address, units, tx_hash = %latest.tx_hash, "Wrapping USDC.e into pUSD");
-    // Every hash sent at the nonce: whichever is mined settles the wrap.
-    let mut hashes = vec![latest.tx_hash.clone()];
-    for poll in 1..=RECEIPT_POLLS {
-        tokio::time::sleep(RECEIPT_POLL).await;
-        for hash in &hashes {
-            match client.transaction_receipt(hash).await {
-                Ok(Some(receipt)) if receipt.success => return Ok(WrapOutcome::Wrapped(units)),
-                Ok(Some(_)) => anyhow::bail!("the wrap {hash} reverted"),
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(error = %chain_error_message(&error), "Could not read a wrap's receipt")
+
+    fn busy(&mut self) -> WrapOutcome {
+        let since = *self.busy_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= STARVED_AFTER {
+            warn!(
+                minutes = since.elapsed().as_secs() / 60,
+                "The trading wallet's USDC.e has not been wrapped for a long time: a withdrawal \
+                 from it is unresolved or a transaction it sent is still pending"
+            );
+            self.busy_since = Some(Instant::now());
+        }
+        WrapOutcome::Busy
+    }
+
+    async fn wrap(
+        &mut self,
+        lock: &mut SpendLock,
+        client: &PolygonClient,
+        wallet: &TradingWallet,
+    ) -> anyhow::Result<WrapOutcome> {
+        let address = wallet.address_string();
+        let unresolved: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM wallet_withdrawals \
+             WHERE LOWER(wallet_address) = LOWER($1) AND status = ANY($2))",
+        )
+        .bind(&address)
+        .bind(&UNRESOLVED_STATUSES[..])
+        .fetch_one(lock.conn())
+        .await?;
+        if unresolved {
+            return Ok(WrapOutcome::Busy);
+        }
+        let (mined, pending) = client.nonces(&wallet.address()).await.map_err(chain)?;
+        if mined != pending {
+            return Ok(WrapOutcome::Busy);
+        }
+        let units = client
+            .get_usdc_balance_units(&address)
+            .await
+            .map_err(chain)?;
+        if units < MIN_WRAP_UNITS {
+            return Ok(WrapOutcome::Nothing);
+        }
+
+        let signed = client
+            .prepare_wrap(wallet.signer(), units, mined)
+            .await
+            .map_err(chain)?;
+        if let Ok(BroadcastOutcome::Rejected(reason)) =
+            client.broadcast(&signed.raw, &signed.tx_hash).await
+        {
+            anyhow::bail!("the node refused the wrap: {reason}");
+        }
+        info!(wallet = %address, units, tx_hash = %signed.tx_hash, "Wrapping USDC.e into pUSD");
+        self.pending = Some(PendingWrap {
+            nonce: mined,
+            units,
+            hashes: vec![signed.tx_hash.clone()],
+            latest: signed,
+        });
+        self.follow_up(client, wallet, NEW_WRAP_POLLS).await
+    }
+
+    /// Wait up to `polls` for the pending wrap to settle, sending it again
+    /// should the node drop it and raising its gas when underpriced.
+    async fn follow_up(
+        &mut self,
+        client: &PolygonClient,
+        wallet: &TradingWallet,
+        polls: u32,
+    ) -> anyhow::Result<WrapOutcome> {
+        let Some(mut wrap) = self.pending.take() else {
+            return Ok(WrapOutcome::Nothing);
+        };
+        for poll in 1..=polls {
+            tokio::time::sleep(RECEIPT_POLL).await;
+            for hash in &wrap.hashes {
+                match client.transaction_receipt(hash).await {
+                    Ok(Some(receipt)) => {
+                        anyhow::ensure!(receipt.success, "the wrap {hash} reverted");
+                        if let Some(block) = receipt.block_number {
+                            await_balances_after(client, block).await;
+                        }
+                        return Ok(WrapOutcome::Wrapped(wrap.units));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(error = %chain_error_message(&error), "Could not read a wrap's receipt")
+                    }
                 }
             }
-        }
-        if poll % BUMP_EVERY_POLLS == 0 {
+            if poll % CHECK_EVERY_POLLS != 0 {
+                continue;
+            }
+            // Its nonce used by a transaction none of whose receipts this
+            // look found: another one (or a node that was behind) took it.
+            match client.nonces(&wallet.address()).await {
+                Ok((mined, _)) if mined > wrap.nonce => {
+                    let mut ours = false;
+                    for hash in &wrap.hashes {
+                        ours |= matches!(client.transaction_receipt(hash).await, Ok(Some(_)));
+                    }
+                    if !ours {
+                        warn!(
+                            nonce = wrap.nonce,
+                            "A wrap's nonce was used by another transaction"
+                        );
+                        return Ok(WrapOutcome::Superseded);
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %chain_error_message(&error), "Could not read the wallet's nonce")
+                }
+            }
+            // Dropped by the node: send it again.
+            if matches!(
+                client.transaction_known(&wrap.latest.tx_hash).await,
+                Ok(false)
+            ) {
+                let _ = client
+                    .broadcast(&wrap.latest.raw, &wrap.latest.tx_hash)
+                    .await;
+            }
             match client.gas_price_wei().await {
-                Ok(network) if network > latest.gas_price => {
-                    let min_gas_price = latest.gas_price + latest.gas_price / 10 + 1;
+                Ok(network) if network > wrap.latest.gas_price => {
+                    let min_gas_price = wrap.latest.gas_price + wrap.latest.gas_price / 10 + 1;
                     match client
-                        .prepare_replacement(wallet.signer(), &latest.raw, mined, min_gas_price)
+                        .prepare_replacement(
+                            wallet.signer(),
+                            &wrap.latest.raw,
+                            wrap.nonce,
+                            min_gas_price,
+                        )
                         .await
                     {
                         Ok(replacement) => {
-                            let _ = client
+                            if let Ok(BroadcastOutcome::Accepted) = client
                                 .broadcast(&replacement.raw, &replacement.tx_hash)
-                                .await;
-                            info!(wallet = %address, gas_price = replacement.gas_price, "Raised the gas price of a waiting wrap");
-                            hashes.push(replacement.tx_hash.clone());
-                            latest = replacement;
+                                .await
+                            {
+                                info!(
+                                    gas_price = replacement.gas_price,
+                                    "Raised the gas price of a waiting wrap"
+                                );
+                                wrap.hashes.push(replacement.tx_hash.clone());
+                                wrap.latest = replacement;
+                            }
                         }
                         Err(error) => {
                             warn!(error = %chain_error_message(&error), "Could not sign a wrap's replacement")
@@ -142,13 +264,32 @@ async fn wrap_under_lock(
                 }
             }
         }
+        warn!(nonce = wrap.nonce, hashes = ?wrap.hashes, "A wrap is not mined yet; it is followed up");
+        self.pending = Some(wrap);
+        Ok(WrapOutcome::Unmined)
     }
-    warn!(wallet = %address, ?hashes, "A wrap was not mined in time; withdrawals may wait behind it");
-    Ok(WrapOutcome::Unmined)
 }
 
-/// Wrap the trading wallet's USDC.e now and then every [`SWEEP_INTERVAL`],
-/// telling the exchange to re-read the wallet's collateral after a wrap.
+fn chain(error: polymarket_core::Error) -> anyhow::Error {
+    anyhow::anyhow!(chain_error_message(&error))
+}
+
+/// Wait (briefly) until the head is far enough past `block` that balances
+/// read [`BALANCE_BLOCK_LAG`] blocks behind it include what was mined there,
+/// so a withdrawal planned right after a wrap does not draw on USDC.e the wrap
+/// already took.
+async fn await_balances_after(client: &PolygonClient, block: u64) {
+    for _ in 0..NEW_WRAP_POLLS {
+        match client.get_block_number().await {
+            Ok(head) if head > block + BALANCE_BLOCK_LAG => return,
+            _ => tokio::time::sleep(RECEIPT_POLL).await,
+        }
+    }
+}
+
+/// Wrap the trading wallet's USDC.e now and then every [`SWEEP_INTERVAL`]
+/// (every [`FOLLOW_UP_INTERVAL`] while a wrap waits to be mined), telling
+/// the exchange to re-read the wallet's collateral after a wrap.
 pub fn spawn_collateral_sweeper(
     pool: PgPool,
     client: PolygonClient,
@@ -156,8 +297,9 @@ pub fn spawn_collateral_sweeper(
     executor: Arc<trading_engine::OrderExecutor>,
 ) {
     tokio::spawn(async move {
+        let mut sweeper = Sweeper::default();
         loop {
-            match wrap_idle_usdc(&pool, &client, &wallet).await {
+            match sweeper.look(&pool, &client, &wallet).await {
                 Ok(WrapOutcome::Wrapped(units)) => {
                     info!(units, "Wrapped the trading wallet's USDC.e into pUSD");
                     if let Err(error) = executor.refresh_clob_allowance_cache().await {
@@ -167,7 +309,12 @@ pub fn spawn_collateral_sweeper(
                 Ok(_) => {}
                 Err(error) => warn!(%error, "Could not wrap the trading wallet's USDC.e"),
             }
-            tokio::time::sleep(SWEEP_INTERVAL).await;
+            let interval = if sweeper.waiting() {
+                FOLLOW_UP_INTERVAL
+            } else {
+                SWEEP_INTERVAL
+            };
+            tokio::time::sleep(interval).await;
         }
     });
 }
@@ -199,7 +346,10 @@ mod tests {
 
         // Something the wallet sent still waits to be mined.
         assert_eq!(
-            wrap_idle_usdc(&pool, &client, &wallet).await.unwrap(),
+            Sweeper::default()
+                .look(&pool, &client, &wallet)
+                .await
+                .unwrap(),
             WrapOutcome::Busy
         );
         chain.lock().unwrap().pending_nonce = 6;
@@ -221,7 +371,10 @@ mod tests {
         )
         .await;
         assert_eq!(
-            wrap_idle_usdc(&pool, &client, &wallet).await.unwrap(),
+            Sweeper::default()
+                .look(&pool, &client, &wallet)
+                .await
+                .unwrap(),
             WrapOutcome::Busy
         );
         sqlx::query("UPDATE wallet_withdrawals SET status = 'confirmed' WHERE id = $1")
@@ -235,13 +388,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            wrap_idle_usdc(&pool, &client, &wallet).await.unwrap(),
+            Sweeper::default()
+                .look(&pool, &client, &wallet)
+                .await
+                .unwrap(),
             WrapOutcome::Busy
         );
         held.release().await;
 
         assert_eq!(
-            wrap_idle_usdc(&pool, &client, &wallet).await.unwrap(),
+            Sweeper::default()
+                .look(&pool, &client, &wallet)
+                .await
+                .unwrap(),
             WrapOutcome::Wrapped(25_000_000)
         );
         let raw = chain.lock().unwrap().broadcasts[0].clone();
@@ -269,14 +428,17 @@ mod tests {
         // Too little to bother with.
         chain.lock().unwrap().usdc_units = 999_999;
         assert_eq!(
-            wrap_idle_usdc(&pool, &client, &wallet).await.unwrap(),
+            Sweeper::default()
+                .look(&pool, &client, &wallet)
+                .await
+                .unwrap(),
             WrapOutcome::Nothing
         );
     }
 
     #[sqlx::test(migrations = false)]
     async fn a_waiting_wrap_is_signed_again_at_its_nonce_and_a_doomed_one_never_sent(pool: PgPool) {
-        setup(&pool).await;
+        let (user, workspace) = setup(&pool).await;
         let chain = Arc::new(Mutex::new(Chain {
             usdc_units: 5_000_000,
             pol_wei: 1_000_000_000_000_000_000,
@@ -285,9 +447,11 @@ mod tests {
         }));
         let client = mock_node(chain.clone()).await;
         let wallet = wallet();
+        let mut sweeper = Sweeper::default();
         // The node expects the wrap to revert (no allowance, a paused Onramp).
-        assert!(wrap_idle_usdc(&pool, &client, &wallet).await.is_err());
+        assert!(sweeper.look(&pool, &client, &wallet).await.is_err());
         assert!(chain.lock().unwrap().broadcasts.is_empty());
+        assert!(!sweeper.waiting());
 
         // Never mined, while the network asks more than it pays.
         {
@@ -295,18 +459,21 @@ mod tests {
             chain.gas_estimate = Some(90_000);
             chain.gas_price = 100_000_000_000;
         }
-        let client_for_bump = client.clone();
         let chain_for_bump = chain.clone();
-        let wrapping =
-            tokio::spawn(async move { wrap_idle_usdc(&pool, &client_for_bump, &wallet).await });
-        // Let the first send happen, then raise the network's price.
-        while chain_for_bump.lock().unwrap().broadcasts.is_empty() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        chain_for_bump.lock().unwrap().gas_price = 200_000_000_000;
-        assert_eq!(wrapping.await.unwrap().unwrap(), WrapOutcome::Unmined);
+        let raise = tokio::spawn(async move {
+            while chain_for_bump.lock().unwrap().broadcasts.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            chain_for_bump.lock().unwrap().gas_price = 200_000_000_000;
+        });
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        raise.await.unwrap();
+        assert!(sweeper.waiting());
         let broadcasts = chain.lock().unwrap().broadcasts.clone();
-        assert!(broadcasts.len() > 1);
+        assert_eq!(broadcasts.len(), 2);
         for raw in &broadcasts {
             assert_eq!(legacy_call(raw), legacy_call(&broadcasts[0]));
             assert_eq!(
@@ -314,5 +481,73 @@ mod tests {
                 Some(0)
             );
         }
+
+        // A withdrawal is signed behind it once the lock is let go; the node
+        // then drops the wrap. The next look sends it again, unresolved
+        // withdrawal or not.
+        insert(
+            &pool,
+            user,
+            workspace,
+            Row {
+                wallet: &wallet.address_string().to_lowercase(),
+                amount: 1,
+                status: "submitted",
+                tx_hash: Some("0xw"),
+                nonce: Some(1),
+                journaled: true,
+                age_minutes: 0,
+            },
+        )
+        .await;
+        let latest = broadcasts[1].clone();
+        let latest_hash = format!(
+            "{:#x}",
+            alloy_primitives::keccak256(hex::decode(latest.trim_start_matches("0x")).unwrap())
+        );
+        chain.lock().unwrap().known.clear();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        assert_eq!(chain.lock().unwrap().broadcasts.last(), Some(&latest));
+
+        // Mined at last: settled, and forgotten.
+        chain.lock().unwrap().mine(&latest_hash, true);
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet).await.unwrap(),
+            WrapOutcome::Wrapped(5_000_000)
+        );
+        assert!(!sweeper.waiting());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_wrap_whose_nonce_another_transaction_took_is_given_up(pool: PgPool) {
+        setup(&pool).await;
+        let chain = Arc::new(Mutex::new(Chain {
+            usdc_units: 5_000_000,
+            pol_wei: 1_000_000_000_000_000_000,
+            // A node behind: the nonce it reports is already used.
+            send_error: Some("nonce too low".into()),
+            ..Default::default()
+        }));
+        let client = mock_node(chain.clone()).await;
+        chain.lock().unwrap().latest_nonce = 0;
+        let mut sweeper = Sweeper::default();
+        let chain_for_nonce = chain.clone();
+        let advance = tokio::spawn(async move {
+            while chain_for_nonce.lock().unwrap().broadcasts.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let mut chain = chain_for_nonce.lock().unwrap();
+            chain.latest_nonce = 1;
+            chain.pending_nonce = 1;
+        });
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Superseded
+        );
+        advance.await.unwrap();
+        assert!(!sweeper.waiting());
     }
 }

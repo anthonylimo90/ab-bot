@@ -292,7 +292,7 @@ impl PositionService {
         }
 
         let from = format!("{:?}", position.state).to_lowercase();
-        let reason_str = format!("{:?}", reason);
+        let reason_str = reason.to_string();
         position.mark_entry_failed(reason);
 
         self.repo
@@ -669,7 +669,7 @@ impl PositionService {
         }
 
         let from = format!("{:?}", position.state).to_lowercase();
-        let reason_str = format!("{:?}", reason);
+        let reason_str = reason.to_string();
         position.mark_exit_failed(reason);
 
         self.repo

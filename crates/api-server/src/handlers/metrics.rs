@@ -32,7 +32,9 @@ async fn metrics_for(state: &AppState, headers: &HeaderMap, token: Option<&str>)
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
+        .and_then(|value| value.trim().split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, credentials)| credentials.trim());
     if !presented.is_some_and(|presented| constant_time_eq(presented, token)) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -43,12 +45,15 @@ async fn metrics_for(state: &AppState, headers: &HeaderMap, token: Option<&str>)
         .into_response()
 }
 
+/// Compares digests, so neither the time taken nor an early exit tells
+/// anything about the token, its length included.
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
+    use sha2::{Digest, Sha256};
+    Sha256::digest(a.as_bytes())
+        .iter()
+        .zip(Sha256::digest(b.as_bytes()).iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Positions not yet closed, by state and execution mode.
@@ -75,11 +80,19 @@ async fn render(state: &AppState) -> String {
     };
     let one = |value: String| vec![(String::new(), value)];
 
+    // Whether trading may proceed now: a trip whose cooldown has passed no
+    // longer halts it.
+    let halted = !state.circuit_breaker.can_trade().await;
     let breaker = state.circuit_breaker.state().await;
     gauge(
         "abbot_circuit_breaker_tripped",
         "1 while the circuit breaker halts trading.",
-        &one(u8::from(breaker.tripped).to_string()),
+        &one(u8::from(halted).to_string()),
+    );
+    gauge(
+        "abbot_circuit_breaker_recovering",
+        "1 while trading resumes in gradual recovery after a trip.",
+        &one(u8::from(breaker.recovery_state.is_some()).to_string()),
     );
     gauge(
         "abbot_circuit_breaker_consecutive_losses",
@@ -108,26 +121,41 @@ async fn render(state: &AppState) -> String {
     );
 
     let now = chrono::Utc::now().timestamp();
-    let heartbeats: Vec<(String, String)> = [
+    let workers = [
         ("arb_executor", &state.arb_executor_heartbeat),
         ("exit_handler", &state.exit_handler_heartbeat),
         ("quant_executor", &state.quant_executor_heartbeat),
-    ]
-    .into_iter()
-    .filter_map(|(worker, beat)| {
-        let at = beat.load(Ordering::Relaxed);
-        (at > 0).then(|| {
-            (
-                format!("{{worker=\"{worker}\"}}"),
-                (now - at).max(0).to_string(),
-            )
+    ];
+    let heartbeats: Vec<(String, String)> = workers
+        .iter()
+        .filter_map(|(worker, beat)| {
+            let at = beat.load(Ordering::Relaxed);
+            (at > 0).then(|| {
+                (
+                    format!("{{worker=\"{worker}\"}}"),
+                    (now - at).max(0).to_string(),
+                )
+            })
         })
-    })
-    .collect();
+        .collect();
     gauge(
         "abbot_worker_heartbeat_age_seconds",
         "Seconds since a trading worker last reported progress.",
         &heartbeats,
+    );
+    let started: Vec<(String, String)> = workers
+        .iter()
+        .map(|(worker, beat)| {
+            (
+                format!("{{worker=\"{worker}\"}}"),
+                u8::from(beat.load(Ordering::Relaxed) > 0).to_string(),
+            )
+        })
+        .collect();
+    gauge(
+        "abbot_worker_started",
+        "1 once a trading worker has reported progress (a worker that never did has no age).",
+        &started,
     );
 
     let positions: Result<Vec<(Option<String>, String, i64)>, _> =
@@ -241,10 +269,22 @@ mod tests {
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
         let missing = metrics_for(&state, &HeaderMap::new(), Some(TOKEN)).await;
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let mut lower = HeaderMap::new();
+        lower.insert(
+            header::AUTHORIZATION,
+            format!("bearer {TOKEN}").parse().unwrap(),
+        );
+        assert_eq!(
+            metrics_for(&state, &lower, Some(TOKEN)).await.status(),
+            StatusCode::OK
+        );
+        assert!(!constant_time_eq(TOKEN, &TOKEN[..TOKEN.len() - 1]));
 
         let text = body(metrics_for(&state, &bearer(TOKEN), Some(TOKEN)).await).await;
         for line in [
             "abbot_circuit_breaker_tripped 0",
+            "abbot_circuit_breaker_recovering 0",
+            "abbot_worker_started{worker=\"arb_executor\"} 0",
             "abbot_database_up 1",
             "abbot_positions{state=\"open\",mode=\"live\"} 2",
             "abbot_positions{state=\"exit_failed\",mode=\"paper\"} 1",

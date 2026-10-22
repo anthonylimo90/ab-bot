@@ -161,6 +161,12 @@ pub struct SubmitOrderResponse {
     pub tx_hash: Option<String>,
 }
 
+/// The shortest lifetime an order may be prepared with.
+const MIN_ORDER_LIFETIME_SECS: u64 = 120;
+/// What must be left of an order's lifetime when it is submitted: the
+/// exchange refuses a good-till-date order expiring within a minute.
+const GTD_MIN_REMAINING_SECS: i64 = 70;
+
 const INSERT_PENDING_ORDER: &str = r#"
     INSERT INTO pending_wallet_orders (
         id, user_id, maker_address, token_id, side,
@@ -220,6 +226,33 @@ async fn outcome_label(state: &AppState, token_id: &str) -> &'static str {
         Some((_, no)) if no == token_id => "NO",
         _ => "UNKNOWN",
     }
+}
+
+/// Price within (0, 1) and on a tick (the finest is 0.0001); size positive,
+/// at most a million shares, in whole hundredths.
+fn validate_order_terms(price: Decimal, size: Decimal) -> ApiResult<()> {
+    if price <= Decimal::ZERO || price >= Decimal::ONE {
+        return Err(ApiError::BadRequest(
+            "Price must be between 0 and 1 (exclusive)".into(),
+        ));
+    }
+    if price.normalize().scale() > 4 {
+        return Err(ApiError::BadRequest(
+            "Price must have at most four decimals".into(),
+        ));
+    }
+    if size <= Decimal::ZERO || size > Decimal::from(1_000_000) || size.normalize().scale() > 2 {
+        return Err(ApiError::BadRequest(
+            "Share size must be positive, at most 1,000,000, with at most two decimals".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an order expiring at `expires_at` may still be sent at `now`: the
+/// exchange refuses a good-till-date order that expires within a minute.
+fn submittable(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now + Duration::seconds(GTD_MIN_REMAINING_SECS) <= expires_at
 }
 
 /// Generate a random salt for order uniqueness.
@@ -312,22 +345,7 @@ pub async fn prepare_order(
     }
     let side: u8 = if side_str == "BUY" { 0 } else { 1 };
 
-    // Validate price
-    if req.price <= Decimal::ZERO || req.price >= Decimal::ONE {
-        return Err(ApiError::BadRequest(
-            "Price must be between 0 and 1 (exclusive)".into(),
-        ));
-    }
-
-    // Validate size
-    if req.size <= Decimal::ZERO
-        || req.size > Decimal::from(1_000_000)
-        || req.size.normalize().scale() > 2
-    {
-        return Err(ApiError::BadRequest(
-            "Share size must be positive, at most 1,000,000, with at most two decimals".into(),
-        ));
-    }
+    validate_order_terms(req.price, req.size)?;
 
     // Validate maker address
     req.maker_address
@@ -346,9 +364,9 @@ pub async fn prepare_order(
 
     // Calculate expiration
     let expires_in_secs = req.expires_in_secs.unwrap_or(3600); // Default 1 hour
-    if !(60..=86400).contains(&expires_in_secs) {
+    if !(MIN_ORDER_LIFETIME_SECS..=86400).contains(&expires_in_secs) {
         return Err(ApiError::BadRequest(
-            "Order expiry must be between 60 seconds and one day".into(),
+            "Order expiry must be between two minutes and one day".into(),
         ));
     }
     let now = Utc::now();
@@ -493,15 +511,16 @@ pub async fn submit_order(
         ));
     }
 
-    // Check if order has expired
-    if Utc::now() > pending_order.expires_at {
+    if !submittable(pending_order.expires_at, Utc::now()) {
         // Delete expired order
         sqlx::query("DELETE FROM pending_wallet_orders WHERE id = $1")
             .bind(pending_order_id)
             .execute(&state.pool)
             .await?;
 
-        return Err(ApiError::Gone("Order has expired".into()));
+        return Err(ApiError::Gone(
+            "Order has expired or expires within a minute; prepare it again".into(),
+        ));
     }
 
     // Validate signature format
@@ -619,9 +638,9 @@ fn wallet_submission_response(
 ) -> SubmitOrderResponse {
     SubmitOrderResponse {
         success: !response.is_unfilled(),
+        tx_hash: response.settlement_tx_hash(),
         order_id: Some(response.order_id),
         message: "Exchange response recorded; check order status for confirmed fills".into(),
-        tx_hash: response.transaction_hash,
     }
 }
 
@@ -895,6 +914,27 @@ mod amount_tests {
             format!("Order({})", fields.join(",")),
             polymarket_core::signing::order_types::ORDER_TYPE
         );
+    }
+
+    #[test]
+    fn orders_are_on_a_tick_in_whole_lots_and_sent_with_time_to_spare() {
+        let ok = |price: i64, scale: u32, size: i64| {
+            validate_order_terms(Decimal::new(price, scale), Decimal::new(size, 2)).is_ok()
+        };
+        assert!(ok(45, 2, 1000));
+        assert!(ok(9991, 4, 1));
+        assert!(!ok(12345, 5, 1000)); // off any tick
+        assert!(!ok(0, 0, 1000));
+        assert!(!ok(1, 0, 1000));
+        assert!(!ok(45, 2, 0));
+        assert!(validate_order_terms(Decimal::new(45, 2), Decimal::new(1001, 3)).is_err());
+
+        let now = Utc::now();
+        assert!(submittable(now + Duration::minutes(5), now));
+        assert!(submittable(now + Duration::seconds(70), now));
+        // The exchange would refuse it: expiring within a minute and change.
+        assert!(!submittable(now + Duration::seconds(69), now));
+        assert!(!submittable(now - Duration::seconds(1), now));
     }
 
     #[test]

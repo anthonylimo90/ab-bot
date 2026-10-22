@@ -321,7 +321,7 @@ export function Header() {
                   </div>
                   <div className="min-w-0">
                     <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                      Available USDC.e
+                      Available USDC
                     </div>
                     <div className="flex items-center gap-2">
                       {hasUsdcBalance ? (
@@ -380,7 +380,7 @@ export function Header() {
                       {usdCompactFormatter.format(usdcBalance)}
                     </span>
                   ) : (
-                    <span className="text-xs text-muted-foreground">USDC.e</span>
+                    <span className="text-xs text-muted-foreground">USDC</span>
                   )}
                 </div>
                 <RecoveryDialog workspaceId={currentWorkspace?.id} compact />

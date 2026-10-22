@@ -88,6 +88,28 @@ pub enum FailureReason {
     Unknown { message: String },
 }
 
+impl std::fmt::Display for FailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrderRejected { message } => write!(f, "order rejected: {message}"),
+            Self::OrderTimeout { elapsed_ms } => write!(f, "order timed out after {elapsed_ms} ms"),
+            Self::InsufficientBalance => write!(f, "insufficient balance"),
+            Self::MarketClosed => write!(f, "market closed"),
+            Self::PriceSlippage { expected, actual } => {
+                write!(f, "price moved from {expected} to {actual}")
+            }
+            Self::ConnectivityError { message } => write!(f, "connectivity error: {message}"),
+            Self::OneLeggedEntry { held_leg, message } => {
+                write!(f, "one-legged entry holding {held_leg}: {message}")
+            }
+            Self::StalePosition { last_update_secs } => {
+                write!(f, "no update for {last_update_secs} s")
+            }
+            Self::Unknown { message } => write!(f, "{message}"),
+        }
+    }
+}
+
 /// An arbitrage position tracking both YES and NO holdings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
@@ -771,7 +793,7 @@ impl Position {
             }
             PositionState::EntryFailed => {
                 if let Some(ref reason) = self.failure_reason {
-                    format!("Entry failed: {:?}", reason)
+                    format!("Entry failed: {reason}")
                 } else {
                     "Entry failed".to_string()
                 }
@@ -783,7 +805,7 @@ impl Position {
                     " (max retries exceeded)".to_string()
                 };
                 if let Some(ref reason) = self.failure_reason {
-                    format!("Exit failed: {:?}{}", reason, retry_msg)
+                    format!("Exit failed: {reason}{retry_msg}")
                 } else {
                     format!("Exit failed{}", retry_msg)
                 }
@@ -1285,6 +1307,19 @@ mod tests {
         let msg = pos.status_message();
         assert!(msg.contains("Exit failed"));
         assert!(msg.contains("retry 1/3"));
+    }
+
+    #[test]
+    fn failure_reasons_read_as_text() {
+        let reason = FailureReason::OrderRejected {
+            message: "not enough balance".into(),
+        };
+        assert_eq!(reason.to_string(), "order rejected: not enough balance");
+        let one_legged = FailureReason::OneLeggedEntry {
+            held_leg: "yes".into(),
+            message: "NO leg unfilled".into(),
+        };
+        assert!(one_legged.to_string().contains("one-legged"));
     }
 
     #[test]

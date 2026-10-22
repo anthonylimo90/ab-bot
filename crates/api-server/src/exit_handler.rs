@@ -708,7 +708,14 @@ impl ExitHandler {
             return;
         }
         match self.clob_client.get_fee_schedule(&position.market_id).await {
-            Ok(terms) => position.taker_fees = Some(terms),
+            Ok(terms) => {
+                position.taker_fees = Some(terms);
+                // Kept at once, so a sale settled later elsewhere (the intent
+                // reconciler, after an unclear submission) charges its fee too.
+                if let Err(error) = self.position_service.repo().update(position).await {
+                    warn!(position_id = %position.id, %error, "Could not record the market's fee terms");
+                }
+            }
             Err(error) => warn!(
                 position_id = %position.id,
                 %error,

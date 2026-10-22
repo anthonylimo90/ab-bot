@@ -11,10 +11,10 @@ datasources:
   - name: PostgreSQL
     type: postgres
     url: postgres:5432
-    database: ab_bot
-    user: abbot
+    database: $POSTGRES_DB
+    user: $POSTGRES_USER
     secureJsonData:
-      password: abbot_secret
+      password: $POSTGRES_PASSWORD
     jsonData:
       sslmode: disable
       maxOpenConns: 5

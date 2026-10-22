@@ -88,7 +88,10 @@ pub(crate) async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                     + p.held_no_qty * (COALESCE(m.no_price, p.no_entry_price) - p.no_entry_price)
                     -- The taker fees paid buying the shares still held, under
                     -- the position's recorded fee terms (none without them).
-                    - COALESCE(p.taker_fee_rate * (
+                    -- Buys before the CLOB V2 cutover paid their fees in
+                    -- shares (the holding is already smaller), not in USDC.
+                    - COALESCE(CASE WHEN p.entry_timestamp >= TIMESTAMPTZ '2026-04-28 00:00:00+00'
+                        THEN p.taker_fee_rate END * (
                         p.held_yes_qty * power(GREATEST(0, LEAST(1, p.yes_entry_price))
                                                * (1 - GREATEST(0, LEAST(1, p.yes_entry_price))),
                                                p.taker_fee_exponent)
@@ -192,7 +195,12 @@ mod tests {
             rate: Decimal::new(7, 2),
             exponent: Decimal::new(15, 1),
         });
-        for position in [&pair, &leg, &fractional, &failed, &taxed, &odd] {
+        // Bought on the V1 exchange, which kept the fee in shares; its terms
+        // were attached at a later exit attempt.
+        let mut legacy = taxed.clone();
+        legacy.id = uuid::Uuid::new_v4();
+        legacy.entry_timestamp = "2026-03-01T00:00:00Z".parse().unwrap();
+        for position in [&pair, &leg, &fractional, &failed, &taxed, &odd, &legacy] {
             service.repo().insert(position).await.unwrap();
         }
         sqlx::query("UPDATE positions SET is_open = TRUE, unrealized_pnl = 1 WHERE id = $1")
@@ -201,7 +209,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 6);
+        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 7);
         let mark = |id| {
             let pool = pool.clone();
             async move {
@@ -224,6 +232,8 @@ mod tests {
             mark(taxed.id).await.2,
             Decimal::new(20, 2) - Decimal::new(34972, 5)
         );
+        // Its V1 buy paid no USDC fee to deduct.
+        assert_eq!(mark(legacy.id).await.2, Decimal::new(20, 2));
         // The leg's 4 shares are worth $2.20.
         let (quantity, price, pnl) = mark(leg.id).await;
         assert_eq!(quantity * price, Decimal::new(220, 2));

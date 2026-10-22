@@ -221,14 +221,61 @@ async fn an_unwrap_the_node_expects_to_fail_sends_nothing(pool: PgPool) {
         chain.pusd_units = 100_000_000;
         chain.gas_estimate = None;
     }
-    assert!(matches!(
-        f.submit(10, Uuid::new_v4()).await,
-        Err(ApiError::ServiceUnavailable(_))
-    ));
+    match f.submit(10, Uuid::new_v4()).await {
+        Err(ApiError::Conflict(message)) => assert!(message.contains("execution reverted")),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
     assert_eq!(f.broadcasts(), 0);
     let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM wallet_withdrawals")
         .fetch_all(&pool)
         .await
         .unwrap();
     assert_eq!(statuses, ["failed"]);
+
+    // Too little POL for gas is the requester's to fix.
+    {
+        let mut chain = f.chain.lock().unwrap();
+        chain.gas_estimate = Some(120_000);
+        chain.pol_wei = 1;
+    }
+    match f.submit(10, Uuid::new_v4()).await {
+        Err(ApiError::BadRequest(message)) => assert!(message.contains("Insufficient POL")),
+        other => panic!("expected a bad request, got {other:?}"),
+    }
+    assert_eq!(f.broadcasts(), 0);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_withdrawal_waits_only_so_long_for_another_spend_from_the_wallet(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    let held = SpendLock::acquire(&pool, &f.wallet.address_string())
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        f.submit(10, Uuid::new_v4()),
+    )
+    .await
+    .expect("the request must not wait without end");
+    assert!(matches!(waited, Err(ApiError::ServiceUnavailable(_))));
+    assert!(started.elapsed() >= SPEND_LOCK_WAIT);
+    assert_eq!(f.broadcasts(), 0);
+    held.release().await;
+    assert!(f.submit(10, Uuid::new_v4()).await.is_ok());
+}
+
+#[test]
+fn protocol_contracts_are_not_withdrawal_destinations() {
+    use polymarket_core::api::polygon::is_protocol_contract;
+    for contract in [
+        polymarket_core::signing::USDC_ADDRESS,
+        polymarket_core::signing::COLLATERAL_ADDRESS,
+        polymarket_core::signing::COLLATERAL_OFFRAMP_ADDRESS,
+        polymarket_core::signing::CTF_EXCHANGE_ADDRESS,
+        "0x0000000000000000000000000000000000000000",
+    ] {
+        assert!(is_protocol_contract(&contract.to_ascii_lowercase()));
+    }
+    assert!(!is_protocol_contract(DEST));
 }

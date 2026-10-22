@@ -25,9 +25,12 @@ const DEFAULT_ERC20_TRANSFER_GAS_LIMIT: u64 = 100_000;
 /// The least gas a collateral wrap or unwrap is given, whatever the node
 /// estimates.
 const MIN_RAMP_GAS_LIMIT: u64 = 150_000;
+/// What the error of a transaction the node expects to revert starts with.
+pub const CALL_WOULD_FAIL: &str = "The node expects the call to fail";
+
 /// How far behind the head balances are read, so every node behind a load
 /// balancer already has the block.
-const BALANCE_BLOCK_LAG: u64 = 2;
+pub const BALANCE_BLOCK_LAG: u64 = 2;
 
 /// The cash a wallet holds: USDC.e, and pUSD (the exchange's collateral,
 /// redeemable 1:1 for USDC.e). Both are read at one block, so a wrap or
@@ -40,6 +43,27 @@ pub struct CashBalances {
     pub pusd_units: u128,
     /// The block both were read at.
     pub block: u64,
+}
+
+/// The token contracts and Polymarket contracts on Polygon (and the zero
+/// address): funds sent to one of them cannot be recovered.
+pub fn is_protocol_contract(address: &str) -> bool {
+    use crate::signing::{
+        CTF_EXCHANGE_ADDRESS, NEG_RISK_ADAPTER_ADDRESS, NEG_RISK_CTF_EXCHANGE_ADDRESS,
+    };
+    [
+        "0x0000000000000000000000000000000000000000",
+        POLYGON_USDC_ADDRESS,
+        COLLATERAL_ADDRESS,
+        COLLATERAL_ONRAMP_ADDRESS,
+        COLLATERAL_OFFRAMP_ADDRESS,
+        CTF_ADDRESS,
+        CTF_EXCHANGE_ADDRESS,
+        NEG_RISK_CTF_EXCHANGE_ADDRESS,
+        NEG_RISK_ADAPTER_ADDRESS,
+    ]
+    .iter()
+    .any(|contract| contract.eq_ignore_ascii_case(address.trim()))
 }
 
 impl CashBalances {
@@ -331,18 +355,32 @@ impl PolygonClient {
         Ok(merge_asset_transfers(per_direction))
     }
 
-    /// The wallet's USDC.e and pUSD, read at one recent block.
+    /// The wallet's USDC.e and pUSD, read at one recent block (named by its
+    /// hash, so a reorganization between the reads cannot mix two blocks).
     pub async fn get_cash_balances(&self, wallet_address: &str) -> Result<CashBalances> {
         let block = self
             .get_block_number()
             .await?
             .saturating_sub(BALANCE_BLOCK_LAG);
-        let at = format!("{block:#x}");
+        let header = self
+            .rpc_value(
+                "eth_getBlockByNumber",
+                serde_json::json!([format!("{block:#x}"), false]),
+            )
+            .await?;
+        let hash = header
+            .get("hash")
+            .and_then(|hash| hash.as_str())
+            .ok_or_else(|| Error::Api {
+                message: format!("No hash for block {block}"),
+                status: None,
+            })?;
+        let at = serde_json::json!({ "blockHash": hash });
         let usdc_units = self
-            .get_erc20_balance_units_at(wallet_address, POLYGON_USDC_ADDRESS, &at)
+            .get_erc20_balance_units_at(wallet_address, POLYGON_USDC_ADDRESS, at.clone())
             .await?;
         let pusd_units = self
-            .get_erc20_balance_units_at(wallet_address, COLLATERAL_ADDRESS, &at)
+            .get_erc20_balance_units_at(wallet_address, COLLATERAL_ADDRESS, at)
             .await?;
         Ok(CashBalances {
             usdc_units,
@@ -353,15 +391,15 @@ impl PolygonClient {
 
     /// The wallet's USDC.e balance now (6-decimal base units).
     pub async fn get_usdc_balance_units(&self, wallet_address: &str) -> Result<u128> {
-        self.get_erc20_balance_units_at(wallet_address, POLYGON_USDC_ADDRESS, "latest")
+        self.get_erc20_balance_units_at(wallet_address, POLYGON_USDC_ADDRESS, "latest".into())
             .await
     }
 
     /// Sign a withdrawal of `amount_units` USDC.e to `to_address` from
     /// `source`, at the sender's next pending nonce, paying at least
     /// `min_gas_price` wei for gas, after checking it holds enough POL for
-    /// gas. An unwrap the node expects to fail is refused here. Nothing is
-    /// sent.
+    /// gas. A withdrawal the node expects to fail (the token already moved, a
+    /// paused Offramp) is refused here. Nothing is sent.
     pub async fn prepare_withdrawal(
         &self,
         signer: &PrivateKeySigner,
@@ -382,22 +420,21 @@ impl PolygonClient {
         })?;
         let usdc = Address::from_str(POLYGON_USDC_ADDRESS).expect("invalid USDC address");
         let amount = U256::from(amount_units);
-        let (to, input, gas_limit) = match source {
+        let (to, input, min_gas_limit) = match source {
             WithdrawalSource::Usdc => (
                 usdc,
                 encode_erc20_transfer(recipient, amount),
                 DEFAULT_ERC20_TRANSFER_GAS_LIMIT,
             ),
-            WithdrawalSource::Pusd => {
-                let offramp =
-                    Address::from_str(COLLATERAL_OFFRAMP_ADDRESS).expect("invalid Offramp address");
-                let input = encode_ramp_call("unwrap", usdc, recipient, amount);
-                let gas_limit = self
-                    .ramp_gas_limit(signer.address(), offramp, &input)
-                    .await?;
-                (offramp, input, gas_limit)
-            }
+            WithdrawalSource::Pusd => (
+                Address::from_str(COLLATERAL_OFFRAMP_ADDRESS).expect("invalid Offramp address"),
+                encode_ramp_call("unwrap", usdc, recipient, amount),
+                MIN_RAMP_GAS_LIMIT,
+            ),
         };
+        let gas_limit = self
+            .gas_limit(signer.address(), to, &input, min_gas_limit)
+            .await?;
         self.sign_call(signer, to, input, gas_limit, None, min_gas_price)
             .await
     }
@@ -415,7 +452,7 @@ impl PolygonClient {
         let onramp = Address::from_str(COLLATERAL_ONRAMP_ADDRESS).expect("invalid Onramp address");
         let input = encode_ramp_call("wrap", usdc, signer.address(), U256::from(amount_units));
         let gas_limit = self
-            .ramp_gas_limit(signer.address(), onramp, &input)
+            .gas_limit(signer.address(), onramp, &input, MIN_RAMP_GAS_LIMIT)
             .await?;
         self.sign_call(signer, onramp, input, gas_limit, Some(nonce), 0)
             .await
@@ -469,10 +506,10 @@ impl PolygonClient {
         ))
     }
 
-    /// Gas for a collateral ramp call: half again the node's estimate, and
-    /// never less than [`MIN_RAMP_GAS_LIMIT`]. A call the node expects to
-    /// revert is an error.
-    async fn ramp_gas_limit(&self, from: Address, to: Address, input: &Bytes) -> Result<u64> {
+    /// Gas for a call: half again the node's estimate, and never less than
+    /// `min`. Estimating simulates the call, so one the node expects to
+    /// revert is an error, told apart from a node that could not estimate.
+    async fn gas_limit(&self, from: Address, to: Address, input: &Bytes, min: u64) -> Result<u64> {
         let params = serde_json::json!([{
             "from": format!("{from:#x}"),
             "to": format!("{to:#x}"),
@@ -480,11 +517,15 @@ impl PolygonClient {
         }]);
         let response = self.rpc_response("eth_estimateGas", params).await?;
         if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            let message = rpc_error_message(error);
+            let reverted = error.get("code").and_then(|code| code.as_i64()) == Some(3)
+                || message.to_ascii_lowercase().contains("revert");
             return Err(Error::Api {
-                message: format!(
-                    "The node expects the call to fail: {}",
-                    rpc_error_message(error)
-                ),
+                message: if reverted {
+                    format!("{CALL_WOULD_FAIL}: {message}")
+                } else {
+                    format!("Could not estimate gas: {message}")
+                },
                 status: None,
             });
         }
@@ -496,9 +537,7 @@ impl PolygonClient {
                 message: "No gas estimate from eth_estimateGas".to_string(),
                 status: None,
             })?;
-        Ok(estimate
-            .saturating_add(estimate / 2)
-            .max(MIN_RAMP_GAS_LIMIT))
+        Ok(estimate.saturating_add(estimate / 2).max(min))
     }
 
     /// Sign a call of `to` with `input`, at `nonce` (else the sender's next
@@ -722,7 +761,7 @@ impl PolygonClient {
         &self,
         wallet_address: &str,
         token_address: &str,
-        block: &str,
+        block: serde_json::Value,
     ) -> Result<u128> {
         // balanceOf(address) selector = 0x70a08231 + 32-byte left-padded address
         let addr = wallet_address.trim_start_matches("0x");

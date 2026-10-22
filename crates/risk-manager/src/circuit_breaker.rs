@@ -633,10 +633,11 @@ impl CircuitBreaker {
         }
         let hard_breach = config.hard_kill_drawdown_pct > Decimal::ZERO
             && drawdown(state.peak_value, best_case) >= config.hard_kill_drawdown_pct;
+        // A best case short of a breach does not show the equity recovered,
+        // so it leaves a run of confirmed breaches as it is.
         let breaches = if hard_breach {
             self.hard_kill_breaches.fetch_add(1, Ordering::SeqCst) + 1
         } else {
-            self.hard_kill_breaches.store(0, Ordering::SeqCst);
             0
         };
         let reason = if hard_breach && breaches >= HARD_KILL_CONFIRMATIONS {
@@ -1226,6 +1227,33 @@ mod tests {
             Some(TripReason::MaxDrawdown)
         );
         assert!(breaker.state().await.tripped);
+    }
+
+    #[tokio::test]
+    async fn a_held_reading_does_not_reset_hard_kill_confirmation() {
+        let breaker = CircuitBreaker::new(latching_config());
+        breaker
+            .update_portfolio_value(Decimal::new(1000, 0))
+            .await
+            .unwrap();
+        // A 45% loss once: one confirmation of the 40% hard kill.
+        breaker
+            .update_portfolio_value(Decimal::new(550, 0))
+            .await
+            .unwrap();
+        // A held reading whose best case shows no breach proves nothing.
+        breaker
+            .check_drawdown_bound(Decimal::new(900, 0))
+            .await
+            .unwrap();
+        // The next breach confirms the hard kill.
+        assert_eq!(
+            breaker
+                .update_portfolio_value(Decimal::new(550, 0))
+                .await
+                .unwrap(),
+            Some(TripReason::HardKillSwitch)
+        );
     }
 
     async fn enter_recovery(breaker: &CircuitBreaker) {

@@ -14,6 +14,6 @@ scrape_configs:
     metrics_path: '/metrics'
     authorization:
       type: Bearer
-      credentials_file: /tmp/metrics_token
+      credentials_file: /prometheus/.metrics_token
     static_configs:
       - targets: ['api-server:3000']

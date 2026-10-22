@@ -644,6 +644,9 @@ async fn load_position_valuation_from_positions(
 
         let (value, cost_basis, unpriced) = holdings.value(yes_qty, no_qty);
         valuation.position_value += value;
+        // Holdings marked against their entry prices: the fees their buys
+        // paid already left the cash, so equity counts them, but this gross
+        // figure does not (a position's own unrealized P&L is net of them).
         valuation.unrealized_pnl += value - cost_basis;
         if unpriced > Decimal::ZERO {
             valuation.unpriced_open_positions += holdings.positions;

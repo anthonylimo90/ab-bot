@@ -573,18 +573,32 @@ unsigned). Fees are set by the exchange when an order matches.
 - The API then wraps the trading wallet's USDC.e into pUSD, at startup and
   every five minutes, so deposits become tradable without a restart. A wrap
   waits until no withdrawal from the wallet is unresolved and nothing it sent
-  is pending, and holds the wallet's spend lock until it is mined, raising its
-  gas price if the network asks more. A withdrawal request made during a wrap
-  waits for it (seconds, normally). The log says "Wrapping USDC.e into pUSD".
+  is pending, and holds the wallet's spend lock while it is mined (up to about
+  a minute and a half) and until balance reads include it. A withdrawal
+  request waits up to 20 seconds for the lock, then answers 503 to retry;
+  nothing is sent. A wrap still unmined when the lock is let go is followed
+  up every 30 seconds: sent again if the node dropped it, its gas raised when
+  the network asks more, until its nonce is used (by it, or by another
+  transaction, which ends it). Only a restart in that window loses track of
+  it. The log says "Wrapping USDC.e into pUSD"; an hour without a chance to
+  wrap is logged as a warning. The sweeper wraps for the signer selected at
+  startup.
 - Cash, for equity, the circuit breaker and the vault balance, is the
   wallet's USDC.e plus its pUSD, both read at one block.
 - A withdrawal still pays the recipient USDC.e: from the wallet's USDC.e with
   a transfer when that covers it, otherwise from its pUSD through the
   Offramp's `unwrap`, which pays the recipient directly. One withdrawal draws
-  on one of the two, so the most one can take is the larger capacity. An
-  unwrap the node expects to fail (for example while the Offramp is paused)
-  is refused before anything is signed. A withdrawal's gas bump re-signs its
-  journaled transaction exactly, whichever kind it is.
+  on one of the two, so the most one can take is the larger capacity. Every
+  withdrawal is simulated before it is signed: one the node expects to fail
+  (the token already wrapped, the Offramp paused) is refused with 409 and
+  nothing is sent. Destinations that are token or Polymarket contracts are
+  refused. A withdrawal's gas bump re-signs its journaled transaction
+  exactly, whichever kind it is.
+- Which exchange a token's orders are signed for is looked up from the CLOB
+  and cached; a failed lookup fails the order instead of guessing, and an
+  arbitrage looks up both legs before buying either. The CLOB's V2
+  balance-allowance answer (an allowance per spender) and order answer
+  (`success`, `errorMsg`, `transactionsHashes`) are read.
 - 093 drops browser-wallet orders prepared for the V1 exchange (they can no
   longer be submitted) and stores the signed creation time of new ones.
 - The bot-scanner indexer now reads trades from both V2 exchanges.

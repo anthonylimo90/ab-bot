@@ -1397,9 +1397,12 @@ pub struct BalanceAllowanceResponse {
     /// Balance in base units (as string).
     #[serde(default)]
     pub balance: String,
-    /// Allowance in base units (as string).
+    /// Allowance in base units (as string), as V1 reported it.
     #[serde(default)]
     pub allowance: String,
+    /// Allowance per spender contract in base units, as V2 reports it.
+    #[serde(default)]
+    pub allowances: HashMap<String, String>,
 }
 
 impl BalanceAllowanceResponse {
@@ -1408,13 +1411,24 @@ impl BalanceAllowanceResponse {
         base_units_to_decimal(&self.balance)
     }
 
-    /// An unlimited approval (2^256 − 1 base units) is larger than a
-    /// `Decimal` holds; it reads as `Decimal::MAX` rather than as unknown.
+    /// The allowance an order can count on: the least any spender has
+    /// (every one of them is approved for trading), unknown when any is
+    /// unreadable. An unlimited approval (2^256 − 1 base units) is larger
+    /// than a `Decimal` holds; it reads as `Decimal::MAX`, not as unknown.
     pub fn allowance_in_units(&self) -> Option<Decimal> {
-        let raw = self.allowance.trim();
-        base_units_to_decimal(raw).or_else(|| {
-            (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())).then_some(Decimal::MAX)
-        })
+        let units = |raw: &str| {
+            let raw = raw.trim();
+            base_units_to_decimal(raw).or_else(|| {
+                (!raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit())).then_some(Decimal::MAX)
+            })
+        };
+        if self.allowances.is_empty() {
+            return units(&self.allowance);
+        }
+        self.allowances
+            .values()
+            .map(|raw| units(raw))
+            .try_fold(Decimal::MAX, |least, value| Some(least.min(value?)))
     }
 }
 
@@ -1427,6 +1441,7 @@ mod balance_unit_tests {
         let response = BalanceAllowanceResponse {
             balance: "1250000".into(),
             allowance: "2000000".into(),
+            allowances: HashMap::new(),
         };
         assert_eq!(response.balance_in_units(), Some(Decimal::new(125, 2)));
         assert_eq!(response.allowance_in_units(), Some(Decimal::from(2)));
@@ -1437,6 +1452,7 @@ mod balance_unit_tests {
         let allowance = |allowance: &str| BalanceAllowanceResponse {
             balance: "0".into(),
             allowance: allowance.into(),
+            allowances: HashMap::new(),
         };
         // An unlimited approval is known, not unreadable: no refresh per order.
         let unlimited =
@@ -1448,6 +1464,23 @@ mod balance_unit_tests {
         // A blank allowance is unknown: the preflight refreshes it.
         assert_eq!(allowance("").allowance_in_units(), None);
         assert_eq!(allowance("1.5").allowance_in_units(), None);
+
+        // V2 reports an allowance per spender: an order counts on the least.
+        let v2: BalanceAllowanceResponse = serde_json::from_value(serde_json::json!({
+            "balance": "5000000",
+            "allowances": {
+                "0xE111180000d2663C0091e4f400237545B87B996B": unlimited,
+                "0xe2222d279d744050d28e00520010520000310F59": "3000000",
+            }
+        }))
+        .unwrap();
+        assert_eq!(v2.allowance_in_units(), Some(Decimal::from(3)));
+        let unreadable: BalanceAllowanceResponse = serde_json::from_value(serde_json::json!({
+            "balance": "0",
+            "allowances": {"0xa": unlimited, "0xb": "n/a"}
+        }))
+        .unwrap();
+        assert_eq!(unreadable.allowance_in_units(), None);
     }
 }
 
@@ -1468,12 +1501,33 @@ pub struct PostOrderResponse {
     pub making_amount: Option<String>,
     #[serde(default, rename = "takingAmount")]
     pub taking_amount: Option<String>,
-    /// Transaction hash if applicable.
-    #[serde(rename = "transactionHash")]
+    /// Transaction hash if applicable (V1).
+    #[serde(default, rename = "transactionHash")]
     pub transaction_hash: Option<String>,
+    /// Settlement transaction hashes of the order's fills, best effort (V2).
+    #[serde(
+        default,
+        rename = "transactionsHashes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub transactions_hashes: Vec<String>,
+    /// Whether the exchange took the order (V2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    /// Why the exchange did not take it (V2).
+    #[serde(default, rename = "errorMsg", skip_serializing_if = "Option::is_none")]
+    pub error_msg: Option<String>,
 }
 
 impl PostOrderResponse {
+    /// A settlement transaction of the order's fills, when one is known.
+    pub fn settlement_tx_hash(&self) -> Option<String> {
+        self.transaction_hash
+            .clone()
+            .filter(|hash| !hash.is_empty())
+            .or_else(|| self.transactions_hashes.first().cloned())
+    }
+
     /// Check if the order was successfully matched/filled.
     /// FOK orders that fail return status "unmatched".
     pub fn is_filled(&self) -> bool {
@@ -1481,10 +1535,15 @@ impl PostOrderResponse {
         s == "matched"
     }
 
-    /// Check if the order was explicitly not filled (FOK rejection).
+    /// Check if the order was explicitly not filled (FOK rejection), or not
+    /// taken at all (`success: false`) without a status saying it matched or
+    /// rests on the book.
     pub fn is_unfilled(&self) -> bool {
         let s = self.status.to_lowercase();
-        s == "unmatched" || s == "rejected"
+        s == "unmatched"
+            || s == "rejected"
+            || (self.success == Some(false)
+                && !matches!(s.as_str(), "matched" | "live" | "delayed"))
     }
 }
 
@@ -1694,49 +1753,21 @@ impl AuthenticatedClobClient {
         self.credentials.is_some()
     }
 
-    /// Query the CLOB API for whether a token uses the neg-risk exchange.
-    /// Results are cached per token_id since neg-risk status rarely changes.
-    async fn is_neg_risk(&self, token_id: &str) -> Result<bool> {
-        // Check cache first
+    /// Whether a token trades on the neg-risk exchange, which decides the
+    /// contract its orders are signed for. A successful lookup is cached; a
+    /// failed one is an error, never a guess: an order signed for the wrong
+    /// exchange is refused.
+    pub async fn is_neg_risk(&self, token_id: &str) -> Result<bool> {
         if let Some(&cached) = self.neg_risk_cache.lock().unwrap().get(token_id) {
             return Ok(cached);
         }
-
-        let url = format!("{}/neg-risk?token_id={}", self.client.base_url, token_id);
-        let response = self.client.http_client.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            // Default to neg_risk=true since most Polymarket markets are neg-risk
-            warn!(
-                token_id = token_id,
-                status = response.status().as_u16(),
-                "Failed to query neg-risk status, defaulting to true"
-            );
-            return Ok(true);
-        }
-
-        #[derive(Deserialize)]
-        struct NegRiskResponse {
-            neg_risk: bool,
-        }
-
-        let result: NegRiskResponse = response.json().await.map_err(|e| {
-            warn!(error = %e, "Failed to parse neg-risk response, defaulting to true");
-            e
-        })?;
-
-        // Store in cache
+        let neg_risk = self.client.get_neg_risk(token_id).await?;
         self.neg_risk_cache
             .lock()
             .unwrap()
-            .insert(token_id.to_string(), result.neg_risk);
-
-        debug!(
-            token_id = token_id,
-            neg_risk = result.neg_risk,
-            "Queried and cached neg-risk status"
-        );
-        Ok(result.neg_risk)
+            .insert(token_id.to_string(), neg_risk);
+        debug!(token_id, neg_risk, "Queried and cached neg-risk status");
+        Ok(neg_risk)
     }
 
     /// Query the CLOB's view of balance and allowance for the authenticated user.
@@ -1866,7 +1897,7 @@ impl AuthenticatedClobClient {
         order_type: OrderType,
     ) -> Result<SignedOrder> {
         // Determine which exchange contract to use for signing
-        let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
+        let neg_risk = self.is_neg_risk(token_id).await?;
         let signer = if neg_risk {
             &self.neg_risk_signer
         } else {
@@ -1897,7 +1928,9 @@ impl AuthenticatedClobClient {
         };
 
         let order = builder.build().ok_or_else(|| Error::Order {
-            message: "Failed to build order - missing required fields".to_string(),
+            message: format!(
+                "Failed to build order - missing or invalid fields (token id {token_id})"
+            ),
         })?;
 
         info!(
@@ -1940,7 +1973,7 @@ impl AuthenticatedClobClient {
             });
         }
 
-        let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
+        let neg_risk = self.is_neg_risk(token_id).await?;
         let signer = if neg_risk {
             &self.neg_risk_signer
         } else {
@@ -2661,6 +2694,32 @@ mod authenticated_tests {
             // A good-till-date order carries its expiry, unsigned.
             assert!(signed.expiration.parse::<u64>().unwrap() > current_timestamp());
         }
+    }
+
+    #[test]
+    fn v2_order_responses_are_read() {
+        let response: PostOrderResponse = serde_json::from_value(serde_json::json!({
+            "success": true, "errorMsg": "", "orderID": "0xabc", "status": "matched",
+            "takingAmount": "10", "makingAmount": "4.5",
+            "transactionsHashes": ["0xt1", "0xt2"], "tradeIDs": ["t"]
+        }))
+        .unwrap();
+        assert!(response.is_filled());
+        assert!(!response.is_unfilled());
+        assert_eq!(response.settlement_tx_hash().as_deref(), Some("0xt1"));
+        // Not taken: not filled, whatever the status is missing or says.
+        let refused: PostOrderResponse = serde_json::from_value(serde_json::json!({
+            "success": false, "errorMsg": "not enough balance", "orderID": "", "status": ""
+        }))
+        .unwrap();
+        assert!(refused.is_unfilled());
+        // V1 responses read as before.
+        let v1: PostOrderResponse = serde_json::from_value(serde_json::json!({
+            "orderID": "0xabc", "status": "live", "transactionHash": "0xt"
+        }))
+        .unwrap();
+        assert!(!v1.is_unfilled());
+        assert_eq!(v1.settlement_tx_hash().as_deref(), Some("0xt"));
     }
 
     #[test]

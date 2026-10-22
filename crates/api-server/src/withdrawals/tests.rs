@@ -125,17 +125,25 @@ pub(crate) async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
                         Some("latest") => chain.latest_nonce,
                         _ => chain.final_nonce,
                     })),
-                    "eth_getBlockByNumber" => match chain.finalized {
-                        Some(block) if params[0] == "finalized" => {
+                    "eth_getBlockByNumber" => match (params[0].as_str(), chain.finalized) {
+                        (Some("finalized"), Some(block)) => {
                             json!({"number": format!("{block:#x}")})
                         }
+                        (Some("finalized"), None) => Value::Null,
+                        // A block by number: its hash names the number.
+                        (Some(number), _) => json!({
+                            "number": number,
+                            "hash": format!("0xb10c{:0>60}", number.trim_start_matches("0x")),
+                        }),
                         _ => Value::Null,
                     },
                     "eth_blockNumber" => hex(u128::from(chain.head)),
                     "eth_call" => {
-                        chain
-                            .call_blocks
-                            .push(params[1].as_str().unwrap().to_string());
+                        let block = match &params[1] {
+                            Value::String(tag) => tag.clone(),
+                            pinned => pinned["blockHash"].as_str().unwrap().to_string(),
+                        };
+                        chain.call_blocks.push(block);
                         let token = params[0]["to"].as_str().unwrap().to_ascii_lowercase();
                         if token
                             == polymarket_core::signing::COLLATERAL_ADDRESS.to_ascii_lowercase()
@@ -1106,7 +1114,9 @@ async fn cash_is_read_at_one_settled_block() {
         (1_000_000, 2_500_000, 498)
     );
     assert_eq!(cash.total(), Decimal::new(35, 1));
-    assert_eq!(chain.lock().unwrap().call_blocks, ["0x1f2", "0x1f2"]);
+    // Both read at block 498 (0x1f2), named by its hash.
+    let hash = format!("0xb10c{:0>60}", "1f2");
+    assert_eq!(chain.lock().unwrap().call_blocks, [hash.clone(), hash]);
 }
 
 #[tokio::test]
