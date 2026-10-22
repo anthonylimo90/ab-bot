@@ -9,12 +9,19 @@
 //! transaction on two looks minutes apart, proves it was never sent. Failed
 //! transfers with a hash are still watched for a receipt for a day, so a wrong
 //! verdict is corrected rather than repeated by a retry.
+//!
+//! A transfer left waiting below the network's gas price is signed again at
+//! the same nonce for more gas (journaled before it is sent). Only one
+//! transaction per nonce can be mined, but any of them may be, so every hash
+//! broadcast for a withdrawal is kept and each is checked for a receipt.
 
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use polymarket_core::api::polygon::{BroadcastOutcome, MinedTransaction};
+use polymarket_core::api::polygon::{
+    legacy_nonce_and_gas_price, BroadcastOutcome, MinedTransaction,
+};
 use polymarket_core::api::PolygonClient;
 use rust_decimal::Decimal;
 use sqlx::pool::PoolConnection;
@@ -27,6 +34,9 @@ use crate::workspace_scope::CANONICAL_WORKSPACE_SQL;
 
 /// How often unresolved withdrawals are checked against the chain.
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_secs(30);
+/// A transfer still unmined this long after it was signed, paying less for
+/// gas than the network now asks, is signed again at its nonce for more.
+const FEE_BUMP_AFTER_MINUTES: i64 = 5;
 /// A journaled row still `pending` this long was never signed: nothing was sent.
 const UNSIGNED_GRACE_MINUTES: i32 = 10;
 /// A transfer unknown to the node this long is sent again (and no more often).
@@ -289,13 +299,16 @@ struct SettledWithdrawal {
     trading_wallet: Option<bool>,
 }
 
-/// Settle a transfer from its final receipt: `confirmed` (recording the cash
-/// flow when it left the trading wallet) or `failed` when it reverted. A
-/// transfer failed by an earlier verdict is confirmed if its receipt proves it
-/// was mined. Idempotent; `false` when nothing changed.
+/// Settle a transfer from the final receipt of `tx_hash`, one of the
+/// transactions broadcast for it: `confirmed` (recording the cash flow when it
+/// left the trading wallet) or `failed` when it reverted. The mined hash
+/// becomes the row's `tx_hash`. A transfer failed by an earlier verdict is
+/// confirmed if its receipt proves it was mined. Idempotent; `false` when
+/// nothing changed.
 pub(crate) async fn finalize_mined(
     conn: &mut PgConnection,
     withdrawal_id: Uuid,
+    tx_hash: &str,
     mined: &MinedTransaction,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = sqlx::Connection::begin(conn).await?;
@@ -305,8 +318,11 @@ pub(crate) async fn finalize_mined(
             confirmed_at = CASE WHEN $2 THEN NOW() ELSE confirmed_at END, \
             error = CASE WHEN $2 THEN NULL ELSE $3 END, \
             superseded_seen_at = NULL, \
+            replaced_tx_hashes = CASE WHEN tx_hash = $4 THEN replaced_tx_hashes \
+                ELSE array_append(array_remove(replaced_tx_hashes, $4), tx_hash) END, \
+            tx_hash = $4, \
             updated_at = NOW() \
-         WHERE id = $1 AND tx_hash IS NOT NULL \
+         WHERE id = $1 AND (tx_hash = $4 OR replaced_tx_hashes @> ARRAY[$4]::text[]) \
            AND (status IN ('submitting', 'submitted') OR (status = 'failed' AND $2)) \
          RETURNING workspace_id, wallet_address, destination_address, amount, user_id, tx_hash, \
                    trading_wallet",
@@ -314,6 +330,7 @@ pub(crate) async fn finalize_mined(
     .bind(withdrawal_id)
     .bind(mined.success)
     .bind(REVERTED_ERROR)
+    .bind(tx_hash)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(settled) = settled else {
@@ -354,6 +371,20 @@ pub(crate) async fn finalize_mined(
     Ok(true)
 }
 
+/// Whether a withdrawal has journaled a transaction with `tx_hash`.
+pub(crate) async fn hash_recorded(
+    conn: &mut PgConnection,
+    tx_hash: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM wallet_withdrawals \
+         WHERE tx_hash = $1 OR replaced_tx_hashes @> ARRAY[$1]::text[])",
+    )
+    .bind(tx_hash)
+    .fetch_one(conn)
+    .await
+}
+
 /// Fail an unresolved withdrawal that certainly moved no funds.
 pub(crate) async fn fail_unsent(
     conn: &mut PgConnection,
@@ -377,13 +408,27 @@ struct UnresolvedWithdrawal {
     id: Uuid,
     user_id: Uuid,
     wallet_address: String,
+    destination_address: String,
+    amount: Decimal,
     status: String,
     tx_hash: Option<String>,
+    replaced_tx_hashes: Vec<String>,
     nonce: Option<i64>,
     raw_tx: Option<String>,
     requested_at: DateTime<Utc>,
+    signed_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
     superseded_seen_at: Option<DateTime<Utc>>,
+}
+
+impl UnresolvedWithdrawal {
+    /// Every transaction broadcast for the transfer, `tx_hash` (the latest)
+    /// first: any one of them may be the one mined.
+    fn hashes<'a>(&'a self, tx_hash: &'a str) -> Vec<&'a str> {
+        std::iter::once(tx_hash)
+            .chain(self.replaced_tx_hashes.iter().rev().map(String::as_str))
+            .collect()
+    }
 }
 
 /// Run the reconciler forever.
@@ -400,11 +445,21 @@ pub fn spawn_withdrawal_reconciler(state: Arc<AppState>) {
 
 /// Resolve unresolved withdrawals from the chain.
 pub(crate) async fn reconcile_withdrawals(state: &AppState) -> anyhow::Result<()> {
-    reconcile_with(&state.pool, |user_id| async move {
-        crate::handlers::vault::resolve_polygon_client_for_user(state, user_id)
-            .await
-            .ok()
-    })
+    reconcile_with(
+        &state.pool,
+        |user_id| async move {
+            crate::handlers::vault::resolve_polygon_client_for_user(state, user_id)
+                .await
+                .ok()
+        },
+        |address| async move {
+            state
+                .load_wallet_from_vault(&address)
+                .await
+                .map_err(|error| warn!(%error, "No signer to raise a withdrawal's gas price"))
+                .ok()
+        },
+    )
     .await
 }
 
@@ -424,8 +479,8 @@ where
     F: Fn(Uuid) -> Fut,
     Fut: std::future::Future<Output = Option<PolygonClient>>,
 {
-    let stalled: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT id, user_id, tx_hash FROM wallet_withdrawals \
+    let stalled: Vec<(Uuid, Uuid, String, Vec<String>)> = sqlx::query_as(
+        "SELECT id, user_id, tx_hash, replaced_tx_hashes FROM wallet_withdrawals \
          WHERE workspace_id = $1 AND COALESCE(trading_wallet, TRUE) \
            AND status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL \
            AND mined_seen_at IS NULL \
@@ -436,24 +491,26 @@ where
     .bind(stalled_minutes)
     .fetch_all(pool)
     .await?;
-    for (id, user_id, tx_hash) in stalled {
+    for (id, user_id, tx_hash, replaced) in stalled {
         let Some(client) = client_for(user_id).await else {
             continue;
         };
-        match client.transaction_receipt(&tx_hash).await {
-            Ok(Some(_)) => {
-                sqlx::query(
-                    "UPDATE wallet_withdrawals SET mined_seen_at = NOW() \
-                     WHERE id = $1 AND mined_seen_at IS NULL",
-                )
-                .bind(id)
-                .execute(pool)
-                .await?;
-                return Ok(true);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(withdrawal_id = %id, error = %chain_error_message(&error), "Could not read a stalled withdrawal's receipt");
+        for hash in std::iter::once(&tx_hash).chain(replaced.iter()) {
+            match client.transaction_receipt(hash).await {
+                Ok(Some(_)) => {
+                    sqlx::query(
+                        "UPDATE wallet_withdrawals SET mined_seen_at = NOW() \
+                         WHERE id = $1 AND mined_seen_at IS NULL",
+                    )
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                    return Ok(true);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(withdrawal_id = %id, error = %chain_error_message(&error), "Could not read a stalled withdrawal's receipt");
+                }
             }
         }
     }
@@ -461,18 +518,25 @@ where
 }
 
 /// [`reconcile_withdrawals`] with the chain client for each row's user
-/// supplied by `client_for`.
-async fn reconcile_with<F, Fut>(pool: &PgPool, client_for: F) -> anyhow::Result<()>
+/// supplied by `client_for`, and the signer of a wallet by `signer_for`.
+async fn reconcile_with<F, Fut, S, SFut>(
+    pool: &PgPool,
+    client_for: F,
+    signer_for: S,
+) -> anyhow::Result<()>
 where
     F: Fn(Uuid) -> Fut,
     Fut: std::future::Future<Output = Option<PolygonClient>>,
+    S: Fn(String) -> SFut,
+    SFut: std::future::Future<Output = Option<auth::TradingWallet>>,
 {
     // Only rows that can be decided: legacy rows sent without a recorded hash
     // are left to an operator and must not crowd the others out. Unresolved
     // rows come before the failed ones watched for a late receipt.
     let rows: Vec<UnresolvedWithdrawal> = sqlx::query_as(
-        "SELECT id, user_id, wallet_address, status, tx_hash, nonce, raw_tx, requested_at, \
-                updated_at, superseded_seen_at \
+        "SELECT id, user_id, wallet_address, destination_address, amount, status, tx_hash, \
+                replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, \
+                superseded_seen_at \
          FROM wallet_withdrawals \
          WHERE (status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL) \
             OR (status = 'pending' AND journaled AND tx_hash IS NULL) \
@@ -494,7 +558,31 @@ where
         let result = match row.tx_hash.as_deref() {
             None => fail_unsigned(lock.conn(), &row).await,
             Some(tx_hash) => match client_for(row.user_id).await {
-                Some(client) => reconcile_on_chain(lock.conn(), &client, &row, tx_hash).await,
+                Some(client) => {
+                    match reconcile_on_chain(lock.conn(), &client, &row, tx_hash).await {
+                        // Waiting at its nonce: perhaps for a gas price it does not pay.
+                        Ok(true) if fee_bump_due(&row) => match underpriced(&client, &row).await {
+                            Ok(Some(latest)) => {
+                                match signer_for(row.wallet_address.clone()).await {
+                                    Some(wallet) => {
+                                        bump_fee(
+                                            lock.conn(),
+                                            &client,
+                                            &wallet,
+                                            &row,
+                                            tx_hash,
+                                            latest,
+                                        )
+                                        .await
+                                    }
+                                    None => Ok(()),
+                                }
+                            }
+                            other => other.map(drop),
+                        },
+                        other => other.map(drop),
+                    }
+                }
                 None => Err(anyhow::anyhow!("no Polygon client available")),
             },
         };
@@ -525,40 +613,54 @@ async fn fail_unsigned(conn: &mut PgConnection, row: &UnresolvedWithdrawal) -> a
     Ok(())
 }
 
+/// Settle or advance one journaled transfer from the chain. `Ok(true)` when
+/// it is still waiting to be mined at its nonce (a node holds it, or it was
+/// just sent again), so a fee bump may be due.
 async fn reconcile_on_chain(
     conn: &mut PgConnection,
     client: &PolygonClient,
     row: &UnresolvedWithdrawal,
     tx_hash: &str,
-) -> anyhow::Result<()> {
-    match final_receipt(client, tx_hash).await? {
-        Receipt::Final(mined) => {
-            if finalize_mined(conn, row.id, &mined).await? {
-                info!(withdrawal_id = %row.id, success = mined.success, "Withdrawal resolved on chain");
+) -> anyhow::Result<bool> {
+    let hashes = row.hashes(tx_hash);
+    // They share a nonce, so at most one is mined: its receipt decides.
+    for hash in &hashes {
+        match final_receipt(client, hash).await? {
+            Receipt::Final(mined) => {
+                if finalize_mined(conn, row.id, hash, &mined).await? {
+                    info!(withdrawal_id = %row.id, success = mined.success, "Withdrawal resolved on chain");
+                }
+                return Ok(false);
             }
-            return Ok(());
+            // Mined: wait for its block to become final. The balance already
+            // lacks the amount; say so for the circuit breaker.
+            Receipt::Unsettled => {
+                sqlx::query(
+                    "UPDATE wallet_withdrawals SET mined_seen_at = NOW() \
+                     WHERE id = $1 AND mined_seen_at IS NULL",
+                )
+                .bind(row.id)
+                .execute(conn)
+                .await?;
+                return Ok(false);
+            }
+            Receipt::Unmined => {}
         }
-        // Mined: wait for its block to become final. The balance already
-        // lacks the amount; say so for the circuit breaker.
-        Receipt::Unsettled => {
-            sqlx::query(
-                "UPDATE wallet_withdrawals SET mined_seen_at = NOW() \
-                 WHERE id = $1 AND mined_seen_at IS NULL",
-            )
-            .bind(row.id)
-            .execute(conn)
-            .await?;
-            return Ok(());
-        }
-        Receipt::Unmined => {}
     }
     if row.status == "failed" {
         // Failed transfers are only watched for a receipt.
-        return Ok(());
+        return Ok(false);
     }
 
-    if client.transaction_known(tx_hash).await? {
-        // A node holds it: it was sent, and its nonce is not used by another.
+    let mut known = false;
+    for hash in &hashes {
+        if client.transaction_known(hash).await? {
+            known = true;
+            break;
+        }
+    }
+    if known {
+        // A node holds one: it was sent, and its nonce is not used by another.
         sqlx::query(
             "UPDATE wallet_withdrawals SET status = 'submitted', superseded_seen_at = NULL, \
              updated_at = NOW() \
@@ -568,10 +670,10 @@ async fn reconcile_on_chain(
         .bind(row.id)
         .execute(conn)
         .await?;
-        return Ok(());
+        return Ok(true);
     }
     let Some(nonce) = row.nonce.and_then(|nonce| u64::try_from(nonce).ok()) else {
-        return Ok(());
+        return Ok(false);
     };
 
     // Is the nonce used by a transaction deep enough not to be reorganized?
@@ -595,22 +697,26 @@ async fn reconcile_on_chain(
                 if Utc::now() - first_seen >= Duration::minutes(SUPERSEDED_CONFIRM_MINUTES) =>
             {
                 // Still unknown and still superseded minutes later. A last look
-                // for any receipt, then it can never be mined.
-                if client.transaction_receipt(tx_hash).await?.is_none()
-                    && fail_unsent(
-                        conn,
-                        row.id,
-                        "Another transaction used this transfer's nonce; it was never mined \
-                         and no funds moved",
-                    )
-                    .await?
+                // for any receipt, then none of them can ever be mined.
+                for hash in &hashes {
+                    if client.transaction_receipt(hash).await?.is_some() {
+                        return Ok(false);
+                    }
+                }
+                if fail_unsent(
+                    conn,
+                    row.id,
+                    "Another transaction used this transfer's nonce; it was never mined \
+                     and no funds moved",
+                )
+                .await?
                 {
                     info!(withdrawal_id = %row.id, "Withdrawal superseded; marked failed");
                 }
             }
             Some(_) => {}
         }
-        return Ok(());
+        return Ok(false);
     }
 
     if row.superseded_seen_at.is_some() {
@@ -628,7 +734,7 @@ async fn reconcile_on_chain(
             <= nonce
     {
         let Some(raw) = row.raw_tx.as_deref() else {
-            return Ok(());
+            return Ok(false);
         };
         let outcome = client.broadcast(raw, tx_hash).await;
         let accepted = matches!(outcome, Ok(BroadcastOutcome::Accepted));
@@ -650,8 +756,9 @@ async fn reconcile_on_chain(
                     withdrawal_id = %row.id,
                     %reason,
                     unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
-                    "Node did not take a re-sent withdrawal; it stays unresolved and blocks \
-                     this wallet's withdrawals until mined or superseded (see DEPLOY.md)"
+                    "Node did not take a re-sent withdrawal; its gas price is raised when the \
+                     network asks more, otherwise it blocks this wallet's withdrawals until \
+                     mined or superseded (see DEPLOY.md)"
                 )
             }
             Err(error) => {
@@ -662,6 +769,164 @@ async fn reconcile_on_chain(
                     "Re-sending a withdrawal failed"
                 )
             }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Whether an unresolved transfer was signed long enough ago that, still
+/// unmined, it may be waiting for a gas price it does not pay.
+fn fee_bump_due(row: &UnresolvedWithdrawal) -> bool {
+    matches!(row.status.as_str(), "submitting" | "submitted")
+        && row.signed_at.unwrap_or(row.requested_at)
+            < Utc::now() - Duration::minutes(FEE_BUMP_AFTER_MINUTES)
+}
+
+/// `amount` USDC in base units (six decimals), when it is a positive whole
+/// number of them.
+fn usdc_units(amount: Decimal) -> Option<u128> {
+    use rust_decimal::prelude::ToPrimitive;
+    let units = amount * Decimal::from(1_000_000u64);
+    (units > Decimal::ZERO && units.fract().is_zero())
+        .then(|| units.to_u128())
+        .flatten()
+}
+
+/// A transfer's latest transaction, when the network now asks more for gas
+/// than it pays.
+struct Underpriced {
+    nonce: u64,
+    gas_price: u128,
+    amount_units: u128,
+}
+
+/// Whether the transfer's latest transaction (its journaled `raw_tx`) pays
+/// less for gas than the network now asks, and so may be waiting for it.
+async fn underpriced(
+    client: &PolygonClient,
+    row: &UnresolvedWithdrawal,
+) -> anyhow::Result<Option<Underpriced>> {
+    let (Some(raw), Some(nonce)) = (
+        row.raw_tx.as_deref(),
+        row.nonce.and_then(|nonce| u64::try_from(nonce).ok()),
+    ) else {
+        return Ok(None);
+    };
+    let Some((signed_nonce, gas_price)) = legacy_nonce_and_gas_price(raw) else {
+        warn!(withdrawal_id = %row.id, "Journaled withdrawal is unreadable; its gas price is not raised");
+        return Ok(None);
+    };
+    if signed_nonce != nonce {
+        warn!(withdrawal_id = %row.id, "Journaled withdrawal does not match its nonce; its gas price is not raised");
+        return Ok(None);
+    }
+    let Some(amount_units) = usdc_units(row.amount) else {
+        warn!(withdrawal_id = %row.id, amount = %row.amount, "Withdrawal amount is not whole USDC units; its gas price is not raised");
+        return Ok(None);
+    };
+    let network_price = client
+        .gas_price_wei()
+        .await
+        .map_err(|error| anyhow::anyhow!(chain_error_message(&error)))?;
+    Ok((network_price > gas_price).then_some(Underpriced {
+        nonce,
+        gas_price,
+        amount_units,
+    }))
+}
+
+/// Sign the underpriced transfer again at the same nonce, paying the
+/// network's price (with the margin new transfers carry) and at least a tenth
+/// more than before (what nodes require of a replacement). The new
+/// transaction is journaled, keeping every earlier hash, before it is sent:
+/// whichever one is mined settles the transfer, and only one can be.
+async fn bump_fee(
+    conn: &mut PgConnection,
+    client: &PolygonClient,
+    wallet: &auth::TradingWallet,
+    row: &UnresolvedWithdrawal,
+    tx_hash: &str,
+    latest: Underpriced,
+) -> anyhow::Result<()> {
+    let Underpriced {
+        nonce,
+        gas_price,
+        amount_units,
+    } = latest;
+    if !wallet
+        .address_string()
+        .eq_ignore_ascii_case(&row.wallet_address)
+    {
+        warn!(withdrawal_id = %row.id, "Signer does not match the withdrawal's wallet; its gas price is not raised");
+        return Ok(());
+    }
+
+    let mut min_gas_price = gas_price + gas_price / 10 + 1;
+    let mut replacement = None;
+    for _ in 0..3 {
+        let signed = client
+            .prepare_usdc_replacement(
+                wallet.signer(),
+                &row.destination_address,
+                amount_units,
+                nonce,
+                min_gas_price,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(chain_error_message(&error)))?;
+        anyhow::ensure!(signed.nonce == nonce, "replacement signed at another nonce");
+        if !hash_recorded(conn, &signed.tx_hash).await? {
+            replacement = Some(signed);
+            break;
+        }
+        min_gas_price = signed.gas_price + signed.gas_price / 10 + 1;
+    }
+    let Some(signed) = replacement else {
+        return Ok(());
+    };
+
+    // Journal it before it can leave.
+    let journaled = sqlx::query(
+        "UPDATE wallet_withdrawals SET \
+            replaced_tx_hashes = array_append(replaced_tx_hashes, tx_hash), \
+            tx_hash = $3, raw_tx = $4, signed_at = NOW(), status = 'submitting', \
+            updated_at = NOW() \
+         WHERE id = $1 AND tx_hash = $2 AND status IN ('submitting', 'submitted')",
+    )
+    .bind(row.id)
+    .bind(tx_hash)
+    .bind(&signed.tx_hash)
+    .bind(&signed.raw)
+    .execute(&mut *conn)
+    .await?;
+    if journaled.rows_affected() != 1 {
+        return Ok(());
+    }
+    info!(
+        withdrawal_id = %row.id,
+        nonce,
+        previous_gas_price = gas_price,
+        gas_price = signed.gas_price,
+        "Raised the gas price of a waiting withdrawal"
+    );
+    match client.broadcast(&signed.raw, &signed.tx_hash).await {
+        Ok(BroadcastOutcome::Accepted) => {
+            sqlx::query(
+                "UPDATE wallet_withdrawals SET status = 'submitted', updated_at = NOW() \
+                 WHERE id = $1 AND tx_hash = $2 AND status = 'submitting'",
+            )
+            .bind(row.id)
+            .bind(&signed.tx_hash)
+            .execute(conn)
+            .await?;
+        }
+        // Journaled: the reconciler sends it again or settles it from the chain.
+        Ok(BroadcastOutcome::Rejected(reason) | BroadcastOutcome::Uncertain(reason)) => {
+            warn!(withdrawal_id = %row.id, %reason, "Node did not take a withdrawal's replacement")
+        }
+        Err(error) => {
+            warn!(withdrawal_id = %row.id, error = %chain_error_message(&error), "Sending a withdrawal's replacement failed")
         }
     }
     Ok(())

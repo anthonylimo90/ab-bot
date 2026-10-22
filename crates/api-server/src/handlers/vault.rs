@@ -25,8 +25,8 @@ use polymarket_core::api::polygon::BroadcastOutcome;
 use polymarket_core::api::PolygonClient;
 
 use crate::withdrawals::{
-    chain_error_message, fail_unsent, final_receipt, finalize_mined, Receipt, SpendLock,
-    WithdrawalHolds,
+    chain_error_message, fail_unsent, final_receipt, finalize_mined, hash_recorded, Receipt,
+    SpendLock, WithdrawalHolds,
 };
 
 #[cfg(test)]
@@ -1258,7 +1258,7 @@ async fn submit_withdrawal(
     // nonce let the reconciler find out what happened whatever follows.
     let journaled = sqlx::query(
         "UPDATE wallet_withdrawals SET status = 'submitting', tx_hash = $2, nonce = $3, \
-         raw_tx = $4, updated_at = NOW() WHERE id = $1 AND status = 'pending'",
+         raw_tx = $4, signed_at = NOW(), updated_at = NOW() WHERE id = $1 AND status = 'pending'",
     )
     .bind(withdrawal_id)
     .bind(&signed.tx_hash)
@@ -1365,7 +1365,9 @@ async fn submit_withdrawal(
             match final_receipt(&client, &signed.tx_hash).await {
                 Ok(Receipt::Final(mined)) => {
                     let settled = match state.pool.acquire().await {
-                        Ok(mut conn) => finalize_mined(&mut conn, withdrawal_id, &mined).await,
+                        Ok(mut conn) => {
+                            finalize_mined(&mut conn, withdrawal_id, &signed.tx_hash, &mined).await
+                        }
                         Err(e) => Err(e),
                     };
                     match settled {
@@ -1446,16 +1448,12 @@ async fn sign_new_transfer(
             )
             .await
             .map_err(|error| chain_error_message(&error))?;
-        let recorded: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM wallet_withdrawals WHERE tx_hash = $1)",
-        )
-        .bind(&signed.tx_hash)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|error| {
-            warn!(%error, "Could not check a signed withdrawal against the journal");
-            "Could not check the signed transfer".to_string()
-        })?;
+        let recorded = hash_recorded(&mut *conn, &signed.tx_hash)
+            .await
+            .map_err(|error| {
+                warn!(%error, "Could not check a signed withdrawal against the journal");
+                "Could not check the signed transfer".to_string()
+            })?;
         if !recorded {
             return Ok(signed);
         }

@@ -330,6 +330,39 @@ impl PolygonClient {
         amount_units: u128,
         min_gas_price: u128,
     ) -> Result<SignedTransaction> {
+        self.sign_usdc_transfer(signer, to_address, amount_units, None, min_gas_price)
+            .await
+    }
+
+    /// Sign a USDC.e transfer at exactly `nonce`, to replace a transaction
+    /// already signed at it: paying at least `min_gas_price` wei for gas, as
+    /// [`Self::prepare_usdc_transfer`] otherwise. Two transactions at one
+    /// nonce can never both be mined. Nothing is sent.
+    pub async fn prepare_usdc_replacement(
+        &self,
+        signer: &PrivateKeySigner,
+        to_address: &str,
+        amount_units: u128,
+        nonce: u64,
+        min_gas_price: u128,
+    ) -> Result<SignedTransaction> {
+        self.sign_usdc_transfer(signer, to_address, amount_units, Some(nonce), min_gas_price)
+            .await
+    }
+
+    /// The network's current gas price, in wei.
+    pub async fn gas_price_wei(&self) -> Result<u128> {
+        self.get_gas_price_wei().await
+    }
+
+    async fn sign_usdc_transfer(
+        &self,
+        signer: &PrivateKeySigner,
+        to_address: &str,
+        amount_units: u128,
+        nonce: Option<u64>,
+        min_gas_price: u128,
+    ) -> Result<SignedTransaction> {
         if amount_units == 0 {
             return Err(Error::Api {
                 message: "Transfer amount must be greater than zero".to_string(),
@@ -345,9 +378,12 @@ impl PolygonClient {
         let sender = signer.address();
 
         let pol_balance = self.get_native_balance_wei(&sender).await?;
-        // "pending" counts transactions still in the mempool, so a transfer
-        // never reuses (and replaces) the nonce of one not yet mined.
-        let nonce = self.get_nonce(&sender, "pending").await?;
+        // "pending" counts transactions still in the mempool, so a new
+        // transfer never reuses (and replaces) the nonce of one not yet mined.
+        let nonce = match nonce {
+            Some(nonce) => nonce,
+            None => self.get_nonce(&sender, "pending").await?,
+        };
         let gas_price = self.get_gas_price_wei().await?;
         let gas_price = (gas_price + gas_price / 5).max(min_gas_price);
         let required_gas = gas_price.saturating_mul(DEFAULT_ERC20_TRANSFER_GAS_LIMIT as u128);
@@ -649,6 +685,16 @@ impl PolygonClient {
     }
 }
 
+/// The nonce and gas price (wei) of a signed legacy transaction, from its
+/// `0x`-prefixed raw encoding; `None` when it is not one.
+pub fn legacy_nonce_and_gas_price(raw: &str) -> Option<(u64, u128)> {
+    use alloy_consensus::transaction::RlpEcdsaTx;
+    let bytes = hex::decode(raw.strip_prefix("0x").unwrap_or(raw)).ok()?;
+    let mut buf = bytes.as_slice();
+    let (tx, _) = TxLegacy::rlp_decode_with_signature(&mut buf).ok()?;
+    buf.is_empty().then_some((tx.nonce, tx.gas_price))
+}
+
 /// Sign a legacy transaction and compute its hash locally.
 fn sign_legacy_transaction(signer: &PrivateKeySigner, tx: TxLegacy) -> Result<SignedTransaction> {
     use alloy_consensus::transaction::RlpEcdsaTx;
@@ -886,6 +932,32 @@ mod tests {
         AssetTransfersResponse, Log, TransferDirection, ERC1155_TRANSFER_BATCH_TOPIC,
         ERC1155_TRANSFER_SINGLE_TOPIC,
     };
+
+    #[test]
+    fn a_signed_transfer_reads_back_its_nonce_and_gas_price() {
+        use super::*;
+        let signer: PrivateKeySigner = format!("{:064x}", 1).parse().unwrap();
+        let tx = TxLegacy {
+            chain_id: Some(POLYGON_CHAIN_ID),
+            nonce: 7,
+            gas_price: 36_000_000_001,
+            gas_limit: DEFAULT_ERC20_TRANSFER_GAS_LIMIT,
+            to: TxKind::Call(Address::from_str(POLYGON_USDC_ADDRESS).unwrap()),
+            value: U256::ZERO,
+            input: encode_erc20_transfer(Address::ZERO, U256::from(5_000_000u64)),
+        };
+        let signed = sign_legacy_transaction(&signer, tx).unwrap();
+        assert_eq!(
+            legacy_nonce_and_gas_price(&signed.raw),
+            Some((7, 36_000_000_001))
+        );
+        assert_eq!(legacy_nonce_and_gas_price("0xraw01"), None);
+        assert_eq!(
+            legacy_nonce_and_gas_price(&format!("{}00", signed.raw)),
+            None
+        );
+        assert_eq!(legacy_nonce_and_gas_price(""), None);
+    }
 
     fn transfer(
         unique_id: Option<&str>,

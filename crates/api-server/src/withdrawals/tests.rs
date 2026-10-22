@@ -29,6 +29,8 @@ pub(crate) struct Chain {
     pub finalized: Option<u64>,
     pub usdc_units: u128,
     pub pol_wei: u128,
+    /// What `eth_gasPrice` answers, in wei.
+    pub gas_price: u128,
     /// When set, `eth_sendRawTransaction` answers with this error.
     pub send_error: Option<String>,
     /// Whether accepted transactions are mined at once (in `MINED_BLOCK`).
@@ -51,6 +53,7 @@ impl Default for Chain {
             finalized: Some(100),
             usdc_units: 0,
             pol_wei: 0,
+            gas_price: 30_000_000_000,
             send_error: None,
             mine_on_send: false,
             broadcasts: Vec::new(),
@@ -122,7 +125,7 @@ pub(crate) async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
                     "eth_blockNumber" => hex(u128::from(chain.head)),
                     "eth_call" => hex(chain.usdc_units),
                     "eth_getBalance" => hex(chain.pol_wei),
-                    "eth_gasPrice" => hex(30_000_000_000),
+                    "eth_gasPrice" => hex(chain.gas_price),
                     "eth_sendRawTransaction" => {
                         let raw = params[0].as_str().unwrap().to_string();
                         chain.broadcasts.push(raw.clone());
@@ -184,6 +187,7 @@ pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
         include_str!("../../../../migrations/082_withdrawal_journal.sql"),
         include_str!("../../../../migrations/088_withdrawal_reconcile_state.sql"),
         include_str!("../../../../migrations/089_withdrawal_mined_seen.sql"),
+        include_str!("../../../../migrations/091_withdrawal_fee_bumps.sql"),
     ] {
         pool.execute(migration).await.unwrap();
     }
@@ -274,10 +278,26 @@ fn row(
 }
 
 async fn reconcile(pool: &PgPool, client: &PolygonClient) {
-    reconcile_with(pool, |_| {
-        let client = client.clone();
-        async move { Some(client) }
-    })
+    reconcile_signing(pool, client, None).await;
+}
+
+/// [`reconcile`] with `signer` as the key of every wallet.
+async fn reconcile_signing(
+    pool: &PgPool,
+    client: &PolygonClient,
+    signer: Option<&auth::TradingWallet>,
+) {
+    reconcile_with(
+        pool,
+        |_| {
+            let client = client.clone();
+            async move { Some(client) }
+        },
+        |_| {
+            let signer = signer.cloned();
+            async move { signer }
+        },
+    )
     .await
     .unwrap();
 }
@@ -772,4 +792,161 @@ async fn a_stalled_transfer_is_found_mined_before_the_reconciler_looks(pool: PgP
     assert!(seen().await.is_some());
     // Seen once, it is the reconciler's to settle; it is not read again.
     assert!(!mined().await.unwrap());
+}
+
+/// A transfer of 10 USDC from the wallet of private key 1 to `DEST`, signed
+/// at nonce 0 while the network asks 30 gwei (so paying 36), journaled ten
+/// minutes ago with `status`.
+async fn waiting_transfer(
+    pool: &PgPool,
+    client: &PolygonClient,
+    status: &str,
+) -> (
+    auth::TradingWallet,
+    Uuid,
+    polymarket_core::api::polygon::SignedTransaction,
+) {
+    let (user, workspace) = setup(pool).await;
+    let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
+    let signed = client
+        .prepare_usdc_transfer(wallet.signer(), DEST, 10_000_000, 0)
+        .await
+        .unwrap();
+    assert_eq!((signed.nonce, signed.gas_price), (0, 36_000_000_000));
+    let address = wallet.address_string().to_lowercase();
+    let id = insert(
+        pool,
+        user,
+        workspace,
+        Row {
+            wallet: &address,
+            amount: 10,
+            status,
+            tx_hash: Some(&signed.tx_hash),
+            nonce: Some(0),
+            journaled: true,
+            age_minutes: 10,
+        },
+    )
+    .await;
+    sqlx::query(
+        "UPDATE wallet_withdrawals SET raw_tx = $2, signed_at = NOW() - INTERVAL '10 minutes', \
+         requested_at = NOW() - INTERVAL '10 minutes' WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&signed.raw)
+    .execute(pool)
+    .await
+    .unwrap();
+    (wallet, id, signed)
+}
+
+/// `(tx_hash, replaced_tx_hashes, status)` of a withdrawal.
+async fn journal(pool: &PgPool, id: Uuid) -> (String, Vec<String>, String) {
+    sqlx::query_as(
+        "SELECT tx_hash, replaced_tx_hashes, status FROM wallet_withdrawals WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_transfer_the_network_outbids_is_signed_again_at_its_nonce(pool: PgPool) {
+    let chain = Arc::new(Mutex::new(Chain {
+        pol_wei: 1_000_000_000_000_000_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let (wallet, id, original) = waiting_transfer(&pool, &client, "submitted").await;
+
+    // The network asks no more than it pays: it is only sent again.
+    chain.lock().unwrap().send_error = Some("transaction underpriced".into());
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    assert_eq!(journal(&pool, id).await.0, original.tx_hash);
+    assert_eq!(chain.lock().unwrap().broadcasts, vec![original.raw.clone()]);
+
+    // Gas now costs 100 gwei, and the node will not take the transfer.
+    sqlx::query("UPDATE wallet_withdrawals SET updated_at = NOW() - INTERVAL '10 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    chain.lock().unwrap().gas_price = 100_000_000_000;
+    // Without its key nothing can be signed: it waits as it is.
+    reconcile(&pool, &client).await;
+    assert_eq!(journal(&pool, id).await.0, original.tx_hash);
+    sqlx::query("UPDATE wallet_withdrawals SET updated_at = NOW() - INTERVAL '10 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    let (tx_hash, replaced, status) = journal(&pool, id).await;
+    assert_ne!(tx_hash, original.tx_hash);
+    assert_eq!(replaced, vec![original.tx_hash.clone()]);
+    // Journaled before it was sent; the node refused it too, so it stays
+    // `submitting` for the reconciler to send again.
+    assert_eq!(status, "submitting");
+    let raw: String = sqlx::query_scalar("SELECT raw_tx FROM wallet_withdrawals WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Same nonce, the network's price plus the margin new transfers carry.
+    assert_eq!(legacy_nonce_and_gas_price(&raw), Some((0, 120_000_000_000)));
+    assert_eq!(chain.lock().unwrap().broadcasts.last(), Some(&raw));
+    let sends = chain.lock().unwrap().broadcasts.len();
+
+    // Just signed: not raised again on the next pass.
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    assert_eq!(journal(&pool, id).await.1.len(), 1);
+    assert_eq!(chain.lock().unwrap().broadcasts.len(), sends);
+
+    // The original is mined after all: that settles the transfer, under the
+    // hash that was mined.
+    chain.lock().unwrap().mine(&original.tx_hash, true);
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    let (tx_hash, replaced, status) = journal(&pool, id).await;
+    assert_eq!(status, "confirmed");
+    assert_eq!(tx_hash, original.tx_hash);
+    assert_eq!(replaced.len(), 1);
+    assert_ne!(replaced[0], original.tx_hash);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_held_transfer_below_the_network_price_is_replaced_and_its_replacement_settles(
+    pool: PgPool,
+) {
+    let chain = Arc::new(Mutex::new(Chain {
+        pol_wei: 1_000_000_000_000_000_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let (wallet, id, original) = waiting_transfer(&pool, &client, "submitted").await;
+    {
+        let mut chain = chain.lock().unwrap();
+        // The node holds it, but it pays 36 gwei while the network asks 50.
+        chain.known.insert(original.tx_hash.clone());
+        chain.gas_price = 50_000_000_000;
+    }
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    let (tx_hash, replaced, status) = journal(&pool, id).await;
+    assert_ne!(tx_hash, original.tx_hash);
+    assert_eq!(replaced, vec![original.tx_hash.clone()]);
+    // The node took the replacement.
+    assert_eq!(status, "submitted");
+    let raw: String = sqlx::query_scalar("SELECT raw_tx FROM wallet_withdrawals WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy_nonce_and_gas_price(&raw), Some((0, 60_000_000_000)));
+
+    // The replacement is mined and settles it; the original never can be.
+    chain.lock().unwrap().mine(&tx_hash, true);
+    reconcile_signing(&pool, &client, Some(&wallet)).await;
+    let settled = journal(&pool, id).await;
+    assert_eq!(settled.2, "confirmed");
+    assert_eq!(settled.0, tx_hash);
+    assert_eq!(settled.1, vec![original.tx_hash]);
 }

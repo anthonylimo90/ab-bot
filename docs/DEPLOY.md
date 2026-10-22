@@ -440,13 +440,25 @@ it is still `submitting`, blocks further withdrawals from that wallet.
   `SELECT id, wallet_address, amount, status, requested_at FROM wallet_withdrawals WHERE status IN ('pending','submitting','submitted') AND tx_hash IS NULL AND NOT (status = 'pending' AND journaled);`
   Check each against the wallet's history on Polygonscan and set it to
   `confirmed` or `failed` by hand.
-- A transfer the node keeps refusing (for example "transaction underpriced"
-  after a gas spike) is logged as "Node did not take a re-sent withdrawal"
-  with how long it has been unresolved. To release it, send any transaction
-  from the wallet at the same nonce (a zero-value transfer to itself at a
-  higher gas price); the reconciler then fails the stuck transfer once that
-  nonce is final. Never mark it `failed` by hand while its nonce is unused:
-  it can still be mined.
+- A transfer still unmined five minutes after it was signed, while the
+  network asks more for gas than it pays (for example after a gas spike), is
+  signed again at the same nonce for the network's price plus a margin
+  (migration 091). The replacement is journaled before it is sent and every
+  earlier hash is kept in `replaced_tx_hashes`: only one transaction per
+  nonce can be mined, and whichever is settles the withdrawal under its
+  hash. This needs the wallet's key in the vault and enough POL for the new
+  gas price; the log says "Raised the gas price of a waiting withdrawal" when
+  it happens. Run every API replica on a version with migration 091:
+  an older reconciler checks only the latest hash and could fail a
+  withdrawal whose earlier transaction was mined (the 24-hour receipt watch
+  then confirms it).
+- A transfer that still does not resolve (no key or POL for a replacement,
+  or a node that refuses it for another reason) is logged as "Node did not
+  take a re-sent withdrawal" with how long it has been unresolved. To release
+  it, send any transaction from the wallet at the same nonce (a zero-value
+  transfer to itself at a higher gas price); the reconciler then fails the
+  stuck transfer once that nonce is final. Never mark it `failed` by hand
+  while its nonce is unused: it can still be mined.
 
 The file vault replaces `VAULT_FILE_PATH` by writing a sibling file and renaming it over the old one. Mount a writable directory (for example a Railway volume) and point `VAULT_FILE_PATH` inside it; a bind mount of the single file cannot be replaced this way.
 
