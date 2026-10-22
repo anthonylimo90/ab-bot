@@ -161,6 +161,12 @@ pub struct SubmitOrderResponse {
     pub tx_hash: Option<String>,
 }
 
+/// What a wallet is told when its order was sent and the exchange's answer
+/// left open whether it was taken. The server cannot read the order back.
+const UNCLEAR_SUBMISSION: &str = "This order was sent but its outcome is unknown: check the \
+     wallet's open orders on Polymarket before placing it again. Further orders from this \
+     wallet wait until ten minutes after this one expires";
+
 /// The shortest lifetime an order may be prepared with: time to sign it
 /// twice in the wallet and still keep [`GTD_MIN_REMAINING_SECS`].
 const MIN_ORDER_LIFETIME_SECS: u64 = 300;
@@ -510,8 +516,12 @@ pub async fn submit_order(
             }
         }
         return Err(ApiError::Conflict(
-            "This order was already submitted; reconcile its outcome before placing another order"
-                .into(),
+            if status == "rejected" {
+                "The exchange refused this order; prepare a new one"
+            } else {
+                UNCLEAR_SUBMISSION
+            }
+            .into(),
         ));
     }
 
@@ -627,14 +637,41 @@ pub async fn submit_order(
             .await
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Order task failed: {e}")))?
-    .map_err(|_| {
-        ApiError::ServiceUnavailable(
-            "Order submission requires reconciliation; keep this pending order ID for retries"
+    .map_err(|e| ApiError::Internal(format!("Order task failed: {e}")))?;
+    match response {
+        Ok(response) => Ok(Json(wallet_submission_response(response))),
+        Err(error) => Err(wallet_submission_error(&state.pool, pending_order_id, error).await),
+    }
+}
+
+/// What a wallet is told when its order was not answered with an acceptance
+/// or a refusal: whether anything may have been sent decides the answer.
+async fn wallet_submission_error(pool: &sqlx::PgPool, id: Uuid, error: anyhow::Error) -> ApiError {
+    let text = error.to_string();
+    tracing::warn!(error = %text, pending_order_id = %id, "Wallet order submission failed");
+    if text.contains("submission_requires_reconciliation") {
+        return ApiError::ServiceUnavailable(UNCLEAR_SUBMISSION.into());
+    }
+    if text.contains("live_submission_fence_busy") {
+        return ApiError::ServiceUnavailable(
+            "An earlier order from this wallet is unresolved or still being sent; nothing was \
+             sent, retry later"
                 .into(),
-        )
-    })?;
-    Ok(Json(wallet_submission_response(response)))
+        );
+    }
+    // Refused by the exchange, or stopped before anything was journaled.
+    match sqlx::query_scalar::<_, String>("SELECT status FROM execution_intents WHERE id=$1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(status)) if status == "rejected" => {
+            let reason: String = text.chars().take(300).collect();
+            ApiError::Validation(format!("The exchange refused the order: {reason}"))
+        }
+        Ok(None) => ApiError::ServiceUnavailable("Nothing was sent; retry shortly".into()),
+        _ => ApiError::ServiceUnavailable(UNCLEAR_SUBMISSION.into()),
+    }
 }
 
 fn wallet_submission_response(
@@ -911,6 +948,42 @@ mod amount_tests {
                 (other, _) => panic!("{status}: {:?}", other.map(|answer| answer.0)),
             }
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_failed_wallet_submission_says_whether_anything_may_have_been_sent(
+        pool: sqlx::PgPool,
+    ) {
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let refused = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_intents (id, market_id, signed_order, status) VALUES ($1, 'm', '{}', 'rejected')")
+            .bind(refused)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = |text: &str| anyhow::anyhow!(text.to_string());
+        assert!(matches!(
+            wallet_submission_error(&pool, refused, error("API error (400): invalid tick")).await,
+            ApiError::Validation(message) if message.contains("invalid tick")
+        ));
+        assert!(matches!(
+            wallet_submission_error(&pool, Uuid::new_v4(), error("submission_requires_reconciliation: timeout")).await,
+            ApiError::ServiceUnavailable(message) if message == UNCLEAR_SUBMISSION
+        ));
+        assert!(matches!(
+            wallet_submission_error(&pool, Uuid::new_v4(), error("live_submission_fence_busy: busy")).await,
+            ApiError::ServiceUnavailable(message) if message.contains("nothing was sent")
+        ));
+        // Stopped before the journal: nothing was sent.
+        assert!(matches!(
+            wallet_submission_error(&pool, Uuid::new_v4(), error("pool timed out")).await,
+            ApiError::ServiceUnavailable(message) if message.starts_with("Nothing was sent")
+        ));
     }
 
     #[tokio::test]

@@ -137,9 +137,10 @@ impl OrderExecutor {
         match operation().await {
             Ok(response) => {
                 // An answer without an id keeps the order's own hash as its
-                // identity. One the exchange refused outright is rejected; a
-                // refusal that still names an order leaves its existence
-                // unknown, for the reconciler to read from the exchange.
+                // identity. One the exchange refused outright is rejected; an
+                // answer that is neither a refusal nor an acceptance leaves
+                // the order's existence unknown, for the reconciler to read
+                // from the exchange under the order's own hash.
                 let status = if response.refused() {
                     "rejected"
                 } else if response.unclear() {
@@ -147,12 +148,15 @@ impl OrderExecutor {
                 } else {
                     "acknowledged"
                 };
-                sqlx::query("UPDATE execution_intents SET status = $4, exchange_order_id = COALESCE(NULLIF($2, ''), exchange_order_id), response = $3, updated_at = NOW() WHERE id = $1")
+                sqlx::query("UPDATE execution_intents SET status = $4, exchange_order_id = CASE WHEN $4 = 'unknown' THEN COALESCE(exchange_order_id, NULLIF($2, '')) ELSE COALESCE(NULLIF($2, ''), exchange_order_id) END, response = $3, updated_at = NOW() WHERE id = $1")
                     .bind(id).bind(&response.order_id).bind(serde_json::to_value(&response)?).bind(status)
                     .execute(pool).await.map_err(|e| anyhow::anyhow!("{SUBMISSION_UNKNOWN}: acknowledgement persistence failed: {e}"))?;
-                if response.unclear() {
+                if status == "unknown" {
                     anyhow::bail!(
-                        "{SUBMISSION_UNKNOWN}: the exchange refused order {} yet named it: {}",
+                        "{SUBMISSION_UNKNOWN}: the exchange's answer does not say whether it took the order \
+                         (success {:?}, status {:?}, order {:?}): {}",
+                        response.success,
+                        response.status,
                         response.order_id,
                         response.error_msg.as_deref().unwrap_or_default()
                     );
@@ -308,11 +312,6 @@ mod tests {
                 serde_json::json!({"success": false, "errorMsg": "not enough balance"}),
                 "rejected",
             ),
-            // Placed on the book after a matching delay: an order to track.
-            (
-                serde_json::json!({"success": true, "status": "unmatched"}),
-                "acknowledged",
-            ),
         ] {
             let order = signer
                 .order_builder()
@@ -341,8 +340,9 @@ mod tests {
             assert_eq!(Some(row.1), signed.order_hash);
         }
 
-        // A refusal naming an order may still have placed it: the outcome is
-        // unknown, reconciled under the named id, and fences the wallet.
+        // An answer that neither refuses nor accepts the order may still have
+        // placed it: the outcome is unknown, reconciled under the order's own
+        // hash, and fences the wallet.
         let sign = |token: &'static str| {
             let order = signer
                 .order_builder()
@@ -356,35 +356,53 @@ mod tests {
             let signer = &signer;
             async move { signer.sign_order(&order).await.unwrap() }
         };
-        let signed = sign("2").await;
-        let id = Uuid::new_v4();
-        let response = answer(
-            serde_json::json!({"success": false, "errorMsg": "timeout", "orderID": "0xnamed"}),
-        );
-        let error = executor
-            .submit_once(id, "market", &signed, || async { Ok(response) })
+        for (token, json) in [
+            (
+                "2",
+                serde_json::json!({"success": false, "errorMsg": "timeout", "orderID": "0xnamed"}),
+            ),
+            (
+                "3",
+                serde_json::json!({"success": true, "orderID": "0xnamed", "status": "unmatched"}),
+            ),
+        ] {
+            let signed = sign(token).await;
+            let id = Uuid::new_v4();
+            let response = answer(json);
+            let error = executor
+                .submit_once(id, "market", &signed, || async { Ok(response) })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(SUBMISSION_UNKNOWN));
+            let row: (String, String, serde_json::Value) = sqlx::query_as(
+                "SELECT status, exchange_order_id, response FROM execution_intents WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains(SUBMISSION_UNKNOWN));
-        let row: (String, String) =
-            sqlx::query_as("SELECT status, exchange_order_id FROM execution_intents WHERE id=$1")
+            .unwrap();
+            assert_eq!(row.0, "unknown");
+            assert_eq!(Some(row.1), signed.order_hash);
+            assert_eq!(row.2["orderID"], "0xnamed");
+            let posts = AtomicUsize::new(0);
+            let fenced = executor
+                .submit_once(Uuid::new_v4(), "market", &sign("4").await, || async {
+                    posts.fetch_add(1, Ordering::SeqCst);
+                    Ok(answer(
+                        serde_json::json!({"success": true, "status": "live"}),
+                    ))
+                })
+                .await
+                .unwrap_err();
+            assert!(fenced.to_string().contains(SUBMISSION_FENCE_BUSY));
+            assert_eq!(posts.load(Ordering::SeqCst), 0);
+            // Reconciled as never placed, the fence lifts for the next case.
+            sqlx::query("UPDATE execution_intents SET status='rejected' WHERE id=$1")
                 .bind(id)
-                .fetch_one(&pool)
+                .execute(&pool)
                 .await
                 .unwrap();
-        assert_eq!(row, ("unknown".to_string(), "0xnamed".to_string()));
-        let posts = AtomicUsize::new(0);
-        let fenced = executor
-            .submit_once(Uuid::new_v4(), "market", &sign("3").await, || async {
-                posts.fetch_add(1, Ordering::SeqCst);
-                Ok(answer(
-                    serde_json::json!({"success": true, "status": "live"}),
-                ))
-            })
-            .await
-            .unwrap_err();
-        assert!(fenced.to_string().contains(SUBMISSION_FENCE_BUSY));
-        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[sqlx::test(migrations = false)]

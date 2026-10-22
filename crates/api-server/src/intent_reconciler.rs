@@ -14,6 +14,9 @@ use uuid::Uuid;
 /// A `submitting`/`unknown` intent that the exchange still has no record of
 /// after this long, and that no trade involves, was never executed.
 const ABSENCE_GRACE_MINUTES: i64 = 10;
+/// How long after its expiry a browser-wallet order of unknown outcome
+/// still fences its wallet.
+const EXPIRED_WALLET_ORDER_GRACE_SECS: i64 = 600;
 
 #[derive(FromRow)]
 struct Intent {
@@ -52,10 +55,27 @@ pub fn spawn(state: Arc<AppState>) {
 pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     // Retire only attempts which never crossed the durable POST boundary. The
     // submitter checks these markers while holding the same lock before POST.
+    let wallet = state.order_executor.wallet_address().await;
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('live-order-submission'))")
         .execute(&mut *tx)
         .await?;
+    // Orders signed by browser wallets cannot be read back from the exchange:
+    // the server keeps no credentials for those wallets. One whose outcome
+    // is unknown can no longer fill once its expiry has long passed, so it
+    // stops fencing its wallet; nothing here depends on its outcome.
+    let expired = sqlx::query("UPDATE execution_intents i SET status='reconciled',updated_at=NOW() WHERE i.status IN ('submitting','unknown') AND ($1::text IS NULL OR LOWER(i.signed_order->>'maker')<>LOWER($1)) AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.id=i.id) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AND (CASE WHEN i.signed_order->>'expiration' ~ '^[0-9]{1,15}$' THEN (i.signed_order->>'expiration')::bigint END) BETWEEN 1 AND EXTRACT(EPOCH FROM NOW())::bigint-$2")
+        .bind(wallet.as_deref())
+        .bind(EXPIRED_WALLET_ORDER_GRACE_SECS)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if expired > 0 {
+        tracing::warn!(
+            count = expired,
+            "Browser-wallet orders with an unknown outcome have expired; they no longer fence their wallets"
+        );
+    }
     sqlx::query("UPDATE position_order_links l SET settled=TRUE WHERE NOT settled AND created_at<NOW()-INTERVAL '5 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=l.id)")
         .execute(&mut *tx).await?;
     // An order the exchange refused holds nothing: settle its link, as the
@@ -94,7 +114,7 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     )
     .execute(&state.pool)
     .await?;
-    let Some(wallet) = state.order_executor.wallet_address().await else {
+    let Some(wallet) = wallet else {
         return Ok(());
     };
     // Every intent of the trading wallet is reconciled, including orphan
@@ -153,6 +173,18 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
                     "canceled" | "cancelled" | "expired" | "rejected"
                 );
             if !terminal {
+                // The exchange holds the order, so it is no longer in doubt:
+                // unless a position waits on it, it stops fencing the wallet
+                // and is followed like any resting order (a manual order's
+                // row keeps its cash reserved).
+                if intent.position_id.is_none()
+                    && matches!(intent.status.as_str(), "submitting" | "unknown")
+                {
+                    sqlx::query("UPDATE execution_intents SET status='acknowledged',updated_at=NOW() WHERE id=$1 AND status IN ('submitting','unknown')")
+                        .bind(intent.id)
+                        .execute(&state.pool)
+                        .await?;
+                }
                 anyhow::bail!("Exchange order remains active");
             }
             let (quantity, price) = state
@@ -814,6 +846,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manual_status, "rejected");
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_order_found_resting_stops_fencing_unless_a_position_waits_on_it(pool: PgPool) {
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"LIVE","original_size":"10","size_matched":"0","associate_trades":[]})),
+            serde_json::json!([]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let orphan = journal(&pool, &maker, None, "unknown", 1).await;
+        let position = live_position(&state, &maker, 48, 0).await;
+        let linked = journal(
+            &pool,
+            &maker,
+            Some((position.id, "yes", "buy")),
+            "unknown",
+            1,
+        )
+        .await;
+        reconcile(&state).await.unwrap();
+        for (id, expected) in [(orphan, "acknowledged"), (linked, "unknown")] {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(status, expected);
+        }
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_browser_wallet_order_of_unknown_outcome_stops_fencing_once_expired(pool: PgPool) {
+        let (clob, server) = exchange(None, serde_json::json!([])).await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let now = Utc::now().timestamp();
+        let mut ids = Vec::new();
+        for (wallet, expiration) in [
+            ("0xbrowser", now - 3600),
+            // Expired moments ago, still within the grace.
+            ("0xbrowser", now - 60),
+            ("0xbrowser", now + 3600),
+            // Never expires: a fill-or-kill order.
+            ("0xbrowser", 0),
+            // The trading wallet's own orders are read from the exchange.
+            (maker.as_str(), now - 3600),
+        ] {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO execution_intents(id,market_id,exchange_order_id,signed_order,status) VALUES($1,'token','hash',$2,'unknown')")
+                .bind(id)
+                .bind(serde_json::json!({"maker": wallet, "tokenId": "token", "expiration": expiration.to_string()}))
+                .execute(&pool)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        reconcile(&state).await.unwrap();
+        let mut statuses = Vec::new();
+        for id in ids {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            statuses.push(status);
+        }
+        assert_eq!(
+            statuses,
+            ["reconciled", "unknown", "unknown", "unknown", "unknown"]
+        );
         server.abort();
     }
 

@@ -586,8 +586,9 @@ unsigned). Fees are set by the exchange when an order matches.
   lock), and the lock is taken again. Any spend lock given up this way, or
   whose release does not answer within ten seconds, is freed the same way.
   After half an hour the
-  lock is let go with a warning rather than hold withdrawals back without
-  end; a restart lets go of it too. The log says "Wrapping USDC.e into pUSD";
+  lock is let go with a warning; a restart lets go of it too. A withdrawal
+  still waits (503) while the node holds the wrap, and goes out once the
+  node has mined or dropped it. The log says "Wrapping USDC.e into pUSD";
   USDC.e left waiting for an hour is logged as a warning. The sweeper wraps
   for the signer selected at startup.
 - Cash, for equity, the circuit breaker and the vault balance, is the
@@ -609,14 +610,20 @@ unsigned). Fees are set by the exchange when an order matches.
   arbitrage looks up both legs before buying either. The CLOB's V2
   balance-allowance answer (an allowance per spender) and order answer
   (`success`, `errorMsg`, `transactionsHashes`) are read. Only an answer
-  with `success: false`, no order id and no placed status proves no order
-  exists; one that names an order is reconciled from the exchange before
-  the wallet trades again. `unmatched` is an order placed on the book after
-  a matching delay (Polymarket's order lifecycle), so it is tracked like a
-  resting order, not released as a kill. A fill-or-kill order that cannot
-  fill is expected to be refused with an HTTP error, as V1 did; should the
-  exchange answer `unmatched` for one instead, the wallet's next live order
-  waits until the reconciler has read that order from the exchange.
+  with `success: false`, no order id and no status saying one was placed
+  proves no order exists, and only `success` with `matched`, `live` or
+  `delayed` proves one was taken. Any other answer (a refusal that names an
+  order, a missing or contradictory status, `unmatched`, which Polymarket
+  documents as an order placed on the book after a matching delay) leaves
+  the order unknown: the wallet's next live order waits until the reconciler
+  has read it from the exchange under the order's own hash, and an order it
+  finds resting stops holding the wallet back unless a position waits on
+  it. A fill-or-kill order that cannot fill is expected to be refused with
+  an HTTP error, as V1 did.
+- Browser-wallet orders cannot be read back from the exchange (the server
+  keeps no credentials for those wallets). One whose outcome is unknown
+  holds back further orders from its wallet until ten minutes after its
+  expiry (at most a day), and never the trading wallet's withdrawals.
 - 093 drops browser-wallet orders prepared for the V1 exchange (they can no
   longer be submitted) and stores the signed creation time of new ones.
 - The bot-scanner indexer now reads trades from both V2 exchanges.

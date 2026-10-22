@@ -1119,11 +1119,11 @@ enum Reservation {
 }
 
 /// Refuse while the wallet has a transaction waiting to be mined other than
-/// its own withdrawals sent and not yet settled (a collateral wrap, an
+/// its own withdrawals sent and not yet mined (a collateral wrap, an
 /// approval, anything sent from elsewhere): a transfer signed behind it
 /// would plan on balances it is about to change, or wait on a nonce nothing
-/// fills should it be dropped. The spend lock keeps the sweeper's wraps out;
-/// this holds should that lock have been lost.
+/// fills should it be dropped. The spend lock keeps the sweeper's wraps out
+/// while it holds; this also holds once it lets go, or should it be lost.
 async fn unexplained_pending_transaction(
     lock: &mut SpendLock,
     client: &PolygonClient,
@@ -1132,31 +1132,43 @@ async fn unexplained_pending_transaction(
     let address = source
         .parse::<alloy_primitives::Address>()
         .map_err(|_| ApiError::BadRequest("Invalid source wallet address".into()))?;
-    let submitted: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM wallet_withdrawals \
-         WHERE LOWER(wallet_address) = LOWER($1) AND status = 'submitted'",
+    let (mined, pending) = match tokio::time::timeout(
+        WITHDRAWAL_BALANCE_TIMEOUT,
+        client.nonces(&address),
     )
-    .bind(source)
-    .fetch_one(lock.conn())
-    .await?;
-    match tokio::time::timeout(WITHDRAWAL_BALANCE_TIMEOUT, client.nonces(&address)).await {
-        Ok(Ok((mined, pending))) if pending.saturating_sub(mined) > submitted as u64 => {
-            Err(ApiError::ServiceUnavailable(
-                "A transaction from this wallet is still pending; nothing was sent, retry shortly"
-                    .into(),
-            ))
-        }
-        Ok(Ok(_)) => Ok(()),
+    .await
+    {
+        Ok(Ok(nonces)) => nonces,
         Ok(Err(e)) => {
             warn!(error = %chain_error_message(&e), "Failed to read the source wallet's nonces");
-            Err(ApiError::ServiceUnavailable(
+            return Err(ApiError::ServiceUnavailable(
                 "Could not read the wallet's pending transactions".into(),
+            ));
+        }
+        Err(_) => {
+            return Err(ApiError::ServiceUnavailable(
+                "Reading the wallet's pending transactions timed out".into(),
             ))
         }
-        Err(_) => Err(ApiError::ServiceUnavailable(
-            "Reading the wallet's pending transactions timed out".into(),
-        )),
+    };
+    if pending <= mined {
+        return Ok(());
     }
+    let own: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT nonce) FROM wallet_withdrawals \
+         WHERE LOWER(wallet_address) = LOWER($1) AND status = 'submitted' AND nonce >= $2",
+    )
+    .bind(source)
+    .bind(i64::try_from(mined).unwrap_or(i64::MAX))
+    .fetch_one(lock.conn())
+    .await?;
+    if pending - mined > u64::try_from(own).unwrap_or(0) {
+        return Err(ApiError::ServiceUnavailable(
+            "A transaction from this wallet is still pending; nothing was sent, retry shortly"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Check capacity and write the `pending` row, under the wallet's spend lock
@@ -1180,11 +1192,12 @@ async fn reserve_withdrawal(
         return Ok(Reservation::Existing(row));
     }
 
+    // Read before entries wait on this decision: it is a chain read.
+    unexplained_pending_transaction(lock, client, &request.source).await?;
     lock.lock_entries().await?;
     // Holds first, then the balance: a transfer settling in between can only
     // make the capacity look smaller.
     let holds = WithdrawalHolds::load(lock.conn(), &request.source).await?;
-    unexplained_pending_transaction(lock, client, &request.source).await?;
     let cash = match tokio::time::timeout(
         WITHDRAWAL_BALANCE_TIMEOUT,
         client.get_cash_balances(&request.source),

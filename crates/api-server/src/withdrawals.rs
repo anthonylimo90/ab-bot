@@ -86,7 +86,8 @@ struct Session {
 impl Session {
     async fn of(conn: &mut PgConnection) -> Result<Self, sqlx::Error> {
         let (pid, started) = sqlx::query_as(
-            "SELECT pid, backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+            "SELECT pg_backend_pid(), \
+             (SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid())",
         )
         .fetch_one(conn)
         .await?;
@@ -156,29 +157,32 @@ impl SpendLock {
         wallet: &str,
     ) -> Result<Option<Self>, sqlx::Error> {
         let mut conn = pool.acquire().await?;
-        let locked = async {
-            let locked: bool =
-                sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-                    .bind(wallet_lock_key(wallet))
-                    .fetch_one(&mut *conn)
-                    .await?;
-            match locked {
-                true => Session::of(&mut conn).await.map(Some),
-                false => Ok(None),
+        // Named first, so a session that takes the lock and then stops
+        // answering can still be ended.
+        let session = match Session::of(&mut conn).await {
+            Ok(session) => session,
+            Err(error) => {
+                drop(conn.detach());
+                return Err(error);
             }
-        }
-        .await;
+        };
+        let locked: Result<bool, _> =
+            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+                .bind(wallet_lock_key(wallet))
+                .fetch_one(&mut *conn)
+                .await;
         match locked {
-            Ok(Some(session)) => Ok(Some(Self {
+            Ok(true) => Ok(Some(Self {
                 conn: Some(conn),
                 pool: pool.clone(),
                 session,
             })),
             // Holding nothing, the connection goes back to the pool.
-            Ok(None) => Ok(None),
+            Ok(false) => Ok(None),
             Err(error) => {
-                // It may hold the lock: closed, never pooled, so it frees it.
+                // It may hold the lock: closed, never pooled, and ended.
                 drop(conn.detach());
+                session.end(pool.clone()).await;
                 Err(error)
             }
         }
@@ -309,12 +313,15 @@ impl WithdrawalHolds {
         let mut reserved_for_open_buys = Decimal::ZERO;
         if trading_wallet {
             // Live trades in flight need this wallet's USDC; withdrawing it
-            // could leave a hedge half built.
+            // could leave a hedge half built. Orders other wallets signed
+            // spend their own funds.
             let (entries_in_flight, unresolved_orders): (bool, bool) = sqlx::query_as(
                 "SELECT \
                     EXISTS(SELECT 1 FROM positions WHERE state = 0 AND execution_mode = 'live'), \
-                    EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting', 'unknown'))",
+                    EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting', 'unknown') \
+                           AND LOWER(signed_order->>'maker') = LOWER($1))",
             )
+            .bind(source)
             .fetch_one(&mut *conn)
             .await?;
             if entries_in_flight {

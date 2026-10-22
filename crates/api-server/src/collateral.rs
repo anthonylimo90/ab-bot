@@ -11,8 +11,9 @@
 //! nothing fills should the wrap be dropped. Meanwhile every look sends the
 //! wrap again if the node dropped it and raises its gas when the network asks
 //! more or the node refuses it, until its nonce is used. After
-//! [`MAX_HOLD`] the lock is let go (and said so) rather than block
-//! withdrawals without end; a restart lets go of it too.
+//! [`MAX_HOLD`] the lock is let go (and said so); a restart lets go of it
+//! too. A withdrawal still waits while the node holds the wrap, and goes out
+//! once the node has mined or dropped it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -139,7 +140,8 @@ impl Sweeper {
             Some(wrap) if wrap.sent_at.elapsed() >= MAX_HOLD && self.lock.is_some() => {
                 warn!(
                     nonce = wrap.nonce,
-                    "A wrap has waited half an hour; withdrawals are no longer held back for it"
+                    "A wrap has waited half an hour; the spend lock is let go, and withdrawals \
+                     wait only while the node still holds the wrap"
                 );
                 self.release().await;
             }

@@ -307,4 +307,46 @@ async fn a_withdrawal_waits_behind_a_transaction_it_did_not_send(pool: PgPool) {
     let next = f.submit(10, Uuid::new_v4()).await.unwrap();
     assert_eq!(next.status, "submitted");
     assert_eq!(f.broadcasts(), 2);
+    // Mined, though their rows still say `submitted`, they no longer account
+    // for a transaction now pending: one sent from elsewhere.
+    {
+        let mut chain = f.chain.lock().unwrap();
+        chain.latest_nonce = 6;
+        chain.pending_nonce = 7;
+    }
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::ServiceUnavailable(message)) if message.contains("still pending")
+    ));
+    assert_eq!(f.broadcasts(), 2);
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_the_wallets_own_unresolved_orders_hold_its_withdrawals(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    let journal = |maker: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("INSERT INTO execution_intents(id,market_id,signed_order,status) VALUES($1,'m',$2,'unknown')")
+                .bind(Uuid::new_v4())
+                .bind(serde_json::json!({"maker": maker}))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    // A browser wallet's order of unknown outcome spends that wallet's funds.
+    journal("0x4444444444444444444444444444444444444444".into()).await;
+    f.chain.lock().unwrap().mine_on_send = true;
+    assert_eq!(
+        f.submit(10, Uuid::new_v4()).await.unwrap().status,
+        "confirmed"
+    );
+    // One of the trading wallet's own holds its withdrawals back.
+    journal(f.wallet.address_string().to_uppercase().replace("0X", "0x")).await;
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::Conflict(message)) if message.contains("Live orders")
+    ));
+    assert_eq!(f.broadcasts(), 1);
 }
