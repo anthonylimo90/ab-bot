@@ -694,15 +694,17 @@ impl ExitHandler {
         Ok(())
     }
 
-    /// Before a live sale, write off the part of a leg's holding the wallet
-    /// does not hold, when it is no more than a buy fee could have kept (see
-    /// [`fee_shortfall`]). The balance is the wallet's, so what other live
-    /// positions and manual orders of this wallet hold of the token is set
-    /// aside first. Nothing is written off while an order on the token has an
-    /// unknown outcome or is recent enough to still be settling on chain: a
-    /// balance read then can be short by shares that are on their way. A
-    /// larger gap is left for reconciliation and the sale goes ahead as
-    /// recorded, for the balance preflight to refuse.
+    /// Before a live sale, write off this position's part of what the wallet
+    /// lacks of a token, when the gap is no more than buy fees could have
+    /// kept (see [`fee_shortfall`]). The balance is the wallet's: the gap is
+    /// measured against everything its live positions and manual orders
+    /// record of the token, and each holder answers for its share of it, so
+    /// another holder's kept fees never land on this position. Nothing is
+    /// written off while an order of the wallet on the token has an unknown
+    /// outcome or a buy may still be settling on chain: a balance read then
+    /// can be short by shares that are on their way. A larger gap is left for
+    /// reconciliation and the sale goes ahead as recorded, for the balance
+    /// preflight to refuse.
     async fn align_leg_with_wallet(
         &self,
         position: &mut Position,
@@ -755,26 +757,30 @@ impl ExitHandler {
         let Some(balance) = balance else {
             return Ok(());
         };
-        let available = balance - others;
-        match fee_shortfall(held, available) {
+        let recorded = held + others.max(Decimal::ZERO);
+        match fee_shortfall(recorded, balance) {
             Some(shortfall) => {
+                let share = shortfall * held / recorded;
                 info!(
                     position_id = %position.id,
                     leg = %leg,
                     %held,
-                    %available,
+                    %recorded,
+                    %balance,
+                    %share,
                     "Writing off shares the exchange kept as fees"
                 );
                 self.position_service
-                    .write_off_missing_shares(position, leg, shortfall, ctx)
+                    .write_off_missing_shares(position, leg, share, ctx)
                     .await
             }
-            None if available < held => {
+            None if balance < recorded => {
                 warn!(
                     position_id = %position.id,
                     leg = %leg,
                     %held,
-                    %available,
+                    %recorded,
+                    %balance,
                     "Wallet holds far fewer shares than recorded; leaving it for reconciliation"
                 );
                 Ok(())
@@ -1991,9 +1997,9 @@ const FEE_WRITE_OFF_SETTLE_MINUTES: i32 = 30;
 
 /// For a position, market, wallet, leg ('yes'/'no'), token and settling
 /// window: what the wallet's other live positions and manual orders hold of
-/// the leg, and whether an order on the token has an unknown outcome (or one
-/// of the position is not yet applied) or a buy not refused may still be
-/// settling. Sells are left out of the window: sold shares leave the wallet
+/// the leg, and whether an order of the wallet on the token has an unknown
+/// outcome (or one of the position is not yet applied) or a buy of it not
+/// refused may still be settling. Sells are left out of the window: sold shares leave the wallet
 /// after the position records them, so they never make the balance look
 /// short, and a refused exit sell must not keep the write-off waiting.
 const OTHER_HOLDERS_SQL: &str = "SELECT \
@@ -2002,6 +2008,7 @@ const OTHER_HOLDERS_SQL: &str = "SELECT \
     + COALESCE((SELECT SUM(quantity) FROM manual_inventory \
         WHERE execution_mode = 'live' AND wallet_address = LOWER($3) AND market_id = $2 AND outcome = $4), 0), \
     EXISTS(SELECT 1 FROM execution_intents WHERE signed_order->>'tokenId' = $5 \
+        AND LOWER(signed_order->>'maker') = LOWER($3) \
         AND (status IN ('submitting', 'unknown') \
             OR (signed_order->>'side' = 'BUY' AND status <> 'rejected' \
                 AND created_at > NOW() - make_interval(mins => $6)))) \
