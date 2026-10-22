@@ -812,6 +812,16 @@ async fn live_handler(
     pool: &PgPool,
     balance: Arc<std::sync::Mutex<String>>,
 ) -> (ExitHandler, String, tokio::task::JoinHandle<()>) {
+    live_handler_with(pool, balance, true).await
+}
+
+/// [`live_handler`], with the executor's wallet loaded or (a signer that
+/// failed to load) not; the wallet's address is returned either way.
+async fn live_handler_with(
+    pool: &PgPool,
+    balance: Arc<std::sync::Mutex<String>>,
+    load_wallet: bool,
+) -> (ExitHandler, String, tokio::task::JoinHandle<()>) {
     use axum::{extract::State, routing::get, routing::post, Json};
     let app = axum::Router::new()
         .route(
@@ -861,10 +871,12 @@ async fn live_handler(
             ..Default::default()
         },
     ));
-    let wallet = executor
-        .reload_wallet(auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap())
-        .await
-        .unwrap();
+    let signer = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
+    let wallet = if load_wallet {
+        executor.reload_wallet(signer).await.unwrap()
+    } else {
+        signer.address_string()
+    };
     let cache = Arc::new(OutcomeTokenCache::new(
         clob.clone(),
         Arc::new(RwLock::new(HashSet::new())),
@@ -1299,9 +1311,47 @@ async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_it
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_live_executor_whose_signer_did_not_load_waits_its_grace(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new("100000000".to_string()));
+    let (h, wallet, server) = live_handler_with(&pool, balance, false).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let mut p = position();
+    p.state = PositionState::Open;
+    p.execution_mode = "live".into();
+    p.wallet_address = Some(wallet);
+    p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    p.held_yes_qty = Decimal::from(100);
+    service.repo().insert(&p).await.unwrap();
+    // A restart may still load the signer and measure it: it waits.
+    assert!(!h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert!(h
+        .balance_unreadable_since
+        .lock()
+        .unwrap()
+        .contains_key(&(p.id, true)));
+    // Past the grace, the record stands.
+    h.balance_unreadable_since.lock().unwrap().insert(
+        (p.id, true),
+        std::time::Instant::now() - super::UNREADABLE_BALANCE_GRACE,
+    );
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert_eq!(p.realized_pnl, Some(Decimal::from(60)));
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn with_no_trading_wallet_loaded_a_resolution_closes_at_its_record_noted(pool: PgPool) {
     let service = setup(&pool).await;
-    // The paper handler's executor has no wallet loaded.
+    // The paper handler's executor never loads a wallet.
     let (h, server) = handler(&pool).await;
     h.token_cache
         .alias("market", &("yes".into(), "no".into()))

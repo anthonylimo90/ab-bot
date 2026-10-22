@@ -816,8 +816,14 @@ impl ExitHandler {
             return Ok(Measured::Matches);
         };
         // The balance read below is the executor's wallet, which is loaded
-        // only at startup: with none, or another, it cannot be measured.
+        // only at startup. A paper executor never has one; a live one whose
+        // signer failed to load may have it after a restart, so the close
+        // gives that the unreadable-balance grace. Another wallet's holding
+        // can never be measured.
         match self.order_executor.wallet_address().await {
+            None if self.order_executor.is_live() => {
+                return Ok(Measured::Waiting(BALANCE_UNREADABLE));
+            }
             None => return Ok(Measured::Unmeasured("no trading wallet is loaded")),
             Some(executor) if !executor.eq_ignore_ascii_case(&wallet) => {
                 return Ok(Measured::Unmeasured(
