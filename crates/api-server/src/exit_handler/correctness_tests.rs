@@ -1109,6 +1109,24 @@ async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions
         .unwrap());
     assert_eq!(b.realized_pnl, Some(Decimal::new(565, 1)));
 
+    // Another wallet's holding cannot be measured here: it closes at its
+    // record, and its close says so.
+    let mut other = live_yes();
+    other.wallet_address = Some("0x0000000000000000000000000000000000000002".into());
+    service.repo().insert(&other).await.unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut other, 0, None, Some(true))
+        .await
+        .unwrap());
+    let note: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata FROM trade_events WHERE position_id = $1 AND event_type = 'closed_via_resolution'",
+    )
+    .bind(other.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(note["unmeasured"][0]["leg"], "yes");
+
     // Already redeemed (or moved): the wallet holds none; the record stands
     // and the position closes rather than waiting for ever: 100 − 40.
     let mut c = live_yes();

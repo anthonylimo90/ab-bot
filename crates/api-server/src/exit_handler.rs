@@ -815,14 +815,17 @@ impl ExitHandler {
         let Some(wallet) = position.wallet_address.clone() else {
             return Ok(Measured::Matches);
         };
-        // The balance read below is the executor's wallet.
+        // The balance read below is the executor's wallet: another wallet's
+        // holding (or any, with no trading wallet loaded) cannot be measured.
         if self
             .order_executor
             .wallet_address()
             .await
             .is_none_or(|executor| !executor.eq_ignore_ascii_case(&wallet))
         {
-            return Ok(Measured::Matches);
+            return Ok(Measured::Unmeasured(
+                "the position's wallet is not the trading wallet",
+            ));
         }
         let (others, unsettled): (Decimal, bool) = sqlx::query_as(OTHER_HOLDERS_SQL)
             .bind(position.id)
@@ -1076,7 +1079,15 @@ impl ExitHandler {
                 }
             }
             None if position.execution_mode == "live" => {
-                unmeasured.push((Leg::Yes, "the market's tokens are unknown"));
+                let legs = match resolved_yes_winner {
+                    Some(true) => vec![Leg::Yes],
+                    Some(false) => vec![Leg::No],
+                    None => vec![Leg::Yes, Leg::No],
+                };
+                unmeasured.extend(
+                    legs.into_iter()
+                        .map(|leg| (leg, "the market's tokens are unknown")),
+                );
             }
             None => {}
         }
@@ -1097,14 +1108,6 @@ impl ExitHandler {
         };
 
         // Where the wallet could not confirm the record, the close says so.
-        for (leg, why) in &unmeasured {
-            warn!(
-                position_id = %position.id,
-                leg = %leg,
-                reason = why,
-                "Resolved position closes at its recorded holding, not measured against the wallet"
-            );
-        }
         let note = (!unmeasured.is_empty()).then(|| {
             serde_json::json!({
                 "unmeasured": unmeasured
@@ -1128,6 +1131,14 @@ impl ExitHandler {
         }
         for leg in [Leg::Yes, Leg::No] {
             self.balance_read(position.id, leg);
+        }
+        for (leg, why) in &unmeasured {
+            warn!(
+                position_id = %position.id,
+                leg = %leg,
+                reason = why,
+                "Resolved position closed at its recorded holding, not measured against the wallet"
+            );
         }
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
