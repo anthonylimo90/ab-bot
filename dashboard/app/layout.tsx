@@ -4,7 +4,6 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { ToastProvider } from '@/components/shared/ToastProvider';
 import { AlertBannerProvider } from '@/components/shared/AlertBannerProvider';
 import { QueryProvider } from '@/providers/QueryProvider';
-import { WalletProvider } from '@/providers/WalletProvider';
 import { WorkspaceProvider } from '@/providers/WorkspaceProvider';
 import { AuthGuard } from '@/components/auth/AuthGuard';
 import { AppShell } from '@/components/layout/AppShell';
@@ -26,17 +25,15 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body className={inter.className}>
         <QueryProvider>
-          <WalletProvider>
-            <TooltipProvider>
-              <AuthGuard>
-                <WorkspaceProvider>
-                  <AppShell>{children}</AppShell>
-                </WorkspaceProvider>
-              </AuthGuard>
-              <ToastProvider />
-              <AlertBannerProvider />
-            </TooltipProvider>
-          </WalletProvider>
+          <TooltipProvider>
+            <AuthGuard>
+              <WorkspaceProvider>
+                <AppShell>{children}</AppShell>
+              </WorkspaceProvider>
+            </AuthGuard>
+            <ToastProvider />
+            <AlertBannerProvider />
+          </TooltipProvider>
         </QueryProvider>
       </body>
     </html>
