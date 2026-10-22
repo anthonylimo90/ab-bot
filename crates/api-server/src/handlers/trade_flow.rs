@@ -497,9 +497,7 @@ fn canonical_trade_event_journeys_query() -> String {
     format!(
         r#"
         WITH scope AS (
-            SELECT DISTINCT
-                strategy,
-                COALESCE(signal_id::text, position_id::text) AS journey_key
+            SELECT DISTINCT strategy, signal_id, position_id
             FROM trade_events
             WHERE occurred_at >= $1
               AND occurred_at <= $2
@@ -507,15 +505,24 @@ fn canonical_trade_event_journeys_query() -> String {
               AND ($4::text IS NULL OR market_id = $4)
               AND (signal_id IS NOT NULL OR position_id IS NOT NULL)
         ),
+        -- A journey is keyed by its signal, or by its position when it has
+        -- none. Each kind is looked up by its own uuid index; the two are
+        -- disjoint (by whether signal_id is set).
         history AS (
-            SELECT
-                te.*,
-                COALESCE(te.signal_id::text, te.position_id::text) AS journey_key
+            SELECT te.*, te.signal_id::text AS journey_key
             FROM trade_events te
-            JOIN scope s
-              ON s.strategy = te.strategy
-             AND s.journey_key = COALESCE(te.signal_id::text, te.position_id::text)
-            WHERE te.occurred_at <= $2
+            WHERE (te.strategy, te.signal_id) IN (
+                    SELECT strategy, signal_id FROM scope WHERE signal_id IS NOT NULL
+                )
+              AND te.occurred_at <= $2
+            UNION ALL
+            SELECT te.*, te.position_id::text AS journey_key
+            FROM trade_events te
+            WHERE te.signal_id IS NULL
+              AND (te.strategy, te.position_id) IN (
+                    SELECT strategy, position_id FROM scope WHERE signal_id IS NULL
+                )
+              AND te.occurred_at <= $2
         ),
         latest AS (
             SELECT DISTINCT ON (strategy, journey_key)
@@ -2017,6 +2024,14 @@ async fn load_trade_event_summary_rows(
             FROM filtered
             WHERE position_id IS NOT NULL
         ),
+        -- Read once for both the latest stage and the hold durations.
+        position_history AS MATERIALIZED (
+            SELECT te.position_id, te.strategy, te.source, te.state_to, te.event_type,
+                   te.occurred_at
+            FROM trade_events te
+            JOIN position_scope ps ON ps.position_id = te.position_id
+            WHERE te.occurred_at <= $2
+        ),
         latest_positions AS (
             SELECT DISTINCT ON (te.position_id)
                 te.position_id,
@@ -2030,9 +2045,7 @@ async fn load_trade_event_summary_rows(
                         ELSE NULL
                     END
                 ) AS lifecycle_stage
-            FROM trade_events te
-            JOIN position_scope ps ON ps.position_id = te.position_id
-            WHERE te.occurred_at <= $2
+            FROM position_history te
             ORDER BY te.position_id, te.occurred_at DESC
         ),
         hold_stats AS (
@@ -2052,9 +2065,7 @@ async fn load_trade_event_summary_rows(
                         WHERE te.state_to = 'closed'
                            OR te.event_type IN ('position_closed', 'closed_via_resolution')
                     ) AS closed_at
-                FROM trade_events te
-                JOIN position_scope ps ON ps.position_id = te.position_id
-                WHERE te.occurred_at <= $2
+                FROM position_history te
                 GROUP BY te.position_id
             ) durations
             WHERE opened_at IS NOT NULL
@@ -3912,6 +3923,116 @@ mod tests {
         assert_eq!(merged[0].confidence, Some(0.84));
         assert!(merged[0].signal_generated_at.is_some());
         assert!(merged[0].position_id.is_some());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn journeys_are_keyed_by_signal_or_else_position_with_their_whole_history(
+        pool: sqlx::PgPool,
+    ) {
+        let schema = include_str!("../../../../migrations/048_trade_events.sql")
+            .replace("uuid_generate_v4()", "gen_random_uuid()");
+        sqlx::Executor::execute(&pool, schema.as_str())
+            .await
+            .unwrap();
+        let signal = Uuid::new_v4();
+        let signal_position = Uuid::new_v4();
+        let position = Uuid::new_v4();
+        let event = |strategy: &'static str,
+                     signal: Option<Uuid>,
+                     position: Option<Uuid>,
+                     event_type: &'static str,
+                     state_to: Option<&'static str>,
+                     hours_ago: i64| {
+            sqlx::query(
+                "INSERT INTO trade_events (occurred_at, strategy, execution_mode, source, \
+                 market_id, signal_id, position_id, event_type, state_to) \
+                 VALUES (NOW() - make_interval(hours => $1), $2, 'paper', 'src', 'm', $3, $4, $5, $6)",
+            )
+            .bind(hours_ago as i32)
+            .bind(strategy)
+            .bind(signal)
+            .bind(position)
+            .bind(event_type)
+            .bind(state_to)
+            .execute(&pool)
+        };
+        // A signal's journey began before the window; its position opened in it.
+        event("flow", Some(signal), None, "signal_generated", None, 72)
+            .await
+            .unwrap();
+        event(
+            "flow",
+            Some(signal),
+            Some(signal_position),
+            "position_open",
+            Some("open"),
+            2,
+        )
+        .await
+        .unwrap();
+        // The same signal under another strategy is another journey, outside the filter.
+        event("arb", Some(signal), None, "signal_generated", None, 1)
+            .await
+            .unwrap();
+        // A position without a signal: opened before the window, closed in it.
+        event(
+            "flow",
+            None,
+            Some(position),
+            "position_open",
+            Some("open"),
+            48,
+        )
+        .await
+        .unwrap();
+        event(
+            "flow",
+            None,
+            Some(position),
+            "position_closed",
+            Some("closed"),
+            1,
+        )
+        .await
+        .unwrap();
+        // A position event outside the window and never touched in it.
+        event(
+            "flow",
+            None,
+            Some(Uuid::new_v4()),
+            "position_open",
+            Some("open"),
+            100,
+        )
+        .await
+        .unwrap();
+
+        let journeys = load_trade_event_journeys(
+            &pool,
+            Utc::now() - Duration::hours(24),
+            Utc::now(),
+            Some("flow"),
+            None,
+            50,
+        )
+        .await
+        .unwrap();
+        assert_eq!(journeys.len(), 2, "{journeys:?}");
+        let by_signal = journeys
+            .iter()
+            .find(|j| j.signal_id == Some(signal))
+            .unwrap();
+        assert!(by_signal.signal_generated_at.unwrap() < Utc::now() - Duration::hours(70));
+        assert_eq!(by_signal.position_id, Some(signal_position));
+        assert_eq!(by_signal.lifecycle_stage, "open");
+        let by_position = journeys
+            .iter()
+            .find(|j| j.position_id == Some(position))
+            .unwrap();
+        assert_eq!(by_position.signal_id, None);
+        assert!(by_position.opened_at.unwrap() < Utc::now() - Duration::hours(40));
+        assert!(by_position.closed_at.is_some());
+        assert_eq!(by_position.lifecycle_stage, "closed");
     }
 
     #[test]
