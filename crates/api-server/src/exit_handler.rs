@@ -2072,22 +2072,27 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
     current_deviation <= entry_deviation / Decimal::new(2, 0)
 }
 
-/// Feed a closed position's realized P&L to the circuit breaker, unless it
-/// was traded in the other mode than the executor runs in now: a paper
-/// position closing after a switch to live (or the reverse) says nothing
-/// about the risk the breaker guards.
+/// Feed a closed position's realized P&L to the circuit breaker. A live
+/// result always counts: live trading switched off for a while makes its
+/// losses no less real. A paper result counts only while the executor does
+/// not trade live (as positions are tagged): one closing after a switch to
+/// live says nothing about the risk the breaker guards. One of unknown
+/// provenance never counts.
 pub(crate) async fn record_close_with_breaker(
     breaker: &CircuitBreaker,
     executor: &OrderExecutor,
     position: &Position,
 ) {
-    let mode = if executor.is_live() { "live" } else { "paper" };
-    if position.execution_mode != mode {
+    let counts = match position.execution_mode.as_str() {
+        "live" => true,
+        "paper" => !executor.is_live_ready().await,
+        _ => false,
+    };
+    if !counts {
         info!(
             position_id = %position.id,
             position_mode = %position.execution_mode,
-            executor_mode = mode,
-            "Close left out of the circuit breaker: traded in the other mode"
+            "Close left out of the circuit breaker: not a result of the mode traded now"
         );
         return;
     }

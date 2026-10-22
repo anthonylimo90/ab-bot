@@ -1161,6 +1161,51 @@ async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions
 }
 
 #[sqlx::test(migrations = false)]
+async fn live_results_always_reach_the_breaker_and_paper_ones_only_off_live(pool: PgPool) {
+    let service = setup(&pool).await;
+    let resolved = |mode: &str, wallet: Option<String>| {
+        let mut p = position();
+        p.id = uuid::Uuid::new_v4();
+        p.state = PositionState::Open;
+        p.execution_mode = mode.into();
+        p.wallet_address = wallet;
+        p.held_yes_qty = Decimal::TEN;
+        p
+    };
+    // Live trading switched off: a live position's loss still counts.
+    let (h, server) = handler(&pool).await;
+    let mut p = resolved("live", Some("0xlive".into()));
+    service.repo().insert(&p).await.unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(false))
+        .await
+        .unwrap());
+    let breaker = h.circuit_breaker.state().await;
+    assert_eq!(breaker.daily_pnl, p.realized_pnl.unwrap());
+    assert!(breaker.daily_pnl < Decimal::ZERO);
+    assert_eq!(breaker.consecutive_losses, 1);
+    server.abort();
+
+    // Trading live: a paper position left over does not count.
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, _wallet, server) = live_handler(&pool, balance).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let mut p = resolved("paper", None);
+    service.repo().insert(&p).await.unwrap();
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(false))
+        .await
+        .unwrap());
+    assert!(p.realized_pnl.unwrap() < Decimal::ZERO);
+    let breaker = h.circuit_breaker.state().await;
+    assert_eq!(breaker.daily_pnl, Decimal::ZERO);
+    assert_eq!(breaker.consecutive_losses, 0);
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_market_stays_taken_while_a_position_in_it_is_active_or_holds_shares(pool: PgPool) {
     let service = setup(&pool).await;
     let repo = service.repo();

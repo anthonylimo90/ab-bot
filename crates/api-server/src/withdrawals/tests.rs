@@ -534,6 +534,31 @@ async fn every_unresolved_withdrawal_is_settled_from_the_chain(pool: PgPool) {
     assert!(flows.contains(&(unsettled, Decimal::from(-10))));
 }
 
+#[sqlx::test(migrations = false)]
+async fn the_chain_is_read_through_the_canonical_workspace_with_no_member_needed(pool: PgPool) {
+    let (_, workspace) = setup(&pool).await;
+    pool.execute(
+        "ALTER TABLE workspaces ADD COLUMN polygon_rpc_url TEXT, ADD COLUMN alchemy_api_key TEXT",
+    )
+    .await
+    .unwrap();
+    let state = crate::state::AppState::for_tests(pool.clone());
+    assert!(state.polygon_client.is_none());
+    // Nothing configured: no chain to read.
+    assert!(crate::handlers::vault::canonical_polygon_client(&state)
+        .await
+        .is_err());
+    // The canonical workspace's RPC, though no user is a member of it.
+    sqlx::query("UPDATE workspaces SET polygon_rpc_url = 'http://127.0.0.1:1' WHERE id = $1")
+        .bind(workspace)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(crate::handlers::vault::canonical_polygon_client(&state)
+        .await
+        .is_ok());
+}
+
 #[tokio::test]
 async fn a_safe_block_is_never_past_the_block_balances_are_read_at() {
     let chain = Arc::new(Mutex::new(Chain {

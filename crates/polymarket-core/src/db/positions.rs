@@ -402,8 +402,6 @@ impl PositionRepository {
         }
     }
 
-    /// Get all active (non-closed, non-entry-failed) positions.
-    /// This includes positions needing recovery (ExitFailed, Stalled).
     /// Whether a position in `market_id` is still active: in any state but
     /// closed or entry failed, or still holding shares (an entry that failed
     /// after one leg filled, waiting to be flattened).
@@ -418,6 +416,8 @@ impl PositionRepository {
         Ok(active)
     }
 
+    /// Get all active (non-closed, non-entry-failed) positions.
+    /// This includes positions needing recovery (ExitFailed, Stalled).
     pub async fn get_active(&self) -> Result<Vec<Position>> {
         let rows = sqlx::query(
             r#"

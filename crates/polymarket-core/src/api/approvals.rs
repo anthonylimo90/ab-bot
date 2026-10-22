@@ -193,7 +193,9 @@ async fn send_raw_tx(
 /// a receipt it is signed again at its nonce for a tenth more gas (at least
 /// what the network asks now, never over [`MAX_GAS_OVER_NETWORK`] times it),
 /// so an underpriced approval does not hold the wallet's later transactions
-/// back. Whichever send is mined, the on-chain state alone proves it.
+/// back, but only while the nonce is still its own: the node holds one of
+/// its transactions, or counts nothing pending at the nonce. Whichever send
+/// is mined, the on-chain state alone proves it.
 async fn send_approval<F, Fut>(
     http: &reqwest::Client,
     rpc_url: &str,
@@ -221,6 +223,9 @@ where
                 warn!(hashes = ?hashes, "Approval not mined yet; checking the chain");
             }
             None => {
+                if !nonce_still_ours(http, rpc_url, signer, &tx, &hashes).await {
+                    continue;
+                }
                 let network = match get_gas_price(http, rpc_url).await {
                     Ok(price) => price,
                     Err(error) => {
@@ -248,6 +253,40 @@ where
         }
     }
     await_state(is_set).await
+}
+
+/// Whether the approval's nonce is still its own to sign at again: the node
+/// holds one of its `hashes`, or counts nothing pending at the nonce.
+/// Otherwise another transaction may hold it, and a replacement would push
+/// that one out.
+async fn nonce_still_ours(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    signer: &PrivateKeySigner,
+    tx: &TxLegacy,
+    hashes: &[String],
+) -> bool {
+    for hash in hashes {
+        if matches!(transaction_known(http, rpc_url, hash).await, Ok(true)) {
+            return true;
+        }
+    }
+    matches!(get_nonce(http, rpc_url, &signer.address()).await, Ok(pending) if pending <= tx.nonce)
+}
+
+/// Whether the node knows a transaction (pending or mined).
+async fn transaction_known(http: &reqwest::Client, rpc_url: &str, hash: &str) -> Result<bool> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getTransactionByHash",
+        "params": [hash]
+    });
+    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
+        anyhow::bail!("eth_getTransactionByHash error: {err}");
+    }
+    Ok(resp.get("result").is_some_and(|result| !result.is_null()))
 }
 
 /// The first receipt found for one of `hashes` (and whether it succeeded),
@@ -694,6 +733,20 @@ mod tests {
                         sent.push(raw);
                         serde_json::json!({"result": hash})
                     }
+                    // The node holds every send; another transaction is
+                    // pending behind them.
+                    "eth_getTransactionByHash" => {
+                        let held = sent.iter().any(|raw| {
+                            format!(
+                                "{:#x}",
+                                alloy_primitives::keccak256(
+                                    hex::decode(raw.trim_start_matches("0x")).unwrap()
+                                )
+                            ) == request["params"][0].as_str().unwrap()
+                        });
+                        serde_json::json!({"result": held.then(|| serde_json::json!({}))})
+                    }
+                    "eth_getTransactionCount" => serde_json::json!({"result": "0x6"}),
                     // Only the third send is mined.
                     "eth_getTransactionReceipt" => {
                         let mined = sent.get(2).map(|raw| {
@@ -736,6 +789,46 @@ mod tests {
         assert_eq!(prices[1], NETWORK + NETWORK / 5);
         assert_eq!(prices[2], prices[1] + prices[1] / 10 + 1);
         assert!(prices.iter().all(|price| *price <= 3 * NETWORK));
+    }
+
+    #[tokio::test]
+    async fn an_approval_is_never_signed_again_over_a_transaction_holding_its_nonce() {
+        use std::sync::atomic::AtomicU64;
+        let sent = std::sync::Arc::new(AtomicU32::new(0));
+        let pending = std::sync::Arc::new(AtomicU64::new(5));
+        let node = {
+            let (sent, pending) = (sent.clone(), pending.clone());
+            mock_node(move |request| match request["method"].as_str().unwrap() {
+                "eth_gasPrice" => serde_json::json!({"result": "0x6fc23ac00"}),
+                "eth_sendRawTransaction" => {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({"result": "0x01"})
+                }
+                // The node dropped the approval and holds nothing of ours.
+                "eth_getTransactionByHash" | "eth_getTransactionReceipt" => {
+                    serde_json::json!({"result": null})
+                }
+                "eth_getTransactionCount" => serde_json::json!({
+                    "result": format!("{:#x}", pending.load(Ordering::SeqCst))
+                }),
+                other => panic!("unexpected RPC method {other}"),
+            })
+            .await
+        };
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let signer: PrivateKeySigner = format!("{:064x}", 1).parse().unwrap();
+        // Another transaction is pending at its nonce (4): sent once only.
+        send_approval(&http, &node, &signer, approval_tx(1), || async { Ok(true) })
+            .await
+            .unwrap();
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        // Nothing pending at its nonce: signed again for more gas.
+        sent.store(0, Ordering::SeqCst);
+        pending.store(4, Ordering::SeqCst);
+        send_approval(&http, &node, &signer, approval_tx(1), || async { Ok(true) })
+            .await
+            .unwrap();
+        assert!(sent.load(Ordering::SeqCst) > 1);
     }
 
     #[tokio::test]

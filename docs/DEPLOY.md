@@ -602,6 +602,10 @@ unsigned). Fees are set by the exchange when an order matches.
   Tokens for both V2 exchanges and the Neg Risk Adapter, USDC.e for the
   Collateral Onramp and pUSD for the Collateral Offramp. Fund the wallet with
   a little more POL than before (eight approvals on a fresh wallet).
+  Approvals are sent under the wallet's spend lock (waited for up to 30
+  seconds); one left unmined is signed again at its nonce for more gas (up
+  to three times the network's price), but only while the node holds one of
+  its transactions or counts nothing pending at its nonce.
 - The API then wraps the trading wallet's USDC.e into pUSD, at startup and
   every five minutes, so deposits become tradable without a restart. A wrap
   waits until no withdrawal from the wallet is unresolved and nothing it sent
@@ -612,15 +616,19 @@ unsigned). Fees are set by the exchange when an order matches.
   that waits is looked after every 30 seconds: sent again if the node dropped
   it, its gas raised when the network asks more or the node refuses it (up
   to three times the network's price), until its nonce is used, by it or, as
-  checks over two minutes find, by another transaction. A held lock whose
+  checks over two minutes find, by another transaction. Nothing is sent
+  while the node counts the wrap's nonce pending without holding the wrap
+  (another transaction holds it). A held lock whose
   database session stops answering is given up, that session is ended from
   another connection (a proxy can keep it alive at the server, holding the
   lock), and the lock is taken again. Any spend lock given up this way, or
   whose release does not answer within ten seconds, is freed the same way.
   After half an hour the
-  lock is let go with a warning; a restart lets go of it too. A withdrawal
-  still waits (503) while the node holds the wrap, and goes out once the
-  node has mined or dropped it. The log says "Wrapping USDC.e into pUSD";
+  lock is let go with a warning; a restart lets go of it too. From then on
+  the wrap is only watched, never sent again: one the node drops is let go,
+  and a later look wraps afresh under the lock. A withdrawal still waits
+  (503) while the node holds the wrap, and goes out once the node has mined
+  or dropped it. The log says "Wrapping USDC.e into pUSD";
   USDC.e left waiting for an hour is logged as a warning. The sweeper wraps
   for the signer selected at startup.
 - Cash, for equity, the circuit breaker and the vault balance, is the
@@ -686,9 +694,9 @@ unsigned). Fees are set by the exchange when an order matches.
   (they stay in the wallet) and listed in its `closed_via_resolution` event
   (metadata `unpaired`).
 - A break-even close neither extends nor ends the circuit breaker's run of
-  losses. A position traded in the other mode than the executor runs in now
-  (paper left over after a switch to live, or the reverse) is left out of
-  the breaker when it closes.
+  losses. A live position's close always counts in the breaker, live trading
+  switched off or not; a paper position's counts only while the executor
+  does not trade live, and one of unknown provenance never.
 - An arb signal is skipped while any position in its market is still active,
   read from the database (an entry still settling included), so a restart
   or a reconciled entry never lets a second pair into the same market.
