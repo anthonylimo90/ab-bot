@@ -1,2 +1,2 @@
-export { ConnectWalletModal, ConnectWalletButton } from './ConnectWalletModal';
-export { WalletLoginButton, WalletStatusButton } from './WalletButton';
+export { ConnectWalletModal } from './ConnectWalletModal';
+export { WalletLoginButton } from './WalletButton';

@@ -14,7 +14,6 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useWalletStore } from '@/stores/wallet-store';
-import { cn } from '@/lib/utils';
 
 interface ConnectWalletModalProps {
   open: boolean;
@@ -190,35 +189,5 @@ export function ConnectWalletModal({ open, onOpenChange }: ConnectWalletModalPro
         </form>
       </DialogContent>
     </Dialog>
-  );
-}
-
-// Button component that triggers the modal
-interface ConnectWalletButtonProps {
-  className?: string;
-  variant?: 'default' | 'outline' | 'ghost';
-  size?: 'default' | 'sm' | 'lg';
-}
-
-export function ConnectWalletButton({
-  className,
-  variant = 'default',
-  size = 'default',
-}: ConnectWalletButtonProps) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <>
-      <Button
-        variant={variant}
-        size={size}
-        onClick={() => setOpen(true)}
-        className={cn('gap-2', className)}
-      >
-        <Wallet className="h-4 w-4" />
-        Connect Wallet
-      </Button>
-      <ConnectWalletModal open={open} onOpenChange={setOpen} />
-    </>
   );
 }
