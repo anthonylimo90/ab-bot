@@ -12,9 +12,6 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Enable sqlx offline mode (uses pre-generated .sqlx cache)
-ENV SQLX_OFFLINE=true
-
 # --- Phase 1: Cache dependency compilation ---
 # Copy only manifests and lock file
 COPY Cargo.toml Cargo.lock ./

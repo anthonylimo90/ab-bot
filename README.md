@@ -102,7 +102,7 @@ DYNAMIC_TUNER_REDIS_URL=redis://dynamic_tuner:<tuner_password>@redis:6379
 DYNAMIC_CONFIG_REDIS_URL=redis://dynamic_subscriber:<subscriber_password>@redis:6379
 
 # External APIs
-POLYMARKET_API_URL=https://clob.polymarket.com
+POLYMARKET_CLOB_URL=https://clob.polymarket.com
 POLYGON_RPC_URL=https://polygon-rpc.com
 
 # Email
@@ -225,9 +225,11 @@ cargo clippy --all-targets -- -D warnings
 
 ### Migrations
 
+The API server applies `migrations/` at startup (unless `SKIP_MIGRATIONS=true`).
+To apply them by hand:
+
 ```bash
 DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot sqlx migrate run
-DATABASE_URL=postgres://abbot:abbot_secret@localhost:5432/ab_bot cargo sqlx prepare --workspace
 ```
 
 ## Deployment

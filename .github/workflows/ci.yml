@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  SQLX_OFFLINE: true
 
 jobs:
   # ==========================================================================
@@ -36,8 +35,6 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/**'
-              - 'src/**'
-              - '.sqlx/**'
               - 'migrations/**'
               - '.github/workflows/ci.yml'
             dashboard:
