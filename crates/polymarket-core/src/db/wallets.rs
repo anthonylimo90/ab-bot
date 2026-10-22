@@ -47,7 +47,9 @@ impl WalletRepository {
                 hourly_distribution = EXCLUDED.hourly_distribution,
                 activity_spread = EXCLUDED.activity_spread,
                 total_volume = EXCLUDED.total_volume,
-                first_trade = EXCLUDED.first_trade,
+                -- Features come from the newest page of transfers; an earlier
+                -- first trade already known is kept.
+                first_trade = LEAST(wallet_features.first_trade, EXCLUDED.first_trade),
                 last_trade = EXCLUDED.last_trade,
                 updated_at = NOW()
             "#,

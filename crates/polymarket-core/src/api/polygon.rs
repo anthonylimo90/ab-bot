@@ -624,7 +624,10 @@ fn asset_transfers_params(
         "toBlock": to_block.map(|b| format!("0x{:x}", b)).unwrap_or_else(|| "latest".to_string()),
         "category": ["erc20"],
         "withMetadata": true,
-        "maxCount": "0x3e8" // 1000
+        "maxCount": "0x3e8", // 1000
+        // Newest first: one page must describe the wallet's current behaviour,
+        // not the first 1000 transfers it ever made (Alchemy defaults to oldest).
+        "order": "desc"
     });
     filter[direction.filter_key()] = serde_json::Value::String(address.to_string());
     serde_json::json!([filter])
@@ -818,6 +821,7 @@ mod tests {
         assert_eq!(filter["fromBlock"], "0x0");
         assert_eq!(filter["toBlock"], "latest");
         assert_eq!(filter["maxCount"], "0x3e8");
+        assert_eq!(filter["order"], "desc");
         assert_eq!(filter["category"][0], "erc20");
 
         let to = asset_transfers_params("0xabc", TransferDirection::To, Some(255), Some(4096));
