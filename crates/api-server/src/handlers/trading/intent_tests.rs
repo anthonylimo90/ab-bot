@@ -155,6 +155,45 @@ async fn exchange_snapshots_record_only_confirmed_quantities_and_keep_progress(p
 }
 
 #[sqlx::test(migrations = false)]
+async fn an_order_closed_by_the_exchange_keeps_its_fills_and_its_close(pool: PgPool) {
+    setup(&pool).await;
+    for closed in [
+        "CANCELED_MARKET_RESOLVED",
+        "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+        "INVALID",
+    ] {
+        let (id, _) = reserve_order(&pool, &order(), true, Some("0xreview"), Decimal::from(1000))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE orders SET exchange_order_id='exchange-id', status='open' WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut snapshot = polymarket_core::api::clob::ExchangeOrder {
+            associate_trades: vec![],
+            id: "exchange-id".into(),
+            status: closed.into(),
+            original_size: "10".into(),
+            size_matched: "4".into(),
+        };
+        let row = load_order(&pool, id).await.unwrap();
+        apply_exchange_snapshot(&pool, &row, &snapshot)
+            .await
+            .unwrap();
+        let stored = load_order(&pool, id).await.unwrap();
+        assert_eq!(stored.status, "cancelled", "{closed}");
+        assert_eq!(stored.filled_quantity, Decimal::from(4));
+        // A later, stale answer does not reopen it.
+        snapshot.status = "LIVE".into();
+        apply_exchange_snapshot(&pool, &stored, &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(load_order(&pool, id).await.unwrap().status, "cancelled");
+    }
+}
+
+#[sqlx::test(migrations = false)]
 async fn preflight_failure_rejects_only_intents_that_never_crossed_submission_boundary(
     pool: PgPool,
 ) {

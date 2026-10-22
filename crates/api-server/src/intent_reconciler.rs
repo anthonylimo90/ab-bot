@@ -66,8 +66,11 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     // Orders signed by browser wallets cannot be read back from the exchange:
     // the server keeps no credentials for those wallets. One whose outcome
     // is unknown can no longer fill once its expiry has long passed, so it
-    // stops fencing its wallet; nothing here depends on its outcome.
-    let expired = sqlx::query("UPDATE execution_intents i SET status='reconciled',updated_at=NOW() WHERE i.status IN ('submitting','unknown') AND ($1::text IS NULL OR LOWER(i.signed_order->>'maker')<>LOWER($1)) AND EXISTS(SELECT 1 FROM pending_wallet_orders p WHERE p.id=i.id) AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.id=i.id) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AND (CASE WHEN i.signed_order->>'expiration' ~ '^[0-9]{1,15}$' THEN (i.signed_order->>'expiration')::bigint END) BETWEEN 1 AND EXTRACT(EPOCH FROM NOW())::bigint-$2")
+    // stops fencing its wallet; nothing here depends on its outcome. The
+    // engine's own orders never match: they are signed by the trading
+    // wallet without an expiry (fill-or-kill or good-till-cancelled), and
+    // carry a position link or an order row.
+    let expired = sqlx::query("UPDATE execution_intents i SET status='reconciled',updated_at=NOW() WHERE i.status IN ('submitting','unknown') AND ($1::text IS NULL OR LOWER(i.signed_order->>'maker')<>LOWER($1)) AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.id=i.id) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AND (CASE WHEN i.signed_order->>'expiration' ~ '^[0-9]{1,15}$' THEN (i.signed_order->>'expiration')::bigint END) BETWEEN 1 AND EXTRACT(EPOCH FROM NOW())::bigint-$2")
         .bind(wallet.as_deref())
         .bind(EXPIRED_WALLET_ORDER_GRACE_SECS)
         .execute(&mut *tx)
@@ -188,7 +191,9 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
                     && intent.position_id.is_none()
                     && matches!(intent.status.as_str(), "submitting" | "unknown")
                 {
-                    sqlx::query("UPDATE execution_intents SET status='acknowledged',exchange_order_id=$2,updated_at=NOW() WHERE id=$1 AND status IN ('submitting','unknown')")
+                    // The order row takes the exchange's id too, so the order
+                    // can be refreshed and cancelled by it.
+                    sqlx::query("WITH promoted AS (UPDATE execution_intents SET status='acknowledged',exchange_order_id=$2,updated_at=NOW() WHERE id=$1 AND status IN ('submitting','unknown') RETURNING id) UPDATE orders SET exchange_order_id=$2,updated_at=NOW() WHERE id IN (SELECT id FROM promoted)")
                         .bind(intent.id)
                         .bind(&snapshot.id)
                         .execute(&state.pool)
@@ -868,9 +873,18 @@ mod tests {
         )
         .await;
         let (state, maker) = live_state(&pool, clob).await;
-        // Its row keeps the cash reserved while it rests.
+        // Its row keeps the cash reserved while it rests. Journaled under
+        // its own hash, it is found under the id the answer named.
         let manual = journal(&pool, &maker, None, "unknown", 1).await;
-        sqlx::query("INSERT INTO orders(id,status,execution_mode,quantity,filled_quantity) VALUES($1,'pending','live',10,0)")
+        sqlx::query(
+            "UPDATE execution_intents SET exchange_order_id='0xhash',response=$2 WHERE id=$1",
+        )
+        .bind(manual)
+        .bind(serde_json::json!({"success": false, "orderID": "exchange"}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO orders(id,status,execution_mode,quantity,filled_quantity,exchange_order_id) VALUES($1,'pending','live',10,0,'0xhash')")
             .bind(manual)
             .execute(&pool)
             .await
@@ -900,6 +914,40 @@ mod tests {
                     .unwrap();
             assert_eq!(status, expected);
         }
+        // Both the intent and the order row now carry the exchange's id.
+        let ids: (String, String) = sqlx::query_as("SELECT i.exchange_order_id, o.exchange_order_id FROM execution_intents i JOIN orders o USING(id) WHERE id=$1")
+            .bind(manual)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, ("exchange".to_string(), "exchange".to_string()));
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn trades_under_the_named_id_keep_an_unfound_order_fenced(pool: PgPool) {
+        let (clob, server) = exchange(
+            None,
+            serde_json::json!([{"id":"t","taker_order_id":"exchange","status":"MATCHED"}]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let id = journal(&pool, &maker, None, "unknown", 20).await;
+        sqlx::query(
+            "UPDATE execution_intents SET exchange_order_id='0xhash',response=$2 WHERE id=$1",
+        )
+        .bind(id)
+        .bind(serde_json::json!({"success": false, "orderID": "exchange"}))
+        .execute(&pool)
+        .await
+        .unwrap();
+        reconcile(&state).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown");
         server.abort();
     }
 
@@ -944,17 +992,15 @@ mod tests {
         let (state, maker) = live_state(&pool, clob).await;
         let now = Utc::now().timestamp();
         let mut ids = Vec::new();
-        for (wallet, expiration, browser) in [
-            ("0xbrowser", now - 3600, true),
+        for (wallet, expiration) in [
+            ("0xbrowser", now - 3600),
             // Expired moments ago, still within the grace.
-            ("0xbrowser", now - 60, true),
-            ("0xbrowser", now + 3600, true),
-            // Never expires: a fill-or-kill order.
-            ("0xbrowser", 0, true),
+            ("0xbrowser", now - 60),
+            ("0xbrowser", now + 3600),
+            // Never expires: how the engine signs every order.
+            ("0xbrowser", 0),
             // The trading wallet's own orders are read from the exchange.
-            (maker.as_str(), now - 3600, true),
-            // Not prepared for a browser wallet: never released this way.
-            ("0xelsewhere", now - 3600, false),
+            (maker.as_str(), now - 3600),
         ] {
             let id = Uuid::new_v4();
             sqlx::query("INSERT INTO execution_intents(id,market_id,exchange_order_id,signed_order,status) VALUES($1,'token','hash',$2,'unknown')")
@@ -963,8 +1009,28 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-            if browser {
-                sqlx::query("INSERT INTO pending_wallet_orders(id) VALUES($1)")
+            ids.push(id);
+        }
+        // One with a position link or an order row is never released so.
+        for (link, order) in [(true, false), (false, true)] {
+            let id = Uuid::new_v4();
+            sqlx::query("INSERT INTO execution_intents(id,market_id,exchange_order_id,signed_order,status) VALUES($1,'token','hash',$2,'unknown')")
+                .bind(id)
+                .bind(serde_json::json!({"maker": "0xbrowser", "tokenId": "token", "expiration": (now - 3600).to_string()}))
+                .execute(&pool)
+                .await
+                .unwrap();
+            if link {
+                let position = live_position(&state, "0xbrowser", 48, 0).await;
+                sqlx::query("INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity,settled) VALUES($1,$2,'yes','buy',10,TRUE)")
+                    .bind(id)
+                    .bind(position.id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if order {
+                sqlx::query("INSERT INTO orders(id,status,execution_mode,quantity,filled_quantity) VALUES($1,'pending','live',10,0)")
                     .bind(id)
                     .execute(&pool)
                     .await
@@ -987,6 +1053,7 @@ mod tests {
             statuses,
             [
                 "reconciled",
+                "unknown",
                 "unknown",
                 "unknown",
                 "unknown",

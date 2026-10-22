@@ -22,10 +22,9 @@ pub(crate) async fn setup(pool: &PgPool) -> PositionService {
             current_price NUMERIC
         );
         CREATE TABLE markets(id TEXT, yes_price NUMERIC, no_price NUMERIC);
-        CREATE TABLE orders(quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT, status TEXT,id UUID, execution_mode TEXT NOT NULL DEFAULT 'unknown', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ);
+        CREATE TABLE orders(quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT, status TEXT,id UUID, execution_mode TEXT NOT NULL DEFAULT 'unknown', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ, exchange_order_id TEXT);
 
         CREATE TABLE quant_signals(id UUID, kind TEXT, direction TEXT, metadata JSONB);
-        CREATE TABLE pending_wallet_orders(id UUID PRIMARY KEY);
     "#).await.unwrap();
     pool.execute(include_str!(
         "../../../../migrations/069_execution_intents.sql"
