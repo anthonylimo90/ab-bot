@@ -60,14 +60,15 @@ fn encode_set_approval_for_all(operator: Address) -> Bytes {
     Bytes::from(data)
 }
 
-/// RPC helper to get the current nonce for an address.
+/// RPC helper to get the next nonce for an address, counting transactions
+/// still pending so an approval never replaces one (e.g. a withdrawal).
 async fn get_nonce(http: &reqwest::Client, rpc_url: &str, address: &Address) -> Result<u64> {
     let addr = format!("{:?}", address);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "eth_getTransactionCount",
-        "params": [addr, "latest"]
+        "params": [addr, "pending"]
     });
 
     let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;

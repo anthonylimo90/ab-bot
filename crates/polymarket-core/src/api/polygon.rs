@@ -31,9 +31,31 @@ pub struct PolygonClient {
     http_client: reqwest::Client,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransactionReceiptSummary {
+/// A signed transaction whose hash is known before it is broadcast, so it can
+/// be journaled first and found on chain whatever happens to the broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedTransaction {
+    /// `0x`-prefixed RLP encoding, ready for `eth_sendRawTransaction`.
+    pub raw: String,
+    /// `0x`-prefixed keccak-256 of `raw`.
     pub tx_hash: String,
+    pub nonce: u64,
+}
+
+/// What the node said about a broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastOutcome {
+    /// The node holds the transaction (newly accepted or already known).
+    Accepted,
+    /// The node refused it; it was not propagated. Carries the node's reason.
+    Rejected(String),
+}
+
+/// A mined transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinedTransaction {
+    /// `false` when the transaction reverted (it was mined but did nothing).
+    pub success: bool,
     pub block_number: Option<u64>,
     pub gas_used: Option<u64>,
 }
@@ -251,13 +273,14 @@ impl PolygonClient {
         Ok(balance as f64 / 1_000_000.0)
     }
 
-    /// Submit a signed USDC.e transfer transaction and return the tx hash.
-    pub async fn submit_usdc_transfer(
+    /// Sign a USDC.e transfer at the sender's next pending nonce, after
+    /// checking it holds enough POL for gas. Nothing is sent.
+    pub async fn prepare_usdc_transfer(
         &self,
         signer: &PrivateKeySigner,
         to_address: &str,
         amount_units: u128,
-    ) -> Result<String> {
+    ) -> Result<SignedTransaction> {
         if amount_units == 0 {
             return Err(Error::Api {
                 message: "Transfer amount must be greater than zero".to_string(),
@@ -273,7 +296,9 @@ impl PolygonClient {
         let sender = signer.address();
 
         let pol_balance = self.get_native_balance_wei(&sender).await?;
-        let nonce = self.get_nonce(&sender).await?;
+        // "pending" counts transactions still in the mempool, so a transfer
+        // never reuses (and replaces) the nonce of one not yet mined.
+        let nonce = self.get_nonce(&sender, "pending").await?;
         let gas_price = self.get_gas_price_wei().await?;
         let gas_price = gas_price + gas_price / 5;
         let required_gas = gas_price.saturating_mul(DEFAULT_ERC20_TRANSFER_GAS_LIMIT as u128);
@@ -299,84 +324,126 @@ impl PolygonClient {
             input: encode_erc20_transfer(recipient, U256::from(amount_units)),
         };
 
-        self.send_raw_tx(signer, tx).await
+        sign_legacy_transaction(signer, tx)
     }
 
-    /// Wait for a Polygon transaction to be mined and return its receipt summary.
-    pub async fn wait_for_transaction(
-        &self,
-        tx_hash: &str,
-        max_attempts: usize,
-        poll_interval: Duration,
-    ) -> Result<TransactionReceiptSummary> {
-        for _ in 0..max_attempts {
-            tokio::time::sleep(poll_interval).await;
+    /// Send a signed transaction. An `Err` is a transport failure: the node
+    /// may or may not have received it.
+    pub async fn broadcast(&self, tx: &SignedTransaction) -> Result<BroadcastOutcome> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [tx.raw]
+        });
 
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_getTransactionReceipt",
-                "params": [tx_hash]
-            });
+        let response: serde_json::Value = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
 
-            let response: serde_json::Value = self
-                .http_client
-                .post(&self.rpc_url)
-                .json(&body)
-                .send()
-                .await?
-                .json()
-                .await?;
-
-            if let Some(err) = response.get("error") {
-                let message = err
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown RPC error");
-                return Err(Error::Api {
-                    message: format!("eth_getTransactionReceipt RPC error: {}", message),
-                    status: None,
-                });
-            }
-
-            let Some(receipt) = response.get("result") else {
-                continue;
-            };
-            if receipt.is_null() {
-                continue;
-            }
-
-            let status = receipt
-                .get("status")
+        if let Some(err) = response.get("error") {
+            let message = err
+                .get("message")
                 .and_then(|value| value.as_str())
-                .unwrap_or("0x0");
-            if status != "0x1" {
-                return Err(Error::Api {
-                    message: format!("Transaction {} reverted on-chain", tx_hash),
-                    status: None,
-                });
+                .unwrap_or("unknown RPC error")
+                .to_string();
+            if message.to_ascii_lowercase().contains("already known") {
+                return Ok(BroadcastOutcome::Accepted);
             }
+            return Ok(BroadcastOutcome::Rejected(message));
+        }
+        match response.get("result").and_then(|value| value.as_str()) {
+            Some(hash) if hash.eq_ignore_ascii_case(&tx.tx_hash) => Ok(BroadcastOutcome::Accepted),
+            Some(hash) => Err(Error::Api {
+                message: format!("Node reported hash {hash} for transaction {}", tx.tx_hash),
+                status: None,
+            }),
+            None => Err(Error::Api {
+                message: "Missing tx hash from eth_sendRawTransaction".to_string(),
+                status: None,
+            }),
+        }
+    }
 
-            return Ok(TransactionReceiptSummary {
-                tx_hash: tx_hash.to_string(),
-                block_number: receipt
-                    .get("blockNumber")
-                    .and_then(|value| value.as_str())
-                    .and_then(parse_hex_u64),
-                gas_used: receipt
-                    .get("gasUsed")
-                    .and_then(|value| value.as_str())
-                    .and_then(parse_hex_u64),
+    /// The receipt of a transaction, or `None` while it is not mined.
+    pub async fn transaction_receipt(&self, tx_hash: &str) -> Result<Option<MinedTransaction>> {
+        let receipt = self
+            .rpc_value("eth_getTransactionReceipt", serde_json::json!([tx_hash]))
+            .await?;
+        if receipt.is_null() {
+            return Ok(None);
+        }
+        let status = receipt.get("status").and_then(|value| value.as_str());
+        Ok(Some(MinedTransaction {
+            success: status == Some("0x1"),
+            block_number: receipt
+                .get("blockNumber")
+                .and_then(|value| value.as_str())
+                .and_then(parse_hex_u64),
+            gas_used: receipt
+                .get("gasUsed")
+                .and_then(|value| value.as_str())
+                .and_then(parse_hex_u64),
+        }))
+    }
+
+    /// Whether the node knows the transaction at all (pending or mined).
+    pub async fn transaction_known(&self, tx_hash: &str) -> Result<bool> {
+        let tx = self
+            .rpc_value("eth_getTransactionByHash", serde_json::json!([tx_hash]))
+            .await?;
+        Ok(!tx.is_null())
+    }
+
+    /// Number of transactions from `address` that are mined (`"latest"`) or
+    /// also pending (`"pending"`): the next nonce in each view.
+    pub async fn transaction_count(&self, address: &str, block_tag: &str) -> Result<u64> {
+        let address = Address::from_str(address).map_err(|e| Error::Api {
+            message: format!("Invalid address: {}", e),
+            status: None,
+        })?;
+        self.get_nonce(&address, block_tag).await
+    }
+
+    /// Call `method` and return its `result`, which may be JSON null.
+    async fn rpc_value(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+        let response: serde_json::Value = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(err) = response.get("error") {
+            let message = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown RPC error");
+            return Err(Error::Api {
+                message: format!("{method} RPC error: {message}"),
+                status: None,
             });
         }
-
-        Err(Error::Api {
-            message: format!(
-                "Transaction {} not mined after {} polls",
-                tx_hash, max_attempts
-            ),
-            status: None,
-        })
+        Ok(response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     async fn get_erc20_balance_units(
@@ -439,8 +506,8 @@ impl PolygonClient {
         Ok(response.json().await?)
     }
 
-    async fn get_nonce(&self, address: &Address) -> Result<u64> {
-        let params = serde_json::json!([format!("{:?}", address), "latest"]);
+    async fn get_nonce(&self, address: &Address, block_tag: &str) -> Result<u64> {
+        let params = serde_json::json!([format!("{:?}", address), block_tag]);
         let response: JsonRpcResponse<String> =
             self.rpc_call("eth_getTransactionCount", params).await?;
 
@@ -482,60 +549,29 @@ impl PolygonClient {
             status: None,
         })
     }
+}
 
-    async fn send_raw_tx(&self, signer: &PrivateKeySigner, tx: TxLegacy) -> Result<String> {
-        use alloy_consensus::transaction::RlpEcdsaTx;
-        use alloy_network::TxSignerSync;
-        use alloy_primitives::bytes::BytesMut;
+/// Sign a legacy transaction and compute its hash locally.
+fn sign_legacy_transaction(signer: &PrivateKeySigner, tx: TxLegacy) -> Result<SignedTransaction> {
+    use alloy_consensus::transaction::RlpEcdsaTx;
+    use alloy_network::TxSignerSync;
+    use alloy_primitives::bytes::BytesMut;
 
-        let mut tx = tx;
-        let sig = signer
-            .sign_transaction_sync(&mut tx)
-            .map_err(|e| Error::Api {
-                message: format!("Failed to sign transaction: {}", e),
-                status: None,
-            })?;
+    let mut tx = tx;
+    let sig = signer
+        .sign_transaction_sync(&mut tx)
+        .map_err(|e| Error::Api {
+            message: format!("Failed to sign transaction: {}", e),
+            status: None,
+        })?;
 
-        let mut encoded = BytesMut::new();
-        tx.rlp_encode_signed(&sig, &mut encoded);
-
-        let raw_hex = format!("0x{}", hex::encode(&encoded));
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_sendRawTransaction",
-            "params": [raw_hex]
-        });
-
-        let response: serde_json::Value = self
-            .http_client
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        if let Some(err) = response.get("error") {
-            let message = err
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown RPC error");
-            return Err(Error::Api {
-                message: format!("eth_sendRawTransaction error: {}", message),
-                status: None,
-            });
-        }
-
-        response
-            .get("result")
-            .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
-            .ok_or_else(|| Error::Api {
-                message: "Missing tx hash from eth_sendRawTransaction".to_string(),
-                status: None,
-            })
-    }
+    let mut encoded = BytesMut::new();
+    tx.rlp_encode_signed(&sig, &mut encoded);
+    Ok(SignedTransaction {
+        raw: format!("0x{}", hex::encode(&encoded)),
+        tx_hash: format!("{:#x}", alloy_primitives::keccak256(&encoded)),
+        nonce: tx.nonce,
+    })
 }
 
 fn encode_erc20_transfer(recipient: Address, amount: U256) -> Bytes {
@@ -917,5 +953,35 @@ mod tests {
 
         let token_ids = extract_ctf_token_ids(&log).expect("batch transfer should parse");
         assert_eq!(token_ids, vec!["7".to_string(), "9".to_string()]);
+    }
+
+    #[test]
+    fn signed_transfer_hash_is_the_hash_the_chain_will_use() {
+        use alloy_consensus::{SignableTransaction, TxLegacy};
+        use alloy_network::TxSignerSync;
+        use alloy_primitives::{Address, TxKind, U256};
+        use std::str::FromStr;
+
+        let signer: alloy_signer_local::PrivateKeySigner =
+            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+                .parse()
+                .unwrap();
+        let tx = TxLegacy {
+            chain_id: Some(super::POLYGON_CHAIN_ID),
+            nonce: 7,
+            gas_price: 30_000_000_000,
+            gas_limit: super::DEFAULT_ERC20_TRANSFER_GAS_LIMIT,
+            to: TxKind::Call(Address::from_str(super::POLYGON_USDC_ADDRESS).unwrap()),
+            value: U256::ZERO,
+            input: super::encode_erc20_transfer(Address::ZERO, U256::from(1_000_000u64)),
+        };
+        let signed = super::sign_legacy_transaction(&signer, tx.clone()).unwrap();
+
+        let mut reference = tx;
+        let signature = signer.sign_transaction_sync(&mut reference).unwrap();
+        let expected = reference.into_signed(signature);
+        assert_eq!(signed.tx_hash, format!("{:#x}", expected.hash()));
+        assert_eq!(signed.nonce, 7);
+        assert!(signed.raw.starts_with("0x"));
     }
 }

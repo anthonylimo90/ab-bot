@@ -59,6 +59,7 @@ pub mod trade_events;
 pub mod wallet_harvester;
 pub mod wallet_inventory;
 pub mod websocket;
+pub mod withdrawals;
 pub mod workspace_scope;
 
 pub use accounting_ledger::{spawn_account_snapshot_calculator, AccountSnapshotConfig};
@@ -536,6 +537,8 @@ impl ApiServer {
         let position_reconciler_config = PositionReconcilerConfig::from_env();
         spawn_position_reconciler(position_reconciler_config, state.pool.clone());
         intent_reconciler::spawn(state.clone());
+        // Resolve every journaled on-chain withdrawal from the chain.
+        crate::withdrawals::spawn_withdrawal_reconciler(state.clone());
 
         // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
         let account_snapshot_config = AccountSnapshotConfig::from_env();

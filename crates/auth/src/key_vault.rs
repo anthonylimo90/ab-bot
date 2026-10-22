@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -105,7 +105,9 @@ impl WalletKey {
         })
     }
 
-    /// Derive a 256-bit key from the master key and salt using SHA-256.
+    /// Derive a 256-bit key from the master key and salt using SHA-256. This
+    /// is not a password hash: the master key must itself be a high-entropy
+    /// secret (see [`KeyVault::from_env`]).
     fn derive_key(key: &[u8], salt: &[u8]) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(key);
@@ -118,7 +120,8 @@ impl WalletKey {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum KeyVaultProvider {
-    /// Store keys in environment variables (development only).
+    /// Read keys from `WALLET_KEY_<ADDRESS>` environment variables. Read-only:
+    /// storing a key fails, because it would not survive a restart.
     Environment,
     /// Store keys in encrypted file.
     EncryptedFile { path: PathBuf },
@@ -139,6 +142,8 @@ pub struct KeyVault {
     master_key: Vec<u8>,
     /// In-memory cache of loaded keys.
     cache: Arc<RwLock<HashMap<String, WalletKey>>>,
+    /// Serializes read-modify-write cycles of the vault file in this process.
+    file_lock: tokio::sync::Mutex<()>,
 }
 
 impl KeyVault {
@@ -148,6 +153,7 @@ impl KeyVault {
             provider,
             master_key,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            file_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -155,6 +161,12 @@ impl KeyVault {
     pub fn from_env() -> Result<Self> {
         let master_key = std::env::var("VAULT_MASTER_KEY")
             .context("VAULT_MASTER_KEY environment variable not set")?;
+        if master_key.len() < 32 {
+            warn!(
+                "VAULT_MASTER_KEY is shorter than 32 characters; use a random secret \
+                 (e.g. openssl rand -base64 32)"
+            );
+        }
 
         let provider = match std::env::var("VAULT_PROVIDER").as_deref() {
             Ok("aws") => {
@@ -180,10 +192,14 @@ impl KeyVault {
 
         match &self.provider {
             KeyVaultProvider::Environment => {
-                warn!("Storing key in environment is not persistent");
+                return Err(anyhow!(
+                    "The environment key vault is read-only (keys come from WALLET_KEY_<ADDRESS> \
+                     variables); set VAULT_PROVIDER=file and VAULT_MASTER_KEY to store keys"
+                ));
             }
             KeyVaultProvider::EncryptedFile { path } => {
-                self.store_to_file(path, address, &wallet_key).await?;
+                self.store_to_file(path, &address.to_lowercase(), &wallet_key)
+                    .await?;
             }
             KeyVaultProvider::Memory => {
                 debug!("Storing key in memory");
@@ -260,20 +276,26 @@ impl KeyVault {
         }
     }
 
-    /// Check if a wallet key exists.
+    /// Check if a wallet key exists, in the cache or in persistent storage.
     pub async fn has_wallet_key(&self, address: &str) -> bool {
-        let address_lower = address.to_lowercase();
-
-        let cache = self.cache.read().await;
-        cache.contains_key(&address_lower)
+        matches!(self.get_wallet_key(address).await, Ok(Some(_)))
     }
 
-    /// Remove a wallet key.
+    /// Remove a wallet key from persistent storage and the cache.
     pub async fn remove_wallet_key(&self, address: &str) -> Result<bool> {
         let address_lower = address.to_lowercase();
 
+        // Persistent storage first: a key that stays on disk would come back
+        // on the next restart.
+        let removed_from_file = match &self.provider {
+            KeyVaultProvider::EncryptedFile { path } => {
+                self.remove_from_file(path, &address_lower).await?
+            }
+            _ => false,
+        };
+
         let mut cache = self.cache.write().await;
-        let removed = cache.remove(&address_lower).is_some();
+        let removed = cache.remove(&address_lower).is_some() || removed_from_file;
 
         if removed {
             info!(address = %address, "Wallet key removed");
@@ -282,7 +304,7 @@ impl KeyVault {
         Ok(removed)
     }
 
-    /// List all stored wallet addresses.
+    /// List the wallet addresses whose keys are currently cached.
     pub async fn list_wallet_addresses(&self) -> Vec<String> {
         let cache = self.cache.read().await;
         cache.keys().cloned().collect()
@@ -310,13 +332,8 @@ impl KeyVault {
         }
     }
 
-    async fn load_from_file(&self, path: &PathBuf, address: &str) -> Result<Option<WalletKey>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        let content = tokio::fs::read_to_string(path).await?;
-        let keys: HashMap<String, StoredKey> = serde_json::from_str(&content)?;
+    async fn load_from_file(&self, path: &Path, address: &str) -> Result<Option<WalletKey>> {
+        let keys = read_vault_file(path).await?;
 
         if let Some(stored) = keys.get(address) {
             let wallet_key = WalletKey {
@@ -336,29 +353,95 @@ impl KeyVault {
         }
     }
 
-    async fn store_to_file(&self, path: &PathBuf, address: &str, key: &WalletKey) -> Result<()> {
+    async fn store_to_file(&self, path: &Path, address: &str, key: &WalletKey) -> Result<()> {
         use base64::Engine;
 
-        let mut keys: HashMap<String, StoredKey> = if path.exists() {
-            let content = tokio::fs::read_to_string(path).await?;
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-
+        let _guard = self.file_lock.lock().await;
+        // An unreadable vault is an error, never an empty one: rewriting it
+        // would destroy every other key it holds.
+        let mut keys = read_vault_file(path).await?;
         keys.insert(
-            address.to_lowercase(),
+            address.to_string(),
             StoredKey {
                 encrypted_key: base64::engine::general_purpose::STANDARD.encode(&key.encrypted_key),
                 salt: base64::engine::general_purpose::STANDARD.encode(&key.salt),
             },
         );
-
-        let content = serde_json::to_string_pretty(&keys)?;
-        tokio::fs::write(path, content).await?;
-
-        Ok(())
+        write_vault_file(path, &keys).await
     }
+
+    async fn remove_from_file(&self, path: &Path, address: &str) -> Result<bool> {
+        let _guard = self.file_lock.lock().await;
+        let mut keys = read_vault_file(path).await?;
+        if keys.remove(address).is_none() {
+            return Ok(false);
+        }
+        write_vault_file(path, &keys).await?;
+        Ok(true)
+    }
+}
+
+/// Read the vault file; empty when it does not exist yet.
+async fn read_vault_file(path: &Path) -> Result<HashMap<String, StoredKey>> {
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read vault file {path:?}"))
+        }
+    };
+    serde_json::from_str(&content)
+        .with_context(|| format!("Vault file {path:?} is not a valid key store"))
+}
+
+/// Replace the vault file atomically: the new content is written to a
+/// sibling file readable only by its owner, flushed, and renamed over the old
+/// one, so a crash leaves either the old or the new vault, never a torn one.
+async fn write_vault_file(path: &Path, keys: &HashMap<String, StoredKey>) -> Result<()> {
+    let content = serde_json::to_vec_pretty(keys)?;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use rand::Rng;
+        use std::io::Write;
+
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("Vault path {path:?} has no file name"))?
+            .to_string_lossy()
+            .into_owned();
+        let tmp = dir.join(format!(
+            ".{name}.{:016x}.tmp",
+            rand::thread_rng().gen::<u64>()
+        ));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let written = (|| -> std::io::Result<()> {
+            let mut file = options.open(&tmp)?;
+            file.write_all(&content)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(&dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("Failed to write vault file {path:?}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow!("Vault write task failed: {e}"))?
 }
 
 #[derive(Serialize, Deserialize)]
@@ -422,6 +505,86 @@ mod tests {
         assert_eq!(addresses.len(), 2);
         assert!(addresses.contains(&"0xaaa".to_string()));
         assert!(addresses.contains(&"0xbbb".to_string()));
+    }
+
+    fn temp_vault_path(name: &str) -> PathBuf {
+        use rand::Rng;
+        let dir = std::env::temp_dir().join(format!(
+            "key-vault-test-{name}-{:016x}",
+            rand::thread_rng().gen::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("vault.enc")
+    }
+
+    fn file_vault(path: &Path) -> KeyVault {
+        KeyVault::new(
+            KeyVaultProvider::EncryptedFile {
+                path: path.to_path_buf(),
+            },
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn file_vault_persists_and_removes_keys_across_restarts() {
+        let path = temp_vault_path("persist");
+        let vault = file_vault(&path);
+        vault.store_wallet_key("0xAAA", b"key-a").await.unwrap();
+        vault.store_wallet_key("0xbbb", b"key-b").await.unwrap();
+
+        // A fresh process (empty cache) sees both keys.
+        let restarted = file_vault(&path);
+        assert!(restarted.has_wallet_key("0xaaa").await);
+        assert_eq!(
+            restarted.get_wallet_key("0xBBB").await.unwrap(),
+            Some(b"key-b".to_vec())
+        );
+
+        // Removal reaches the file, not just the cache, and spares other keys.
+        assert!(restarted.remove_wallet_key("0xAAA").await.unwrap());
+        let again = file_vault(&path);
+        assert_eq!(again.get_wallet_key("0xaaa").await.unwrap(), None);
+        assert!(!again.has_wallet_key("0xaaa").await);
+        assert_eq!(
+            again.get_wallet_key("0xbbb").await.unwrap(),
+            Some(b"key-b".to_vec())
+        );
+        assert!(!again.remove_wallet_key("0xaaa").await.unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "vault file must be owner-only");
+        }
+        // No temporary files are left behind.
+        let entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(entries, 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_vault_file_is_never_overwritten() {
+        let path = temp_vault_path("corrupt");
+        std::fs::write(&path, "{\"0xaaa\": {\"encrypted_key\": \"trunc").unwrap();
+        let vault = file_vault(&path);
+
+        assert!(vault.store_wallet_key("0xbbb", b"key-b").await.is_err());
+        assert!(vault.remove_wallet_key("0xaaa").await.is_err());
+        assert!(vault.get_wallet_key("0xaaa").await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"0xaaa\": {\"encrypted_key\": \"trunc"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_environment_vault_refuses_keys_it_cannot_keep() {
+        let vault = KeyVault::new(KeyVaultProvider::Environment, b"test-master-key".to_vec());
+        assert!(vault.store_wallet_key("0x1234", b"key").await.is_err());
+        assert!(!vault.has_wallet_key("0x1234").await);
     }
 
     #[test]

@@ -11,15 +11,6 @@ async fn personal_wallet_preferences_do_not_change_the_workspace_signer(pool: Pg
         .store_wallet_key(&bot_address, &hex::decode(KEY_ONE).unwrap())
         .await
         .unwrap();
-    pool.execute(
-        "CREATE TABLE workspaces (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), trading_wallet_address TEXT,
-        live_trading_enabled BOOLEAN DEFAULT true, exit_handler_enabled BOOLEAN DEFAULT false,
-        arb_auto_execute BOOLEAN DEFAULT false, created_at TIMESTAMPTZ DEFAULT NOW()
-    )",
-    )
-    .await
-    .unwrap();
     sqlx::query("INSERT INTO workspaces (trading_wallet_address) VALUES ($1)")
         .bind(&bot_address)
         .execute(&pool)
@@ -63,6 +54,54 @@ async fn personal_wallet_preferences_do_not_change_the_workspace_signer(pool: Pg
     );
 }
 
+#[sqlx::test(migrations = false)]
+async fn the_live_signer_keeps_its_key_while_its_trades_are_open(pool: PgPool) {
+    let [owner, _, _] = setup(&pool).await;
+    pool.execute(
+        "CREATE TABLE positions (held_yes_qty NUMERIC, held_no_qty NUMERIC, state SMALLINT);
+         CREATE TABLE execution_intents (status TEXT);
+         CREATE TABLE orders (execution_mode TEXT, status TEXT);
+         CREATE TABLE manual_inventory (execution_mode TEXT, quantity NUMERIC);",
+    )
+    .await
+    .unwrap();
+    let vault = vault();
+    let signer = request(KEY_ONE);
+    let personal = request(KEY_TWO);
+    register_wallet(&pool, &vault, owner, &signer)
+        .await
+        .unwrap();
+    register_wallet(&pool, &vault, owner, &personal)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (trading_wallet_address) VALUES ($1)")
+        .bind(signer.address.to_lowercase())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.execute("INSERT INTO positions VALUES (10, 0, 1)")
+        .await
+        .unwrap();
+
+    // Exits and reconciliation of the open position need the signer's key.
+    assert!(matches!(
+        disconnect_wallet(&pool, &vault, owner, &signer.address).await,
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(vault.has_wallet_key(&signer.address).await);
+    // Other wallets are not tied to the trading book.
+    disconnect_wallet(&pool, &vault, owner, &personal.address)
+        .await
+        .unwrap();
+
+    // Once flat, the signer can go.
+    pool.execute("DELETE FROM positions").await.unwrap();
+    disconnect_wallet(&pool, &vault, owner, &signer.address)
+        .await
+        .unwrap();
+    assert!(!vault.has_wallet_key(&signer.address).await);
+}
+
 // Public test keys only; never fund these addresses.
 const KEY_ONE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 const KEY_TWO: &str = "0000000000000000000000000000000000000000000000000000000000000002";
@@ -89,6 +128,15 @@ async fn setup(pool: &PgPool) -> [Uuid; 3] {
     pool.execute("CREATE TABLE users (id UUID PRIMARY KEY)")
         .await
         .unwrap();
+    pool.execute(
+        "CREATE TABLE workspaces (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(), trading_wallet_address TEXT,
+        live_trading_enabled BOOLEAN DEFAULT true, exit_handler_enabled BOOLEAN DEFAULT false,
+        arb_auto_execute BOOLEAN DEFAULT false, created_at TIMESTAMPTZ DEFAULT NOW()
+    )",
+    )
+    .await
+    .unwrap();
     pool.execute(include_str!(
         "../../../../../migrations/008_user_wallets.sql"
     ))

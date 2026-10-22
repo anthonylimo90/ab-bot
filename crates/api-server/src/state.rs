@@ -27,7 +27,7 @@ use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 #[path = "state/wallet_selection_tests.rs"]
 mod wallet_selection_tests;
 
-const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled')) OR EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode<>'paper' AND quantity>0)";
+pub(crate) const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled')) OR EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode<>'paper' AND quantity>0)";
 
 fn normalize_trading_wallet_address(address: &str) -> anyhow::Result<String> {
     let parsed = address
@@ -249,16 +249,27 @@ impl AppState {
         let key_vault = match KeyVault::from_env() {
             Ok(vault) => Arc::new(vault),
             Err(e) => {
-                tracing::warn!(
-                    "Failed to initialize KeyVault from env: {}. Using in-memory vault.",
-                    e
-                );
-                // Fall back to in-memory vault with a default key
-                let default_key = jwt_secret.as_bytes().to_vec();
-                Arc::new(KeyVault::new(
-                    auth::key_vault::KeyVaultProvider::Memory,
-                    default_key,
-                ))
+                // Without a master key nothing can be stored durably. Outside
+                // development the vault only reads WALLET_KEY_<ADDRESS>
+                // variables and refuses new keys, so a connected wallet can
+                // never silently vanish on the next restart.
+                let environment = std::env::var("ENVIRONMENT").unwrap_or_default();
+                let provider = if crate::is_development_environment(&environment) {
+                    tracing::warn!(
+                        "Failed to initialize KeyVault from env: {}. Using an in-memory vault; \
+                         stored wallet keys are lost on restart.",
+                        e
+                    );
+                    auth::key_vault::KeyVaultProvider::Memory
+                } else {
+                    tracing::error!(
+                        "Failed to initialize KeyVault from env: {}. Wallet keys cannot be \
+                         stored until VAULT_MASTER_KEY and VAULT_PROVIDER=file are set.",
+                        e
+                    );
+                    auth::key_vault::KeyVaultProvider::Environment
+                };
+                Arc::new(KeyVault::new(provider, jwt_secret.as_bytes().to_vec()))
             }
         };
 
