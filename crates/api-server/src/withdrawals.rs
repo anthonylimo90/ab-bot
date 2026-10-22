@@ -408,6 +408,58 @@ pub(crate) async fn reconcile_withdrawals(state: &AppState) -> anyhow::Result<()
     .await
 }
 
+/// Whether a stalled trading-wallet transfer of `workspace_id` (unresolved,
+/// requested more than `stalled_minutes` ago and not yet seen mined) has a
+/// receipt now, which is then recorded as `mined_seen_at`. The reconciler
+/// notices a mined transfer only on its next pass; a caller that read the
+/// wallet balance before calling this learns whether that balance may lack
+/// a transfer. A transfer whose chain cannot be read counts as unmined.
+pub(crate) async fn stalled_transfer_mined<F, Fut>(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    stalled_minutes: i32,
+    client_for: F,
+) -> anyhow::Result<bool>
+where
+    F: Fn(Uuid) -> Fut,
+    Fut: std::future::Future<Output = Option<PolygonClient>>,
+{
+    let stalled: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT id, user_id, tx_hash FROM wallet_withdrawals \
+         WHERE workspace_id = $1 AND COALESCE(trading_wallet, TRUE) \
+           AND status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL \
+           AND mined_seen_at IS NULL \
+           AND requested_at <= NOW() - make_interval(mins => $2) \
+         ORDER BY requested_at DESC LIMIT 10",
+    )
+    .bind(workspace_id)
+    .bind(stalled_minutes)
+    .fetch_all(pool)
+    .await?;
+    for (id, user_id, tx_hash) in stalled {
+        let Some(client) = client_for(user_id).await else {
+            continue;
+        };
+        match client.transaction_receipt(&tx_hash).await {
+            Ok(Some(_)) => {
+                sqlx::query(
+                    "UPDATE wallet_withdrawals SET mined_seen_at = NOW() \
+                     WHERE id = $1 AND mined_seen_at IS NULL",
+                )
+                .bind(id)
+                .execute(pool)
+                .await?;
+                return Ok(true);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(withdrawal_id = %id, error = %chain_error_message(&error), "Could not read a stalled withdrawal's receipt");
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// [`reconcile_withdrawals`] with the chain client for each row's user
 /// supplied by `client_for`.
 async fn reconcile_with<F, Fut>(pool: &PgPool, client_for: F) -> anyhow::Result<()>
@@ -486,8 +538,18 @@ async fn reconcile_on_chain(
             }
             return Ok(());
         }
-        // Mined: wait for its block to become final.
-        Receipt::Unsettled => return Ok(()),
+        // Mined: wait for its block to become final. The balance already
+        // lacks the amount; say so for the circuit breaker.
+        Receipt::Unsettled => {
+            sqlx::query(
+                "UPDATE wallet_withdrawals SET mined_seen_at = NOW() \
+                 WHERE id = $1 AND mined_seen_at IS NULL",
+            )
+            .bind(row.id)
+            .execute(conn)
+            .await?;
+            return Ok(());
+        }
         Receipt::Unmined => {}
     }
     if row.status == "failed" {

@@ -290,6 +290,24 @@ async fn feed_circuit_breaker(
         info!("Circuit breaker equity feed held while a withdrawal settles");
         return Ok(());
     }
+    // A stalled transfer mined since the reconciler last looked would read as
+    // a loss too. Its receipt is read after the snapshot's balance was, so
+    // one mined before that read is always found.
+    if crate::withdrawals::stalled_transfer_mined(
+        &state.pool,
+        snapshot.workspace_id,
+        WITHDRAWAL_SETTLE_WINDOW_MINUTES,
+        |user_id| async move {
+            crate::handlers::vault::resolve_polygon_client_for_user(state, user_id)
+                .await
+                .ok()
+        },
+    )
+    .await?
+    {
+        info!("Circuit breaker equity feed held: a stalled withdrawal has been mined");
+        return Ok(());
+    }
     let (withdrawals, flows_through) =
         match state.circuit_breaker.cash_flows_applied_through().await {
             Some(applied) if applied >= through => (Decimal::ZERO, None),
@@ -320,12 +338,18 @@ async fn feed_circuit_breaker(
 /// How long after the time it records a cash flow may still be uncommitted.
 const CASH_FLOW_COMMIT_LAG_SECS: i64 = 15;
 /// A trading-wallet withdrawal sent this recently may be mined before its cash
-/// flow exists; one older than this has stalled and holds nothing up.
+/// flow exists; one older than this has stalled and holds the breaker only
+/// once it has been seen mined.
 const WITHDRAWAL_SETTLE_WINDOW_MINUTES: i32 = 30;
+/// How long a transfer seen mined (its block not yet final) holds the
+/// breaker: finality takes minutes, so longer means its receipt was lost to
+/// a reorganization and it is no longer known to be gone.
+const WITHDRAWAL_MINED_HOLD_MINUTES: i32 = 120;
 
 /// Whether cash may have left the trading wallet without a cash flow the
-/// breaker has applied through `through`: a recent withdrawal not yet
-/// resolved, or an outbound flow recorded after `through`.
+/// breaker has applied through `through`: a withdrawal not yet resolved that
+/// is recent or has been seen mined, or an outbound flow recorded after
+/// `through`.
 async fn withdrawal_settling(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -339,7 +363,8 @@ async fn withdrawal_settling(
               AND COALESCE(trading_wallet, TRUE)
               AND status IN ('submitting', 'submitted')
               AND tx_hash IS NOT NULL
-              AND requested_at > NOW() - make_interval(mins => $3)
+              AND (requested_at > NOW() - make_interval(mins => $3)
+                   OR mined_seen_at > NOW() - make_interval(mins => $4))
         ) OR EXISTS(
             SELECT 1 FROM cash_flow_events
             WHERE workspace_id = $1
@@ -352,6 +377,7 @@ async fn withdrawal_settling(
     .bind(workspace_id)
     .bind(through)
     .bind(WITHDRAWAL_SETTLE_WINDOW_MINUTES)
+    .bind(WITHDRAWAL_MINED_HOLD_MINUTES)
     .fetch_one(pool)
     .await?)
 }
@@ -770,7 +796,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn equity_waits_while_a_trading_withdrawal_settles(pool: PgPool) {
         sqlx::raw_sql(
-            "CREATE TABLE cash_flow_events (id UUID PRIMARY KEY, workspace_id UUID NOT NULL,              event_type TEXT NOT NULL, amount DECIMAL(18, 8) NOT NULL,              created_at TIMESTAMPTZ NOT NULL);              CREATE TABLE wallet_withdrawals (workspace_id UUID, trading_wallet BOOLEAN,              status TEXT, tx_hash TEXT, requested_at TIMESTAMPTZ)",
+            "CREATE TABLE cash_flow_events (id UUID PRIMARY KEY, workspace_id UUID NOT NULL,              event_type TEXT NOT NULL, amount DECIMAL(18, 8) NOT NULL,              created_at TIMESTAMPTZ NOT NULL);              CREATE TABLE wallet_withdrawals (workspace_id UUID, trading_wallet BOOLEAN,              status TEXT, tx_hash TEXT, requested_at TIMESTAMPTZ, mined_seen_at TIMESTAMPTZ)",
         )
         .execute(&pool)
         .await
@@ -779,7 +805,7 @@ mod tests {
         let through = Utc::now() - Duration::seconds(15);
         let settling = || withdrawal_settling(&pool, workspace, through);
         let withdrawal = |trading: Option<bool>, status: &'static str, minutes: i64| {
-            sqlx::query("INSERT INTO wallet_withdrawals VALUES ($1, $2, $3, '0xa', $4)")
+            sqlx::query("INSERT INTO wallet_withdrawals VALUES ($1, $2, $3, '0xa', $4, NULL)")
                 .bind(workspace)
                 .bind(trading)
                 .bind(status)
@@ -813,6 +839,20 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+
+        // Long past the window, but seen mined while its block is not final:
+        // the balance already lacks it.
+        sqlx::query("UPDATE wallet_withdrawals SET mined_seen_at = NOW() - INTERVAL '3 minutes' WHERE status = 'submitting'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(settling().await.unwrap());
+        // Seen mined hours ago and still unresolved: no longer known to be gone.
+        sqlx::query("UPDATE wallet_withdrawals SET mined_seen_at = NOW() - INTERVAL '3 hours' WHERE status = 'submitting'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!settling().await.unwrap());
 
         // Sent from the trading wallet (or not known otherwise) and unresolved.
         withdrawal(None, "submitted", 2).await.unwrap();

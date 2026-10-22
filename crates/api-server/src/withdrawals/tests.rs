@@ -183,6 +183,7 @@ pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
         include_str!("../../../../migrations/069_execution_intents.sql"),
         include_str!("../../../../migrations/082_withdrawal_journal.sql"),
         include_str!("../../../../migrations/088_withdrawal_reconcile_state.sql"),
+        include_str!("../../../../migrations/089_withdrawal_mined_seen.sql"),
     ] {
         pool.execute(migration).await.unwrap();
     }
@@ -457,6 +458,15 @@ async fn every_unresolved_withdrawal_is_settled_from_the_chain(pool: PgPool) {
         vec!["0xraw0xl1".to_string()]
     );
 
+    // Seen mined: the breaker is told, though nothing is settled yet.
+    let seen: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT mined_seen_at FROM wallet_withdrawals WHERE id = $1")
+            .bind(unsettled)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(seen.is_some());
+
     // The block becomes final: settled then, not before.
     chain.lock().unwrap().finalized = Some(160);
     reconcile(&pool, &client).await;
@@ -692,4 +702,74 @@ async fn only_an_explicit_receipt_status_settles_a_transfer(pool: PgPool) {
     assert_eq!(status(&pool, padded).await.0, "confirmed");
     // A receipt without a readable status is not a revert: still unresolved.
     assert_eq!(status(&pool, unreadable).await.0, "submitted");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stalled_transfer_is_found_mined_before_the_reconciler_looks(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let chain = Arc::new(Mutex::new(Chain::default()));
+    let client = mock_node(chain.clone()).await;
+    let mined = || {
+        let client = client.clone();
+        stalled_transfer_mined(&pool, workspace, 30, move |_| {
+            let client = client.clone();
+            async move { Some(client) }
+        })
+    };
+    let sent = |hash: &'static str, minutes: i32, trading: Option<bool>| {
+        let pool = pool.clone();
+        async move {
+            let id = insert(
+                &pool,
+                user,
+                workspace,
+                row(TRADING, "submitted", Some(hash), Some(1), 0),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE wallet_withdrawals SET requested_at = NOW() - make_interval(mins => $2), \
+                 trading_wallet = $3 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(minutes)
+            .bind(trading)
+            .execute(&pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let stalled = sent("0xs1", 45, Some(true)).await;
+    // Recent transfers are held for by their age; others' wallets never.
+    sent("0xs2", 5, Some(true)).await;
+    sent("0xs3", 45, Some(false)).await;
+    let seen = || async {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT mined_seen_at FROM wallet_withdrawals WHERE id = $1",
+        )
+        .bind(stalled)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    // Still unmined: nothing to hold for.
+    assert!(!mined().await.unwrap());
+    assert_eq!(seen().await, None);
+
+    // Only the transfers it does not cover are mined: still nothing.
+    {
+        let mut chain = chain.lock().unwrap();
+        chain.mine("0xs2", true);
+        chain.mine("0xs3", true);
+    }
+    assert!(!mined().await.unwrap());
+
+    // The stalled transfer is mined (its block not yet final): found, and
+    // recorded so the breaker keeps holding until it settles.
+    chain.lock().unwrap().mine("0xs1", true);
+    assert!(mined().await.unwrap());
+    assert!(seen().await.is_some());
+    // Seen once, it is the reconciler's to settle; it is not read again.
+    assert!(!mined().await.unwrap());
 }
