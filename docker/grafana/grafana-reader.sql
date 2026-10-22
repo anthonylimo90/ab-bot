@@ -1,4 +1,4 @@
--- The login Grafana's PostgreSQL datasource uses: read-only, and only on the
+-- The login Grafana's PostgreSQL datasource uses: SELECT only, and only on the
 -- trading and analytics tables an operator charts. Users, credentials,
 -- sessions, signed orders and signed transactions stay out of reach.
 -- Run by the monitoring profile's grafana-db-reader service on every start
@@ -16,7 +16,9 @@ ALTER ROLE grafana_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION L
 ALTER ROLE grafana_reader SET default_transaction_read_only = on;
 ALTER ROLE grafana_reader SET statement_timeout = '30s';
 
--- Exactly the tables below: one taken off the list loses its grant.
+-- Exactly the tables below: one taken off the list loses its grant. In one
+-- transaction, so a live Grafana never sees the tables without grants.
+BEGIN;
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM grafana_reader;
 
 DO $$
@@ -40,3 +42,4 @@ BEGIN
     END LOOP;
 END
 $$;
+COMMIT;

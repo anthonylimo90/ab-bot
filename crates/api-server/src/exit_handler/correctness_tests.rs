@@ -827,8 +827,22 @@ async fn live_handler(
         .route(
             "/balance-allowance",
             get(
-                |State(balance): State<Arc<std::sync::Mutex<String>>>| async move {
+                |State(balance): State<Arc<std::sync::Mutex<String>>>,
+                 axum::extract::Query(query): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    // "token:units,…" answers per token; anything else for all.
                     let balance = balance.lock().unwrap().clone();
+                    let token = query.get("token_id").cloned().unwrap_or_default();
+                    let balance = balance
+                        .split(',')
+                        .find_map(|entry| {
+                            entry
+                                .split_once(':')
+                                .filter(|(id, _)| *id == token)
+                                .map(|(_, units)| units.to_string())
+                        })
+                        .unwrap_or(balance);
                     Json(serde_json::json!({"balance": balance, "allowance": "0"}))
                 },
             ),
@@ -1115,6 +1129,61 @@ async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions
         .finalize_resolution_close(&mut d, 0, None, Some(false))
         .await
         .unwrap());
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_pair_without_a_winner_pays_its_full_pairs_and_an_unmeasured_one_still_closes(
+    pool: PgPool,
+) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, wallet, server) = live_handler(&pool, balance.clone()).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let live_pair = || {
+        let mut p = position();
+        p.id = uuid::Uuid::new_v4();
+        p.state = PositionState::Open;
+        p.execution_mode = "live".into();
+        p.wallet_address = Some(wallet.clone());
+        p.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+        p.no_entry_price = Decimal::new(5, 1);
+        p.held_yes_qty = Decimal::from(100);
+        p.held_no_qty = Decimal::from(100);
+        p
+    };
+    // V1 buys kept a different number of shares of each leg: 95.8 YES and
+    // 97.1 NO remain. Without a winner the 95.8 full pairs pay a dollar
+    // each and the extra NO counts for nothing: 95.8 − 90.
+    let mut p = live_pair();
+    service.repo().insert(&p).await.unwrap();
+    *balance.lock().unwrap() = "yes:95800000,no:97100000".into();
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, None)
+        .await
+        .unwrap());
+    assert_eq!(p.realized_pnl, Some(Decimal::new(58, 1)));
+
+    // A balance that cannot be read leaves the record standing: the
+    // position closes, and the close is marked as not measured.
+    let mut p = live_pair();
+    service.repo().insert(&p).await.unwrap();
+    *balance.lock().unwrap() = "unreadable".into();
+    assert!(h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert_eq!(p.realized_pnl, Some(Decimal::from(10)));
+    let unmeasured: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trade_events WHERE position_id = $1 AND event_type = 'resolution_unmeasured'",
+    )
+    .bind(p.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unmeasured, 1);
     server.abort();
 }
 

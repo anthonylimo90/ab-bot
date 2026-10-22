@@ -533,6 +533,31 @@ impl PositionService {
 
     // ── Position close ─────────────────────────────────────────────
 
+    /// Records that a resolved position is closed at its recorded holding of
+    /// `leg` because the wallet could not confirm it, and why.
+    pub async fn record_resolution_unmeasured(
+        &self,
+        position: &Position,
+        leg: Leg,
+        reason: &str,
+        ctx: &EventContext,
+    ) {
+        self.events
+            .record_warn(
+                NewTradeEvent::new(
+                    &ctx.strategy,
+                    &ctx.execution_mode,
+                    &ctx.source_label,
+                    &position.market_id,
+                    "resolution_unmeasured",
+                )
+                .with_position(position.id)
+                .with_reason(Some(reason))
+                .with_metadata(serde_json::json!({ "leg": leg.to_string() })),
+            )
+            .await;
+    }
+
     /// Final close: computes PnL, sets state=Closed, records event.
     pub async fn close_position(
         &self,
@@ -604,20 +629,18 @@ impl PositionService {
                 "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
-                if position.held_yes_qty != position.held_no_qty {
-                    return Err(anyhow!(
-                        "Winner required for unequal remaining resolution holdings"
-                    ));
+                if !position.has_full_pair_exposure() {
+                    return Err(anyhow!("Winner required for a resolution without a pair"));
                 }
+                // Each full pair pays one dollar whichever side won; any
+                // excess of one leg is valued at nothing.
+                let pairs = position.held_yes_qty.min(position.held_no_qty);
                 let proceeds = position.yes_exit_price.unwrap_or_default()
                     * position.exited_yes_qty
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
                 let basis = position.entry_cost();
-                position.realized_pnl = Some(
-                    proceeds + position.held_yes_qty
-                        - basis
-                        - position.fee_charges(fee, basis + proceeds),
-                );
+                position.realized_pnl =
+                    Some(proceeds + pairs - basis - position.fee_charges(fee, basis + proceeds));
                 position.exited_yes_qty += position.held_yes_qty;
                 position.exited_no_qty += position.held_no_qty;
                 position.held_yes_qty = Decimal::ZERO;
