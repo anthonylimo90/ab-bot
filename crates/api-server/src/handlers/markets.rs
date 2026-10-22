@@ -27,14 +27,14 @@ pub struct MarketResponse {
     pub description: Option<String>,
     /// Market category.
     pub category: String,
-    /// End date.
-    pub end_date: DateTime<Utc>,
+    /// End date; `null` when the source reports none.
+    pub end_date: Option<DateTime<Utc>>,
     /// Whether the market is active.
     pub active: bool,
-    /// Current yes price.
-    pub yes_price: Decimal,
-    /// Current no price.
-    pub no_price: Decimal,
+    /// Current yes price; `null` when the source reports none.
+    pub yes_price: Option<Decimal>,
+    /// Current no price; `null` when the source reports none.
+    pub no_price: Option<Decimal>,
     /// 24h volume.
     pub volume_24h: Decimal,
     /// Total liquidity.
@@ -112,10 +112,10 @@ struct MarketRow {
     question: String,
     description: Option<String>,
     category: String,
-    end_date: DateTime<Utc>,
+    end_date: Option<DateTime<Utc>>,
     active: bool,
-    yes_price: Decimal,
-    no_price: Decimal,
+    yes_price: Option<Decimal>,
+    no_price: Option<Decimal>,
     volume_24h: Decimal,
     liquidity: Decimal,
     created_at: DateTime<Utc>,
@@ -261,7 +261,7 @@ pub async fn get_market(
                 question: m.question,
                 description: m.description,
                 category,
-                end_date: m.end_date.unwrap_or(now + chrono::Duration::days(365)),
+                end_date: m.end_date,
                 active: !m.resolved,
                 yes_price,
                 no_price,
@@ -490,10 +490,10 @@ mod tests {
             question: "Test question?".to_string(),
             description: None,
             category: "test".to_string(),
-            end_date: Utc::now(),
+            end_date: Some(Utc::now()),
             active: true,
-            yes_price: Decimal::new(50, 2),
-            no_price: Decimal::new(50, 2),
+            yes_price: Some(Decimal::new(50, 2)),
+            no_price: None,
             volume_24h: Decimal::new(1000, 0),
             liquidity: Decimal::new(5000, 0),
             created_at: Utc::now(),

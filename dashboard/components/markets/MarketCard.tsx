@@ -2,7 +2,7 @@
 
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { cn, formatCurrency } from "@/lib/utils";
+import { cn, formatCents, formatCurrency } from "@/lib/utils";
 import type { Market } from "@/types/api";
 
 interface MarketCardProps {
@@ -30,13 +30,13 @@ export function MarketCard({ market, onSelect }: MarketCardProps) {
           <div className="flex-1">
             <p className="text-xs text-muted-foreground mb-1">Yes</p>
             <p className="text-lg font-bold tabular-nums text-profit">
-              {(market.yes_price * 100).toFixed(0)}¢
+              {formatCents(market.yes_price, 0)}
             </p>
           </div>
           <div className="flex-1">
             <p className="text-xs text-muted-foreground mb-1">No</p>
             <p className="text-lg font-bold tabular-nums text-loss">
-              {(market.no_price * 100).toFixed(0)}¢
+              {formatCents(market.no_price, 0)}
             </p>
           </div>
         </div>

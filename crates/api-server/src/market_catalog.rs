@@ -44,24 +44,34 @@ pub(crate) fn infer_category(question: &str) -> String {
     }
 }
 
-/// Extract yes/no prices from market outcomes.
+/// The indices of the outcomes treated as YES and NO in a binary market.
 ///
-/// Looks for outcomes named "Yes" and "No" and returns their CLOB prices.
-/// Falls back to 0.50/0.50 if prices are unavailable.
-pub(crate) fn extract_prices(outcomes: &[polymarket_core::types::Outcome]) -> (Decimal, Decimal) {
-    let yes = outcomes
-        .iter()
-        .find(|o| o.name.to_lowercase().contains("yes"))
-        .and_then(|o| o.price)
-        .unwrap_or(Decimal::new(50, 2));
+/// Every position, order and price in the system uses this one mapping:
+/// the first outcome is YES when its name says so, otherwise the second is.
+/// For named outcomes ("Lakers"/"Celtics") the choice is a convention, but it
+/// must never differ between the tokens a position holds and the prices
+/// used to value it.
+pub(crate) fn yes_no_indices(
+    outcomes: &[polymarket_core::types::Outcome],
+) -> Option<(usize, usize)> {
+    (outcomes.len() == 2).then(|| {
+        if outcomes[0].name.to_lowercase().contains("yes") {
+            (0, 1)
+        } else {
+            (1, 0)
+        }
+    })
+}
 
-    let no = outcomes
-        .iter()
-        .find(|o| o.name.to_lowercase().contains("no"))
-        .and_then(|o| o.price)
-        .unwrap_or(Decimal::new(50, 2));
-
-    (yes, no)
+/// YES and NO prices of a binary market under [`yes_no_indices`]; `None`
+/// for a price the source did not report (never a made-up 0.50).
+pub(crate) fn extract_prices(
+    outcomes: &[polymarket_core::types::Outcome],
+) -> (Option<Decimal>, Option<Decimal>) {
+    match yes_no_indices(outcomes) {
+        Some((yes, no)) => (outcomes[yes].price, outcomes[no].price),
+        None => (None, None),
+    }
 }
 
 /// Cached mapping of market_id → (yes_token_id, no_token_id).
@@ -182,19 +192,17 @@ impl OutcomeTokenCache {
                     token_condition_pairs.push((outcome.token_id.clone(), market.id.clone()));
                 }
             }
-            if tradable_ids.contains(&market.id) && market.outcomes.len() == 2 {
-                let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
+            if let (true, Some((yes, no))) = (
+                tradable_ids.contains(&market.id),
+                yes_no_indices(&market.outcomes),
+            ) {
+                map.insert(
+                    market.id.clone(),
                     (
-                        market.outcomes[0].token_id.clone(),
-                        market.outcomes[1].token_id.clone(),
-                    )
-                } else {
-                    (
-                        market.outcomes[1].token_id.clone(),
-                        market.outcomes[0].token_id.clone(),
-                    )
-                };
-                map.insert(market.id.clone(), (yes_id, no_id));
+                        market.outcomes[yes].token_id.clone(),
+                        market.outcomes[no].token_id.clone(),
+                    ),
+                );
             }
         }
 
@@ -314,18 +322,11 @@ impl OutcomeTokenCache {
             }
         }
 
-        let token_pair = if market.outcomes.len() == 2 {
-            let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-                (
-                    market.outcomes[0].token_id.clone(),
-                    market.outcomes[1].token_id.clone(),
-                )
-            } else {
-                (
-                    market.outcomes[1].token_id.clone(),
-                    market.outcomes[0].token_id.clone(),
-                )
-            };
+        let token_pair = if let Some((yes, no)) = yes_no_indices(&market.outcomes) {
+            let (yes_id, no_id) = (
+                market.outcomes[yes].token_id.clone(),
+                market.outcomes[no].token_id.clone(),
+            );
             tokens.insert(market.id.clone(), (yes_id.clone(), no_id.clone()));
             Some((yes_id, no_id))
         } else {

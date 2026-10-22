@@ -27,6 +27,11 @@ async fn setup(pool: &PgPool) {
     ))
     .await
     .unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/083_manual_fill_cost_bound.sql"
+    ))
+    .await
+    .unwrap();
 }
 
 fn order() -> PlaceOrderRequest {
@@ -129,6 +134,14 @@ async fn exchange_snapshots_record_only_confirmed_quantities_and_keep_progress(p
     assert_eq!(partial.status, "partially_filled");
     assert_eq!(partial.filled_quantity, Decimal::from(4));
     assert!(partial.avg_fill_price.is_none());
+    // Fills of unknown price are costed at the 0.50 limit, not at $1.
+    let (quantity, cost_basis): (Decimal, Decimal) = sqlx::query_as(
+        "SELECT quantity, cost_basis FROM manual_inventory WHERE wallet_address = '0xreview'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((quantity, cost_basis), (Decimal::from(4), Decimal::from(2)));
     snapshot.size_matched = "3".into();
     assert!(apply_exchange_snapshot(&pool, &partial, &snapshot)
         .await

@@ -114,6 +114,12 @@ export function formatFixed(
   return `${value.toFixed(decimals)}${suffix}`;
 }
 
+/** A 0–1 price in cents (e.g. "48¢"), or an em dash when it is unknown. */
+export function formatCents(value: number | null | undefined, decimals: number = 0): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return NO_VALUE;
+  return `${(value * 100).toFixed(decimals)}¢`;
+}
+
 /** {@link formatCurrency}, or an em dash for null / undefined / NaN. */
 export function formatCurrencyOrDash(
   value: number | null | undefined,

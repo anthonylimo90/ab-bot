@@ -37,6 +37,17 @@ test('toNumber converts Decimal strings and guards non-numeric input', () => {
   assert.equal(toNumberOr('4.5', 9), 4.5);
 });
 
+test('parseMarket keeps unknown prices unknown instead of 0', () => {
+  const market = parseMarket({
+    id: 'm', question: 'Who wins?', category: 'sports', end_date: null,
+    active: true, yes_price: null, no_price: '0.55', volume_24h: '1', liquidity: '1',
+    created_at: '2024-01-01T00:00:00Z',
+  });
+  assert.equal(market.yes_price, null);
+  assert.equal(market.no_price, 0.55);
+  assert.equal(market.end_date, null);
+});
+
 test('parseMarket turns Decimal strings into numbers that support toFixed', () => {
   const market = parseMarket({
     id: 'm1', question: 'Q?', category: 'politics', end_date: '2026-12-31T00:00:00Z',

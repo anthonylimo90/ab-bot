@@ -63,8 +63,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function parseMarket(raw: Market): Market {
   return {
     ...raw,
-    yes_price: toNumberOr(raw.yes_price),
-    no_price: toNumberOr(raw.no_price),
+    yes_price: toNumber(raw.yes_price),
+    no_price: toNumber(raw.no_price),
     volume_24h: toNumberOr(raw.volume_24h),
     liquidity: toNumberOr(raw.liquidity),
   };

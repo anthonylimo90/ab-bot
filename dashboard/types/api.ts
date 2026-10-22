@@ -252,10 +252,12 @@ export interface Market {
   question: string;
   description?: string;
   category: string;
-  end_date: string;
+  /** null when the market's source reports no end date. */
+  end_date: string | null;
   active: boolean;
-  yes_price: number;
-  no_price: number;
+  /** null when no price is known; never a made-up 50¢. */
+  yes_price: number | null;
+  no_price: number | null;
   volume_24h: number;
   liquidity: number;
   created_at: string;

@@ -84,7 +84,6 @@ struct ObservedConditionalBalances {
 #[derive(Debug, FromRow)]
 struct HeldPositionRow {
     market_id: String,
-    current_price: Option<Decimal>,
     yes_price: Option<Decimal>,
     no_price: Option<Decimal>,
     yes_entry_price: Decimal,
@@ -103,8 +102,6 @@ struct MarketHoldings {
     no_cost: Decimal,
     yes_price: Option<Decimal>,
     no_price: Option<Decimal>,
-    /// Row mark; usable as a leg price only when the market holds one leg.
-    current_price: Option<Decimal>,
 }
 
 impl MarketHoldings {
@@ -116,7 +113,6 @@ impl MarketHoldings {
         self.no_cost += row.held_no_qty * row.no_entry_price;
         self.yes_price = self.yes_price.or(row.yes_price);
         self.no_price = self.no_price.or(row.no_price);
-        self.current_price = self.current_price.or(row.current_price);
     }
 
     /// Cost basis of `qty` shares of a leg holding `held` shares at `cost`:
@@ -135,23 +131,18 @@ impl MarketHoldings {
     /// A leg without a market price is marked at its average entry cost and
     /// reported as unpriced.
     fn value(&self, yes_qty: Decimal, no_qty: Decimal) -> (Decimal, Decimal, Decimal) {
-        let single_leg_mark = if (yes_qty > Decimal::ZERO) != (no_qty > Decimal::ZERO) {
-            self.current_price
-        } else {
-            None
-        };
         let mut value = Decimal::ZERO;
         let mut cost_basis = Decimal::ZERO;
         let mut unpriced = Decimal::ZERO;
         for (qty, price, leg_cost) in [
             (
                 yes_qty,
-                self.yes_price.or(single_leg_mark),
+                self.yes_price,
                 Self::leg_cost(yes_qty, self.yes_qty, self.yes_cost),
             ),
             (
                 no_qty,
-                self.no_price.or(single_leg_mark),
+                self.no_price,
                 Self::leg_cost(no_qty, self.no_qty, self.no_cost),
             ),
         ] {
@@ -477,7 +468,6 @@ async fn load_position_valuation_from_positions(
         r#"
         SELECT
             p.market_id,
-            p.current_price,
             m.yes_price,
             m.no_price,
             p.yes_entry_price,
@@ -647,7 +637,6 @@ mod tests {
     fn held_row(market: &str, entry: (i64, i64), held: (i64, i64)) -> HeldPositionRow {
         HeldPositionRow {
             market_id: market.to_string(),
-            current_price: Some(Decimal::new(90, 2)),
             yes_price: None,
             no_price: None,
             yes_entry_price: Decimal::new(entry.0, 2),
@@ -673,22 +662,19 @@ mod tests {
     }
 
     #[test]
-    fn blended_row_mark_is_never_used_for_paired_legs() {
+    fn legs_without_a_market_price_are_valued_at_cost_and_unpriced() {
         let mut holdings = MarketHoldings::default();
         holdings.add(&held_row("m", (48, 50), (100, 100)));
-
-        // No per-leg market price: both legs fall back to cost and are unpriced.
         let (value, cost, unpriced) = holdings.value(holdings.yes_qty, holdings.no_qty);
         assert_eq!(value, Decimal::new(98, 0));
         assert_eq!(cost, Decimal::new(98, 0));
         assert_eq!(unpriced, Decimal::new(98, 0));
 
-        // A single held leg may use the row mark.
         let mut single = MarketHoldings::default();
         single.add(&held_row("m", (40, 0), (10, 0)));
         assert_eq!(
-            single.value(single.yes_qty, single.no_qty).0,
-            Decimal::new(9, 0)
+            single.value(single.yes_qty, single.no_qty),
+            (Decimal::new(4, 0), Decimal::new(4, 0), Decimal::new(4, 0))
         );
     }
 

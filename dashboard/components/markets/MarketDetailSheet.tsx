@@ -8,7 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useMarketQuery, useOrderbookQuery } from "@/hooks/queries/useMarketsQuery";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import { formatCurrency } from "@/lib/utils";
+import { formatCents, formatCurrency } from "@/lib/utils";
 import { X, TrendingUp, TrendingDown } from "lucide-react";
 import type { WebSocketMessage, OrderbookUpdate } from "@/types/api";
 import { useCallback, useRef } from "react";
@@ -129,7 +129,7 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
                       <InfoTooltip content="The current price for buying the 'Yes' outcome. A higher price means the market thinks this outcome is more likely." />
                     </p>
                     <p className="text-2xl font-bold tabular-nums text-profit">
-                      {(market.yes_price * 100).toFixed(1)}¢
+                      {formatCents(market.yes_price, 1)}
                     </p>
                   </CardContent>
                 </Card>
@@ -140,7 +140,7 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
                       <InfoTooltip content="The current price for buying the 'No' outcome. A higher price means the market thinks the event is less likely to happen." />
                     </p>
                     <p className="text-2xl font-bold tabular-nums text-loss">
-                      {(market.no_price * 100).toFixed(1)}¢
+                      {formatCents(market.no_price, 1)}
                     </p>
                   </CardContent>
                 </Card>
@@ -159,7 +159,7 @@ export function MarketDetailSheet({ marketId, onClose }: MarketDetailSheetProps)
                 <div>
                   <p className="text-muted-foreground">End Date</p>
                   <p className="font-medium">
-                    {new Date(market.end_date).toLocaleDateString()}
+                    {market.end_date ? new Date(market.end_date).toLocaleDateString() : "—"}
                   </p>
                 </div>
               </div>
