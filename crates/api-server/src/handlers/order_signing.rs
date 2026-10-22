@@ -159,6 +159,23 @@ pub struct SubmitOrderResponse {
     pub tx_hash: Option<String>,
 }
 
+const INSERT_PENDING_ORDER: &str = r#"
+    INSERT INTO pending_wallet_orders (
+        id, user_id, maker_address, token_id, side,
+        maker_amount, taker_amount, salt, expiration, nonce,
+        fee_rate_bps, signature_type, neg_risk, expires_at, created_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+"#;
+
+const SELECT_PENDING_ORDER: &str = r#"
+    SELECT id, user_id, maker_address, token_id, side,
+           maker_amount, taker_amount, salt, expiration, nonce,
+           fee_rate_bps, signature_type, neg_risk, expires_at, created_at
+    FROM pending_wallet_orders
+    WHERE id = $1 AND user_id = $2
+"#;
+
 /// Database row for pending orders.
 #[derive(Debug, sqlx::FromRow)]
 struct PendingOrderRow {
@@ -375,36 +392,27 @@ pub async fn prepare_order(
     let pending_order_id = Uuid::new_v4();
 
     // Store pending order in database
-    sqlx::query(
-        r#"
-        INSERT INTO pending_wallet_orders (
-            id, user_id, maker_address, token_id, side,
-            maker_amount, taker_amount, salt, expiration, nonce,
-            fee_rate_bps, signature_type, neg_risk, expires_at, created_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        "#,
-    )
-    .bind(pending_order_id)
-    .bind(user_id)
-    .bind(&req.maker_address)
-    .bind(&req.token_id)
-    .bind(side as i16)
-    .bind(&maker_amount)
-    .bind(&taker_amount)
-    .bind(&salt)
-    .bind(expiration_timestamp as i64)
-    .bind("0") // nonce
-    .bind(
-        i32::try_from(fee_rate)
-            .map_err(|_| ApiError::ServiceUnavailable("Invalid fee rate".into()))?,
-    ) // fee_rate_bps
-    .bind(0i16) // signature_type (EOA)
-    .bind(neg_risk)
-    .bind(expires_at)
-    .bind(now)
-    .execute(&state.pool)
-    .await?;
+    sqlx::query(INSERT_PENDING_ORDER)
+        .bind(pending_order_id)
+        .bind(user_id)
+        .bind(&req.maker_address)
+        .bind(&req.token_id)
+        .bind(side as i16)
+        .bind(&maker_amount)
+        .bind(&taker_amount)
+        .bind(&salt)
+        .bind(expiration_timestamp as i64)
+        .bind("0") // nonce
+        .bind(
+            i32::try_from(fee_rate)
+                .map_err(|_| ApiError::ServiceUnavailable("Invalid fee rate".into()))?,
+        ) // fee_rate_bps
+        .bind(0i16) // signature_type (EOA)
+        .bind(neg_risk)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&state.pool)
+        .await?;
 
     // Build EIP-712 typed data
     let verifying_contract = if neg_risk {
@@ -489,19 +497,11 @@ pub async fn submit_order(
         .map_err(|_| ApiError::BadRequest("Invalid pending order ID".into()))?;
 
     // Fetch pending order
-    let pending_order: Option<PendingOrderRow> = sqlx::query_as(
-        r#"
-        SELECT id, user_id, maker_address, token_id, side,
-               maker_amount, taker_amount, salt, expiration, nonce,
-               fee_rate_bps, signature_type, neg_risk, expires_at, created_at
-        FROM pending_wallet_orders
-        WHERE id = $1 AND user_id = $2
-        "#,
-    )
-    .bind(pending_order_id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let pending_order: Option<PendingOrderRow> = sqlx::query_as(SELECT_PENDING_ORDER)
+        .bind(pending_order_id)
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await?;
 
     let pending_order = pending_order.ok_or_else(|| {
         ApiError::NotFound("Pending order not found or does not belong to you".into())
@@ -795,6 +795,49 @@ mod amount_tests {
         assert_eq!(outcome_label(&state, "8881").await, "NO");
         assert_eq!(outcome_label(&state, "9991").await, "UNKNOWN");
         assert_eq!(outcome_label(&state, "1231").await, "UNKNOWN");
+    }
+    #[sqlx::test(migrations = false)]
+    async fn pending_orders_are_stored_and_read_on_the_migrated_schema(pool: sqlx::PgPool) {
+        // Migration 044 dropped pending_wallet_orders; 090 restores it.
+        crate::workspace_scope::test_fixture::real_schema(&pool).await;
+        let user = crate::workspace_scope::test_fixture::user(&pool, auth::UserRole::Trader).await;
+        let id = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::hours(1);
+        sqlx::query(INSERT_PENDING_ORDER)
+            .bind(id)
+            .bind(user)
+            .bind("0x0000000000000000000000000000000000000001")
+            .bind("123")
+            .bind(0i16)
+            .bind("4000000")
+            .bind("10000000")
+            .bind("42")
+            .bind(expires_at.timestamp())
+            .bind("0")
+            .bind(0i32)
+            .bind(0i16)
+            .bind(true)
+            .bind(expires_at)
+            .bind(Utc::now())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let row: PendingOrderRow = sqlx::query_as(SELECT_PENDING_ORDER)
+            .bind(id)
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.maker_amount, "4000000");
+        assert!(row.neg_risk);
+        // Another user's id never reads the order.
+        let other: Option<PendingOrderRow> = sqlx::query_as(SELECT_PENDING_ORDER)
+            .bind(id)
+            .bind(Uuid::new_v4())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(other.is_none());
     }
     #[tokio::test]
     async fn browser_order_and_auth_signatures_match_shared_signing_for_both_domains() {

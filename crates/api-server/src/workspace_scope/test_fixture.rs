@@ -28,9 +28,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../../../migrations/031_dynamic_config_history_actions.sql"),
     include_str!("../../../../migrations/032_workspace_cb_config.sql"),
     include_str!("../../../../migrations/033_workspace_exit_handler.sql"),
+    include_str!("../../../../migrations/044_remove_copy_trading.sql"),
     include_str!("../../../../migrations/072_persistent_sessions.sql"),
     include_str!("../../../../migrations/080_wallet_only_users.sql"),
     include_str!("../../../../migrations/081_password_reset_token_lookup.sql"),
+    include_str!("../../../../migrations/090_restore_invites_and_wallet_orders.sql"),
 ];
 
 /// Create the production user/workspace/session schema in an empty test database.

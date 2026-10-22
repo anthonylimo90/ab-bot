@@ -559,3 +559,112 @@ async fn admins_can_still_manage_non_admin_members(pool: PgPool) {
         StatusCode::OK
     );
 }
+
+/// Store an invite with the statement `create_workspace_invite` runs (that
+/// handler also needs an email client) and return its token.
+async fn stored_invite(pool: &PgPool, workspace: Uuid, email: &str, invited_by: Uuid) -> String {
+    let token = generate_invite_token();
+    sqlx::query(
+        r#"
+        INSERT INTO workspace_invites (id, workspace_id, email, role, token_hash, invited_by, expires_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(workspace)
+    .bind(email)
+    .bind("member")
+    .bind(hash_token(&token))
+    .bind(invited_by)
+    .bind(Utc::now() + Duration::days(7))
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .unwrap();
+    token
+}
+
+#[sqlx::test(migrations = false)]
+async fn invites_work_on_the_migrated_schema(pool: PgPool) {
+    // Migration 044 dropped workspace_invites; 090 restores it. This runs the
+    // invite flow against the schema the migrations actually produce.
+    let f = fixture(&pool).await;
+    let state = AppState::for_tests(pool.clone());
+    let owner = f.user_ids["owner_a"];
+    let app = Router::new()
+        .route(
+            "/api/v1/workspaces/:workspace_id/invites",
+            get(list_workspace_invites),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::require_auth,
+        ))
+        .route("/api/v1/invites/:token", get(get_invite_info))
+        .route(
+            "/api/v1/invites/:token/accept",
+            axum::routing::post(accept_invite),
+        )
+        .with_state(state.clone());
+
+    // An existing account accepts while signed in.
+    let invitee = fx::user(&pool, UserRole::Trader).await;
+    let invitee_email = format!("{invitee}@example.test");
+    let token = stored_invite(&pool, f.canonical, &invitee_email, owner).await;
+    let (status, listed) = fx::call(
+        &app,
+        "GET",
+        &format!("/api/v1/workspaces/{}/invites", f.canonical),
+        Some(&f.tokens["owner_a"]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed.as_array().map(Vec::len), Some(1), "{listed}");
+    let (status, info) =
+        fx::call(&app, "GET", &format!("/api/v1/invites/{token}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["user_exists"], json!(true), "{info}");
+    let invitee_token = fx::token(&state, invitee, UserRole::Trader).await;
+    let (status, accepted) = fx::call(
+        &app,
+        "POST",
+        &format!("/api/v1/invites/{token}/accept"),
+        Some(&invitee_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    let role: String = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(f.canonical)
+    .bind(invitee)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(role, "member");
+    // A used invite cannot be accepted again.
+    let (status, _) = fx::call(
+        &app,
+        "POST",
+        &format!("/api/v1/invites/{token}/accept"),
+        Some(&invitee_token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+
+    // A new account is created by accepting.
+    let token = stored_invite(&pool, f.canonical, "new.person@example.test", owner).await;
+    let (status, accepted) = fx::call(
+        &app,
+        "POST",
+        &format!("/api/v1/invites/{token}/accept"),
+        None,
+        Some(json!({ "password": "long enough password" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(accepted["is_new_user"], json!(true), "{accepted}");
+}

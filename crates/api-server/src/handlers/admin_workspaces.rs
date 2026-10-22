@@ -43,7 +43,6 @@ pub struct AdminWorkspaceListItem {
     pub auto_optimize_enabled: bool,
     pub owner_email: Option<String>,
     pub member_count: i64,
-    pub active_wallet_count: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -114,7 +113,6 @@ struct WorkspaceListRow {
     created_at: DateTime<Utc>,
     owner_email: Option<String>,
     member_count: i64,
-    active_wallet_count: i64,
 }
 
 /// Database row for workspace detail.
@@ -168,8 +166,7 @@ pub async fn list_workspaces(
             w.id, w.name, w.description, w.setup_mode, w.total_budget,
             w.auto_optimize_enabled, w.created_at,
             owner.email as owner_email,
-            (SELECT COUNT(*) FROM workspace_members WHERE workspace_id = w.id) as member_count,
-            (SELECT COUNT(*) FROM workspace_wallet_allocations WHERE workspace_id = w.id AND tier = 'active') as active_wallet_count
+            (SELECT COUNT(*) FROM workspace_members WHERE workspace_id = w.id) as member_count
         FROM workspaces w
         LEFT JOIN workspace_members wm ON w.id = wm.workspace_id AND wm.role = 'owner'
         LEFT JOIN users owner ON wm.user_id = owner.id
@@ -193,7 +190,6 @@ pub async fn list_workspaces(
             auto_optimize_enabled: w.auto_optimize_enabled,
             owner_email: w.owner_email,
             member_count: w.member_count,
-            active_wallet_count: w.active_wallet_count,
             created_at: w.created_at,
         })
         .collect();
