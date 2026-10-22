@@ -782,7 +782,7 @@ impl ExitHandler {
                 position_id = %position.id,
                 leg = %leg,
                 reason = why,
-                "Holding not measured against the wallet; the sale goes ahead as recorded"
+                "Holding not measured against the wallet; nothing written off"
             ),
             Measured::Matches | Measured::Waiting(_) => {}
         }
@@ -815,17 +815,16 @@ impl ExitHandler {
         let Some(wallet) = position.wallet_address.clone() else {
             return Ok(Measured::Matches);
         };
-        // The balance read below is the executor's wallet: another wallet's
-        // holding (or any, with no trading wallet loaded) cannot be measured.
-        if self
-            .order_executor
-            .wallet_address()
-            .await
-            .is_none_or(|executor| !executor.eq_ignore_ascii_case(&wallet))
-        {
-            return Ok(Measured::Unmeasured(
-                "the position's wallet is not the trading wallet",
-            ));
+        // The balance read below is the executor's wallet: with none loaded
+        // nothing can be read yet; another wallet's holding never can be.
+        match self.order_executor.wallet_address().await {
+            None => return Ok(Measured::Waiting(BALANCE_UNREADABLE)),
+            Some(executor) if !executor.eq_ignore_ascii_case(&wallet) => {
+                return Ok(Measured::Unmeasured(
+                    "the position's wallet is not the trading wallet",
+                ));
+            }
+            Some(_) => {}
         }
         let (others, unsettled): (Decimal, bool) = sqlx::query_as(OTHER_HOLDERS_SQL)
             .bind(position.id)
@@ -1084,8 +1083,13 @@ impl ExitHandler {
                     Some(false) => vec![Leg::No],
                     None => vec![Leg::Yes, Leg::No],
                 };
+                let held = |leg: &Leg| match leg {
+                    Leg::Yes => position.held_yes_qty > Decimal::ZERO,
+                    Leg::No => position.held_no_qty > Decimal::ZERO,
+                };
                 unmeasured.extend(
                     legs.into_iter()
+                        .filter(held)
                         .map(|leg| (leg, "the market's tokens are unknown")),
                 );
             }
@@ -2322,7 +2326,7 @@ const UNREADABLE_BALANCE_GRACE: std::time::Duration = std::time::Duration::from_
 /// What measuring a position's leg against the wallet found.
 enum Measured {
     /// The record is what the wallet holds (any fee shares written off), or
-    /// is not to be measured (paper, another wallet's position).
+    /// is not measured at all (a paper position, or nothing held).
     Matches,
     /// It could not be measured, for this reason; the record stands.
     Unmeasured(&'static str),
