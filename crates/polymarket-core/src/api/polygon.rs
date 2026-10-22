@@ -61,6 +61,11 @@ pub fn is_protocol_contract(address: &str) -> bool {
         CTF_EXCHANGE_ADDRESS,
         NEG_RISK_CTF_EXCHANGE_ADDRESS,
         NEG_RISK_ADAPTER_ADDRESS,
+        // The V1 exchanges.
+        "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+        "0xC5d563A36AE78145C45a50134d48A1215220f80a",
+        // Native USDC.
+        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
     ]
     .iter()
     .any(|contract| contract.eq_ignore_ascii_case(address.trim()))

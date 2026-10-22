@@ -1138,6 +1138,33 @@ async fn an_arbitrage_position_pays_the_taker_fee_of_each_fill(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn no_leg_is_sold_until_both_legs_exchanges_are_known(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new("10000000".to_string()));
+    // The mock exchange answers no neg-risk lookups.
+    let (h, wallet, server) = live_handler(&pool, balance).await;
+    h.token_cache
+        .alias("market", &("yes".into(), "no".into()))
+        .await;
+    let mut p = position();
+    p.execution_mode = "live".into();
+    p.wallet_address = Some(wallet);
+    p.held_yes_qty = Decimal::TEN;
+    p.state = PositionState::ExitReady;
+    service.repo().insert(&p).await.unwrap();
+    h.execute_exit(&mut p).await.unwrap();
+    let stored = service.repo().get(p.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, PositionState::ExitFailed);
+    assert_eq!(stored.held_yes_qty, Decimal::TEN);
+    assert!(stored
+        .failure_reason
+        .map(|reason| reason.to_string())
+        .unwrap_or_default()
+        .contains("exchange"));
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_position_opened_without_fee_terms_pays_its_markets_fees_on_exit(pool: PgPool) {
     let service = setup(&pool).await;
     let balance = Arc::new(std::sync::Mutex::new(String::new()));

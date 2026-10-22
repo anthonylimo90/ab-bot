@@ -164,8 +164,9 @@ pub struct SubmitOrderResponse {
 /// The shortest lifetime an order may be prepared with.
 const MIN_ORDER_LIFETIME_SECS: u64 = 120;
 /// What must be left of an order's lifetime when it is submitted: the
-/// exchange refuses a good-till-date order expiring within a minute.
-const GTD_MIN_REMAINING_SECS: i64 = 70;
+/// exchange refuses a good-till-date order expiring within a minute, and the
+/// submission itself (credentials, the order fence, the post) takes time.
+const GTD_MIN_REMAINING_SECS: i64 = 90;
 
 const INSERT_PENDING_ORDER: &str = r#"
     INSERT INTO pending_wallet_orders (
@@ -931,9 +932,9 @@ mod amount_tests {
 
         let now = Utc::now();
         assert!(submittable(now + Duration::minutes(5), now));
-        assert!(submittable(now + Duration::seconds(70), now));
-        // The exchange would refuse it: expiring within a minute and change.
-        assert!(!submittable(now + Duration::seconds(69), now));
+        assert!(submittable(now + Duration::seconds(90), now));
+        // The exchange could refuse it by the time it arrives.
+        assert!(!submittable(now + Duration::seconds(89), now));
         assert!(!submittable(now - Duration::seconds(1), now));
     }
 

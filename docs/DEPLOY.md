@@ -573,16 +573,18 @@ unsigned). Fees are set by the exchange when an order matches.
 - The API then wraps the trading wallet's USDC.e into pUSD, at startup and
   every five minutes, so deposits become tradable without a restart. A wrap
   waits until no withdrawal from the wallet is unresolved and nothing it sent
-  is pending, and holds the wallet's spend lock while it is mined (up to about
-  a minute and a half) and until balance reads include it. A withdrawal
-  request waits up to 20 seconds for the lock, then answers 503 to retry;
-  nothing is sent. A wrap still unmined when the lock is let go is followed
-  up every 30 seconds: sent again if the node dropped it, its gas raised when
-  the network asks more, until its nonce is used (by it, or by another
-  transaction, which ends it). Only a restart in that window loses track of
-  it. The log says "Wrapping USDC.e into pUSD"; an hour without a chance to
-  wrap is logged as a warning. The sweeper wraps for the signer selected at
-  startup.
+  is pending, and keeps the wallet's spend lock until it is mined and balance
+  reads include it (normally seconds): a withdrawal planned meanwhile would
+  draw on USDC.e the wrap is about to take. A withdrawal request waits up to
+  20 seconds for the lock, then answers 503 to retry; nothing is sent. A wrap
+  that waits is looked after every 30 seconds: sent again if the node dropped
+  it, its gas raised when the network asks more or the node refuses it (up
+  to three times the network's price), until its nonce is used, by it or, as
+  two checks in a row find, by another transaction. After half an hour the
+  lock is let go with a warning rather than hold withdrawals back without
+  end; a restart lets go of it too. The log says "Wrapping USDC.e into pUSD";
+  USDC.e left waiting for an hour is logged as a warning. The sweeper wraps
+  for the signer selected at startup.
 - Cash, for equity, the circuit breaker and the vault balance, is the
   wallet's USDC.e plus its pUSD, both read at one block.
 - A withdrawal still pays the recipient USDC.e: from the wallet's USDC.e with

@@ -3,14 +3,16 @@
 //! wrapped into pUSD by the Collateral Onramp (1:1, and redeemable through
 //! the Offramp, which is how withdrawals pay it out).
 //!
-//! A wrap spends one of the wallet's nonces. A new one is sent only under the
+//! A wrap spends one of the wallet's nonces. It is sent only under the
 //! wallet's spend lock, while no withdrawal from it is unresolved and nothing
-//! else it sent waits to be mined, and the lock is held while it is mined
-//! (normally seconds) and until balance reads include it. A wrap still
-//! unmined when the lock is let go is kept: every later look sends it again
-//! should the node have dropped it, and raises its gas when the network asks
-//! more, until its nonce is used. So a withdrawal signed behind it never
-//! waits on a nonce nothing fills (unless the process restarts meanwhile).
+//! else it sent waits to be mined, and the lock is kept until the wrap is
+//! mined and balance reads include it: a withdrawal signed behind a waiting
+//! wrap would plan on USDC.e the wrap is about to take, or wait on a nonce
+//! nothing fills should the wrap be dropped. Meanwhile every look sends the
+//! wrap again if the node dropped it and raises its gas when the network asks
+//! more or the node refuses it, until its nonce is used. After
+//! [`MAX_HOLD`] the lock is let go (and said so) rather than block
+//! withdrawals without end; a restart lets go of it too.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,7 +31,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const FOLLOW_UP_INTERVAL: Duration = Duration::from_secs(30);
 /// Less USDC.e than this (one dollar) is left as it is.
 const MIN_WRAP_UNITS: u128 = 1_000_000;
-/// How often a wrap is checked for a receipt while the lock is held.
+/// How often a wrap is checked for a receipt while a look waits for it.
 const RECEIPT_POLL: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 2000 });
 /// How many polls a new wrap is waited for, and a waiting one on a later look.
 const NEW_WRAP_POLLS: u32 = 45;
@@ -37,6 +39,14 @@ const FOLLOW_UP_POLLS: u32 = 10;
 /// Every this many polls a waiting wrap's nonce is checked, the wrap sent
 /// again if the node no longer knows it, and its gas raised if underpriced.
 const CHECK_EVERY_POLLS: u32 = 5;
+/// How many checks in a row must find the wrap's nonce used, without one of
+/// its receipts, before it counts as taken by another transaction.
+const NONCE_USED_CHECKS: u32 = 2;
+/// The most a waiting wrap's gas price is raised to, as a multiple of what
+/// the network asks.
+const MAX_GAS_OVER_NETWORK: u128 = 3;
+/// How long the spend lock is kept for a wrap that is not mined.
+const MAX_HOLD: Duration = Duration::from_secs(1800);
 /// How long the sweeper may be kept from wrapping before it says so.
 const STARVED_AFTER: Duration = Duration::from_secs(3600);
 
@@ -60,16 +70,21 @@ pub(crate) enum WrapOutcome {
 struct PendingWrap {
     nonce: u64,
     units: u128,
+    sent_at: Instant,
     /// The transaction last signed at the nonce.
     latest: SignedTransaction,
     /// Every hash signed at the nonce: whichever is mined settles the wrap.
     hashes: Vec<String>,
+    /// Checks in a row that found the nonce used and none of its receipts.
+    nonce_used_checks: u32,
 }
 
 /// Wraps the wallet's idle USDC.e, remembering a wrap until it settles.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Sweeper {
     pending: Option<PendingWrap>,
+    /// The wallet's spend lock, kept while a wrap waits to be mined.
+    lock: Option<SpendLock>,
     /// Since when every look has found the wallet busy.
     busy_since: Option<Instant>,
 }
@@ -84,16 +99,33 @@ impl Sweeper {
         wallet: &TradingWallet,
     ) -> anyhow::Result<WrapOutcome> {
         let address = wallet.address_string();
-        let Some(mut lock) = SpendLock::try_acquire(pool, &address).await? else {
-            return Ok(self.busy());
+        let outcome = if let Some(wrap) = &self.pending {
+            // Keep (or take back) the lock while it waits, within the bound.
+            if self.lock.is_none() && wrap.sent_at.elapsed() < MAX_HOLD {
+                self.lock = SpendLock::try_acquire(pool, &address).await?;
+            }
+            self.follow_up(client, wallet, FOLLOW_UP_POLLS).await
+        } else {
+            let Some(mut lock) = SpendLock::try_acquire(pool, &address).await? else {
+                return Ok(self.busy(client, &address).await);
+            };
+            let outcome = self.wrap(&mut lock, client, wallet).await;
+            self.lock = Some(lock);
+            outcome
         };
-        let outcome = match self.pending.is_some() {
-            true => self.follow_up(client, wallet, FOLLOW_UP_POLLS).await,
-            false => self.wrap(&mut lock, client, wallet).await,
-        };
-        lock.release().await;
+        match &self.pending {
+            None => self.release().await,
+            Some(wrap) if wrap.sent_at.elapsed() >= MAX_HOLD && self.lock.is_some() => {
+                warn!(
+                    nonce = wrap.nonce,
+                    "A wrap has waited half an hour; withdrawals are no longer held back for it"
+                );
+                self.release().await;
+            }
+            Some(_) => {}
+        }
         if matches!(outcome, Ok(WrapOutcome::Busy)) {
-            return Ok(self.busy());
+            return Ok(self.busy(client, &address).await);
         }
         self.busy_since = None;
         outcome
@@ -104,14 +136,27 @@ impl Sweeper {
         self.pending.is_some()
     }
 
-    fn busy(&mut self) -> WrapOutcome {
+    async fn release(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            lock.release().await;
+        }
+    }
+
+    /// A look that could not wrap; after long enough, said so if USDC.e
+    /// is waiting for it.
+    async fn busy(&mut self, client: &PolygonClient, address: &str) -> WrapOutcome {
         let since = *self.busy_since.get_or_insert_with(Instant::now);
         if since.elapsed() >= STARVED_AFTER {
-            warn!(
-                minutes = since.elapsed().as_secs() / 60,
-                "The trading wallet's USDC.e has not been wrapped for a long time: a withdrawal \
-                 from it is unresolved or a transaction it sent is still pending"
-            );
+            if matches!(
+                client.get_usdc_balance_units(address).await,
+                Ok(units) if units >= MIN_WRAP_UNITS
+            ) {
+                warn!(
+                    minutes = since.elapsed().as_secs() / 60,
+                    "The trading wallet's USDC.e has waited long to be wrapped: a withdrawal \
+                     from it is unresolved or a transaction it sent is still pending"
+                );
+            }
             self.busy_since = Some(Instant::now());
         }
         WrapOutcome::Busy
@@ -160,8 +205,10 @@ impl Sweeper {
         self.pending = Some(PendingWrap {
             nonce: mined,
             units,
+            sent_at: Instant::now(),
             hashes: vec![signed.tx_hash.clone()],
             latest: signed,
+            nonce_used_checks: 0,
         });
         self.follow_up(client, wallet, NEW_WRAP_POLLS).await
     }
@@ -197,39 +244,49 @@ impl Sweeper {
             if poll % CHECK_EVERY_POLLS != 0 {
                 continue;
             }
-            // Its nonce used by a transaction none of whose receipts this
-            // look found: another one (or a node that was behind) took it.
+            // Its nonce used, on checks in a row that each read every one of
+            // its receipts and found none: another transaction took it.
             match client.nonces(&wallet.address()).await {
                 Ok((mined, _)) if mined > wrap.nonce => {
-                    let mut ours = false;
+                    let mut none_of_ours = true;
                     for hash in &wrap.hashes {
-                        ours |= matches!(client.transaction_receipt(hash).await, Ok(Some(_)));
+                        none_of_ours &= matches!(client.transaction_receipt(hash).await, Ok(None));
                     }
-                    if !ours {
-                        warn!(
-                            nonce = wrap.nonce,
-                            "A wrap's nonce was used by another transaction"
-                        );
-                        return Ok(WrapOutcome::Superseded);
+                    if none_of_ours {
+                        wrap.nonce_used_checks += 1;
+                        if wrap.nonce_used_checks >= NONCE_USED_CHECKS {
+                            warn!(
+                                nonce = wrap.nonce,
+                                "A wrap's nonce was used by another transaction"
+                            );
+                            return Ok(WrapOutcome::Superseded);
+                        }
                     }
                     continue;
                 }
-                Ok(_) => {}
+                Ok(_) => wrap.nonce_used_checks = 0,
                 Err(error) => {
                     warn!(error = %chain_error_message(&error), "Could not read the wallet's nonce")
                 }
             }
-            // Dropped by the node: send it again.
+            // Dropped by the node: send it again. Refused again: raise its gas.
+            let mut refused = false;
             if matches!(
                 client.transaction_known(&wrap.latest.tx_hash).await,
                 Ok(false)
             ) {
-                let _ = client
-                    .broadcast(&wrap.latest.raw, &wrap.latest.tx_hash)
-                    .await;
+                refused = !matches!(
+                    client
+                        .broadcast(&wrap.latest.raw, &wrap.latest.tx_hash)
+                        .await,
+                    Ok(BroadcastOutcome::Accepted)
+                );
             }
             match client.gas_price_wei().await {
-                Ok(network) if network > wrap.latest.gas_price => {
+                Ok(network)
+                    if (network > wrap.latest.gas_price || refused)
+                        && wrap.latest.gas_price < network.saturating_mul(MAX_GAS_OVER_NETWORK) =>
+                {
                     let min_gas_price = wrap.latest.gas_price + wrap.latest.gas_price / 10 + 1;
                     match client
                         .prepare_replacement(
@@ -241,17 +298,19 @@ impl Sweeper {
                         .await
                     {
                         Ok(replacement) => {
-                            if let Ok(BroadcastOutcome::Accepted) = client
+                            let outcome = client
                                 .broadcast(&replacement.raw, &replacement.tx_hash)
-                                .await
-                            {
-                                info!(
-                                    gas_price = replacement.gas_price,
-                                    "Raised the gas price of a waiting wrap"
-                                );
-                                wrap.hashes.push(replacement.tx_hash.clone());
-                                wrap.latest = replacement;
-                            }
+                                .await;
+                            info!(
+                                gas_price = replacement.gas_price,
+                                ?outcome,
+                                "Raised the gas price of a waiting wrap"
+                            );
+                            // Kept whatever the node said: should it hold it
+                            // after all its receipt settles the wrap, and the
+                            // next raise starts from it.
+                            wrap.hashes.push(replacement.tx_hash.clone());
+                            wrap.latest = replacement;
                         }
                         Err(error) => {
                             warn!(error = %chain_error_message(&error), "Could not sign a wrap's replacement")
@@ -472,6 +531,11 @@ mod tests {
         );
         raise.await.unwrap();
         assert!(sweeper.waiting());
+        // While it waits no withdrawal can be signed behind it.
+        assert!(SpendLock::try_acquire(&pool, &wallet.address_string())
+            .await
+            .unwrap()
+            .is_none());
         let broadcasts = chain.lock().unwrap().broadcasts.clone();
         assert_eq!(broadcasts.len(), 2);
         for raw in &broadcasts {
@@ -482,9 +546,9 @@ mod tests {
             );
         }
 
-        // A withdrawal is signed behind it once the lock is let go; the node
-        // then drops the wrap. The next look sends it again, unresolved
-        // withdrawal or not.
+        // A withdrawal signed behind it all the same (the lock let go after
+        // half an hour, or a restart); the node then drops the wrap. The next
+        // look sends it again, unresolved withdrawal or not.
         insert(
             &pool,
             user,
@@ -519,6 +583,92 @@ mod tests {
             WrapOutcome::Wrapped(5_000_000)
         );
         assert!(!sweeper.waiting());
+        // Settled: the wallet is free again.
+        let free = SpendLock::try_acquire(&pool, &wallet.address_string())
+            .await
+            .unwrap();
+        assert!(free.is_some());
+        free.unwrap().release().await;
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_wrap_the_node_keeps_refusing_is_signed_again_for_more_gas(pool: PgPool) {
+        setup(&pool).await;
+        let chain = Arc::new(Mutex::new(Chain {
+            usdc_units: 5_000_000,
+            pol_wei: 1_000_000_000_000_000_000,
+            send_error: Some("transaction underpriced".into()),
+            ..Default::default()
+        }));
+        let client = mock_node(chain.clone()).await;
+        let mut sweeper = Sweeper::default();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        // The network asks no more, yet each refusal is met with a higher
+        // price at the same nonce, up to three times what the network asks.
+        let prices: Vec<u128> = chain
+            .lock()
+            .unwrap()
+            .broadcasts
+            .iter()
+            .map(|raw| {
+                let (nonce, price) =
+                    polymarket_core::api::polygon::legacy_nonce_and_gas_price(raw).unwrap();
+                assert_eq!(nonce, 0);
+                price
+            })
+            .collect();
+        assert!(
+            prices.windows(2).any(|pair| pair[1] > pair[0]),
+            "{prices:?}"
+        );
+        assert!(prices
+            .iter()
+            .all(|price| *price <= 3 * 30_000_000_000 * 11 / 10 + 1));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_wrap_is_given_up_only_when_two_checks_find_its_nonce_used(pool: PgPool) {
+        setup(&pool).await;
+        let chain = Arc::new(Mutex::new(Chain {
+            usdc_units: 5_000_000,
+            pol_wei: 1_000_000_000_000_000_000,
+            ..Default::default()
+        }));
+        let client = mock_node(chain.clone()).await;
+        let mut sweeper = Sweeper::default();
+        assert_eq!(
+            sweeper.look(&pool, &client, &wallet()).await.unwrap(),
+            WrapOutcome::Unmined
+        );
+        // Its nonce now reads as used, but one look only: not yet given up.
+        {
+            let mut chain = chain.lock().unwrap();
+            chain.latest_nonce = 1;
+            chain.pending_nonce = 1;
+        }
+        let wrap = sweeper.pending.clone().unwrap();
+        sweeper.pending = Some(PendingWrap {
+            nonce_used_checks: 0,
+            ..wrap
+        });
+        let outcome = sweeper
+            .follow_up(&client, &wallet(), CHECK_EVERY_POLLS)
+            .await
+            .unwrap();
+        assert_eq!(outcome, WrapOutcome::Unmined);
+        assert_eq!(sweeper.pending.as_ref().unwrap().nonce_used_checks, 1);
+        // A second look in a row: taken by another transaction.
+        assert_eq!(
+            sweeper
+                .follow_up(&client, &wallet(), CHECK_EVERY_POLLS)
+                .await
+                .unwrap(),
+            WrapOutcome::Superseded
+        );
+        sweeper.release().await;
     }
 
     #[sqlx::test(migrations = false)]

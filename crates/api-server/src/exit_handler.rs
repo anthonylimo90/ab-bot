@@ -420,6 +420,27 @@ impl ExitHandler {
             }
         };
 
+        // Both legs' exchanges before either is sold: a lookup failing only
+        // for the second leg would leave the exit one-legged.
+        if let Err(error) = self
+            .order_executor
+            .resolve_exchanges(&[yes_token_id.as_str(), no_token_id.as_str()])
+            .await
+        {
+            let _ = self
+                .position_service
+                .mark_exit_failed(
+                    position,
+                    FailureReason::ConnectivityError {
+                        message: error.to_string(),
+                    },
+                    &ctx,
+                )
+                .await;
+            self.publish_alert(&market_id, "exit_failed", &error.to_string());
+            return Ok(());
+        }
+
         // The fees of these sales are charged under the market's terms.
         self.attach_fee_terms(position).await;
         // Sell what the wallet has: a buy whose fee the V1 exchange kept in

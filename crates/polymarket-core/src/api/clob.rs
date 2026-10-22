@@ -1492,10 +1492,12 @@ fn base_units_to_decimal(raw: &str) -> Option<Decimal> {
 /// Response from posting an order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostOrderResponse {
-    /// Order ID assigned by the CLOB.
-    #[serde(rename = "orderID")]
+    /// Order ID assigned by the CLOB (empty when it took no order).
+    #[serde(default, rename = "orderID")]
     pub order_id: String,
-    /// Status of the order (e.g. "matched", "delayed", "unmatched").
+    /// Status of the order (e.g. "matched", "delayed", "unmatched"). An
+    /// empty one proves nothing: the order is reconciled from the exchange.
+    #[serde(default)]
     pub status: String,
     #[serde(default, rename = "makingAmount")]
     pub making_amount: Option<String>,
@@ -1508,9 +1510,9 @@ pub struct PostOrderResponse {
     #[serde(
         default,
         rename = "transactionsHashes",
-        skip_serializing_if = "Vec::is_empty"
+        skip_serializing_if = "Option::is_none"
     )]
-    pub transactions_hashes: Vec<String>,
+    pub transactions_hashes: Option<Vec<String>>,
     /// Whether the exchange took the order (V2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
@@ -1525,7 +1527,7 @@ impl PostOrderResponse {
         self.transaction_hash
             .clone()
             .filter(|hash| !hash.is_empty())
-            .or_else(|| self.transactions_hashes.first().cloned())
+            .or_else(|| self.transactions_hashes.as_ref()?.first().cloned())
     }
 
     /// Check if the order was successfully matched/filled.
@@ -2713,6 +2715,14 @@ mod authenticated_tests {
         }))
         .unwrap();
         assert!(refused.is_unfilled());
+        // An answer is never unreadable for a field the clients treat as
+        // optional: missing, null or empty alike.
+        let sparse: PostOrderResponse = serde_json::from_value(serde_json::json!({
+            "success": false, "errorMsg": "not enough balance", "transactionsHashes": null
+        }))
+        .unwrap();
+        assert!(sparse.is_unfilled());
+        assert_eq!(sparse.settlement_tx_hash(), None);
         // V1 responses read as before.
         let v1: PostOrderResponse = serde_json::from_value(serde_json::json!({
             "orderID": "0xabc", "status": "live", "transactionHash": "0xt"

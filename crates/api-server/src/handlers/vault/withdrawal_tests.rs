@@ -274,6 +274,7 @@ fn protocol_contracts_are_not_withdrawal_destinations() {
         polymarket_core::signing::COLLATERAL_OFFRAMP_ADDRESS,
         polymarket_core::signing::CTF_EXCHANGE_ADDRESS,
         "0x0000000000000000000000000000000000000000",
+        "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
     ] {
         assert!(is_protocol_contract(&contract.to_ascii_lowercase()));
     }
