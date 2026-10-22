@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 use crate::wallet_inventory::{
-    load_canonical_inventory_summary, refresh_canonical_wallet_inventory,
+    load_canonical_inventory_summary, refresh_canonical_wallet_inventory_within,
 };
 use crate::workspace_scope::resolve_canonical_workspace_id;
 
@@ -190,8 +190,15 @@ async fn run_loop(config: AccountSnapshotConfig, state: Arc<AppState>) {
     }
 }
 
+/// How old an inventory scan the periodic snapshot (which feeds the circuit
+/// breaker) may reuse.
+const SNAPSHOT_INVENTORY_MAX_AGE: time::Duration = time::Duration::from_secs(30);
+
+/// A live account snapshot, reusing an inventory scan up to
+/// `inventory_max_age` old.
 pub async fn load_live_account_snapshot(
     state: &AppState,
+    inventory_max_age: time::Duration,
 ) -> anyhow::Result<Option<AccountSnapshotRecord>> {
     let Some(workspace_id) = resolve_canonical_workspace_id(&state.pool).await? else {
         return Ok(None);
@@ -214,7 +221,7 @@ pub async fn load_live_account_snapshot(
 
     let live = state.order_executor.is_live_ready().await;
     let inventory_refreshed = if live {
-        match refresh_canonical_wallet_inventory(state).await {
+        match refresh_canonical_wallet_inventory_within(state, inventory_max_age).await {
             Ok(_) => true,
             Err(error) => {
                 warn!(error = %error, "Failed to refresh wallet inventory before account snapshot");
@@ -254,7 +261,7 @@ pub async fn load_live_account_snapshot(
 }
 
 async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<()> {
-    if let Some(snapshot) = load_live_account_snapshot(state).await? {
+    if let Some(snapshot) = load_live_account_snapshot(state, SNAPSHOT_INVENTORY_MAX_AGE).await? {
         persist_snapshot(&state.pool, &snapshot).await?;
 
         // Only a complete live valuation may drive drawdown: paper fills and

@@ -32,4 +32,5 @@ tracing.workspace = true
 sqlx.workspace = true
 
 [dev-dependencies]
+axum = "0.7"
 chrono.workspace = true

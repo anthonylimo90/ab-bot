@@ -21,6 +21,10 @@ pub(crate) async fn status(
         .bind(wallet).fetch_optional(pool).await?)
 }
 
+/// After a failed scan, how long a scan that may reuse an older result
+/// (`max_age` above zero) reports that failure instead of scanning again.
+const FAILURE_BACKOFF: chrono::Duration = chrono::Duration::seconds(60);
+
 /// Local serialization prevents pool exhaustion; the transaction lock coordinates
 /// replicas. Requests already waiting reuse the completed result of the same scan.
 pub(super) async fn coordinate<T, F, Fut>(
@@ -46,7 +50,15 @@ where
     .await?;
     if let Some(previous) = status(pool, wallet).await? {
         if let Some(finished) = previous.finished_at {
-            if finished >= requested_at {
+            // The scan this request waited for failed or, unless a fresh
+            // scan was demanded, one failed moments ago: report it rather
+            // than hammer the sources again.
+            let recent_failure = if max_age.is_zero() {
+                requested_at
+            } else {
+                requested_at - FAILURE_BACKOFF
+            };
+            if finished >= recent_failure {
                 if let Some(error) = previous.last_error.as_deref() {
                     anyhow::bail!("{error}");
                 }
@@ -139,6 +151,22 @@ mod tests {
         assert_eq!(failed.completed_at, completed);
         assert_eq!(failed.result, Some(serde_json::json!(7)));
         assert_eq!(failed.last_error.as_deref(), Some("balance unavailable"));
+        // A caller content with an older result does not rescan right after
+        // a failure; it gets the failure.
+        let backed_off: anyhow::Result<i32> = coordinate(
+            &pool,
+            &a,
+            "wallet",
+            time::Duration::from_secs(300),
+            || async {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(8_i32)
+            },
+        )
+        .await;
+        assert_eq!(backed_off.unwrap_err().to_string(), "balance unavailable");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        // A demanded refresh always scans.
         assert_eq!(
             coordinate(&pool, &a, "wallet", time::Duration::ZERO, || async {
                 Ok(9_i32)

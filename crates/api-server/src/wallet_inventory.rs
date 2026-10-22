@@ -167,6 +167,14 @@ pub async fn refresh_canonical_wallet_inventory(
     refresh_inventory(state, time::Duration::from_secs(30)).await
 }
 
+/// Refresh the inventory unless a scan completed within `max_age`.
+pub async fn refresh_canonical_wallet_inventory_within(
+    state: &AppState,
+    max_age: time::Duration,
+) -> anyhow::Result<Option<WalletInventoryRefreshResult>> {
+    refresh_inventory(state, max_age).await
+}
+
 pub async fn force_refresh_canonical_wallet_inventory(
     state: &AppState,
 ) -> anyhow::Result<Option<WalletInventoryRefreshResult>> {

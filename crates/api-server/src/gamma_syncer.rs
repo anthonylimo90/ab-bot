@@ -77,6 +77,10 @@ async fn backfill_loop(pool: PgPool) {
     tokio::time::sleep(Duration::from_secs(30)).await;
 
     let mut interval = tokio::time::interval(Duration::from_secs(300));
+
+    // After an overrun, wait a full period instead of catching up.
+
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await; // consume the first immediate tick
 
     loop {
@@ -154,37 +158,9 @@ async fn sync_cycle(
     let mut upserted = 0usize;
 
     for chunk in parsed.chunks(BATCH_SIZE) {
-        let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-            "INSERT INTO market_metadata (condition_id, question, category, tags, end_date, volume, liquidity, active, fetched_at) ",
-        );
-
-        query_builder.push_values(chunk, |mut b, market| {
-            b.push_bind(&market.condition_id)
-                .push_bind(&market.question)
-                .push_bind(&market.category)
-                .push_bind(&market.tags)
-                .push_bind(market.end_date)
-                .push_bind(market.volume)
-                .push_bind(market.liquidity)
-                .push_bind(market.active)
-                .push_bind(chrono::Utc::now());
-        });
-
-        query_builder.push(
-            " ON CONFLICT (condition_id) DO UPDATE SET \
-             question = EXCLUDED.question, \
-             category = EXCLUDED.category, \
-             tags = EXCLUDED.tags, \
-             end_date = EXCLUDED.end_date, \
-             volume = EXCLUDED.volume, \
-             liquidity = EXCLUDED.liquidity, \
-             active = EXCLUDED.active, \
-             fetched_at = EXCLUDED.fetched_at",
-        );
-
-        match query_builder.build().execute(pool).await {
-            Ok(result) => {
-                upserted += result.rows_affected() as usize;
+        match upsert_market_metadata(pool, chunk).await {
+            Ok(changed) => {
+                upserted += changed as usize;
             }
             Err(e) => {
                 warn!(
@@ -209,6 +185,48 @@ async fn sync_cycle(
     })
 }
 
+/// Upsert a batch of market metadata, rewriting only rows whose values
+/// changed; returns how many rows were written.
+async fn upsert_market_metadata(
+    pool: &PgPool,
+    chunk: &[polymarket_core::api::gamma::ParsedGammaMarket],
+) -> Result<u64, sqlx::Error> {
+    let mut query_builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+        "INSERT INTO market_metadata (condition_id, question, category, tags, end_date, volume, liquidity, active, fetched_at) ",
+    );
+
+    query_builder.push_values(chunk, |mut b, market| {
+        b.push_bind(&market.condition_id)
+            .push_bind(&market.question)
+            .push_bind(&market.category)
+            .push_bind(&market.tags)
+            .push_bind(market.end_date)
+            .push_bind(market.volume)
+            .push_bind(market.liquidity)
+            .push_bind(market.active)
+            .push_bind(chrono::Utc::now());
+    });
+
+    query_builder.push(
+        " ON CONFLICT (condition_id) DO UPDATE SET \
+         question = EXCLUDED.question, \
+         category = EXCLUDED.category, \
+         tags = EXCLUDED.tags, \
+         end_date = EXCLUDED.end_date, \
+         volume = EXCLUDED.volume, \
+         liquidity = EXCLUDED.liquidity, \
+         active = EXCLUDED.active, \
+         fetched_at = EXCLUDED.fetched_at \
+         WHERE (market_metadata.question, market_metadata.category, market_metadata.tags, \
+                market_metadata.end_date, market_metadata.volume, market_metadata.liquidity, \
+                market_metadata.active) \
+               IS DISTINCT FROM \
+               (EXCLUDED.question, EXCLUDED.category, EXCLUDED.tags, EXCLUDED.end_date, \
+                EXCLUDED.volume, EXCLUDED.liquidity, EXCLUDED.active)",
+    );
+    Ok(query_builder.build().execute(pool).await?.rows_affected())
+}
+
 /// Backfill NULL condition_id values in wallet_trades from token_condition_cache.
 ///
 /// Limited to 10,000 rows per cycle to avoid long-running transactions.
@@ -216,11 +234,18 @@ async fn backfill_condition_ids(pool: &PgPool) -> Result<i64, sqlx::Error> {
     let result = sqlx::query(
         r#"
         UPDATE wallet_trades wt
-        SET condition_id = tcc.condition_id
-        FROM token_condition_cache tcc
-        WHERE wt.asset_id = tcc.token_id
+        SET condition_id = pick.condition_id
+        FROM (
+            SELECT t.transaction_hash, t.timestamp, c.condition_id
+            FROM wallet_trades t
+            JOIN token_condition_cache c ON c.token_id = t.asset_id
+            WHERE t.condition_id IS NULL
+              AND c.condition_id IS NOT NULL
+            LIMIT 10000
+        ) pick
+        WHERE wt.transaction_hash = pick.transaction_hash
+          AND wt.timestamp = pick.timestamp
           AND wt.condition_id IS NULL
-          AND tcc.condition_id IS NOT NULL
         "#,
     )
     .execute(pool)
@@ -236,6 +261,75 @@ async fn backfill_condition_ids(pool: &PgPool) -> Result<i64, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+
+    #[sqlx::test(migrations = false)]
+    async fn unchanged_market_metadata_is_not_rewritten(pool: PgPool) {
+        sqlx::raw_sql(include_str!("../../../migrations/038_market_metadata.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let market = |volume: &str| polymarket_core::api::gamma::ParsedGammaMarket {
+            condition_id: "c1".into(),
+            question: "Will it?".into(),
+            category: Some("crypto".into()),
+            tags: vec!["btc".into()],
+            end_date: None,
+            // More places than the column keeps: compared after rounding.
+            volume: volume.parse().unwrap(),
+            liquidity: Decimal::ONE,
+            active: true,
+        };
+        let upsert = |volume| {
+            let pool = pool.clone();
+            async move {
+                upsert_market_metadata(&pool, &[market(volume)])
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(upsert("12.345678901234").await, 1);
+        assert_eq!(upsert("12.345678901234").await, 0);
+        assert_eq!(upsert("13").await, 1);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn backfill_fills_missing_condition_ids_a_bounded_batch_at_a_time(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE wallet_trades (transaction_hash TEXT, timestamp TIMESTAMPTZ, \
+                 asset_id TEXT, condition_id TEXT, UNIQUE (transaction_hash, timestamp)); \
+             CREATE TABLE token_condition_cache (token_id TEXT PRIMARY KEY, condition_id TEXT); \
+             INSERT INTO token_condition_cache VALUES ('t1', 'c1'), ('t2', NULL); \
+             INSERT INTO wallet_trades \
+                 SELECT 'h' || n, NOW() - make_interval(secs => n), 't1', NULL \
+                 FROM generate_series(1, 10005) n; \
+             INSERT INTO wallet_trades VALUES \
+                 ('h1', NOW() - INTERVAL '1 day', 't2', NULL), \
+                 ('h2', NOW() - INTERVAL '1 day', 't1', 'kept')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(backfill_condition_ids(&pool).await.unwrap(), 10_000);
+        assert_eq!(backfill_condition_ids(&pool).await.unwrap(), 5);
+        assert_eq!(backfill_condition_ids(&pool).await.unwrap(), 0);
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT asset_id, condition_id FROM wallet_trades \
+             WHERE condition_id IS DISTINCT FROM 'c1' ORDER BY asset_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        // Unknown tokens stay unfilled; existing ids are never overwritten.
+        assert_eq!(
+            rows,
+            vec![
+                ("t1".to_string(), Some("kept".to_string())),
+                ("t2".to_string(), None)
+            ]
+        );
+    }
 
     #[test]
     fn test_config_defaults() {

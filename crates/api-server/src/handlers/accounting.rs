@@ -185,6 +185,12 @@ fn inventory_backfill_in_progress(
         .unwrap_or(false)
 }
 
+/// How old an inventory scan the polled account summary may show. The
+/// background reconciler rescans every three minutes (by default), so a
+/// dashboard poll reuses its scan instead of starting one per request; the
+/// response says when the inventory was last synced.
+const SUMMARY_INVENTORY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(240);
+
 #[utoipa::path(
     get,
     path = "/api/v1/workspaces/{workspace_id}/account/summary",
@@ -209,7 +215,7 @@ pub async fn get_account_summary(
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
     require_canonical_workspace_member(&state.pool, user_id).await?;
 
-    let snapshot = load_live_account_snapshot(state.as_ref())
+    let snapshot = load_live_account_snapshot(state.as_ref(), SUMMARY_INVENTORY_MAX_AGE)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("Canonical workspace not found".into()))?;

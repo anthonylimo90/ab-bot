@@ -50,6 +50,8 @@ pub struct MarketMetadataResponse {
     pub volume: Decimal,
     pub liquidity: Decimal,
     pub active: bool,
+    /// When these values were last fetched with a change: an unchanged
+    /// market is not rewritten.
     pub fetched_at: DateTime<Utc>,
 }
 

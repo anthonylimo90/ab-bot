@@ -25,17 +25,6 @@ use tracing::{debug, info, warn};
 const COLLATERAL_DECIMALS: u32 = 6;
 const MARKET_ORDER_SIZE_SCALE: u32 = 2;
 
-fn allowance_needs_refresh(allowance: &str) -> bool {
-    let trimmed = allowance.trim();
-    trimmed.is_empty()
-        || trimmed == "0"
-        || trimmed == "0.0"
-        || trimmed
-            .parse::<Decimal>()
-            .map(|value| value <= Decimal::ZERO)
-            .unwrap_or(false)
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct WebSocketRuntimeStatsSnapshot {
     pub subscribed_assets: usize,
@@ -676,6 +665,8 @@ impl ClobClient {
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_u64);
         let mut ping_tick = tokio::time::interval(StdDuration::from_secs(ping_interval_secs));
+        // After an overrun, wait a full period instead of catching up.
+        ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping_tick.tick().await;
         let mut order_books_by_asset: HashMap<String, OrderBook> = HashMap::new();
 
@@ -1907,8 +1898,6 @@ impl AuthenticatedClobClient {
         size: Decimal,
         order_type: OrderType,
     ) -> Result<SignedOrder> {
-        self.log_and_refresh_collateral_allowance().await;
-
         // Determine which exchange contract to use for signing
         let neg_risk = self.is_neg_risk(token_id).await.unwrap_or(true);
         let signer = if neg_risk {
@@ -1978,8 +1967,6 @@ impl AuthenticatedClobClient {
         amount: Decimal,
         order_type: OrderType,
     ) -> Result<SignedOrder> {
-        self.log_and_refresh_collateral_allowance().await;
-
         if amount <= Decimal::ZERO {
             return Err(Error::Order {
                 message: "Market order amount must be positive".to_string(),
@@ -2039,47 +2026,6 @@ impl AuthenticatedClobClient {
         signer.sign_order(&order).await.map_err(|e| Error::Signing {
             message: format!("Failed to sign order: {e}"),
         })
-    }
-
-    async fn log_and_refresh_collateral_allowance(&self) {
-        match self.get_balance_allowance(None, "COLLATERAL").await {
-            Ok(ba) => {
-                info!(
-                    balance = %ba.balance,
-                    allowance = %ba.allowance,
-                    maker = %self.address(),
-                    "CLOB USDC balance/allowance check"
-                );
-
-                if allowance_needs_refresh(&ba.allowance) {
-                    warn!(
-                        maker = %self.address(),
-                        allowance = %ba.allowance,
-                        "CLOB collateral allowance is empty or zero; refreshing server-side allowance cache"
-                    );
-                    if let Err(error) = self.update_balance_allowance("COLLATERAL").await {
-                        warn!(error = %error, "Failed to refresh CLOB collateral allowance cache");
-                        return;
-                    }
-
-                    match self.get_balance_allowance(None, "COLLATERAL").await {
-                        Ok(refreshed) => info!(
-                            balance = %refreshed.balance,
-                            allowance = %refreshed.allowance,
-                            maker = %self.address(),
-                            "CLOB USDC balance/allowance after refresh"
-                        ),
-                        Err(error) => warn!(
-                            error = %error,
-                            "Failed to re-check CLOB balance/allowance after refresh"
-                        ),
-                    }
-                }
-            }
-            Err(error) => {
-                warn!(error = %error, "Failed to check CLOB balance/allowance (continuing)");
-            }
-        }
     }
 
     /// Post a signed order to the CLOB.
@@ -2730,14 +2676,6 @@ mod authenticated_tests {
         let debug_str = format!("{:?}", auth_client);
         assert!(!debug_str.contains("secret-key"));
         assert!(!debug_str.contains("secret-pass"));
-    }
-
-    #[test]
-    fn test_allowance_needs_refresh_handles_blank_and_zero() {
-        assert!(allowance_needs_refresh(""));
-        assert!(allowance_needs_refresh("0"));
-        assert!(allowance_needs_refresh("0.0"));
-        assert!(!allowance_needs_refresh("1000"));
     }
 
     #[test]

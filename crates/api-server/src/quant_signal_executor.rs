@@ -457,7 +457,13 @@ impl QuantSignalExecutor {
         }
 
         let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+
+        // After an overrun, wait a full period instead of catching up.
+
+        heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut outcome_ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        // After an overrun, wait a full period instead of catching up.
+        outcome_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         outcome_ticker.tick().await;
 
         loop {

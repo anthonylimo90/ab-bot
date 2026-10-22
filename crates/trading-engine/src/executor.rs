@@ -931,7 +931,9 @@ impl OrderExecutor {
         anyhow::ensure!(balance.is_some(), "Invalid CLOB balance in preflight");
 
         let balance_short = balance.is_some_and(|value| value < required_amount);
-        let allowance_short = allowance.is_some_and(|value| value < required_amount);
+        // A blank allowance means the exchange's cache is empty: refresh it
+        // before relying on it, as for one that is too small.
+        let allowance_short = allowance.is_none_or(|value| value < required_amount);
 
         if balance_short || allowance_short {
             warn!(
@@ -1664,6 +1666,62 @@ mod tests {
             Arc::new(ClobClient::new(None, None)),
             ExecutorConfig::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn a_blank_allowance_is_refreshed_before_an_order_relies_on_it() {
+        use axum::{extract::State, routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        // The exchange's cache answers a blank allowance until refreshed.
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/balance-allowance",
+                get(|State(refreshes): State<Arc<AtomicUsize>>| async move {
+                    let allowance = if refreshes.load(Ordering::SeqCst) == 0 {
+                        ""
+                    } else {
+                        "5000000"
+                    };
+                    Json(serde_json::json!({"balance": "5000000", "allowance": allowance}))
+                }),
+            )
+            .route(
+                "/balance-allowance/update",
+                get(|State(refreshes): State<Arc<AtomicUsize>>| async move {
+                    refreshes.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({}))
+                }),
+            )
+            .with_state(refreshes.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let wallet = TradingWallet::from_private_key(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let client = AuthenticatedClobClient::with_credentials(
+            ClobClient::new(Some(url), None),
+            OrderSigner::new(wallet.into_signer()),
+            polymarket_core::api::clob::ApiCredentials {
+                api_key: "key".into(),
+                api_secret: "c2VjcmV0".into(),
+                api_passphrase: "pass".into(),
+            },
+        );
+        OrderExecutor::ensure_live_order_capacity(
+            &client,
+            Uuid::new_v4(),
+            OrderSide::Buy,
+            "token",
+            Decimal::ONE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     }
 
     #[sqlx::test(migrations = false)]

@@ -210,9 +210,15 @@ impl ExitHandler {
         let mut exit_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
             startup_cfg.exit_poll_interval_secs,
         ));
+
+        // After an overrun, wait a full period instead of catching up.
+
+        exit_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut resolution_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
             startup_cfg.resolution_check_secs,
         ));
+        // After an overrun, wait a full period instead of catching up.
+        resolution_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Skip the first immediate ticks
         exit_ticker.tick().await;
@@ -306,8 +312,12 @@ impl ExitHandler {
             ExitBidStatus::Unavailable => return Ok(()),
         };
 
+        let previous_pnl = candidate.position.unrealized_pnl;
         candidate.position.update_pnl(yes_bid, no_bid, fee);
-        self.position_repo.update(&mut candidate.position).await?;
+        // Most ticks move nothing; an unchanged mark is not rewritten.
+        if candidate.position.unrealized_pnl != previous_pnl {
+            self.position_repo.update(&mut candidate.position).await?;
+        }
 
         if self
             .should_mark_exit_ready(
@@ -684,32 +694,23 @@ impl ExitHandler {
             return Ok(ExitBidStatus::Unavailable);
         };
 
+        // Both books at once: a leg not held is worth nothing to exit.
         let (has_yes, has_no) = held_outcomes(position);
-        let yes_bid = if has_yes {
-            match self
-                .load_exit_best_bid(market_id, &yes_token_id, "YES")
-                .await?
-            {
-                Some(bid) => bid,
-                None => return self.exit_bid_fallback_status(market_id).await,
+        let bid = |held: bool, token_id: String, side: &'static str| async move {
+            if held {
+                self.load_exit_best_bid(market_id, &token_id, side).await
+            } else {
+                Ok(Some(Decimal::ZERO))
             }
-        } else {
-            Decimal::ZERO
         };
-
-        let no_bid = if has_no {
-            match self
-                .load_exit_best_bid(market_id, &no_token_id, "NO")
-                .await?
-            {
-                Some(bid) => bid,
-                None => return self.exit_bid_fallback_status(market_id).await,
-            }
-        } else {
-            Decimal::ZERO
-        };
-
-        Ok(ExitBidStatus::Available(yes_bid, no_bid))
+        let (yes_bid, no_bid) = tokio::join!(
+            bid(has_yes, yes_token_id, "YES"),
+            bid(has_no, no_token_id, "NO")
+        );
+        match (yes_bid?, no_bid?) {
+            (Some(yes_bid), Some(no_bid)) => Ok(ExitBidStatus::Available(yes_bid, no_bid)),
+            _ => self.exit_bid_fallback_status(market_id).await,
+        }
     }
 
     async fn load_exit_best_bid(

@@ -471,6 +471,8 @@ impl ArbAutoExecutor {
             let hb = self.heartbeat.clone();
             let keeper = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(15));
+                // After an overrun, wait a full period instead of catching up.
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
                     hb.store(Utc::now().timestamp(), Ordering::Relaxed);
@@ -497,6 +499,8 @@ impl ArbAutoExecutor {
         let cache_interval =
             tokio::time::Duration::from_secs(startup_cfg.cache_refresh_secs.max(1));
         let mut cache_ticker = tokio::time::interval(cache_interval);
+        // After an overrun, wait a full period instead of catching up.
+        cache_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the first immediate tick (we already loaded above)
         cache_ticker.tick().await;
         let cache_refresh_inflight = Arc::new(AtomicBool::new(false));
@@ -504,6 +508,8 @@ impl ArbAutoExecutor {
         // Heartbeat ticker keeps the liveness stamp fresh even when no signals arrive.
         // Must be well under the 120s staleness threshold checked by the status endpoint.
         let mut heartbeat_ticker = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        // After an overrun, wait a full period instead of catching up.
+        heartbeat_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat_ticker.tick().await;
 
         loop {

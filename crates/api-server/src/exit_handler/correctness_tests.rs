@@ -682,3 +682,43 @@ fn failed_exit_retry_delay_doubles_and_caps() {
     assert_eq!(failed_exit_retry_delay_secs(300, 40), 3600);
     assert_eq!(failed_exit_retry_delay_secs(7200, 3), 7200);
 }
+
+#[sqlx::test(migrations = false)]
+async fn an_unchanged_mark_is_not_rewritten_each_tick(pool: PgPool) {
+    let service = setup(&pool).await;
+    // A 2.5% gain: below every exit threshold.
+    let (h, server) = handler_with(
+        &pool,
+        book_router(serde_json::json!([{"price":"0.41","size":"1000"}])),
+    )
+    .await;
+    let mut p = position();
+    p.state = PositionState::Open;
+    p.held_yes_qty = Decimal::TEN;
+    service.repo().insert(&p).await.unwrap();
+    let version = || async {
+        sqlx::query_scalar::<_, i64>("SELECT version FROM positions WHERE id = $1")
+            .bind(p.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let mut candidate = polymarket_core::db::positions::ExitCandidate {
+        position: p.clone(),
+        source: polymarket_core::db::positions::SOURCE_MANUAL,
+        source_signal_id: None,
+    };
+    let cfg = ExitHandlerConfig::default();
+
+    let before = version().await;
+    h.evaluate_open_candidate(&mut candidate, None, &cfg)
+        .await
+        .unwrap();
+    assert_eq!(version().await, before + 1, "a new mark is written");
+    h.evaluate_open_candidate(&mut candidate, None, &cfg)
+        .await
+        .unwrap();
+    assert_eq!(version().await, before + 1, "the same mark is not");
+    assert_eq!(candidate.position.state, PositionState::Open);
+    server.abort();
+}

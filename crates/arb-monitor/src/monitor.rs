@@ -572,11 +572,15 @@ impl ArbMonitor {
         // Process updates
         let mut health_tick = 0u64;
         let mut stats_tick = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        // After an overrun, wait a full period instead of catching up.
+        stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         stats_tick.tick().await;
         // Heartbeat ticker keeps the health file fresh even when no orderbook
         // updates are flowing (e.g. WebSocket hung). Without this, liveness
         // depends entirely on update volume.
         let mut heartbeat_tick = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        // After an overrun, wait a full period instead of catching up.
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat_tick.tick().await;
 
         let mut updates_since_tick = 0u64;
