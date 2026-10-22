@@ -47,7 +47,6 @@ pub mod quant_signal_executor;
 pub mod redis_forwarder;
 pub mod routes;
 pub mod runtime_sync;
-pub mod schema;
 #[cfg(test)]
 mod security_http_tests;
 pub mod signals;

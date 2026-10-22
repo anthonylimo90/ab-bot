@@ -10,8 +10,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     accounting, activity, admin_workspaces, auth, backtest, discover, health, markets,
-    order_signing, positions, recommendations, recovery, risk, signals, strategy_health,
-    trade_flow, trading, users, vault, wallet_auth, wallets, workspaces,
+    order_signing, positions, recovery, risk, signals, strategy_health, trade_flow, trading, users,
+    vault, wallet_auth, wallets, workspaces,
 };
 use crate::middleware::rate_limit::{LimiterJanitor, TrustedProxyKeyExtractor};
 use crate::middleware::{require_admin, require_auth, require_trader};
@@ -72,9 +72,6 @@ use crate::websocket;
         vault::list_withdrawals,
         vault::create_withdrawal,
         vault::withdrawal_preflight,
-        recommendations::get_rotation_recommendations,
-        recommendations::dismiss_recommendation,
-        recommendations::accept_recommendation,
         users::list_users,
         users::create_user,
         users::get_user,
@@ -205,10 +202,6 @@ use crate::websocket;
             vault::CreateWithdrawalRequest,
             vault::WalletWithdrawalResponse,
             vault::WithdrawalPreflightResponse,
-            recommendations::RotationRecommendation,
-            recommendations::RecommendationType,
-            recommendations::RecommendationReason,
-            recommendations::Urgency,
             users::UserListItem,
             users::CreateUserRequest,
             users::UpdateUserRequest,
@@ -310,7 +303,6 @@ use crate::websocket;
         (name = "backtest", description = "Backtesting operations"),
         (name = "discover", description = "Wallet discovery and live trade monitoring"),
         (name = "vault", description = "Secure wallet key management"),
-        (name = "recommendations", description = "Advisory wallet rotation and research recommendations"),
         (name = "users", description = "User management (admin only)"),
         (name = "admin_workspaces", description = "Workspace management (platform admin only)"),
         (name = "workspaces", description = "User workspace operations"),
@@ -394,19 +386,6 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
             get(discover::get_discovered_wallet),
         )
         .route("/api/v1/regime/current", get(discover::get_current_regime))
-        // Recommendations (public for demo purposes)
-        .route(
-            "/api/v1/recommendations/rotation",
-            get(recommendations::get_rotation_recommendations),
-        )
-        .route(
-            "/api/v1/recommendations/:id/dismiss",
-            post(recommendations::dismiss_recommendation),
-        )
-        .route(
-            "/api/v1/recommendations/:id/accept",
-            post(recommendations::accept_recommendation),
-        )
         .route("/api/v1/invites/:token", get(workspaces::get_invite_info))
         .route(
             "/api/v1/invites/:token/accept",

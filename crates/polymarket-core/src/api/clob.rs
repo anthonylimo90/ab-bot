@@ -970,17 +970,6 @@ impl ActivityEntry {
     }
 }
 
-/// Response wrapper for paginated trades (legacy CLOB API format - no longer used).
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct TradesResponse {
-    #[serde(default)]
-    data: Option<Vec<ClobTrade>>,
-    /// Some endpoints return trades at top level.
-    #[serde(flatten)]
-    _extra: serde_json::Value,
-}
-
 /// Order book update from WebSocket.
 #[derive(Debug, Clone)]
 pub struct OrderBookUpdate {
@@ -1024,7 +1013,6 @@ struct ClobMarket {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct ClobToken {
     token_id: String,
     outcome: String,

@@ -6,26 +6,15 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-polymarket-core.workspace = true
-
-# Async
-tokio.workspace = true
-futures-util.workspace = true
-
 # Serialization
 serde.workspace = true
-serde_json.workspace = true
 
 # Types
 chrono.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
 
-# Concurrent data structures
-dashmap.workspace = true
-
 # Error handling
-thiserror.workspace = true
 anyhow.workspace = true
 
 # Logging
@@ -38,5 +27,5 @@ sqlx.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
-tokio-test.workspace = true
-mockall.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

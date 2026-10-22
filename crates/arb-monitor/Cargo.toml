@@ -31,22 +31,14 @@ redis = { workspace = true }
 
 # Types
 chrono = { workspace = true }
-uuid = { workspace = true }
 rust_decimal = { workspace = true }
 
 # Error handling
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# Configuration
-dotenvy = { workspace = true }
-
 # Memory allocator
 tikv-jemallocator = { workspace = true }
-
-[dev-dependencies]
-tokio-test = { workspace = true }

@@ -2,9 +2,7 @@
 //!
 //! Identifies automated trading wallets on Polymarket through behavioral analysis.
 
-mod feature_extractor;
 mod indexer;
-mod scorer;
 mod trade_history;
 
 use anyhow::Result;
@@ -81,7 +79,7 @@ async fn analyze_wallet(config: &Config, address: &str) -> Result<()> {
     info!("Found {} transfers for wallet", transfers.len());
 
     // Extract features, then add the realized win rate from trade history
-    let mut features = feature_extractor::extract_features(address, &transfers)?;
+    let mut features = polymarket_core::feature_extractor::extract_features(address, &transfers)?;
     trade_history::attach_win_rate(&pool, &mut features).await;
     info!(
         "Extracted features: {} trades, interval_cv={:?}, win_rate={:?}",

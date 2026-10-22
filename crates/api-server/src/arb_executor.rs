@@ -1519,29 +1519,14 @@ pub fn spawn_arb_auto_executor(
     token_cache
 }
 
-#[allow(dead_code)] // Builder trait — some methods used only for signal events, others reserved.
 trait ArbTradeEventExt {
-    fn with_position(self, position_id: uuid::Uuid) -> Self;
-    fn with_state(self, from: Option<&str>, to: Option<&str>) -> Self;
     fn with_reason(self, reason: Option<&str>) -> Self;
     fn with_expected_edge(self, edge: Decimal) -> Self;
     fn with_observed_edge(self, edge: Decimal) -> Self;
-    fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
     fn with_metadata(self, metadata: serde_json::Value) -> Self;
 }
 
 impl ArbTradeEventExt for NewTradeEvent {
-    fn with_position(mut self, position_id: uuid::Uuid) -> Self {
-        self.position_id = Some(position_id);
-        self
-    }
-
-    fn with_state(mut self, from: Option<&str>, to: Option<&str>) -> Self {
-        self.state_from = from.map(str::to_string);
-        self.state_to = to.map(str::to_string);
-        self
-    }
-
     fn with_reason(mut self, reason: Option<&str>) -> Self {
         self.reason = reason.map(str::to_string);
         self
@@ -1554,11 +1539,6 @@ impl ArbTradeEventExt for NewTradeEvent {
 
     fn with_observed_edge(mut self, edge: Decimal) -> Self {
         self.observed_edge = Some(edge);
-        self
-    }
-
-    fn with_unrealized_pnl(mut self, pnl: Decimal) -> Self {
-        self.unrealized_pnl = Some(pnl);
         self
     }
 

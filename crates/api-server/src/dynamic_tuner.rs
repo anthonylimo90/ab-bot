@@ -1646,7 +1646,6 @@ fn env_aggressiveness_level() -> Decimal {
     }
 }
 
-#[allow(dead_code)]
 fn ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator <= 0.0 {
         return 0.0;

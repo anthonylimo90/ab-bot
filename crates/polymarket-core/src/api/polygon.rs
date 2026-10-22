@@ -817,9 +817,7 @@ struct JsonRpcResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct JsonRpcError {
-    code: i64,
     message: String,
 }
 
@@ -861,11 +859,8 @@ pub struct TransferMetadata {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct AssetTransfersResponse {
     transfers: Vec<AssetTransfer>,
-    #[serde(rename = "pageKey")]
-    page_key: Option<String>,
 }
 
 #[cfg(test)]

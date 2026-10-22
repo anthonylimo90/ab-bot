@@ -137,10 +137,9 @@ Sources:
 wallet harvester + wallet_trades
   -> metrics_calculator
   -> wallet_success_metrics
-  -> wallet discovery / scoring / prediction
-  -> advisory recommendation endpoints
+  -> wallet discovery and strategy classification
 ```
 
 Important boundary:
-- wallet discovery and recommendations are research/operator tooling.
+- wallet discovery is research/operator tooling.
 - they do not currently drive live copy trading or automated wallet rotation.

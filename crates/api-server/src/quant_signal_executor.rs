@@ -1520,15 +1520,12 @@ pub fn spawn_quant_signal_executor(
     info!("Quant signal executor spawned");
 }
 
-#[allow(dead_code)] // Builder methods for trade event enrichment; some currently unused.
 trait TradeEventBuilderExt {
     fn with_signal(self, signal: &QuantSignal) -> Self;
     fn with_position(self, position_id: uuid::Uuid) -> Self;
     fn with_state(self, from: Option<&str>, to: Option<&str>) -> Self;
     fn with_reason(self, reason: Option<&str>) -> Self;
     fn with_requested_size(self, size: Decimal) -> Self;
-    fn with_filled_size(self, size: Decimal) -> Self;
-    fn with_fill_price(self, price: Decimal) -> Self;
     fn with_unrealized_pnl(self, pnl: Decimal) -> Self;
     fn with_metadata(self, metadata: serde_json::Value) -> Self;
 }
@@ -1560,16 +1557,6 @@ impl TradeEventBuilderExt for NewTradeEvent {
 
     fn with_requested_size(mut self, size: Decimal) -> Self {
         self.requested_size_usd = Some(size);
-        self
-    }
-
-    fn with_filled_size(mut self, size: Decimal) -> Self {
-        self.filled_size_usd = Some(size);
-        self
-    }
-
-    fn with_fill_price(mut self, price: Decimal) -> Self {
-        self.fill_price = Some(price);
         self
     }
 

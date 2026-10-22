@@ -55,8 +55,8 @@ impl DiscoveryCriteria {
     /// During bear/volatile markets, thresholds are relaxed to prevent empty candidate
     /// pools while still maintaining quality standards. During bull/calm markets,
     /// defaults (or slightly stricter thresholds) are used.
-    pub fn from_market_regime(regime: crate::advanced_predictor::MarketRegime) -> Self {
-        use crate::advanced_predictor::MarketRegime;
+    pub fn from_market_regime(regime: crate::market_regime::MarketRegime) -> Self {
+        use crate::market_regime::MarketRegime;
         let base = Self::default();
         match regime {
             MarketRegime::BullCalm => base, // Keep strict defaults — best conditions

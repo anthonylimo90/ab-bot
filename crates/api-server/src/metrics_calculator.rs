@@ -23,8 +23,6 @@ struct CorrelationRow {
     sample_size: i32,
 }
 
-use crate::schema::wallet_features_has_strategy_type;
-
 /// Configuration for the metrics calculator background job.
 #[derive(Debug, Clone)]
 pub struct MetricsCalculatorConfig {
@@ -485,11 +483,6 @@ impl MetricsCalculator {
     /// runs the rule-based classifier, and stores the primary strategy label.
     async fn classify_wallet_strategies(&self) -> Result<()> {
         use polymarket_core::types::WalletFeatures;
-
-        if !wallet_features_has_strategy_type(&self.pool).await {
-            debug!("Skipping strategy classification: strategy_type column is missing");
-            return Ok(());
-        }
 
         // Fetch wallets missing a strategy classification (limit per batch)
         #[allow(clippy::type_complexity)]

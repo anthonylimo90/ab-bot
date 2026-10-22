@@ -2,7 +2,7 @@
 //!
 //! Run with:
 //! ```
-//! WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
+//! WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 //! ```
 
 use auth::TradingWallet;

@@ -338,7 +338,8 @@ impl TradeIndexer {
         }
 
         // Extract features, then add the realized win rate from trade history
-        let mut features = crate::feature_extractor::extract_features(address, &transfers)?;
+        let mut features =
+            polymarket_core::feature_extractor::extract_features(address, &transfers)?;
         crate::trade_history::attach_win_rate(self.wallet_repo.pool(), &mut features).await;
 
         // Calculate bot score

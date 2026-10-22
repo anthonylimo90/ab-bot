@@ -9,7 +9,6 @@ use tokio::sync::{broadcast, RwLock};
 
 use auth::jwt::{JwtAuth, JwtConfig};
 use auth::key_vault::KeyVault;
-use auth::rbac::RbacManager;
 use auth::{AuditLogger, AuditStorage, PostgresAuditStorage, TradingWallet};
 use polymarket_core::api::{ClobClient, PolygonClient};
 use polymarket_core::types::{ArbOpportunity, QuantSignal};
@@ -153,8 +152,6 @@ pub struct AppState {
     pub encryption_key: String,
     /// JWT authentication handler.
     pub jwt_auth: Arc<JwtAuth>,
-    /// RBAC manager for fine-grained permission checking.
-    pub rbac: Arc<RbacManager>,
     /// Key vault for secure wallet key storage.
     pub key_vault: Arc<KeyVault>,
     /// Audit logger for security and compliance logging.
@@ -243,7 +240,6 @@ impl AppState {
         let jwt_auth = Arc::new(JwtAuth::new(jwt_config));
 
         // Create RBAC manager with default roles
-        let rbac = Arc::new(RbacManager::new());
 
         // Create KeyVault from environment or with default config
         let key_vault = match KeyVault::from_env() {
@@ -637,7 +633,6 @@ impl AppState {
             jwt_secret,
             encryption_key,
             jwt_auth,
-            rbac,
             key_vault,
             audit_logger,
             email_client,
@@ -680,7 +675,6 @@ impl AppState {
             audience: None,
             expiry_hours: 1,
         }));
-        let rbac = Arc::new(RbacManager::new());
         let key_vault = Arc::new(KeyVault::new(
             auth::key_vault::KeyVaultProvider::Memory,
             jwt_secret.as_bytes().to_vec(),
@@ -721,7 +715,6 @@ impl AppState {
             jwt_secret,
             encryption_key,
             jwt_auth,
-            rbac,
             key_vault,
             audit_logger,
             email_client,

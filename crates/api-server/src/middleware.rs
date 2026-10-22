@@ -153,10 +153,8 @@ pub async fn require_auth(
     // Log successful authentication
     tracing::debug!(user_id = %claims.sub, role = ?claims.role, "Authenticated request");
 
-    // Authorization decisions use the validated claims (and the database state
-    // that `authorize_session` just re-checked), never `state.rbac`: nothing
-    // reads it, and writing to it on every request only grew its in-memory role
-    // lists under a global write lock.
+    // Authorization decisions use the validated claims and the database state
+    // that `authorize_session` just re-checked.
 
     // Inject claims into request extensions
     request.extensions_mut().insert(claims);

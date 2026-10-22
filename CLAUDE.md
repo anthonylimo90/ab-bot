@@ -6,12 +6,12 @@ Rust workspace for bot detection and arbitrage monitoring on Polymarket.
 
 - `api-server` - REST/WebSocket API (Axum, port 3000)
 - `arb-monitor` - Arbitrage detection and position tracking
-- `auth` - JWT, RBAC, API keys, audit logging
+- `auth` - JWT, wallet key vault, audit logging
 - `backtester` - Historical backtesting with TimescaleDB
 - `bot-scanner` - Wallet behavior analysis and bot detection
 - `polymarket-core` - Shared types, API clients, database models
-- `risk-manager` - Stop-loss, circuit breaker
-- `trading-engine` - Order execution, position management
+- `risk-manager` - Circuit breaker
+- `trading-engine` - Order execution
 - `wallet-tracker` - Wallet discovery, profitability analysis
 
 ## Dashboard

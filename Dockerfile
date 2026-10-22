@@ -29,8 +29,7 @@ COPY crates/trading-engine/Cargo.toml crates/trading-engine/Cargo.toml
 COPY crates/wallet-tracker/Cargo.toml crates/wallet-tracker/Cargo.toml
 
 # Create dummy source files so cargo can resolve the workspace
-RUN mkdir -p src && echo "" > src/lib.rs \
-    && mkdir -p crates/api-server/src && echo "fn main() {}" > crates/api-server/src/main.rs && echo "" > crates/api-server/src/lib.rs \
+RUN mkdir -p crates/api-server/src && echo "fn main() {}" > crates/api-server/src/main.rs && echo "" > crates/api-server/src/lib.rs \
     && mkdir -p crates/arb-monitor/src && echo "fn main() {}" > crates/arb-monitor/src/main.rs \
     && mkdir -p crates/auth/src && echo "" > crates/auth/src/lib.rs \
     && mkdir -p crates/backtester/src && echo "" > crates/backtester/src/lib.rs \
@@ -48,8 +47,7 @@ RUN cargo build --release --workspace 2>/dev/null || true
 COPY . .
 
 # Touch source files to ensure cargo rebuilds workspace crates
-RUN touch src/lib.rs \
-    && touch crates/api-server/src/main.rs crates/api-server/src/lib.rs \
+RUN touch crates/api-server/src/main.rs crates/api-server/src/lib.rs \
     && touch crates/arb-monitor/src/main.rs \
     && touch crates/auth/src/lib.rs \
     && touch crates/backtester/src/lib.rs \

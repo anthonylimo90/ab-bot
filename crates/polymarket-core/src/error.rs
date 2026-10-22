@@ -22,9 +22,6 @@ pub enum Error {
     #[error("Redis error: {0}")]
     Redis(Box<redis::RedisError>),
 
-    #[error("Configuration file error: {0}")]
-    ConfigFile(#[from] config::ConfigError),
-
     #[error("Configuration error: {message}")]
     Config { message: String },
 

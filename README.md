@@ -12,13 +12,12 @@ A Rust-based Polymarket trading platform focused on arbitrage execution, quantit
 ### Supporting systems
 - **Risk management**: circuit breaker, recovery logic, and manual risk controls per workspace.
 - **Dynamic tuning**: runtime config updates over Redis, mainly for arbitrage thresholds, with quant base size support.
-- **Wallet research**: wallet harvesting, profitability metrics, scoring, discovery, and recommendation endpoints for operator research.
+- **Wallet research**: wallet harvesting, profitability metrics, strategy classification, and discovery endpoints for operator research.
 - **Backtesting**: historical simulation for arbitrage, momentum, mean reversion, and grid strategies.
 - **Dashboard**: Next.js UI for markets, positions, risk, signals, history, backtests, settings, and admin/workspace flows.
 
 ### What was removed
-- Copy trading, tracked-wallet roster automation, auto-rotation, allocation management, and related copy-trading tables/configuration were removed from the live product.
-- Recommendation endpoints still exist, but they are **advisory only** and do not drive a live wallet-following engine.
+- Copy trading, tracked-wallet roster automation, auto-rotation, allocation management, and related copy-trading tables/configuration were removed from the live product, along with the wallet-rotation recommendation endpoints that depended on them.
 
 ## Architecture
 
@@ -27,13 +26,13 @@ ab-bot/
 ├── crates/
 │   ├── api-server/       # REST/WebSocket API, executors, handlers, runtime wiring
 │   ├── arb-monitor/      # Arbitrage opportunity detection and market monitoring
-│   ├── auth/             # JWT, RBAC, wallet auth, key vault
+│   ├── auth/             # JWT, wallet key vault, audit logging
 │   ├── backtester/       # Historical simulation framework
 │   ├── bot-scanner/      # Wallet behavior analysis
 │   ├── polymarket-core/  # Shared types, DB repos, API clients
-│   ├── risk-manager/     # Circuit breaker and stop logic
-│   ├── trading-engine/   # Order execution helpers and position manager utilities
-│   └── wallet-tracker/   # Wallet discovery, metrics, scoring, prediction
+│   ├── risk-manager/     # Circuit breaker
+│   ├── trading-engine/   # Order execution, submission journal and drain
+│   └── wallet-tracker/   # Wallet discovery, metrics, strategy classification, market regime
 ├── dashboard/            # Next.js frontend
 ├── docs/                 # Deployment and runtime state-machine docs
 ├── migrations/           # PostgreSQL / TimescaleDB migrations
@@ -129,7 +128,7 @@ CB_COOLDOWN_MINUTES=30
 Wallet smoke test:
 
 ```bash
-WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
+WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 ```
 
 ## API Surface
@@ -140,9 +139,6 @@ WALLET_PRIVATE_KEY=0x... cargo run --example test_wallet
 - `GET /api/v1/discover/wallets`
 - `GET /api/v1/discover/wallets/:address`
 - `GET /api/v1/regime/current`
-- `GET /api/v1/recommendations/rotation`
-- `POST /api/v1/recommendations/:id/dismiss`
-- `POST /api/v1/recommendations/:id/accept`
 - invite acceptance endpoints
 - WebSocket: `/ws/orderbook`, `/ws/positions`, `/ws/signals`, `/ws/all`
 
@@ -246,7 +242,6 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for deployment steps.
 ## Known Limitations
 
 - Quant exits now use a generic risk-managed close policy; strategy-specific exit logic is still future work.
-- Recommendation / rotation endpoints are advisory only and do not operate a live wallet-following engine.
 - Arbitrage backtests were moved closer to live behavior, but they are still not a full live-parity replay of the production execution stack.
 - Some legacy handlers and comments still reference removed copy-trading schema and should be cleaned up in a later pass.
 
