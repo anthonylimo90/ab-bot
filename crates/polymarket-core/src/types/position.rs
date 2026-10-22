@@ -477,52 +477,35 @@ impl Position {
     }
 
     /// Write off `quantity` of the YES (or NO) holding that the wallet does
-    /// not have, such as shares an exchange kept as a buy fee. Returns the
-    /// quantity written off (at most the holding).
+    /// not have. Returns the quantity written off (at most the holding).
     ///
-    /// Under the share-based model they count as exited for no proceeds, so
-    /// their cost lands in the realized P&L, and a fee kept in shares was not
-    /// also charged in USDC: as much of `fees_paid` as their cost is taken
-    /// back, up to the leg's own buy fees. Under the flat model, whose rate
-    /// already stands for every fee, they exit at their entry price and leave
-    /// the P&L as it was.
+    /// The shares count as exited for no proceeds, so their cost lands in the
+    /// realized P&L. The V1 exchange kept a buy's fee in shares, which this
+    /// books as the fee it was; the V2 exchange (since 2026-04-28) charges
+    /// every fee in collateral, so a shortfall is never a fee already in
+    /// `fees_paid`, and none is taken back.
     pub fn write_off_missing_shares(&mut self, yes: bool, quantity: Decimal) -> Decimal {
-        let (held, exited, price, entry_price) = if yes {
+        let (held, exited, price) = if yes {
             (
                 &mut self.held_yes_qty,
                 &mut self.exited_yes_qty,
                 &mut self.yes_exit_price,
-                self.yes_entry_price,
             )
         } else {
             (
                 &mut self.held_no_qty,
                 &mut self.exited_no_qty,
                 &mut self.no_exit_price,
-                self.no_entry_price,
             )
         };
         let missing = quantity.max(Decimal::ZERO).min(*held);
         if missing.is_zero() {
             return Decimal::ZERO;
         }
-        let bought = *held + *exited;
-        let mut proceeds = price.unwrap_or_default() * *exited;
-        if self.fee_model == PositionFeeModel::LegacyFlat {
-            proceeds += missing * entry_price;
-        }
+        let proceeds = price.unwrap_or_default() * *exited;
         *exited += missing;
         *held -= missing;
         *price = Some(proceeds / *exited);
-        if self.fee_model == PositionFeeModel::ShareBased {
-            let leg_buy_fees = self
-                .taker_fees
-                .map(|terms| terms.fee_per_share(entry_price) * bought)
-                .unwrap_or_default();
-            self.fees_paid -= (missing * entry_price)
-                .min(leg_buy_fees)
-                .min(self.fees_paid);
-        }
         self.last_updated = Utc::now();
         missing
     }
@@ -1305,8 +1288,8 @@ mod tests {
     }
 
     #[test]
-    fn shares_kept_as_fees_count_as_exited_for_nothing() {
-        let partly_sold = |model: PositionFeeModel| {
+    fn missing_shares_count_as_exited_for_nothing() {
+        for model in [PositionFeeModel::ShareBased, PositionFeeModel::LegacyFlat] {
             let mut pos = Position::new(
                 "m".into(),
                 Decimal::new(50, 2),
@@ -1316,59 +1299,37 @@ mod tests {
             );
             pos.fee_model = model;
             pos.taker_fees = Some(FeeSchedule::CONSERVATIVE);
-            pos.held_yes_qty = Decimal::from(100);
-            // An earlier partial sale of 10 at 0.60.
-            pos.held_yes_qty -= Decimal::from(10);
+            pos.fees_paid = Decimal::from(2);
+            // 100 bought, then a partial sale of 10 at 0.60.
+            pos.held_yes_qty = Decimal::from(90);
             pos.exited_yes_qty = Decimal::from(10);
             pos.yes_exit_price = Some(Decimal::new(60, 2));
-            pos
-        };
 
-        // Share-based: the 100 bought at 0.50 paid 100 × 0.07 × 0.25 = 1.75 of
-        // USDC fees, part of the 2 charged so far (the rest on other fills).
-        let mut pos = partly_sold(PositionFeeModel::ShareBased);
-        pos.fees_paid = Decimal::from(2);
-        let written_off = pos.write_off_missing_shares(true, Decimal::new(35, 1));
-        assert_eq!(written_off, Decimal::new(35, 1));
-        // 3.5 shares at the 0.50 entry price: their 1.75 of fee taken back.
-        assert_eq!(pos.fees_paid, Decimal::new(25, 2));
-        assert_eq!(pos.held_yes_qty, Decimal::new(865, 1));
-        assert_eq!(pos.exited_yes_qty, Decimal::new(135, 1));
-        // Proceeds unchanged (10 × 0.60 = 6), spread over the larger quantity.
-        assert_eq!(
-            (pos.yes_exit_price.unwrap() * pos.exited_yes_qty).round_dp(20),
-            Decimal::from(6)
-        );
-        // Never more than is held, never a negative amount, other leg untouched.
-        assert_eq!(
-            pos.write_off_missing_shares(true, Decimal::from(1000)),
-            Decimal::new(865, 1)
-        );
-        assert_eq!(pos.held_yes_qty, Decimal::ZERO);
-        assert_eq!(
-            pos.write_off_missing_shares(false, Decimal::ONE),
-            Decimal::ZERO
-        );
-        assert_eq!(
-            pos.write_off_missing_shares(true, -Decimal::ONE),
-            Decimal::ZERO
-        );
-
-        // Shares written off for any other reason take back no more than the
-        // leg's own buy fees, never fees charged to other fills.
-        let mut pos = partly_sold(PositionFeeModel::ShareBased);
-        pos.fees_paid = Decimal::from(5);
-        pos.write_off_missing_shares(true, Decimal::from(9));
-        assert_eq!(pos.fees_paid, Decimal::new(325, 2));
-
-        // Flat model: its rate stands for every fee, so the shares leave at
-        // their entry price and the P&L is as it was.
-        let mut pos = partly_sold(PositionFeeModel::LegacyFlat);
-        pos.write_off_missing_shares(true, Decimal::new(35, 1));
-        assert_eq!(
-            (pos.yes_exit_price.unwrap() * pos.exited_yes_qty).round_dp(20),
-            Decimal::new(775, 2)
-        );
-        assert_eq!(pos.fees_paid, Decimal::ZERO);
+            let written_off = pos.write_off_missing_shares(true, Decimal::new(35, 1));
+            assert_eq!(written_off, Decimal::new(35, 1));
+            assert_eq!(pos.held_yes_qty, Decimal::new(865, 1));
+            assert_eq!(pos.exited_yes_qty, Decimal::new(135, 1));
+            // Proceeds unchanged (10 × 0.60 = 6), spread over the larger quantity.
+            assert_eq!(
+                (pos.yes_exit_price.unwrap() * pos.exited_yes_qty).round_dp(20),
+                Decimal::from(6)
+            );
+            // Fees charged in collateral stay charged.
+            assert_eq!(pos.fees_paid, Decimal::from(2));
+            // Never more than is held, never a negative amount, other leg untouched.
+            assert_eq!(
+                pos.write_off_missing_shares(true, Decimal::from(1000)),
+                Decimal::new(865, 1)
+            );
+            assert_eq!(pos.held_yes_qty, Decimal::ZERO);
+            assert_eq!(
+                pos.write_off_missing_shares(false, Decimal::ONE),
+                Decimal::ZERO
+            );
+            assert_eq!(
+                pos.write_off_missing_shares(true, -Decimal::ONE),
+                Decimal::ZERO
+            );
+        }
     }
 }

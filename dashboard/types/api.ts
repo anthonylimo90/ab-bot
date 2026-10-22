@@ -53,19 +53,6 @@ export interface UpdateUserRequest {
   password?: string;
 }
 
-// WalletPosition - shared UI position format used by ManualPositions
-export interface WalletPosition {
-  id: string;
-  marketId: string;
-  marketQuestion?: string;
-  outcome: "yes" | "no";
-  quantity: number;
-  entryPrice: number;
-  currentPrice: number;
-  pnl: number;
-  pnlPercent: number;
-}
-
 // Position types
 export type PositionSide = "long" | "short";
 export type PositionOutcome = "yes" | "no";
@@ -1050,76 +1037,6 @@ export interface AcceptInviteResponse {
   // Only present for new users
   token?: string;
   user?: User;
-}
-
-// Order Signing Types (for MetaMask trade signing)
-export interface Eip712Domain {
-  name: string;
-  version: string;
-  chainId: number;
-  verifyingContract: string;
-}
-
-export interface Eip712Order {
-  salt: string;
-  maker: string;
-  signer: string;
-  tokenId: string;
-  makerAmount: string;
-  takerAmount: string;
-  side: number;
-  signatureType: number;
-  timestamp: string;
-  metadata: string;
-  builder: string;
-}
-
-export interface Eip712TypedData {
-  types: {
-    EIP712Domain: Array<{ name: string; type: string }>;
-    Order: Array<{ name: string; type: string }>;
-  };
-  primaryType: string;
-  domain: Eip712Domain;
-  message: Eip712Order;
-}
-
-export interface OrderSummary {
-  side: string;
-  outcome: string;
-  price: string;
-  size: string;
-  total_cost: string;
-  potential_payout: string;
-}
-
-export interface PrepareOrderRequest {
-  token_id: string;
-  side: "BUY" | "SELL";
-  price: number;
-  size: number;
-  maker_address: string;
-  neg_risk?: boolean;
-  expires_in_secs?: number;
-}
-
-export interface PrepareOrderResponse {
-  pending_order_id: string;
-  typed_data: Eip712TypedData;
-  expires_at: string;
-  summary: OrderSummary;
-}
-
-export interface SubmitOrderRequest {
-  pending_order_id: string;
-  signature: string;
-}
-
-export interface SubmitOrderResponse {
-  success: boolean;
-  order_id?: string;
-  message: string;
-  tx_hash?: string;
 }
 
 // Service status types

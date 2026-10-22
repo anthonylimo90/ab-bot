@@ -750,18 +750,6 @@ class ApiClient {
     return parseOrder(raw);
   }
 
-  async getOrder(orderId: string): Promise<Order> {
-    const raw = await this.request<Order>(`/api/v1/orders/${orderId}`);
-    return parseOrder(raw);
-  }
-
-  async cancelOrder(orderId: string): Promise<Order> {
-    const raw = await this.request<Order>(`/api/v1/orders/${orderId}/cancel`, {
-      method: "POST",
-    });
-    return parseOrder(raw);
-  }
-
   // Backtest
   async runBacktest(params: BacktestParams): Promise<BacktestResult> {
     const raw = await this.request<BacktestResult>("/api/v1/backtest", {

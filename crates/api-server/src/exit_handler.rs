@@ -420,8 +420,10 @@ impl ExitHandler {
             }
         };
 
-        // Sell what the wallet has: should a buy's fee have been kept in
-        // shares, a recorded holding exceeds the balance by that fee.
+        // The fees of these sales are charged under the market's terms.
+        self.attach_fee_terms(position).await;
+        // Sell what the wallet has: a buy whose fee the V1 exchange kept in
+        // shares left the recorded holding above the balance by that fee.
         for (leg, token_id) in [(Leg::Yes, &yes_token_id), (Leg::No, &no_token_id)] {
             self.align_leg_with_wallet(position, leg, token_id, &ctx)
                 .await?;
@@ -694,12 +696,34 @@ impl ExitHandler {
         Ok(())
     }
 
+    /// Give a share-based position that records no fee terms (one opened
+    /// before migration 092) its market's terms, as the exchange charges them,
+    /// so the fees of its sales are charged. Its buys were made on the V1
+    /// exchange, which kept their fees in shares: the wallet alignment books
+    /// those. When the terms cannot be read the sale goes ahead uncharged.
+    async fn attach_fee_terms(&self, position: &mut Position) {
+        if position.fee_model != polymarket_core::types::PositionFeeModel::ShareBased
+            || position.taker_fees.is_some()
+        {
+            return;
+        }
+        match self.clob_client.get_fee_schedule(&position.market_id).await {
+            Ok(terms) => position.taker_fees = Some(terms),
+            Err(error) => warn!(
+                position_id = %position.id,
+                %error,
+                "Could not read the market's fee terms; this exit's fees go uncharged"
+            ),
+        }
+    }
+
     /// Before a live sale, write off this position's part of what the wallet
-    /// lacks of a token, when the gap is no more than buy fees could have
-    /// kept (see [`fee_shortfall`]). The balance is the wallet's: the gap is
+    /// lacks of a token, when the gap is small (see [`fee_shortfall`]): buy
+    /// fees the V1 exchange kept in shares, or rounding dust (the V2 exchange
+    /// charges fees in collateral). The balance is the wallet's: the gap is
     /// measured against everything its live positions and manual orders
     /// record of the token, and each holder answers for its share of it, so
-    /// another holder's kept fees never land on this position. Nothing is
+    /// another holder's shortfall never lands on this position. Nothing is
     /// written off while an order of the wallet on the token has an unknown
     /// outcome or a buy may still be settling on chain: a balance read then
     /// can be short by shares that are on their way. A larger gap is left for
@@ -768,7 +792,7 @@ impl ExitHandler {
                     %recorded,
                     %balance,
                     %share,
-                    "Writing off shares the exchange kept as fees"
+                    "Writing off shares the wallet lacks"
                 );
                 self.position_service
                     .write_off_missing_shares(position, leg, share, ctx)
@@ -1986,9 +2010,9 @@ fn held_outcomes(position: &Position) -> (bool, bool) {
     position.held_outcomes()
 }
 
-/// The most a buy's fee could keep of the shares bought, were it kept in
-/// shares (Polymarket documents it as charged in USDC on top): the fee is
-/// `rate × p(1 − p)` USDC per share, paid in shares worth `p`, so
+/// The most a buy's fee kept of the shares bought on the V1 exchange, which
+/// took buy fees in shares (the V2 exchange charges them in collateral): the
+/// fee is `rate × p(1 − p)` USDC per share, paid in shares worth `p`, so
 /// `rate × (1 − p)` of them, and no published rate exceeds 0.07.
 const MAX_FEE_SHARE_FRACTION: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
 
@@ -2017,9 +2041,9 @@ const OTHER_HOLDERS_SQL: &str = "SELECT \
     OR EXISTS(SELECT 1 FROM position_order_links l JOIN positions p ON p.id = l.position_id \
         WHERE NOT l.settled AND p.market_id = $2 AND LOWER(p.wallet_address) = LOWER($3))";
 
-/// How much of `held` to write off as fee shares when the wallet holds only
-/// `balance` for it: the whole shortfall when a buy fee explains it,
-/// otherwise none.
+/// How much of `held` to write off when the wallet holds only `balance` for
+/// it: the whole shortfall when it is no more than V1 buy fees kept in shares
+/// (or dust), otherwise none.
 fn fee_shortfall(held: Decimal, balance: Decimal) -> Option<Decimal> {
     let shortfall = held - balance.max(Decimal::ZERO);
     (shortfall > Decimal::ZERO && shortfall <= held * MAX_FEE_SHARE_FRACTION).then_some(shortfall)

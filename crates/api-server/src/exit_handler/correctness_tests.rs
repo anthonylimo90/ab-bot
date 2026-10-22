@@ -748,7 +748,7 @@ fn only_a_fee_sized_shortfall_is_written_off() {
 }
 
 #[sqlx::test(migrations = false)]
-async fn fee_shares_written_off_lower_the_realized_pnl(pool: PgPool) {
+async fn missing_shares_written_off_lower_the_realized_pnl(pool: PgPool) {
     let service = setup(&pool).await;
     let ctx = context();
     // The wallet held 96.5 of the 100 shares recorded at 0.50; all 96.5 sold
@@ -792,17 +792,17 @@ async fn fee_shares_written_off_lower_the_realized_pnl(pool: PgPool) {
             p.realized_pnl.unwrap()
         }
     };
-    // Share-based: 96.5 × 0.60 − 100 × 0.50 = 7.90, the kept shares' cost
-    // counted as their fee (none charged in USDC here), not 10 from 100.
+    // Share-based: 96.5 × 0.60 − 100 × 0.50 = 7.90: the missing shares' cost
+    // is lost (no fee charged in USDC here), not 10 from 100.
     assert_eq!(
         realized(polymarket_core::types::PositionFeeModel::ShareBased).await,
         Decimal::new(790, 2)
     );
-    // Flat: the 2% rate already stands for the fees, so the kept shares leave
-    // at cost: 57.9 + 1.75 − 50 − 2% × (50 + 59.65) = 7.457.
+    // Flat: the missing shares are lost too, and the 2% rate is charged on
+    // the volume: 57.9 − 50 − 2% × (50 + 57.9) = 5.742.
     assert_eq!(
         realized(polymarket_core::types::PositionFeeModel::LegacyFlat).await,
-        Decimal::new(7457, 3)
+        Decimal::new(5742, 3)
     );
 }
 
@@ -819,6 +819,10 @@ async fn live_handler(
             post(|| async {
                 Json(serde_json::json!({"apiKey": "key", "secret": "c2VjcmV0", "passphrase": "pass"}))
             }),
+        )
+        .route(
+            "/clob-markets/:condition",
+            get(|| async { Json(serde_json::json!({"fd": {"r": 0.07, "e": 1, "to": true}})) }),
         )
         .route(
             "/balance-allowance",
@@ -1131,6 +1135,60 @@ async fn an_arbitrage_position_pays_the_taker_fee_of_each_fill(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(legacy.fees_paid, Decimal::ZERO);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_position_opened_without_fee_terms_pays_its_markets_fees_on_exit(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, _, server) = live_handler(&pool, balance).await;
+    let ctx = context();
+
+    // Opened before fee terms were recorded (migration 092).
+    let mut legacy = position();
+    legacy.execution_mode = "paper".into();
+    legacy.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    legacy.held_yes_qty = Decimal::TEN;
+    legacy.state = PositionState::Closing;
+    service.repo().insert(&legacy).await.unwrap();
+    h.attach_fee_terms(&mut legacy).await;
+    assert_eq!(
+        legacy.taker_fees,
+        Some(polymarket_core::types::FeeSchedule {
+            rate: Decimal::new(7, 2),
+            exponent: Decimal::ONE
+        })
+    );
+    // Sold at 0.50: 10 × 0.07 × 0.25 = 0.175, and the terms are kept.
+    service
+        .record_exit_fill(
+            &mut legacy,
+            Leg::Yes,
+            Decimal::new(50, 2),
+            Decimal::TEN,
+            &ctx,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy.fees_paid, Decimal::new(175, 3));
+    let stored = service.repo().get(legacy.id).await.unwrap().unwrap();
+    assert_eq!(stored.taker_fees, legacy.taker_fees);
+    assert_eq!(stored.fees_paid, Decimal::new(175, 3));
+
+    // Recorded terms stand, and flat-fee positions are left to their rate.
+    let mut priced = position();
+    priced.fee_model = polymarket_core::types::PositionFeeModel::ShareBased;
+    priced.taker_fees = Some(polymarket_core::types::FeeSchedule::FREE);
+    h.attach_fee_terms(&mut priced).await;
+    assert_eq!(
+        priced.taker_fees,
+        Some(polymarket_core::types::FeeSchedule::FREE)
+    );
+    let mut flat = position();
+    h.attach_fee_terms(&mut flat).await;
+    assert_eq!(flat.taker_fees, None);
+    server.abort();
 }
 
 #[sqlx::test(migrations = false)]

@@ -529,8 +529,13 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - 092 records an arbitrage position's taker fee terms and the fees charged to
   its fills (`fees_paid`), which its P&L now deducts: Polymarket charges a
   taker `C × rate × p(1 − p)` USDC per fill on top of the order amount.
-  Positions opened before 092 carry no terms and keep their previous P&L;
-  quant positions keep the flat 2% fee model. Live buys also keep room for
+  Positions opened before 092 were all bought on the V1 exchange, which kept
+  buy fees in shares: the wallet alignment before a sale books those as
+  shares lost. They take their market's terms from the exchange
+  (`/clob-markets`, `fd`) at their first exit sale, so the fees of their
+  sales are charged; quant positions keep the flat 2% fee model. A share
+  shortfall is never credited back as a fee: the V2 exchange charges every
+  fee in collateral. Live buys also keep room for
   the highest published fee on top of their amount, so a buy cannot spend
   USDC held back for an unsettled withdrawal.
 
@@ -540,6 +545,14 @@ taker buy's fee on top of the collateral the fill costs and deducts a taker
 sell's fee from its proceeds, and its `OrderFilled` event reports the fill
 amounts and the fee separately. The accounting books exactly that: fills at
 their pre-fee amounts, fees charged on top.
+
+### Circuit breaker during withdrawals
+
+While a withdrawal settles the breaker holds its equity feed (the balance may
+already lack the cash), but it still checks drawdown against the most equity
+can be: the snapshot plus every withdrawal and outbound flow not yet applied.
+It trips only on a loss even that shows, so withdrawals one after another
+cannot keep the breaker from seeing a real loss for longer than they last.
 
 ### CLOB V2 and pUSD collateral (093)
 
@@ -575,6 +588,11 @@ unsigned). Fees are set by the exchange when an order matches.
 - 093 drops browser-wallet orders prepared for the V1 exchange (they can no
   longer be submitted) and stores the signed creation time of new ones.
 - The bot-scanner indexer now reads trades from both V2 exchanges.
+- The dashboard's unmounted manual-order components (order form, order
+  panel, manual positions) and their wallet-signing hook were removed: no
+  page used them, and the form could not run without the wallet provider.
+  The browser-wallet order endpoints (`/api/v1/orders/prepare`, `/submit`)
+  remain for API clients and sign V2 orders.
 - Polymarket's documentation says a plain EOA trades on the CLOB "if your EOA
   is allowlisted for trading". The bot signs as an EOA (signature type 0);
   confirm the trading wallet is allowed before enabling live trading. Markets

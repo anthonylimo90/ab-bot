@@ -249,6 +249,19 @@ impl ClobClient {
         ))
     }
 
+    /// The taker fee terms the exchange charges in the market of
+    /// `condition_id`: the rate `r` and exponent `e` of its CLOB market info
+    /// (`fd`), free when it reports none. Terms that cannot be priced are an
+    /// error, not free.
+    pub async fn get_fee_schedule(&self, condition_id: &str) -> Result<crate::types::FeeSchedule> {
+        let info: serde_json::Value = self
+            .get_with_retry(&format!("{}/clob-markets/{condition_id}", self.base_url))
+            .await?
+            .json()
+            .await?;
+        fee_schedule_from_market_info(&info)
+    }
+
     /// Whether `token_id` trades on the neg-risk exchange, which decides the
     /// contract its orders are signed for.
     pub async fn get_neg_risk(&self, token_id: &str) -> Result<bool> {
@@ -2423,6 +2436,36 @@ fn calculate_market_order_amounts(
     ))
 }
 
+/// The fee terms in CLOB market info (`{"fd": {"r": rate, "e": exponent}}`).
+fn fee_schedule_from_market_info(info: &serde_json::Value) -> Result<crate::types::FeeSchedule> {
+    let invalid = || Error::Order {
+        message: format!(
+            "Unpriceable exchange fee terms: {}",
+            info.get("fd").unwrap_or(info)
+        ),
+    };
+    let terms = info.get("fd").filter(|fd| !fd.is_null());
+    let rate = match terms.and_then(|fd| fd.get("r")) {
+        None => return Ok(crate::types::FeeSchedule::FREE),
+        Some(rate) => rate.as_f64().ok_or_else(invalid)?,
+    };
+    if !(rate.is_finite() && rate >= 0.0) {
+        return Err(invalid());
+    }
+    if rate == 0.0 {
+        return Ok(crate::types::FeeSchedule::FREE);
+    }
+    let exponent = terms
+        .and_then(|fd| fd.get("e"))
+        .and_then(|e| e.as_f64())
+        .filter(|e| e.is_finite() && *e > 0.0)
+        .ok_or_else(invalid)?;
+    Ok(crate::types::FeeSchedule {
+        rate: Decimal::try_from(rate).map_err(|_| invalid())?,
+        exponent: Decimal::try_from(exponent).map_err(|_| invalid())?,
+    })
+}
+
 /// Get current Unix timestamp in seconds.
 fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -2618,6 +2661,44 @@ mod authenticated_tests {
             // A good-till-date order carries its expiry, unsigned.
             assert!(signed.expiration.parse::<u64>().unwrap() > current_timestamp());
         }
+    }
+
+    #[test]
+    fn exchange_fee_terms_are_read_from_market_info() {
+        use crate::types::FeeSchedule;
+        let terms = |info: serde_json::Value| fee_schedule_from_market_info(&info);
+        assert_eq!(
+            terms(serde_json::json!({"fd": {"r": 0.07, "e": 1, "to": true}})).unwrap(),
+            FeeSchedule {
+                rate: Decimal::new(7, 2),
+                exponent: Decimal::ONE
+            }
+        );
+        assert_eq!(
+            terms(serde_json::json!({"fd": {"r": 0.05, "e": 2}})).unwrap(),
+            FeeSchedule {
+                rate: Decimal::new(5, 2),
+                exponent: Decimal::TWO
+            }
+        );
+        // No fee terms, or a zero rate: free.
+        assert_eq!(
+            terms(serde_json::json!({"t": []})).unwrap(),
+            FeeSchedule::FREE
+        );
+        assert_eq!(
+            terms(serde_json::json!({"fd": null})).unwrap(),
+            FeeSchedule::FREE
+        );
+        assert_eq!(
+            terms(serde_json::json!({"fd": {"r": 0, "e": 0}})).unwrap(),
+            FeeSchedule::FREE
+        );
+        // A rate without a usable exponent, or a bad rate, is not free.
+        assert!(terms(serde_json::json!({"fd": {"r": 0.07}})).is_err());
+        assert!(terms(serde_json::json!({"fd": {"r": 0.07, "e": 0}})).is_err());
+        assert!(terms(serde_json::json!({"fd": {"r": -1, "e": 1}})).is_err());
+        assert!(terms(serde_json::json!({"fd": {"r": "x", "e": 1}})).is_err());
     }
 
     #[test]

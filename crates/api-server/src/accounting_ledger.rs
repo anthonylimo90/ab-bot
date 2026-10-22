@@ -288,7 +288,7 @@ async fn feed_circuit_breaker(
         // The observed balance may already lack a withdrawal whose cash flow
         // is not applied yet: that would read as a trading loss.
         info!("Circuit breaker equity feed held while a withdrawal settles");
-        return Ok(());
+        return check_held_equity(state, snapshot).await;
     }
     // A stalled transfer mined since the reconciler last looked would read as
     // a loss too. Its receipt is read after the snapshot's balance was, so
@@ -306,7 +306,7 @@ async fn feed_circuit_breaker(
     .await?
     {
         info!("Circuit breaker equity feed held: a stalled withdrawal has been mined");
-        return Ok(());
+        return check_held_equity(state, snapshot).await;
     }
     let (withdrawals, flows_through) =
         match state.circuit_breaker.cash_flows_applied_through().await {
@@ -333,6 +333,59 @@ async fn feed_circuit_breaker(
         );
     }
     Ok(())
+}
+
+/// While the equity feed is held, still trip on a drawdown the snapshot shows
+/// even counting every outflow in doubt as still in the wallet: holds can
+/// follow each other (small withdrawals one after another) for as long as
+/// someone keeps sending them, and must not blind the breaker meanwhile.
+async fn check_held_equity(
+    state: &AppState,
+    snapshot: &AccountSnapshotRecord,
+) -> anyhow::Result<()> {
+    let Some(applied) = state.circuit_breaker.cash_flows_applied_through().await else {
+        return Ok(());
+    };
+    let in_doubt = unapplied_outflows(&state.pool, snapshot.workspace_id, applied).await?;
+    if let Err(error) = state
+        .circuit_breaker
+        .check_drawdown_bound(snapshot.total_equity + in_doubt)
+        .await
+    {
+        warn!(%error, "Failed to check held equity against the circuit breaker");
+    }
+    Ok(())
+}
+
+/// Cash that may have left the trading wallet without the breaker having
+/// applied it: unresolved trading-wallet withdrawals, and outbound flows
+/// recorded after `applied`. Positive.
+async fn unapplied_outflows(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    applied: DateTime<Utc>,
+) -> anyhow::Result<Decimal> {
+    let value: Option<Decimal> = sqlx::query_scalar(
+        r#"
+        SELECT COALESCE((
+            SELECT SUM(amount) FROM wallet_withdrawals
+            WHERE workspace_id = $1
+              AND COALESCE(trading_wallet, TRUE)
+              AND status IN ('pending', 'submitting', 'submitted')
+        ), 0) - COALESCE((
+            SELECT SUM(amount) FROM cash_flow_events
+            WHERE workspace_id = $1
+              AND event_type IN ('withdrawal', 'transfer')
+              AND amount < 0
+              AND created_at > $2
+        ), 0)
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(applied)
+    .fetch_one(pool)
+    .await?;
+    Ok(value.unwrap_or(Decimal::ZERO).max(Decimal::ZERO))
 }
 
 /// How long after the time it records a cash flow may still be uncommitted.
@@ -790,6 +843,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, Decimal::new(-120, 0));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn outflows_in_doubt_are_unresolved_withdrawals_and_unapplied_flows(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE cash_flow_events (id UUID PRIMARY KEY, workspace_id UUID NOT NULL, \
+             event_type TEXT NOT NULL, amount DECIMAL(18, 8) NOT NULL, \
+             created_at TIMESTAMPTZ NOT NULL); \
+             CREATE TABLE wallet_withdrawals (workspace_id UUID, trading_wallet BOOLEAN, \
+             status TEXT, amount NUMERIC)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workspace = Uuid::new_v4();
+        let applied = Utc::now() - Duration::minutes(5);
+        for (ws, trading, status, amount) in [
+            (workspace, Some(true), "submitted", 3),
+            (workspace, None, "submitting", 2),
+            (workspace, Some(true), "pending", 1),
+            (workspace, Some(false), "submitted", 40),
+            (workspace, Some(true), "confirmed", 50),
+            (Uuid::new_v4(), Some(true), "submitted", 60),
+        ] {
+            sqlx::query("INSERT INTO wallet_withdrawals VALUES ($1, $2, $3, $4)")
+                .bind(ws)
+                .bind(trading)
+                .bind(status)
+                .bind(Decimal::from(amount))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        for (kind, amount, minutes) in [
+            ("withdrawal", "-7", 1),
+            ("transfer", "-4", 2),
+            ("deposit", "100", 1),
+            ("withdrawal", "-30", 10),
+        ] {
+            sqlx::query("INSERT INTO cash_flow_events VALUES ($1, $2, $3, $4::numeric, $5)")
+                .bind(Uuid::new_v4())
+                .bind(workspace)
+                .bind(kind)
+                .bind(amount)
+                .bind(Utc::now() - Duration::minutes(minutes))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // 3 + 2 + 1 unresolved, 7 + 4 recorded since the breaker applied flows.
+        assert_eq!(
+            unapplied_outflows(&pool, workspace, applied).await.unwrap(),
+            Decimal::from(17)
+        );
     }
 
     #[sqlx::test(migrations = false)]

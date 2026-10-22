@@ -616,6 +616,45 @@ impl CircuitBreaker {
         Ok(reason)
     }
 
+    /// Check drawdown while an equity reading is held back (cash may have
+    /// left the wallet without the flow being applied yet): `best_case` is
+    /// the most equity can be, the reading plus every outflow that may have
+    /// left. It trips only on a drawdown even that much equity shows, and it
+    /// changes no reference, so it can neither raise a peak nor trip falsely,
+    /// and misses a loss by no more than the outflows in doubt.
+    pub async fn check_drawdown_bound(&self, best_case: Decimal) -> Result<Option<TripReason>> {
+        let config = self.config.read().await.clone();
+        if !config.enabled {
+            return Ok(None);
+        }
+        let mut state = self.state.write().await;
+        if !state.portfolio_value_seeded {
+            return Ok(None);
+        }
+        let hard_breach = config.hard_kill_drawdown_pct > Decimal::ZERO
+            && drawdown(state.peak_value, best_case) >= config.hard_kill_drawdown_pct;
+        let breaches = if hard_breach {
+            self.hard_kill_breaches.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            self.hard_kill_breaches.store(0, Ordering::SeqCst);
+            0
+        };
+        let reason = if hard_breach && breaches >= HARD_KILL_CONFIRMATIONS {
+            Some(TripReason::HardKillSwitch)
+        } else if hard_breach || drawdown(state.drawdown_peak, best_case) >= config.max_drawdown_pct
+        {
+            Some(TripReason::MaxDrawdown)
+        } else {
+            None
+        };
+        if let Some(reason) = &reason {
+            warn!(%best_case, ?reason, "Drawdown breached even counting withdrawals in doubt");
+            self.trip_internal(&mut state, reason.clone(), &config);
+            self.persist_state(&state).await;
+        }
+        Ok(reason)
+    }
+
     /// Manually trip the circuit breaker. A manual trip latches until reset.
     pub async fn manual_trip(&self, reason: Option<String>) {
         let config = self.config.read().await.clone();
@@ -1147,6 +1186,46 @@ mod tests {
             enabled: true,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn a_held_reading_trips_only_on_a_loss_its_best_case_shows() {
+        let breaker = CircuitBreaker::new(latching_config());
+        // Nothing to compare with before equity is first seen.
+        assert_eq!(
+            breaker.check_drawdown_bound(Decimal::ZERO).await.unwrap(),
+            None
+        );
+        breaker
+            .update_portfolio_value(Decimal::new(1000, 0))
+            .await
+            .unwrap();
+        // 780 read while 50 may have left: at best 830, a 17% drawdown.
+        assert_eq!(
+            breaker
+                .check_drawdown_bound(Decimal::new(830, 0))
+                .await
+                .unwrap(),
+            None
+        );
+        // A best case above the peak raises nothing.
+        breaker
+            .check_drawdown_bound(Decimal::new(5000, 0))
+            .await
+            .unwrap();
+        let state = breaker.state().await;
+        assert_eq!(state.peak_value, Decimal::new(1000, 0));
+        assert_eq!(state.current_value, Decimal::new(1000, 0));
+        assert!(!state.tripped);
+        // At best 790: a 21% loss whatever the withdrawals did.
+        assert_eq!(
+            breaker
+                .check_drawdown_bound(Decimal::new(790, 0))
+                .await
+                .unwrap(),
+            Some(TripReason::MaxDrawdown)
+        );
+        assert!(breaker.state().await.tripped);
     }
 
     async fn enter_recovery(breaker: &CircuitBreaker) {

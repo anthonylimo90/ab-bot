@@ -139,12 +139,6 @@ export const queryKeys = {
     ) => [...queryKeys.tradeFlow.all(), "market", marketId, params] as const,
   },
 
-  // Orders
-  orders: {
-    all: () => ["orders"] as const,
-    detail: (id: string) => [...queryKeys.orders.all(), "detail", id] as const,
-  },
-
   // Quant signals
   signals: {
     all: () => ["signals"] as const,
