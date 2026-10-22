@@ -1231,12 +1231,20 @@ impl OrderExecutor {
             ));
         }
 
+        // What the order spends (USDC for a buy, shares for a sell): this is
+        // what gets signed.
         let market_amount = match order.side {
+            OrderSide::Buy => order.quantity * price,
+            OrderSide::Sell => order.quantity,
+        };
+        // A buy must also leave room for withdrawals that may still take USDC
+        // from the wallet; that reserve is checked, never spent.
+        let required_amount = match order.side {
             OrderSide::Buy => {
-                order.quantity * price
+                market_amount
                     + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
             }
-            OrderSide::Sell => order.quantity,
+            OrderSide::Sell => market_amount,
         };
 
         Self::prepare(
@@ -1246,7 +1254,7 @@ impl OrderExecutor {
                 order.id,
                 order.side,
                 &order.outcome_id,
-                market_amount,
+                required_amount,
             ),
         )
         .await??;
@@ -1722,6 +1730,126 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_market_buy_spends_its_own_amount_and_only_checks_the_withdrawal_reserve(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::{
+            extract::State,
+            routing::{get, post},
+            Json, Router,
+        };
+        use sqlx::Executor;
+
+        type Posted = Arc<std::sync::Mutex<Option<serde_json::Value>>>;
+        // The exchange: a book with depth at 0.50, a wallet holding 50 USDC,
+        // and an order endpoint that records what was posted.
+        let posted: Posted = Arc::default();
+        let app = Router::new()
+            .route(
+                "/book",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "market": "m", "asset_id": "1",
+                        "bids": [{"price": "0.49", "size": "1000"}],
+                        "asks": [{"price": "0.50", "size": "1000"}],
+                        "timestamp": "2026-01-01T00:00:00Z"
+                    }))
+                }),
+            )
+            .route(
+                "/balance-allowance",
+                get(|| async {
+                    Json(serde_json::json!({"balance": "50000000", "allowance": "50000000"}))
+                }),
+            )
+            .route(
+                "/balance-allowance/update",
+                get(|| async { Json(serde_json::json!({})) }),
+            )
+            .route(
+                "/order",
+                post(
+                    |State(posted): State<Posted>, Json(body): Json<serde_json::Value>| async move {
+                        *posted.lock().unwrap() = Some(body);
+                        Json(serde_json::json!({
+                            "success": true, "orderID": "ex1", "status": "unmatched"
+                        }))
+                    },
+                ),
+            )
+            .with_state(posted.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let wallet = TradingWallet::from_private_key(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let client = AuthenticatedClobClient::with_credentials(
+            ClobClient::new(Some(url.clone()), None),
+            OrderSigner::new(wallet.into_signer()),
+            polymarket_core::api::clob::ApiCredentials {
+                api_key: "key".into(),
+                api_secret: "c2VjcmV0".into(),
+                api_passphrase: "pass".into(),
+            },
+        );
+        let address = client.address();
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(Some(url), None)),
+            ExecutorConfig {
+                live_trading: true,
+                ..ExecutorConfig::default()
+            },
+        )
+        .with_database(pool.clone());
+        *executor.auth_client.write().await = Some(client);
+        pool.execute(include_str!(
+            "../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute(
+            "CREATE TABLE position_order_links (id UUID, settled BOOLEAN); \
+             CREATE TABLE orders (id UUID, status TEXT); \
+             CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT)",
+        )
+        .await
+        .unwrap();
+
+        // 10 shares at 0.50 spend 5 USDC.
+        let buy = || MarketOrder::new("m".into(), "1".into(), OrderSide::Buy, Decimal::from(10));
+        let maker_amount = || {
+            posted
+                .lock()
+                .unwrap()
+                .take()
+                .map(|body| body["order"]["makerAmount"].as_str().unwrap().to_string())
+        };
+        let _ = executor.execute_live_market_order(&buy(), None).await;
+        assert_eq!(maker_amount().as_deref(), Some("5000000"));
+
+        // A 40 USDC withdrawal in flight: still 5 USDC spent (45 of 50 held).
+        sqlx::query("INSERT INTO wallet_withdrawals VALUES ($1, 40, 'submitted')")
+            .bind(&address)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = executor.execute_live_market_order(&buy(), None).await;
+        assert_eq!(maker_amount().as_deref(), Some("5000000"));
+
+        // 46 USDC in flight leaves less than 5: refused, nothing posted.
+        sqlx::query("UPDATE wallet_withdrawals SET amount = 46")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let refused = executor.execute_live_market_order(&buy(), None).await;
+        assert!(refused.is_err() || !refused.unwrap().is_success());
+        assert_eq!(maker_amount(), None);
     }
 
     #[sqlx::test(migrations = false)]
