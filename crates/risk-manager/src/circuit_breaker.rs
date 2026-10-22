@@ -353,7 +353,9 @@ impl CircuitBreaker {
     }
 
     /// Resumes trading when a non-latching trip's cooldown has elapsed.
-    /// Returns whether trading is allowed.
+    /// A daily loss limit holds for the rest of its UTC day: the trip lasts
+    /// while the day's loss still breaches it. Returns whether trading is
+    /// allowed.
     async fn resume_if_cooldown_elapsed(&self) -> bool {
         let config = self.config.read().await.clone();
         let mut state = self.state.write().await;
@@ -365,6 +367,15 @@ impl CircuitBreaker {
                 .is_some_and(|resume_at| Utc::now() >= resume_at);
         if !due {
             return !state.tripped;
+        }
+        let rolled = state.roll_daily_counters(Utc::now().date_naive());
+        if state.trip_reason == Some(TripReason::DailyLossLimit)
+            && Self::check_loss_thresholds(&config, &state) == Some(TripReason::DailyLossLimit)
+        {
+            if rolled {
+                self.persist_state(&state).await;
+            }
+            return false;
         }
 
         // Measure any further soft drawdown from the equity trading resumes at;
@@ -839,6 +850,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_daily_loss_trip_holds_for_the_rest_of_its_day() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            max_daily_loss: Decimal::new(100, 0),
+            max_consecutive_losses: 100,
+            cooldown_minutes: 0,
+            enabled: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            breaker.record_trade(Decimal::new(-150, 0)).await.unwrap(),
+            Some(TripReason::DailyLossLimit)
+        );
+        // The cooldown has passed, but the day's loss still breaches.
+        assert!(!breaker.can_trade().await);
+        assert!(breaker.is_tripped());
+        // A new UTC day clears the day's loss: trading resumes.
+        breaker.state.write().await.last_reset_date =
+            Utc::now().date_naive() - chrono::Days::new(1);
+        assert!(breaker.can_trade().await);
+        assert!(!breaker.is_tripped());
+        assert_eq!(breaker.state().await.daily_pnl, Decimal::ZERO);
+    }
+
+    #[tokio::test]
     async fn a_break_even_trade_neither_extends_nor_ends_a_losing_streak() {
         let breaker = CircuitBreaker::new(CircuitBreakerConfig {
             max_consecutive_losses: 2,
@@ -1067,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_retrip_on_loss() {
         let config = CircuitBreakerConfig {
-            max_consecutive_losses: 100,          // Won't trip on consecutive
+            max_consecutive_losses: 3,
             max_daily_loss: Decimal::new(100, 0), // $100 daily loss
             cooldown_minutes: 0,
             gradual_recovery_enabled: true,
@@ -1079,8 +1114,8 @@ mod tests {
         };
         let breaker = CircuitBreaker::new(config);
 
-        // Trigger initial trip via daily loss
-        for _ in 0..10 {
+        // Trigger the initial trip by a run of losses ($30, within the day's limit)
+        for _ in 0..3 {
             breaker.record_trade(Decimal::new(-10, 0)).await.unwrap();
         }
         assert!(breaker.is_tripped());
@@ -1089,9 +1124,8 @@ mod tests {
         breaker.can_trade().await;
         assert!(breaker.is_in_recovery().await);
 
-        // At stage 1 (25% capacity), scaled limit is $25
-        // Current daily P&L is -$100, which exceeds the scaled limit
-        // But the check happens on new trades, so record another loss
+        // At stage 1 (25% capacity), the scaled daily limit is $25, which the
+        // day's -$30 already exceeds: the next loss re-trips.
         let reason = breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
 
         // Should re-trip

@@ -62,3 +62,49 @@ async fn stale_orphan_flags_cannot_sell_manual_or_partially_exited_inventory(poo
     assert_eq!(recoverable.len(), 1);
     assert_eq!(recoverable[0].token_id, "3");
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_partial_sale_takes_its_share_of_the_cost_basis(pool: PgPool) {
+    pool.execute("CREATE TABLE positions(id UUID PRIMARY KEY)")
+        .await
+        .unwrap();
+    let schema = include_str!("../../../../../migrations/057_wallet_inventory.sql");
+    pool.execute(schema.split("CREATE TRIGGER").next().unwrap())
+        .await
+        .unwrap();
+    let repo = WalletInventoryRepository::new(pool);
+    repo.upsert_entries(&[WalletInventoryUpsert {
+        wallet_address: "wallet".into(),
+        token_id: "token".into(),
+        condition_id: None,
+        outcome: None,
+        linked_position_id: None,
+        quantity: Decimal::from(100),
+        cost_basis: Some(Decimal::from(50)),
+        current_price: None,
+        marked_value: None,
+        is_orphan: true,
+        discovery_source: "inventory".into(),
+        recovery_status: "observed".into(),
+        last_exit_error: None,
+        last_exit_attempted_at: None,
+        first_observed_at: Utc::now(),
+        last_observed_at: Utc::now(),
+    }])
+    .await
+    .unwrap();
+    // 40 of 100 sold: 60 remain, carrying 60% of the basis.
+    repo.record_disposal("WALLET", "token", Decimal::from(40))
+        .await
+        .unwrap();
+    let row = &repo.list_wallet_entries("wallet").await.unwrap()[0];
+    assert_eq!(row.quantity, Decimal::from(60));
+    assert_eq!(row.cost_basis, Some(Decimal::from(30)));
+    // Selling more than is held leaves nothing, and no basis.
+    repo.record_disposal("wallet", "token", Decimal::from(80))
+        .await
+        .unwrap();
+    let row = &repo.list_wallet_entries("wallet").await.unwrap()[0];
+    assert_eq!(row.quantity, Decimal::ZERO);
+    assert_eq!(row.cost_basis, Some(Decimal::ZERO));
+}

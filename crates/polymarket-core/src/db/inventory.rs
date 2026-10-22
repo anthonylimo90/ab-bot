@@ -343,6 +343,36 @@ impl WalletInventoryRepository {
         Ok(())
     }
 
+    /// Take `sold` shares out of a row: its quantity, and the same share of
+    /// its cost basis, so a later sale of the rest charges only what is left.
+    pub async fn record_disposal(
+        &self,
+        wallet_address: &str,
+        token_id: &str,
+        sold: Decimal,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE wallet_inventory
+            SET
+                cost_basis = CASE
+                    WHEN cost_basis IS NULL OR quantity <= 0 THEN cost_basis
+                    ELSE cost_basis * GREATEST(quantity - $3, 0) / quantity
+                END,
+                quantity = GREATEST(quantity - $3, 0),
+                updated_at = NOW()
+            WHERE LOWER(wallet_address) = LOWER($1)
+              AND token_id = $2
+            "#,
+        )
+        .bind(wallet_address)
+        .bind(token_id)
+        .bind(sold)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn record_recovery_attempt(
         &self,
         wallet_address: &str,

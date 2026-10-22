@@ -42,9 +42,8 @@ pub enum CloseMethod {
     MarketExit { fee: Decimal },
     /// Market resolved; winner is known.
     ResolutionWithWinner { yes_wins: bool, fee: Decimal },
-    /// Market resolved; winner unknown. Each pair held pays one dollar
-    /// whichever side won; shares without a pair are valued at nothing, the
-    /// least they can pay.
+    /// Market resolved; winner unknown. Only equal legs: each pair pays one
+    /// dollar whichever side won.
     ResolutionConservative { fee: Decimal },
 }
 
@@ -592,11 +591,16 @@ impl PositionService {
     /// [`Self::close_position`], with `note` as the close event's metadata.
     pub async fn close_position_noting(
         &self,
-        position: &mut Position,
+        target: &mut Position,
         method: CloseMethod,
         ctx: &EventContext,
         note: Option<serde_json::Value>,
     ) -> anyhow::Result<()> {
+        // Closed on a copy: the caller's position changes only once the close
+        // is stored, so a failed store leaves nothing half-closed for a
+        // later write (an exit marked failed) to persist.
+        let mut closed = target.clone();
+        let position = &mut closed;
         if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
             return Err(anyhow!(
                 "Position has an unresolved order; reconcile it before changing lifecycle"
@@ -661,7 +665,14 @@ impl PositionService {
                 "closed_via_resolution"
             }
             CloseMethod::ResolutionConservative { fee } => {
-                let pairs = position.held_yes_qty.min(position.held_no_qty);
+                if !position.has_full_pair_exposure()
+                    || position.held_yes_qty != position.held_no_qty
+                {
+                    return Err(anyhow!(
+                        "Winner required for unequal remaining resolution holdings"
+                    ));
+                }
+                let pairs = position.held_yes_qty;
                 let proceeds = position.yes_exit_price.unwrap_or_default()
                     * position.exited_yes_qty
                     + position.no_exit_price.unwrap_or_default() * position.exited_no_qty;
@@ -702,6 +713,7 @@ impl PositionService {
         }
 
         self.events.record_warn(event).await;
+        *target = closed;
 
         Ok(())
     }

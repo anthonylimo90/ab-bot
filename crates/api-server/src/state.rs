@@ -576,16 +576,33 @@ impl AppState {
             pool.clone(),
         ));
 
-        // Load persisted circuit breaker state from DB (daily P&L, drawdown, etc.)
-        match circuit_breaker.load_state().await {
-            Ok(true) => {
-                tracing::info!("Loaded circuit breaker state from database");
-            }
-            Ok(false) => {
-                tracing::info!("No persisted circuit breaker state found, starting fresh");
-            }
-            Err(e) => {
-                tracing::warn!("Failed to load circuit breaker state from DB, starting fresh: {e}");
+        // Load persisted circuit breaker state from DB (daily P&L, drawdown,
+        // a latched trip). Never start without it: a fresh breaker would
+        // trade through a latched trip and overwrite it on its first save.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match circuit_breaker.load_state().await {
+                Ok(true) => {
+                    tracing::info!("Loaded circuit breaker state from database");
+                    break;
+                }
+                Ok(false) => {
+                    tracing::info!("No persisted circuit breaker state found, starting fresh");
+                    break;
+                }
+                Err(e) if attempt < 5 => {
+                    tracing::warn!(
+                        attempt,
+                        "Failed to load circuit breaker state, retrying: {e}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "Could not load the circuit breaker's state; not starting without it: {e}"
+                    );
+                }
             }
         }
 

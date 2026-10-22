@@ -689,7 +689,7 @@ impl ExitHandler {
         let no_price = position.no_exit_price.unwrap_or(Decimal::ZERO);
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        record_close_with_breaker(&self.circuit_breaker, position).await;
+        record_close_with_breaker(&self.circuit_breaker, position, true).await;
 
         // Publish success signal
         let signal = SignalUpdate {
@@ -1116,36 +1116,19 @@ impl ExitHandler {
         {
             // Equal legs pay one dollar a pair whichever side won.
             CloseMethod::ResolutionConservative { fee }
-        } else if self.waited_for_winner(position, &ctx).await? < NO_WINNER_GRACE {
+        } else {
+            // No single winner named and the legs differ: a resolution not
+            // final yet (trading may stop days before it), flags not set, or
+            // a split payout. Never booked at a guessed payout: the position
+            // waits, the first such look recorded for an operator.
+            let waited = self.waited_for_winner(position, &ctx).await?;
             warn!(
                 position_id = %position.id,
                 market_id = %market_id,
-                "Resolved market has no winner yet and the position's legs differ; waiting for the winner"
+                waited_hours = waited.num_hours(),
+                "Resolved market has no single winner and the position's legs differ; waiting for the winner"
             );
             return Ok(false);
-        } else {
-            // Still no winner: closed at the least it can pay, a dollar a
-            // pair, and the shares without a pair (valued at nothing, still
-            // in the wallet) named.
-            let pairs = position.held_yes_qty.min(position.held_no_qty);
-            let unpaired: Vec<_> = [
-                (Leg::Yes, position.held_yes_qty - pairs),
-                (Leg::No, position.held_no_qty - pairs),
-            ]
-            .into_iter()
-            .filter(|(_, quantity)| *quantity > Decimal::ZERO)
-            .map(|(leg, quantity)| {
-                serde_json::json!({"leg": leg.to_string(), "quantity": quantity.normalize().to_string()})
-            })
-            .collect();
-            warn!(
-                position_id = %position.id,
-                market_id = %market_id,
-                unpaired = ?unpaired,
-                "Resolved market named no winner for a day; closing at a dollar a pair, unpaired shares valued at nothing"
-            );
-            note.insert("unpaired".into(), serde_json::Value::Array(unpaired));
-            CloseMethod::ResolutionConservative { fee }
         };
 
         // Where the wallet could not confirm the record, the close says so.
@@ -1185,7 +1168,7 @@ impl ExitHandler {
         }
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        record_close_with_breaker(&self.circuit_breaker, position).await;
+        record_close_with_breaker(&self.circuit_breaker, position, unmeasured.is_empty()).await;
 
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
@@ -1768,11 +1751,18 @@ impl ExitHandler {
         for mut position in positions {
             self.touch_heartbeat();
             let market_id = position.market_id.clone();
-            if position.yes_entry_price <= Decimal::ZERO {
+            let held_leg = position.one_legged_held_leg();
+            let entry_price = if held_leg == "no" {
+                position.no_entry_price
+            } else {
+                position.yes_entry_price
+            };
+            if entry_price <= Decimal::ZERO {
                 warn!(
                     market_id = %market_id,
                     position_id = %position.id,
-                    "Cannot flatten one-legged position without a recorded YES entry price"
+                    leg = held_leg,
+                    "Cannot flatten one-legged position without a recorded entry price"
                 );
                 continue;
             }
@@ -1785,8 +1775,8 @@ impl ExitHandler {
                 .position_service
                 .transition_one_legged_to_exit_ready(
                     &mut position,
-                    "yes",
-                    "one-legged recovery: flattening held YES leg",
+                    held_leg,
+                    &format!("one-legged recovery: flattening held {held_leg} leg"),
                     &ctx,
                 )
                 .await
@@ -2076,19 +2066,24 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
 /// guards real money: only a live position's result counts, live trading
 /// switched off or not. A paper result (or one of unknown provenance) never
 /// does, so a paper win can never end a run of live losses or offset them.
-pub(crate) async fn record_close_with_breaker(breaker: &CircuitBreaker, position: &Position) {
-    if position.execution_mode != "live" {
+/// A result the wallet did not confirm (`confirmed` false: a resolution
+/// close at the record) counts as a loss, never as a win.
+pub(crate) async fn record_close_with_breaker(
+    breaker: &CircuitBreaker,
+    position: &Position,
+    confirmed: bool,
+) {
+    let pnl = position.realized_pnl.unwrap_or_default();
+    if position.execution_mode != "live" || (!confirmed && pnl > Decimal::ZERO) {
         debug!(
             position_id = %position.id,
             position_mode = %position.execution_mode,
-            "Close left out of the circuit breaker: not a live result"
+            confirmed,
+            "Close left out of the circuit breaker"
         );
         return;
     }
-    if let Err(error) = breaker
-        .record_trade(position.realized_pnl.unwrap_or_default())
-        .await
-    {
+    if let Err(error) = breaker.record_trade(pnl).await {
         warn!(%error, position_id = %position.id, "Failed to record a close with the circuit breaker");
     }
 }
@@ -2415,9 +2410,6 @@ fn waits_out_its_grace(why: &str) -> bool {
 /// How long a resolved position waits for a balance that cannot be read
 /// before it closes at its recorded holding.
 const UNREADABLE_BALANCE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
-/// How long a resolved position whose legs differ waits for its market to
-/// name a winner before it closes at the least it can pay.
-const NO_WINNER_GRACE: chrono::Duration = chrono::Duration::hours(24);
 /// The trade event marking the first look that found no winner.
 const WAITING_FOR_WINNER: &str = "resolution_waiting_for_winner";
 

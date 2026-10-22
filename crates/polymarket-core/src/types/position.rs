@@ -732,6 +732,16 @@ impl Position {
     }
 
     /// Check if this is a one-legged entry failure (YES filled but NO failed).
+    /// The leg a one-legged entry holds: NO when only NO is held, else YES
+    /// (the leg an arb buys first).
+    pub fn one_legged_held_leg(&self) -> &'static str {
+        if self.held_no_qty > Decimal::ZERO && self.held_yes_qty <= Decimal::ZERO {
+            "no"
+        } else {
+            "yes"
+        }
+    }
+
     pub fn is_one_legged_entry_fail(&self) -> bool {
         if self.state != PositionState::EntryFailed {
             return false;
@@ -826,6 +836,22 @@ impl Position {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_legged_entry_flattens_the_leg_it_holds() {
+        let mut p = Position::new(
+            "m".into(),
+            Decimal::new(48, 2),
+            Decimal::new(50, 2),
+            Decimal::TEN,
+            ExitStrategy::HoldToResolution,
+        );
+        assert_eq!(p.one_legged_held_leg(), "yes");
+        p.held_no_qty = Decimal::TEN;
+        assert_eq!(p.one_legged_held_leg(), "no");
+        p.held_yes_qty = Decimal::ONE;
+        assert_eq!(p.one_legged_held_leg(), "yes");
+    }
 
     #[test]
     fn unsellable_dust_is_written_off_without_changing_proceeds() {

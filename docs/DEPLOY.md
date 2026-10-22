@@ -689,19 +689,23 @@ unsigned). Fees are set by the exchange when an order matches.
   and its `closed_via_resolution` event lists the legs not measured and why
   (metadata `unmeasured`). The hour counts only an unbroken run of
   unreadable balances. A position whose market resolved with no single
-  winner flagged and whose legs differ (a split payout, or flags not yet
-  set) is never booked at a guessed payout: it waits a day for the winner,
-  from the first look that found none (a `resolution_waiting_for_winner`
-  trade event, so restarts keep the count), then closes at the least it can
-  pay: a dollar a pair held, the shares without a pair valued at nothing
-  (they stay in the wallet) and listed in its `closed_via_resolution` event
-  (metadata `unpaired`).
+  winner flagged and whose legs differ (a resolution not final yet: trading
+  can stop days before it; flags not yet set; or a split payout) is never
+  booked at a guessed payout: it waits for the winner, with a warning at
+  each look. The first such look is recorded as a
+  `resolution_waiting_for_winner` trade event for an operator; a split
+  payout must be settled by one.
 - A break-even close neither extends nor ends the circuit breaker's run of
   losses. The breaker guards real money: only a live position's close counts
   in it, live trading switched off or not. Paper results (and those of
   unknown provenance) never do, so a paper win cannot end or offset a run
   of live losses; paper trading no longer trips the breaker by its own
-  losses.
+  losses. A resolution close the wallet could not confirm feeds the breaker
+  a loss but never a win.
+- A daily loss trip holds for the rest of its UTC day, cooldown or not. The
+  API does not start while the breaker's stored state cannot be read (it
+  retries for a few seconds first): a fresh breaker would trade through a
+  latched trip and overwrite it.
 - An arb signal is skipped while any position in its market is still active,
   read from the database (an entry still settling included), so a restart
   or a reconciled entry never lets a second pair into the same market.

@@ -577,6 +577,12 @@ pub async fn recover_wallet_orphan_inventory(
             Ok(report) if report.is_success() => {
                 repo.record_recovery_attempt(wallet_address, &entry.token_id, None)
                     .await?;
+                repo.record_disposal(
+                    wallet_address,
+                    &entry.token_id,
+                    report.filled_quantity.min(entry.quantity),
+                )
+                .await?;
                 result.succeeded += 1;
 
                 // A partial fill only disposes of its share of the cost basis.

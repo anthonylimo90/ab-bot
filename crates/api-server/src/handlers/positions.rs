@@ -727,11 +727,12 @@ pub async fn close_position(
             }
         }
         PositionState::EntryFailed if position.is_one_legged_entry_fail() => {
+            let held_leg = position.one_legged_held_leg();
             state
                 .position_service
                 .transition_one_legged_to_exit_ready(
                     &mut position,
-                    "yes",
+                    held_leg,
                     "manual_close_one_legged",
                     &ctx,
                 )
