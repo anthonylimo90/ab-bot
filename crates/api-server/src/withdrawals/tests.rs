@@ -7,25 +7,76 @@ use sqlx::Executor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-const TRADING: &str = "0x1111111111111111111111111111111111111111";
+pub(crate) const TRADING: &str = "0x1111111111111111111111111111111111111111";
 const OTHER: &str = "0x2222222222222222222222222222222222222222";
-const DEST: &str = "0x3333333333333333333333333333333333333333";
+pub(crate) const DEST: &str = "0x3333333333333333333333333333333333333333";
+/// The block test receipts are mined in, unless a test says otherwise.
+const MINED_BLOCK: u64 = 16;
 
 /// The chain as the mock node reports it.
-#[derive(Default)]
-struct Chain {
-    /// Mined transactions by hash: `true` succeeded, `false` reverted.
-    receipts: HashMap<String, bool>,
+pub(crate) struct Chain {
+    /// Mined transactions by hash: success (`false` reverted) and block.
+    pub receipts: HashMap<String, (bool, u64)>,
     /// Transactions the node knows (pending or mined).
-    known: HashSet<String>,
-    /// Mined ("latest") and mined-plus-pending transaction counts.
-    latest_nonce: u64,
-    pending_nonce: u64,
+    pub known: HashSet<String>,
+    /// Transaction counts: mined at the final block, mined at the head, and
+    /// mined plus pending.
+    pub final_nonce: u64,
+    pub latest_nonce: u64,
+    pub pending_nonce: u64,
+    pub head: u64,
+    /// The `finalized` block, when the node reports one.
+    pub finalized: Option<u64>,
+    pub usdc_units: u128,
+    pub pol_wei: u128,
+    /// When set, `eth_sendRawTransaction` answers with this error.
+    pub send_error: Option<String>,
+    /// Whether accepted transactions are mined at once (in `MINED_BLOCK`).
+    pub mine_on_send: bool,
     /// Raw transactions sent to the node.
-    broadcasts: Vec<String>,
+    pub broadcasts: Vec<String>,
 }
 
-async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
+impl Default for Chain {
+    fn default() -> Self {
+        Self {
+            receipts: HashMap::new(),
+            known: HashSet::new(),
+            final_nonce: 0,
+            latest_nonce: 0,
+            pending_nonce: 0,
+            head: 200,
+            finalized: Some(100),
+            usdc_units: 0,
+            pol_wei: 0,
+            send_error: None,
+            mine_on_send: false,
+            broadcasts: Vec::new(),
+        }
+    }
+}
+
+impl Chain {
+    pub(crate) fn mine(&mut self, hash: &str, success: bool) {
+        self.receipts
+            .insert(hash.to_string(), (success, MINED_BLOCK));
+        self.known.insert(hash.to_string());
+    }
+}
+
+/// Hash of a raw transaction: test transactions are "0xraw" followed by
+/// their hash; real signed ones hash their bytes.
+fn raw_hash(raw: &str) -> String {
+    match raw.strip_prefix("0xraw") {
+        Some(hash) => hash.to_string(),
+        None => {
+            let bytes = hex::decode(raw.trim_start_matches("0x")).unwrap();
+            format!("{:#x}", alloy_primitives::keccak256(bytes))
+        }
+    }
+}
+
+pub(crate) async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
     let app = Router::new().route(
         "/",
         post(move |Json(request): Json<Value>| {
@@ -33,12 +84,13 @@ async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
             async move {
                 let mut chain = chain.lock().unwrap();
                 let params = &request["params"];
+                let hex = |value: u128| json!(format!("{value:#x}"));
                 let result = match request["method"].as_str().unwrap() {
                     "eth_getTransactionReceipt" => {
                         match chain.receipts.get(params[0].as_str().unwrap()) {
-                            Some(ok) => json!({
+                            Some((ok, block)) => json!({
                                 "status": if *ok { "0x1" } else { "0x0" },
-                                "blockNumber": "0x10",
+                                "blockNumber": format!("{block:#x}"),
                                 "gasUsed": "0x5208"
                             }),
                             None => Value::Null,
@@ -51,20 +103,35 @@ async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
                             Value::Null
                         }
                     }
-                    "eth_getTransactionCount" => {
-                        let count = if params[1] == "pending" {
-                            chain.pending_nonce
-                        } else {
-                            chain.latest_nonce
-                        };
-                        json!(format!("{count:#x}"))
-                    }
+                    "eth_getTransactionCount" => hex(u128::from(match params[1].as_str() {
+                        Some("pending") => chain.pending_nonce,
+                        Some("latest") => chain.latest_nonce,
+                        _ => chain.final_nonce,
+                    })),
+                    "eth_getBlockByNumber" => match chain.finalized {
+                        Some(block) if params[0] == "finalized" => {
+                            json!({"number": format!("{block:#x}")})
+                        }
+                        _ => Value::Null,
+                    },
+                    "eth_blockNumber" => hex(u128::from(chain.head)),
+                    "eth_call" => hex(chain.usdc_units),
+                    "eth_getBalance" => hex(chain.pol_wei),
+                    "eth_gasPrice" => hex(30_000_000_000),
                     "eth_sendRawTransaction" => {
-                        // Test transactions are "0xraw" followed by their hash.
                         let raw = params[0].as_str().unwrap().to_string();
-                        let hash = raw.trim_start_matches("0xraw").to_string();
-                        chain.broadcasts.push(raw);
+                        chain.broadcasts.push(raw.clone());
+                        if let Some(message) = chain.send_error.clone() {
+                            return Json(json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "error": {"code": -32000, "message": message}
+                            }));
+                        }
+                        let hash = raw_hash(&raw);
                         chain.known.insert(hash.clone());
+                        if chain.mine_on_send {
+                            chain.mine(&hash, true);
+                        }
                         json!(hash)
                     }
                     other => panic!("unexpected RPC method {other}"),
@@ -79,13 +146,15 @@ async fn mock_node(chain: Arc<Mutex<Chain>>) -> PolygonClient {
     PolygonClient::new(format!("http://{address}"))
 }
 
-async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
+/// The tables withdrawals touch, with one user and the canonical workspace,
+/// whose trading wallet is `TRADING`.
+pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
     pool.execute(
         r#"
-        CREATE TABLE users (id UUID PRIMARY KEY);
-        CREATE TABLE workspaces (
-            id UUID PRIMARY KEY, trading_wallet_address TEXT,
-            live_trading_enabled BOOLEAN, exit_handler_enabled BOOLEAN,
+        CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(), trading_wallet_address TEXT,
+            live_trading_enabled BOOLEAN DEFAULT TRUE, exit_handler_enabled BOOLEAN,
             arb_auto_execute BOOLEAN, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE TABLE positions (id UUID, state SMALLINT, execution_mode TEXT);
@@ -108,6 +177,7 @@ async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
         include_str!("../../../../migrations/061_withdrawal_idempotency.sql"),
         include_str!("../../../../migrations/069_execution_intents.sql"),
         include_str!("../../../../migrations/082_withdrawal_journal.sql"),
+        include_str!("../../../../migrations/088_withdrawal_reconcile_state.sql"),
     ] {
         pool.execute(migration).await.unwrap();
     }
@@ -129,17 +199,17 @@ async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
     (user, workspace)
 }
 
-struct Row<'a> {
-    wallet: &'a str,
-    amount: i64,
-    status: &'a str,
-    tx_hash: Option<&'a str>,
-    nonce: Option<i64>,
-    journaled: bool,
-    age_minutes: i64,
+pub(crate) struct Row<'a> {
+    pub wallet: &'a str,
+    pub amount: i64,
+    pub status: &'a str,
+    pub tx_hash: Option<&'a str>,
+    pub nonce: Option<i64>,
+    pub journaled: bool,
+    pub age_minutes: i64,
 }
 
-async fn insert(pool: &PgPool, user: Uuid, workspace: Uuid, row: Row<'_>) -> Uuid {
+pub(crate) async fn insert(pool: &PgPool, user: Uuid, workspace: Uuid, row: Row<'_>) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO wallet_withdrawals (id, user_id, workspace_id, wallet_address, \
@@ -164,12 +234,46 @@ async fn insert(pool: &PgPool, user: Uuid, workspace: Uuid, row: Row<'_>) -> Uui
     id
 }
 
-async fn status(pool: &PgPool, id: Uuid) -> (String, Option<String>) {
+pub(crate) async fn status(pool: &PgPool, id: Uuid) -> (String, Option<String>) {
     sqlx::query_as("SELECT status, error FROM wallet_withdrawals WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn cash_flows(pool: &PgPool) -> Vec<(Uuid, Decimal)> {
+    sqlx::query_as("SELECT id, amount FROM cash_flow_events ORDER BY created_at")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+fn row(
+    wallet: &'static str,
+    status: &'static str,
+    tx_hash: Option<&'static str>,
+    nonce: Option<i64>,
+    age_minutes: i64,
+) -> Row<'static> {
+    Row {
+        wallet,
+        amount: 10,
+        status,
+        tx_hash,
+        nonce,
+        journaled: true,
+        age_minutes,
+    }
+}
+
+async fn reconcile(pool: &PgPool, client: &PolygonClient) {
+    reconcile_with(pool, |_| {
+        let client = client.clone();
+        async move { Some(client) }
+    })
+    .await
+    .unwrap();
 }
 
 #[sqlx::test(migrations = false)]
@@ -203,9 +307,9 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
     .unwrap();
 
     let mut conn = pool.acquire().await.unwrap();
-    let capacity = withdrawal_capacity(&mut conn, TRADING, balance_units)
-        .await
-        .unwrap();
+    let holds = WithdrawalHolds::load(&mut conn, TRADING).await.unwrap();
+    assert!(holds.trading_wallet);
+    let capacity = holds.capacity(balance_units);
     assert_eq!(capacity.available_usdc, Decimal::from(100));
     assert_eq!(capacity.in_flight_withdrawals, Decimal::from(5));
     assert_eq!(capacity.reserved_for_open_buys, Decimal::new(55, 1));
@@ -213,10 +317,12 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
     assert!(capacity.blocking_reasons.is_empty());
 
     // Another vault wallet carries no trading reserve.
-    let other = withdrawal_capacity(&mut conn, OTHER, balance_units)
-        .await
-        .unwrap();
-    assert_eq!(other.max_withdrawable, Decimal::from(100));
+    let other = WithdrawalHolds::load(&mut conn, OTHER).await.unwrap();
+    assert!(!other.trading_wallet);
+    assert_eq!(
+        other.capacity(balance_units).max_withdrawable,
+        Decimal::from(100)
+    );
 
     // A live entry in flight or an unresolved transfer blocks a withdrawal.
     pool.execute("INSERT INTO positions VALUES (gen_random_uuid(), 0, 'live')")
@@ -237,13 +343,9 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
         },
     )
     .await;
-    let blocked = withdrawal_capacity(&mut conn, TRADING, balance_units)
-        .await
-        .unwrap();
+    let blocked = WithdrawalHolds::load(&mut conn, TRADING).await.unwrap();
     assert_eq!(blocked.blocking_reasons.len(), 1, "{blocked:?}");
-    let blocked_other = withdrawal_capacity(&mut conn, OTHER, balance_units)
-        .await
-        .unwrap();
+    let blocked_other = WithdrawalHolds::load(&mut conn, OTHER).await.unwrap();
     assert_eq!(blocked_other.blocking_reasons.len(), 1, "{blocked_other:?}");
 }
 
@@ -251,164 +353,306 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
 async fn every_unresolved_withdrawal_is_settled_from_the_chain(pool: PgPool) {
     let (user, workspace) = setup(&pool).await;
     let chain = Arc::new(Mutex::new(Chain {
+        final_nonce: 6,
         latest_nonce: 6,
         pending_nonce: 6,
         ..Default::default()
     }));
     let client = mock_node(chain.clone()).await;
-    let row = |wallet, status, tx_hash, nonce, journaled, age_minutes| Row {
-        wallet,
-        amount: 10,
-        status,
-        tx_hash,
-        nonce,
-        journaled,
-        age_minutes,
-    };
 
     let confirmed = insert(
         &pool,
         user,
         workspace,
-        row(TRADING, "submitted", Some("0xc1"), Some(1), true, 1),
+        row(TRADING, "submitted", Some("0xc1"), Some(1), 1),
     )
     .await;
     let confirmed_other = insert(
         &pool,
         user,
         workspace,
-        row(OTHER, "submitted", Some("0xc2"), Some(1), true, 1),
+        row(OTHER, "submitted", Some("0xc2"), Some(1), 1),
     )
     .await;
     let reverted = insert(
         &pool,
         user,
         workspace,
-        row(TRADING, "submitted", Some("0xr1"), Some(2), true, 1),
+        row(TRADING, "submitted", Some("0xr1"), Some(2), 1),
     )
     .await;
-    let superseded = insert(
+    let unsettled = insert(
         &pool,
         user,
         workspace,
-        row(TRADING, "submitting", Some("0xs1"), Some(5), true, 1),
+        row(TRADING, "submitted", Some("0xu1"), Some(3), 1),
     )
     .await;
     let lost = insert(
         &pool,
         user,
         workspace,
-        row(OTHER, "submitting", Some("0xl1"), Some(6), true, 5),
+        row(OTHER, "submitting", Some("0xl1"), Some(6), 5),
+    )
+    .await;
+    let held = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "submitting", Some("0xk1"), Some(7), 0),
     )
     .await;
     let waiting = insert(
         &pool,
         user,
         workspace,
-        row(OTHER, "submitted", Some("0xw1"), Some(6), true, 1),
+        row(OTHER, "submitted", Some("0xw1"), Some(7), 1),
     )
     .await;
     let never_signed = insert(
         &pool,
         user,
         workspace,
-        row(TRADING, "pending", None, None, true, 20),
+        row(TRADING, "pending", None, None, 20),
     )
     .await;
-    let legacy = insert(
-        &pool,
-        user,
-        workspace,
-        row(TRADING, "pending", None, None, false, 600),
-    )
-    .await;
+    let mut legacy = row(TRADING, "pending", None, None, 600);
+    legacy.journaled = false;
+    let legacy = insert(&pool, user, workspace, legacy).await;
     {
         let mut chain = chain.lock().unwrap();
-        chain.receipts.insert("0xc1".into(), true);
-        chain.receipts.insert("0xc2".into(), true);
-        chain.receipts.insert("0xr1".into(), false);
+        chain.mine("0xc1", true);
+        chain.mine("0xc2", true);
+        chain.mine("0xr1", false);
+        // Mined above the final block: it could still be reorganized away.
+        chain.receipts.insert("0xu1".into(), (true, 150));
+        chain.known.insert("0xk1".into());
         chain.known.insert("0xw1".into());
     }
 
     for _ in 0..2 {
-        reconcile_with(&pool, |_| {
-            let client = client.clone();
-            async move { Some(client) }
-        })
-        .await
-        .unwrap();
+        reconcile(&pool, &client).await;
     }
 
     assert_eq!(status(&pool, confirmed).await.0, "confirmed");
     assert_eq!(status(&pool, confirmed_other).await.0, "confirmed");
     let (reverted_status, reverted_error) = status(&pool, reverted).await;
     assert_eq!(reverted_status, "failed");
-    assert!(reverted_error.unwrap().contains("reverted"));
-    // Nonce 5 is mined (latest 6) but not by this transfer: it never will be.
-    let (superseded_status, superseded_error) = status(&pool, superseded).await;
-    assert_eq!(superseded_status, "failed");
-    assert!(superseded_error.unwrap().contains("nonce"));
-    // Nonce 6 is still free and the node lost the transfer: sent again.
+    assert_eq!(reverted_error.as_deref(), Some(REVERTED_ERROR));
+    assert_eq!(status(&pool, unsettled).await.0, "submitted");
+    // Nonce 6 is still free and the node lost the transfer: sent again, once.
     assert_eq!(status(&pool, lost).await.0, "submitted");
+    // A node holds it: it was sent.
+    assert_eq!(status(&pool, held).await.0, "submitted");
+    assert_eq!(status(&pool, waiting).await.0, "submitted");
+    assert_eq!(status(&pool, never_signed).await.0, "failed");
+    assert_eq!(status(&pool, legacy).await.0, "pending");
     assert_eq!(
         chain.lock().unwrap().broadcasts,
         vec!["0xraw0xl1".to_string()]
     );
-    // Still in the mempool: left alone.
-    assert_eq!(status(&pool, waiting).await.0, "submitted");
-    assert_eq!(status(&pool, never_signed).await.0, "failed");
-    assert_eq!(status(&pool, legacy).await.0, "pending");
 
-    // One cash flow, once, for the trading wallet only, keyed by the withdrawal.
-    let flows: Vec<(Uuid, Decimal, String)> =
-        sqlx::query_as("SELECT id, amount, event_type FROM cash_flow_events")
-            .fetch_all(&pool)
+    // The block becomes final: settled then, not before.
+    chain.lock().unwrap().finalized = Some(160);
+    reconcile(&pool, &client).await;
+    assert_eq!(status(&pool, unsettled).await.0, "confirmed");
+
+    // One cash flow each, for the trading wallet only, keyed by the withdrawal.
+    let flows = cash_flows(&pool).await;
+    assert_eq!(flows.len(), 2, "{flows:?}");
+    assert!(flows.contains(&(confirmed, Decimal::from(-10))));
+    assert!(flows.contains(&(unsettled, Decimal::from(-10))));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_used_nonce_fails_a_transfer_only_on_a_second_look_minutes_later(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let chain = Arc::new(Mutex::new(Chain {
+        final_nonce: 6,
+        latest_nonce: 6,
+        pending_nonce: 6,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let superseded = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "submitting", Some("0xs1"), Some(5), 1),
+    )
+    .await;
+    // Used only above the final block: not proof yet.
+    let shallow = insert(
+        &pool,
+        user,
+        workspace,
+        row(OTHER, "submitting", Some("0xs2"), Some(6), 1),
+    )
+    .await;
+    chain.lock().unwrap().latest_nonce = 7;
+
+    for _ in 0..2 {
+        reconcile(&pool, &client).await;
+    }
+    assert_eq!(status(&pool, superseded).await.0, "submitting");
+    assert_eq!(status(&pool, shallow).await.0, "submitting");
+    let marked: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT superseded_seen_at FROM wallet_withdrawals WHERE id = $1")
+            .bind(superseded)
+            .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(
-        flows,
-        vec![(confirmed, Decimal::from(-10), "withdrawal".to_string())]
-    );
+    assert!(marked.is_some());
+
+    pool.execute(
+        "UPDATE wallet_withdrawals SET superseded_seen_at = superseded_seen_at - INTERVAL '6 minutes'",
+    )
+    .await
+    .unwrap();
+    reconcile(&pool, &client).await;
+    let (superseded_status, superseded_error) = status(&pool, superseded).await;
+    assert_eq!(superseded_status, "failed");
+    assert!(superseded_error.unwrap().contains("nonce"));
+    assert_eq!(status(&pool, shallow).await.0, "submitting");
+    assert!(cash_flows(&pool).await.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_failed_transfer_that_is_mined_after_all_is_confirmed(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let chain = Arc::new(Mutex::new(Chain::default()));
+    let client = mock_node(chain.clone()).await;
+    let late = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "failed", Some("0xf1"), Some(1), 60),
+    )
+    .await;
+    let expired = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "failed", Some("0xf2"), Some(2), 60 * 25),
+    )
+    .await;
+    let reverted = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "failed", Some("0xf3"), Some(3), 60),
+    )
+    .await;
+    sqlx::query("UPDATE wallet_withdrawals SET error = $2 WHERE id = $1")
+        .bind(reverted)
+        .bind(REVERTED_ERROR)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Nothing on chain: a failed transfer is never re-sent or re-judged.
+    reconcile(&pool, &client).await;
+    assert_eq!(status(&pool, late).await.0, "failed");
+    assert!(chain.lock().unwrap().broadcasts.is_empty());
+
+    {
+        let mut chain = chain.lock().unwrap();
+        chain.mine("0xf1", true);
+        chain.mine("0xf2", true);
+        chain.mine("0xf3", true);
+    }
+    reconcile(&pool, &client).await;
+    let (late_status, late_error) = status(&pool, late).await;
+    assert_eq!(late_status, "confirmed");
+    assert_eq!(late_error, None);
+    assert_eq!(cash_flows(&pool).await, vec![(late, Decimal::from(-10))]);
+    // Older than the watch window, or settled by its own receipt: left alone.
+    assert_eq!(status(&pool, expired).await.0, "failed");
+    assert_eq!(status(&pool, reverted).await.0, "failed");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_refused_resend_leaves_the_transfer_to_the_chain(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let chain = Arc::new(Mutex::new(Chain {
+        final_nonce: 4,
+        latest_nonce: 4,
+        pending_nonce: 4,
+        send_error: Some("nonce too low".into()),
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let id = insert(
+        &pool,
+        user,
+        workspace,
+        row(OTHER, "submitting", Some("0xn1"), Some(4), 5),
+    )
+    .await;
+
+    // Refused, but not in a way that proves it unsent; and not re-sent until
+    // the interval has passed again.
+    for _ in 0..2 {
+        reconcile(&pool, &client).await;
+    }
+    assert_eq!(status(&pool, id).await.0, "submitting");
+    assert_eq!(chain.lock().unwrap().broadcasts.len(), 1);
 }
 
 #[sqlx::test(migrations = false)]
 async fn a_busy_wallet_is_left_to_the_request_sending_from_it(pool: PgPool) {
     let (user, workspace) = setup(&pool).await;
     let chain = Arc::new(Mutex::new(Chain::default()));
-    chain.lock().unwrap().receipts.insert("0xc1".into(), true);
+    chain.lock().unwrap().mine("0xc1", true);
     let client = mock_node(chain).await;
     let id = insert(
         &pool,
         user,
         workspace,
-        Row {
-            wallet: TRADING,
-            amount: 10,
-            status: "submitted",
-            tx_hash: Some("0xc1"),
-            nonce: Some(1),
-            journaled: true,
-            age_minutes: 1,
-        },
+        row(TRADING, "submitted", Some("0xc1"), Some(1), 1),
     )
     .await;
 
-    let mut holder = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(wallet_lock_key(TRADING))
-        .execute(&mut *holder)
-        .await
-        .unwrap();
-    let reconcile = || {
-        reconcile_with(&pool, |_| {
-            let client = client.clone();
-            async move { Some(client) }
-        })
-    };
-    reconcile().await.unwrap();
+    let holder = SpendLock::acquire(&pool, TRADING).await.unwrap();
+    reconcile(&pool, &client).await;
     assert_eq!(status(&pool, id).await.0, "submitted");
 
-    holder.commit().await.unwrap();
-    reconcile().await.unwrap();
+    holder.release().await;
+    reconcile(&pool, &client).await;
     assert_eq!(status(&pool, id).await.0, "confirmed");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_dropped_spend_lock_frees_the_wallet(pool: PgPool) {
+    let mut held = SpendLock::acquire(&pool, TRADING).await.unwrap();
+    held.lock_entries().await.unwrap();
+    assert!(SpendLock::try_acquire(&pool, TRADING)
+        .await
+        .unwrap()
+        .is_none());
+    let mut entry = pool.begin().await.unwrap();
+    let entries_free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('position-exposure'))")
+            .fetch_one(&mut *entry)
+            .await
+            .unwrap();
+    assert!(!entries_free, "entries wait while capacity is decided");
+    entry.rollback().await.unwrap();
+    // An early return or a cancelled task drops the lock without releasing it.
+    drop(held);
+    let again = tokio::time::timeout(
+        StdDuration::from_secs(5),
+        SpendLock::acquire(&pool, TRADING),
+    )
+    .await
+    .expect("the dropped holder's session ended")
+    .unwrap();
+    let mut entries = pool.begin().await.unwrap();
+    let free: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('position-exposure'))")
+            .fetch_one(&mut *entries)
+            .await
+            .unwrap();
+    assert!(free);
+    again.release().await;
 }

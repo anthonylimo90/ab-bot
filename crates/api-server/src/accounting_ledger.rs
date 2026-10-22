@@ -274,7 +274,15 @@ async fn feed_circuit_breaker(
     state: &AppState,
     snapshot: &AccountSnapshotRecord,
 ) -> anyhow::Result<()> {
-    let through = snapshot.cash_observed_at;
+    // Flows are applied only up to a moment every flow recorded before it has
+    // surely committed, so the cursor never passes one still invisible.
+    let through = snapshot.cash_observed_at - Duration::seconds(CASH_FLOW_COMMIT_LAG_SECS);
+    if withdrawal_settling(&state.pool, snapshot.workspace_id, through).await? {
+        // The observed balance may already lack a withdrawal whose cash flow
+        // is not applied yet: that would read as a trading loss.
+        info!("Circuit breaker equity feed held while a withdrawal settles");
+        return Ok(());
+    }
     let (withdrawals, flows_through) =
         match state.circuit_breaker.cash_flows_applied_through().await {
             Some(applied) if applied >= through => (Decimal::ZERO, None),
@@ -300,6 +308,45 @@ async fn feed_circuit_breaker(
         );
     }
     Ok(())
+}
+
+/// How long after the time it records a cash flow may still be uncommitted.
+const CASH_FLOW_COMMIT_LAG_SECS: i64 = 15;
+/// A trading-wallet withdrawal sent this recently may be mined before its cash
+/// flow exists; one older than this has stalled and holds nothing up.
+const WITHDRAWAL_SETTLE_WINDOW_MINUTES: i32 = 30;
+
+/// Whether cash may have left the trading wallet without a cash flow the
+/// breaker has applied through `through`: a recent withdrawal not yet
+/// resolved, or an outbound flow recorded after `through`.
+async fn withdrawal_settling(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    through: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM wallet_withdrawals
+            WHERE workspace_id = $1
+              AND COALESCE(trading_wallet, TRUE)
+              AND status IN ('submitting', 'submitted')
+              AND tx_hash IS NOT NULL
+              AND requested_at > NOW() - make_interval(mins => $3)
+        ) OR EXISTS(
+            SELECT 1 FROM cash_flow_events
+            WHERE workspace_id = $1
+              AND event_type IN ('withdrawal', 'transfer')
+              AND amount < 0
+              AND created_at > $2
+        )
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(through)
+    .bind(WITHDRAWAL_SETTLE_WINDOW_MINUTES)
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Sum of cash moved out of the trading wallet (withdrawals and outbound
@@ -754,5 +801,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, Decimal::new(-120, 0));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn equity_waits_while_a_trading_withdrawal_settles(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE cash_flow_events (id UUID PRIMARY KEY, workspace_id UUID NOT NULL,              event_type TEXT NOT NULL, amount DECIMAL(18, 8) NOT NULL,              created_at TIMESTAMPTZ NOT NULL);              CREATE TABLE wallet_withdrawals (workspace_id UUID, trading_wallet BOOLEAN,              status TEXT, tx_hash TEXT, requested_at TIMESTAMPTZ)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let workspace = Uuid::new_v4();
+        let through = Utc::now() - Duration::seconds(15);
+        let settling = || withdrawal_settling(&pool, workspace, through);
+        let withdrawal = |trading: Option<bool>, status: &'static str, minutes: i64| {
+            sqlx::query("INSERT INTO wallet_withdrawals VALUES ($1, $2, $3, '0xa', $4)")
+                .bind(workspace)
+                .bind(trading)
+                .bind(status)
+                .bind(Utc::now() - Duration::minutes(minutes))
+                .execute(&pool)
+        };
+
+        // Settled, other wallets', stalled, or long applied: nothing to wait for.
+        withdrawal(Some(true), "confirmed", 1).await.unwrap();
+        withdrawal(Some(false), "submitted", 1).await.unwrap();
+        withdrawal(Some(true), "submitting", 45).await.unwrap();
+        sqlx::query("INSERT INTO cash_flow_events VALUES ($1, $2, 'withdrawal', -5, $3)")
+            .bind(Uuid::new_v4())
+            .bind(workspace)
+            .bind(through - Duration::minutes(1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!settling().await.unwrap());
+
+        // A flow recorded after the cursor is not applied yet.
+        sqlx::query("INSERT INTO cash_flow_events VALUES ($1, $2, 'withdrawal', -5, $3)")
+            .bind(Uuid::new_v4())
+            .bind(workspace)
+            .bind(through + Duration::seconds(5))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(settling().await.unwrap());
+        sqlx::query("DELETE FROM cash_flow_events")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Sent from the trading wallet (or not known otherwise) and unresolved.
+        withdrawal(None, "submitted", 2).await.unwrap();
+        assert!(settling().await.unwrap());
     }
 }

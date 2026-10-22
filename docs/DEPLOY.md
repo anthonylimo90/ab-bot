@@ -424,6 +424,10 @@ A missing or mismatched key never causes fallback to another user's wallet. Exch
 
 Startup rejects a change away from the saved trading wallet while positions are pending, open, recovering, or still hold tokens. Reconcile and close that exposure before rotating the wallet. Importing a key through personal wallet settings alone does not authorize its use by the bot.
 
+Disconnecting a wallet in the vault is refused while the running server signs with it, and, for the saved trading wallet, while any exposure remains. Disconnecting the saved trading wallet once it is idle and flat also clears the saved selection, so the next start uses `TRADING_WALLET_ADDRESS` or `WALLET_PRIVATE_KEY` instead of looking for the erased key.
+
+The file vault replaces `VAULT_FILE_PATH` by writing a sibling file and renaming it over the old one. Mount a writable directory (for example a Railway volume) and point `VAULT_FILE_PATH` inside it; a bind mount of the single file cannot be replaced this way.
+
 ### Review fix migrations and client compatibility
 
 Apply the repository's migrations before starting the updated API. Migrations 069–072 add durable signed-order intents, exchange order identity/provenance, recovery of closed rows with explicit holdings, and persistent session revocation. Migration 068 now preserves unresolved positions instead of closing them by age. If a deployment already recorded the original 068 checksum, SQLx will require a reviewed migration-history repair; back up the database, reconcile the affected positions, and review migration 071 before accepting the revised checksum. Do not disable checksum validation globally.

@@ -40,6 +40,8 @@ pub struct SignedTransaction {
     /// `0x`-prefixed keccak-256 of `raw`.
     pub tx_hash: String,
     pub nonce: u64,
+    /// Gas price in wei.
+    pub gas_price: u128,
 }
 
 /// What the node said about a broadcast.
@@ -47,8 +49,53 @@ pub struct SignedTransaction {
 pub enum BroadcastOutcome {
     /// The node holds the transaction (newly accepted or already known).
     Accepted,
-    /// The node refused it; it was not propagated. Carries the node's reason.
+    /// The node refused it for a reason that can never apply to a transaction
+    /// it holds (e.g. insufficient funds). Carries the node's reason.
     Rejected(String),
+    /// The node answered with an error that does not settle whether it holds
+    /// the transaction (e.g. "nonce too low" after its own retry). Only the
+    /// chain can tell.
+    Uncertain(String),
+}
+
+/// Classify a JSON-RPC error answering `eth_sendRawTransaction`.
+fn classify_send_error(message: &str) -> BroadcastOutcome {
+    let lower = message.to_ascii_lowercase();
+    const HELD: [&str; 5] = [
+        "already known",
+        "known transaction",
+        "already imported",
+        "alreadyknown",
+        "already in mempool",
+    ];
+    // Validation failures a node reports only for a transaction it refused.
+    const REFUSED: [&str; 6] = [
+        "insufficient funds",
+        "intrinsic gas too low",
+        "exceeds block gas limit",
+        "invalid sender",
+        "invalid chain id",
+        "oversized data",
+    ];
+    if HELD.iter().any(|pattern| lower.contains(pattern)) {
+        BroadcastOutcome::Accepted
+    } else if REFUSED.iter().any(|pattern| lower.contains(pattern)) {
+        BroadcastOutcome::Rejected(message.to_string())
+    } else {
+        BroadcastOutcome::Uncertain(message.to_string())
+    }
+}
+
+/// The message of a JSON-RPC `error` member (an object or a bare string).
+fn rpc_error_message(error: &serde_json::Value) -> String {
+    match error {
+        serde_json::Value::String(message) => message.clone(),
+        other => other
+            .get("message")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| other.to_string()),
+    }
 }
 
 /// A mined transaction.
@@ -273,13 +320,15 @@ impl PolygonClient {
         Ok(balance as f64 / 1_000_000.0)
     }
 
-    /// Sign a USDC.e transfer at the sender's next pending nonce, after
-    /// checking it holds enough POL for gas. Nothing is sent.
+    /// Sign a USDC.e transfer at the sender's next pending nonce, paying at
+    /// least `min_gas_price` wei for gas, after checking it holds enough POL
+    /// for gas. Nothing is sent.
     pub async fn prepare_usdc_transfer(
         &self,
         signer: &PrivateKeySigner,
         to_address: &str,
         amount_units: u128,
+        min_gas_price: u128,
     ) -> Result<SignedTransaction> {
         if amount_units == 0 {
             return Err(Error::Api {
@@ -300,7 +349,7 @@ impl PolygonClient {
         // never reuses (and replaces) the nonce of one not yet mined.
         let nonce = self.get_nonce(&sender, "pending").await?;
         let gas_price = self.get_gas_price_wei().await?;
-        let gas_price = gas_price + gas_price / 5;
+        let gas_price = (gas_price + gas_price / 5).max(min_gas_price);
         let required_gas = gas_price.saturating_mul(DEFAULT_ERC20_TRANSFER_GAS_LIMIT as u128);
 
         if pol_balance < required_gas {
@@ -327,40 +376,20 @@ impl PolygonClient {
         sign_legacy_transaction(signer, tx)
     }
 
-    /// Send a signed transaction. An `Err` is a transport failure: the node
-    /// may or may not have received it.
-    pub async fn broadcast(&self, tx: &SignedTransaction) -> Result<BroadcastOutcome> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_sendRawTransaction",
-            "params": [tx.raw]
-        });
-
-        let response: serde_json::Value = self
-            .http_client
-            .post(&self.rpc_url)
-            .json(&body)
-            .send()
-            .await?
-            .json()
+    /// Send the signed transaction `raw`, whose hash is `tx_hash`. An `Err`
+    /// (transport failure, HTTP error, unreadable answer) leaves open whether
+    /// the node received it.
+    pub async fn broadcast(&self, raw: &str, tx_hash: &str) -> Result<BroadcastOutcome> {
+        let response = self
+            .rpc_response("eth_sendRawTransaction", serde_json::json!([raw]))
             .await?;
-
-        if let Some(err) = response.get("error") {
-            let message = err
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown RPC error")
-                .to_string();
-            if message.to_ascii_lowercase().contains("already known") {
-                return Ok(BroadcastOutcome::Accepted);
-            }
-            return Ok(BroadcastOutcome::Rejected(message));
+        if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            return Ok(classify_send_error(&rpc_error_message(error)));
         }
         match response.get("result").and_then(|value| value.as_str()) {
-            Some(hash) if hash.eq_ignore_ascii_case(&tx.tx_hash) => Ok(BroadcastOutcome::Accepted),
+            Some(hash) if hash.eq_ignore_ascii_case(tx_hash) => Ok(BroadcastOutcome::Accepted),
             Some(hash) => Err(Error::Api {
-                message: format!("Node reported hash {hash} for transaction {}", tx.tx_hash),
+                message: format!("Node reported hash {hash} for transaction {tx_hash}"),
                 status: None,
             }),
             None => Err(Error::Api {
@@ -368,6 +397,46 @@ impl PolygonClient {
                 status: None,
             }),
         }
+    }
+
+    /// A block deep enough not to be reorganized: the chain's `finalized`
+    /// block, or 128 blocks below the head when the node does not report one.
+    pub async fn safe_block_number(&self) -> Result<u64> {
+        if let Ok(block) = self
+            .rpc_value(
+                "eth_getBlockByNumber",
+                serde_json::json!(["finalized", false]),
+            )
+            .await
+        {
+            if let Some(number) = block
+                .get("number")
+                .and_then(|value| value.as_str())
+                .and_then(parse_hex_u64)
+            {
+                return Ok(number);
+            }
+        }
+        let head = self
+            .rpc_value("eth_blockNumber", serde_json::json!([]))
+            .await?;
+        let head = head
+            .as_str()
+            .and_then(parse_hex_u64)
+            .ok_or_else(|| Error::Api {
+                message: "Unreadable eth_blockNumber result".to_string(),
+                status: None,
+            })?;
+        Ok(head.saturating_sub(128))
+    }
+
+    /// Number of transactions sent by `address` and mined by block `block`.
+    pub async fn transaction_count_at(&self, address: &str, block: u64) -> Result<u64> {
+        let address = Address::from_str(address).map_err(|e| Error::Api {
+            message: format!("Invalid address: {}", e),
+            status: None,
+        })?;
+        self.get_nonce(&address, &format!("0x{block:x}")).await
     }
 
     /// The receipt of a transaction, or `None` while it is not mined.
@@ -410,8 +479,29 @@ impl PolygonClient {
         self.get_nonce(&address, block_tag).await
     }
 
-    /// Call `method` and return its `result`, which may be JSON null.
+    /// Call `method` and return its `result`, which may be JSON null. Any
+    /// HTTP error, `error` member or missing `result` is an `Err`: never read
+    /// as "not found".
     async fn rpc_value(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self.rpc_response(method, params).await?;
+        if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
+            return Err(Error::Api {
+                message: format!("{method} RPC error: {}", rpc_error_message(error)),
+                status: None,
+            });
+        }
+        response.get("result").cloned().ok_or_else(|| Error::Api {
+            message: format!("{method} answered without a result"),
+            status: None,
+        })
+    }
+
+    /// POST a JSON-RPC call and return the decoded body of a 2xx answer.
+    async fn rpc_response(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -422,28 +512,20 @@ impl PolygonClient {
             "method": method,
             "params": params
         });
-        let response: serde_json::Value = self
+        let response = self
             .http_client
             .post(&self.rpc_url)
             .json(&body)
             .send()
-            .await?
-            .json()
             .await?;
-        if let Some(err) = response.get("error") {
-            let message = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown RPC error");
+        let status = response.status();
+        if !status.is_success() {
             return Err(Error::Api {
-                message: format!("{method} RPC error: {message}"),
-                status: None,
+                message: format!("{method} failed with HTTP {status}"),
+                status: Some(status.as_u16()),
             });
         }
-        Ok(response
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
+        Ok(response.json().await?)
     }
 
     async fn get_erc20_balance_units(
@@ -571,6 +653,7 @@ fn sign_legacy_transaction(signer: &PrivateKeySigner, tx: TxLegacy) -> Result<Si
         raw: format!("0x{}", hex::encode(&encoded)),
         tx_hash: format!("{:#x}", alloy_primitives::keccak256(&encoded)),
         nonce: tx.nonce,
+        gas_price: tx.gas_price,
     })
 }
 
@@ -987,5 +1070,46 @@ mod tests {
         assert_eq!(signed.tx_hash, format!("{:#x}", expected.hash()));
         assert_eq!(signed.nonce, 7);
         assert!(signed.raw.starts_with("0x"));
+    }
+
+    #[test]
+    fn only_deterministic_refusals_count_as_not_sent() {
+        use super::{classify_send_error, BroadcastOutcome};
+        for held in [
+            "already known",
+            "known transaction: 0xabc",
+            "Transaction already imported",
+            "AlreadyKnown",
+        ] {
+            assert_eq!(
+                classify_send_error(held),
+                BroadcastOutcome::Accepted,
+                "{held}"
+            );
+        }
+        for refused in [
+            "insufficient funds for gas * price + value",
+            "intrinsic gas too low",
+            "invalid sender",
+        ] {
+            assert!(
+                matches!(classify_send_error(refused), BroadcastOutcome::Rejected(_)),
+                "{refused}"
+            );
+        }
+        // A retrying provider can answer these for a transaction it holds.
+        for unclear in [
+            "nonce too low",
+            "replacement transaction underpriced",
+            "transaction underpriced",
+            "Your app has exceeded its compute units per second capacity",
+            "internal error",
+            "unknown RPC error",
+        ] {
+            assert!(
+                matches!(classify_send_error(unclear), BroadcastOutcome::Uncertain(_)),
+                "{unclear}"
+            );
+        }
     }
 }

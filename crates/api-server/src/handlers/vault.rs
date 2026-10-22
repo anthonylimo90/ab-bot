@@ -25,13 +25,17 @@ use polymarket_core::api::polygon::BroadcastOutcome;
 use polymarket_core::api::PolygonClient;
 
 use crate::withdrawals::{
-    chain_error_message, fail_unsent, finalize_mined, is_trading_wallet, wallet_lock_key,
-    withdrawal_capacity,
+    chain_error_message, fail_unsent, final_receipt, finalize_mined, Receipt, SpendLock,
+    WithdrawalHolds,
 };
 
 #[cfg(test)]
 #[path = "vault/ownership_tests.rs"]
 mod wallet_ownership_tests;
+
+#[cfg(test)]
+#[path = "vault/withdrawal_tests.rs"]
+mod withdrawal_tests;
 
 const POLYGONSCAN_TX_BASE_URL: &str = "https://polygonscan.com/tx/";
 
@@ -584,17 +588,36 @@ pub async fn remove_wallet(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
-    disconnect_wallet(&state.pool, &state.key_vault, user_id, &address).await?;
+    let active_signer = state.order_executor.wallet_address().await;
+    disconnect_wallet(
+        &state.pool,
+        &state.key_vault,
+        active_signer.as_deref(),
+        user_id,
+        &address,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn disconnect_wallet(
     pool: &PgPool,
     vault: &auth::KeyVault,
+    active_signer: Option<&str>,
     user_id: Uuid,
     address: &str,
 ) -> ApiResult<()> {
     let address = validate_wallet_address(address)?;
+    // The executor signs with the key it loaded; erasing it from the vault
+    // would not stop that, only strand the next start.
+    if active_signer.is_some_and(|signer| signer.eq_ignore_ascii_case(&address)) {
+        return Err(ApiError::Conflict(
+            "This wallet is the live trading signer the server is using; configure another \
+             signer and restart before disconnecting it"
+                .into(),
+        ));
+    }
+
     let mut tx = pool.begin().await?;
     lock_wallet_mutation(&mut tx, user_id, &address).await?;
 
@@ -612,12 +635,12 @@ async fn disconnect_wallet(
         None => return Err(ApiError::NotFound("Wallet not connected".into())),
     };
 
-    // The live trading signer must keep its key while anything it traded is
+    // The pinned trading signer must keep its key while anything it traded is
     // still open: exits, reconciliation and withdrawals all need it.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
         .execute(&mut *tx)
         .await?;
-    let signs_live_trading: bool = sqlx::query_scalar(&format!(
+    let pinned: bool = sqlx::query_scalar(&format!(
         "SELECT EXISTS(SELECT 1 FROM workspaces WHERE LOWER(trading_wallet_address) = $1 \
          AND id = ({}))",
         crate::workspace_scope::CANONICAL_WORKSPACE_SQL
@@ -625,7 +648,7 @@ async fn disconnect_wallet(
     .bind(&address)
     .fetch_one(&mut *tx)
     .await?;
-    if signs_live_trading {
+    if pinned {
         let exposed: bool = sqlx::query_scalar(crate::state::STARTUP_EXPOSURE_SQL)
             .fetch_one(&mut *tx)
             .await?;
@@ -648,13 +671,16 @@ async fn disconnect_wallet(
     .fetch_one(&mut *tx)
     .await?;
     if !shared {
-        vault
-            .remove_wallet_key(&address)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to remove wallet key: {}", e)))?;
+        // Its key is about to go: the next start must not look for it.
+        sqlx::query(
+            "UPDATE workspaces SET trading_wallet_address = NULL \
+             WHERE LOWER(trading_wallet_address) = $1",
+        )
+        .bind(&address)
+        .execute(&mut *tx)
+        .await?;
     }
 
-    // Remove from database
     sqlx::query("DELETE FROM user_wallets WHERE id = $1")
         .bind(wallet_id)
         .execute(&mut *tx)
@@ -677,6 +703,32 @@ async fn disconnect_wallet(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    }
+    tx.commit().await?;
+    if shared {
+        return Ok(());
+    }
+
+    // The key goes only after the disconnect is committed, so a failure
+    // leaves an unused key (which reconnecting reuses), never a connected
+    // wallet without one. Recheck under the locks: the address may have been
+    // connected again meanwhile.
+    let mut tx = pool.begin().await?;
+    lock_wallet_mutation(&mut tx, user_id, &address).await?;
+    let reconnected: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM user_wallets WHERE LOWER(address) = $1)")
+            .bind(&address)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !reconnected {
+        vault.remove_wallet_key(&address).await.map_err(|e| {
+            tracing::error!(error = %e, wallet = %address, "Disconnected a wallet but could not erase its key");
+            ApiError::ServiceUnavailable(
+                "The wallet was disconnected, but its key could not be erased from the vault; \
+                 an operator must remove it"
+                    .into(),
+            )
+        })?;
     }
     tx.commit().await?;
     Ok(())
@@ -891,8 +943,8 @@ pub async fn list_withdrawals(
     Ok(Json(rows.into_iter().map(Into::into).collect()))
 }
 
-async fn existing_withdrawal(
-    pool: &PgPool,
+async fn existing_withdrawal<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     user_id: Uuid,
     source: &str,
     destination: &str,
@@ -900,8 +952,15 @@ async fn existing_withdrawal(
     request_id: Uuid,
 ) -> ApiResult<Option<WalletWithdrawalRow>> {
     let row: Option<WalletWithdrawalRow> = sqlx::query_as(
-        "SELECT id, wallet_address, destination_address, asset, amount, status, tx_hash, error, requested_at, confirmed_at FROM wallet_withdrawals WHERE wallet_address=$1 AND client_request_id=$2 AND user_id=$3"
-    ).bind(source).bind(request_id).bind(user_id).fetch_optional(pool).await?;
+        "SELECT id, wallet_address, destination_address, asset, amount, status, tx_hash, error, \
+         requested_at, confirmed_at FROM wallet_withdrawals \
+         WHERE wallet_address = $1 AND client_request_id = $2 AND user_id = $3",
+    )
+    .bind(source)
+    .bind(request_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await?;
     if let Some(row) = &row {
         if !row.destination_address.eq_ignore_ascii_case(destination) || row.amount != amount {
             return Err(ApiError::Conflict(
@@ -969,61 +1028,6 @@ pub async fn create_withdrawal(
     }
 
     let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
-
-    // Serialize with every other spend from this wallet and, for the trading
-    // wallet, with new entries, which need its USDC. Held until the transfer
-    // has been handed to the node.
-    let mut guard = state.pool.begin().await?;
-    if is_trading_wallet(&mut guard, &source_address).await? {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
-            .execute(&mut *guard)
-            .await?;
-    }
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(wallet_lock_key(&source_address))
-        .execute(&mut *guard)
-        .await?;
-
-    // Read under the lock, so no other transfer from this wallet can settle
-    // between this balance and the capacity check below.
-    let balance_units = polygon_client
-        .get_usdc_balance_units(&source_address)
-        .await
-        .map_err(|e| {
-            warn!(error = %chain_error_message(&e), "Failed to fetch source wallet balance");
-            ApiError::ServiceUnavailable("Could not read the wallet's USDC balance".into())
-        })?;
-
-    // A concurrent request with the same id may have held the lock first.
-    if let Some(row) = existing_withdrawal(
-        &state.pool,
-        user_id,
-        &source_address,
-        &destination_address,
-        req.amount,
-        request_id,
-    )
-    .await?
-    {
-        return Ok(Json(row.into()));
-    }
-
-    let capacity = withdrawal_capacity(&mut guard, &source_address, balance_units).await?;
-    if let Some(reason) = capacity.blocking_reasons.first() {
-        return Err(ApiError::Conflict(reason.clone()));
-    }
-    if req.amount > capacity.max_withdrawable {
-        return Err(ApiError::BadRequest(format!(
-            "Withdrawal of {} USDC exceeds the {} USDC that can leave this wallet \
-             (balance {}, unconfirmed withdrawals {}, open live buy orders {})",
-            req.amount,
-            capacity.max_withdrawable,
-            capacity.available_usdc,
-            capacity.in_flight_withdrawals,
-            capacity.reserved_for_open_buys
-        )));
-    }
-
     let wallet = state
         .load_wallet_from_vault(&source_address)
         .await
@@ -1031,44 +1035,168 @@ pub async fn create_withdrawal(
             warn!(error = %e, "Failed to load wallet signer for withdrawal");
             ApiError::ServiceUnavailable("The wallet's signing key is unavailable".into())
         })?;
-    let signer = wallet.signer();
 
-    let withdrawal_id = Uuid::new_v4();
+    let request = WithdrawalRequest {
+        user_id,
+        workspace_id,
+        source: source_address,
+        destination: destination_address,
+        amount: req.amount,
+        amount_units,
+        request_id,
+    };
+    // Once a transfer is signed its outcome must be recorded, so the work runs
+    // to the end even if the client goes away.
+    let row = tokio::spawn(submit_withdrawal(state, polygon_client, wallet, request))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Withdrawal task failed: {e}")))??;
+    Ok(Json(row.into()))
+}
+
+/// A validated withdrawal request.
+struct WithdrawalRequest {
+    user_id: Uuid,
+    workspace_id: Uuid,
+    source: String,
+    destination: String,
+    amount: Decimal,
+    amount_units: u128,
+    request_id: Uuid,
+}
+
+impl WithdrawalRequest {
+    fn audit(&self, state: &AppState, withdrawal_id: Uuid, status: &str, failure: Option<String>) {
+        let mut event = AuditEvent::builder(
+            AuditAction::Custom("wallet_withdrawal".to_string()),
+            format!("wallet/{}", self.source),
+        )
+        .user(self.user_id.to_string())
+        .details(serde_json::json!({
+            "withdrawal_id": withdrawal_id,
+            "destination_address": self.destination,
+            "amount": self.amount.to_string(),
+            "status": status,
+        }));
+        if let Some(failure) = failure {
+            event = event.failure(failure);
+        }
+        state.audit_logger.log(event.build());
+    }
+}
+
+/// How long the balance read may hold up entries, which wait on the lock.
+const WITHDRAWAL_BALANCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many times, two seconds apart, a request looks for its transfer's
+/// final receipt.
+const WITHDRAWAL_RECEIPT_POLLS: u32 = if cfg!(test) { 2 } else { 30 };
+
+/// A request's row: one it had already made, or the one it just reserved.
+enum Reservation {
+    Existing(WalletWithdrawalRow),
+    Reserved {
+        id: Uuid,
+        requested_at: DateTime<Utc>,
+    },
+}
+
+/// Check capacity and write the `pending` row, under the wallet's spend lock
+/// and, while deciding, the entries lock. Nothing is signed yet.
+async fn reserve_withdrawal(
+    lock: &mut SpendLock,
+    client: &PolygonClient,
+    request: &WithdrawalRequest,
+) -> ApiResult<Reservation> {
+    // A concurrent request with the same id may have held the lock first.
+    if let Some(row) = existing_withdrawal(
+        lock.conn(),
+        request.user_id,
+        &request.source,
+        &request.destination,
+        request.amount,
+        request.request_id,
+    )
+    .await?
+    {
+        return Ok(Reservation::Existing(row));
+    }
+
+    lock.lock_entries().await?;
+    // Holds first, then the balance: a transfer settling in between can only
+    // make the capacity look smaller.
+    let holds = WithdrawalHolds::load(lock.conn(), &request.source).await?;
+    let balance_units = match tokio::time::timeout(
+        WITHDRAWAL_BALANCE_TIMEOUT,
+        client.get_usdc_balance_units(&request.source),
+    )
+    .await
+    {
+        Ok(Ok(units)) => units,
+        Ok(Err(e)) => {
+            warn!(error = %chain_error_message(&e), "Failed to fetch source wallet balance");
+            return Err(ApiError::ServiceUnavailable(
+                "Could not read the wallet's USDC balance".into(),
+            ));
+        }
+        Err(_) => {
+            return Err(ApiError::ServiceUnavailable(
+                "Reading the wallet's USDC balance timed out".into(),
+            ))
+        }
+    };
+    let capacity = holds.capacity(balance_units);
+    if let Some(reason) = capacity.blocking_reasons.first() {
+        return Err(ApiError::Conflict(reason.clone()));
+    }
+    if request.amount > capacity.max_withdrawable {
+        return Err(ApiError::BadRequest(format!(
+            "Withdrawal of {} USDC exceeds the {} USDC that can leave this wallet \
+             (balance {}, unconfirmed withdrawals {}, open live buy orders {})",
+            request.amount,
+            capacity.max_withdrawable,
+            capacity.available_usdc,
+            capacity.in_flight_withdrawals,
+            capacity.reserved_for_open_buys
+        )));
+    }
+
+    let id = Uuid::new_v4();
     let requested_at = Utc::now();
-    let insert_result = sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO wallet_withdrawals (
             id, user_id, workspace_id, wallet_address, destination_address, asset, amount,
-            status, requested_at, created_at, updated_at, client_request_id, journaled
+            status, requested_at, created_at, updated_at, client_request_id, journaled,
+            trading_wallet
         )
-        VALUES ($1, $2, $3, $4, $5, 'USDC', $6, 'pending', $7, $7, $7, $8, TRUE)
+        VALUES ($1, $2, $3, $4, $5, 'USDC', $6, 'pending', $7, $7, $7, $8, TRUE, $9)
         "#,
     )
-    .bind(withdrawal_id)
-    .bind(user_id)
-    .bind(workspace_id)
-    .bind(&source_address)
-    .bind(&destination_address)
-    .bind(req.amount)
+    .bind(id)
+    .bind(request.user_id)
+    .bind(request.workspace_id)
+    .bind(&request.source)
+    .bind(&request.destination)
+    .bind(request.amount)
     .bind(requested_at)
-    .bind(req.client_request_id)
-    .execute(&state.pool)
+    .bind(request.request_id)
+    .bind(holds.trading_wallet)
+    .execute(lock.conn())
     .await;
-
-    if let Err(sqlx::Error::Database(ref db_err)) = insert_result {
-        if db_err.code().is_some_and(|c| c == "23505") {
+    match inserted {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.code().is_some_and(|c| c == "23505") => {
             // Unique constraint violation on (wallet_address, client_request_id).
             if let Some(row) = existing_withdrawal(
-                &state.pool,
-                user_id,
-                &source_address,
-                &destination_address,
-                req.amount,
-                request_id,
+                lock.conn(),
+                request.user_id,
+                &request.source,
+                &request.destination,
+                request.amount,
+                request.request_id,
             )
             .await?
             {
-                return Ok(Json(WalletWithdrawalResponse::from(row)));
+                return Ok(Reservation::Existing(row));
             }
             return Err(ApiError::Conflict(
                 "A withdrawal with this client_request_id was processed concurrently. \
@@ -1076,39 +1204,48 @@ pub async fn create_withdrawal(
                     .into(),
             ));
         }
+        Err(error) => return Err(error.into()),
     }
-    insert_result?;
+    // The row now counts against capacity everywhere: entries may resume.
+    lock.unlock_entries().await?;
+    Ok(Reservation::Reserved { id, requested_at })
+}
 
-    let audit = |status: &str, failure: Option<String>| {
-        let mut event = AuditEvent::builder(
-            AuditAction::Custom("wallet_withdrawal".to_string()),
-            format!("wallet/{}", source_address),
-        )
-        .user(user_id.to_string())
-        .details(serde_json::json!({
-            "withdrawal_id": withdrawal_id,
-            "destination_address": destination_address,
-            "amount": req.amount.to_string(),
-            "status": status,
-        }));
-        if let Some(failure) = failure {
-            event = event.failure(failure);
+/// Reserve, sign, journal and send a withdrawal, then wait briefly for it to
+/// settle. Errors are returned only while nothing has been sent; after the
+/// broadcast every failure is logged and the reconciler takes over.
+async fn submit_withdrawal(
+    state: Arc<AppState>,
+    client: PolygonClient,
+    wallet: auth::TradingWallet,
+    request: WithdrawalRequest,
+) -> ApiResult<WalletWithdrawalRow> {
+    let mut lock = SpendLock::acquire(&state.pool, &request.source).await?;
+    let (withdrawal_id, requested_at) = match reserve_withdrawal(&mut lock, &client, &request).await
+    {
+        Ok(Reservation::Reserved { id, requested_at }) => (id, requested_at),
+        Ok(Reservation::Existing(row)) => {
+            lock.release().await;
+            return Ok(row);
         }
-        state.audit_logger.log(event.build());
+        Err(error) => {
+            lock.release().await;
+            return Err(error);
+        }
     };
 
-    let signed = match polygon_client
-        .prepare_usdc_transfer(signer, &destination_address, amount_units)
-        .await
-    {
+    let signed = match sign_new_transfer(lock.conn(), &client, &wallet, &request).await {
         Ok(signed) => signed,
         Err(error) => {
             // Nothing was signed for the chain to see: a certain non-transfer.
-            let message = chain_error_message(&error);
-            fail_unsent(&state.pool, withdrawal_id, &message).await?;
-            audit("failed", Some(message.clone()));
-            return Err(if message.starts_with("Insufficient POL") {
-                ApiError::BadRequest(message)
+            if let Err(e) = fail_unsent(lock.conn(), withdrawal_id, &error).await {
+                // Still `pending` without a hash: the reconciler fails it.
+                warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not record an unsent withdrawal");
+            }
+            lock.release().await;
+            request.audit(&state, withdrawal_id, "failed", Some(error.clone()));
+            return Err(if error.starts_with("Insufficient POL") {
+                ApiError::BadRequest(error)
             } else {
                 ApiError::ServiceUnavailable(
                     "Could not prepare the transfer; nothing was sent".into(),
@@ -1119,90 +1256,214 @@ pub async fn create_withdrawal(
 
     // Journal the transfer before it can leave: from here on its hash and
     // nonce let the reconciler find out what happened whatever follows.
-    sqlx::query(
+    let journaled = sqlx::query(
         "UPDATE wallet_withdrawals SET status = 'submitting', tx_hash = $2, nonce = $3, \
-         raw_tx = $4, updated_at = NOW() WHERE id = $1",
+         raw_tx = $4, updated_at = NOW() WHERE id = $1 AND status = 'pending'",
     )
     .bind(withdrawal_id)
     .bind(&signed.tx_hash)
     .bind(signed.nonce as i64)
     .bind(&signed.raw)
-    .execute(&state.pool)
-    .await?;
+    .execute(lock.conn())
+    .await;
+    if !matches!(&journaled, Ok(result) if result.rows_affected() == 1) {
+        // Not journaled, so never sent. A `pending` row without a hash is
+        // failed by the reconciler.
+        lock.release().await;
+        if let Err(error) = journaled {
+            warn!(withdrawal_id = %withdrawal_id, %error, "Could not journal a withdrawal; nothing was sent");
+        }
+        return Err(ApiError::ServiceUnavailable(
+            "Could not record the transfer before sending it; nothing was sent".into(),
+        ));
+    }
 
-    let broadcast = polygon_client.broadcast(&signed).await;
-    let submitted = match broadcast {
+    let (mut status, mut error) = ("submitting", None::<String>);
+    let note = match client.broadcast(&signed.raw, &signed.tx_hash).await {
         Ok(BroadcastOutcome::Accepted) => {
+            status = "submitted";
+            None
+        }
+        Ok(BroadcastOutcome::Rejected(reason)) => {
+            // A refusal no held transaction can get, but make sure: a node
+            // that knows the transfer, or a receipt, means it was sent.
+            let reason: String = reason.chars().take(300).collect();
+            let unsent = matches!(client.transaction_known(&signed.tx_hash).await, Ok(false))
+                && matches!(client.transaction_receipt(&signed.tx_hash).await, Ok(None));
+            if unsent {
+                let message = format!("Rejected by the Polygon node: {reason}");
+                match fail_unsent(lock.conn(), withdrawal_id, &message).await {
+                    Ok(_) => {
+                        status = "failed";
+                        error = Some(message);
+                        request.audit(&state, withdrawal_id, "failed", Some(reason));
+                        None
+                    }
+                    Err(e) => {
+                        warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not record a refused withdrawal");
+                        Some(UNRESOLVED_BROADCAST_NOTE)
+                    }
+                }
+            } else {
+                warn!(withdrawal_id = %withdrawal_id, %reason, "Node refused a withdrawal it may hold");
+                Some(UNRESOLVED_BROADCAST_NOTE)
+            }
+        }
+        Ok(BroadcastOutcome::Uncertain(reason)) => {
+            warn!(withdrawal_id = %withdrawal_id, %reason, "Withdrawal broadcast outcome unknown");
+            Some(UNRESOLVED_BROADCAST_NOTE)
+        }
+        Err(e) => {
+            warn!(withdrawal_id = %withdrawal_id, error = %chain_error_message(&e), "Withdrawal broadcast outcome unknown");
+            Some(UNRESOLVED_BROADCAST_NOTE)
+        }
+    };
+    let recorded = match note {
+        None if status == "submitted" => sqlx::query(
+            "UPDATE wallet_withdrawals SET status = 'submitted', updated_at = NOW() \
+             WHERE id = $1 AND status = 'submitting'",
+        )
+        .bind(withdrawal_id)
+        .execute(lock.conn())
+        .await
+        .map(drop),
+        None => Ok(()),
+        Some(note) => {
+            error = Some(note.to_string());
+            request.audit(
+                &state,
+                withdrawal_id,
+                "submission_requires_reconciliation",
+                None,
+            );
             sqlx::query(
-                "UPDATE wallet_withdrawals SET status = 'submitted', updated_at = NOW() \
+                "UPDATE wallet_withdrawals SET error = $2, updated_at = NOW() \
                  WHERE id = $1 AND status = 'submitting'",
             )
             .bind(withdrawal_id)
-            .execute(&state.pool)
-            .await?;
-            true
-        }
-        Ok(BroadcastOutcome::Rejected(reason)) => {
-            // The node refused it, so it was never propagated.
-            let reason: String = reason.chars().take(300).collect();
-            fail_unsent(
-                &state.pool,
-                withdrawal_id,
-                &format!("Rejected by the Polygon node: {reason}"),
-            )
-            .await?;
-            audit("failed", Some(reason));
-            false
-        }
-        Err(error) => {
-            // The node may or may not have it; the reconciler decides from the chain.
-            warn!(withdrawal_id = %withdrawal_id, error = %chain_error_message(&error), "Withdrawal broadcast outcome unknown");
-            sqlx::query(
-                "UPDATE wallet_withdrawals SET error = $2, updated_at = NOW() WHERE id = $1",
-            )
-            .bind(withdrawal_id)
-            .bind("Broadcast outcome unknown; it is being resolved from the chain. Do not start another transfer.")
-            .execute(&state.pool)
-            .await?;
-            audit("submission_requires_reconciliation", None);
-            false
+            .bind(note)
+            .execute(lock.conn())
+            .await
+            .map(drop)
         }
     };
-    guard.commit().await?;
+    if let Err(e) = recorded {
+        // The journal already holds the hash; the reconciler settles it.
+        warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not record a withdrawal's broadcast");
+    }
+    lock.release().await;
 
-    // Wait briefly for the receipt; the reconciler settles anything slower.
-    if submitted {
-        for _ in 0..30 {
+    // Wait briefly for the final receipt; the reconciler settles anything slower.
+    let mut confirmed_at = None;
+    if status != "failed" {
+        for _ in 0..WITHDRAWAL_RECEIPT_POLLS {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match polygon_client.transaction_receipt(&signed.tx_hash).await {
-                Ok(Some(mined)) => {
-                    if finalize_mined(&state.pool, withdrawal_id, &mined).await? {
-                        audit(
+            match final_receipt(&client, &signed.tx_hash).await {
+                Ok(Receipt::Final(mined)) => {
+                    let settled = match state.pool.acquire().await {
+                        Ok(mut conn) => finalize_mined(&mut conn, withdrawal_id, &mined).await,
+                        Err(e) => Err(e),
+                    };
+                    match settled {
+                        Ok(changed) => {
+                            if changed {
+                                request.audit(
+                                    &state,
+                                    withdrawal_id,
+                                    if mined.success {
+                                        "confirmed"
+                                    } else {
+                                        "reverted"
+                                    },
+                                    None,
+                                );
+                            }
                             if mined.success {
-                                "confirmed"
-                            } else {
-                                "reverted"
-                            },
-                            None,
-                        );
+                                (status, error, confirmed_at) =
+                                    ("confirmed", None, Some(Utc::now()));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not settle a mined withdrawal; the reconciler will")
+                        }
                     }
                     break;
                 }
-                Ok(None) => continue,
+                Ok(Receipt::Unmined | Receipt::Unsettled) => continue,
                 Err(_) => break,
             }
         }
     }
 
-    let row: WalletWithdrawalRow = sqlx::query_as(
+    let row: Result<WalletWithdrawalRow, sqlx::Error> = sqlx::query_as(
         "SELECT id, wallet_address, destination_address, asset, amount, status, tx_hash, error, \
          requested_at, confirmed_at FROM wallet_withdrawals WHERE id = $1",
     )
     .bind(withdrawal_id)
     .fetch_one(&state.pool)
-    .await?;
-    Ok(Json(row.into()))
+    .await;
+    Ok(row.unwrap_or_else(|e| {
+        warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not read back a sent withdrawal");
+        WalletWithdrawalRow {
+            id: withdrawal_id,
+            wallet_address: request.source.clone(),
+            destination_address: request.destination.clone(),
+            asset: "USDC".into(),
+            amount: request.amount,
+            status: status.into(),
+            tx_hash: Some(signed.tx_hash.clone()),
+            error,
+            requested_at,
+            confirmed_at,
+        }
+    }))
 }
+
+/// Sign the request's transfer as a transaction no other withdrawal has
+/// recorded. Signing is deterministic, so a retry of a transfer that was
+/// refused at the same nonce would repeat the refused one's hash exactly; it
+/// is signed again at a higher gas price, which also lets it replace that one
+/// should a node hold it after all. Only one of the two can be mined. The
+/// error is a client-safe reason.
+async fn sign_new_transfer(
+    conn: &mut sqlx::PgConnection,
+    client: &PolygonClient,
+    wallet: &auth::TradingWallet,
+    request: &WithdrawalRequest,
+) -> Result<polymarket_core::api::polygon::SignedTransaction, String> {
+    let mut min_gas_price = 0;
+    for _ in 0..3 {
+        let signed = client
+            .prepare_usdc_transfer(
+                wallet.signer(),
+                &request.destination,
+                request.amount_units,
+                min_gas_price,
+            )
+            .await
+            .map_err(|error| chain_error_message(&error))?;
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM wallet_withdrawals WHERE tx_hash = $1)",
+        )
+        .bind(&signed.tx_hash)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|error| {
+            warn!(%error, "Could not check a signed withdrawal against the journal");
+            "Could not check the signed transfer".to_string()
+        })?;
+        if !recorded {
+            return Ok(signed);
+        }
+        // Nodes accept a replacement paying at least 10% more.
+        min_gas_price = signed.gas_price + signed.gas_price / 10 + 1;
+    }
+    Err("Could not sign a transfer distinct from earlier ones".into())
+}
+
+/// What a transfer whose broadcast outcome is unknown tells its owner.
+const UNRESOLVED_BROADCAST_NOTE: &str =
+    "Broadcast outcome unknown; it is being resolved from the chain. Do not start another transfer.";
 
 // ─── D3b: Withdrawal Preflight ────────────────────────────────────────────────
 
@@ -1284,7 +1545,12 @@ pub async fn withdrawal_preflight(
         resolve_user_wallet_address(state.as_ref(), user_id, params.address.as_deref()).await?;
 
     // Fetch on-chain USDC balance.
+    // Holds first, then the balance, as a withdrawal reads them.
     let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
+    let holds = {
+        let mut conn = state.pool.acquire().await?;
+        WithdrawalHolds::load(&mut conn, &source_address).await?
+    };
     let balance_units = polygon_client
         .get_usdc_balance_units(&source_address)
         .await
@@ -1292,9 +1558,7 @@ pub async fn withdrawal_preflight(
             warn!(error = %chain_error_message(&e), "Failed to fetch source wallet balance");
             ApiError::ServiceUnavailable("Could not read the wallet's USDC balance".into())
         })?;
-    let mut conn = state.pool.acquire().await?;
-    let capacity = withdrawal_capacity(&mut conn, &source_address, balance_units).await?;
-    drop(conn);
+    let capacity = holds.capacity(balance_units);
 
     // Query orphan exposure from wallet_inventory.
     let orphan_exposure: Decimal = sqlx::query_scalar(

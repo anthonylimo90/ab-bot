@@ -35,7 +35,7 @@ async fn personal_wallet_preferences_do_not_change_the_workspace_signer(pool: Pg
             .unwrap(),
         Some(bot_address.clone())
     );
-    disconnect_wallet(&pool, &vault, owner, &second.address)
+    disconnect_wallet(&pool, &vault, None, owner, &second.address)
         .await
         .unwrap();
     assert_eq!(
@@ -85,21 +85,36 @@ async fn the_live_signer_keeps_its_key_while_its_trades_are_open(pool: PgPool) {
 
     // Exits and reconciliation of the open position need the signer's key.
     assert!(matches!(
-        disconnect_wallet(&pool, &vault, owner, &signer.address).await,
+        disconnect_wallet(&pool, &vault, None, owner, &signer.address).await,
         Err(ApiError::Conflict(_))
     ));
     assert!(vault.has_wallet_key(&signer.address).await);
     // Other wallets are not tied to the trading book.
-    disconnect_wallet(&pool, &vault, owner, &personal.address)
+    disconnect_wallet(&pool, &vault, None, owner, &personal.address)
         .await
         .unwrap();
 
-    // Once flat, the signer can go.
+    // Flat, but the server is still signing with it.
     pool.execute("DELETE FROM positions").await.unwrap();
-    disconnect_wallet(&pool, &vault, owner, &signer.address)
+    let active = signer.address.to_uppercase().replacen("0X", "0x", 1);
+    assert!(matches!(
+        disconnect_wallet(&pool, &vault, Some(&active), owner, &signer.address).await,
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(vault.has_wallet_key(&signer.address).await);
+
+    // Once flat and idle, the signer can go, and the next start no longer
+    // looks for its key.
+    disconnect_wallet(&pool, &vault, None, owner, &signer.address)
         .await
         .unwrap();
     assert!(!vault.has_wallet_key(&signer.address).await);
+    assert_eq!(
+        crate::state::resolve_startup_wallet_address(&pool, None)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 // Public test keys only; never fund these addresses.
@@ -245,10 +260,10 @@ async fn legacy_shared_registration_cannot_destroy_another_accounts_key(pool: Pg
         .await
         .unwrap();
     assert!(matches!(
-        disconnect_wallet(&pool, &vault, stranger, &req.address).await,
+        disconnect_wallet(&pool, &vault, None, stranger, &req.address).await,
         Err(ApiError::NotFound(_))
     ));
-    disconnect_wallet(&pool, &vault, legacy_owner, &req.address)
+    disconnect_wallet(&pool, &vault, None, legacy_owner, &req.address)
         .await
         .unwrap();
     assert_eq!(
@@ -296,7 +311,7 @@ async fn mixed_case_legacy_rows_retain_the_shared_key(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    disconnect_wallet(&pool, &vault, owner, &req.address)
+    disconnect_wallet(&pool, &vault, None, owner, &req.address)
         .await
         .unwrap();
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_wallets")

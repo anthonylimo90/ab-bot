@@ -142,7 +142,9 @@ pub struct KeyVault {
     master_key: Vec<u8>,
     /// In-memory cache of loaded keys.
     cache: Arc<RwLock<HashMap<String, WalletKey>>>,
-    /// Serializes read-modify-write cycles of the vault file in this process.
+    /// Serializes changes to the stored keys in this process: the vault
+    /// file's read-modify-write cycles together with the cache updates that
+    /// go with them, so a load cannot cache a key a removal just erased.
     file_lock: tokio::sync::Mutex<()>,
 }
 
@@ -190,6 +192,7 @@ impl KeyVault {
     pub async fn store_wallet_key(&self, address: &str, private_key: &[u8]) -> Result<()> {
         let wallet_key = WalletKey::new(address.to_string(), private_key, &self.master_key)?;
 
+        let _guard = self.file_lock.lock().await;
         match &self.provider {
             KeyVaultProvider::Environment => {
                 return Err(anyhow!(
@@ -240,7 +243,12 @@ impl KeyVault {
             }
         }
 
-        // Load from provider
+        // Load from provider, under the lock removals hold, and check the
+        // cache again: another caller may have loaded it meanwhile.
+        let _guard = self.file_lock.lock().await;
+        if let Some(key) = self.cache.read().await.get(&address_lower) {
+            return Ok(Some(key.decrypt(&self.master_key)?));
+        }
         let wallet_key = match &self.provider {
             KeyVaultProvider::Environment => self.load_from_env(&address_lower).await?,
             KeyVaultProvider::EncryptedFile { path } => {
@@ -285,6 +293,7 @@ impl KeyVault {
     pub async fn remove_wallet_key(&self, address: &str) -> Result<bool> {
         let address_lower = address.to_lowercase();
 
+        let _guard = self.file_lock.lock().await;
         // Persistent storage first: a key that stays on disk would come back
         // on the next restart.
         let removed_from_file = match &self.provider {
@@ -353,10 +362,10 @@ impl KeyVault {
         }
     }
 
+    /// Called with `file_lock` held.
     async fn store_to_file(&self, path: &Path, address: &str, key: &WalletKey) -> Result<()> {
         use base64::Engine;
 
-        let _guard = self.file_lock.lock().await;
         // An unreadable vault is an error, never an empty one: rewriting it
         // would destroy every other key it holds.
         let mut keys = read_vault_file(path).await?;
@@ -370,8 +379,8 @@ impl KeyVault {
         write_vault_file(path, &keys).await
     }
 
+    /// Called with `file_lock` held.
     async fn remove_from_file(&self, path: &Path, address: &str) -> Result<bool> {
-        let _guard = self.file_lock.lock().await;
         let mut keys = read_vault_file(path).await?;
         if keys.remove(address).is_none() {
             return Ok(false);
@@ -429,14 +438,18 @@ async fn write_vault_file(path: &Path, keys: &HashMap<String, StoredKey>) -> Res
             let mut file = options.open(&tmp)?;
             file.write_all(&content)?;
             file.sync_all()?;
-            std::fs::rename(&tmp, &path)?;
-            #[cfg(unix)]
-            std::fs::File::open(&dir)?.sync_all()?;
-            Ok(())
+            std::fs::rename(&tmp, &path)
         })();
         if let Err(error) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(error).with_context(|| format!("Failed to write vault file {path:?}"));
+        }
+        // The new vault is in place; flushing the directory only makes the
+        // rename survive a power loss. Failing it must not report the write
+        // as failed (callers would act as if the old vault were current).
+        #[cfg(unix)]
+        if let Err(error) = std::fs::File::open(&dir).and_then(|dir| dir.sync_all()) {
+            warn!(%error, path = ?path, "Could not flush the vault directory after a write");
         }
         Ok(())
     })
@@ -561,6 +574,24 @@ mod tests {
         // No temporary files are left behind.
         let entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(entries, 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_load_racing_a_removal_never_brings_the_key_back() {
+        let path = temp_vault_path("race");
+        let vault = Arc::new(file_vault(&path));
+        for _ in 0..50 {
+            vault.store_wallet_key("0xaaa", b"key-a").await.unwrap();
+            vault.clear_cache().await;
+            let loader = vault.clone();
+            let load = tokio::spawn(async move { loader.get_wallet_key("0xaaa").await });
+            vault.remove_wallet_key("0xaaa").await.unwrap();
+            load.await.unwrap().unwrap();
+            // Whichever ran first, the removal leaves no copy behind.
+            assert!(vault.list_wallet_addresses().await.is_empty());
+            assert_eq!(vault.get_wallet_key("0xaaa").await.unwrap(), None);
+        }
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

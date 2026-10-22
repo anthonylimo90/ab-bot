@@ -841,14 +841,35 @@ impl OrderExecutor {
             ));
         };
 
+        let withheld = self.collateral_withheld(&client.address()).await?;
         Self::ensure_live_order_capacity(
             client,
             Uuid::new_v4(),
             OrderSide::Buy,
             "collateral",
-            required_collateral,
+            required_collateral + withheld,
         )
         .await
+    }
+
+    /// USDC that withdrawals from `wallet` still being settled may take: the
+    /// exchange balance does not know about them until they are mined.
+    async fn collateral_withheld(&self, wallet: &str) -> Result<Decimal> {
+        let Some(pool) = &self.database else {
+            return Ok(Decimal::ZERO);
+        };
+        let withheld: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM wallet_withdrawals \
+             WHERE LOWER(wallet_address) = LOWER($1) \
+               AND status IN ('pending', 'submitting', 'submitted')",
+        )
+        .bind(wallet)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("Could not read withdrawals in flight for the buy preflight: {e}")
+        })?;
+        Ok(withheld)
     }
 
     // Private methods
@@ -1209,7 +1230,10 @@ impl OrderExecutor {
         }
 
         let market_amount = match order.side {
-            OrderSide::Buy => order.quantity * price,
+            OrderSide::Buy => {
+                order.quantity * price
+                    + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
+            }
             OrderSide::Sell => order.quantity,
         };
 
@@ -1344,12 +1368,15 @@ impl OrderExecutor {
             ));
         }
 
+        let deadline = self.preparation_deadline();
         let required_amount = match order.side {
-            OrderSide::Buy => order.quantity * order.price,
+            OrderSide::Buy => {
+                order.quantity * order.price
+                    + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
+            }
             OrderSide::Sell => order.quantity,
         };
 
-        let deadline = self.preparation_deadline();
         Self::prepare(
             deadline,
             Self::ensure_live_order_capacity(
@@ -1637,6 +1664,32 @@ mod tests {
             Arc::new(ClobClient::new(None, None)),
             ExecutorConfig::default(),
         )
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn buys_keep_back_usdc_that_unsettled_withdrawals_may_take(pool: sqlx::PgPool) {
+        use sqlx::Executor;
+        // Without a database there is nothing to keep back.
+        assert_eq!(
+            executor().collateral_withheld("0xabc").await.unwrap(),
+            Decimal::ZERO
+        );
+        let executor = executor().with_database(pool.clone());
+        // Fail closed: an unreadable journal is not "nothing in flight".
+        assert!(executor.collateral_withheld("0xabc").await.is_err());
+
+        pool.execute(
+            "CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT); \
+             INSERT INTO wallet_withdrawals VALUES \
+                ('0xABC', 5, 'pending'), ('0xabc', 7, 'submitting'), ('0xabc', 11, 'submitted'), \
+                ('0xabc', 13, 'confirmed'), ('0xabc', 17, 'failed'), ('0xdef', 19, 'submitted')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            executor.collateral_withheld("0xAbC").await.unwrap(),
+            Decimal::from(23)
+        );
     }
 
     fn sell(quantity: &str) -> MarketOrder {
