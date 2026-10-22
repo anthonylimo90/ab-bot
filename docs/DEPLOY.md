@@ -625,7 +625,8 @@ unsigned). Fees are set by the exchange when an order matches.
   whose release does not answer within ten seconds, is freed the same way.
   After half an hour the
   lock is let go with a warning; a restart lets go of it too. From then on
-  the lock is taken only for a look, when free: the wrap's gas is still
+  the lock is taken only for one check (about ten seconds), when free, and
+  a lock that cannot be read leaves the wrap watched: the wrap's gas is still
   raised while the node holds it, but it is never sent again. One the node
   drops (as checks over two minutes agree) is let go, and a later look wraps
   afresh under the lock. Without the lock nothing is sent. A withdrawal
