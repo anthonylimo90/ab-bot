@@ -30,7 +30,34 @@ pub struct Market {
     pub fee_schedule: Option<FeeSchedule>,
 }
 
+/// The indices of the outcomes treated as YES and NO in a binary market.
+///
+/// Every position, order and price in the system uses this one mapping:
+/// the first outcome is YES when its name says so, otherwise the second is.
+/// For named outcomes ("Lakers"/"Celtics") the choice is a convention, but it
+/// must never differ between the tokens a position holds and the prices
+/// used to value it.
+pub fn yes_no_indices(outcomes: &[Outcome]) -> Option<(usize, usize)> {
+    (outcomes.len() == 2).then(|| {
+        if outcomes[0].name.to_lowercase().contains("yes") {
+            (0, 1)
+        } else {
+            (1, 0)
+        }
+    })
+}
+
 impl Market {
+    /// The YES and NO token ids of a binary market, under [`yes_no_indices`].
+    pub fn yes_no_token_ids(&self) -> Option<(String, String)> {
+        yes_no_indices(&self.outcomes).map(|(yes, no)| {
+            (
+                self.outcomes[yes].token_id.clone(),
+                self.outcomes[no].token_id.clone(),
+            )
+        })
+    }
+
     /// The taker fee terms to price trades with. A market that reports fees
     /// without publishing their terms is priced at the highest known rate.
     pub fn effective_fee_schedule(&self) -> FeeSchedule {
@@ -330,6 +357,48 @@ mod tests {
             price: Decimal::new(price, 2),
             size: Decimal::new(size, 0),
         }
+    }
+
+    #[test]
+    fn every_binary_market_maps_its_tokens_to_yes_and_no_one_way() {
+        let outcome = |name: &str, token: &str| Outcome {
+            id: token.into(),
+            name: name.into(),
+            token_id: token.into(),
+            price: None,
+            winner: None,
+        };
+        let market = |outcomes| Market {
+            id: "m".into(),
+            question: "q".into(),
+            description: None,
+            outcomes,
+            volume: Decimal::ZERO,
+            liquidity: Decimal::ZERO,
+            end_date: None,
+            resolved: false,
+            resolution: None,
+            category: None,
+            tags: vec![],
+            fees_enabled: false,
+            fee_type: None,
+            fee_schedule: None,
+        };
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(
+            market(vec![outcome("Yes", "y"), outcome("No", "n")]).yes_no_token_ids(),
+            pair("y", "n")
+        );
+        assert_eq!(
+            market(vec![outcome("No", "n"), outcome("Yes", "y")]).yes_no_token_ids(),
+            pair("y", "n")
+        );
+        // Named outcomes: by convention the second is YES.
+        assert_eq!(
+            market(vec![outcome("Lakers", "l"), outcome("Celtics", "c")]).yes_no_token_ids(),
+            pair("c", "l")
+        );
+        assert_eq!(market(vec![outcome("A", "a")]).yes_no_token_ids(), None);
     }
 
     #[test]

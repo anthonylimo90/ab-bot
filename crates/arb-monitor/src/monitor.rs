@@ -503,18 +503,9 @@ impl ArbMonitor {
                 },
             );
             fee_schedules.insert(market.id.clone(), market.effective_fee_schedule());
-            let (yes_id, no_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-                (
-                    market.outcomes[0].token_id.clone(),
-                    market.outcomes[1].token_id.clone(),
-                )
-            } else {
-                (
-                    market.outcomes[1].token_id.clone(),
-                    market.outcomes[0].token_id.clone(),
-                )
-            };
-            outcomes.insert(market.id.clone(), (yes_id, no_id));
+            if let Some(tokens) = market.yes_no_token_ids() {
+                outcomes.insert(market.id.clone(), tokens);
+            }
         }
         self.market_profiles = profiles;
         self.market_fee_schedules = fee_schedules;

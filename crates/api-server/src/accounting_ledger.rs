@@ -573,11 +573,12 @@ async fn load_observed_conditional_balances(
     state: &AppState,
     markets: &HashMap<String, MarketHoldings>,
 ) -> anyhow::Result<HashMap<String, ObservedConditionalBalances>> {
-    let mut market_tokens = HashMap::new();
     let mut balances = HashMap::new();
 
     for (market_id, holdings) in markets {
-        let tokens = match resolve_market_tokens(state, &mut market_tokens, market_id).await {
+        // The shared token cache, so balances are read for the same YES/NO
+        // tokens positions are traded and valued with.
+        let tokens = match state.market_catalog.hydrate_market(market_id).await {
             Ok(Some(tokens)) => tokens,
             Ok(None) => continue,
             Err(error) => {
@@ -619,50 +620,6 @@ async fn load_observed_conditional_balances(
     }
 
     Ok(balances)
-}
-
-async fn resolve_market_tokens(
-    state: &AppState,
-    cache: &mut HashMap<String, (String, String)>,
-    market_id: &str,
-) -> anyhow::Result<Option<(String, String)>> {
-    if let Some(tokens) = cache.get(market_id) {
-        return Ok(Some(tokens.clone()));
-    }
-
-    let market = match state.clob_client.get_market_by_id(market_id).await {
-        Ok(market) => market,
-        Err(error) => {
-            warn!(
-                market_id = %market_id,
-                error = %error,
-                "Failed to load market details for token resolution"
-            );
-            return Ok(None);
-        }
-    };
-
-    if market.outcomes.len() != 2 {
-        return Ok(None);
-    }
-
-    let (yes_token_id, no_token_id) = if market.outcomes[0].name.to_lowercase().contains("yes") {
-        (
-            market.outcomes[0].token_id.clone(),
-            market.outcomes[1].token_id.clone(),
-        )
-    } else {
-        (
-            market.outcomes[1].token_id.clone(),
-            market.outcomes[0].token_id.clone(),
-        )
-    };
-    cache.insert(
-        market_id.to_string(),
-        (yes_token_id.clone(), no_token_id.clone()),
-    );
-
-    Ok(Some((yes_token_id, no_token_id)))
 }
 
 async fn load_conditional_balance(

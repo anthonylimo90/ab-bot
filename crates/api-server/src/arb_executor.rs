@@ -167,7 +167,7 @@ impl ArbExecutorConfig {
     }
 }
 
-pub use crate::market_catalog::OutcomeTokenCache;
+use crate::market_catalog::OutcomeTokenCache;
 
 #[derive(Debug, Clone, Default)]
 pub struct ArbExecutorRuntimeStatus {
@@ -1478,10 +1478,6 @@ impl ArbAutoExecutor {
 
 /// Spawn the arb auto-executor as a background task.
 #[allow(clippy::too_many_arguments)]
-/// Spawn the arb auto-executor and return the shared `OutcomeTokenCache`.
-///
-/// The returned cache is shared with the exit handler to avoid duplicating
-/// the entire Polymarket market universe in memory (~57MB saved).
 pub fn spawn_arb_auto_executor(
     config: Arc<RwLock<ArbExecutorConfig>>,
     arb_entry_rx: broadcast::Receiver<ArbOpportunity>,
@@ -1494,7 +1490,7 @@ pub fn spawn_arb_auto_executor(
     active_markets: Arc<RwLock<HashSet<String>>>,
     heartbeat: Arc<AtomicI64>,
     runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
-) -> Arc<OutcomeTokenCache> {
+) {
     let executor = ArbAutoExecutor::new(
         config,
         arb_entry_rx,
@@ -1504,7 +1500,7 @@ pub fn spawn_arb_auto_executor(
         circuit_breaker,
         pool,
         active_markets,
-        token_cache.clone(),
+        token_cache,
         heartbeat,
         runtime_status,
     );
@@ -1516,7 +1512,6 @@ pub fn spawn_arb_auto_executor(
     });
 
     info!("Arb auto-executor spawned as background task");
-    token_cache
 }
 
 trait ArbTradeEventExt {

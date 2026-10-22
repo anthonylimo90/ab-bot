@@ -109,7 +109,7 @@ impl ExitHandlerConfig {
 }
 
 // Token cache is shared with arb_executor (saves ~57MB of duplicated market data).
-use crate::arb_executor::OutcomeTokenCache;
+use crate::market_catalog::OutcomeTokenCache;
 
 /// Exit handler service — closes positions via sell orders or resolution detection.
 pub struct ExitHandler {

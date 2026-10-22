@@ -398,9 +398,8 @@ impl ApiServer {
         let arb_dedup = state.arb_dedup.clone();
 
         // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
-        // Returns the shared OutcomeTokenCache so exit_handler can reuse it
-        // instead of duplicating the entire Polymarket market universe (~57MB saved).
-        let shared_token_cache = spawn_arb_auto_executor(
+        // It and the exit handler share the one market catalog.
+        spawn_arb_auto_executor(
             arb_config_arc.clone(),
             state.subscribe_arb_entry(),
             state.signal_tx.clone(),
@@ -428,7 +427,7 @@ impl ApiServer {
             state.pool.clone(),
             arb_dedup.clone(),
             state.exit_handler_heartbeat.clone(),
-            shared_token_cache,
+            state.market_catalog.clone(),
         );
 
         // Subscribe local runtime to dynamic updates (arb executor config knobs)

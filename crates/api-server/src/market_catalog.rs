@@ -44,24 +44,7 @@ pub(crate) fn infer_category(question: &str) -> String {
     }
 }
 
-/// The indices of the outcomes treated as YES and NO in a binary market.
-///
-/// Every position, order and price in the system uses this one mapping:
-/// the first outcome is YES when its name says so, otherwise the second is.
-/// For named outcomes ("Lakers"/"Celtics") the choice is a convention, but it
-/// must never differ between the tokens a position holds and the prices
-/// used to value it.
-pub(crate) fn yes_no_indices(
-    outcomes: &[polymarket_core::types::Outcome],
-) -> Option<(usize, usize)> {
-    (outcomes.len() == 2).then(|| {
-        if outcomes[0].name.to_lowercase().contains("yes") {
-            (0, 1)
-        } else {
-            (1, 0)
-        }
-    })
-}
+pub(crate) use polymarket_core::types::yes_no_indices;
 
 /// YES and NO prices of a binary market under [`yes_no_indices`]; `None`
 /// for a price the source did not report (never a made-up 0.50).

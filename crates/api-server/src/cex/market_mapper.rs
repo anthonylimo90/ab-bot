@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use polymarket_core::api::gamma::GammaClient;
+use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time;
@@ -126,14 +127,14 @@ impl MarketMapper {
                 continue;
             };
 
-            // Get YES price from outcomes
-            let yes_price = market
-                .outcomes
-                .iter()
-                .find(|o| o.name.to_lowercase() == "yes")
-                .and_then(|o| o.price)
-                .and_then(|p| p.to_string().parse::<f64>().ok())
-                .unwrap_or(0.5);
+            // The YES price under the shared YES/NO mapping. A market without
+            // one is skipped: a made-up 0.50 would read as a real price.
+            let Some(yes_price) = polymarket_core::types::yes_no_indices(&market.outcomes)
+                .and_then(|(yes, _)| market.outcomes[yes].price)
+                .and_then(|price| price.to_f64())
+            else {
+                continue;
+            };
 
             mapped.insert(
                 market.id.clone(),

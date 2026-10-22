@@ -18,9 +18,9 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use trading_engine::OrderExecutor;
 
-use crate::arb_executor::OutcomeTokenCache;
 use crate::learning::{QuantShadowPredictionInput, ShadowPredictionRecorder};
 use crate::learning_rollouts::LearningRolloutController;
+use crate::market_catalog::OutcomeTokenCache;
 use crate::position_service::{CreatePositionParams, EventContext, Leg, PositionService};
 use crate::trade_events::{NewTradeEvent, TradeEventRecorder};
 use crate::websocket::{SignalType, SignalUpdate};
