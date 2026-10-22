@@ -18,6 +18,8 @@ jobs:
     name: Detect Changes
     runs-on: ubuntu-latest
     permissions:
+      # A job-level block replaces the defaults: checkout needs contents.
+      contents: read
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}

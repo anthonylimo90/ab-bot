@@ -285,6 +285,10 @@ impl ApiServer {
 
     /// Run the server.
     pub async fn run(mut self) -> anyhow::Result<()> {
+        // Listen for stop signals before anything trades: one arriving while
+        // the executors start must still lead to a drain.
+        let mut stop = polymarket_core::shutdown::StopSignals::install()?;
+
         // ── Pre-create arb executor config Arc (must happen before Arc-wrapping state) ──
         let mut arb_config_pre = ArbExecutorConfig::from_env();
         if !arb_config_pre.enabled {
@@ -608,64 +612,65 @@ impl ApiServer {
         let server = std::future::IntoFuture::into_future(server);
         tokio::pin!(server);
 
-        tokio::select! {
-            result = &mut server => result?,
-            () = shutdown_signal() => {
-                // No new trading operation starts from here; started ones
-                // (an arb between its legs, an exit, a manual order) finish.
-                info!("Shutdown requested: draining requests and trading operations");
-                state.order_executor.begin_draining();
-                stop_accepting.notify_one();
-                if tokio::time::timeout(HTTP_DRAIN, &mut server).await.is_err() {
+        let mut server_error = None;
+        let signalled = tokio::select! {
+            result = &mut server => {
+                if let Err(error) = result {
+                    tracing::error!(%error, "API server failed; draining trading operations");
+                    server_error = Some(error);
+                }
+                false
+            }
+            () = stop.recv() => true,
+        };
+
+        // No new trading operation starts from here; started ones (an arb
+        // between its legs, an exit, a manual order) finish while open
+        // requests do.
+        info!("Shutting down: draining requests and trading operations");
+        state.order_executor.begin_draining();
+        stop_accepting.notify_one();
+        let drained = async {
+            let requests = async {
+                if signalled && tokio::time::timeout(HTTP_DRAIN, &mut server).await.is_err() {
                     tracing::warn!("Requests still open after the drain period; closing them");
                 }
+            };
+            let ((), finished) =
+                tokio::join!(requests, state.order_executor.drain(OPERATION_DRAIN));
+            finished
+        };
+        tokio::select! {
+            finished = drained => {
+                if finished {
+                    info!("Trading operations finished; shutting down");
+                } else {
+                    tracing::warn!(
+                        "Trading operations still running at shutdown; their journaled orders \
+                         are reconciled on the next start"
+                    );
+                }
+            }
+            () = stop.recv() => {
+                tracing::warn!(
+                    "Stop requested again; exiting without waiting. Journaled orders are \
+                     reconciled on the next start"
+                );
             }
         }
-
-        if state.order_executor.drain(OPERATION_DRAIN).await {
-            info!("Trading operations finished; shutting down");
-        } else {
-            tracing::warn!(
-                "Trading operations still running at shutdown; their journaled orders are \
-                 reconciled on the next start"
-            );
+        match server_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
         }
-        Ok(())
     }
 }
 
 /// How long open HTTP requests may finish after a shutdown request.
 const HTTP_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
-/// How long started trading operations may finish after that.
-const OPERATION_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Resolve on SIGTERM (container stop, deploy) or Ctrl-C.
-async fn shutdown_signal() {
-    let interrupt = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "Failed to listen for Ctrl-C");
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(error) => {
-                tracing::error!(%error, "Failed to listen for SIGTERM");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
-}
+/// How long started trading operations may finish, alongside open requests:
+/// enough for an order's whole preparation deadline (30s by default) and its
+/// send, so an arb between its legs gets its second leg out.
+const OPERATION_DRAIN: std::time::Duration = std::time::Duration::from_secs(40);
 
 #[cfg(test)]
 mod cors_tests {

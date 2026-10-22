@@ -596,26 +596,34 @@ pub async fn submit_order(
         .map_err(|_| {
             ApiError::ServiceUnavailable("Wallet-specific exchange authentication failed".into())
         })?;
-    let Some(_operation) = state.order_executor.begin_operation() else {
+    let Some(operation) = state.order_executor.begin_operation() else {
         return Err(ApiError::ServiceUnavailable(
-            "The server is shutting down; nothing was sent".into(),
+            crate::handlers::trading::SHUTTING_DOWN.into(),
         ));
     };
-    let response = state
-        .order_executor
-        .submit_wallet_order(
-            &state.clob_client,
-            pending_order_id,
-            signed_order,
-            &credentials,
-        )
-        .await
-        .map_err(|_| {
-            ApiError::ServiceUnavailable(
-                "Order submission requires reconciliation; keep this pending order ID for retries"
-                    .into(),
+    // Runs to the end even if the client goes away, so the exchange's answer
+    // is recorded rather than dropped mid-request.
+    let submit_state = state.clone();
+    let response = tokio::spawn(async move {
+        let _operation = operation;
+        submit_state
+            .order_executor
+            .submit_wallet_order(
+                &submit_state.clob_client,
+                pending_order_id,
+                signed_order,
+                &credentials,
             )
-        })?;
+            .await
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Order task failed: {e}")))?
+    .map_err(|_| {
+        ApiError::ServiceUnavailable(
+            "Order submission requires reconciliation; keep this pending order ID for retries"
+                .into(),
+        )
+    })?;
     Ok(Json(wallet_submission_response(response)))
 }
 

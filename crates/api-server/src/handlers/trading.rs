@@ -286,11 +286,29 @@ pub async fn place_order(
     }
     validate_order_request(&request)?;
     // Held until the order's outcome is recorded; refused once shutdown began.
-    let Some(_operation) = state.order_executor.begin_operation() else {
-        return Err(ApiError::ServiceUnavailable(
-            "The server is shutting down; nothing was sent".into(),
-        ));
+    let Some(operation) = state.order_executor.begin_operation() else {
+        return Err(ApiError::ServiceUnavailable(SHUTTING_DOWN.into()));
     };
+    // Runs to the end even if the client goes away: an order handed to the
+    // exchange must have its outcome recorded, not be dropped mid-request.
+    tokio::spawn(async move {
+        let _operation = operation;
+        reserve_and_execute_order(state, request).await
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Order task failed: {e}")))?
+}
+
+/// What a request refused at shutdown is told. It sent nothing, but an
+/// earlier request with the same client order ID may have: retrying with that
+/// ID finds the earlier order instead of placing another.
+pub(crate) const SHUTTING_DOWN: &str = "The server is shutting down and this request sent \
+     nothing; retry it with the same client order ID once the server is back";
+
+async fn reserve_and_execute_order(
+    state: Arc<AppState>,
+    request: PlaceOrderRequest,
+) -> ApiResult<Json<OrderResponse>> {
     let wallet = state.order_executor.wallet_address().await;
     let max_exposure = if let Some(cfg) = &state.arb_executor_config {
         cfg.read().await.max_total_exposure
@@ -954,9 +972,13 @@ fn manual_execution_error(error: anyhow::Error) -> ApiError {
              do not resubmit it, check its status instead"
                 .into(),
         )
-    } else if text.contains("live_submission_fence_busy") || text.contains("nothing was sent") {
+    } else if text.contains("live_submission_fence_busy") {
         ApiError::ServiceUnavailable(
             "Another live order is still being submitted; nothing was sent, retry shortly".into(),
+        )
+    } else if text.contains("nothing was sent") {
+        ApiError::ServiceUnavailable(
+            "The order could not be prepared in time; nothing was sent, retry shortly".into(),
         )
     } else if text.starts_with("Insufficient ") {
         // Our own balance/allowance preflight: amounts of the caller's wallet.
@@ -993,6 +1015,9 @@ mod tests {
 
         let busy = map("live_submission_fence_busy: another live order is still being posted; nothing was sent");
         assert!(busy.to_string().contains("nothing was sent"));
+        let late = map("Live order preparation exceeded its deadline; nothing was sent");
+        assert!(late.to_string().contains("nothing was sent"));
+        assert!(!late.to_string().contains("Another live order"));
 
         let funds = map("Insufficient USDC balance for live order: available 3, required 5");
         assert_eq!(

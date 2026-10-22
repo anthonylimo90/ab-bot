@@ -80,13 +80,16 @@ impl QuantSignalExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
-            // Generators read hourly bars that materialize up to two hours
-            // late; the drift check below bounds how far the price has moved.
+            // Generators read hourly bars. A bar is materialized up to two
+            // hours after it starts (an hourly refresh lagging an hour) and
+            // stays the newest for another hour, so the newest bar is up to
+            // four hours old; the drift check below bounds how far the price
+            // has moved since.
             max_reference_age_secs: std::env::var("QUANT_MAX_REFERENCE_AGE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|secs| *secs > 0)
-                .unwrap_or(3 * 3600),
+                .unwrap_or(5 * 3600),
             max_reference_drift: std::env::var("QUANT_MAX_REFERENCE_DRIFT")
                 .ok()
                 .and_then(|s| s.parse::<Decimal>().ok())
@@ -558,8 +561,9 @@ impl QuantSignalExecutor {
 
         // Persist the signal before anything refers to it: status updates,
         // the position link, exit context and the per-strategy breaker all
-        // read this row. A signal that cannot be recorded is not executed.
-        if let Err(error) = sqlx::query(
+        // read this row. A signal that cannot be recorded is not executed,
+        // and one already recorded was handled when it first arrived.
+        match sqlx::query(
             r#"
             INSERT INTO quant_signals (id, kind, condition_id, direction, confidence, size_usd, metadata, generated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -577,21 +581,30 @@ impl QuantSignalExecutor {
         .execute(&self.pool)
         .await
         {
-            warn!(
-                error = %error,
-                signal_id = %signal.id,
-                kind = signal.kind.as_str(),
-                condition_id = %signal.condition_id,
-                "Failed to persist quant signal; not executing it"
-            );
-            self.record_signal_outcome_event(
-                &signal,
-                &execution_mode,
-                "signal_skipped",
-                Some("signal_persist_failed"),
-            )
-            .await;
-            return Ok(());
+            Ok(inserted) if inserted.rows_affected() == 0 => {
+                // A redelivery: recording an outcome would overwrite the
+                // first delivery's.
+                debug!(signal_id = %signal.id, "Ignoring a quant signal already recorded");
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    signal_id = %signal.id,
+                    kind = signal.kind.as_str(),
+                    condition_id = %signal.condition_id,
+                    "Failed to persist quant signal; not executing it"
+                );
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some("signal_persist_failed"),
+                )
+                .await;
+                return Ok(());
+            }
         }
 
         self.trade_event_recorder
@@ -1867,6 +1880,77 @@ mod tests {
         assert_eq!(flow.daily_pnl, Decimal::from(-250));
         // -$250 is past the default $200 per-strategy daily loss limit.
         assert!(flow.halted);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_redelivered_signal_is_not_handled_again(pool: PgPool) {
+        crate::exit_handler::correctness_tests::setup(&pool).await;
+        sqlx::Executor::execute(
+            &pool,
+            "DROP TABLE quant_signals;
+             CREATE TABLE quant_signals (
+                id UUID, kind TEXT, condition_id TEXT, direction TEXT, confidence DOUBLE PRECISION,
+                size_usd NUMERIC, metadata JSONB, generated_at TIMESTAMPTZ, status TEXT,
+                PRIMARY KEY (id, generated_at)
+             )",
+        )
+        .await
+        .unwrap();
+        let signal = QuantSignal::new(
+            QuantSignalKind::Flow,
+            "0xcond".to_string(),
+            SignalDirection::BuyYes,
+            0.82,
+            Decimal::new(30, 0),
+            Utc::now() + chrono::Duration::minutes(15),
+        );
+        sqlx::query(
+            "INSERT INTO quant_signals (id, kind, generated_at, status) VALUES ($1, 'flow', $2, 'executed')",
+        )
+        .bind(signal.id)
+        .bind(signal.generated_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = crate::state::AppState::for_tests(pool.clone());
+        let mut executor = QuantSignalExecutor::new(
+            Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env())),
+            broadcast::channel(1).1,
+            broadcast::channel(1).0,
+            broadcast::channel(1).0,
+            state.order_executor.clone(),
+            state.circuit_breaker.clone(),
+            state.market_catalog.clone(),
+            pool.clone(),
+            Arc::new(AtomicI64::new(0)),
+        );
+        let events = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trade_events")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        executor.process_signal(signal.clone()).await.unwrap();
+        assert_eq!(events().await, 0);
+        let status: String = sqlx::query_scalar("SELECT status FROM quant_signals")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "executed");
+
+        // A new signal is handled (and leaves a trail).
+        let fresh = QuantSignal::new(
+            QuantSignalKind::Flow,
+            "0xcond".to_string(),
+            SignalDirection::BuyYes,
+            0.82,
+            Decimal::new(30, 0),
+            Utc::now() + chrono::Duration::minutes(15),
+        );
+        executor.process_signal(fresh).await.unwrap();
+        assert!(events().await > 0);
     }
 
     #[test]

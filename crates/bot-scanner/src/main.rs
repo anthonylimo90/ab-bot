@@ -44,8 +44,16 @@ async fn main() -> Result<()> {
         let wallet_address = &args[1];
         analyze_wallet(&config, wallet_address).await?;
     } else {
-        // Run continuous indexer
-        run_indexer(&config).await?;
+        // Run the continuous indexer until it fails or the process is asked
+        // to stop. Stopping between its writes at worst leaves a wallet's
+        // features newer than its score until the next pass rescores it, so
+        // no draining is needed; as PID 1 in its container the scanner must
+        // handle SIGTERM itself.
+        let mut stop = polymarket_core::shutdown::StopSignals::install()?;
+        tokio::select! {
+            result = run_indexer(&config) => result?,
+            () = stop.recv() => info!("Shutdown requested; stopping bot scanner"),
+        }
     }
 
     Ok(())

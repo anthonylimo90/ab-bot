@@ -76,18 +76,24 @@ pub(crate) async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
             SELECT
                 p.id,
                 (p.state IN (0,1,2,3) OR p.held_yes_qty > 0 OR p.held_no_qty > 0) AS is_open,
+                -- Rounded to the columns' scale, so an unchanged mark compares
+                -- equal to the stored one.
                 CASE WHEN p.held_yes_qty + p.held_no_qty > 0 AND p.quantity > 0
-                    THEN (p.held_yes_qty * COALESCE(m.yes_price, p.yes_entry_price)
+                    THEN ROUND((p.held_yes_qty * COALESCE(m.yes_price, p.yes_entry_price)
                         + p.held_no_qty * COALESCE(m.no_price, p.no_entry_price))
-                        / p.quantity
+                        / p.quantity, 8)
                     ELSE p.current_price
                 END AS current_price,
-                p.held_yes_qty * (COALESCE(m.yes_price, p.yes_entry_price) - p.yes_entry_price)
-                    + p.held_no_qty * (COALESCE(m.no_price, p.no_entry_price) - p.no_entry_price)
-                    AS unrealized_pnl
+                ROUND(p.held_yes_qty * (COALESCE(m.yes_price, p.yes_entry_price) - p.yes_entry_price)
+                    + p.held_no_qty * (COALESCE(m.no_price, p.no_entry_price) - p.no_entry_price),
+                    8) AS unrealized_pnl
             FROM positions p
             LEFT JOIN markets m ON m.id = p.market_id
-            WHERE p.state <> 4 OR p.held_yes_qty > 0 OR p.held_no_qty > 0
+            WHERE p.state IN (0, 1, 2, 3, 6, 7)
+               OR p.held_yes_qty > 0 OR p.held_no_qty > 0
+               -- A failed entry holding nothing is settled once (closed, no
+               -- open P&L) and then never read again.
+               OR (p.state = 5 AND (p.is_open OR p.unrealized_pnl <> 0))
         ), changed AS (
             UPDATE positions p SET
                 is_open = k.is_open,
@@ -139,11 +145,40 @@ mod tests {
         );
         leg.state = PositionState::ExitFailed;
         leg.held_yes_qty = Decimal::from(4);
-        for position in [&pair, &leg] {
+        // Arb quantities are size / cost: never round numbers.
+        sqlx::query("INSERT INTO markets (id, yes_price, no_price) VALUES ('f', 0.553, 0.441)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let shares: Decimal = "10.20408163".parse().unwrap();
+        let mut fractional = Position::new(
+            "f".into(),
+            Decimal::new(48, 2),
+            Decimal::new(50, 2),
+            shares,
+            ExitStrategy::HoldToResolution,
+        );
+        fractional.state = PositionState::Open;
+        fractional.held_yes_qty = shares;
+        fractional.held_no_qty = shares;
+        let mut failed = Position::new(
+            "m".into(),
+            Decimal::new(48, 2),
+            Decimal::new(50, 2),
+            Decimal::TEN,
+            ExitStrategy::HoldToResolution,
+        );
+        failed.state = PositionState::EntryFailed;
+        for position in [&pair, &leg, &fractional, &failed] {
             service.repo().insert(position).await.unwrap();
         }
+        sqlx::query("UPDATE positions SET is_open = TRUE, unrealized_pnl = 1 WHERE id = $1")
+            .bind(failed.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
-        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 2);
+        assert_eq!(reconcile_cycle(&pool).await.unwrap(), 4);
         let mark = |id| {
             let pool = pool.clone();
             async move {
@@ -165,6 +200,19 @@ mod tests {
         let (quantity, price, pnl) = mark(leg.id).await;
         assert_eq!(quantity * price, Decimal::new(220, 2));
         assert_eq!(pnl, Decimal::new(60, 2));
+
+        // 10.20408163 × (0.073 − 0.059), rounded to the column's 8 places.
+        let (_, _, pnl) = mark(fractional.id).await;
+        assert_eq!(pnl, "0.14285714".parse::<Decimal>().unwrap());
+        // The failed entry is closed with no open P&L.
+        let (open, pnl): (bool, Decimal) =
+            sqlx::query_as("SELECT is_open, unrealized_pnl FROM positions WHERE id = $1")
+                .bind(failed.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!open);
+        assert_eq!(pnl, Decimal::ZERO);
 
         // Nothing moved: nothing is rewritten.
         assert_eq!(reconcile_cycle(&pool).await.unwrap(), 0);

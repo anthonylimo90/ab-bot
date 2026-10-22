@@ -113,13 +113,14 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    APP_URI=https://<your-dashboard-domain>
    TRUSTED_PROXY_HOPS=1
    SKIP_MIGRATIONS=false
-   RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
+   RAILWAY_DEPLOYMENT_DRAINING_SECONDS=50
    ```
 
    On SIGTERM the API server stops accepting requests and new trading
-   operations, then lets open requests (15s) and started operations, such as
-   an arb between its two legs, finish (10s). Railway's default drain is only
-   a few seconds, so give it 30.
+   operations, then lets open requests (up to 15s) and, at the same time,
+   started operations such as an arb between its two legs (up to 40s, an
+   order's whole preparation deadline) finish. A second SIGTERM stops the
+   wait. Railway's default drain is only a few seconds, so give it 50.
 
    `CORS_ALLOWED_ORIGINS` is what restricts cross-origin access; without it all
    origins are allowed whatever `CORS_PERMISSIVE` says. Wallet sign-in stays

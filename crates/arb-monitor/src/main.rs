@@ -36,41 +36,27 @@ async fn main() -> Result<()> {
     info!("Starting Arbitrage Monitor");
     touch_health_file();
 
+    // As PID 1 in its container the monitor must handle SIGTERM itself.
+    let mut stop = polymarket_core::shutdown::StopSignals::install()?;
+
     // Load configuration
     let config = Config::from_env()?;
 
     // Initialize the monitor
-    let mut monitor = monitor::ArbMonitor::new(config).await?;
+    let mut monitor = tokio::select! {
+        monitor = monitor::ArbMonitor::new(config) => monitor?,
+        () = stop.recv() => {
+            info!("Shutdown requested while starting; stopping arbitrage monitor");
+            return Ok(());
+        }
+    };
 
     // Run the monitoring loop until it fails or the process is asked to stop.
-    // The monitor only publishes signals, so stopping needs no draining; as
-    // PID 1 in its container it must still handle SIGTERM itself.
+    // The monitor only publishes signals, so stopping needs no draining.
     tokio::select! {
         result = monitor.run() => result?,
-        () = shutdown_signal() => info!("Shutdown requested; stopping arbitrage monitor"),
+        () = stop.recv() => info!("Shutdown requested; stopping arbitrage monitor"),
     }
 
     Ok(())
-}
-
-/// Resolve on SIGTERM (container stop, deploy) or Ctrl-C.
-async fn shutdown_signal() {
-    let interrupt = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
 }

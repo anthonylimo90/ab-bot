@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod feature_extractor;
+pub mod shutdown;
 pub mod signing;
 pub mod sizing;
 pub mod types;

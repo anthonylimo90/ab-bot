@@ -105,8 +105,9 @@ services:
       DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS: ${DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS:-20}
     ports:
       - "${API_PORT:-3000}:3000"
-    # Room for open requests and started trading operations to finish.
-    stop_grace_period: 30s
+    # Room for open requests (15s) and, alongside them, started trading
+    # operations (40s) to finish.
+    stop_grace_period: 50s
     mem_limit: 2g
     memswap_limit: 2g
     depends_on:
@@ -119,7 +120,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      # Migrations run before the server listens; dependants wait on this.
+      start_period: 120s
     networks:
       - ab-bot-network
     restart: unless-stopped
