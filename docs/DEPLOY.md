@@ -658,8 +658,13 @@ unsigned). Fees are set by the exchange when an order matches.
   why, while an order of the wallet on the market may still settle, and for
   up to an hour while the balance cannot be read. A balance far below the
   record (shares redeemed or moved), or still unreadable after that hour,
-  leaves the record standing: the position closes at it, with a warning and
-  a `resolution_unmeasured` trade event.
+  leaves the record standing: the position closes at it, with a warning,
+  and its `closed_via_resolution` event lists the legs not measured and why
+  (metadata `unmeasured`). The hour counts only an unbroken run of
+  unreadable balances. A position whose market resolved with no single
+  winner flagged and whose legs differ (a split payout, or flags not yet
+  set) is never booked at a guessed payout: it waits for the winner, with a
+  warning at each look, for an operator to settle if none comes.
 - Preparing a browser-wallet order reads the market's tick size and refuses
   a price outside one tick of either end or with more decimals than the
   tick has (as Polymarket's own clients round), before the wallet signs.

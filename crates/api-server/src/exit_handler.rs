@@ -128,8 +128,9 @@ pub struct ExitHandler {
     position_service: crate::position_service::PositionService,
     /// Heartbeat timestamp (epoch secs) — updated every tick to prove liveness.
     heartbeat: Arc<AtomicI64>,
-    /// Since when each resolved position's token balance could not be read.
-    balance_unreadable_since: std::sync::Mutex<HashMap<uuid::Uuid, std::time::Instant>>,
+    /// Since when a resolved position's token balance of a leg (true for
+    /// YES) has been unreadable, without a read succeeding since.
+    balance_unreadable_since: std::sync::Mutex<HashMap<(uuid::Uuid, bool), std::time::Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -994,13 +995,21 @@ impl ExitHandler {
 
     /// How long the token balance of a resolved position has been
     /// unreadable, counting from the first look that found it so.
-    fn unreadable_for(&self, position_id: uuid::Uuid) -> std::time::Duration {
+    fn unreadable_for(&self, position_id: uuid::Uuid, leg: Leg) -> std::time::Duration {
         self.balance_unreadable_since
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(position_id)
+            .entry((position_id, leg == Leg::Yes))
             .or_insert_with(std::time::Instant::now)
             .elapsed()
+    }
+
+    /// A read of the leg's balance answered: its grace starts afresh.
+    fn balance_read(&self, position_id: uuid::Uuid, leg: Leg) {
+        self.balance_unreadable_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&(position_id, leg == Leg::Yes));
     }
 
     async fn finalize_resolution_close(
@@ -1039,13 +1048,18 @@ impl ExitHandler {
                     None => vec![(Leg::Yes, yes_token_id), (Leg::No, no_token_id)],
                 };
                 for (leg, token_id) in legs {
-                    match self.measure_leg(position, leg, token_id, &ctx).await? {
+                    let measured = self.measure_leg(position, leg, token_id, &ctx).await?;
+                    if !matches!(measured, Measured::Waiting(BALANCE_UNREADABLE)) {
+                        self.balance_read(position.id, leg);
+                    }
+                    match measured {
                         Measured::Matches => {}
                         Measured::Unmeasured(why) => unmeasured.push((leg, why)),
                         // A balance that stays unreadable leaves the record
                         // standing once the grace has passed.
                         Measured::Waiting(BALANCE_UNREADABLE)
-                            if self.unreadable_for(position.id) >= UNREADABLE_BALANCE_GRACE =>
+                            if self.unreadable_for(position.id, leg)
+                                >= UNREADABLE_BALANCE_GRACE =>
                         {
                             unmeasured.push((leg, BALANCE_UNREADABLE))
                         }
@@ -1082,9 +1096,26 @@ impl ExitHandler {
             return Ok(false);
         };
 
+        // Where the wallet could not confirm the record, the close says so.
+        for (leg, why) in &unmeasured {
+            warn!(
+                position_id = %position.id,
+                leg = %leg,
+                reason = why,
+                "Resolved position closes at its recorded holding, not measured against the wallet"
+            );
+        }
+        let note = (!unmeasured.is_empty()).then(|| {
+            serde_json::json!({
+                "unmeasured": unmeasured
+                    .iter()
+                    .map(|(leg, why)| serde_json::json!({"leg": leg.to_string(), "reason": why}))
+                    .collect::<Vec<_>>(),
+            })
+        });
         if let Err(e) = self
             .position_service
-            .close_position(position, method, &ctx)
+            .close_position_noting(position, method, &ctx, note)
             .await
         {
             warn!(
@@ -1095,21 +1126,8 @@ impl ExitHandler {
             );
             return Ok(false);
         }
-        self.balance_unreadable_since
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&position.id);
-        // The record stood where the wallet could not confirm it: say so.
-        for (leg, why) in unmeasured {
-            warn!(
-                position_id = %position.id,
-                leg = %leg,
-                reason = why,
-                "Resolved position closed at its recorded holding, not measured against the wallet"
-            );
-            self.position_service
-                .record_resolution_unmeasured(position, leg, why, &ctx)
-                .await;
+        for leg in [Leg::Yes, Leg::No] {
+            self.balance_read(position.id, leg);
         }
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
@@ -2182,6 +2200,52 @@ mod tests {
         };
 
         assert_eq!(resolved_yes_winner(&market), Some(true));
+    }
+
+    #[test]
+    fn a_named_outcome_market_is_resolved_by_its_tokens() {
+        let outcome =
+            |token: &str, name: &str, winner: Option<bool>| polymarket_core::types::Outcome {
+                id: token.to_string(),
+                name: name.to_string(),
+                token_id: token.to_string(),
+                price: None,
+                winner,
+            };
+        let market = |up: Option<bool>, down: Option<bool>| Market {
+            id: "m1".to_string(),
+            question: "Up or down?".to_string(),
+            description: None,
+            outcomes: vec![outcome("up", "Up", up), outcome("down", "Down", down)],
+            volume: Decimal::ZERO,
+            liquidity: Decimal::ZERO,
+            end_date: None,
+            resolved: true,
+            resolution: None,
+            category: None,
+            tags: Vec::new(),
+            fees_enabled: false,
+            fee_type: None,
+            fee_schedule: None,
+        };
+        let tokens = ("up".to_string(), "down".to_string());
+        assert_eq!(
+            resolved_yes_winner_for_tokens(&market(Some(false), Some(true)), Some(&tokens)),
+            Some(false)
+        );
+        assert_eq!(
+            resolved_yes_winner_for_tokens(&market(Some(true), Some(false)), Some(&tokens)),
+            Some(true)
+        );
+        // Both flagged alike, or the names not Yes/No: no winner is guessed.
+        assert_eq!(
+            resolved_yes_winner_for_tokens(&market(Some(false), Some(false)), Some(&tokens)),
+            None
+        );
+        assert_eq!(
+            resolved_yes_winner_for_tokens(&market(Some(true), Some(false)), None),
+            None
+        );
     }
 
     #[test]

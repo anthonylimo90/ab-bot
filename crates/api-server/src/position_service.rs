@@ -576,38 +576,24 @@ impl PositionService {
 
     // ── Position close ─────────────────────────────────────────────
 
-    /// Records that a resolved position was closed at its recorded holding of
-    /// `leg` because the wallet could not confirm it, and why.
-    pub async fn record_resolution_unmeasured(
-        &self,
-        position: &Position,
-        leg: Leg,
-        reason: &str,
-        ctx: &EventContext,
-    ) {
-        self.events
-            .record_warn(
-                NewTradeEvent::new(
-                    &ctx.strategy,
-                    &ctx.execution_mode,
-                    &ctx.source_label,
-                    &position.market_id,
-                    "resolution_unmeasured",
-                )
-                .with_position(position.id)
-                .with_state(Some("closed"), Some("closed"))
-                .with_reason(Some(reason))
-                .with_metadata(serde_json::json!({ "leg": leg.to_string() })),
-            )
-            .await;
-    }
-
     /// Final close: computes PnL, sets state=Closed, records event.
     pub async fn close_position(
         &self,
         position: &mut Position,
         method: CloseMethod,
         ctx: &EventContext,
+    ) -> anyhow::Result<()> {
+        self.close_position_noting(position, method, ctx, None)
+            .await
+    }
+
+    /// [`Self::close_position`], with `note` as the close event's metadata.
+    pub async fn close_position_noting(
+        &self,
+        position: &mut Position,
+        method: CloseMethod,
+        ctx: &EventContext,
+        note: Option<serde_json::Value>,
     ) -> anyhow::Result<()> {
         if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
             return Err(anyhow!(
@@ -716,6 +702,9 @@ impl PositionService {
 
         if let Some(pnl) = position.realized_pnl {
             event = event.with_realized_pnl(pnl);
+        }
+        if let Some(note) = note {
+            event = event.with_metadata(note);
         }
 
         self.events.record_warn(event).await;

@@ -1187,28 +1187,61 @@ async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_it
         .finalize_resolution_close(&mut p, 0, None, Some(true))
         .await
         .unwrap());
-    h.balance_unreadable_since.lock().unwrap().insert(
-        p.id,
-        std::time::Instant::now() - super::UNREADABLE_BALANCE_GRACE,
-    );
+    assert_eq!(service.load(p.id).await.unwrap().state, PositionState::Open);
+    // A look that does not end at an unreadable balance (here, an order of
+    // the wallet still settling) starts the grace afresh: the hour is one
+    // unbroken stretch of unreadable balances.
+    let since = std::time::Instant::now() - super::UNREADABLE_BALANCE_GRACE;
+    h.balance_unreadable_since
+        .lock()
+        .unwrap()
+        .insert((p.id, true), since);
+    sqlx::query("INSERT INTO execution_intents (id, market_id, signed_order, status) VALUES (gen_random_uuid(), 'market', jsonb_build_object('tokenId', 'yes', 'side', 'SELL', 'maker', $1::text), 'unknown')")
+        .bind(&wallet)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    assert!(!h
+        .balance_unreadable_since
+        .lock()
+        .unwrap()
+        .contains_key(&(p.id, true)));
+    sqlx::query("UPDATE execution_intents SET status = 'reconciled'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Unreadable again, it waits from the start.
+    assert!(!h
+        .finalize_resolution_close(&mut p, 0, None, Some(true))
+        .await
+        .unwrap());
+    // Past the grace, the record stands: the position closes, and its close
+    // event says the holding was not measured (no second closing event).
+    h.balance_unreadable_since
+        .lock()
+        .unwrap()
+        .insert((p.id, true), since);
     assert!(h
         .finalize_resolution_close(&mut p, 0, None, Some(true))
         .await
         .unwrap());
     assert_eq!(p.realized_pnl, Some(Decimal::from(10)));
-    let unmeasured: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT reason, state_to FROM trade_events WHERE position_id = $1 AND event_type = 'resolution_unmeasured'",
+    let closes: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT event_type, metadata FROM trade_events WHERE position_id = $1 AND state_to = 'closed'",
     )
     .bind(p.id)
     .fetch_all(&pool)
     .await
     .unwrap();
+    assert_eq!(closes.len(), 1);
+    assert_eq!(closes[0].0, "closed_via_resolution");
     assert_eq!(
-        unmeasured,
-        [(
-            Some(super::BALANCE_UNREADABLE.to_string()),
-            Some("closed".to_string())
-        )]
+        closes[0].1["unmeasured"][0]["reason"],
+        super::BALANCE_UNREADABLE
     );
 
     // One-legged without a winner: nothing to pay is known; it waits.
@@ -1221,6 +1254,70 @@ async fn a_pair_without_a_winner_waits_for_it_and_an_unreadable_balance_waits_it
         .await
         .unwrap());
     server.abort();
+}
+
+#[sqlx::test(migrations = false)]
+async fn shares_written_off_together_are_all_written_or_none(pool: PgPool) {
+    let service = setup(&pool).await;
+    let ctx = context();
+    let mut a = position();
+    a.held_yes_qty = Decimal::from(100);
+    let mut b = position();
+    b.id = uuid::Uuid::new_v4();
+    b.held_yes_qty = Decimal::from(100);
+    service.repo().insert(&a).await.unwrap();
+    service.repo().insert(&b).await.unwrap();
+    // B changed since it was read: its copy is stale.
+    let stale_b = service.load(b.id).await.unwrap();
+    let mut fresh_b = service.load(b.id).await.unwrap();
+    service.repo().update(&mut fresh_b).await.unwrap();
+    let a_read = service.load(a.id).await.unwrap();
+    assert!(service
+        .write_off_missing_shares_together(
+            Leg::Yes,
+            vec![
+                (a_read, Decimal::new(35, 1), ctx.clone()),
+                (stale_b, Decimal::new(35, 1), ctx.clone()),
+            ],
+        )
+        .await
+        .is_err());
+    for id in [a.id, b.id] {
+        assert_eq!(
+            service.load(id).await.unwrap().held_yes_qty,
+            Decimal::from(100)
+        );
+    }
+    let told: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM trade_events WHERE event_type = 'entry_fee_shares_written_off'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(told, 0);
+    // Read afresh, both are written off, and the versions are the ones stored.
+    let written = service
+        .write_off_missing_shares_together(
+            Leg::Yes,
+            vec![
+                (
+                    service.load(a.id).await.unwrap(),
+                    Decimal::new(35, 1),
+                    ctx.clone(),
+                ),
+                (
+                    service.load(b.id).await.unwrap(),
+                    Decimal::new(35, 1),
+                    ctx.clone(),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    for mut position in written {
+        assert_eq!(position.held_yes_qty, Decimal::new(965, 1));
+        service.repo().update(&mut position).await.unwrap();
+    }
 }
 
 #[sqlx::test(migrations = false)]
