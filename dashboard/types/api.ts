@@ -478,8 +478,7 @@ export type TradeFlowStrategy =
   | "flow"
   | "mean_reversion"
   | "cross_market"
-  | "resolution_proximity"
-  | "latency_arb";
+  | "resolution_proximity";
 
 export interface TradeFlowStrategySummary {
   strategy: string;
@@ -1306,7 +1305,7 @@ export interface RiskStatus {
 }
 
 // Quant Signal types
-export type QuantSignalKind = "flow" | "cross_market" | "mean_reversion" | "resolution_proximity" | "latency_arb";
+export type QuantSignalKind = "flow" | "cross_market" | "mean_reversion" | "resolution_proximity";
 export type SignalDirection = "BuyYes" | "BuyNo";
 /** A signal past its expiry is "skipped" with skip_reason "expired". */
 export type SignalExecutionStatus = "pending" | "executed" | "skipped" | "failed";

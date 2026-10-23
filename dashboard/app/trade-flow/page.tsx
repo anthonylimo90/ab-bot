@@ -20,8 +20,7 @@ type StrategyFilter =
   | "flow"
   | "mean_reversion"
   | "cross_market"
-  | "resolution_proximity"
-  | "latency_arb";
+  | "resolution_proximity";
 
 const STRATEGY_LABELS: Record<StrategyFilter, string> = {
   all: "All",
@@ -30,7 +29,6 @@ const STRATEGY_LABELS: Record<StrategyFilter, string> = {
   mean_reversion: "Mean Rev",
   cross_market: "Cross Mkt",
   resolution_proximity: "Resolution",
-  latency_arb: "CEX Latency",
 };
 
 function StageBadge({ stage }: { stage: string }) {

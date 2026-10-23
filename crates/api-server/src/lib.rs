@@ -23,7 +23,6 @@ pub mod accounting_ledger;
 pub mod arb_executor;
 mod background;
 pub mod backtest_automation;
-pub mod cex;
 pub mod collateral;
 pub mod crypto;
 pub mod dynamic_tuner;
@@ -68,9 +67,6 @@ pub mod workspace_scope;
 pub use accounting_ledger::{spawn_account_snapshot_calculator, AccountSnapshotConfig};
 pub use arb_executor::{spawn_arb_auto_executor, ArbExecutorConfig};
 pub use backtest_automation::{spawn_backtest_automation, BacktestAutomationConfig};
-pub use cex::{
-    spawn_binance_ws_client, spawn_latency_arb_executor, BinanceWsConfig, LatencyArbExecutorConfig,
-};
 pub use dynamic_tuner::{spawn_dynamic_config_subscriber, DynamicTuner};
 pub use error::ApiError;
 use exit_handler::spawn_exit_handler;
@@ -762,30 +758,6 @@ fn spawn_trading_tasks(
     // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
     let account_snapshot_config = AccountSnapshotConfig::from_env();
     spawn_account_snapshot_calculator(account_snapshot_config, state.clone());
-
-    // Spawn CEX latency arbitrage system (Binance WS → price tracker → executor)
-    let latency_arb_config = LatencyArbExecutorConfig::from_env();
-    if latency_arb_config.enabled {
-        let binance_config = BinanceWsConfig::from_env();
-        let tracker_config = cex::PriceTrackerConfig::from_env();
-        let gamma_client = Arc::new(polymarket_core::api::GammaClient::new(None));
-        let market_mapper = Arc::new(cex::MarketMapper::new(gamma_client, 300));
-        market_mapper.clone().spawn_refresh_loop();
-
-        let (price_tx, price_rx) = tokio::sync::mpsc::channel(2000);
-        spawn_binance_ws_client(binance_config, price_tx);
-        spawn_latency_arb_executor(
-            latency_arb_config,
-            tracker_config,
-            price_rx,
-            market_mapper,
-            state.circuit_breaker.clone(),
-            state.pool.clone(),
-        );
-        info!("CEX latency arbitrage system started (Binance WS + executor)");
-    } else {
-        info!("CEX latency arbitrage disabled (LATENCY_ARB_ENABLED is off)");
-    }
 }
 
 /// Become the trading leader: reload what another process may have changed

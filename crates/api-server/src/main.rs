@@ -79,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
             arb_allow_live_execution = env_switch("ARB_ALLOW_LIVE_EXECUTION"),
             quant_executor_enabled = env_switch("QUANT_EXECUTOR_ENABLED"),
             exit_handler_enabled = env_switch("EXIT_HANDLER_ENABLED"),
-            latency_arb_enabled = env_switch("LATENCY_ARB_ENABLED"),
             cross_market_signal_enabled = env_switch("CROSS_MARKET_SIGNAL_ENABLED"),
             "Trading switches set in the environment (the workspace's settings can also \
              switch services on)"

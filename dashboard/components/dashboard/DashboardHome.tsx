@@ -63,7 +63,6 @@ const STRATEGY_PNL_LABELS: Record<string, string> = {
   mean_reversion: "Mean Rev",
   cross_market: "Cross Mkt",
   resolution_proximity: "Resolution",
-  latency_arb: "CEX Latency",
 };
 
 const activityLabels: Record<string, string> = {
