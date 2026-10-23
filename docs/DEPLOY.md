@@ -1061,6 +1061,12 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   refresh or single-market read; they used to buy from cached tokens until
   the next refresh and have the order refused, or a pair left one-legged.
   Exits still find those markets' tokens.
+- Routes that spend shared resources now need membership in the trading
+  workspace (403 otherwise): storing a wallet key needs trading rights there
+  (owner, admin or member, with a trading account); a wallet's balance (RPC
+  reads), a market missing from the database and its order book, and a
+  wallet's trade history (exchange reads) need any membership. Any
+  self-registered account could use them before, and grow the shared vault.
 
 ### API contract changes
 

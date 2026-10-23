@@ -13,6 +13,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::error::{ApiError, ApiResult};
 use crate::market_catalog::{extract_prices, infer_category};
 use crate::state::AppState;
+use crate::workspace_scope::WorkspaceReadAccess;
 use axum::http::{HeaderMap, HeaderValue};
 
 /// Market response.
@@ -206,10 +207,13 @@ async fn load_market_page(
     ),
     responses(
         (status = 200, description = "Market details", body = MarketResponse),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 404, description = "Market not found")
     )
 )]
 pub async fn get_market(
+    // A miss is fetched from the exchange, so only workspace members may ask.
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<MarketResponse>> {
@@ -283,10 +287,12 @@ pub async fn get_market(
     ),
     responses(
         (status = 200, description = "Market orderbook", body = OrderbookResponse),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 404, description = "Market not found")
     )
 )]
 pub async fn get_market_orderbook(
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<String>,
 ) -> ApiResult<Json<OrderbookResponse>> {

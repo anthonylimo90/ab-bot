@@ -14,6 +14,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::workspace_scope::WorkspaceReadAccess;
 
 const MAX_WALLET_TRADES_LIMIT: usize = 100;
 const MAX_WALLET_TRADES_FETCH: usize = 1_000;
@@ -187,10 +188,14 @@ pub struct WalletTradeResponse {
     ),
     responses(
         (status = 200, description = "Wallet trades", body = Vec<WalletTradeResponse>),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn get_wallet_trades(
+    // Short histories are fetched from the exchange, so only workspace
+    // members may ask.
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
     Query(query): Query<WalletTradesQuery>,

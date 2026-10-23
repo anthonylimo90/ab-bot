@@ -20,7 +20,8 @@ use auth::{AuditAction, AuditEvent};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::workspace_scope::{
-    resolve_canonical_workspace_id, resolve_canonical_workspace_membership,
+    resolve_canonical_workspace_id, resolve_canonical_workspace_membership, WorkspaceReadAccess,
+    WorkspaceTradeAccess,
 };
 use polymarket_core::api::polygon::{
     is_protocol_contract, BroadcastOutcome, WithdrawalSource, CALL_WOULD_FAIL,
@@ -426,6 +427,7 @@ async fn resolve_user_wallet_address(
         (status = 201, description = "Wallet stored successfully", body = WalletInfo),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "No trading rights in the trading workspace"),
         (status = 409, description = "Wallet already exists"),
     ),
     security(
@@ -434,6 +436,9 @@ async fn resolve_user_wallet_address(
     tag = "vault"
 )]
 pub async fn store_wallet(
+    // A stored key exists to trade for the workspace; an account outside it
+    // has no use for one and must not grow the shared vault.
+    _access: WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(req): Json<StoreWalletRequest>,
@@ -948,6 +953,7 @@ pub struct WalletBalanceResponse {
     responses(
         (status = 200, description = "Wallet USDC balance", body = WalletBalanceResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 404, description = "Wallet not found"),
         (status = 503, description = "Polygon RPC not configured"),
     ),
@@ -957,6 +963,8 @@ pub struct WalletBalanceResponse {
     tag = "vault"
 )]
 pub async fn get_wallet_balance(
+    // Each read spends the workspace's RPC quota.
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(address): Path<String>,
