@@ -2372,17 +2372,19 @@ async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
 /// by a process that stopped before saving it. Today's count, in close order
 /// (the breaker's daily counters have moved past earlier days'); the rest
 /// are only marked. Run by a new trading leader before it trades; a retry
-/// once it trades passes `closed_before` (it records its own). During the
-/// first upgrade to this version, a close the previous version makes while
-/// handing over is counted twice, which errs towards tripping.
+/// once it trades passes `closed_before` (it records its own).
 ///
 /// A win from a resolution close with a winner counts only when its close
 /// event says the payout was measured: the event is written after the
 /// position, so a process that stopped between the two leaves no proof.
+///
+/// With `count` false the closes are only marked: the first leader of this
+/// version takes over from one that counted its closes without marking them.
 pub(crate) async fn record_missed_closes(
     pool: &PgPool,
     breaker: &CircuitBreaker,
     closed_before: Option<chrono::DateTime<chrono::Utc>>,
+    count: bool,
 ) -> anyhow::Result<()> {
     #[derive(sqlx::FromRow)]
     struct MissedClose {
@@ -2429,11 +2431,12 @@ pub(crate) async fn record_missed_closes(
         let today_close = close
             .exit_timestamp
             .is_some_and(|at| at.date_naive() == today);
-        if today_close && breaker_counts_close(&close.execution_mode, pnl, close.confirmed) {
+        if count && today_close && breaker_counts_close(&close.execution_mode, pnl, close.confirmed)
+        {
             breaker.record_close(pnl, close.id).await?;
             warn!(position_id = %close.id, %pnl, "Recorded a close the circuit breaker had missed");
         } else {
-            if close.execution_mode == "live" && !today_close {
+            if count && close.execution_mode == "live" && !today_close {
                 warn!(
                     position_id = %close.id,
                     %pnl,
@@ -2650,13 +2653,14 @@ mod tests {
         for migration in [
             include_str!("../../../migrations/079_circuit_breaker_full_state.sql"),
             include_str!("../../../migrations/094_circuit_breaker_operator_epoch.sql"),
+            include_str!("../../../migrations/099_circuit_breaker_leader_fence.sql"),
         ] {
             sqlx::raw_sql(migration).execute(&pool).await.unwrap();
         }
         let breaker = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         breaker.lead().await.unwrap();
         // A retry once this process trades: only closes before its cutoff.
-        record_missed_closes(&pool, &breaker, Some(now))
+        record_missed_closes(&pool, &breaker, Some(now), true)
             .await
             .unwrap();
         let state = breaker.state().await;
@@ -2681,9 +2685,13 @@ mod tests {
         // the close made after the first one's cutoff; once.
         let next = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         next.lead().await.unwrap();
-        record_missed_closes(&pool, &next, None).await.unwrap();
+        record_missed_closes(&pool, &next, None, true)
+            .await
+            .unwrap();
         assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
-        record_missed_closes(&pool, &next, None).await.unwrap();
+        record_missed_closes(&pool, &next, None, true)
+            .await
+            .unwrap();
         assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
     }
 

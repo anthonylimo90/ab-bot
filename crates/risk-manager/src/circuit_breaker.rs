@@ -310,6 +310,11 @@ pub struct CircuitBreaker {
     synced_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Holds on new entries in this process ([`Self::hold_entries`]), by key.
     holds: std::sync::Mutex<std::collections::BTreeMap<&'static str, String>>,
+    /// The leader epoch this process claimed ([`Self::lead`]): its saves are
+    /// refused once another process claims a newer one.
+    leader_epoch: AtomicI64,
+    /// The trading leader's holds, as a follower last read them.
+    leader_holds: std::sync::Mutex<Vec<String>>,
 }
 
 /// How often a follower re-reads the stored state.
@@ -352,6 +357,8 @@ impl CircuitBreaker {
             unsaved_closes: std::sync::Mutex::new(Vec::new()),
             synced_at: std::sync::Mutex::new(None),
             holds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            leader_epoch: AtomicI64::new(0),
+            leader_holds: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -380,11 +387,28 @@ impl CircuitBreaker {
         self.leader.load(Ordering::SeqCst)
     }
 
-    /// Take over the persisted state: reload it (the previous leader's last
-    /// save included) and keep it from now on.
+    /// Take over the persisted state: claim the lead, reload it (the
+    /// previous leader's last save included) and keep it from now on. The
+    /// claim comes first: a save the previous leader still has in flight is
+    /// refused from then on, so what is read is what it left.
     pub async fn lead(&self) -> Result<bool> {
+        if let Some(repo) = &self.repo {
+            self.leader_epoch
+                .store(repo.claim_leadership().await?, Ordering::SeqCst);
+        }
         self.leader.store(true, Ordering::SeqCst);
+        self.leader_holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.load_state().await
+    }
+
+    /// Whether this process made the first claim of the lead ever: no
+    /// process of this version led before it (the one it took over from, if
+    /// any, did not mark the closes it counted).
+    pub fn first_leader(&self) -> bool {
+        self.leader_epoch.load(Ordering::SeqCst) == 1
     }
 
     /// Bring this process's view up to date with the stored state, at most
@@ -429,12 +453,18 @@ impl CircuitBreaker {
         let Some(repo) = &self.repo else {
             return Ok(());
         };
-        if let Some((mut stored, epoch)) = repo.load().await? {
-            stored.roll_daily_counters(Utc::now().date_naive());
+        if let Some(stored) = repo.load().await? {
+            let mut loaded = stored.state;
+            loaded.roll_daily_counters(Utc::now().date_naive());
             let mut state = self.state.write().await;
-            self.is_tripped.store(stored.tripped, Ordering::SeqCst);
-            *state = stored;
-            self.operator_epoch.store(epoch, Ordering::SeqCst);
+            self.is_tripped.store(loaded.tripped, Ordering::SeqCst);
+            *state = loaded;
+            self.operator_epoch
+                .store(stored.operator_epoch, Ordering::SeqCst);
+            *self
+                .leader_holds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = stored.entry_holds;
         }
         Ok(())
     }
@@ -452,9 +482,13 @@ impl CircuitBreaker {
             }
         };
 
-        let Some((mut loaded, epoch)) = repo.load().await? else {
+        // The stored holds were the previous leader's: this one's own are
+        // stored by the save below.
+        let Some(stored) = repo.load().await? else {
             return Ok(false);
         };
+        let epoch = stored.operator_epoch;
+        let mut loaded = stored.state;
         loaded.roll_daily_counters(Utc::now().date_naive());
 
         let mut state = self.state.write().await;
@@ -486,6 +520,8 @@ impl CircuitBreaker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(key, reason);
+        // A leader stores its holds for the other processes to honour.
+        self.unsaved.store(true, Ordering::SeqCst);
     }
 
     /// Lift the hold [`Self::hold_entries`] set under `key`.
@@ -498,7 +534,18 @@ impl CircuitBreaker {
             .is_some()
         {
             info!(key, "Hold on new entries lifted");
+            self.unsaved.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// This process's own holds.
+    fn own_holds(&self) -> Vec<String> {
+        self.holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Whether this process counted the close and still owes its mark (a
@@ -530,14 +577,23 @@ impl CircuitBreaker {
         }
     }
 
-    /// Why new entries are held in this process, if they are.
+    /// Why new entries are held in this process, if they are: its own holds
+    /// and, in a process that does not lead, the leader's as last read.
     pub fn entry_holds(&self) -> Vec<String> {
-        self.holds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect()
+        let mut holds = self.own_holds();
+        if !self.is_leader() {
+            for hold in self
+                .leader_holds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+            {
+                if !holds.contains(hold) {
+                    holds.push(hold.clone());
+                }
+            }
+        }
+        holds
     }
 
     /// Check if trading is currently halted (fast path).
@@ -552,12 +608,7 @@ impl CircuitBreaker {
     /// recovery when enabled); recovery stages advance as their time comes.
     pub async fn can_trade(&self) -> bool {
         self.sync().await;
-        if !self
-            .holds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty()
-        {
+        if !self.entry_holds().is_empty() {
             return false;
         }
         if !self.config.read().await.enabled {
@@ -1088,52 +1139,68 @@ impl CircuitBreaker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        let holds = self.own_holds();
+        let leader_epoch = self.leader_epoch.load(Ordering::SeqCst);
         let saved = match repo
-            .save(state, self.operator_epoch.load(Ordering::SeqCst), &closes)
+            .save(
+                state,
+                self.operator_epoch.load(Ordering::SeqCst),
+                leader_epoch,
+                &holds,
+                &closes,
+            )
             .await
         {
-            Ok(outcome) if !outcome.saved => match repo.load().await {
-                Ok(Some((stored, epoch))) => {
+            Ok(outcome) if !outcome.saved && !outcome.fenced => match repo.load().await {
+                Ok(Some(stored)) => {
                     warn!(
-                        tripped = stored.tripped,
-                        trip_reason = ?stored.trip_reason,
+                        tripped = stored.state.tripped,
+                        trip_reason = ?stored.state.trip_reason,
                         "Adopting a circuit breaker change made through another process"
                     );
-                    if !stored.tripped {
+                    if !stored.state.tripped {
                         self.hard_kill_breaches.store(0, Ordering::SeqCst);
                     }
-                    adopt_operator_change(state, stored);
+                    adopt_operator_change(state, stored.state);
                     self.is_tripped.store(state.tripped, Ordering::SeqCst);
-                    self.operator_epoch.store(epoch, Ordering::SeqCst);
-                    repo.save(state, epoch, &closes).await
+                    self.operator_epoch
+                        .store(stored.operator_epoch, Ordering::SeqCst);
+                    repo.save(state, stored.operator_epoch, leader_epoch, &holds, &closes)
+                        .await
                 }
                 Ok(None) => Ok(crate::circuit_breaker_repo::SaveOutcome {
                     saved: false,
-                    marked: false,
+                    fenced: false,
                 }),
                 Err(error) => Err(error),
             },
             other => other,
         };
         match saved {
+            Ok(outcome) if outcome.fenced => {
+                // Another process claimed the lead: it keeps the state now.
+                error!(
+                    "Another process has taken over trading; this one stops saving the circuit \
+                     breaker"
+                );
+                self.step_down();
+                self.unsaved.store(false, Ordering::SeqCst);
+            }
             Ok(outcome) if outcome.saved => {
-                // Closes whose marks failed stay queued and the save stays
-                // owed: [`Self::sync`] saves again shortly (the counters are
-                // absolute, the marks idempotent), so another leader does
-                // not find them unmarked and count them again.
-                self.unsaved.store(!outcome.marked, Ordering::SeqCst);
-                if outcome.marked {
-                    self.unsaved_closes
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .retain(|close| !closes.contains(close));
-                }
+                // Saved with the closes it marked (all or nothing).
+                self.unsaved.store(false, Ordering::SeqCst);
+                self.unsaved_closes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|close| !closes.contains(close));
             }
             Ok(_) => {
                 warn!("Circuit breaker state changed again while saving; retrying later");
                 self.unsaved.store(true, Ordering::SeqCst);
             }
             Err(e) => {
+                // Nothing was stored, the marks included: the closes stay
+                // queued, counted only here, and [`Self::sync`] retries.
                 error!(error = %e, "Failed to persist circuit breaker state");
                 self.unsaved.store(true, Ordering::SeqCst);
             }

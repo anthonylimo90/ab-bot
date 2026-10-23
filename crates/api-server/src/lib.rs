@@ -817,13 +817,24 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
         "closes a previous trading process left uncounted by the circuit breaker are not \
          counted yet",
     );
+    // The first leader of this version takes over from one that counted
+    // its closes without marking them: those are marked, not counted again.
+    let count = !state.circuit_breaker.first_leader();
+    if !count {
+        info!("First trading leader of this version: closes left unmarked are marked, not counted");
+    }
     let mut attempt = 0;
     loop {
         attempt += 1;
         // Nothing here trades yet, so every unmarked close is another
         // process's: no cutoff (one would depend on the clocks agreeing).
-        match crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker, None)
-            .await
+        match crate::exit_handler::record_missed_closes(
+            &state.pool,
+            &state.circuit_breaker,
+            None,
+            count,
+        )
+        .await
         {
             Ok(()) => {
                 state.circuit_breaker.release_entries(MISSED_CLOSES_HOLD);
@@ -846,6 +857,7 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
                     state.pool.clone(),
                     state.circuit_breaker.clone(),
                     chrono::Utc::now(),
+                    count,
                 );
                 break;
             }
@@ -874,6 +886,7 @@ fn spawn_missed_close_retry(
     pool: sqlx::PgPool,
     breaker: Arc<risk_manager::CircuitBreaker>,
     closed_before: chrono::DateTime<chrono::Utc>,
+    count: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -882,8 +895,13 @@ fn spawn_missed_close_retry(
                 breaker.release_entries(MISSED_CLOSES_HOLD);
                 return;
             }
-            match crate::exit_handler::record_missed_closes(&pool, &breaker, Some(closed_before))
-                .await
+            match crate::exit_handler::record_missed_closes(
+                &pool,
+                &breaker,
+                Some(closed_before),
+                count,
+            )
+            .await
             {
                 Ok(()) => {
                     info!("Recorded the closes the circuit breaker missed; new entries may resume");
