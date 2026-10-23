@@ -62,3 +62,34 @@ export function useCreateWalletWithdrawalMutation() {
     },
   });
 }
+
+export function useWithdrawalDestinationsQuery(enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.wallets.withdrawalDestinations(),
+    queryFn: () => api.listWithdrawalDestinations(),
+    enabled,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+  });
+}
+
+export function useAddWithdrawalDestinationMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (params: { address: string; label?: string }) =>
+      api.addWithdrawalDestination(params.address, params.label),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.withdrawalDestinations() });
+    },
+  });
+}
+
+export function useRemoveWithdrawalDestinationMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.removeWithdrawalDestination(id),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.withdrawalDestinations() });
+    },
+  });
+}

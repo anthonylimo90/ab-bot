@@ -562,6 +562,8 @@ pub const SETTINGS: &[(&str, SettingKind)] = &[
         "WALLET_INVENTORY_PHASE2_CHUNK_BLOCKS",
         count(1, 1_000_000_000),
     ),
+    ("WITHDRAWAL_DAILY_CAP_USD", SettingKind::PositiveDecimal),
+    ("WITHDRAWAL_DESTINATION_DELAY_HOURS", count(0, 720)),
     ("WS_CHANNEL_CAPACITY", count(1, 1_000_000)),
 ];
 

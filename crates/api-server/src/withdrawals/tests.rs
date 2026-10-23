@@ -235,6 +235,7 @@ pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
         include_str!("../../../../migrations/088_withdrawal_reconcile_state.sql"),
         include_str!("../../../../migrations/089_withdrawal_mined_seen.sql"),
         include_str!("../../../../migrations/091_withdrawal_fee_bumps.sql"),
+        include_str!("../../../../migrations/106_withdrawal_destinations.sql"),
     ] {
         pool.execute(migration).await.unwrap();
     }
@@ -250,6 +251,16 @@ pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
     )
     .bind(workspace)
     .bind(TRADING)
+    .execute(pool)
+    .await
+    .unwrap();
+    // DEST has long been on the workspace's withdrawal address list.
+    sqlx::query(
+        "INSERT INTO withdrawal_destinations (workspace_id, address, usable_from) \
+         VALUES ($1, $2, NOW() - INTERVAL '1 day')",
+    )
+    .bind(workspace)
+    .bind(DEST)
     .execute(pool)
     .await
     .unwrap();

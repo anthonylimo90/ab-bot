@@ -30,7 +30,8 @@ use polymarket_core::api::PolygonClient;
 
 use crate::withdrawals::{
     chain_error_message, fail_unsent, final_receipt, finalize_mined, hash_recorded,
-    withdrawal_plan, Receipt, SpendLock, WithdrawalHolds,
+    lock_workspace_withdrawals, withdrawal_plan, Receipt, SpendLock, WithdrawalHolds,
+    WithdrawalPolicy,
 };
 
 #[cfg(test)]
@@ -1160,6 +1161,19 @@ pub async fn create_withdrawal(
         ));
     }
 
+    // Checked again, and decided, when the withdrawal is reserved: here it
+    // spares the chain reads and the signer of a request that cannot go.
+    {
+        let mut conn = state.pool.acquire().await?;
+        if let Some(refusal) = state
+            .withdrawal_policy
+            .refusal(&mut conn, workspace_id, &destination_address, req.amount)
+            .await?
+        {
+            return Err(refusal.into());
+        }
+    }
+
     let polygon_client = resolve_polygon_client_for_user(state.as_ref(), user_id).await?;
     let wallet = state
         .load_wallet_from_vault(&source_address)
@@ -1337,6 +1351,7 @@ async fn reserve_withdrawal(
     lock: &mut SpendLock,
     client: &PolygonClient,
     request: &WithdrawalRequest,
+    policy: &WithdrawalPolicy,
 ) -> ApiResult<Reservation> {
     // The wallet may have been disconnected while this request waited for
     // the lock; its key may be erased right after.
@@ -1408,6 +1423,22 @@ async fn reserve_withdrawal(
 
     let id = Uuid::new_v4();
     let requested_at = Utc::now();
+    // Decided and reserved in one transaction, under the workspace's lock:
+    // the destination list and the daily cap as they stand when the row
+    // starts to count.
+    let mut tx = sqlx::Connection::begin(lock.conn()).await?;
+    lock_workspace_withdrawals(&mut tx, request.workspace_id).await?;
+    if let Some(refusal) = policy
+        .refusal(
+            &mut tx,
+            request.workspace_id,
+            &request.destination,
+            request.amount,
+        )
+        .await?
+    {
+        return Err(refusal.into());
+    }
     let inserted = sqlx::query(
         r#"
         INSERT INTO wallet_withdrawals (
@@ -1427,11 +1458,12 @@ async fn reserve_withdrawal(
     .bind(requested_at)
     .bind(request.request_id)
     .bind(holds.trading_wallet)
-    .execute(lock.conn())
+    .execute(&mut *tx)
     .await;
     match inserted {
-        Ok(_) => {}
+        Ok(_) => tx.commit().await?,
         Err(sqlx::Error::Database(db_err)) if db_err.code().is_some_and(|c| c == "23505") => {
+            tx.rollback().await?;
             // Unique constraint violation on (wallet_address, client_request_id).
             if let Some(row) = existing_withdrawal(
                 lock.conn(),
@@ -1494,7 +1526,7 @@ async fn submit_withdrawal(
         ));
     };
     let (withdrawal_id, requested_at, source) =
-        match reserve_withdrawal(&mut lock, &client, &request).await {
+        match reserve_withdrawal(&mut lock, &client, &request, &state.withdrawal_policy).await {
             Ok(Reservation::Reserved {
                 id,
                 requested_at,
@@ -1798,6 +1830,11 @@ pub struct WithdrawalPreflightResponse {
     pub can_withdraw: bool,
     /// Human-readable reasons that block the withdrawal, if any.
     pub blocking_reasons: Vec<String>,
+    /// The most the workspace may withdraw in any 24 hours, in USDC.
+    pub daily_cap: Decimal,
+    /// What the workspace's withdrawals in the last 24 hours took (failed
+    /// ones aside).
+    pub withdrawn_last_24h: Decimal,
 }
 
 /// Check whether a proposed withdrawal is safe before submitting it.
@@ -1827,7 +1864,7 @@ pub async fn withdrawal_preflight(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
-    let (_, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
+    let (workspace_id, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
     if role != "owner" && role != "admin" {
         return Err(ApiError::Forbidden(
             "Only workspace owners and admins can use the withdrawal preflight".into(),
@@ -1902,6 +1939,19 @@ pub async fn withdrawal_preflight(
         }
         _ => {}
     }
+    let withdrawn_last_24h = {
+        let mut conn = state.pool.acquire().await?;
+        crate::withdrawals::withdrawn_last_day(&mut conn, workspace_id).await?
+    };
+    let daily_cap = state.withdrawal_policy.daily_cap;
+    if let Some(amount) = params.amount {
+        if withdrawn_last_24h + amount > daily_cap {
+            blocking_reasons.push(format!(
+                "Withdrawal of {amount} USDC would exceed the daily limit of {daily_cap} USDC \
+                 ({withdrawn_last_24h} USDC withdrawn in the last 24 hours)"
+            ));
+        }
+    }
     let can_withdraw = blocking_reasons.is_empty();
 
     Ok(Json(WithdrawalPreflightResponse {
@@ -1914,5 +1964,222 @@ pub async fn withdrawal_preflight(
         inventory_synced_at,
         can_withdraw,
         blocking_reasons,
+        daily_cap,
+        withdrawn_last_24h,
     }))
+}
+
+/// An address the workspace may withdraw to.
+#[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
+pub struct WithdrawalDestinationResponse {
+    pub id: Uuid,
+    pub address: String,
+    pub label: Option<String>,
+    pub added_at: DateTime<Utc>,
+    /// Withdrawals may go to it from this time.
+    pub usable_from: DateTime<Utc>,
+}
+
+/// The workspace's withdrawal addresses and limits.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WithdrawalDestinationsResponse {
+    pub destinations: Vec<WithdrawalDestinationResponse>,
+    /// How long after it is added an address may receive withdrawals.
+    pub delay_hours: i64,
+    /// The most the workspace may withdraw in any 24 hours, in USDC.
+    pub daily_cap: Decimal,
+    /// What the workspace's withdrawals in the last 24 hours took.
+    pub withdrawn_last_24h: Decimal,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AddWithdrawalDestinationRequest {
+    pub address: String,
+    pub label: Option<String>,
+}
+
+/// The canonical workspace, for an owner or admin.
+async fn require_withdrawal_manager(state: &AppState, claims: &Claims) -> ApiResult<(Uuid, Uuid)> {
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
+    let (workspace_id, role) = require_canonical_workspace_member(&state.pool, user_id).await?;
+    if role != "owner" && role != "admin" {
+        return Err(ApiError::Forbidden(
+            "Only workspace owners and admins manage withdrawal addresses".into(),
+        ));
+    }
+    Ok((user_id, workspace_id))
+}
+
+/// Record a change to the withdrawal address list (refused if it cannot be).
+async fn audit_destination_change(
+    state: &AppState,
+    user_id: Uuid,
+    action: &str,
+    destination: &WithdrawalDestinationResponse,
+) -> ApiResult<()> {
+    let event = AuditEvent::builder(
+        AuditAction::Custom(action.to_string()),
+        format!("withdrawal_destination/{}", destination.id),
+    )
+    .user(user_id.to_string())
+    .details(serde_json::json!({
+        "address": destination.address,
+        "label": destination.label,
+        "usable_from": destination.usable_from,
+    }))
+    .build();
+    state
+        .audit_logger
+        .log_sync(event)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            ApiError::Internal(format!(
+                "Could not record the change in the audit log: {error}"
+            ))
+        })
+}
+
+/// List the addresses the workspace may withdraw to, with the limits.
+#[utoipa::path(
+    get,
+    path = "/api/v1/vault/withdrawal-destinations",
+    responses(
+        (status = 200, description = "Withdrawal addresses and limits", body = WithdrawalDestinationsResponse),
+        (status = 403, description = "Not a workspace owner or admin")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "vault"
+)]
+pub async fn list_withdrawal_destinations(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult<Json<WithdrawalDestinationsResponse>> {
+    let (_, workspace_id) = require_withdrawal_manager(&state, &claims).await?;
+    let destinations: Vec<WithdrawalDestinationResponse> = sqlx::query_as(
+        "SELECT id, address, label, added_at, usable_from FROM withdrawal_destinations \
+         WHERE workspace_id = $1 AND removed_at IS NULL ORDER BY added_at",
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut conn = state.pool.acquire().await?;
+    let withdrawn_last_24h =
+        crate::withdrawals::withdrawn_last_day(&mut conn, workspace_id).await?;
+    Ok(Json(WithdrawalDestinationsResponse {
+        destinations,
+        delay_hours: state.withdrawal_policy.destination_delay.num_hours(),
+        daily_cap: state.withdrawal_policy.daily_cap,
+        withdrawn_last_24h,
+    }))
+}
+
+/// Add an address the workspace may withdraw to, usable once the delay has
+/// passed.
+#[utoipa::path(
+    post,
+    path = "/api/v1/vault/withdrawal-destinations",
+    request_body = AddWithdrawalDestinationRequest,
+    responses(
+        (status = 201, description = "Address added", body = WithdrawalDestinationResponse),
+        (status = 400, description = "Invalid address"),
+        (status = 403, description = "Not a workspace owner or admin"),
+        (status = 409, description = "Address already listed")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "vault"
+)]
+pub async fn add_withdrawal_destination(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<AddWithdrawalDestinationRequest>,
+) -> ApiResult<(StatusCode, Json<WithdrawalDestinationResponse>)> {
+    let (user_id, workspace_id) = require_withdrawal_manager(&state, &claims).await?;
+    let address = validate_wallet_address(&req.address)?;
+    if is_protocol_contract(&address) {
+        return Err(ApiError::BadRequest(
+            "The address is a token or Polymarket contract; funds sent there cannot be recovered"
+                .into(),
+        ));
+    }
+    let label = req
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(|label| label.chars().take(100).collect::<String>());
+    let usable_from = Utc::now() + state.withdrawal_policy.destination_delay;
+    // Audited before it commits: an addition never lands unrecorded.
+    let mut tx = state.pool.begin().await?;
+    let added: Option<WithdrawalDestinationResponse> = sqlx::query_as(
+        "INSERT INTO withdrawal_destinations (workspace_id, address, label, added_by, usable_from) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (workspace_id, address) WHERE removed_at IS NULL DO NOTHING \
+         RETURNING id, address, label, added_at, usable_from",
+    )
+    .bind(workspace_id)
+    .bind(&address)
+    .bind(&label)
+    .bind(user_id)
+    .bind(usable_from)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(added) = added else {
+        return Err(ApiError::Conflict(
+            "The address is already on the withdrawal address list".into(),
+        ));
+    };
+    audit_destination_change(&state, user_id, "withdrawal_destination_added", &added).await?;
+    tx.commit().await?;
+    warn!(
+        address = %added.address,
+        usable_from = %added.usable_from,
+        added_by = %user_id,
+        "Withdrawal address added"
+    );
+    Ok((StatusCode::CREATED, Json(added)))
+}
+
+/// Remove an address from the withdrawal list, at once.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/vault/withdrawal-destinations/{id}",
+    params(("id" = Uuid, Path, description = "Withdrawal address id")),
+    responses(
+        (status = 204, description = "Address removed"),
+        (status = 403, description = "Not a workspace owner or admin"),
+        (status = 404, description = "No such address on the list")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "vault"
+)]
+pub async fn remove_withdrawal_destination(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let (user_id, workspace_id) = require_withdrawal_manager(&state, &claims).await?;
+    // Under the workspace's withdrawal lock: a withdrawal deciding now sees
+    // the address listed or gone, not half of either.
+    let mut tx = state.pool.begin().await?;
+    lock_workspace_withdrawals(&mut tx, workspace_id).await?;
+    let removed: Option<WithdrawalDestinationResponse> = sqlx::query_as(
+        "UPDATE withdrawal_destinations SET removed_at = NOW(), removed_by = $3 \
+         WHERE id = $1 AND workspace_id = $2 AND removed_at IS NULL \
+         RETURNING id, address, label, added_at, usable_from",
+    )
+    .bind(id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(removed) = removed else {
+        return Err(ApiError::NotFound(
+            "No such address on the withdrawal address list".into(),
+        ));
+    };
+    audit_destination_change(&state, user_id, "withdrawal_destination_removed", &removed).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }

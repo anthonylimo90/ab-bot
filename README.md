@@ -153,6 +153,8 @@ WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 ### Wallets / vault
 - wallet metrics and wallet trades
 - vault wallet CRUD, primary wallet selection, balance lookup
+- withdrawals (preflight, send, history) to listed addresses only, under a
+  daily limit; withdrawal address list (add, remove)
 
 ### Workspaces / risk / activity
 - workspace list, current workspace, detail, switch

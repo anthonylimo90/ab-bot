@@ -1066,6 +1066,23 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Paper manual sales reach no breaker. Deploy stop-then-start: 105
   replaces the fill trigger.
 
+### Withdrawal address list and daily limit (106)
+
+- Withdrawals go only to addresses on the workspace's withdrawal address
+  list (Settings → Withdraw USDC). An owner or admin adds an address; it can
+  receive withdrawals `WITHDRAWAL_DESTINATION_DELAY_HOURS` after (24 by
+  default), time to notice an address added by someone who took over a
+  session. Removing one takes effect at once. Additions and removals are in
+  the audit log (`withdrawal_destination_added`, `_removed`).
+- A workspace withdraws at most `WITHDRAWAL_DAILY_CAP_USD` (1000 by default)
+  in any 24 hours, counting every withdrawal not failed. The list and the
+  limit are checked when the withdrawal is reserved, under a workspace lock,
+  so two at once cannot both pass on room for one.
+- After deploying, the list is empty: no withdrawal can go until an address
+  is added and its delay has passed. Add the addresses you withdraw to
+  first. Set both settings in the API's environment; the dashboard cannot
+  change them.
+
 ### Equity history and trade-flow figures
 
 - Equity history stores only complete live valuations (cash, and live

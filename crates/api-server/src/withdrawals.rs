@@ -55,6 +55,125 @@ const REVERTED_ERROR: &str = "Transaction reverted on-chain; no USDC moved";
 /// Statuses of a withdrawal that may still move funds.
 pub(crate) const UNRESOLVED_STATUSES: [&str; 3] = ["pending", "submitting", "submitted"];
 
+/// Where and how much a workspace may withdraw.
+#[derive(Debug, Clone, Copy)]
+pub struct WithdrawalPolicy {
+    /// How long after it is added a destination may receive withdrawals
+    /// (`WITHDRAWAL_DESTINATION_DELAY_HOURS`, 24 by default).
+    pub destination_delay: Duration,
+    /// The most a workspace may withdraw in any 24 hours, in USDC
+    /// (`WITHDRAWAL_DAILY_CAP_USD`, 1000 by default).
+    pub daily_cap: Decimal,
+}
+
+impl WithdrawalPolicy {
+    pub fn from_env() -> Self {
+        Self {
+            destination_delay: Duration::hours(polymarket_core::config::env_count(
+                "WITHDRAWAL_DESTINATION_DELAY_HOURS",
+                24_i64,
+            )),
+            daily_cap: polymarket_core::config::env_positive_decimal(
+                "WITHDRAWAL_DAILY_CAP_USD",
+                Decimal::from(1000),
+            ),
+        }
+    }
+
+    /// Why `amount` may not go from the workspace to `destination` now, if
+    /// it may not: the destination is not on its list, or not usable yet, or
+    /// the amount takes the last 24 hours' withdrawals past the cap. Run under
+    /// [`lock_workspace_withdrawals`] (in the same transaction) to decide.
+    pub(crate) async fn refusal(
+        &self,
+        conn: &mut PgConnection,
+        workspace_id: Uuid,
+        destination: &str,
+        amount: Decimal,
+    ) -> Result<Option<PolicyRefusal>, sqlx::Error> {
+        let usable_from: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT usable_from FROM withdrawal_destinations \
+             WHERE workspace_id = $1 AND address = $2 AND removed_at IS NULL",
+        )
+        .bind(workspace_id)
+        .bind(destination.to_lowercase())
+        .fetch_optional(&mut *conn)
+        .await?;
+        match usable_from {
+            None => {
+                return Ok(Some(PolicyRefusal::Destination(
+                    "The destination is not on the workspace's withdrawal address list; an owner \
+                     or admin must add it first"
+                        .to_string(),
+                )))
+            }
+            Some(at) if at > Utc::now() => {
+                return Ok(Some(PolicyRefusal::Destination(format!(
+                    "The destination was added recently; it can receive withdrawals from {}",
+                    at.format("%Y-%m-%d %H:%M UTC")
+                ))))
+            }
+            Some(_) => {}
+        }
+        let withdrawn = withdrawn_last_day(conn, workspace_id).await?;
+        if withdrawn + amount > self.daily_cap {
+            return Ok(Some(PolicyRefusal::Cap(format!(
+                "Withdrawal of {amount} USDC would exceed the daily limit of {} USDC \
+                 ({withdrawn} USDC withdrawn in the last 24 hours, {} USDC left)",
+                self.daily_cap,
+                (self.daily_cap - withdrawn).max(Decimal::ZERO)
+            ))));
+        }
+        Ok(None)
+    }
+}
+
+/// Why [`WithdrawalPolicy::refusal`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyRefusal {
+    Destination(String),
+    Cap(String),
+}
+
+impl From<PolicyRefusal> for crate::error::ApiError {
+    fn from(refusal: PolicyRefusal) -> Self {
+        match refusal {
+            PolicyRefusal::Destination(reason) => Self::Forbidden(reason),
+            PolicyRefusal::Cap(reason) => Self::Conflict(reason),
+        }
+    }
+}
+
+/// What a workspace's withdrawals in the last 24 hours took, or may still
+/// take: every one but those that failed (which moved nothing).
+pub(crate) async fn withdrawn_last_day(
+    conn: &mut PgConnection,
+    workspace_id: Uuid,
+) -> Result<Decimal, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount), 0)::numeric FROM wallet_withdrawals \
+         WHERE workspace_id = $1 AND status <> 'failed' \
+           AND requested_at > NOW() - INTERVAL '24 hours'",
+    )
+    .bind(workspace_id)
+    .fetch_one(conn)
+    .await
+}
+
+/// Serializes a workspace's withdrawal decisions until the transaction ends:
+/// two withdrawals from different wallets must not both fit under the cap
+/// that only one of them fits under.
+pub(crate) async fn lock_workspace_withdrawals(
+    conn: &mut PgConnection,
+    workspace_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("workspace-withdrawals:{workspace_id}"))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Advisory lock key for everything that spends from `address`'s nonces.
 pub(crate) fn wallet_lock_key(address: &str) -> String {
     format!("wallet-withdrawal:{}", address.to_lowercase())

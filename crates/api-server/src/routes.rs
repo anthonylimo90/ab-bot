@@ -72,6 +72,9 @@ use crate::websocket;
         vault::list_withdrawals,
         vault::create_withdrawal,
         vault::withdrawal_preflight,
+        vault::list_withdrawal_destinations,
+        vault::add_withdrawal_destination,
+        vault::remove_withdrawal_destination,
         users::list_users,
         users::create_user,
         users::get_user,
@@ -201,6 +204,9 @@ use crate::websocket;
             vault::CreateWithdrawalRequest,
             vault::WalletWithdrawalResponse,
             vault::WithdrawalPreflightResponse,
+            vault::WithdrawalDestinationResponse,
+            vault::WithdrawalDestinationsResponse,
+            vault::AddWithdrawalDestinationRequest,
             users::UserListItem,
             users::CreateUserRequest,
             users::UpdateUserRequest,
@@ -447,6 +453,10 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
             "/api/v1/vault/withdrawals/preflight",
             get(vault::withdrawal_preflight),
         )
+        .route(
+            "/api/v1/vault/withdrawal-destinations",
+            get(vault::list_withdrawal_destinations),
+        )
         // Order endpoints (read-only)
         .route("/api/v1/orders/:order_id", get(trading::get_order_status))
         // Backtest endpoints (read-only)
@@ -610,6 +620,14 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
             put(vault::set_primary_wallet),
         )
         .route("/api/v1/vault/withdrawals", post(vault::create_withdrawal))
+        .route(
+            "/api/v1/vault/withdrawal-destinations",
+            post(vault::add_withdrawal_destination),
+        )
+        .route(
+            "/api/v1/vault/withdrawal-destinations/:id",
+            delete(vault::remove_withdrawal_destination),
+        )
         // Workspace operations (owner/admin can modify)
         // NOTE: PUT /workspaces/:id is in config_routes with stricter rate limiting
         .route(

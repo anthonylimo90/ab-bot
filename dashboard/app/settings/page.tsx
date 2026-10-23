@@ -46,6 +46,9 @@ import {
   useWalletBalanceQuery,
   useWalletWithdrawalsQuery,
   useWithdrawalCapacityQuery,
+  useWithdrawalDestinationsQuery,
+  useAddWithdrawalDestinationMutation,
+  useRemoveWithdrawalDestinationMutation,
 } from '@/hooks/queries/useWalletsQuery';
 import api from '@/lib/api';
 import { queryKeys } from '@/lib/queryClient';
@@ -87,6 +90,8 @@ export default function SettingsPage() {
   const [withdrawDestination, setWithdrawDestination] = useState('');
   const withdrawalIntentRef = useRef<{ fingerprint: string; id: string } | null>(null);
   const [withdrawAmount, setWithdrawAmount] = useState('');
+  const [newDestination, setNewDestination] = useState('');
+  const [newDestinationLabel, setNewDestinationLabel] = useState('');
 
   const {
     connectedWallets,
@@ -142,6 +147,16 @@ export default function SettingsPage() {
   const { data: recentWithdrawals = [], isLoading: withdrawalsLoading } =
     useWalletWithdrawalsQuery(8);
   const createWithdrawalMutation = useCreateWalletWithdrawalMutation();
+  // Withdrawals go only to listed addresses, each usable once its delay has
+  // passed, and stop at a daily limit.
+  const { data: withdrawalDestinations, isError: withdrawalDestinationsFailed } =
+    useWithdrawalDestinationsQuery(canManageWithdrawals);
+  const addDestinationMutation = useAddWithdrawalDestinationMutation();
+  const removeDestinationMutation = useRemoveWithdrawalDestinationMutation();
+  const destinationUsable = (usableFrom: string) => new Date(usableFrom).getTime() <= Date.now();
+  const usableDestinations = (withdrawalDestinations?.destinations ?? []).filter((destination) =>
+    destinationUsable(destination.usable_from),
+  );
 
   // Initialize the risk form from the stored config, and again only when that
   // config changes: the status poll (P&L, equity) must not reset an edit.
@@ -510,6 +525,46 @@ export default function SettingsPage() {
     }
   };
 
+  const handleAddDestination = async () => {
+    const address = newDestination.trim();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+      toast.error('Invalid address', 'Enter a valid Polygon wallet address.');
+      return;
+    }
+    try {
+      const added = await addDestinationMutation.mutateAsync({
+        address,
+        label: newDestinationLabel.trim() || undefined,
+      });
+      toast.success(
+        'Withdrawal address added',
+        `It can receive withdrawals from ${new Date(added.usable_from).toLocaleString()}.`,
+      );
+      setNewDestination('');
+      setNewDestinationLabel('');
+    } catch (err) {
+      toast.error(
+        'Address not added',
+        err instanceof Error ? err.message : 'Unable to add the address',
+      );
+    }
+  };
+
+  const handleRemoveDestination = async (id: string, address: string) => {
+    try {
+      await removeDestinationMutation.mutateAsync(id);
+      if (withdrawDestination.trim().toLowerCase() === address.toLowerCase()) {
+        setWithdrawDestination('');
+      }
+      toast.success('Withdrawal address removed', 'Withdrawals can no longer go to it.');
+    } catch (err) {
+      toast.error(
+        'Address not removed',
+        err instanceof Error ? err.message : 'Unable to remove the address',
+      );
+    }
+  };
+
   const shortAddress = (address: string) => `${address.slice(0, 6)}...${address.slice(-4)}`;
 
   return (
@@ -679,6 +734,11 @@ export default function SettingsPage() {
                         ? 'The amount that can be withdrawn now could not be checked.'
                         : 'Checking how much can be withdrawn now...'}
                   </p>
+                  {withdrawalCapacity && (
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {`Daily limit: ${formatCurrency(withdrawalCapacity.withdrawn_last_24h)} of ${formatCurrency(withdrawalCapacity.daily_cap)} withdrawn in the last 24 hours.`}
+                    </p>
+                  )}
                   {withdrawalCapacity && withdrawalCapacity.blocking_reasons.length > 0 && (
                     <ul className="mt-1 list-disc pl-5 text-xs text-destructive">
                       {withdrawalCapacity.blocking_reasons.map((reason) => (
@@ -691,12 +751,24 @@ export default function SettingsPage() {
                 <div className="grid gap-3 md:grid-cols-2">
                   <label className="space-y-2 text-sm">
                     <span className="font-medium">Destination Address</span>
-                    <Input
+                    <select
                       value={withdrawDestination}
                       onChange={(e) => setWithdrawDestination(e.target.value)}
-                      placeholder="0x..."
-                      className="font-mono"
-                    />
+                      className="w-full rounded border bg-background px-3 py-2 font-mono"
+                    >
+                      <option value="">
+                        {usableDestinations.length === 0
+                          ? 'No withdrawal address usable yet'
+                          : 'Choose a withdrawal address'}
+                      </option>
+                      {usableDestinations.map((destination) => (
+                        <option key={destination.id} value={destination.address}>
+                          {destination.label
+                            ? `${destination.label} (${shortAddress(destination.address)})`
+                            : destination.address}
+                        </option>
+                      ))}
+                    </select>
                   </label>
                   <label className="space-y-2 text-sm">
                     <span className="font-medium">Amount (USDC)</span>
@@ -744,6 +816,74 @@ export default function SettingsPage() {
                       <span className="ml-2">Withdraw</span>
                     </Button>
                   </ConfirmAction>
+                </div>
+
+                <div className="space-y-2 rounded-md border p-3">
+                  <p className="text-sm font-medium">Withdrawal Addresses</p>
+                  <p className="text-xs text-muted-foreground">
+                    {withdrawalDestinations
+                      ? `Withdrawals go only to these addresses. A new address can receive withdrawals ${withdrawalDestinations.delay_hours} hours after it is added; removing one takes effect at once.`
+                      : withdrawalDestinationsFailed
+                        ? 'The withdrawal addresses could not be loaded.'
+                        : 'Loading withdrawal addresses...'}
+                  </p>
+                  {(withdrawalDestinations?.destinations ?? []).map((destination) => (
+                    <div
+                      key={destination.id}
+                      className="flex flex-col gap-2 rounded-md border p-2 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate font-mono text-xs">{destination.address}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {destination.label ? `${destination.label} · ` : ''}
+                          {destinationUsable(destination.usable_from)
+                            ? 'Usable'
+                            : `Usable from ${new Date(destination.usable_from).toLocaleString()}`}
+                        </p>
+                      </div>
+                      <ConfirmAction
+                        title="Remove this withdrawal address?"
+                        description={`Withdrawals can no longer go to ${destination.address}. Adding it again starts a new waiting period.`}
+                        confirmLabel="Remove Address"
+                        onConfirm={() => handleRemoveDestination(destination.id, destination.address)}
+                      >
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={removeDestinationMutation.isPending}
+                        >
+                          Remove
+                        </Button>
+                      </ConfirmAction>
+                    </div>
+                  ))}
+                  <div className="grid gap-2 md:grid-cols-[2fr_1fr_auto]">
+                    <Input
+                      value={newDestination}
+                      onChange={(e) => setNewDestination(e.target.value)}
+                      placeholder="0x... address to allow"
+                      className="font-mono"
+                    />
+                    <Input
+                      value={newDestinationLabel}
+                      onChange={(e) => setNewDestinationLabel(e.target.value)}
+                      placeholder="Label (optional)"
+                      maxLength={100}
+                    />
+                    <ConfirmAction
+                      title="Add this withdrawal address?"
+                      description={`${newDestination.trim()} will be able to receive withdrawals ${withdrawalDestinations?.delay_hours ?? 24} hours from now. Check the address: a transfer on Polygon cannot be undone.`}
+                      confirmLabel="Add Address"
+                      onConfirm={handleAddDestination}
+                    >
+                      <Button
+                        variant="outline"
+                        disabled={addDestinationMutation.isPending || !newDestination.trim()}
+                      >
+                        Add Address
+                      </Button>
+                    </ConfirmAction>
+                  </div>
                 </div>
 
                 <div className="space-y-2">

@@ -117,6 +117,76 @@ async fn a_sent_withdrawal_is_journaled_settled_and_replayed(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn only_listed_destinations_past_their_delay_receive_withdrawals(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    let refused =
+        |result: ApiResult<WalletWithdrawalRow>| matches!(result, Err(ApiError::Forbidden(_)));
+    // Added an hour ago: not usable for a day.
+    sqlx::query("UPDATE withdrawal_destinations SET usable_from = NOW() + INTERVAL '23 hours'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(refused(f.submit(10, Uuid::new_v4()).await));
+    // Removed: refused at once.
+    sqlx::query(
+        "UPDATE withdrawal_destinations SET usable_from = NOW() - INTERVAL '1 day', \
+         removed_at = NOW()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(refused(f.submit(10, Uuid::new_v4()).await));
+    // Never listed (another workspace's entry does not count).
+    sqlx::query("DELETE FROM withdrawal_destinations")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(refused(f.submit(10, Uuid::new_v4()).await));
+    assert_eq!(f.broadcasts(), 0);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallet_withdrawals")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[sqlx::test(migrations = false)]
+async fn withdrawals_stop_at_the_daily_cap(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    f.chain.lock().unwrap().mine_on_send = true;
+    // 995 USDC left in the last 24 hours (a failed one, and one older, do
+    // not count).
+    for (amount, status, hours_ago) in [
+        (995, "confirmed", 23),
+        (500, "failed", 1),
+        (500, "confirmed", 25),
+    ] {
+        sqlx::query(
+            "INSERT INTO wallet_withdrawals (user_id, workspace_id, wallet_address, \
+             destination_address, amount, status, requested_at) \
+             VALUES ($1, $2, '0xelsewhere', $3, $4, $5, NOW() - $6 * INTERVAL '1 hour')",
+        )
+        .bind(f.user)
+        .bind(f.workspace)
+        .bind(DEST)
+        .bind(Decimal::from(amount))
+        .bind(status)
+        .bind(hours_ago as f64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::Conflict(reason)) if reason.contains("daily limit")
+    ));
+    assert_eq!(f.broadcasts(), 0);
+    // What is left still goes.
+    let row = f.submit(5, Uuid::new_v4()).await.unwrap();
+    assert_eq!(row.status, "confirmed");
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_wallet_disconnected_while_the_request_waited_sends_nothing(pool: PgPool) {
     let f = fixture(pool.clone()).await;
     pool.execute("DELETE FROM user_wallets").await.unwrap();

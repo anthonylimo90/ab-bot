@@ -86,6 +86,8 @@ export const queryKeys = {
       [...queryKeys.wallets.all(), "withdrawal-capacity", address] as const,
     withdrawals: (params?: { limit?: number }) =>
       [...queryKeys.wallets.all(), "withdrawals", params] as const,
+    withdrawalDestinations: () =>
+      [...queryKeys.wallets.all(), "withdrawal-destinations"] as const,
   },
 
   // Markets

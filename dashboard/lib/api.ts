@@ -17,6 +17,8 @@ import type {
   CreateWalletWithdrawalRequest,
   WalletWithdrawal,
   WithdrawalPreflight,
+  WithdrawalDestination,
+  WithdrawalDestinations,
   UserListItem,
   CreateUserRequest,
   UpdateUserRequest,
@@ -869,7 +871,37 @@ class ApiClient {
       reserved_for_open_buys: Number(raw.reserved_for_open_buys),
       orphan_exposure: Number(raw.orphan_exposure),
       max_withdrawable: Number(raw.max_withdrawable),
+      daily_cap: Number(raw.daily_cap),
+      withdrawn_last_24h: Number(raw.withdrawn_last_24h),
     };
+  }
+
+  async listWithdrawalDestinations(): Promise<WithdrawalDestinations> {
+    const raw = await this.request<WithdrawalDestinations>(
+      "/api/v1/vault/withdrawal-destinations",
+    );
+    return {
+      ...raw,
+      daily_cap: Number(raw.daily_cap),
+      withdrawn_last_24h: Number(raw.withdrawn_last_24h),
+    };
+  }
+
+  async addWithdrawalDestination(
+    address: string,
+    label?: string,
+  ): Promise<WithdrawalDestination> {
+    return this.request<WithdrawalDestination>("/api/v1/vault/withdrawal-destinations", {
+      method: "POST",
+      body: JSON.stringify({ address, label: label || null }),
+    });
+  }
+
+  async removeWithdrawalDestination(id: string): Promise<void> {
+    await this.request<void>(
+      `/api/v1/vault/withdrawal-destinations/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    );
   }
 
   async listWalletWithdrawals(limit = 10): Promise<WalletWithdrawal[]> {

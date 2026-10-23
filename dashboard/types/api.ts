@@ -787,6 +787,27 @@ export interface WithdrawalPreflight {
   inventory_synced_at?: string | null;
   can_withdraw: boolean;
   blocking_reasons: string[];
+  /** The most the workspace may withdraw in any 24 hours, in USDC. */
+  daily_cap: number;
+  /** What the workspace's withdrawals in the last 24 hours took. */
+  withdrawn_last_24h: number;
+}
+
+/** An address the workspace may withdraw to, from `usable_from`. */
+export interface WithdrawalDestination {
+  id: string;
+  address: string;
+  label?: string | null;
+  added_at: string;
+  usable_from: string;
+}
+
+export interface WithdrawalDestinations {
+  destinations: WithdrawalDestination[];
+  /** How long after it is added an address may receive withdrawals. */
+  delay_hours: number;
+  daily_cap: number;
+  withdrawn_last_24h: number;
 }
 
 export interface WalletWithdrawal {
