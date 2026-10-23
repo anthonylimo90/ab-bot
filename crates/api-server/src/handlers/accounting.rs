@@ -448,7 +448,21 @@ pub async fn create_cash_flow(
         occurred_at: req.occurred_at.unwrap_or_else(Utc::now),
         created_by: user_id,
     };
-    Ok(Json(record_cash_flow(&state.pool, entry).await?))
+    let recorded = record_cash_flow(&state.pool, entry).await?;
+    // A withdrawal recorded here moves the breaker's drawdown references.
+    super::audit_change(
+        &state,
+        user_id,
+        ::auth::AuditAction::Custom("cash_flow_recorded".into()),
+        format!("cash_flow/{}", recorded.id),
+        serde_json::json!({
+            "event_type": recorded.event_type,
+            "amount": recorded.amount,
+            "occurred_at": recorded.occurred_at,
+        }),
+    )
+    .await;
+    Ok(Json(recorded))
 }
 
 /// Why a cash flow's sign contradicts its type: money in is positive, money

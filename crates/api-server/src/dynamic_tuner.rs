@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration as TokioDuration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wallet_tracker::MarketRegime;
 
 use risk_manager::circuit_breaker::CircuitBreaker;
@@ -1546,9 +1546,9 @@ async fn apply_startup_snapshot_to_arb_executor(
         }
     }
 
-    info!(
+    debug!(
         applied,
-        "Applied startup dynamic config snapshot to arb executor"
+        "Applied the stored dynamic config to the arb executor"
     );
     Ok(())
 }
@@ -1586,9 +1586,9 @@ async fn apply_startup_snapshot_to_quant_executor(
         }
     }
 
-    info!(
+    debug!(
         applied,
-        "Applied startup dynamic config snapshot to quant executor"
+        "Applied the stored dynamic config to the quant executor"
     );
     Ok(())
 }

@@ -2313,6 +2313,8 @@ impl AuthenticatedClobClient {
     }
 
     /// Reconstruct execution price from authenticated, confirmed trade records.
+    /// A trade that `FAILED` (settlement failed and is not retried) filled
+    /// nothing; any other status short of `CONFIRMED` is not yet evidence.
     /// Schema: github.com/Polymarket/clob-client/blob/main/src/types.ts (Trade).
     pub async fn confirmed_order_fill(&self, order: &ExchangeOrder) -> Result<(Decimal, Decimal)> {
         let invalid = || Error::Api {
@@ -2330,6 +2332,7 @@ impl AuthenticatedClobClient {
         let mut seen = std::collections::HashSet::new();
         let mut quantity = Decimal::ZERO;
         let mut value = Decimal::ZERO;
+        let mut failed = Decimal::ZERO;
         for id in &order.associate_trades {
             if !seen.insert(id) {
                 return Err(invalid());
@@ -2361,9 +2364,11 @@ impl AuthenticatedClobClient {
                 .iter()
                 .find(|v| v["id"].as_str() == Some(id))
                 .ok_or_else(invalid)?;
-            if trade["status"].as_str() != Some("CONFIRMED") {
-                return Err(invalid());
-            }
+            let settled = match trade["status"].as_str() {
+                Some("CONFIRMED") => true,
+                Some("FAILED") => false,
+                _ => return Err(invalid()),
+            };
             let mut add = |q: &serde_json::Value, p: &serde_json::Value| -> Result<()> {
                 let q = q
                     .as_str()
@@ -2378,8 +2383,12 @@ impl AuthenticatedClobClient {
                 if q <= Decimal::ZERO || p <= Decimal::ZERO || p > Decimal::ONE {
                     return Err(invalid());
                 }
-                quantity += q;
-                value += q * p;
+                if settled {
+                    quantity += q;
+                    value += q * p;
+                } else {
+                    failed += q;
+                }
                 Ok(())
             };
             if trade["taker_order_id"].as_str() == Some(&order.id) {
@@ -2394,8 +2403,12 @@ impl AuthenticatedClobClient {
                 }
             }
         }
-        if quantity != expected {
+        // The matched total must be accounted for, failed trades included.
+        if quantity + failed != expected {
             return Err(invalid());
+        }
+        if quantity.is_zero() {
+            return Ok((Decimal::ZERO, Decimal::ZERO));
         }
         Ok((quantity, value / quantity))
     }

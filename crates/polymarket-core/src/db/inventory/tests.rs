@@ -51,7 +51,7 @@ async fn failed_later_inventory_batch_preserves_previous_snapshot(pool: PgPool) 
 
 #[sqlx::test(migrations = false)]
 async fn stale_orphan_flags_cannot_sell_manual_or_partially_exited_inventory(pool: PgPool) {
-    pool.execute("CREATE TABLE positions(id UUID PRIMARY KEY,market_id TEXT,execution_mode TEXT,wallet_address TEXT,held_yes_qty NUMERIC,held_no_qty NUMERIC,state SMALLINT DEFAULT 1); CREATE TABLE orders(execution_mode TEXT,wallet_address TEXT,market_id TEXT,outcome TEXT,status TEXT); CREATE TABLE manual_inventory(execution_mode TEXT,wallet_address TEXT,market_id TEXT,outcome TEXT,quantity NUMERIC)").await.unwrap();
+    pool.execute("CREATE TABLE positions(id UUID PRIMARY KEY,market_id TEXT,execution_mode TEXT,wallet_address TEXT,held_yes_qty NUMERIC,held_no_qty NUMERIC,state SMALLINT DEFAULT 1,resolution_winner TEXT); CREATE TABLE orders(execution_mode TEXT,wallet_address TEXT,market_id TEXT,outcome TEXT,status TEXT); CREATE TABLE manual_inventory(execution_mode TEXT,wallet_address TEXT,market_id TEXT,outcome TEXT,quantity NUMERIC)").await.unwrap();
     let schema = include_str!("../../../../../migrations/057_wallet_inventory.sql");
     pool.execute(schema.split("CREATE TRIGGER").next().unwrap())
         .await
@@ -60,6 +60,8 @@ async fn stale_orphan_flags_cannot_sell_manual_or_partially_exited_inventory(poo
     // A held position's market whose outcome could not be read, a token of
     // no known market, and legacy manual inventory of an unverified wallet.
     pool.execute("INSERT INTO positions(id,market_id,execution_mode,wallet_address,held_yes_qty,held_no_qty) VALUES(gen_random_uuid(),'unread','live','wallet',6,0); INSERT INTO manual_inventory VALUES('unknown','unknown','legacy','no',6); INSERT INTO wallet_inventory(wallet_address,token_id,condition_id,outcome,quantity,is_orphan) VALUES ('wallet','5','unread',NULL,6,TRUE),('wallet','6',NULL,'yes',6,TRUE),('wallet','7','legacy','no',6,TRUE)").await.unwrap();
+    // A market a position saw resolve: nothing to sell into.
+    pool.execute("INSERT INTO positions(id,market_id,execution_mode,wallet_address,held_yes_qty,held_no_qty,state,resolution_winner) VALUES(gen_random_uuid(),'resolved','live','wallet',0,0,4,'yes'); INSERT INTO wallet_inventory(wallet_address,token_id,condition_id,outcome,quantity,is_orphan) VALUES ('wallet','8','resolved','yes',6,TRUE)").await.unwrap();
     let repo = WalletInventoryRepository::new(pool);
     let recoverable = repo.get_recoverable_orphans("wallet", 0).await.unwrap();
     assert_eq!(recoverable.len(), 1);

@@ -1747,9 +1747,10 @@ async fn an_arbitrage_position_pays_the_taker_fee_of_each_fill(pool: PgPool) {
     assert_eq!(stored.fees_paid, Decimal::new(168, 3));
     assert_eq!(stored.taker_fees, p.taker_fees);
 
-    // Marked at a 0.50 bid: 5 − 4, less the fee paid so far.
+    // Marked at a 0.50 bid: 5 − 4, less the fee paid so far and the 0.175
+    // the sale at that bid would pay: what selling there realizes.
     p.update_pnl(Decimal::new(50, 2), Decimal::ZERO, Decimal::new(2, 2));
-    assert_eq!(p.unrealized_pnl, Decimal::new(832, 3));
+    assert_eq!(p.unrealized_pnl, Decimal::new(657, 3));
 
     // Sold at 0.50: 10 × 0.07 × 0.25 = 0.175 more.
     p.state = PositionState::Closing;

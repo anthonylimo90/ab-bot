@@ -279,6 +279,7 @@ async fn reserve_order(
 pub async fn place_order(
     _access: WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<auth::Claims>,
     Json(mut request): Json<PlaceOrderRequest>,
 ) -> ApiResult<Json<OrderResponse>> {
     if request.order_type == OrderType::Market && request.time_in_force == "GTC" {
@@ -293,7 +294,22 @@ pub async fn place_order(
     // exchange must have its outcome recorded, not be dropped mid-request.
     tokio::spawn(async move {
         let _operation = operation;
-        reserve_and_execute_order(state, request).await
+        let requested = serde_json::to_value(&request).unwrap_or_default();
+        let result = reserve_and_execute_order(state.clone(), request).await;
+        super::audit_change(
+            &state,
+            Uuid::parse_str(&claims.sub).unwrap_or_default(),
+            ::auth::AuditAction::Custom("order_placed".into()),
+            "orders",
+            serde_json::json!({
+                "request": requested,
+                "order_id": result.as_ref().ok().map(|order| order.id),
+                "status": result.as_ref().ok().map(|order| order.status),
+                "error": result.as_ref().err().map(ToString::to_string),
+            }),
+        )
+        .await;
+        result
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Order task failed: {e}")))?
@@ -349,6 +365,18 @@ async fn execute_reserved_order(
         .await?
         .map(|flags| flags.live_trading_enabled)
         .ok_or_else(|| ApiError::NotFound("Canonical workspace not found".into()))?;
+
+    // The order took this process's live mode when it was reserved; a
+    // process that has not yet taken up an operator switching live trading
+    // off (it re-reads every few seconds) must not send it.
+    if origin.execution_mode == "live"
+        && !workspace_live_enabled
+        && !crate::runtime_sync::env_enabled("LIVE_TRADING")
+    {
+        return Err(ApiError::Conflict(
+            "Live trading is switched off; nothing was sent".into(),
+        ));
+    }
 
     if workspace_live_enabled {
         if !state.order_executor.is_live() {
@@ -862,7 +890,27 @@ fn parse_order_status(s: &str) -> OrderStatus {
 pub async fn cancel_order(
     _access: WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<auth::Claims>,
     Path(order_id): Path<Uuid>,
+) -> ApiResult<Json<OrderResponse>> {
+    let result = cancel_order_inner(&state, order_id).await;
+    super::audit_change(
+        &state,
+        Uuid::parse_str(&claims.sub).unwrap_or_default(),
+        ::auth::AuditAction::Custom("order_cancel_requested".into()),
+        format!("orders/{order_id}"),
+        serde_json::json!({
+            "status": result.as_ref().ok().map(|order| order.status),
+            "error": result.as_ref().err().map(ToString::to_string),
+        }),
+    )
+    .await;
+    result
+}
+
+async fn cancel_order_inner(
+    state: &Arc<AppState>,
+    order_id: Uuid,
 ) -> ApiResult<Json<OrderResponse>> {
     let row = load_order(&state.pool, order_id).await?;
     if matches!(row.status.as_str(), "filled" | "rejected" | "expired") {
@@ -944,10 +992,13 @@ pub(crate) async fn reject_never_executed_manual_intent(
 }
 
 /// Apply a terminal authenticated snapshot and release its fence atomically.
+/// `quantity` is what confirmed trades filled: matched trades that failed to
+/// settle are not part of it.
 pub(crate) async fn reconcile_manual_intent(
     pool: &PgPool,
     id: Uuid,
     snapshot: &polymarket_core::api::clob::ExchangeOrder,
+    quantity: Decimal,
     price: Decimal,
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
@@ -958,7 +1009,6 @@ pub(crate) async fn reconcile_manual_intent(
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-    let quantity = snapshot.size_matched.parse::<Decimal>()?;
     let size = snapshot.original_size.parse::<Decimal>()?;
     if row.execution_mode != "live" || !snapshot_fits(&row, size, quantity) {
         anyhow::bail!("Snapshot conflicts with stored manual order");

@@ -182,6 +182,19 @@ pub async fn run_recovery(
         ));
     }
 
+    // Run apart from the request: a client that disconnects must not cut a
+    // run off between a sale and its booking (the breaker, the audit log).
+    let user_id = Uuid::parse_str(&claims.sub).ok();
+    tokio::spawn(run_recovery_pass(state, workspace_id, user_id))
+        .await
+        .map_err(|error| ApiError::Internal(format!("recovery run failed: {error}")))?
+}
+
+async fn run_recovery_pass(
+    state: Arc<AppState>,
+    workspace_id: Uuid,
+    user_id: Option<Uuid>,
+) -> ApiResult<Json<RecoveryRunResponse>> {
     force_refresh_canonical_wallet_inventory(state.as_ref())
         .await
         .map_err(map_anyhow)?;
@@ -274,7 +287,7 @@ pub async fn run_recovery(
         _ => Ok(()),
     };
     // Recorded whatever came of the run: requeues and sales already happened.
-    if let Ok(user_id) = Uuid::parse_str(&claims.sub) {
+    if let Some(user_id) = user_id {
         super::audit_change(
             &state,
             user_id,
@@ -505,18 +518,23 @@ async fn runtime_snapshot(state: &AppState, workspace_id: Uuid) -> ApiResult<Run
     .ok_or_else(|| ApiError::NotFound("Workspace not found".into()))?;
 
     let now_epoch = Utc::now().timestamp();
-    let heartbeat_max_age_secs = 120_i64;
+    let exit_config = match &state.exit_handler_config {
+        Some(config) => config.read().await.clone(),
+        None => ExitHandlerConfig {
+            enabled: flags.exit_handler_enabled,
+            ..ExitHandlerConfig::from_env()
+        },
+    };
     let exit_heartbeat_ts = state
         .exit_handler_heartbeat
         .load(std::sync::atomic::Ordering::Relaxed);
-    let exit_handler_alive =
-        exit_heartbeat_ts > 0 && (now_epoch - exit_heartbeat_ts) < heartbeat_max_age_secs;
+    // The same rule live entries are held to.
+    let exit_handler_alive = exit_heartbeat_ts > 0
+        && now_epoch - exit_heartbeat_ts
+            <= crate::exit_handler::heartbeat_stale_after_secs(&exit_config);
     let live_mode = state.order_executor.is_live();
     let live_ready = state.order_executor.is_live_ready().await;
-    let exit_handler_enabled = match &state.exit_handler_config {
-        Some(config) => config.read().await.enabled,
-        None => flags.exit_handler_enabled,
-    };
+    let exit_handler_enabled = exit_config.enabled;
 
     Ok(RuntimeSnapshot {
         live_running: live_mode && live_ready,

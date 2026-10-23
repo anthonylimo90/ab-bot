@@ -1250,8 +1250,36 @@ async fn load_market_prices(
     .bind(&market_ids)
     .fetch_all(pool)
     .await?;
+    let mut prices: HashMap<String, MarketPriceRow> =
+        rows.into_iter().map(|row| (row.id.clone(), row)).collect();
 
-    Ok(rows.into_iter().map(|row| (row.id.clone(), row)).collect())
+    // A market a position saw resolve pays its winning token a dollar and its
+    // losing one nothing, whatever price was last stored: shares still to be
+    // redeemed are worth that, not a stale mark (or none, read as zero).
+    let resolved: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT ON (market_id) market_id, LOWER(resolution_winner) \
+         FROM positions WHERE market_id = ANY($1) AND resolution_winner IS NOT NULL \
+         ORDER BY market_id, last_updated DESC",
+    )
+    .bind(&market_ids)
+    .fetch_all(pool)
+    .await?;
+    for (market_id, winner) in resolved {
+        let (yes, no) = match winner.as_str() {
+            "yes" => (Decimal::ONE, Decimal::ZERO),
+            "no" => (Decimal::ZERO, Decimal::ONE),
+            _ => continue,
+        };
+        prices.insert(
+            market_id.clone(),
+            MarketPriceRow {
+                id: market_id,
+                yes_price: Some(yes),
+                no_price: Some(no),
+            },
+        );
+    }
+    Ok(prices)
 }
 
 async fn load_expected_sell_price(

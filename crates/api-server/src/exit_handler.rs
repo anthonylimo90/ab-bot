@@ -42,11 +42,77 @@ enum ExitBidStatus {
 pub struct ExitReadiness {
     config: Arc<RwLock<ExitHandlerConfig>>,
     heartbeat: Arc<AtomicI64>,
+    pool: Option<PgPool>,
+    /// The last look for live exits that keep failing, and its answer.
+    stuck_exits: Arc<std::sync::Mutex<Option<(std::time::Instant, bool)>>>,
 }
+
+/// How old the exit handler's heartbeat may be before the handler counts as
+/// not running: three exit polls, and never under five minutes (a pass with
+/// many exits and resolutions to check takes time).
+pub(crate) fn heartbeat_stale_after_secs(cfg: &ExitHandlerConfig) -> i64 {
+    (cfg.exit_poll_interval_secs.saturating_mul(3)).max(300) as i64
+}
+
+/// Live exits failing this many times in a row count as exits not working.
+const STUCK_EXIT_FAILURES: i32 = 3;
+/// A live exit waiting this long without a step counts as stuck.
+const STUCK_EXIT_MINUTES: i32 = 30;
+/// How long the answer to the stuck-exit look is reused.
+const STUCK_EXIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ExitReadiness {
     pub fn new(config: Arc<RwLock<ExitHandlerConfig>>, heartbeat: Arc<AtomicI64>) -> Self {
-        Self { config, heartbeat }
+        Self {
+            config,
+            heartbeat,
+            pool: None,
+            stuck_exits: Default::default(),
+        }
+    }
+
+    /// Also refuse live entries while live exits keep failing (see
+    /// [`Self::refusal`]), read from `pool`.
+    pub fn watching_exits(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Whether a live position's exit has failed [`STUCK_EXIT_FAILURES`]
+    /// times in a row, or has waited [`STUCK_EXIT_MINUTES`] without a step:
+    /// the handler runs, but its exits are not getting out.
+    async fn exits_stuck(&self) -> bool {
+        let Some(pool) = &self.pool else {
+            return false;
+        };
+        if let Some((at, stuck)) = *self.stuck_exits.lock().unwrap_or_else(|e| e.into_inner()) {
+            if at.elapsed() < STUCK_EXIT_RECHECK {
+                return stuck;
+            }
+        }
+        let stuck = match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM positions WHERE execution_mode = 'live' \
+             AND ((state = 6 AND retry_count >= $1) \
+                  OR (state IN (2, 3) AND last_updated < NOW() - make_interval(mins => $2))))",
+        )
+        .bind(STUCK_EXIT_FAILURES)
+        .bind(STUCK_EXIT_MINUTES)
+        .fetch_one(pool)
+        .await
+        {
+            Ok(stuck) => stuck,
+            Err(error) => {
+                // Unknown is not "working": entries wait for the next look.
+                warn!(%error, "Could not check for stuck live exits");
+                true
+            }
+        };
+        if stuck {
+            warn!("Live exits keep failing; new live entries wait until they get out");
+        }
+        *self.stuck_exits.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((std::time::Instant::now(), stuck));
+        stuck
     }
 
     /// Why a live entry may not start now, if it may not.
@@ -57,9 +123,13 @@ impl ExitReadiness {
         }
         // The handler marks itself alive at least every exit poll; a pass
         // that panicked clears the mark.
-        let stale_after = (cfg.exit_poll_interval_secs.saturating_mul(3)).max(300) as i64;
+        let stale_after = heartbeat_stale_after_secs(&cfg);
         let age = Utc::now().timestamp() - self.heartbeat.load(Ordering::Relaxed);
-        (age > stale_after).then_some("exit_handler_not_running")
+        if age > stale_after {
+            return Some("exit_handler_not_running");
+        }
+        drop(cfg);
+        self.exits_stuck().await.then_some("live_exits_failing")
     }
 
     /// The loss, as a fraction of cost, at which a quant position is sold.
@@ -2298,6 +2368,53 @@ mod strategy_exit_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn live_entries_wait_while_live_exits_keep_failing(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE positions (execution_mode TEXT, state SMALLINT, \
+             retry_count INTEGER, last_updated TIMESTAMPTZ)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let config = Arc::new(RwLock::new(ExitHandlerConfig {
+            enabled: true,
+            ..ExitHandlerConfig::from_env()
+        }));
+        let heartbeat = Arc::new(AtomicI64::new(Utc::now().timestamp()));
+        let fresh =
+            || ExitReadiness::new(config.clone(), heartbeat.clone()).watching_exits(pool.clone());
+        assert_eq!(fresh().refusal().await, None);
+
+        for (mode, state, retries, minutes_ago, stuck) in [
+            ("live", 6, 2, 0, false),  // failed twice: still trying
+            ("paper", 6, 9, 0, false), // not live
+            ("live", 2, 0, 5, false),  // queued a moment ago
+            ("live", 6, 3, 0, true),   // failed three times in a row
+            ("live", 3, 0, 45, true),  // closing with no step for 45 minutes
+        ] {
+            sqlx::query("DELETE FROM positions")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO positions VALUES ($1, $2, $3, NOW() - make_interval(mins => $4))",
+            )
+            .bind(mode)
+            .bind(state as i16)
+            .bind(retries)
+            .bind(minutes_ago)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                fresh().refusal().await,
+                stuck.then_some("live_exits_failing"),
+                "{mode} {state} {retries} {minutes_ago}"
+            );
+        }
+    }
 
     #[test]
     fn test_config_default() {

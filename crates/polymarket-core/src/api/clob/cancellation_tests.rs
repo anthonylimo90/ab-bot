@@ -201,3 +201,103 @@ async fn an_order_is_never_signed_for_a_guessed_exchange() {
         Some(&false)
     );
 }
+
+/// Serves `/data/trades?id=...` from `trades` (by id) until dropped.
+async fn trade_server(trades: Vec<serde_json::Value>) -> ClobClient {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8_lossy(&bytes);
+            let id = request
+                .split_once("id=")
+                .and_then(|(_, rest)| rest.split([' ', '&']).next())
+                .unwrap_or_default()
+                .to_string();
+            let rows: Vec<_> = trades
+                .iter()
+                .filter(|trade| trade["id"].as_str() == Some(id.as_str()))
+                .cloned()
+                .collect();
+            let body = serde_json::json!({ "data": rows }).to_string();
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    });
+    let mut base = ClobClient::new(Some(format!("http://{address}")), None);
+    base.http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    base
+}
+
+#[tokio::test]
+async fn a_failed_trade_fills_nothing_and_an_unsettled_one_is_not_yet_evidence() {
+    let trade = |id: &str, status: &str, size: &str, price: &str| {
+        serde_json::json!({
+            "id": id, "status": status, "taker_order_id": "order",
+            "size": size, "price": price, "maker_orders": [],
+        })
+    };
+    let order = |matched: &str, trades: &[&str]| ExchangeOrder {
+        associate_trades: trades.iter().map(|id| id.to_string()).collect(),
+        id: "order".into(),
+        status: "MATCHED".into(),
+        original_size: "10".into(),
+        size_matched: matched.into(),
+    };
+    let client = |base| {
+        AuthenticatedClobClient::with_credentials(
+            base,
+            OrderSigner::new(format!("{:064x}", 3).parse().unwrap()),
+            ApiCredentials::new("key".into(), "c2VjcmV0".into(), "pass".into()),
+        )
+    };
+    let base = trade_server(vec![
+        trade("ok", "CONFIRMED", "6", "0.4"),
+        trade("failed", "FAILED", "4", "0.5"),
+        trade("retrying", "RETRYING", "4", "0.5"),
+    ])
+    .await;
+    let client = client(base);
+    // Six confirmed, four failed: six filled at the confirmed price.
+    assert_eq!(
+        client
+            .confirmed_order_fill(&order("10", &["ok", "failed"]))
+            .await
+            .unwrap(),
+        (Decimal::from(6), Decimal::new(4, 1))
+    );
+    // Every trade failed: nothing filled.
+    assert_eq!(
+        client
+            .confirmed_order_fill(&order("4", &["failed"]))
+            .await
+            .unwrap(),
+        (Decimal::ZERO, Decimal::ZERO)
+    );
+    // A trade still settling is no evidence yet, nor are totals that differ.
+    assert!(client
+        .confirmed_order_fill(&order("10", &["ok", "retrying"]))
+        .await
+        .is_err());
+    assert!(client
+        .confirmed_order_fill(&order("10", &["ok"]))
+        .await
+        .is_err());
+}

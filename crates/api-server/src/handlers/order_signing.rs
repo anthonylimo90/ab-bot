@@ -360,6 +360,8 @@ pub async fn prepare_order(
 ) -> ApiResult<Json<PrepareOrderResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    // Trading from a wallet needs the same workspace permission as any order.
+    crate::workspace_scope::authorize_workspace_claims(&state.pool, &claims, true).await?;
 
     // Validate side
     let side_str = req.side.to_uppercase();
@@ -535,6 +537,7 @@ pub async fn submit_order(
 ) -> ApiResult<Json<SubmitOrderResponse>> {
     let user_id =
         Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
+    crate::workspace_scope::authorize_workspace_claims(&state.pool, &claims, true).await?;
 
     let pending_order_id = Uuid::parse_str(&req.pending_order_id)
         .map_err(|_| ApiError::BadRequest("Invalid pending order ID".into()))?;
@@ -674,9 +677,10 @@ pub async fn submit_order(
     // Runs to the end even if the client goes away, so the exchange's answer
     // is recorded rather than dropped mid-request.
     let submit_state = state.clone();
+    let maker = pending_order.maker_address.clone();
     let response = tokio::spawn(async move {
         let _operation = operation;
-        submit_state
+        let response = submit_state
             .order_executor
             .submit_wallet_order(
                 &submit_state.clob_client,
@@ -684,7 +688,20 @@ pub async fn submit_order(
                 signed_order,
                 &credentials,
             )
-            .await
+            .await;
+        super::audit_change(
+            &submit_state,
+            user_id,
+            ::auth::AuditAction::Custom("wallet_order_submitted".into()),
+            format!("wallet_orders/{pending_order_id}"),
+            serde_json::json!({
+                "maker": maker,
+                "accepted": response.as_ref().map(|answer| answer.success).ok(),
+                "error": response.as_ref().err().map(ToString::to_string),
+            }),
+        )
+        .await;
+        response
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Order task failed: {e}")))?;
@@ -1000,6 +1017,8 @@ mod amount_tests {
         .await
         .unwrap();
         let user = crate::workspace_scope::test_fixture::user(&pool, auth::UserRole::Trader).await;
+        let workspace = crate::workspace_scope::test_fixture::workspace(&pool, "w", 0).await;
+        crate::workspace_scope::test_fixture::add_member(&pool, workspace, user, "member").await;
         let state = AppState::for_tests(pool.clone());
         let expires_at = Utc::now() + Duration::hours(1);
         let submit = |id: Uuid| {

@@ -309,8 +309,10 @@ pub struct CircuitBreaker {
 
 /// How often a follower re-reads the stored state.
 const FOLLOWER_SYNC: std::time::Duration = std::time::Duration::from_secs(2);
-/// How often the leader looks for an operator change made elsewhere.
-pub(crate) const LEADER_SYNC: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often the leader looks for an operator change made elsewhere (one
+/// primary-key read): a trip made through another process holds here within
+/// about this long.
+pub(crate) const LEADER_SYNC: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Take an operator's change (trip, reset) from `stored` into `state`,
 /// keeping the counters the leader has kept since.
@@ -853,7 +855,11 @@ impl CircuitBreaker {
         change: impl FnOnce(&Self, &mut CircuitBreakerState),
     ) -> Result<()> {
         if !self.is_leader() {
-            self.mirror().await?;
+            // Best effort: the change still applies (and is stored, the
+            // database permitting) on a view that could not be refreshed.
+            if let Err(error) = self.mirror().await {
+                warn!(%error, "Could not re-read the circuit breaker before an operator change");
+            }
         }
         let mut state = self.state.write().await;
         change(self, &mut state);

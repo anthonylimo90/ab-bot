@@ -189,6 +189,11 @@ impl WalletInventoryRepository {
               AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.market_id=wallet_inventory.condition_id
                   AND p.execution_mode<>'paper' AND (LOWER(p.wallet_address)=LOWER(wallet_inventory.wallet_address) OR p.execution_mode='unknown')
                   AND (p.state=0 OR (wallet_inventory.outcome='yes' AND p.held_yes_qty>0) OR (wallet_inventory.outcome='no' AND p.held_no_qty>0)))
+              -- A resolved market has no book to sell into: its winning
+              -- tokens are redeemed for a dollar, its losing ones are worth
+              -- nothing.
+              AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.market_id=wallet_inventory.condition_id
+                  AND p.resolution_winner IS NOT NULL)
               AND (
                     last_exit_attempted_at IS NULL
                     OR last_exit_attempted_at <= NOW() - ($2 * INTERVAL '1 second')

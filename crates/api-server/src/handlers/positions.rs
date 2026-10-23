@@ -590,6 +590,7 @@ pub async fn get_position(
 pub async fn close_position(
     _access: WorkspaceTradeAccess,
     State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<auth::Claims>,
     Path(position_id): Path<Uuid>,
     Json(request): Json<ClosePositionRequest>,
 ) -> ApiResult<Json<PositionResponse>> {
@@ -634,6 +635,22 @@ pub async fn close_position(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound(format!("Open position {} not found", position_id)))?;
 
+    // A queued exit runs only while the exit handler is on: say so rather
+    // than accept an exit that would wait unseen.
+    let exit_handler_on =
+        crate::runtime_sync::canonical_workspace_exit_handler_enabled(&state.pool).await?
+            || crate::runtime_sync::env_enabled("EXIT_HANDLER_ENABLED");
+    if !exit_handler_on
+        && !matches!(
+            position.state,
+            PositionState::ExitReady | PositionState::Closing
+        )
+    {
+        return Err(ApiError::Conflict(
+            "The exit handler is off, so a queued exit would not run; turn it on first".into(),
+        ));
+    }
+
     let execution_mode = current_execution_mode(state.as_ref()).await;
     let (strategy, source_label) = trade_event_labels(row.source);
     let ctx = EventContext {
@@ -651,16 +668,9 @@ pub async fn close_position(
                 .await
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         }
-        PositionState::ExitReady | PositionState::Closing => {
-            // Already in exit flow — just touch the timestamp and persist
-            position.touch();
-            state
-                .position_service
-                .repo()
-                .update(&mut position)
-                .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-        }
+        // Already in the exit flow. Nothing is written: a write would bump
+        // the row's version under a sale in progress and fail its booking.
+        PositionState::ExitReady | PositionState::Closing => {}
         PositionState::ExitFailed => {
             let recovered = state
                 .position_service
@@ -716,6 +726,19 @@ pub async fn close_position(
             )))
         }
     }
+
+    super::audit_change(
+        &state,
+        Uuid::parse_str(&claims.sub).unwrap_or_default(),
+        ::auth::AuditAction::ManualExit,
+        format!("position/{position_id}"),
+        serde_json::json!({
+            "market_id": row.market_id,
+            "state": position_state_label(position.state),
+            "execution_mode": position.execution_mode,
+        }),
+    )
+    .await;
 
     // Publish position update via WebSocket
     let update = PositionUpdate {

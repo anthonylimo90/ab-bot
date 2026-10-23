@@ -434,7 +434,13 @@ impl ApiServer {
         let exit_readiness = crate::exit_handler::ExitReadiness::new(
             exit_handler_config.clone(),
             state.exit_handler_heartbeat.clone(),
-        );
+        )
+        .watching_exits(state.pool.clone());
+
+        // Every process takes up what operators change through any of them:
+        // the leader for its trading, another for the checks its own
+        // requests make (manual orders, breaker status).
+        spawn_operator_sync(state.clone());
 
         // ── Trading: run by the trading leader only ──
         // Another API process (the next version, while a deploy overlaps the
@@ -447,20 +453,28 @@ impl ApiServer {
             let arb_config_arc = arb_config_arc.clone();
             let quant_config = quant_config.clone();
             tokio::spawn(async move {
-                let leadership = trading_leader::acquire(&state.pool).await;
+                let executor = state.order_executor.clone();
+                let Some(leadership) =
+                    trading_leader::acquire(&state.pool, || executor.is_draining()).await
+                else {
+                    return;
+                };
+                if state.order_executor.is_draining() {
+                    // Shutting down: let the next process lead.
+                    return;
+                }
                 if let Err(error) = take_over_trading(&state).await {
                     tracing::error!(%error, "Could not take over trading; stopping");
                     lost.notify_one();
                     return;
                 }
                 spawn_trading_tasks(
-                    state.clone(),
+                    state,
                     arb_config_arc,
                     exit_handler_config,
                     quant_config,
                     exit_readiness,
                 );
-                spawn_operator_sync(state);
                 leadership.watch(lost);
             });
         }
@@ -554,7 +568,6 @@ impl ApiServer {
         tokio::pin!(server);
 
         let mut server_error = None;
-        let mut leadership_failed = false;
         let signalled = tokio::select! {
             result = &mut server => {
                 if let Err(error) = result {
@@ -565,12 +578,15 @@ impl ApiServer {
             }
             () = stop.recv() => true,
             () = leadership_lost.notified() => {
-                // Another process may lead now: store nothing more, drain,
-                // and exit so a restart waits its turn.
-                tracing::error!("Trading leadership lost; draining and stopping");
+                // Another process may lead within seconds. Stop at once
+                // rather than drain beside it: what was in flight is
+                // journaled, and the next leader's reconcilers book it
+                // (into the circuit breaker too), which this process could
+                // no longer store. A restart then waits its turn.
+                tracing::error!("Trading leadership lost; stopping now");
                 state.circuit_breaker.step_down();
-                leadership_failed = true;
-                true
+                state.order_executor.begin_draining();
+                return Err(anyhow::anyhow!("trading leadership lost"));
             }
         };
 
@@ -610,7 +626,6 @@ impl ApiServer {
         }
         match server_error {
             Some(error) => Err(error.into()),
-            None if leadership_failed => Err(anyhow::anyhow!("trading leadership lost")),
             None => Ok(()),
         }
     }
@@ -780,9 +795,9 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// While leading, take up every few seconds what operators change through
-/// any API process: circuit breaker trips, resets and limits, and the
-/// workspace's service toggles.
+/// Take up every few seconds what operators change through any API process:
+/// circuit breaker trips, resets and limits, the workspace's service
+/// toggles and the stored dynamic config.
 fn spawn_operator_sync(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -805,6 +820,12 @@ async fn sync_operator_settings(state: &AppState) {
         Err(error) => tracing::warn!(%error, "Could not re-read the circuit breaker limits"),
     }
     crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
+    crate::dynamic_tuner::apply_dynamic_config_snapshot(
+        &state.pool,
+        state.arb_executor_config.as_ref(),
+        state.quant_executor_config.as_ref(),
+    )
+    .await;
 }
 
 /// How long open HTTP requests may finish after a shutdown request.

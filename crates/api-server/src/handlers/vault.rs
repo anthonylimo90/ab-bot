@@ -1631,6 +1631,12 @@ async fn submit_withdrawal(
         warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not record a withdrawal's broadcast");
     }
     lock.release().await;
+    if status == "submitted" {
+        // The transfer is on its way: recorded now, whatever settles it later.
+        request
+            .audit(&state, withdrawal_id, "submitted", None)
+            .await;
+    }
 
     // Wait briefly for the final receipt; the reconciler settles anything slower.
     let mut confirmed_at = None;

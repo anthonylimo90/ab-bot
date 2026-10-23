@@ -179,6 +179,21 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         tracing::warn!(%error, "Order journal housekeeping failed; reconciling intents anyway");
     }
     let Some(wallet) = wallet else {
+        // Without the signer no order can be read back from the exchange;
+        // say so when journaled orders are waiting on it.
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution_intents WHERE status IN ('submitting','unknown','acknowledged') \
+             AND updated_at < NOW() - INTERVAL '10 minutes'",
+        )
+        .fetch_one(&state.pool)
+        .await?;
+        if waiting > 0 {
+            tracing::warn!(
+                waiting,
+                "Journaled orders wait to be reconciled, but the trading wallet's signer is not \
+                 loaded"
+            );
+        }
         return Ok(());
     };
     // Every intent of the trading wallet is reconciled, including orphan
@@ -345,6 +360,7 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
                     &state.pool,
                     intent.id,
                     snapshot,
+                    outcome.quantity,
                     outcome.price,
                 )
                 .await

@@ -310,9 +310,19 @@ impl Position {
                 }
                 ExitStrategy::HoldToResolution => self.held_yes_qty.min(self.held_no_qty),
             };
+            // A share-based position sold at the bids pays the taker fee on
+            // that sale too (the flat model's charge already covers it).
+            let exit_fees = match (self.fee_model, self.exit_strategy, self.taker_fees) {
+                (PositionFeeModel::ShareBased, ExitStrategy::ExitOnCorrection, Some(terms)) => {
+                    terms.fee_per_share(yes_bid) * self.held_yes_qty
+                        + terms.fee_per_share(no_bid) * self.held_no_qty
+                }
+                _ => Decimal::ZERO,
+            };
             self.unrealized_pnl = proceeds + remaining
                 - entry_cost
-                - self.fee_charges(fee, entry_cost + proceeds + remaining);
+                - self.fee_charges(fee, entry_cost + proceeds + remaining)
+                - exit_fees;
             self.last_updated = Utc::now();
             return;
         }
@@ -873,6 +883,15 @@ mod tests {
             pos.charge_taker_fee(Decimal::new(99, 2), Decimal::from(2))
         };
         assert_eq!(free, Decimal::ZERO);
+
+        // A live mark counts the fee the sale at the bid would pay.
+        pos.execution_mode = "live".into();
+        pos.held_yes_qty = Decimal::from(2);
+        pos.yes_entry_price = Decimal::new(50, 2);
+        pos.fees_paid = Decimal::ZERO;
+        pos.update_pnl(Decimal::new(50, 2), Decimal::ZERO, Decimal::new(2, 2));
+        // Even at the bid: 0.07 x 0.5 x 0.5 = 0.0175 a share on the way out.
+        assert_eq!(pos.unrealized_pnl, Decimal::new(-35, 3));
     }
 
     #[test]

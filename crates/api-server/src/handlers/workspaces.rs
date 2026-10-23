@@ -904,15 +904,16 @@ pub async fn update_workspace(
     log_change!(exit_handler_enabled);
     log_change!(inactivity_days);
 
-    state.audit_logger.log_user_action(
-        &claims.sub,
+    // Recorded durably: this is where live trading, the exit handler and the
+    // arb executor are switched on and off.
+    super::audit_change(
+        &state,
+        user_id,
         AuditAction::Custom("workspace_updated".to_string()),
-        &workspace_id.to_string(),
-        serde_json::json!({
-            "updated_by": &claims.sub,
-            "changes": change_details,
-        }),
-    );
+        format!("workspace/{workspace_id}"),
+        serde_json::json!({ "changes": change_details }),
+    )
+    .await;
 
     get_workspace(
         State(state),
@@ -2406,8 +2407,15 @@ pub async fn get_service_status(
     let exit_heartbeat_ts = state
         .exit_handler_heartbeat
         .load(std::sync::atomic::Ordering::Relaxed);
+    // The exit handler is held to the rule live entries use.
+    let exit_stale_after = match &state.exit_handler_config {
+        Some(config) => crate::exit_handler::heartbeat_stale_after_secs(&*config.read().await),
+        None => crate::exit_handler::heartbeat_stale_after_secs(
+            &crate::exit_handler::ExitHandlerConfig::from_env(),
+        ),
+    };
     let exit_task_alive =
-        exit_heartbeat_ts > 0 && (now_epoch - exit_heartbeat_ts) < heartbeat_max_age_secs;
+        exit_heartbeat_ts > 0 && (now_epoch - exit_heartbeat_ts) <= exit_stale_after;
 
     // Check live trading using actual executor mode/readiness.
     let live_mode = state.order_executor.is_live();
@@ -2930,11 +2938,13 @@ pub async fn update_opportunity_selection_settings(
         }),
     )
     .await;
+    // All of the request's keys are stored together, or none are.
+    let mut tx = state.pool.begin().await?;
     for (key, value, reason) in &updates {
         let old_value: Option<Decimal> =
             sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
                 .bind(key)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
         let (min_value, max_value, max_step_pct) =
@@ -2970,7 +2980,7 @@ pub async fn update_opportunity_selection_settings(
         .bind(max_value)
         .bind(max_step_pct)
         .bind(reason)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -2984,18 +2994,20 @@ pub async fn update_opportunity_selection_settings(
         .bind(old_value)
         .bind(clamped)
         .bind(reason)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     }
 
-    publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref())
-        .await
-        .map_err(|error| {
-            ApiError::Internal(format!(
-                "Failed publishing dynamic config updates to runtime subscribers: {}",
-                error
-            ))
-        })?;
+    tx.commit().await?;
+
+    // Running executors take the values from Redis at once; failing that,
+    // every process re-reads the stored config within seconds.
+    if let Err(error) = publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref()).await {
+        tracing::warn!(
+            %error,
+            "Could not publish dynamic config updates; processes take them from the database"
+        );
+    }
 
     // Return fresh status projection
     let dynamic_rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(
@@ -3281,11 +3293,13 @@ pub async fn update_arb_executor_config(
         }),
     )
     .await;
+    // All of the request's keys are stored together, or none are.
+    let mut tx = state.pool.begin().await?;
     for (key, value, reason) in &updates {
         let old_value: Option<Decimal> =
             sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
                 .bind(key)
-                .fetch_optional(&state.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
 
         let (min_value, max_value, max_step_pct) =
@@ -3317,7 +3331,7 @@ pub async fn update_arb_executor_config(
         .bind(max_value)
         .bind(max_step_pct)
         .bind(reason)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
 
         sqlx::query(
@@ -3331,19 +3345,21 @@ pub async fn update_arb_executor_config(
         .bind(old_value)
         .bind(*value)
         .bind(reason)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     }
 
     // Publish to Redis for live hot-swap
-    publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref())
-        .await
-        .map_err(|error| {
-            ApiError::Internal(format!(
-                "Failed publishing dynamic config updates to runtime subscribers: {}",
-                error
-            ))
-        })?;
+    tx.commit().await?;
+
+    // Running executors take the values from Redis at once; failing that,
+    // every process re-reads the stored config within seconds.
+    if let Err(error) = publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref()).await {
+        tracing::warn!(
+            %error,
+            "Could not publish dynamic config updates; processes take them from the database"
+        );
+    }
 
     // Read back fresh values
     let rows: Vec<DynamicConfigStatusRow> = sqlx::query_as(

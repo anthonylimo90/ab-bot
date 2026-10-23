@@ -259,11 +259,16 @@ pub async fn manual_trip_circuit_breaker(
     )
     .await;
     if let Err(error) = stored {
-        tracing::error!(%error, "A manual trip holds on this server only");
+        tracing::error!(%error, "A manual trip could not be stored");
         return Err(ApiError::ServiceUnavailable(
-            "Trading is halted on this server, but the trip could not be saved: a restart or \
-             another server would not keep it. Trip again once the database is reachable."
-                .into(),
+            if state.circuit_breaker.is_leader() {
+                "Trading is halted on this server, but the trip could not be saved: a restart \
+                 would not keep it. Trip again once the database is reachable."
+            } else {
+                "The trip could not be saved, so trading was not halted. Trip again once the \
+                 database is reachable."
+            }
+            .into(),
         ));
     }
 
@@ -312,8 +317,15 @@ pub async fn update_circuit_breaker_config(
         ));
     }
 
-    // Read current config and merge partial updates
-    let mut config = state.circuit_breaker.config().await;
+    // Merge onto the stored limits, not this process's copy of them: another
+    // API process may have changed them a moment ago.
+    let previous = crate::state::circuit_breaker_config(&state.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Could not read the stored circuit breaker limits");
+            ApiError::ServiceUnavailable("The stored limits could not be read; retry".into())
+        })?;
+    let mut config = previous.clone();
 
     if let Some(v) = req.max_daily_loss {
         // The stored column is NUMERIC(20, 2).
@@ -356,25 +368,29 @@ pub async fn update_circuit_breaker_config(
     }
 
     config.validate().map_err(ApiError::BadRequest)?;
-    let previous = state.circuit_breaker.config().await;
-    // Stored first, then applied: a failed write changes nothing.
+    // Stored first, then applied: a failed write changes nothing. Only the
+    // limits this request sets are written, so concurrent updates of
+    // different limits both stand.
     sqlx::query(
         r#"
         UPDATE workspaces
-        SET cb_max_daily_loss = $1,
-            cb_max_drawdown_pct = $2,
-            cb_max_consecutive_losses = $3,
-            cb_cooldown_minutes = $4,
-            cb_enabled = $5,
+        SET cb_max_daily_loss = COALESCE($1, cb_max_daily_loss),
+            cb_max_drawdown_pct = COALESCE($2, cb_max_drawdown_pct),
+            cb_max_consecutive_losses = COALESCE($3, cb_max_consecutive_losses),
+            cb_cooldown_minutes = COALESCE($4, cb_cooldown_minutes),
+            cb_enabled = COALESCE($5, cb_enabled),
             updated_at = NOW()
         WHERE id = $6
         "#,
     )
-    .bind(config.max_daily_loss)
-    .bind(config.max_drawdown_pct)
-    .bind(config.max_consecutive_losses as i32)
-    .bind(config.cooldown_minutes as i32)
-    .bind(config.enabled)
+    .bind(req.max_daily_loss.map(|_| config.max_daily_loss))
+    .bind(req.max_drawdown_pct.map(|_| config.max_drawdown_pct))
+    .bind(
+        req.max_consecutive_losses
+            .map(|_| config.max_consecutive_losses as i32),
+    )
+    .bind(req.cooldown_minutes.map(|_| config.cooldown_minutes as i32))
+    .bind(req.enabled)
     .bind(workspace_id)
     .execute(&state.pool)
     .await?;

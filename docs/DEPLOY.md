@@ -609,6 +609,37 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   not take the lock. Trip the breaker before that deploy if no trade may run
   on two processes at once.
 
+### Operator controls on every process; exits that do not get out
+
+- Every API process re-reads trips, resets, breaker limits, service toggles
+  and the stored dynamic config every 5 s; the trading leader looks for a
+  trip made elsewhere every second. A live manual order is refused (409)
+  once live trading is switched off, whichever process takes it.
+- Breaker limit updates apply only the limits sent, on top of the stored
+  ones. Dynamic config updates store all their keys in one transaction; a
+  Redis publish that fails is a warning, as the processes re-read the
+  database.
+- New live entries (arb and quant) wait, with skip reason
+  `live_exits_failing`, while a live position's exit has failed three times
+  in a row or has sat in exit-ready or closing for 30 minutes. Clear the
+  position (recovery, a manual close, or the runbook above) to resume.
+- A manual close answers 409 while the exit handler is off. Asking again
+  for a position already exiting changes nothing.
+- A matched trade that ends `FAILED` counts as no fill, so an order whose
+  trades failed settles instead of holding the wallet's order fence.
+- A process that loses the trading lock stops at once; the next leader's
+  reconcilers book what it had in flight. The lock's session uses TCP
+  keepalives, and only an error, or three slow checks in a row, counts as
+  losing it. A process that waits more than ten minutes for the lock logs
+  an error.
+- Winning shares are not redeemed by this system: redeem them on
+  Polymarket. Until then inventory values a token of a market a position
+  saw resolve at its payout ($1 or $0), and such tokens are not offered for
+  orphan sale.
+- Audit log entries now cover manual orders and cancellations, manual
+  closes, wallet-signed orders, submitted withdrawals, cash flows, and every
+  workspace update (`workspace/<id>`).
+
 ### API contract changes
 
 - `GET .../risk/status` and the trip/reset responses add `drawdown_peak`

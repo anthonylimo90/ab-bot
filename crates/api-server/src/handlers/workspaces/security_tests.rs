@@ -454,13 +454,13 @@ async fn audit_entries_never_contain_the_previous_rpc_url_key(pool: PgPool) {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // Audit events are written by a background task: wait for ours.
+    // The update's audit entry is written before it answers.
     let mut details = None;
     for _ in 0..60 {
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT details::text FROM audit_log WHERE action = 'workspace_updated' AND resource = $1",
         )
-        .bind(format!("user/{}", f.canonical))
+        .bind(format!("workspace/{}", f.canonical))
         .fetch_all(&pool)
         .await
         .unwrap();
