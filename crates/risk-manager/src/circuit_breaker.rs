@@ -404,13 +404,6 @@ impl CircuitBreaker {
         self.load_state().await
     }
 
-    /// Whether this process made the first claim of the lead ever: no
-    /// process of this version led before it (the one it took over from, if
-    /// any, did not mark the closes it counted).
-    pub fn first_leader(&self) -> bool {
-        self.leader_epoch.load(Ordering::SeqCst) == 1
-    }
-
     /// Bring this process's view up to date with the stored state, at most
     /// every few seconds. A follower takes the whole stored state; the leader
     /// takes an operator change made through another process, and retries a
@@ -1134,6 +1127,9 @@ impl CircuitBreaker {
         if !self.is_leader() {
             return;
         }
+        // Cleared before what is saved is read: a hold changed meanwhile
+        // marks the state owed again, for the next sync.
+        self.unsaved.store(false, Ordering::SeqCst);
         let closes = self
             .unsaved_closes
             .lock()
@@ -1188,7 +1184,6 @@ impl CircuitBreaker {
             }
             Ok(outcome) if outcome.saved => {
                 // Saved with the closes it marked (all or nothing).
-                self.unsaved.store(false, Ordering::SeqCst);
                 self.unsaved_closes
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1200,9 +1195,24 @@ impl CircuitBreaker {
             }
             Err(e) => {
                 // Nothing was stored, the marks included: the closes stay
-                // queued, counted only here, and [`Self::sync`] retries.
+                // queued, counted only here, and [`Self::sync`] retries. What
+                // halts trading is stored on its own meanwhile, so a trip is
+                // not kept from the other processes, or lost to a restart.
                 error!(error = %e, "Failed to persist circuit breaker state");
                 self.unsaved.store(true, Ordering::SeqCst);
+                if !closes.is_empty() {
+                    if let Err(error) = repo
+                        .save_halt(
+                            state,
+                            self.operator_epoch.load(Ordering::SeqCst),
+                            leader_epoch,
+                            &holds,
+                        )
+                        .await
+                    {
+                        error!(%error, "Failed to store the circuit breaker's trip on its own");
+                    }
+                }
             }
         }
     }

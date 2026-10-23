@@ -923,7 +923,7 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   but never saved (today's; earlier days' are only marked) before it
   trades. Existing closes are marked by the migration; the first takeover
   marks, without counting, those the previous version makes while handing
-  over (see migration 099 below). The 24-hour realized
+  over (see migration 100 below). The 24-hour realized
   P&L is now dated by close time, so neither the migration nor the marks
   move closes into it.
 - Orphan recovery no longer sells tokens a position sold in the last 30
@@ -946,22 +946,29 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - A close is saved with its mark all or nothing: a mark that fails fails the
   save, so the close stays counted only in the process's memory and is
   retried within seconds (a close is never in the stored counters while
-  unmarked, so a new leader cannot count it twice); a graceful shutdown
-  stores what is still owed. A close the switched-off breaker does not
-  count is marked at once.
+  unmarked, so a new leader cannot count it twice); meanwhile what halts
+  trading (the trip, latches, recovery, equity references, holds) is stored
+  on its own, so a trip still reaches every process and survives a restart.
+  A graceful shutdown stores what is still owed. A close the switched-off
+  breaker does not count is marked at once.
 - Migration 099 adds `circuit_breaker_state.leader_epoch` and `entry_holds`.
   Each process taking over trading counts the leader epoch up before it
-  reads the state, and a save carrying an older epoch is refused (the
-  process that made it stops saving): a save stalled across a change of
-  leader can no longer overwrite the new leader's counters. The leader
-  stores its entry holds there, so every API process refuses entries, and
-  a reset, while they stand.
-- The first takeover by this version (leader epoch 1) marks the closes left
-  unmarked without counting them: the version before it counted its closes
-  in the stored counters but did not mark them. A close that version booked
-  without saving it is not counted (it used to be counted twice, wins
-  included). Rolling back to that version and forward again repeats the
-  double-count risk of the first upgrade.
+  reads the state, and a save carrying an older epoch is refused: the
+  process that made it stops saving and exits (its lock watcher sees the
+  breaker step down), so a save stalled across a change of leader can no
+  longer overwrite the new leader's counters. The leader stores its entry
+  holds there (the missed-close hold right after its claim), so every API
+  process refuses entries, and a reset, while they stand.
+- Migration 100 adds `circuit_breaker_state.marked_write_at`, which this
+  version sets equal to `updated_at` whenever it stores the loss counters.
+  A claim that finds the two apart (an earlier version, which counts its
+  closes without marking them, wrote the row since: the first takeover
+  after the upgrade, or after a rollback and a return to this version)
+  marks every close left unmarked, in the claim's own transaction, so no
+  takeover (a retried one included) counts them again. A close that earlier
+  version booked without saving it is not counted. A hand edit of the row
+  (anything but this version's code moving `updated_at`) is read the same
+  way: the next claim marks rather than counts the closes left unmarked.
 - Cancelling an order is no longer refused while the server shuts down
   (placing one still is); the shutdown waits for it.
 - A process that loses trading leadership stops saving the circuit breaker

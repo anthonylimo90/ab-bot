@@ -487,6 +487,7 @@ impl ApiServer {
                 // starting trades at once, even mid-shutdown (where nothing
                 // waits on `lost`), before another process takes over.
                 let breaker = state.circuit_breaker.clone();
+                let leading = state.circuit_breaker.clone();
                 let executor = state.order_executor.clone();
                 spawn_trading_tasks(
                     state,
@@ -495,10 +496,16 @@ impl ApiServer {
                     quant_config,
                     exit_readiness,
                 );
-                leadership.watch(lost, move || {
-                    breaker.step_down();
-                    executor.begin_draining();
-                });
+                leadership.watch(
+                    lost,
+                    move || {
+                        breaker.step_down();
+                        executor.begin_draining();
+                    },
+                    // A save refused for another leader's newer claim steps
+                    // the breaker down while the lock may still look held.
+                    move || leading.is_leader(),
+                );
             });
         }
 
@@ -793,6 +800,16 @@ fn spawn_trading_tasks(
 /// since this one started, the circuit breaker's stored state (the previous
 /// leader's last save included), its saved limits and the service toggles.
 async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
+    // Closes a stopped process booked but never recorded count before any
+    // new trade does: entries are held until they are (a manual buy in any
+    // process included: the hold is stored as soon as the lead is claimed).
+    // A failure does not stop the takeover (exits must run): the closes are
+    // retried in the background, entries held, until they are counted.
+    state.circuit_breaker.hold_entries(
+        MISSED_CLOSES_HOLD,
+        "closes a previous trading process left uncounted by the circuit breaker are not \
+         counted yet",
+    );
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -805,36 +822,18 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
             Err(error) => return Err(error.context("loading the circuit breaker's state")),
         }
     }
+    // Store the hold for the other processes now (a failure leaves it owed
+    // to the next sync).
+    state.circuit_breaker.flush().await;
     let limits = crate::state::circuit_breaker_config(&state.pool).await?;
     state.circuit_breaker.update_config(limits).await;
-    // Closes a stopped process booked but never recorded count before any
-    // new trade does: entries are held until they are (a manual buy in this
-    // process included). A failure does not stop the takeover (exits must
-    // run): the closes are retried in the background, entries held, until
-    // they are counted.
-    state.circuit_breaker.hold_entries(
-        MISSED_CLOSES_HOLD,
-        "closes a previous trading process left uncounted by the circuit breaker are not \
-         counted yet",
-    );
-    // The first leader of this version takes over from one that counted
-    // its closes without marking them: those are marked, not counted again.
-    let count = !state.circuit_breaker.first_leader();
-    if !count {
-        info!("First trading leader of this version: closes left unmarked are marked, not counted");
-    }
     let mut attempt = 0;
     loop {
         attempt += 1;
         // Nothing here trades yet, so every unmarked close is another
         // process's: no cutoff (one would depend on the clocks agreeing).
-        match crate::exit_handler::record_missed_closes(
-            &state.pool,
-            &state.circuit_breaker,
-            None,
-            count,
-        )
-        .await
+        match crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker, None)
+            .await
         {
             Ok(()) => {
                 state.circuit_breaker.release_entries(MISSED_CLOSES_HOLD);
@@ -857,7 +856,6 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
                     state.pool.clone(),
                     state.circuit_breaker.clone(),
                     chrono::Utc::now(),
-                    count,
                 );
                 break;
             }
@@ -886,7 +884,6 @@ fn spawn_missed_close_retry(
     pool: sqlx::PgPool,
     breaker: Arc<risk_manager::CircuitBreaker>,
     closed_before: chrono::DateTime<chrono::Utc>,
-    count: bool,
 ) {
     tokio::spawn(async move {
         loop {
@@ -895,13 +892,8 @@ fn spawn_missed_close_retry(
                 breaker.release_entries(MISSED_CLOSES_HOLD);
                 return;
             }
-            match crate::exit_handler::record_missed_closes(
-                &pool,
-                &breaker,
-                Some(closed_before),
-                count,
-            )
-            .await
+            match crate::exit_handler::record_missed_closes(&pool, &breaker, Some(closed_before))
+                .await
             {
                 Ok(()) => {
                     info!("Recorded the closes the circuit breaker missed; new entries may resume");

@@ -114,11 +114,24 @@ impl Leadership {
     /// `on_lost` runs first, whatever the rest of the process is doing (a
     /// shutdown's drain included): it stops this process acting as leader
     /// before another can take over.
-    pub fn watch(mut self, lost: Arc<Notify>, on_lost: impl FnOnce() + Send + 'static) {
+    /// `still_leading` is asked at every check too: false (the circuit
+    /// breaker found another process's newer claim) counts as lost.
+    pub fn watch(
+        mut self,
+        lost: Arc<Notify>,
+        on_lost: impl FnOnce() + Send + 'static,
+        still_leading: impl Fn() -> bool + Send + 'static,
+    ) {
         tokio::spawn(async move {
             let mut slow = 0;
             loop {
                 tokio::time::sleep(CHECK).await;
+                if !still_leading() {
+                    error!("Another process has claimed the trading lead; stopping");
+                    on_lost();
+                    lost.notify_one();
+                    return;
+                }
                 let check = tokio::time::timeout(
                     CHECK_TIMEOUT,
                     sqlx::query("SELECT 1").execute(&mut self.conn),
