@@ -1368,7 +1368,11 @@ async fn reserve_withdrawal(
 
     // Read before entries wait on this decision: it is a chain read.
     unexplained_pending_transaction(lock, client, &request.source).await?;
-    lock.lock_entries().await?;
+    if !lock.lock_entries().await? {
+        return Err(ApiError::ServiceUnavailable(
+            "Trading is recording an entry; nothing was sent. Retry the withdrawal shortly".into(),
+        ));
+    }
     // Holds first, then the balance: a transfer settling in between can only
     // make the capacity look smaller.
     let holds = WithdrawalHolds::load(lock.conn(), &request.source).await?;

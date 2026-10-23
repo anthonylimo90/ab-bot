@@ -293,11 +293,13 @@ pub(crate) async fn circuit_breaker_config(pool: &PgPool) -> anyhow::Result<Circ
         if let Some(v) = row.cb_max_drawdown_pct {
             config.max_drawdown_pct = v;
         }
+        // A negative count saved for a limit is refused below, not wrapped
+        // round into one so large it never trips.
         if let Some(v) = row.cb_max_consecutive_losses {
-            config.max_consecutive_losses = v as u32;
+            config.max_consecutive_losses = u32::try_from(v).unwrap_or(0);
         }
         if let Some(v) = row.cb_cooldown_minutes {
-            config.cooldown_minutes = v as i64;
+            config.cooldown_minutes = i64::from(v);
         }
         if let Some(v) = row.cb_enabled {
             config.enabled = v;

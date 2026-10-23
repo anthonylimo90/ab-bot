@@ -1157,6 +1157,15 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   canonically (trimmed, lowercase hex); migration 104 lowercases existing
   rows, merging inventory kept under differently cased ids. An order's own result no longer
   overwrites a reconciliation that already moved it on.
+- Circuit breaker: a missed close with no exit time recorded is counted as
+  today's (it was marked without being counted), and a negative
+  consecutive-loss limit saved for the workspace refuses the start (it
+  wrapped into a limit that never tripped).
+- Withdrawals wait at most 15 seconds for new entries to pause (503,
+  nothing sent, otherwise); they waited without bound while holding the
+  wallet's spend lock. A transfer a node still holds but whose nonce
+  another transaction used at a final block now goes through the
+  superseded checks and is failed; it kept the wallet's capacity reduced.
 
 ### API contract changes
 

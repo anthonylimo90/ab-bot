@@ -60,6 +60,9 @@ pub(crate) fn wallet_lock_key(address: &str) -> String {
     format!("wallet-withdrawal:{}", address.to_lowercase())
 }
 
+/// The longest a withdrawal waits for new entries to pause.
+const ENTRY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Session-level advisory locks held on one dedicated connection.
 ///
 /// Work done under the locks goes through [`SpendLock::conn`], so it never
@@ -193,12 +196,24 @@ impl SpendLock {
     }
 
     /// Also hold the lock new positions and manual orders take, so no entry
-    /// starts while the wallet's capacity is being decided.
-    pub(crate) async fn lock_entries(&mut self) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT pg_advisory_lock(hashtext('position-exposure'))")
-            .execute(self.conn())
-            .await
-            .map(drop)
+    /// starts while the wallet's capacity is being decided. Waits at most
+    /// [`ENTRY_LOCK_WAIT`]: the wallet's spend lock is held meanwhile, and
+    /// every other spender of the wallet waits on it.
+    pub(crate) async fn lock_entries(&mut self) -> Result<bool, sqlx::Error> {
+        let deadline = tokio::time::Instant::now() + ENTRY_LOCK_WAIT;
+        loop {
+            let locked: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('position-exposure'))")
+                    .fetch_one(self.conn())
+                    .await?;
+            if locked {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     pub(crate) async fn unlock_entries(&mut self) -> Result<(), sqlx::Error> {
@@ -882,12 +897,30 @@ async fn reconcile_on_chain(
         return Ok(false);
     }
 
+    // Is the nonce used by a transaction deep enough not to be reorganized?
+    // None of these is mined (no receipt above), so a node still holding one
+    // holds a transaction that can never be mined: it does not keep the
+    // transfer waiting.
+    let nonce = row.nonce.and_then(|nonce| u64::try_from(nonce).ok());
+    let used = match nonce {
+        Some(nonce) => {
+            let safe_block = client.safe_block_number().await?;
+            client
+                .transaction_count_at(&row.wallet_address, safe_block)
+                .await?
+                > nonce
+        }
+        None => false,
+    };
+
     // The first of its transactions (latest first) a node holds.
     let mut held = None;
-    for (index, hash) in hashes.iter().enumerate() {
-        if client.transaction_known(hash).await? {
-            held = Some(index);
-            break;
+    if !used {
+        for (index, hash) in hashes.iter().enumerate() {
+            if client.transaction_known(hash).await? {
+                held = Some(index);
+                break;
+            }
         }
     }
     if let Some(index) = held {
@@ -908,16 +941,9 @@ async fn reconcile_on_chain(
         }
         return Ok(true);
     }
-    let Some(nonce) = row.nonce.and_then(|nonce| u64::try_from(nonce).ok()) else {
+    let Some(nonce) = nonce else {
         return Ok(false);
     };
-
-    // Is the nonce used by a transaction deep enough not to be reorganized?
-    let safe_block = client.safe_block_number().await?;
-    let used = client
-        .transaction_count_at(&row.wallet_address, safe_block)
-        .await?
-        > nonce;
     if used {
         match row.superseded_seen_at {
             None => {

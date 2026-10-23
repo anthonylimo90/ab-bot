@@ -740,6 +740,40 @@ async fn a_used_nonce_fails_a_transfer_only_on_a_second_look_minutes_later(pool:
     assert!(cash_flows(&pool).await.is_empty());
 }
 
+/// A node still holding a transfer whose nonce another transaction used at
+/// a final block holds one that can never be mined: it does not keep the
+/// transfer waiting (and the wallet's capacity reduced) for good.
+#[sqlx::test(migrations = false)]
+async fn a_held_transfer_whose_nonce_is_used_is_still_failed(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let chain = Arc::new(Mutex::new(Chain {
+        final_nonce: 6,
+        latest_nonce: 6,
+        pending_nonce: 6,
+        ..Default::default()
+    }));
+    chain.lock().unwrap().known.insert("0xs1".into());
+    let client = mock_node(chain.clone()).await;
+    let superseded = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "submitted", Some("0xs1"), Some(5), 1),
+    )
+    .await;
+    reconcile(&pool, &client).await;
+    assert_eq!(status(&pool, superseded).await.0, "submitted");
+    pool.execute(
+        "UPDATE wallet_withdrawals SET superseded_seen_at = superseded_seen_at - INTERVAL '6 minutes'",
+    )
+    .await
+    .unwrap();
+    reconcile(&pool, &client).await;
+    let (superseded_status, superseded_error) = status(&pool, superseded).await;
+    assert_eq!(superseded_status, "failed");
+    assert!(superseded_error.unwrap().contains("nonce"));
+}
+
 #[sqlx::test(migrations = false)]
 async fn a_failed_transfer_that_is_mined_after_all_is_confirmed(pool: PgPool) {
     let (user, workspace) = setup(&pool).await;

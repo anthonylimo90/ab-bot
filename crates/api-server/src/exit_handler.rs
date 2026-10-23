@@ -2523,9 +2523,11 @@ pub(crate) async fn record_missed_closes(
             continue;
         }
         let pnl = close.realized_pnl.unwrap_or_default();
+        // A close with no exit time recorded counts as today's: a loss is
+        // never dropped for want of a date.
         let today_close = close
             .exit_timestamp
-            .is_some_and(|at| at.date_naive() == today);
+            .is_none_or(|at| at.date_naive() == today);
         if today_close && breaker_counts_close(&close.execution_mode, pnl, close.confirmed) {
             breaker.record_close(pnl, close.id).await?;
             warn!(position_id = %close.id, %pnl, "Recorded a close the circuit breaker had missed");
