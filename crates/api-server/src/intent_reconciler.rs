@@ -29,6 +29,9 @@ struct Intent {
     id: Uuid,
     status: String,
     created_at: DateTime<Utc>,
+    /// Seconds since it was created, on the database's clock (as
+    /// `created_at`): a process clock ahead would cut grace periods short.
+    age_secs: i64,
     exchange_order_id: Option<String>,
     maker: Option<String>,
     token_id: Option<String>,
@@ -203,7 +206,7 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     };
     // Every intent of the trading wallet is reconciled, including orphan
     // inventory sells that have neither a position link nor an order row.
-    let intents: Vec<Intent> = sqlx::query_as("SELECT i.id,i.status,i.created_at,i.exchange_order_id,i.response->>'orderID' AS named_order_id,i.signed_order->>'maker' AS maker,i.signed_order->>'tokenId' AS token_id,l.position_id,l.leg,l.side,l.applied_quantity,EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AS has_order,i.signed_order->>'side' AS signed_side FROM execution_intents i LEFT JOIN position_order_links l ON l.id=i.id WHERE LOWER(i.signed_order->>'maker')=LOWER($1) AND i.status IN ('submitting','unknown','acknowledged') AND i.updated_at<NOW()-INTERVAL '30 seconds' AND (l.id IS NULL OR NOT l.settled) ORDER BY CASE WHEN i.status IN ('submitting','unknown') THEN 0 WHEN l.id IS NOT NULL THEN 1 ELSE 2 END,i.updated_at,i.id LIMIT 100")
+    let intents: Vec<Intent> = sqlx::query_as("SELECT i.id,i.status,i.created_at,EXTRACT(EPOCH FROM NOW()-i.created_at)::bigint AS age_secs,i.exchange_order_id,i.response->>'orderID' AS named_order_id,i.signed_order->>'maker' AS maker,i.signed_order->>'tokenId' AS token_id,l.position_id,l.leg,l.side,l.applied_quantity,EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AS has_order,i.signed_order->>'side' AS signed_side FROM execution_intents i LEFT JOIN position_order_links l ON l.id=i.id WHERE LOWER(i.signed_order->>'maker')=LOWER($1) AND i.status IN ('submitting','unknown','acknowledged') AND i.updated_at<NOW()-INTERVAL '30 seconds' AND (l.id IS NULL OR NOT l.settled) ORDER BY CASE WHEN i.status IN ('submitting','unknown') THEN 0 WHEN l.id IS NOT NULL THEN 1 ELSE 2 END,i.updated_at,i.id LIMIT 100")
         .bind(wallet).fetch_all(&state.pool).await?;
     for intent in intents {
         let id = intent.id;
@@ -216,7 +219,7 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         let fencing = matches!(intent.status.as_str(), "submitting" | "unknown");
         let holds_position = intent.position_id.is_some();
         let manual = intent.has_order;
-        let age = Utc::now() - intent.created_at;
+        let age = Duration::seconds(intent.age_secs);
         if let Err(error) = reconcile_one(state, intent).await {
             // A manual order found resting was just resolved (it no longer
             // fences the wallet): it is waiting, not stuck.
@@ -292,7 +295,10 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
             {
                 anyhow::bail!("Invalid fill quantity");
             }
-            let terminal = filled >= original || snapshot.is_closed();
+            // A matched order is done even when its matched size falls a
+            // rounding short of its original size.
+            let terminal =
+                filled >= original || snapshot.is_closed() || snapshot.state() == "matched";
             if !terminal {
                 // The exchange holds the order, so it is no longer in doubt:
                 // a manual order, whose row keeps its cash reserved, stops
@@ -326,7 +332,7 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
             if !matches!(intent.status.as_str(), "submitting" | "unknown") {
                 anyhow::bail!("Acknowledged order is missing from the exchange");
             }
-            if Utc::now() - intent.created_at < Duration::minutes(ABSENCE_GRACE_MINUTES) {
+            if Duration::seconds(intent.age_secs) < Duration::minutes(ABSENCE_GRACE_MINUTES) {
                 anyhow::bail!("Exchange has no record of the order yet");
             }
             let token_id = intent
@@ -381,15 +387,18 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
     } else {
         // An orphan-inventory sale: wallet inventory refreshes from observed
         // balances, so only the submission itself needs a terminal status.
-        sqlx::query("UPDATE execution_intents SET status=$2,updated_at=NOW() WHERE id=$1")
-            .bind(intent.id)
-            .bind(if outcome.snapshot.is_some() {
-                "reconciled"
-            } else {
-                "rejected"
-            })
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE execution_intents SET status=$2,updated_at=NOW() \
+             WHERE id=$1 AND status IN ('submitting','unknown','acknowledged')",
+        )
+        .bind(intent.id)
+        .bind(if outcome.snapshot.is_some() {
+            "reconciled"
+        } else {
+            "rejected"
+        })
+        .execute(&state.pool)
+        .await?;
         Ok(())
     }
 }
@@ -477,10 +486,15 @@ async fn apply_to_position(
             .await?;
     }
     if outcome.snapshot.is_none() {
-        sqlx::query("UPDATE execution_intents SET status='rejected',updated_at=NOW() WHERE id=$1")
-            .bind(intent.id)
-            .execute(&state.pool)
-            .await?;
+        sqlx::query(
+            // After the zero receipt above marked it reconciled: an order
+            // the exchange never received was not executed.
+            "UPDATE execution_intents SET status='rejected',updated_at=NOW() \
+             WHERE id=$1 AND status IN ('submitting','unknown','acknowledged','reconciled')",
+        )
+        .bind(intent.id)
+        .execute(&state.pool)
+        .await?;
     }
 
     if selling {
@@ -837,6 +851,45 @@ mod tests {
 
         let stored = state.position_service.load(position.id).await.unwrap();
         assert_eq!(stored.held_no_qty, "10.2".parse::<Decimal>().unwrap());
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(intent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "reconciled");
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_matched_order_a_rounding_short_of_its_size_is_resolved(pool: PgPool) {
+        // Matched, yet 9.99 of 10: the exchange will match no more of it.
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"MATCHED","original_size":"10","size_matched":"9.99","associate_trades":["trade"]})),
+            serde_json::json!([{"id":"trade","taker_order_id":"exchange","status":"CONFIRMED","size":"9.99","price":"0.5"}]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let mut position = live_position(&state, &maker, 48, 49).await;
+        position.held_yes_qty = "9.99".parse().unwrap();
+        state
+            .position_service
+            .repo()
+            .update(&mut position)
+            .await
+            .unwrap();
+        let intent = journal(
+            &pool,
+            &maker,
+            Some((position.id, "no", "buy")),
+            "unknown",
+            1,
+        )
+        .await;
+
+        reconcile(&state).await.unwrap();
+
+        let stored = state.position_service.load(position.id).await.unwrap();
+        assert_eq!(stored.held_no_qty, "9.99".parse::<Decimal>().unwrap());
         let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
             .bind(intent)
             .fetch_one(&pool)
