@@ -1094,6 +1094,8 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   (ten minutes by default) while it is subscribed to markets. A subscription
   that delivered nothing was resubscribed forever while the health file
   stayed fresh, so the service looked healthy with no signals.
+- The periodic data hygiene run also deletes session revocations a day
+  past their token's expiry (the table only grew).
 
 ### API contract changes
 

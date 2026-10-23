@@ -171,6 +171,17 @@ impl MetricsCalculator {
                     Ok(_) => info!("Data hygiene cleanup completed successfully"),
                     Err(e) => warn!(error = %e, "Data hygiene cleanup failed (non-fatal)"),
                 }
+                // A revocation outlives its token by a day (a clock behind
+                // the database's still honours the token that long), then
+                // guards nothing.
+                if let Err(e) = sqlx::query(
+                    "DELETE FROM revoked_sessions WHERE expires_at < NOW() - INTERVAL '1 day'",
+                )
+                .execute(&self.pool)
+                .await
+                {
+                    warn!(error = %e, "Pruning expired session revocations failed (non-fatal)");
+                }
             }
 
             // Weekly market correlation computation for cross-market signal generator.
