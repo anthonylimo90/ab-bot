@@ -206,6 +206,9 @@ async fn compute_cycle(
 
         // ── Acquire semaphore for DB writes ──
         let _permit = db_semaphore.acquire().await.expect("semaphore closed");
+        // A period's snapshots are stored together: readers show the latest
+        // cycle's strategies, never part of them.
+        let mut tx = pool.begin().await?;
 
         // Upsert quant strategy snapshots
         for row in &quant_rows {
@@ -219,7 +222,7 @@ async fn compute_cycle(
             let sharpe = compute_sharpe(pool, &row.strategy, window_start, now, live).await;
 
             upsert_snapshot(
-                pool,
+                &mut tx,
                 &row.strategy,
                 now,
                 period_days,
@@ -247,7 +250,7 @@ async fn compute_cycle(
                 };
 
                 upsert_snapshot(
-                    pool,
+                    &mut tx,
                     "arb",
                     now,
                     period_days,
@@ -266,6 +269,7 @@ async fn compute_cycle(
             }
         }
 
+        tx.commit().await?;
         drop(_permit);
 
         debug!(
@@ -340,7 +344,7 @@ async fn compute_sharpe(
 /// Upsert a single strategy P&L snapshot row.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_snapshot(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     strategy: &str,
     period_end: chrono::DateTime<Utc>,
     period_days: i32,
@@ -385,7 +389,7 @@ async fn upsert_snapshot(
     .bind(win_rate)
     .bind(sharpe)
     .bind(avg_hold_hours)
-    .execute(pool)
+    .execute(conn)
     .await?;
 
     Ok(())

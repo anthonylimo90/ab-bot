@@ -283,8 +283,8 @@ pub(crate) struct WithdrawalHolds {
     /// Withdrawals from this wallet not yet resolved (they may still be mined).
     pub in_flight_withdrawals: Decimal,
     /// USDC committed to the trading wallet's open live buy orders, and to
-    /// its buys matched in the last `SETTLING_BUY_MINUTES` (their trades may
-    /// not have moved the USDC on chain yet).
+    /// its matched buys whose trades may not have moved the USDC on chain
+    /// yet.
     pub reserved_for_open_buys: Decimal,
     /// Whether `source` is the live trading wallet.
     pub trading_wallet: bool,
@@ -351,21 +351,42 @@ impl WithdrawalHolds {
                 .sum();
             // A buy the exchange matched moves the wallet's USDC only when
             // its trade settles on chain; a withdrawal mined first would make
-            // that settlement fail with the shares already booked.
-            let settling: Decimal = sqlx::query_scalar(
-                "SELECT COALESCE(SUM((signed_order->>'makerAmount')::numeric / 1000000), 0) \
-                 FROM execution_intents \
-                 WHERE status = 'reconciled' \
-                   AND LOWER(signed_order->>'maker') = LOWER($1) \
-                   AND UPPER(signed_order->>'side') = 'BUY' \
-                   AND signed_order->>'makerAmount' ~ '^[0-9]{1,30}$' \
-                   AND updated_at > NOW() - make_interval(mins => $2)",
+            // that settlement fail with the shares already booked. Held: a
+            // bot entry's buy from when its fill was booked (its order is
+            // done then) for `SETTLING_BUY_MINUTES`, and a manual buy's fills
+            // until its trades are confirmed (its order row holds the rest).
+            // Each at most its amount, plus the most taker fee it can carry.
+            let settling: Vec<(Decimal, Decimal)> = sqlx::query_as(
+                "SELECT (i.signed_order->>'makerAmount')::numeric / 1000000, l.applied_quantity \
+                 FROM execution_intents i \
+                 JOIN position_order_links l ON l.id = i.id \
+                 WHERE i.status = 'reconciled' \
+                   AND l.side = 'buy' AND l.applied_quantity > 0 \
+                   AND LOWER(i.signed_order->>'maker') = LOWER($1) \
+                   AND i.signed_order->>'makerAmount' ~ '^[0-9]{1,30}$' \
+                   AND i.updated_at > NOW() - make_interval(mins => $2) \
+                 UNION ALL \
+                 SELECT o.filled_quantity * COALESCE(o.avg_fill_price, o.price, 1), \
+                        o.filled_quantity \
+                 FROM execution_intents i \
+                 JOIN orders o ON o.id = i.id \
+                 WHERE i.status = 'acknowledged' \
+                   AND o.side = 'buy' AND o.execution_mode = 'live' \
+                   AND o.filled_quantity > 0 \
+                   AND LOWER(i.signed_order->>'maker') = LOWER($1)",
             )
             .bind(source)
             .bind(SETTLING_BUY_MINUTES)
-            .fetch_one(&mut *conn)
+            .fetch_all(&mut *conn)
             .await?;
-            reserved_for_open_buys += settling;
+            // The fee at its highest, at a price of one half.
+            let half = Decimal::new(5, 1);
+            reserved_for_open_buys += settling
+                .into_iter()
+                .map(|(amount, shares)| {
+                    amount + trading_engine::executor::taker_fee_allowance(shares, half)
+                })
+                .sum::<Decimal>();
         }
         Ok(Self {
             in_flight_withdrawals,
@@ -391,8 +412,9 @@ impl WithdrawalHolds {
     }
 }
 
-/// How long after a live buy is matched its USDC counts as still leaving the
-/// wallet: as long as the exit handler waits for a fill's shares to settle.
+/// How long after a bot entry's buy is booked its USDC counts as still
+/// leaving the wallet: as long as the exit handler waits for a fill's shares
+/// to settle.
 const SETTLING_BUY_MINUTES: i32 = 30;
 
 /// What the unfilled rest of a live buy can still draw from the wallet: its

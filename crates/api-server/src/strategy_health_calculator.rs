@@ -121,6 +121,9 @@ async fn compute_cycle(
         let window_start = now - Duration::days(period_days as i64);
         let rows = load_strategy_health(pool, window_start, now, live).await?;
 
+        // A period's snapshots are stored together: readers show the latest
+        // cycle's strategies, never part of them.
+        let mut tx = pool.begin().await?;
         for row in rows {
             let latest_backtest = latest_backtests
                 .iter()
@@ -194,10 +197,11 @@ async fn compute_cycle(
             .bind(latest_backtest.map(|bt| bt.id))
             .bind(latest_backtest.and_then(|bt| bt.return_pct))
             .bind(latest_backtest.map(|bt| bt.created_at))
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
             upserted += 1;
         }
+        tx.commit().await?;
 
         debug!(
             period_days,
@@ -289,16 +293,17 @@ async fn load_strategy_health(
             SELECT
                 strategy,
                 COUNT(DISTINCT signal_id) FILTER (WHERE event_type = 'signal_generated')::bigint AS generated_signals,
-                -- Entries that got in (a failed one is counted apart). Arb
-                -- entries carry no signal id: their position stands in.
+                -- Entries that opened (a failed one, or an arb pair left
+                -- holding one leg, is counted apart). Arb entries carry no
+                -- signal id: their position stands in.
                 COUNT(DISTINCT COALESCE(signal_id, position_id)) FILTER (
-                    WHERE event_type IN ('entry_filled', 'position_open')
+                    WHERE event_type = 'position_open'
                        OR state_to = 'open'
                 )::bigint AS executed_signals,
                 COUNT(DISTINCT signal_id) FILTER (WHERE event_type = 'signal_skipped')::bigint AS skipped_signals,
                 COUNT(DISTINCT signal_id) FILTER (WHERE event_type = 'signal_expired')::bigint AS expired_signals,
                 COUNT(DISTINCT position_id) FILTER (
-                    WHERE event_type = 'entry_rejected'
+                    WHERE event_type IN ('entry_rejected', 'one_legged_exit_ready')
                        OR state_to = 'entry_failed'
                 )::bigint AS entry_failed_positions,
                 COUNT(DISTINCT position_id) FILTER (

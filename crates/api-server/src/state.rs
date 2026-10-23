@@ -419,168 +419,7 @@ impl AppState {
                 live_workspace = live_trading_workspace,
                 "Live trading enabled — initializing wallet"
             );
-            let configured_address = polymarket_core::config::env_set("TRADING_WALLET_ADDRESS");
-            let selected_address =
-                resolve_startup_wallet_address(&pool, configured_address.as_deref())
-                    .await
-                    .context("Failed resolving startup trading wallet address")?;
-            let environment_key = polymarket_core::config::env_set("WALLET_PRIVATE_KEY");
-            let startup_wallet = match load_startup_trading_wallet(
-                &key_vault,
-                selected_address.as_deref(),
-                environment_key.as_deref(),
-            )
-            .await
-            {
-                Ok(wallet) => wallet,
-                Err(error) => {
-                    tracing::error!(error = %error, "Trading signer unavailable; correct the configuration and restart");
-                    None
-                }
-            };
-            if let Some(wallet) = startup_wallet.as_ref() {
-                pin_startup_trading_wallet(&pool, &wallet.address_string())
-                    .await
-                    .context("Failed persisting the selected trading signer")?;
-                match order_executor.reload_wallet(wallet.clone()).await {
-                    Ok(address) => {
-                        tracing::info!(wallet = %address, "Initialized configured trading signer")
-                    }
-                    Err(error) => {
-                        tracing::error!(error = %error, "Failed to initialize trading credentials; restart after correcting configuration")
-                    }
-                }
-            } else {
-                tracing::warn!("No configured trading signer is available; live order execution is unavailable");
-            }
-
-            // Ensure on-chain Polymarket approvals are set for the trading wallet.
-            // This is a one-time operation per wallet; existing approvals are detected and skipped.
-            if order_executor.is_live_ready().await {
-                // The environment's RPC, else the canonical workspace's (as
-                // withdrawals and the equity feed read it), else a public one.
-                let workspace_rpc = match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
-                    Ok(workspace_id) => crate::handlers::vault::workspace_rpc_url(&pool, &encryption_key, workspace_id)
-                        .await
-                        .unwrap_or_else(|error| {
-                            tracing::warn!(%error, "Could not read the canonical workspace's RPC settings");
-                            None
-                        }),
-                    Err(error) => {
-                        tracing::warn!(%error, "Could not resolve the canonical workspace for its RPC settings");
-                        None
-                    }
-                };
-                let rpc_url = polymarket_core::config::env_set("POLYGON_RPC_URL")
-                    .or_else(|| {
-                        polymarket_core::config::env_set("ALCHEMY_API_KEY")
-                            .map(|k| format!("https://polygon-mainnet.g.alchemy.com/v2/{}", k))
-                    })
-                    .or(workspace_rpc)
-                    .unwrap_or_else(|| {
-                        tracing::warn!("No Polygon RPC configured; approvals and wraps use the public endpoint");
-                        "https://polygon-rpc.com".to_string()
-                    });
-
-                // Build a signer from the same key the executor used
-                let approval_wallet = startup_wallet.as_ref();
-
-                if let Some(wallet) = approval_wallet {
-                    // Under the wallet's spend lock, so an approval never takes
-                    // the nonce of a withdrawal or wrap another replica is
-                    // signing. Waited for briefly at startup; a lock that stays
-                    // held is waited for in the background instead, never
-                    // gone without.
-                    match crate::withdrawals::SpendLock::acquire_within(
-                        &pool,
-                        &wallet.address_string(),
-                        std::time::Duration::from_secs(30),
-                    )
-                    .await
-                    {
-                        Ok(Some(lock)) => {
-                            set_approvals(wallet, &rpc_url, &order_executor).await;
-                            lock.release().await;
-                        }
-                        held => {
-                            if let Err(error) = held {
-                                tracing::warn!(%error, "Could not take the trading wallet's spend lock");
-                            }
-                            tracing::warn!("The trading wallet's spend lock is held; approvals wait for it in the background");
-                            let (pool, wallet, rpc_url, executor) = (
-                                pool.clone(),
-                                wallet.clone(),
-                                rpc_url.clone(),
-                                order_executor.clone(),
-                            );
-                            tokio::spawn(async move {
-                                loop {
-                                    match crate::withdrawals::SpendLock::acquire_within(
-                                        &pool,
-                                        &wallet.address_string(),
-                                        std::time::Duration::from_secs(60),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(lock)) => {
-                                            set_approvals(&wallet, &rpc_url, &executor).await;
-                                            lock.release().await;
-                                            break;
-                                        }
-                                        Ok(None) => {}
-                                        Err(error) => {
-                                            tracing::warn!(%error, "Could not take the trading wallet's spend lock for approvals");
-                                            tokio::time::sleep(std::time::Duration::from_secs(30))
-                                                .await;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    // The exchange settles in pUSD: keep the wallet's USDC.e wrapped.
-                    crate::collateral::spawn_collateral_sweeper(
-                        pool.clone(),
-                        PolygonClient::new(rpc_url.clone()),
-                        wallet.clone(),
-                        order_executor.clone(),
-                    );
-                }
-            }
-
-            // Persist the loaded wallet address to the canonical trading workspace so
-            // the dashboard can display it without querying the executor.
-            if let Some(addr) = order_executor.wallet_address().await {
-                match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
-                    Ok(Some(workspace_id)) => {
-                        match sqlx::query(
-                            "UPDATE workspaces SET trading_wallet_address = $1 WHERE id = $2 AND (trading_wallet_address IS NULL OR trading_wallet_address != $1)",
-                        )
-                        .bind(&addr)
-                        .bind(workspace_id)
-                        .execute(&pool)
-                        .await
-                        {
-                            Ok(result) => {
-                                if result.rows_affected() > 0 {
-                                    tracing::info!(
-                                        wallet = %addr,
-                                        workspace_id = %workspace_id,
-                                        "Persisted trading wallet address to canonical workspace"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Failed to persist trading wallet address to canonical workspace (non-fatal)");
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to resolve canonical workspace for wallet address persistence");
-                    }
-                }
-            }
+            initialize_trading_signer(&pool, &key_vault, &encryption_key, &order_executor).await?;
         } else {
             tracing::info!(
                 live_env = live_trading_env,
@@ -899,6 +738,228 @@ impl AppState {
 
 /// Send the Polymarket approvals the trading wallet lacks (the caller holds
 /// its spend lock), then have the exchange re-read its allowances.
+/// Load the trading signer (the configured or pinned wallet's key and its
+/// exchange credentials) and, once it is loaded, set the wallet's exchange
+/// approvals and start the collateral sweeper (once per process). A signer
+/// that cannot be loaded is logged; `spawn_signer_keeper` tries again.
+pub(crate) async fn initialize_trading_signer(
+    pool: &PgPool,
+    key_vault: &KeyVault,
+    encryption_key: &str,
+    order_executor: &Arc<OrderExecutor>,
+) -> anyhow::Result<()> {
+    let pool = pool.clone();
+    let order_executor = order_executor.clone();
+    let configured_address = polymarket_core::config::env_set("TRADING_WALLET_ADDRESS");
+    let selected_address = resolve_startup_wallet_address(&pool, configured_address.as_deref())
+        .await
+        .context("Failed resolving startup trading wallet address")?;
+    let environment_key = polymarket_core::config::env_set("WALLET_PRIVATE_KEY");
+    let startup_wallet = match load_startup_trading_wallet(
+        key_vault,
+        selected_address.as_deref(),
+        environment_key.as_deref(),
+    )
+    .await
+    {
+        Ok(wallet) => wallet,
+        Err(error) => {
+            tracing::error!(error = %error, "Trading signer unavailable; correct the configuration and restart");
+            None
+        }
+    };
+    if let Some(wallet) = startup_wallet.as_ref() {
+        pin_startup_trading_wallet(&pool, &wallet.address_string())
+            .await
+            .context("Failed persisting the selected trading signer")?;
+        match order_executor.reload_wallet(wallet.clone()).await {
+            Ok(address) => {
+                tracing::info!(wallet = %address, "Initialized configured trading signer")
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to initialize trading credentials; restart after correcting configuration")
+            }
+        }
+    } else {
+        tracing::warn!(
+            "No configured trading signer is available; live order execution is unavailable"
+        );
+    }
+
+    // Ensure on-chain Polymarket approvals are set for the trading wallet.
+    // This is a one-time operation per wallet; existing approvals are detected and skipped.
+    // Approvals and the collateral sweeper start once per process, with the
+    // first signer loaded.
+    if order_executor.is_live_ready().await
+        && !SIGNER_SERVICES_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        // The environment's RPC, else the canonical workspace's (as
+        // withdrawals and the equity feed read it), else a public one.
+        let workspace_rpc = match crate::workspace_scope::resolve_canonical_workspace_id(&pool)
+            .await
+        {
+            Ok(workspace_id) => crate::handlers::vault::workspace_rpc_url(
+                &pool,
+                encryption_key,
+                workspace_id,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "Could not read the canonical workspace's RPC settings");
+                None
+            }),
+            Err(error) => {
+                tracing::warn!(%error, "Could not resolve the canonical workspace for its RPC settings");
+                None
+            }
+        };
+        let rpc_url = polymarket_core::config::env_set("POLYGON_RPC_URL")
+            .or_else(|| {
+                polymarket_core::config::env_set("ALCHEMY_API_KEY")
+                    .map(|k| format!("https://polygon-mainnet.g.alchemy.com/v2/{}", k))
+            })
+            .or(workspace_rpc)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "No Polygon RPC configured; approvals and wraps use the public endpoint"
+                );
+                "https://polygon-rpc.com".to_string()
+            });
+
+        // Build a signer from the same key the executor used
+        let approval_wallet = startup_wallet.as_ref();
+
+        if let Some(wallet) = approval_wallet {
+            // Under the wallet's spend lock, so an approval never takes
+            // the nonce of a withdrawal or wrap another replica is
+            // signing. Waited for briefly at startup; a lock that stays
+            // held is waited for in the background instead, never
+            // gone without.
+            match crate::withdrawals::SpendLock::acquire_within(
+                &pool,
+                &wallet.address_string(),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(Some(lock)) => {
+                    set_approvals(wallet, &rpc_url, &order_executor).await;
+                    lock.release().await;
+                }
+                held => {
+                    if let Err(error) = held {
+                        tracing::warn!(%error, "Could not take the trading wallet's spend lock");
+                    }
+                    tracing::warn!("The trading wallet's spend lock is held; approvals wait for it in the background");
+                    let (pool, wallet, rpc_url, executor) = (
+                        pool.clone(),
+                        wallet.clone(),
+                        rpc_url.clone(),
+                        order_executor.clone(),
+                    );
+                    tokio::spawn(async move {
+                        loop {
+                            match crate::withdrawals::SpendLock::acquire_within(
+                                &pool,
+                                &wallet.address_string(),
+                                std::time::Duration::from_secs(60),
+                            )
+                            .await
+                            {
+                                Ok(Some(lock)) => {
+                                    set_approvals(&wallet, &rpc_url, &executor).await;
+                                    lock.release().await;
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, "Could not take the trading wallet's spend lock for approvals");
+                                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            // The exchange settles in pUSD: keep the wallet's USDC.e wrapped.
+            crate::collateral::spawn_collateral_sweeper(
+                pool.clone(),
+                PolygonClient::new(rpc_url.clone()),
+                wallet.clone(),
+                order_executor.clone(),
+            );
+        }
+    }
+
+    // Persist the loaded wallet address to the canonical trading workspace so
+    // the dashboard can display it without querying the executor.
+    if let Some(addr) = order_executor.wallet_address().await {
+        match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
+            Ok(Some(workspace_id)) => {
+                match sqlx::query(
+                    "UPDATE workspaces SET trading_wallet_address = $1 WHERE id = $2 AND (trading_wallet_address IS NULL OR trading_wallet_address != $1)",
+                )
+                .bind(&addr)
+                .bind(workspace_id)
+                .execute(&pool)
+                .await
+                {
+                    Ok(result) => {
+                        if result.rows_affected() > 0 {
+                            tracing::info!(
+                                wallet = %addr,
+                                workspace_id = %workspace_id,
+                                "Persisted trading wallet address to canonical workspace"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to persist trading wallet address to canonical workspace (non-fatal)");
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to resolve canonical workspace for wallet address persistence");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a loaded signer's approvals and collateral sweeper were started.
+static SIGNER_SERVICES_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How often the keeper looks for a live executor without its signer.
+const SIGNER_KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Loads the trading signer again while live trading is on without one: a
+/// startup whose exchange or database call failed, or live trading switched
+/// on after a paper start. Without it every live order, exits included,
+/// fails until a restart.
+pub fn spawn_signer_keeper(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SIGNER_KEEPER_INTERVAL).await;
+            if !state.order_executor.is_live() || state.order_executor.is_live_ready().await {
+                continue;
+            }
+            tracing::warn!("Live trading is on without a loaded trading signer; loading it");
+            if let Err(error) = initialize_trading_signer(
+                &state.pool,
+                &state.key_vault,
+                &state.encryption_key,
+                &state.order_executor,
+            )
+            .await
+            {
+                tracing::error!(%error, "Could not load the trading signer; retrying");
+            }
+        }
+    });
+}
+
 async fn set_approvals(wallet: &TradingWallet, rpc_url: &str, executor: &OrderExecutor) {
     let signer = wallet.signer();
     match polymarket_core::api::approvals::ensure_polymarket_approvals(signer, rpc_url).await {

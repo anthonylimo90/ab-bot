@@ -42,12 +42,28 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Config::from_env()?;
 
-    // Initialize the monitor
-    let mut monitor = tokio::select! {
-        monitor = monitor::ArbMonitor::new(config) => monitor?,
-        () = stop.recv() => {
-            info!("Shutdown requested while starting; stopping arbitrage monitor");
-            return Ok(());
+    // Initialize the monitor. Its database or Redis being down at start is
+    // waited out rather than exited on: each exit spends one of the
+    // platform's restarts, and a long outage would spend them all.
+    let mut monitor = loop {
+        tokio::select! {
+            monitor = monitor::ArbMonitor::new(config.clone()) => match monitor {
+                Ok(monitor) => break monitor,
+                Err(error) => {
+                    tracing::error!(%error, "Could not start the arbitrage monitor; retrying");
+                }
+            },
+            () = stop.recv() => {
+                info!("Shutdown requested while starting; stopping arbitrage monitor");
+                return Ok(());
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+            () = stop.recv() => {
+                info!("Shutdown requested while starting; stopping arbitrage monitor");
+                return Ok(());
+            }
         }
     };
 

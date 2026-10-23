@@ -775,6 +775,46 @@ impl PositionService {
         Ok(())
     }
 
+    /// Closing → ExitReady for a sale that was certainly not sent. Records
+    /// "exit_deferred". Returns false when the position is not closing.
+    pub async fn defer_exit(
+        &self,
+        position: &mut Position,
+        reason: &str,
+        ctx: &EventContext,
+    ) -> anyhow::Result<bool> {
+        if position.execution_mode == "live" && self.repo.has_unsettled_orders(position.id).await? {
+            return Err(anyhow!(
+                "Position has an unresolved order; reconcile it before changing lifecycle"
+            ));
+        }
+        if !position.defer_exit() {
+            return Ok(false);
+        }
+
+        self.repo
+            .update(position)
+            .await
+            .map_err(|e| anyhow!("update after deferring an exit: {}", e))?;
+
+        self.events
+            .record_warn(
+                NewTradeEvent::new(
+                    &ctx.strategy,
+                    &ctx.execution_mode,
+                    &ctx.source_label,
+                    &position.market_id,
+                    "exit_deferred",
+                )
+                .with_position(position.id)
+                .with_state(Some("closing"), Some("exit_ready"))
+                .with_reason(Some(reason)),
+            )
+            .await;
+
+        Ok(true)
+    }
+
     /// ExitFailed → ExitReady. Records "exit_recovery_requeued" event.
     /// Returns false when the position is not in ExitFailed. Retries are never
     /// exhausted while shares are held; callers pace them.

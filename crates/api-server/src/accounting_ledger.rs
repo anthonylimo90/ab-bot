@@ -217,6 +217,11 @@ const VALUATION_SETTLE_MARGIN_SECS: i32 = 30;
 /// its drawdown guard unfed.
 const MAX_HELD_READINGS: u32 = 3;
 static HELD_READINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Readings in a row, while trading live, that could not value the account
+/// (no cash read or no inventory scan), after which the breaker trips: its
+/// drawdown guard would otherwise stay blind for as long as that lasts.
+const MAX_BLIND_READINGS: u32 = 3;
+static BLIND_READINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// A live account snapshot, reusing an inventory scan up to
 /// `inventory_max_age` old.
@@ -243,13 +248,24 @@ pub async fn load_live_account_snapshot(
         return Ok(None);
     };
 
-    let valuation_started_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+    let mut valuation_started_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&state.pool)
         .await?;
     let live = state.order_executor.is_live_ready().await;
     let inventory_refreshed = if live {
         match refresh_canonical_wallet_inventory_within(state, inventory_max_age).await {
-            Ok(_) => true,
+            Ok(_) => {
+                // A scan already under way when this one was asked for is
+                // reused: the valuation began when that scan did.
+                if let Some(wallet) = target.trading_wallet_address.as_deref() {
+                    if let Ok(Some(started)) =
+                        crate::wallet_inventory::last_scan_started(&state.pool, wallet).await
+                    {
+                        valuation_started_at = valuation_started_at.min(started);
+                    }
+                }
+                true
+            }
             Err(error) => {
                 warn!(error = %error, "Failed to refresh wallet inventory before account snapshot");
                 false
@@ -307,42 +323,75 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
         // Only a complete live valuation may drive drawdown: paper fills and
         // an unobserved cash balance do not describe real equity. Trading
         // live without one leaves the breaker's drawdown guard blind: said so.
+        use std::sync::atomic::Ordering;
         if snapshot.equity_complete {
-            use std::sync::atomic::Ordering;
-            if traded_during_valuation(&state.pool, snapshot.valuation_started_at).await?
-                && HELD_READINGS.fetch_add(1, Ordering::Relaxed) < MAX_HELD_READINGS
-            {
-                // The inventory and the cash may straddle a trade: this
-                // reading is left out, the next one feeds the breaker.
-                debug!("Live orders were placed during the account valuation; not feeding it");
-            } else {
-                HELD_READINGS.store(0, Ordering::Relaxed);
-                feed_circuit_breaker(state, &snapshot).await?;
+            BLIND_READINGS.store(0, Ordering::Relaxed);
+            let straddled = traded_during_valuation(&state.pool, &snapshot).await?;
+            match straddled {
+                Some(buys) if HELD_READINGS.fetch_add(1, Ordering::Relaxed) < MAX_HELD_READINGS => {
+                    // The inventory and the cash may straddle a trade: this
+                    // reading feeds no reference, but a drawdown even its
+                    // best case (the buys' cash back) shows still trips.
+                    debug!("Live orders were placed during the account valuation; holding it");
+                    check_held_equity(state, &snapshot, buys).await?;
+                }
+                _ => {
+                    HELD_READINGS.store(0, Ordering::Relaxed);
+                    feed_circuit_breaker(state, &snapshot).await?;
+                }
             }
         } else if state.order_executor.is_live_ready().await {
+            let blind = BLIND_READINGS.fetch_add(1, Ordering::Relaxed) + 1;
             warn!(
                 wallet = ?snapshot.wallet_address,
+                readings = blind,
                 "Trading live without an observed wallet balance or a completed inventory \
                  scan: the circuit breaker's drawdown guard is not fed (check the Polygon RPC \
                  and the inventory refresh errors above)"
             );
+            if blind >= MAX_BLIND_READINGS {
+                // Losses the guard cannot see could grow unchecked: entries
+                // stop until a reading completes (the trip cools down).
+                state
+                    .circuit_breaker
+                    .trip_connectivity(&format!(
+                        "no complete account valuation in {blind} readings: the drawdown \
+                         guard cannot see equity"
+                    ))
+                    .await;
+            }
+        } else {
+            BLIND_READINGS.store(0, Ordering::Relaxed);
         }
     }
 
     Ok(())
 }
 
-/// Whether a live order was placed from shortly before `started` on, so that
-/// its trade may have settled between the inventory scan and the cash read.
-async fn traded_during_valuation(pool: &PgPool, started: DateTime<Utc>) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution_intents \
-         WHERE created_at >= $1 - make_interval(secs => $2))",
+/// Whether the trading wallet placed a live order from shortly before the
+/// valuation began, so that its trade may have settled between the inventory
+/// scan and the cash read: `Some` with the most cash its buys may have taken,
+/// `None` when it placed none.
+async fn traded_during_valuation(
+    pool: &PgPool,
+    snapshot: &AccountSnapshotRecord,
+) -> anyhow::Result<Option<Decimal>> {
+    let (placed, buys): (i64, Decimal) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM( \
+             CASE WHEN UPPER(signed_order->>'side') = 'BUY' \
+                   AND signed_order->>'makerAmount' ~ '^[0-9]{1,30}$' \
+             THEN (signed_order->>'makerAmount')::numeric / 1000000 END), 0) \
+         FROM execution_intents \
+         WHERE created_at >= $1 - make_interval(secs => $2) \
+           AND status <> 'rejected' \
+           AND LOWER(signed_order->>'maker') = LOWER($3)",
     )
-    .bind(started)
+    .bind(snapshot.valuation_started_at)
     .bind(f64::from(VALUATION_SETTLE_MARGIN_SECS))
+    .bind(snapshot.wallet_address.as_deref().unwrap_or(""))
     .fetch_one(pool)
-    .await?)
+    .await?;
+    Ok((placed > 0).then_some(buys))
 }
 
 /// Passes live equity to the circuit breaker together with the withdrawals
@@ -359,7 +408,7 @@ async fn feed_circuit_breaker(
         // The observed balance may already lack a withdrawal whose cash flow
         // is not applied yet: that would read as a trading loss.
         info!("Circuit breaker equity feed held while a withdrawal settles");
-        return check_held_equity(state, snapshot).await;
+        return check_held_equity(state, snapshot, Decimal::ZERO).await;
     }
     // A stalled transfer mined since the reconciler last looked would read as
     // a loss too. Its receipt is read after the snapshot's balance was, so
@@ -376,7 +425,7 @@ async fn feed_circuit_breaker(
     .await?
     {
         info!("Circuit breaker equity feed held: a stalled withdrawal has been mined");
-        return check_held_equity(state, snapshot).await;
+        return check_held_equity(state, snapshot, Decimal::ZERO).await;
     }
     let (withdrawals, flows_through) =
         match state.circuit_breaker.cash_flows_applied_through().await {
@@ -412,6 +461,7 @@ async fn feed_circuit_breaker(
 async fn check_held_equity(
     state: &AppState,
     snapshot: &AccountSnapshotRecord,
+    also_in_doubt: Decimal,
 ) -> anyhow::Result<()> {
     let Some(applied) = state.circuit_breaker.cash_flows_applied_through().await else {
         return Ok(());
@@ -419,7 +469,7 @@ async fn check_held_equity(
     let in_doubt = unapplied_outflows(&state.pool, snapshot.workspace_id, applied).await?;
     if let Err(error) = state
         .circuit_breaker
-        .check_drawdown_bound(snapshot.total_equity + in_doubt)
+        .check_drawdown_bound(snapshot.total_equity + in_doubt + also_in_doubt)
         .await
     {
         warn!(%error, "Failed to check held equity against the circuit breaker");
@@ -1061,21 +1111,61 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let place = |seconds_before: f64| {
+        let snapshot = AccountSnapshotRecord {
+            workspace_id: Uuid::new_v4(),
+            snapshot_time: Utc::now(),
+            wallet_address: Some("0xTrading".into()),
+            cash_balance: Decimal::ZERO,
+            position_value: Decimal::ZERO,
+            total_equity: Decimal::ZERO,
+            unrealized_pnl: Decimal::ZERO,
+            realized_pnl_24h: Decimal::ZERO,
+            net_cash_flows_24h: Decimal::ZERO,
+            open_positions: 0,
+            open_markets: 0,
+            unpriced_open_positions: 0,
+            unpriced_position_cost_basis: Decimal::ZERO,
+            equity_complete: true,
+            cash_observed: true,
+            cash_observed_at: started,
+            valuation_started_at: started,
+        };
+        let place = |maker: &str, side: &str, status: &str, seconds_before: f64| {
             sqlx::query(
                 "INSERT INTO execution_intents (id, market_id, signed_order, status, created_at) \
-                 VALUES (gen_random_uuid(), 'm', '{}', 'reconciled', \
-                         $1 - make_interval(secs => $2))",
+                 VALUES (gen_random_uuid(), 'm', $1, $2, $3 - make_interval(secs => $4))",
             )
+            .bind(serde_json::json!({ "maker": maker, "side": side, "makerAmount": "12500000" }))
+            .bind(status.to_string())
             .bind(started)
             .bind(seconds_before)
             .execute(&pool)
         };
-        // An order placed a minute before is settled by then.
-        place(60.0).await.unwrap();
-        assert!(!traded_during_valuation(&pool, started).await.unwrap());
-        // One placed ten seconds before may settle between the two reads.
-        place(10.0).await.unwrap();
-        assert!(traded_during_valuation(&pool, started).await.unwrap());
+        // An order placed a minute before is settled by then; a rejected one
+        // and another wallet's never moved this wallet's equity.
+        place("0xtrading", "BUY", "reconciled", 60.0).await.unwrap();
+        place("0xtrading", "BUY", "rejected", 10.0).await.unwrap();
+        place("0xother", "BUY", "reconciled", 10.0).await.unwrap();
+        assert_eq!(
+            traded_during_valuation(&pool, &snapshot).await.unwrap(),
+            None
+        );
+        // A sale placed ten seconds before may settle between the two reads;
+        // it takes no cash.
+        place("0xTRADING", "SELL", "reconciled", 10.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            traded_during_valuation(&pool, &snapshot).await.unwrap(),
+            Some(Decimal::ZERO)
+        );
+        // A buy may have taken its amount.
+        place("0xtrading", "BUY", "acknowledged", 5.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            traded_during_valuation(&pool, &snapshot).await.unwrap(),
+            Some(Decimal::new(125, 1))
+        );
     }
 }

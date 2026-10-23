@@ -82,17 +82,18 @@ export default function HistoryPage() {
       toast.error("Invalid amount", "Enter a non-zero cash flow amount");
       return;
     }
-    // Money in is positive and money out negative, whatever sign was typed.
-    const amount =
-      cashFlowType === "withdrawal"
-        ? -Math.abs(entered)
-        : cashFlowType === "deposit"
-          ? Math.abs(entered)
-          : entered;
+    // Money in is positive and money out negative, whatever sign was typed;
+    // only an adjustment takes the sign as typed. A transfer out counts for
+    // the circuit breaker as a withdrawal does, so its direction is chosen,
+    // not inferred from a sign.
+    const outflow = ["withdrawal", "transfer_out", "fee"].includes(cashFlowType);
+    const inflow = ["deposit", "transfer_in"].includes(cashFlowType);
+    const amount = outflow ? -Math.abs(entered) : inflow ? Math.abs(entered) : entered;
+    const eventType = cashFlowType.startsWith("transfer_") ? "transfer" : cashFlowType;
 
     try {
       await createCashFlowMutation.mutateAsync({
-        event_type: cashFlowType,
+        event_type: eventType,
         amount,
         note: cashFlowNote || undefined,
         occurred_at: cashFlowOccurredAt
@@ -344,8 +345,9 @@ export default function HistoryPage() {
                         >
                           <option value="deposit">Deposit</option>
                           <option value="withdrawal">Withdrawal</option>
-                          <option value="transfer">Transfer</option>
-                          <option value="fee">Fee</option>
+                          <option value="transfer_in">Transfer in</option>
+                          <option value="transfer_out">Transfer out</option>
+                          <option value="fee">Fee (money out)</option>
                           <option value="adjustment">Adjustment</option>
                         </select>
                       </label>
@@ -355,9 +357,7 @@ export default function HistoryPage() {
                           value={cashFlowAmount}
                           onChange={(e) => setCashFlowAmount(e.target.value)}
                           placeholder={
-                            cashFlowType === "deposit" || cashFlowType === "withdrawal"
-                              ? "100"
-                              : "+100 in, -25 out"
+                            cashFlowType === "adjustment" ? "+100 in, -25 out" : "100"
                           }
                         />
                       </label>

@@ -684,7 +684,12 @@ pub async fn close_position(
                     .await
                 {
                     Ok(()) => break,
-                    Err(e) if attempts < 3 && e.to_string().contains("Stale position update") => {
+                    Err(e) if e.to_string().contains("Stale position update") => {
+                        if attempts == 3 {
+                            return Err(ApiError::Conflict(
+                                "The position is being updated; request the close again".into(),
+                            ));
+                        }
                         attempts += 1;
                         position = state
                             .position_service
@@ -695,9 +700,17 @@ pub async fn close_position(
                             .ok_or_else(|| {
                                 ApiError::NotFound(format!("Open position {position_id} not found"))
                             })?;
-                        if position.state != PositionState::Open {
-                            // Moved on meanwhile (the exit handler queued it).
-                            break;
+                        match position.state {
+                            PositionState::Open => {}
+                            // Queued or selling already (the exit handler
+                            // moved it on): what was asked for is under way.
+                            PositionState::ExitReady | PositionState::Closing => break,
+                            other => {
+                                return Err(ApiError::Conflict(format!(
+                                    "The position changed meanwhile (now {}); nothing was queued",
+                                    position_state_label(other)
+                                )))
+                            }
                         }
                     }
                     Err(e) => return Err(ApiError::BadRequest(e.to_string())),

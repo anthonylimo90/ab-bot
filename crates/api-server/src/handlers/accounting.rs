@@ -476,12 +476,16 @@ pub async fn create_cash_flow(
 }
 
 /// Why a cash flow's sign contradicts its type: money in is positive, money
-/// out negative. Transfers, fees and adjustments may go either way.
+/// out negative. Transfers and adjustments may go either way; a refunded fee
+/// is an adjustment.
 fn cash_flow_sign_error(event_type: &str, amount: Decimal) -> Option<&'static str> {
     match event_type {
         "deposit" if amount < Decimal::ZERO => Some("a deposit's amount must be positive"),
         "withdrawal" if amount > Decimal::ZERO => {
             Some("a withdrawal's amount must be negative (money leaving the wallet)")
+        }
+        "fee" if amount > Decimal::ZERO => {
+            Some("a fee's amount must be negative (money leaving the wallet)")
         }
         _ => None,
     }
@@ -658,7 +662,9 @@ mod cash_flow_tests {
         assert!(cash_flow_sign_error("withdrawal", amount(-8000)).is_none());
         assert!(cash_flow_sign_error("deposit", amount(-5)).is_some());
         assert!(cash_flow_sign_error("deposit", amount(5)).is_none());
-        for either_way in ["transfer", "fee", "adjustment"] {
+        assert!(cash_flow_sign_error("fee", amount(5)).is_some());
+        assert!(cash_flow_sign_error("fee", amount(-5)).is_none());
+        for either_way in ["transfer", "adjustment"] {
             assert!(cash_flow_sign_error(either_way, amount(5)).is_none());
             assert!(cash_flow_sign_error(either_way, amount(-5)).is_none());
         }

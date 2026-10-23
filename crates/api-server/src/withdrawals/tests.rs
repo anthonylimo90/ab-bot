@@ -210,7 +210,12 @@ pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
         CREATE TABLE positions (id UUID, state SMALLINT, execution_mode TEXT);
         CREATE TABLE orders (
             quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT,
-            status TEXT, execution_mode TEXT, wallet_address TEXT
+            status TEXT, execution_mode TEXT, wallet_address TEXT, id UUID,
+            avg_fill_price NUMERIC
+        );
+        CREATE TABLE position_order_links (
+            id UUID PRIMARY KEY, side TEXT NOT NULL,
+            applied_quantity NUMERIC NOT NULL DEFAULT 0
         );
         CREATE TABLE cash_flow_events (
             id UUID PRIMARY KEY, workspace_id UUID NOT NULL, event_type TEXT NOT NULL,
@@ -378,30 +383,69 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
     assert_eq!(capacity.max_withdrawable, Decimal::new(893775, 4));
     assert!(capacity.blocking_reasons.is_empty());
 
-    // A buy of $12.50 matched a minute ago may not have moved its USDC yet;
-    // one matched 45 minutes ago, a sale, and another wallet's buy are not
-    // held.
-    for (maker, side, units, minutes) in [
-        (TRADING, "BUY", "12500000", 1),
-        (TRADING, "BUY", "30000000", 45),
-        (TRADING, "SELL", "9000000", 1),
-        (OTHER, "BUY", "7000000", 1),
-    ] {
-        sqlx::query(
-            "INSERT INTO execution_intents (id, market_id, signed_order, status, updated_at) \
-             VALUES (gen_random_uuid(), 'market', $1, 'reconciled', \
-                     NOW() - make_interval(mins => $2))",
-        )
-        .bind(serde_json::json!({ "maker": maker, "side": side, "makerAmount": units }))
-        .bind(minutes)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
+    // Matched buys whose trades may not have moved their USDC yet: a bot
+    // entry's buy of $12.50 for 25 shares booked a minute ago, and a manual
+    // buy of 10 shares at 0.40 its trades have not confirmed. Each holds its
+    // amount and the most fee it can carry (0.0175 a share). Not held: an
+    // entry booked 45 minutes ago, one that filled nothing, a sale, and
+    // another wallet's buy.
+    let intent = |maker: &str, side: &str, units: &str, status: &str, minutes: i32| {
+        let pool = pool.clone();
+        let (maker, side, units, status) = (
+            maker.to_string(),
+            side.to_string(),
+            units.to_string(),
+            status.to_string(),
+        );
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO execution_intents (id, market_id, signed_order, status, updated_at) \
+                 VALUES ($1, 'market', $2, $3, NOW() - make_interval(mins => $4))",
+            )
+            .bind(id)
+            .bind(serde_json::json!({ "maker": maker, "side": side, "makerAmount": units }))
+            .bind(status)
+            .bind(minutes)
+            .execute(&pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let link = |id: Uuid, side: &str, applied: &str| {
+        sqlx::query("INSERT INTO position_order_links VALUES ($1, $2, $3::numeric)")
+            .bind(id)
+            .bind(side.to_string())
+            .bind(applied.to_string())
+            .execute(&pool)
+    };
+    let entry = intent(TRADING, "BUY", "12500000", "reconciled", 1).await;
+    link(entry, "buy", "25").await.unwrap();
+    let old = intent(TRADING, "BUY", "30000000", "reconciled", 45).await;
+    link(old, "buy", "60").await.unwrap();
+    let unfilled = intent(TRADING, "BUY", "8000000", "reconciled", 1).await;
+    link(unfilled, "buy", "0").await.unwrap();
+    let sale = intent(TRADING, "SELL", "9000000", "reconciled", 1).await;
+    link(sale, "sell", "9").await.unwrap();
+    let elsewhere = intent(OTHER, "BUY", "7000000", "reconciled", 1).await;
+    link(elsewhere, "buy", "14").await.unwrap();
+    let manual = intent(TRADING, "BUY", "4000000", "acknowledged", 1).await;
+    sqlx::query(
+        "INSERT INTO orders (quantity, filled_quantity, price, side, status, execution_mode, \
+         wallet_address, id, avg_fill_price) VALUES (10, 10, 0.45, 'buy', 'filled', 'live', $1, $2, 0.4)",
+    )
+    .bind(TRADING)
+    .bind(manual)
+    .execute(&pool)
+    .await
+    .unwrap();
     let settling = WithdrawalHolds::load(&mut conn, TRADING).await.unwrap();
+    // 5.6225 for open buys, 12.50 + 0.4375 for the entry, 4.00 + 0.175 for
+    // the manual buy.
     assert_eq!(
         settling.capacity(balance_units).reserved_for_open_buys,
-        Decimal::new(181225, 4)
+        Decimal::new(22735, 3)
     );
 
     // Another vault wallet carries no trading reserve.

@@ -441,6 +441,8 @@ impl ApiServer {
         // the leader for its trading, another for the checks its own
         // requests make (manual orders, breaker status).
         spawn_operator_sync(state.clone());
+        // And loads the trading signer while live trading is on without one.
+        crate::state::spawn_signer_keeper(state.clone());
 
         // ── Trading: run by the trading leader only ──
         // Another API process (the next version, while a deploy overlaps the

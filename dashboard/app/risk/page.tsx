@@ -419,7 +419,7 @@ export default function RiskPage() {
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-lg border p-3">
                 <p className="text-xs text-muted-foreground mb-1">
-                  Min Net Profit
+                  Monitor Profit Threshold
                 </p>
                 <p className="text-lg font-bold tabular-nums">
                   {formatFixed(dynamicTunerStatus?.signal_thresholds.min_net_profit_threshold_pct, 2, "%")}

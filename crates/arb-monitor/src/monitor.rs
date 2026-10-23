@@ -787,8 +787,16 @@ impl ArbMonitor {
                         min_book_depth_usd: self.min_book_depth.to_f64(),
                         signal_cooldown_secs: Some(SIGNAL_COOLDOWN_SECS),
                     };
-                    if let Err(e) = self.signal_publisher.publish_runtime_stats(&stats).await {
-                        warn!(error = %e, "Failed to publish arb runtime stats");
+                    // Bounded: a hung Redis must not stall the books.
+                    match tokio::time::timeout(
+                        SIGNAL_PUBLISH_TIMEOUT,
+                        self.signal_publisher.publish_runtime_stats(&stats),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => warn!(error = %e, "Failed to publish arb runtime stats"),
+                        Err(_) => warn!("Publishing arb runtime stats timed out"),
                     }
                     info!(
                         monitored_markets = self.eligible_markets.len(),
@@ -1391,8 +1399,10 @@ impl ArbMonitor {
                                                 %error,
                                                 "Could not publish an entry signal"
                                             );
+                                            // From now: a timed-out publish
+                                            // has already spent the wait.
                                             self.publish_paused_until = Some(
-                                                observed_at
+                                                Utc::now()
                                                     + chrono::Duration::seconds(
                                                         SIGNAL_PUBLISH_BACKOFF_SECS,
                                                     ),
@@ -1403,8 +1413,10 @@ impl ArbMonitor {
                                                 market_id = %arb.market_id,
                                                 "Publishing an entry signal timed out"
                                             );
+                                            // From now: a timed-out publish
+                                            // has already spent the wait.
                                             self.publish_paused_until = Some(
-                                                observed_at
+                                                Utc::now()
                                                     + chrono::Duration::seconds(
                                                         SIGNAL_PUBLISH_BACKOFF_SECS,
                                                     ),

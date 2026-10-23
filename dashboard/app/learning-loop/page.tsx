@@ -148,10 +148,16 @@ function asNumber(value: unknown): string {
   return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
 }
 
+/// A blank field is left out; anything else must be a plain number. Text
+/// such as "15%" or "0,15" is refused (the save reports it) rather than
+/// dropped, which would drop that guardrail from the rollout.
 function parseNumberInput(value: string): number | undefined {
   if (!value.trim()) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  const parsed = Number(value.trim());
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`"${value}" is not a number: enter a plain number such as 0.15`);
+  }
+  return parsed;
 }
 
 function rolloutDefaultAuthority(mode: RolloutMode): AuthorityLevel {

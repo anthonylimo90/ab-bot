@@ -39,8 +39,10 @@ export default function TunerPage() {
 
   // Opportunity selection local state
   const [aggLevel, setAggLevel] = useState<Aggressiveness | null>(null);
-  const [explSlots, setExplSlots] = useState<string>("");
-  const [maxMarketsCap, setMaxMarketsCap] = useState<string>("");
+  // `null` until edited: an emptied field stays empty rather than snapping
+  // back to the stored value (where the next digit would be appended to it).
+  const [explSlots, setExplSlots] = useState<string | null>(null);
+  const [maxMarketsCap, setMaxMarketsCap] = useState<string | null>(null);
 
   // Arb executor local state
   const [posSize, setPosSize] = useState<string>("");
@@ -51,9 +53,9 @@ export default function TunerPage() {
   const effectiveAgg =
     aggLevel ?? (tuner?.opportunity_selection?.aggressiveness as Aggressiveness | undefined) ?? "balanced";
   const effectiveSlots =
-    explSlots || String(tuner?.opportunity_selection?.exploration_slots ?? "");
+    explSlots ?? String(tuner?.opportunity_selection?.exploration_slots ?? "");
   const effectiveMaxMarketsCap =
-    maxMarketsCap || String(tuner?.opportunity_selection?.max_markets_cap ?? "");
+    maxMarketsCap ?? String(tuner?.opportunity_selection?.max_markets_cap ?? "");
   const formatOptionalTimeAgo = (value: string | null | undefined) =>
     value ? formatTimeAgo(value) : "Never";
 
@@ -69,8 +71,8 @@ export default function TunerPage() {
     oppMutation.mutate(params, {
       onSuccess: () => {
         setAggLevel(null);
-        setExplSlots("");
-        setMaxMarketsCap("");
+        setExplSlots(null);
+        setMaxMarketsCap(null);
       },
     });
   };
@@ -334,8 +336,8 @@ export default function TunerPage() {
                   <div className="space-y-1">
                     <p className="text-xs text-muted-foreground">
                       <span className="inline-flex items-center gap-1">
-                        Min Net Profit
-                        <InfoTooltip content="Minimum expected profit after fees and slippage before the system will trade." />
+                        Min Net Profit ($ per share, 0.0005–0.05)
+                        <InfoTooltip content="Minimum expected profit per share pair, in dollars, after fees and slippage before the system will trade: 0.001 is a tenth of a cent. Not a percent: 0.05 is five cents, the most allowed, and skips almost every opportunity." />
                       </span>
                     </p>
                     <Input

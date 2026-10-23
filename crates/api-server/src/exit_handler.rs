@@ -517,6 +517,19 @@ impl ExitHandler {
         Ok(())
     }
 
+    /// Puts a closing position whose sale was certainly not sent back in the
+    /// exit queue for the next pass, without counting a failed exit.
+    async fn defer_sale(&self, position: &mut Position, reason: &str, ctx: &EventContext) {
+        info!(position_id = %position.id, reason, "Exit sale not sent; it goes again next pass");
+        if let Err(error) = self
+            .position_service
+            .defer_exit(position, reason, ctx)
+            .await
+        {
+            warn!(position_id = %position.id, %error, "Could not return the position to the exit queue");
+        }
+    }
+
     /// Execute the sell orders for a single ExitReady position.
     async fn execute_exit(&self, position: &mut Position) -> anyhow::Result<()> {
         // Sell every leg of the exit or none of it; a shutdown leaves the
@@ -640,6 +653,10 @@ impl ExitHandler {
                     {
                         return Ok(());
                     }
+                    if nothing_was_sent(&e.to_string()) {
+                        self.defer_sale(position, &e.to_string(), &ctx).await;
+                        return Ok(());
+                    }
                     error!(error = %e, market_id = %market_id, "YES sell order error");
                     let _ = self
                         .position_service
@@ -663,6 +680,10 @@ impl ExitHandler {
                 let msg = yes_report
                     .error_message
                     .unwrap_or_else(|| "YES sell not filled".to_string());
+                if nothing_was_sent(&msg) {
+                    self.defer_sale(position, &msg, &ctx).await;
+                    return Ok(());
+                }
                 let _ = self
                     .position_service
                     .mark_exit_failed(
@@ -734,6 +755,10 @@ impl ExitHandler {
                     {
                         return Ok(());
                     }
+                    if nothing_was_sent(&e.to_string()) {
+                        self.defer_sale(position, &e.to_string(), &ctx).await;
+                        return Ok(());
+                    }
                     error!(error = %e, market_id = %market_id, "NO sell order error");
                     let _ = self
                         .position_service
@@ -757,6 +782,10 @@ impl ExitHandler {
                 let msg = no_report
                     .error_message
                     .unwrap_or_else(|| "NO sell not filled".to_string());
+                if nothing_was_sent(&msg) {
+                    self.defer_sale(position, &msg, &ctx).await;
+                    return Ok(());
+                }
                 let _ = self
                     .position_service
                     .mark_exit_failed(
@@ -2375,6 +2404,20 @@ mod strategy_exit_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sales_refused_before_sending_are_told_apart() {
+        // The executor's words for a sale it never sent.
+        assert!(nothing_was_sent(
+            "live_submission_fence_busy: another live order is still being posted; nothing was sent"
+        ));
+        assert!(nothing_was_sent(
+            "Live order preparation exceeded its deadline; nothing was sent"
+        ));
+        // A rejection or an unknown outcome is a failed exit.
+        assert!(!nothing_was_sent("not enough balance / allowance"));
+        assert!(!nothing_was_sent("submission_requires_reconciliation"));
+    }
+
     #[sqlx::test(migrations = false)]
     async fn live_entries_wait_while_live_exits_keep_failing(pool: PgPool) {
         sqlx::raw_sql(
@@ -2601,6 +2644,14 @@ const MAX_FEE_SHARE_FRACTION: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
 
 /// Shares bought on a token within this window may still be settling on chain.
 const FEE_WRITE_OFF_SETTLE_MINUTES: i32 = 30;
+
+/// Whether an order failure says the order certainly never left: another
+/// live order held the wallet's submission fence, or preparing it ran out of
+/// time. Such a sale is tried again next pass, not counted as a failed exit
+/// (whose retries slow down).
+fn nothing_was_sent(message: &str) -> bool {
+    message.contains("nothing was sent")
+}
 
 /// For a position, market, wallet, leg ('yes'/'no'), token and settling
 /// window: what the wallet's other live positions and manual orders hold of

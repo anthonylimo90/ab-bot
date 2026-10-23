@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { ConfirmAction } from "@/components/shared/ConfirmAction";
 import { cn } from "@/lib/utils";
 import { primaryNavSections } from "@/components/layout/navigation";
 
@@ -32,6 +33,10 @@ interface MobileNavDrawerProps {
   isTradingActive: boolean;
   isTradingPending: boolean;
   onToggleTrading: () => void;
+  /** What pausing or resuming asks before it happens. */
+  tradingToggleConfirm: { title: string; description: string; confirmLabel: string };
+  /** Only the workspace owner may pause or resume trading. */
+  canToggleTrading: boolean;
   onConnectWallet: () => void;
   onLogout: () => void;
 }
@@ -51,6 +56,8 @@ export function MobileNavDrawer({
   isTradingActive,
   isTradingPending,
   onToggleTrading,
+  tradingToggleConfirm,
+  canToggleTrading,
   onConnectWallet,
   onLogout,
 }: MobileNavDrawerProps) {
@@ -139,6 +146,8 @@ export function MobileNavDrawer({
                       </Badge>
                     </div>
 
+                    {canToggleTrading && (
+                    <ConfirmAction {...tradingToggleConfirm} onConfirm={onToggleTrading}>
                     <Button
                       variant="outline"
                       className={cn(
@@ -148,7 +157,6 @@ export function MobileNavDrawer({
                           : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
                       )}
                       disabled={isTradingPending}
-                      onClick={onToggleTrading}
                     >
                       {isTradingActive ? (
                         <Pause className="h-4 w-4" />
@@ -161,6 +169,8 @@ export function MobileNavDrawer({
                           ? "Pause trading"
                           : "Resume trading"}
                     </Button>
+                    </ConfirmAction>
+                    )}
                   </div>
                 </>
               )}

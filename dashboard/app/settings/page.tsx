@@ -100,6 +100,8 @@ export default function SettingsPage() {
   const canManageRisk = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canManageWithdrawals = currentUserRole === 'owner' || currentUserRole === 'admin';
+  // Workspace settings (wallet connection, trading switches) are the owner's.
+  const canUpdateWorkspace = currentUserRole === 'owner';
 
   // Fetch workspace members
   const { data: members = [], isLoading: membersLoading } = useQuery({
@@ -144,17 +146,20 @@ export default function SettingsPage() {
     useWalletWithdrawalsQuery(8);
   const createWithdrawalMutation = useCreateWalletWithdrawalMutation();
 
-  // Initialize risk form from API data
+  // Initialize the risk form from the stored config, and again only when that
+  // config changes: the status poll (P&L, equity) must not reset an edit.
+  const riskConfig = riskStatus?.circuit_breaker?.config;
+  const riskConfigKey = riskConfig ? JSON.stringify(riskConfig) : null;
   useEffect(() => {
-    if (riskStatus?.circuit_breaker?.config) {
-      const cfg = riskStatus.circuit_breaker.config;
+    if (riskConfigKey) {
+      const cfg = JSON.parse(riskConfigKey) as NonNullable<typeof riskConfig>;
       setRiskMaxDailyLoss(cfg.max_daily_loss);
       setRiskMaxDrawdownPct(Math.round(cfg.max_drawdown_pct * 10000) / 100); // ratio -> percent display
       setRiskMaxConsecutiveLosses(cfg.max_consecutive_losses);
       setRiskCooldownMinutes(cfg.cooldown_minutes);
       setRiskEnabled(cfg.enabled);
     }
-  }, [riskStatus]);
+  }, [riskConfigKey]);
 
   // Initialize walletConnectProjectId from workspace
   useEffect(() => {
@@ -220,8 +225,8 @@ export default function SettingsPage() {
       if (arbAutoExecuteDirty) updates.arb_auto_execute = arbAutoExecute;
       if (liveTradingEnabledDirty) updates.live_trading_enabled = liveTradingEnabled;
       if (exitHandlerEnabledDirty) updates.exit_handler_enabled = exitHandlerEnabled;
-      if (polygonRpcUrl) updates.polygon_rpc_url = polygonRpcUrl;
-      if (alchemyApiKey) updates.alchemy_api_key = alchemyApiKey;
+      if (polygonRpcUrl.trim()) updates.polygon_rpc_url = polygonRpcUrl.trim();
+      if (alchemyApiKey.trim()) updates.alchemy_api_key = alchemyApiKey.trim();
       if (Object.keys(updates).length === 0) {
         toast.warning('No changes to save', 'Trading settings already match the current workspace');
         return;
@@ -239,17 +244,27 @@ export default function SettingsPage() {
     }
   };
 
-  // Save risk management config (real API call)
+  // Save risk management config (real API call). Only the fields changed
+  // from the stored config are sent: the others keep whatever is stored, even
+  // if another operator changed them meanwhile, and the drawdown limit is not
+  // re-sent rounded to the two decimals the form shows.
   const handleSaveRisk = async () => {
-    if (!currentWorkspace) return;
+    if (!currentWorkspace || !riskConfig) return;
+    const changed = <T,>(value: T | '', stored: T) =>
+      value === '' || value === stored ? undefined : value;
+    const shownDrawdown = Math.round(riskConfig.max_drawdown_pct * 10000) / 100;
     setIsSavingRisk(true);
     try {
+      const drawdownPct = changed(riskMaxDrawdownPct, shownDrawdown);
       await api.updateCircuitBreakerConfig(currentWorkspace.id, {
-        max_daily_loss: riskMaxDailyLoss === '' ? undefined : Number(riskMaxDailyLoss),
-        max_drawdown_pct: riskMaxDrawdownPct === '' ? undefined : Number(riskMaxDrawdownPct) / 100, // percent -> ratio
-        max_consecutive_losses: riskMaxConsecutiveLosses === '' ? undefined : Number(riskMaxConsecutiveLosses),
-        cooldown_minutes: riskCooldownMinutes === '' ? undefined : Number(riskCooldownMinutes),
-        enabled: riskEnabled,
+        max_daily_loss: changed(riskMaxDailyLoss, riskConfig.max_daily_loss),
+        max_drawdown_pct: drawdownPct === undefined ? undefined : drawdownPct / 100, // percent -> ratio
+        max_consecutive_losses: changed(
+          riskMaxConsecutiveLosses,
+          riskConfig.max_consecutive_losses,
+        ),
+        cooldown_minutes: changed(riskCooldownMinutes, riskConfig.cooldown_minutes),
+        enabled: riskEnabled === riskConfig.enabled ? undefined : riskEnabled,
       });
       toast.success('Risk settings saved', 'Circuit breaker configuration has been updated');
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
@@ -287,6 +302,28 @@ export default function SettingsPage() {
       setIsResettingCb(false);
     }
   };
+
+  // Turning live trading or automatic arbitrage on is confirmed first: with
+  // both on, the bot spends real funds on its own.
+  const enablingLiveTrading =
+    liveTradingEnabledDirty && liveTradingEnabled && !currentWorkspace?.live_trading_enabled;
+  const enablingArbAutoExecute =
+    arbAutoExecuteDirty && arbAutoExecute && !currentWorkspace?.arb_auto_execute;
+  const tradingSaveButton = (onClick?: () => void) => (
+    <Button onClick={onClick} disabled={isSavingTradingConfig} className="w-full">
+      {isSavingTradingConfig ? (
+        <>
+          <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+          Saving...
+        </>
+      ) : (
+        <>
+          <Save className="mr-2 h-4 w-4" />
+          Save Trading Settings
+        </>
+      )}
+    </Button>
+  );
 
   // Check if risk form has changed from API baseline
   const riskDirty = riskStatus?.circuit_breaker?.config
@@ -583,7 +620,7 @@ export default function SettingsPage() {
                   </p>
                   <ConfirmAction
                     title="Send this withdrawal?"
-                    description={`${withdrawAmount} USDC to ${withdrawDestination.trim()}. A transfer on Polygon cannot be undone: check the address.`}
+                    description={`${Number(withdrawAmount).toLocaleString('en-US', { maximumFractionDigits: 6 })} USDC to ${withdrawDestination.trim()}. A transfer on Polygon cannot be undone: check the address.`}
                     confirmLabel="Send Withdrawal"
                     onConfirm={handleWithdraw}
                   >
@@ -656,8 +693,8 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      {/* WalletConnect Settings (Owner/Admin only) */}
-      {currentWorkspace && canConfigureWalletConnect && (
+      {/* WalletConnect Settings (Owner only) */}
+      {currentWorkspace && canUpdateWorkspace && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -729,8 +766,8 @@ export default function SettingsPage() {
         </Card>
       )}
 
-      {/* Trading Configuration (Owner/Admin only) */}
-      {currentWorkspace && canConfigureWalletConnect && (
+      {/* Trading Configuration (Owner only) */}
+      {currentWorkspace && canUpdateWorkspace && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -897,23 +934,29 @@ export default function SettingsPage() {
               </div>
             )}
 
-            <Button
-              onClick={handleSaveTradingConfig}
-              disabled={isSavingTradingConfig}
-              className="w-full"
-            >
-              {isSavingTradingConfig ? (
-                <>
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Trading Settings
-                </>
-              )}
-            </Button>
+            {enablingLiveTrading || enablingArbAutoExecute ? (
+              <ConfirmAction
+                title={
+                  enablingLiveTrading && enablingArbAutoExecute
+                    ? 'Turn on live trading and automatic arbitrage?'
+                    : enablingLiveTrading
+                      ? 'Turn on live trading?'
+                      : 'Turn on automatic arbitrage?'
+                }
+                description={
+                  enablingLiveTrading
+                    ? 'Orders will use real funds from the active wallet, including the automatic strategies that are on. Check the wallet and its balance first.'
+                    : 'The bot will place arbitrage trades on its own; with live trading on, they use real funds from the active wallet.'
+                }
+                confirmLabel="Save and Turn On"
+                destructive
+                onConfirm={handleSaveTradingConfig}
+              >
+                {tradingSaveButton()}
+              </ConfirmAction>
+            ) : (
+              tradingSaveButton(handleSaveTradingConfig)
+            )}
           </CardContent>
         </Card>
       )}
@@ -1126,8 +1169,8 @@ export default function SettingsPage() {
                       value={riskCooldownMinutes}
                       onChange={(e) => setRiskCooldownMinutes(e.target.value === '' ? '' : Number(e.target.value))}
                       className="w-20 rounded border bg-background px-3 py-1 text-right"
-                      min={0}
-                      max={1440}
+                      min={1}
+                      max={10080}
                       disabled={!canManageRisk}
                     />
                     <span className="text-muted-foreground">min</span>

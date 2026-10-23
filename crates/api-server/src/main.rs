@@ -81,7 +81,21 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(5),
         ),
     };
-    let pool = polymarket_core::db::create_pool(&db_config).await?;
+    // The server waits for a database that is down at start rather than
+    // exiting: each exit spends one of the platform's restarts, and a long
+    // outage would spend them all, leaving the service down once the
+    // database is back. A one-off command gives up as before.
+    let serving = matches!(cli.command, Some(Commands::Serve) | None);
+    let pool = loop {
+        match polymarket_core::db::create_pool(&db_config).await {
+            Ok(pool) => break pool,
+            Err(error) if serving => {
+                tracing::error!(%error, "The database is unavailable at startup; waiting for it");
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
 
     // Run migrations
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")

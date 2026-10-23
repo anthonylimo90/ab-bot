@@ -13,6 +13,7 @@ import {
 
 import { useRecoveryPreviewQuery, useRunRecoveryMutation, useRefreshRecoveryPreviewMutation } from "@/hooks/queries/useRecoveryQuery";
 import { Button } from "@/components/ui/button";
+import { ConfirmAction } from "@/components/shared/ConfirmAction";
 import {
   Dialog,
   DialogContent,
@@ -320,20 +321,39 @@ export function RecoveryDialog({
             <div className="text-xs text-muted-foreground">
               Recovery now uses reconciled inventory and canonical exit routing, and recovered funds remain in the active trading wallet unless you later send a separate withdrawal.
             </div>
-            <Button
-              type="button"
-              onClick={handleRunRecovery}
-              disabled={!workspaceId || previewQuery.isPending || runMutation.isPending}
+            {/* Recovery sells at market from the wallet: it starts only from
+                a preview that loaded, and asks first. */}
+            <ConfirmAction
+              title="Start recovery?"
+              description={
+                preview
+                  ? `Requeues failed and stalled exits and sells orphan inventory at market from the trading wallet (orphans marked at ${usdFormatter.format(preview.orphan_inventory.marked_value)} in the preview; what is sold is what the wallet holds when recovery runs).`
+                  : "Recovery sells at market from the trading wallet."
+              }
+              confirmLabel="Start Recovery"
+              destructive
+              onConfirm={handleRunRecovery}
             >
-              {runMutation.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Starting…
-                </>
-              ) : (
-                "Start Safe Recovery"
-              )}
-            </Button>
+              <Button
+                type="button"
+                disabled={
+                  !workspaceId ||
+                  !preview ||
+                  previewQuery.isPending ||
+                  previewQuery.isError ||
+                  runMutation.isPending
+                }
+              >
+                {runMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Starting…
+                  </>
+                ) : (
+                  "Start Safe Recovery"
+                )}
+              </Button>
+            </ConfirmAction>
           </DialogFooter>
         </DialogContent>
       </Dialog>

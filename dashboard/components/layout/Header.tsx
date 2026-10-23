@@ -186,6 +186,17 @@ export function Header() {
         .slice(0, 2)
     : user?.email?.slice(0, 2).toUpperCase() || "U";
 
+  // Pausing or resuming is confirmed first, from the header or the drawer.
+  const tradingToggleConfirm = {
+    title: isTradingActive ? "Pause automated trading?" : "Resume arb execution?",
+    description: isTradingActive
+      ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop all trading at once."
+      : currentWorkspace?.live_trading_enabled
+        ? "Arbitrage resumes with real funds: live trading is on."
+        : "Arbitrage resumes on paper. Live trading stays off; switch it on in Settings.",
+    confirmLabel: isTradingActive ? "Pause" : "Resume",
+  };
+
   return (
     <header className="sticky top-0 z-40 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
       <div className="flex h-16 items-center justify-between gap-2 px-3 sm:px-4 md:px-6">
@@ -227,18 +238,10 @@ export function Header() {
 
         {/* Wallet Info & Actions */}
         <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
-          {/* Trading Pause/Resume */}
-          {currentWorkspace && (
+          {/* Trading Pause/Resume (the workspace owner's) */}
+          {currentWorkspace?.my_role === "owner" && (
             <ConfirmAction
-              title={isTradingActive ? "Pause automated trading?" : "Resume arb execution?"}
-              description={
-                isTradingActive
-                  ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop all trading at once."
-                  : currentWorkspace.live_trading_enabled
-                    ? "Arbitrage resumes with real funds: live trading is on."
-                    : "Arbitrage resumes on paper. Live trading stays off; switch it on in Settings."
-              }
-              confirmLabel={isTradingActive ? "Pause" : "Resume"}
+              {...tradingToggleConfirm}
               onConfirm={() => toggleTradingMutation.mutate()}
             >
             <Button
@@ -515,6 +518,8 @@ export function Header() {
         isTradingActive={isTradingActive}
         isTradingPending={toggleTradingMutation.isPending}
         onToggleTrading={() => toggleTradingMutation.mutate()}
+        tradingToggleConfirm={tradingToggleConfirm}
+        canToggleTrading={currentWorkspace?.my_role === "owner"}
         onConnectWallet={() => setShowConnectModal(true)}
         onLogout={handleLogout}
       />

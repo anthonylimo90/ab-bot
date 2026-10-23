@@ -355,10 +355,11 @@ pub async fn update_circuit_breaker_config(
         config.max_consecutive_losses = v;
     }
     if let Some(v) = req.cooldown_minutes {
+        // Without a cooldown a loss trip lets trading straight back in.
         let most = risk_manager::circuit_breaker::MAX_WAIT_MINUTES;
-        if !(0..=most).contains(&v) {
+        if !(1..=most).contains(&v) {
             return Err(ApiError::BadRequest(format!(
-                "cooldown_minutes must be between 0 and {most} (a week)"
+                "cooldown_minutes must be between 1 and {most} (a week)"
             )));
         }
         config.cooldown_minutes = v;
@@ -368,6 +369,17 @@ pub async fn update_circuit_breaker_config(
     }
 
     config.validate().map_err(ApiError::BadRequest)?;
+    // A drawdown limit at or past the hard kill would never trip first: the
+    // latched kill would.
+    if req.max_drawdown_pct.is_some()
+        && config.hard_kill_drawdown_pct > Decimal::ZERO
+        && config.max_drawdown_pct >= config.hard_kill_drawdown_pct
+    {
+        return Err(ApiError::BadRequest(format!(
+            "max_drawdown_pct must be below the hard kill drawdown ({})",
+            config.hard_kill_drawdown_pct
+        )));
+    }
     // Stored first, then applied: a failed write changes nothing. Only the
     // limits this request sets are written, so concurrent updates of
     // different limits both stand.

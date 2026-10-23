@@ -695,17 +695,20 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   confirmation" and the reconciler books the fills. A manual market buy was
   costed at $1 a share before, and never corrected.
 - Withdrawals hold back, besides open buy orders, the USDC of the trading
-  wallet's live buys matched in the last 30 minutes, whose trades may not
-  have settled on chain. The preflight takes `amount` as optional: without
-  it, it reports the wallet's capacity alone.
+  wallet's matched buys whose trades may not have settled on chain: a bot
+  entry's buy for 30 minutes after its fill is booked, a manual buy's fills
+  until its trades are confirmed; each with the most taker fee it can carry.
+  The preflight takes `amount` as optional: without it, it reports the
+  wallet's capacity alone.
 - An arb entry whose exchange fee terms could not be read books fees at the
   highest published rate (the entry gate already used it), not the
   listing's.
 - The circuit breaker's equity feed scans the wallet's inventory afresh
-  each snapshot, and leaves out a reading when a live order was placed
-  during it (or within 30 s before): the scan and the cash read could
-  straddle its trade. After three such readings in a row the next one feeds
-  it regardless.
+  each snapshot. A reading taken while the trading wallet placed a live
+  order (or within 30 s before) feeds no reference, as the scan and the
+  cash read could straddle its trade, but still trips on a drawdown its
+  best case (the reading plus that order's cash) shows; after three such
+  readings in a row the next one feeds it regardless.
 - `canonical_arb_learning_attempts` (migration 096) takes each attempt's id
   and telemetry from its entry request, so opened and failed arb attempts
   join their shadow predictions and the rollout guardrails' failure and
@@ -726,6 +729,47 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   publishing another entry signal.
 - A manual close that races the exit handler's update of the position
   retries instead of answering 400.
+
+### Restarts, outages and operator safeguards (097)
+
+- A process that loses its database at start waits for it (logging an
+  error every 15 s) instead of exiting; so does the arb monitor for its
+  database and Redis. Each exit spent one of Railway's five restarts, and a
+  long outage left the services down once it ended.
+- While live trading is on without a loaded trading signer (the exchange or
+  database failed at start, or live trading was switched on after a paper
+  start), every API process tries to load it every 30 s. Before, nothing
+  traded live, exits included, until a restart.
+- An exit sale refused before it was sent (another live order still held
+  the wallet's submission fence, or preparing it ran out of time) goes back
+  to the exit queue for the next pass instead of counting as a failed exit
+  and slowing the position's retries.
+- Trading live needs the Polygon RPC: after three snapshots in a row (15
+  minutes by default) without a complete account valuation, the circuit
+  breaker trips on connectivity (it cools down and trips again while the
+  valuation stays incomplete), since its drawdown guard cannot see equity.
+- Strategy health counts an arb entry left holding one leg as a failed
+  entry, and "executed" as the entries that opened. Strategy snapshots of a
+  period are stored together.
+- The arb monitor's runtime stats publish is bounded at 5 s, and its pause
+  after a failed entry publish runs from the failure.
+- Dashboard and API safeguards:
+  - Turning live trading or automatic arbitrage on, pausing or resuming from
+    the mobile menu, and starting recovery (which sells orphans at market)
+    each ask for confirmation; recovery starts only from a preview that
+    loaded.
+  - Workspace settings (wallet connection, trading switches, pause and
+    resume) are shown to the owner only, as only the owner may change them.
+  - Cash flows offer "Transfer in" and "Transfer out" and record each with
+    its sign; a fee is money out, and the API refuses a positive one.
+  - The risk form no longer resets while it is edited and sends only the
+    limits changed. The API refuses a cooldown under a minute and a drawdown
+    limit at or past the hard kill.
+  - A learning rollout guardrail that is not a plain number is refused
+    rather than dropped. The tuner's minimum net profit is labelled in
+    dollars per share.
+- Migration 097 indexes `execution_intents` by creation time and, for
+  reconciled ones, update time.
 
 ### API contract changes
 

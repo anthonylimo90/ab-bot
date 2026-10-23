@@ -594,6 +594,18 @@ impl Position {
 
     /// Requeues a failed exit for another attempt, regardless of how many
     /// attempts failed; callers pace retries (see the exit handler backoff).
+    /// Returns a closing position to the exit queue when its sale was
+    /// certainly not sent (another live order held the wallet's submission
+    /// fence): not a failed exit, so its retry count and backoff stand.
+    pub fn defer_exit(&mut self) -> bool {
+        if self.state != PositionState::Closing {
+            return false;
+        }
+        self.state = PositionState::ExitReady;
+        self.last_updated = Utc::now();
+        true
+    }
+
     pub fn requeue_failed_exit(&mut self) -> bool {
         if self.state != PositionState::ExitFailed {
             return false;
@@ -960,6 +972,27 @@ mod tests {
         assert!(p.requeue_failed_exit());
         assert_eq!(p.state, PositionState::ExitReady);
         assert!(!p.requeue_failed_exit());
+    }
+
+    #[test]
+    fn an_unsent_sale_goes_back_to_the_queue_without_counting_a_failure() {
+        let mut p = Position::new(
+            "m".into(),
+            Decimal::new(48, 2),
+            Decimal::ZERO,
+            Decimal::ONE,
+            ExitStrategy::ExitOnCorrection,
+        );
+        p.held_yes_qty = Decimal::ONE;
+        // Only a closing position is deferred.
+        assert!(!p.defer_exit());
+        p.mark_open().unwrap();
+        p.mark_exit_ready().unwrap();
+        p.mark_closing().unwrap();
+        let retries = p.retry_count;
+        assert!(p.defer_exit());
+        assert_eq!(p.state, PositionState::ExitReady);
+        assert_eq!(p.retry_count, retries);
     }
 
     #[test]
