@@ -65,6 +65,11 @@ struct TuningMetrics {
     successful_fill_rate: f64,
     attempts_last_window: f64,
     fills_last_window: f64,
+    /// Arbitrage signals skipped in the window for a reason the tuner's
+    /// own settings gate (profit threshold, book depth). They never become
+    /// positions, so the watchdog would not see them otherwise.
+    #[serde(default)]
+    gated_skips_last_window: f64,
     top_skip_reason: Option<String>,
     realized_slippage_p90: f64,
     depth_proxy: f64,
@@ -203,6 +208,11 @@ const MIN_PROFIT_FLOOR_SHARE: f64 = 0.8;
 /// base size, and the most the tuner grows it to (as a multiple of default).
 const QUANT_SIZE_MIN_TRADES: i64 = 10;
 const QUANT_SIZE_MAX_MULTIPLE: f64 = 2.0;
+/// The most the tuner grows the monitored market count to, as a multiple
+/// of its default. A count already past it (an operator set more) is held.
+const MAX_MARKETS_MAX_MULTIPLE: f64 = 2.0;
+/// Skip reasons that one of the tuner's settings decides.
+const GATED_SKIP_REASONS: [&str; 2] = ["below_min_profit", "insufficient_depth"];
 
 impl DynamicConfigRow {
     /// Set by an operator recently: the tuner does not move it.
@@ -358,9 +368,7 @@ impl DynamicTuner {
 
         let mut metrics = self.collect_metrics(redis_manager.as_mut()).await?;
         // Judged before any freeze, so the stored verdict is this cycle's.
-        metrics.no_trade_watchdog = metrics.attempts_last_window
-            >= self.config.no_trade_min_attempts as f64
-            && metrics.fills_last_window <= EPSILON;
+        metrics.no_trade_watchdog = self.no_trade_watchdog(&metrics);
         let current_regime = *self.current_regime.read().await;
         let resolved = self.resolve_regime(
             current_regime,
@@ -676,6 +684,14 @@ impl DynamicTuner {
         Ok(())
     }
 
+    /// Many entries tried or signals held back by the tuner's own gates,
+    /// and nothing filled.
+    fn no_trade_watchdog(&self, metrics: &TuningMetrics) -> bool {
+        metrics.attempts_last_window + metrics.gated_skips_last_window
+            >= self.config.no_trade_min_attempts as f64
+            && metrics.fills_last_window <= EPSILON
+    }
+
     fn compute_targets(
         &self,
         rows: &HashMap<String, DynamicConfigRow>,
@@ -693,9 +709,7 @@ impl DynamicTuner {
             .map(|r| decimal_to_f64(r.default_value))
             .unwrap_or(300.0);
 
-        let no_trade_watchdog = metrics.attempts_last_window
-            >= self.config.no_trade_min_attempts as f64
-            && metrics.fills_last_window <= EPSILON;
+        let no_trade_watchdog = self.no_trade_watchdog(metrics);
         let top_skip = metrics
             .top_skip_reason
             .as_deref()
@@ -717,7 +731,12 @@ impl DynamicTuner {
         // attempts AND zero fills the metrics are phantom values and any
         // movement is pure noise — the tuner should hold steady rather
         // than drift upward into a death spiral.
-        if metrics.attempts_last_window >= 1.0 || metrics.fills_last_window >= 1.0 {
+        // Signals the threshold itself holds back count too: they are why
+        // the watchdog is on, and they never become attempts.
+        if metrics.attempts_last_window >= 1.0
+            || metrics.fills_last_window >= 1.0
+            || no_trade_watchdog
+        {
             let expected_arb_slippage = (metrics.realized_slippage_p90 * 2.0).max(0.0015);
             let low_depth_penalty = (0.0010 - metrics.depth_proxy).max(0.0) * 0.3;
             let vol_penalty = metrics.volatility_proxy * 0.01;
@@ -746,15 +765,20 @@ impl DynamicTuner {
 
         // ARB_MIN_BOOK_DEPTH: relax when watchdog says depth is the blocking reason.
         // This targets the actual gating parameter instead of reducing the profit
-        // threshold, which would push into lower-quality opportunities.
-        if no_trade_watchdog && top_skip == "insufficient_depth" {
-            if let Some(row) = rows.get(KEY_ARB_MIN_BOOK_DEPTH) {
-                let current_depth = decimal_to_f64(row.current_value);
+        // threshold, which would push into lower-quality opportunities. Once
+        // depth no longer blocks, a relaxed floor returns toward its default
+        // (apply_step_limit bounds the pace); one above the default is held.
+        if let Some(row) = rows.get(KEY_ARB_MIN_BOOK_DEPTH) {
+            let current_depth = decimal_to_f64(row.current_value);
+            let default_depth = decimal_to_f64(row.default_value);
+            if no_trade_watchdog && top_skip == "insufficient_depth" {
                 // 5% a step, and never below a set share of the default:
                 // failing entries are not cured by ever thinner books.
-                let floor = decimal_to_f64(row.default_value) * MIN_DEPTH_FLOOR_SHARE;
+                let floor = default_depth * MIN_DEPTH_FLOOR_SHARE;
                 let relaxed_depth = (current_depth * 0.95).max(floor.min(current_depth));
                 targets.insert(KEY_ARB_MIN_BOOK_DEPTH.to_string(), relaxed_depth);
+            } else if current_depth + EPSILON < default_depth {
+                targets.insert(KEY_ARB_MIN_BOOK_DEPTH.to_string(), default_depth);
             }
         }
 
@@ -785,7 +809,14 @@ impl DynamicTuner {
                 // default cap. apply_step_limit still bounds the live change rate.
                 max_markets_default
             } else {
-                (max_markets_current * desired_market_factor).round()
+                let grown = (max_markets_current * desired_market_factor).round();
+                // Growth stops at a multiple of the default; shrinking is not capped.
+                let cap = max_markets_default * MAX_MARKETS_MAX_MULTIPLE;
+                if grown > max_markets_current && grown > cap {
+                    cap.max(max_markets_current)
+                } else {
+                    grown
+                }
             };
         targets.insert(
             KEY_ARB_MONITOR_MAX_MARKETS.to_string(),
@@ -964,6 +995,24 @@ impl DynamicTuner {
         .await
         .unwrap_or((Decimal::ZERO, 0));
 
+        let gated_skips_last_window: f64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::double precision
+            FROM trade_events
+            WHERE source = 'arb'
+              AND event_type = 'signal_skipped'
+              AND reason = ANY($2)
+              AND execution_mode = $3
+              AND occurred_at >= NOW() - ($1::bigint * INTERVAL '1 minute')
+            "#,
+        )
+        .bind(self.config.no_trade_window_minutes)
+        .bind(&GATED_SKIP_REASONS[..])
+        .bind(self.traded_mode().await)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0.0);
+
         // Query the most common arb skip reason from recent trade events.
         let top_skip_reason: Option<String> = sqlx::query_scalar(
             r#"
@@ -989,6 +1038,7 @@ impl DynamicTuner {
             successful_fill_rate: ratio(fills_last_window, attempts_last_window),
             attempts_last_window,
             fills_last_window,
+            gated_skips_last_window,
             top_skip_reason,
             realized_slippage_p90: 0.0,
             depth_proxy,
@@ -1197,8 +1247,9 @@ impl DynamicTuner {
         reason: &str,
         metrics: &TuningMetrics,
     ) -> anyhow::Result<bool> {
-        // Only over the value this pass read: an operator's update since
-        // then stands.
+        // Only over the row this pass read: an operator's update since then
+        // stands, even one that saved the same value (it changes who set
+        // it and when, which holds the tuner off).
         let changed = sqlx::query(
             r#"
             UPDATE dynamic_config
@@ -1209,6 +1260,8 @@ impl DynamicTuner {
                 last_reason = $4,
                 updated_by = 'dynamic_tuner'
             WHERE key = $1 AND current_value = $5 AND NOT pending_eval
+              AND updated_by IS NOT DISTINCT FROM $6
+              AND updated_at IS NOT DISTINCT FROM $7
             "#,
         )
         .bind(&row.key)
@@ -1216,6 +1269,8 @@ impl DynamicTuner {
         .bind(serde_json::to_value(metrics).unwrap_or(serde_json::json!({})))
         .bind(reason)
         .bind(row.current_value)
+        .bind(&row.updated_by)
+        .bind(row.updated_at)
         .execute(&self.pool)
         .await?
         .rows_affected();
@@ -1859,6 +1914,85 @@ mod tests {
             updates_per_minute: 60.0,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn signals_held_back_by_the_threshold_wake_the_watchdog() {
+        let tuner = tuner();
+        let rows = HashMap::from([(
+            KEY_ARB_MIN_PROFIT_THRESHOLD.to_string(),
+            DynamicConfigRow {
+                current_value: Decimal::new(5, 3),
+                default_value: Decimal::new(5, 3),
+                ..row(KEY_ARB_MIN_PROFIT_THRESHOLD, 0, 0)
+            },
+        )]);
+        // Every signal skipped below the threshold: no position, no attempt.
+        let skipped = TuningMetrics {
+            gated_skips_last_window: 50.0,
+            top_skip_reason: Some("below_min_profit".to_string()),
+            updates_per_minute: 60.0,
+            ..Default::default()
+        };
+        assert!(tuner.no_trade_watchdog(&skipped));
+        let target = tuner.compute_targets(&rows, &skipped, MarketRegime::Ranging)
+            [KEY_ARB_MIN_PROFIT_THRESHOLD];
+        assert!(target < 0.005);
+
+        // A fill in the window means trades are happening.
+        let filled = TuningMetrics {
+            fills_last_window: 1.0,
+            ..skipped.clone()
+        };
+        assert!(!tuner.no_trade_watchdog(&filled));
+    }
+
+    #[tokio::test]
+    async fn a_relaxed_depth_floor_returns_to_its_default() {
+        let tuner = tuner();
+        let rows = HashMap::from([(
+            KEY_ARB_MIN_BOOK_DEPTH.to_string(),
+            row(KEY_ARB_MIN_BOOK_DEPTH, 70, 100),
+        )]);
+        let blocked = idle_metrics("insufficient_depth");
+        assert!(
+            tuner.compute_targets(&rows, &blocked, MarketRegime::Ranging)[KEY_ARB_MIN_BOOK_DEPTH]
+                < 70.0
+        );
+        let clear = idle_metrics("active_position_exists");
+        assert_eq!(
+            tuner.compute_targets(&rows, &clear, MarketRegime::Ranging)[KEY_ARB_MIN_BOOK_DEPTH],
+            100.0
+        );
+        // One an operator set above the default is left alone.
+        let raised = HashMap::from([(
+            KEY_ARB_MIN_BOOK_DEPTH.to_string(),
+            row(KEY_ARB_MIN_BOOK_DEPTH, 150, 100),
+        )]);
+        assert!(!tuner
+            .compute_targets(&raised, &clear, MarketRegime::Ranging)
+            .contains_key(KEY_ARB_MIN_BOOK_DEPTH));
+    }
+
+    #[tokio::test]
+    async fn market_count_growth_stops_at_a_multiple_of_the_default() {
+        let tuner = tuner();
+        let busy = TuningMetrics {
+            updates_per_minute: 1_000.0,
+            ..Default::default()
+        };
+        let at = |current| {
+            let rows = HashMap::from([(
+                KEY_ARB_MONITOR_MAX_MARKETS.to_string(),
+                row(KEY_ARB_MONITOR_MAX_MARKETS, current, 300),
+            )]);
+            tuner.compute_targets(&rows, &busy, MarketRegime::Ranging)[KEY_ARB_MONITOR_MAX_MARKETS]
+        };
+        assert_eq!(at(300), 330.0);
+        assert_eq!(at(580), 600.0);
+        assert_eq!(at(600), 600.0);
+        // Past the cap already (set by an operator): held, not cut.
+        assert_eq!(at(900), 900.0);
     }
 
     #[tokio::test]

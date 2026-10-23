@@ -1018,6 +1018,26 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Migration 101 deletes the `QUANT_MIN_CONFIDENCE`, `FLOW_MIN_IMBALANCE`
   and `MEAN_REV_MIN_MOVE_PCT` rows: nothing read them (their environment
   settings apply, unchanged), yet the tuner table listed them.
+- The no-trade watchdog also counts arbitrage signals skipped below the
+  profit threshold or for thin books (they never become positions, so it
+  could not see them before). It relaxes only the setting that blocked, as
+  before, and only while nothing fills.
+- A book depth floor the watchdog relaxed returns toward its default once
+  depth stops blocking entries; a floor above the default is left alone.
+- The tuner grows `ARB_MONITOR_MAX_MARKETS` to at most twice its default.
+- A tuner change applies only if the row is as the tuner read it, including
+  who last set it: a value an operator saves meanwhile is kept. Saving a
+  value from the workspace settings also enables a row that was disabled.
+
+### Equity history and trade-flow figures
+
+- Equity history stores only complete live valuations (cash, and live
+  inventory read in full); readings in the same minute replace each other.
+  Expect gaps while the balance or inventory cannot be read, and none while
+  trading on paper.
+- Trade flow: arbitrage "executed" counts only entries that filled; net P&L
+  is the realized result of closes in the window, zero included; the
+  arbitrage market scorecard leaves paper results out while trading live.
 
 ### Positions trade in their own mode; replay proof; paper fidelity
 

@@ -3102,6 +3102,8 @@ pub async fn update_opportunity_selection_settings(
                 pending_baseline = NULL,
                 last_applied_at = NULL,
                 updated_by = 'workspace_manual',
+                -- An operator's value is applied: a disabled row is enabled.
+                enabled = TRUE,
                 last_reason = $6
             "#,
         )
@@ -3444,6 +3446,8 @@ pub async fn update_arb_executor_config(
                 pending_baseline = NULL,
                 last_applied_at = NULL,
                 updated_by = 'workspace_manual',
+                -- An operator's value is applied: a disabled row is enabled.
+                enabled = TRUE,
                 last_reason = $6
             "#,
         )

@@ -1862,12 +1862,14 @@ async fn load_learning_rollout_observations(
         .collect())
 }
 
+/// `live` leaves paper results out, as the strategy summary does.
 async fn load_arb_market_scorecard_rows(
     pool: &sqlx::PgPool,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     market_id: Option<&str>,
     limit: i64,
+    live: bool,
 ) -> Result<Vec<ArbMarketScorecardItem>, sqlx::Error> {
     let rows: Vec<ArbMarketScorecardRow> = sqlx::query_as(
         r#"
@@ -1878,6 +1880,7 @@ async fn load_arb_market_scorecard_rows(
               AND occurred_at >= $1
               AND occurred_at <= $2
               AND ($3::text IS NULL OR market_id = $3)
+              AND ($5 OR execution_mode <> 'paper')
         ),
         markets AS (
             SELECT DISTINCT market_id
@@ -2048,6 +2051,7 @@ async fn load_arb_market_scorecard_rows(
     .bind(to)
     .bind(market_id)
     .bind(limit)
+    .bind(!live)
     .fetch_all(pool)
     .await?;
 
@@ -2326,7 +2330,9 @@ async fn load_derived_summary_rows(
                 'arb'::text AS source,
                 FALSE AS supports_signal_history,
                 0::bigint AS generated_signals,
-                COUNT(*)::bigint AS executed_signals,
+                -- An entry that never filled (failed, or still pending) was
+                -- not executed.
+                COUNT(*) FILTER (WHERE state NOT IN (0, 5))::bigint AS executed_signals,
                 0::bigint AS skipped_signals,
                 0::bigint AS expired_signals,
                 COUNT(*) FILTER (WHERE state = 1)::bigint AS open_positions,
@@ -2649,9 +2655,8 @@ fn hydrate_strategy_summary(
     canonical.exit_failed_positions = canonical
         .exit_failed_positions
         .max(fallback.exit_failed_positions);
-    if canonical.net_pnl.is_zero() && !fallback.net_pnl.is_zero() {
-        canonical.net_pnl = fallback.net_pnl;
-    }
+    // The canonical figure is the realized result of closes in the window,
+    // zero included: the fallback windows on entries, another quantity.
     canonical.avg_hold_hours = canonical.avg_hold_hours.or(fallback.avg_hold_hours);
     canonical
 }
@@ -2971,7 +2976,8 @@ pub async fn get_arb_market_scorecard(
             markets: Vec::new(),
         }));
     }
-    let markets = load_arb_market_scorecard_rows(&state.pool, from, to, None, limit)
+    let live = state.order_executor.is_live_ready().await;
+    let markets = load_arb_market_scorecard_rows(&state.pool, from, to, None, limit, live)
         .await
         .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
@@ -4255,6 +4261,19 @@ mod tests {
             Utc::now() + chrono::Duration::minutes(1),
             None,
             10,
+            true,
+        )
+        .await
+        .unwrap();
+        // Live trading: paper fills are not shown.
+        assert!(rows.is_empty());
+        let rows = load_arb_market_scorecard_rows(
+            &pool,
+            Utc::now() - chrono::Duration::hours(1),
+            Utc::now() + chrono::Duration::minutes(1),
+            None,
+            10,
+            false,
         )
         .await
         .unwrap();

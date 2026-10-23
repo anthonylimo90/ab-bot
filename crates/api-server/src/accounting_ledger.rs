@@ -312,9 +312,10 @@ pub async fn load_live_account_snapshot(
 
 async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<()> {
     if let Some(snapshot) = load_live_account_snapshot(state, SNAPSHOT_INVENTORY_MAX_AGE).await? {
-        // Equity history holds only valuations that include the cash: one
-        // without it would chart as a loss of the whole balance.
-        if snapshot.cash_observed {
+        // Equity history holds only complete live valuations: one without
+        // the cash would chart as a loss of the whole balance, one with paper
+        // positions beside real cash or an incomplete inventory as neither.
+        if snapshot.equity_complete {
             persist_snapshot(&state.pool, &snapshot).await?;
         }
 
@@ -586,8 +587,15 @@ async fn load_withdrawals_between(
 }
 
 async fn persist_snapshot(pool: &PgPool, snapshot: &AccountSnapshotRecord) -> anyhow::Result<()> {
-    let bucket_time = snapshot.snapshot_time
-        - Duration::seconds((snapshot.snapshot_time.timestamp() % 60).max(0));
+    // The minute it falls in, to the microsecond: a reading later in the
+    // same minute replaces it.
+    let bucket_time = {
+        use chrono::DurationRound;
+        snapshot
+            .snapshot_time
+            .duration_trunc(Duration::seconds(60))
+            .unwrap_or(snapshot.snapshot_time)
+    };
 
     sqlx::query(
         r#"
