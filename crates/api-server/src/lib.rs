@@ -626,6 +626,13 @@ impl ApiServer {
                 tokio::join!(requests, state.order_executor.drain(OPERATION_DRAIN));
             finished
         };
+        let drained = async {
+            let finished = drained.await;
+            // Leaving: store what the breaker still owes (a failed save,
+            // closes not yet marked), or the next leader counts them again.
+            state.circuit_breaker.flush().await;
+            finished
+        };
         tokio::select! {
             finished = drained => {
                 if finished {
@@ -782,21 +789,27 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     let limits = crate::state::circuit_breaker_config(&state.pool).await?;
     state.circuit_breaker.update_config(limits).await;
     // Closes a stopped process booked but never recorded count before any
-    // new trade does. A failure does not stop the takeover (exits must
-    // run): new entries are held, and the closes retried in the background,
-    // until they are counted.
-    let takeover_at = chrono::Utc::now();
+    // new trade does: entries are held until they are (a manual buy in this
+    // process included). A failure does not stop the takeover (exits must
+    // run): the closes are retried in the background, entries held, until
+    // they are counted.
+    state.circuit_breaker.hold_entries(
+        MISSED_CLOSES_HOLD,
+        "closes a previous trading process left uncounted by the circuit breaker are not \
+         counted yet",
+    );
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match crate::exit_handler::record_missed_closes(
-            &state.pool,
-            &state.circuit_breaker,
-            takeover_at,
-        )
-        .await
+        // Nothing here trades yet, so every unmarked close is another
+        // process's: no cutoff (one would depend on the clocks agreeing).
+        match crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker, None)
+            .await
         {
-            Ok(()) => break,
+            Ok(()) => {
+                state.circuit_breaker.release_entries(MISSED_CLOSES_HOLD);
+                break;
+            }
             Err(error) if attempt < 3 => {
                 tracing::warn!(attempt, %error, "Could not record closes the circuit breaker missed; retrying");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -804,17 +817,16 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
             Err(error) => {
                 tracing::error!(
                     %error,
-                    "Could not record closes the circuit breaker missed; new entries wait until they are"
+                    "Could not record closes the circuit breaker missed; new entries wait until they are \
+                     (retried every 30 seconds)"
                 );
-                state.circuit_breaker.hold_entries(
-                    MISSED_CLOSES_HOLD,
-                    "closes a previous trading process left uncounted by the circuit breaker are \
-                     not counted yet (retried every 30 seconds)",
-                );
+                // From here this process trades and records its own closes:
+                // the retry looks only at closes made before now, as late as
+                // the cutoff can be.
                 spawn_missed_close_retry(
                     state.pool.clone(),
                     state.circuit_breaker.clone(),
-                    takeover_at,
+                    chrono::Utc::now(),
                 );
                 break;
             }
@@ -836,13 +848,13 @@ const MISSED_CLOSES_HOLD: &str = "missed_closes";
 const UNREADABLE_SETTINGS_HOLD: &str = "unreadable_settings";
 
 /// Retries recording the closes the circuit breaker missed until it works,
-/// then lifts the hold on new entries. Only closes made before the takeover
-/// are looked at: this process records its own. A process that stops leading
-/// lets go (the next leader replays them).
+/// then lifts the hold on new entries. Only closes made before `closed_before`
+/// (when this process began trading) are looked at: it records its own. A
+/// process that stops leading lets go (the next leader replays them).
 fn spawn_missed_close_retry(
     pool: sqlx::PgPool,
     breaker: Arc<risk_manager::CircuitBreaker>,
-    takeover_at: chrono::DateTime<chrono::Utc>,
+    closed_before: chrono::DateTime<chrono::Utc>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -851,7 +863,9 @@ fn spawn_missed_close_retry(
                 breaker.release_entries(MISSED_CLOSES_HOLD);
                 return;
             }
-            match crate::exit_handler::record_missed_closes(&pool, &breaker, takeover_at).await {
+            match crate::exit_handler::record_missed_closes(&pool, &breaker, Some(closed_before))
+                .await
+            {
                 Ok(()) => {
                     info!("Recorded the closes the circuit breaker missed; new entries may resume");
                     breaker.release_entries(MISSED_CLOSES_HOLD);

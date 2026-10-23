@@ -214,9 +214,13 @@ export default function SettingsPage() {
     if (!currentWorkspace) return;
     setIsSavingWalletConnect(true);
     try {
-      await api.updateWorkspace(currentWorkspace.id, {
-        walletconnect_project_id: walletConnectProjectId || undefined,
-      });
+      // Stored as saved: a re-read that started before the save cannot
+      // put the old ID back.
+      setCurrentWorkspace(
+        await api.updateWorkspace(currentWorkspace.id, {
+          walletconnect_project_id: walletConnectProjectId || undefined,
+        }),
+      );
       toast.success('WalletConnect settings saved', 'Your wallet connection is now configured');
       queryClient.invalidateQueries({ queryKey: ['workspace'] });
     } catch (err) {

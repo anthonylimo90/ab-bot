@@ -503,12 +503,31 @@ impl CircuitBreaker {
 
     /// Whether this process counted the close and still owes its mark (a
     /// save, or the mark within it, has not stored it yet): a replay of
-    /// unmarked closes must not count it again.
+    /// unmarked closes in this process must not count it again.
     pub fn counted_unsaved(&self, position_id: uuid::Uuid) -> bool {
         self.unsaved_closes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains(&position_id)
+    }
+
+    /// Store what this leader still owes (a failed save, closes not yet
+    /// marked) before it stops: left owed, the next leader would count those
+    /// closes again. A follower owes nothing.
+    pub async fn flush(&self) {
+        if !self.is_leader() {
+            return;
+        }
+        let owed = self.unsaved.load(Ordering::SeqCst)
+            || !self
+                .unsaved_closes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty();
+        if owed {
+            let mut state = self.state.write().await;
+            self.persist_state(&mut state).await;
+        }
     }
 
     /// Why new entries are held in this process, if they are.
@@ -1098,9 +1117,11 @@ impl CircuitBreaker {
         };
         match saved {
             Ok(outcome) if outcome.saved => {
-                self.unsaved.store(false, Ordering::SeqCst);
-                // Closes whose marks failed stay queued: the next save marks
-                // them (the counters already hold them).
+                // Closes whose marks failed stay queued and the save stays
+                // owed: [`Self::sync`] saves again shortly (the counters are
+                // absolute, the marks idempotent), so another leader does
+                // not find them unmarked and count them again.
+                self.unsaved.store(!outcome.marked, Ordering::SeqCst);
                 if outcome.marked {
                     self.unsaved_closes
                         .lock()

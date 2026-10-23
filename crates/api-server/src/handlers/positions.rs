@@ -28,7 +28,7 @@ pub struct PositionResponse {
     pub id: Uuid,
     /// Market identifier.
     pub market_id: String,
-    /// Outcome (yes/no).
+    /// Side held: "yes", "no", or "both" (an arbitrage pair).
     pub outcome: String,
     /// Position side (long/short).
     pub side: String,
@@ -196,10 +196,15 @@ struct PositionRow {
 }
 
 /// The side a position holds. `outcome` is rarely stored, so it is read from
-/// the legs entered: both for an arbitrage pair, one for a quant position.
+/// the shares it holds or held (a pair whose second leg never filled holds
+/// one side), then from the legs it priced (one not yet filled).
 macro_rules! position_outcome_sql {
     () => {
         "COALESCE(outcome, CASE \
+             WHEN held_yes_qty + exited_yes_qty > 0 AND held_no_qty + exited_no_qty > 0 \
+                 THEN 'both' \
+             WHEN held_no_qty + exited_no_qty > 0 THEN 'no' \
+             WHEN held_yes_qty + exited_yes_qty > 0 THEN 'yes' \
              WHEN yes_entry_price > 0 AND no_entry_price > 0 THEN 'both' \
              WHEN no_entry_price > 0 THEN 'no' \
              WHEN yes_entry_price > 0 THEN 'yes' \
@@ -832,11 +837,23 @@ pub async fn close_position(
     let _ = state.publish_position(update);
 
     let pnl_pct = unrealized_pct(position.unrealized_pnl, row.entry_price, row.quantity);
+    // The side as stored now: queueing a one-legged pair's exit drops the
+    // leg it never held.
+    let outcome: String = sqlx::query_scalar(concat!(
+        "SELECT ",
+        position_outcome_sql!(),
+        " FROM positions WHERE id = $1"
+    ))
+    .bind(position_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?
+    .unwrap_or(row.outcome);
 
     Ok(Json(PositionResponse {
         id: row.id,
         market_id: row.market_id,
-        outcome: row.outcome,
+        outcome,
         side: row.side,
         quantity: row.quantity,
         entry_price: row.entry_price,
@@ -1003,19 +1020,31 @@ mod tests {
         use sqlx::Executor;
         pool.execute(
             "CREATE VIEW positions AS SELECT md5(v.n::text)::uuid AS id,
-            v.n AS market_id, NULL::text AS outcome, NULL::text AS side,
+            v.n AS market_id, v.stored AS outcome, NULL::text AS side,
             10::numeric AS quantity, NULL::numeric AS entry_price, NULL::numeric AS current_price,
             v.yes AS yes_entry_price, v.no AS no_entry_price,
             0::numeric AS unrealized_pnl, NULL::numeric AS stop_loss, NULL::numeric AS take_profit,
             NULL::numeric AS realized_pnl, 1::smallint AS state, NOW() AS opened_at,
             NOW() AS entry_timestamp, NOW() AS updated_at, NULL::timestamptz AS last_updated,
-            0::numeric AS held_yes_qty, 0::numeric AS held_no_qty,
-            0::numeric AS exited_yes_qty, 0::numeric AS exited_no_qty,
+            v.held_yes AS held_yes_qty, 0::numeric AS held_no_qty,
+            0::numeric AS exited_yes_qty, v.exited_no AS exited_no_qty,
             NULL::numeric AS yes_exit_price, NULL::numeric AS no_exit_price,
             NULL::text AS resolution_winner, 0::smallint AS exit_strategy, 3::smallint AS source,
             TRUE AS is_open, 'live'::text AS execution_mode
-            FROM (VALUES ('pair', 0.45::numeric, 0.52::numeric), ('yes', 0.40, 0),
-                         ('no', 0, 0.30)) AS v(n, yes, no)",
+            FROM (VALUES
+                -- Priced, nothing filled yet: read from the prices.
+                ('pair', 0.45::numeric, 0.52::numeric, 0::numeric, 0::numeric, NULL::text),
+                ('yes', 0.40, 0, 0, 0, NULL),
+                ('no', 0, 0.30, 0, 0, NULL),
+                -- A pair whose NO leg never filled holds YES only.
+                ('one-legged', 0.45, 0.52, 10, 0, NULL),
+                -- Held and sold legs both count.
+                ('both-filled', 0.45, 0.52, 10, 10, NULL),
+                -- Nothing priced or held.
+                ('empty', 0, 0, 0, 0, NULL),
+                -- A stored outcome wins.
+                ('stored', 0.45, 0.52, 0, 0, 'yes')
+            ) AS v(n, yes, no, held_yes, exited_no, stored)",
         )
         .await
         .unwrap();
@@ -1035,14 +1064,33 @@ mod tests {
         sides.sort();
         assert_eq!(
             sides,
-            [("no", "no"), ("pair", "both"), ("yes", "yes")]
-                .map(|(m, o)| (m.to_string(), o.to_string()))
+            [
+                ("both-filled", "both"),
+                ("empty", "both"),
+                ("no", "no"),
+                ("one-legged", "yes"),
+                ("pair", "both"),
+                ("stored", "yes"),
+                ("yes", "yes"),
+            ]
+            .map(|(m, o)| (m.to_string(), o.to_string()))
         );
         // The outcome filter reads the same side.
         query.outcome = Some("no".into());
         let rows = load_position_rows(&pool, &query).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].market_id, "no");
+        let one_legged = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM positions WHERE market_id = 'one-legged'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let closeable = load_closeable_position(&pool, one_legged)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closeable.outcome, "yes");
     }
 
     #[test]

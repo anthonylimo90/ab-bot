@@ -938,15 +938,21 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 
 ### Entry holds, effective switches and removals
 
-- A new trading leader that cannot record the closes a stopped process left
-  uncounted (three tries) holds new entries and retries every 30 seconds;
-  entries resume once they are counted. Only closes made before it took
-  over are replayed (it records its own), and a resolution win counts only
-  when its close event says the payout was measured.
+- A new trading leader holds new entries until it has recorded the closes a
+  stopped process left uncounted; if it cannot (three tries), it starts
+  trading with entries held and retries every 30 seconds, looking only at
+  closes made before it began (it records its own). A resolution win counts
+  only when its close event says the payout was measured.
 - A close is queued for its mark together with the counters that hold it; a
-  mark that fails stays queued and is made by the next save (it used to be
-  dropped, so the next leader counted the close again). A close the
-  switched-off breaker does not count is marked at once.
+  mark that fails stays queued and the save is retried within seconds (it
+  used to be dropped, so the next leader counted the close again), and a
+  graceful shutdown stores what is still owed. A close the switched-off
+  breaker does not count is marked at once.
+- Entry holds belong to the process that set them: risk status and the
+  reset's 409 describe the answering process. During a deploy overlap the
+  other process may report none.
+- Cancelling an order is no longer refused while the server shuts down
+  (placing one still is).
 - The dashboard shows trading as the server runs it: switches the
   environment holds on (`LIVE_TRADING`, `ARB_AUTO_EXECUTE`,
   `EXIT_HANDLER_ENABLED`) read as on and cannot be switched off there, and

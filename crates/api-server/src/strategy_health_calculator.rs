@@ -464,7 +464,11 @@ fn skip_rate(row: &StrategyHealthAggRow) -> Option<f64> {
     if row.generated_signals <= 0 {
         return None;
     }
-    Some((row.skipped_signals + row.expired_signals) as f64 / row.generated_signals as f64)
+    // Held to 1: the counts merge two sources (signals and events).
+    Some(
+        ((row.skipped_signals + row.expired_signals) as f64 / row.generated_signals as f64)
+            .min(1.0),
+    )
 }
 
 /// Failed entries and failed exits over the entries tried: those that got in
@@ -708,6 +712,21 @@ mod tests {
             ..sample_row("flow")
         };
 
+        assert_eq!(skip_rate(&row), Some(1.0));
+        // Expired signals were not traded either.
+        let row = StrategyHealthAggRow {
+            generated_signals: 10,
+            skipped_signals: 3,
+            expired_signals: 2,
+            ..sample_row("flow")
+        };
+        assert_eq!(skip_rate(&row), Some(0.5));
+        let row = StrategyHealthAggRow {
+            generated_signals: 10,
+            skipped_signals: 9,
+            expired_signals: 4,
+            ..sample_row("flow")
+        };
         assert_eq!(skip_rate(&row), Some(1.0));
     }
 

@@ -524,9 +524,10 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      // Errors are JSON objects, except a body the server could not parse
-      // (a 422 in plain text): its text says which field was wrong, so it is
-      // kept. Anything else (a proxy's HTML page) is reported by its status.
+      // Errors are JSON objects, except plain text: a body the server could
+      // not parse (422) says which field was wrong, and the rate limiter's
+      // 429 (sent without a content type) says how long to wait. A page
+      // (a proxy's HTML) is reported by its status.
       const body = await response.text().catch(() => "");
       const contentType = response.headers.get("content-type") ?? "";
       let error: ApiError = { code: "UNKNOWN_ERROR", message: `HTTP ${response.status}` };
@@ -543,7 +544,10 @@ class ApiClient {
           message: typeof fields.message === "string" ? fields.message : error.message,
           details: fields.details,
         };
-      } else if (contentType.startsWith("text/plain") && body.trim()) {
+      } else if (
+        (contentType === "" || contentType.startsWith("text/plain")) &&
+        body.trim()
+      ) {
         error = { code: "UNKNOWN_ERROR", message: body.trim().slice(0, 300) };
       }
       if (

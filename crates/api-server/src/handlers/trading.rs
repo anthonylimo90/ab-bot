@@ -524,11 +524,15 @@ async fn execute_reserved_order(
         .bind(order_id).bind(serde_json::to_value(status)?.as_str().unwrap())
         .bind(filled_qty).bind(avg_price).bind(filled_at).bind(&report.exchange_order_id).execute(&state.pool).await?;
 
+    // As an exchange's refusal is reported (its first 300 characters).
     let rejection_reason = (status == OrderStatus::Rejected).then(|| {
         report
             .error_message
-            .clone()
-            .unwrap_or_else(|| "rejected without a reason".to_string())
+            .as_deref()
+            .unwrap_or("rejected without a reason")
+            .chars()
+            .take(300)
+            .collect::<String>()
     });
     if let Some(reason) = &rejection_reason {
         warn!(order_id = %order_id, market = %request.market_id, %reason, "Manual order rejected");
@@ -945,7 +949,8 @@ fn parse_order_status(s: &str) -> OrderStatus {
         (status = 403, description = "Insufficient canonical workspace permissions"),
         (status = 200, description = "Order cancelled", body = OrderResponse),
         (status = 404, description = "Order not found"),
-        (status = 400, description = "Order cannot be cancelled")
+        (status = 409, description = "Order already filled, rejected or expired, or its submission is unresolved"),
+        (status = 503, description = "The cancellation's outcome needs exchange reconciliation")
     )
 )]
 pub async fn cancel_order(
@@ -954,9 +959,9 @@ pub async fn cancel_order(
     axum::Extension(claims): axum::Extension<auth::Claims>,
     Path(order_id): Path<Uuid>,
 ) -> ApiResult<Json<OrderResponse>> {
-    let Some(operation) = state.order_executor.begin_operation() else {
-        return Err(ApiError::ServiceUnavailable(SHUTTING_DOWN.into()));
-    };
+    // Counted by a shutdown's drain, but never refused by it: a cancellation
+    // only takes risk away.
+    let operation = state.order_executor.begin_operation();
     // As placing an order: runs to the end even if the client goes away, so
     // a cancellation the exchange took is recorded, not left open.
     tokio::spawn(async move {

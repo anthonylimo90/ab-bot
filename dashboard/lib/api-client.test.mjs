@@ -144,6 +144,9 @@ test('an error body in plain text is the error message', async () => {
   // A proxy's HTML page, and a JSON body that is not an error object, report the status.
   const html = loadApi(() => textResponse('<html><body>Bad gateway</body></html>', 502, 'text/html'));
   await assert.rejects(html.api.getPositions(), (error) => error.message === 'HTTP 502');
+  // The rate limiter's 429 carries no content type.
+  const limited = loadApi(() => textResponse('Too Many Requests! Wait for 12s', 429, ''));
+  await assert.rejects(limited.api.getPositions(), (error) => error.message === 'Too Many Requests! Wait for 12s');
   const bare = loadApi(() => jsonResponse(null, 500));
   await assert.rejects(bare.api.getPositions(), (error) => error.name === 'ApiHttpError' && error.message === 'HTTP 500');
 });

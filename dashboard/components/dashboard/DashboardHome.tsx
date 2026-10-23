@@ -107,6 +107,8 @@ export function DashboardHome() {
   const isCircuitBreakerPaused =
     breaker?.tripped === true &&
     (!breakerOff || breaker.trip_reason === "manual" || isHardKilled);
+  // Most severe first. A breaker switched off outranks an unread environment
+  // (trading may be live and unguarded), but not a known pause.
   const automationStatus = isHardKilled
     ? {
         label: "HARD KILL",
@@ -130,6 +132,22 @@ export function DashboardHome() {
           tooltip:
             "The circuit breaker is active, so automated trading is paused until the risk controls allow it again.",
         }
+      : !breaker
+      ? {
+          label: "Risk status unavailable",
+          variant: "warning" as const,
+          className: "text-xs",
+          tooltip:
+            "The circuit breaker's status could not be read, so whether it is blocking trading is unknown.",
+        }
+      : breakerOff && !isTradingManuallyPaused
+      ? {
+          label: "No safety stop",
+          variant: "warning" as const,
+          className: "text-xs",
+          tooltip:
+            "The circuit breaker is switched off, so its loss and drawdown limits do not stop trading. Switch it on in Settings.",
+        }
       : switchesUnknown
       ? {
           label: "Switches unknown",
@@ -145,14 +163,6 @@ export function DashboardHome() {
           className: "text-xs",
           tooltip:
             "Live trading and arb execution are switched off, in workspace settings and in the server's environment, even though the automatic safety stop is not tripped.",
-        }
-      : breakerOff
-      ? {
-          label: "No safety stop",
-          variant: "warning" as const,
-          className: "text-xs",
-          tooltip:
-            "The circuit breaker is switched off, so its loss and drawdown limits do not stop trading. Switch it on in Settings.",
         }
       : {
           label: "Healthy",

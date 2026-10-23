@@ -457,9 +457,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // The next save, for another result, marks the close it kept.
-        breaker.record_trade(Decimal::from(-1)).await.unwrap();
-        assert_eq!(stored_pnl().await, Decimal::from(-6));
+        // A flush before stopping (as a sync shortly) saves again and marks
+        // the close it kept.
+        breaker.flush().await;
+        assert_eq!(stored_pnl().await, Decimal::from(-5));
         let marked: bool = sqlx::query_scalar(
             "SELECT breaker_recorded_at IS NOT NULL FROM positions WHERE id = $1",
         )
@@ -469,6 +470,46 @@ mod tests {
         .unwrap();
         assert!(marked);
         assert!(!breaker.counted_unsaved(close));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_switched_off_breaker_marks_a_close_without_counting_it(pool: PgPool) {
+        use rust_decimal::Decimal;
+        create_schema(&pool).await;
+        sqlx::query(
+            "CREATE TABLE positions (id UUID PRIMARY KEY, breaker_recorded_at TIMESTAMPTZ)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let close = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO positions (id) VALUES ($1)")
+            .bind(close)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let breaker = crate::CircuitBreaker::with_persistence(
+            crate::CircuitBreakerConfig {
+                enabled: false,
+                ..config()
+            },
+            pool.clone(),
+        );
+        breaker.load_state().await.unwrap();
+        breaker
+            .record_close(Decimal::from(-5), close)
+            .await
+            .unwrap();
+        assert!(!breaker.counted_unsaved(close));
+        assert_eq!(breaker.state().await.daily_pnl, Decimal::ZERO);
+        let marked: bool = sqlx::query_scalar(
+            "SELECT breaker_recorded_at IS NOT NULL FROM positions WHERE id = $1",
+        )
+        .bind(close)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(marked);
     }
 
     #[sqlx::test(migrations = false)]

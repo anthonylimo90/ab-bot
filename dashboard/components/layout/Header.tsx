@@ -109,7 +109,12 @@ export function Header() {
     onSuccess: (updatedWorkspace, action) => {
       setCurrentWorkspace(updatedWorkspace);
       queryClient.invalidateQueries({ queryKey: queryKeys.runtime.serviceStatus() });
-      if (action === "pause") {
+      if (action === "pause" && !environmentKnown) {
+        toast.warning(
+          "Switched off in this workspace",
+          "The server's switches could not be read: its environment may keep trading on. The status refreshes shortly.",
+        );
+      } else if (action === "pause") {
         toast.warning(
           environmentHold ? "Paused what this workspace controls" : "Trading paused",
           environmentHold
@@ -219,14 +224,17 @@ export function Header() {
       : "Arbitrage resumes on paper: live trading stays off in this workspace's settings.",
     confirmLabel: isTradingActive ? "Pause" : "Resume",
   };
-  // Trading the environment holds on cannot be paused from here; until the
-  // environment's switches are read, neither can be decided.
-  const pauseUnavailable = isTradingActive && !canPause;
-  const pauseUnavailableReason = !environmentKnown
-    ? "Checking the server's switches; they could not be read yet."
-    : pauseUnavailable
-      ? `${environmentHold} Trip the circuit breaker on the Risk page to stop new entries.`
-      : undefined;
+  // Trading the environment holds on cannot be paused from here. Pausing
+  // what the workspace holds on needs no more (the server refuses a switch
+  // the environment holds); resuming waits until the environment is read,
+  // since only then is trading known to be off.
+  const pauseUnavailableReason = isTradingActive
+    ? canPause
+      ? undefined
+      : `${environmentHold} Trip the circuit breaker on the Risk page to stop new entries.`
+    : environmentKnown
+      ? undefined
+      : "Checking the server's switches; they could not be read yet.";
   const toggleTrading = () =>
     toggleTradingMutation.mutate(isTradingActive ? "pause" : "resume");
 

@@ -123,6 +123,9 @@ export default function RiskPage() {
   const drawdownPct = cb ? drawdownFrom(cb.drawdown_peak) : 0;
   const peakDrawdownPct = cb ? drawdownFrom(cb.peak_value) : 0;
   const breakerDisabled = cb ? !cb.config.enabled && !cb.tripped : false;
+  // Holds the answering server keeps on new entries whatever the trip says;
+  // a reset does not lift them.
+  const entryHolds = cb?.entry_holds ?? [];
 
   return (
     <ErrorBoundary>
@@ -138,10 +141,10 @@ export default function RiskPage() {
               </p>
             </div>
           </div>
-          {cb && !cb.tripped && (
+          {cb && !cb.tripped && entryHolds.length === 0 && (
             <LiveIndicator />
           )}
-          {cb?.tripped && (
+          {(cb?.tripped || entryHolds.length > 0) && (
             <div className="flex items-center gap-1.5">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-loss opacity-75" />
@@ -163,6 +166,30 @@ export default function RiskPage() {
             "If it is tripped, the system has halted automated trading and needs cooldown time or manual intervention."
           ]}
         />
+
+        {/* Entry holds: new entries stop whatever the breaker says */}
+        {entryHolds.length > 0 && (
+          <Card className="border-2 border-loss bg-loss/5">
+            <CardContent className="p-6">
+              <div className="flex items-start gap-3">
+                <ShieldOff className="h-8 w-8 shrink-0 text-loss" />
+                <div className="space-y-1">
+                  <p className="text-lg font-bold text-loss">NEW ENTRIES HELD</p>
+                  <ul className="list-disc pl-5 text-sm">
+                    {entryHolds.map((hold) => (
+                      <li key={hold}>{hold}</li>
+                    ))}
+                  </ul>
+                  <p className="text-sm text-muted-foreground">
+                    Exits still run. A reset does not lift a hold, and is refused while one
+                    stands: correct the settings and restart the server, or wait for the
+                    missed closes to be counted.
+                  </p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Circuit Breaker Status Banner */}
         {cb && (

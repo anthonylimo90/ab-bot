@@ -2371,8 +2371,8 @@ async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
 /// close is marked by the save that stores it, so an unmarked one was booked
 /// by a process that stopped before saving it. Today's count, in close order
 /// (the breaker's daily counters have moved past earlier days'); the rest
-/// are only marked. Run by a new trading leader before it trades, for closes
-/// made before `closed_before` (its takeover: it records its own). During the
+/// are only marked. Run by a new trading leader before it trades; a retry
+/// once it trades passes `closed_before` (it records its own). During the
 /// first upgrade to this version, a close the previous version makes while
 /// handing over is counted twice, which errs towards tripping.
 ///
@@ -2382,7 +2382,7 @@ async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
 pub(crate) async fn record_missed_closes(
     pool: &PgPool,
     breaker: &CircuitBreaker,
-    closed_before: chrono::DateTime<chrono::Utc>,
+    closed_before: Option<chrono::DateTime<chrono::Utc>>,
 ) -> anyhow::Result<()> {
     #[derive(sqlx::FromRow)]
     struct MissedClose {
@@ -2411,7 +2411,7 @@ pub(crate) async fn record_missed_closes(
                ) AS confirmed
         FROM positions p
         WHERE p.state = 4 AND p.breaker_recorded_at IS NULL
-          AND (p.exit_timestamp IS NULL OR p.exit_timestamp < $1)
+          AND ($1::timestamptz IS NULL OR p.exit_timestamp IS NULL OR p.exit_timestamp < $1)
         ORDER BY p.exit_timestamp NULLS FIRST, p.id
         "#,
     )
@@ -2420,8 +2420,8 @@ pub(crate) async fn record_missed_closes(
     .await?;
     let today = chrono::Utc::now().date_naive();
     for close in missed {
-        // Counted already by this process, its mark still owed (a retry
-        // after a mark that failed).
+        // Counted already by this process, its mark still owed (the save
+        // that marks it is retried by the breaker).
         if breaker.counted_unsaved(close.id) {
             continue;
         }
@@ -2567,8 +2567,18 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // Away from midnight UTC: only today's closes count, and the closes
+        // below lie within ten seconds of now.
+        let now = loop {
+            use chrono::Timelike;
+            let now = chrono::Utc::now();
+            if (10..86_390).contains(&now.num_seconds_from_midnight()) {
+                break now;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        };
         let close =
-            |pnl: i64, mode: &str, minutes_ago: i64, recorded: bool, winner: Option<&str>| {
+            |pnl: i64, mode: &str, seconds_ago: i64, recorded: bool, winner: Option<&str>| {
                 let pool = pool.clone();
                 let mode = mode.to_string();
                 let winner = winner.map(str::to_string);
@@ -2582,7 +2592,7 @@ mod tests {
                     .bind(id)
                     .bind(Decimal::from(pnl))
                     .bind(mode)
-                    .bind(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago))
+                    .bind(now - chrono::Duration::seconds(seconds_ago))
                     .bind(recorded)
                     .bind(winner)
                     .execute(&pool)
@@ -2613,12 +2623,13 @@ mod tests {
         let unconfirmed = close(50, "live", 1, false, Some("no")).await;
         event(unconfirmed, "{\"unmeasured\": []}").await;
         close(60, "live", 1, false, Some("yes")).await;
-        close(-40, "paper", 0, false, None).await;
+        close(-40, "paper", 1, false, None).await;
         // Missed on an earlier day, and marked already: neither counts.
-        close(-70, "live", 2 * 24 * 60, false, None).await;
-        close(-90, "live", 0, true, None).await;
-        // Closed after the takeover: this process records its own.
-        let after_takeover = close(-5, "live", -10, false, None).await;
+        close(-70, "live", 2 * 24 * 3600, false, None).await;
+        close(-90, "live", 1, true, None).await;
+        // Closed after the retry's cutoff: the retrying process records its
+        // own.
+        let after_takeover = close(-5, "live", -5, false, None).await;
 
         sqlx::raw_sql(
             "CREATE TABLE circuit_breaker_state (id INTEGER PRIMARY KEY DEFAULT 1, \
@@ -2644,7 +2655,8 @@ mod tests {
         }
         let breaker = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         breaker.lead().await.unwrap();
-        record_missed_closes(&pool, &breaker, chrono::Utc::now())
+        // A retry once this process trades: only closes before its cutoff.
+        record_missed_closes(&pool, &breaker, Some(now))
             .await
             .unwrap();
         let state = breaker.state().await;
@@ -2665,25 +2677,13 @@ mod tests {
                 .unwrap();
         assert_eq!(unmarked, vec![after_takeover]);
 
-        // A later leader records only what is left: the close made after the
-        // first takeover.
+        // A later leader's takeover (no cutoff) records only what is left:
+        // the close made after the first one's cutoff; once.
         let next = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         next.lead().await.unwrap();
-        record_missed_closes(
-            &pool,
-            &next,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        )
-        .await
-        .unwrap();
+        record_missed_closes(&pool, &next, None).await.unwrap();
         assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
-        record_missed_closes(
-            &pool,
-            &next,
-            chrono::Utc::now() + chrono::Duration::hours(1),
-        )
-        .await
-        .unwrap();
+        record_missed_closes(&pool, &next, None).await.unwrap();
         assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
     }
 
