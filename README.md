@@ -133,11 +133,8 @@ WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 
 ## API Surface
 
-### Public / demo
+### Public
 - `GET /health`, `GET /ready`
-- `GET /api/v1/discover/trades`
-- `GET /api/v1/discover/wallets`
-- `GET /api/v1/discover/wallets/:address`
 - `GET /api/v1/regime/current`
 - invite acceptance endpoints
 - WebSocket: `/ws/orderbook`, `/ws/positions`, `/ws/signals`, `/ws/all`
@@ -170,7 +167,8 @@ WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 - market metadata
 - strategy performance snapshots
 - backtest create, list, detail
-- wallet discovery leaderboard and regime endpoint
+- wallet discovery leaderboard and live trades (`/api/v1/discover/*`,
+  trading workspace members)
 
 ### Admin
 - admin user management

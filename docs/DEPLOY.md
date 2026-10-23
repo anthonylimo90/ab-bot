@@ -1067,6 +1067,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   reads), a market missing from the database and its order book, and a
   wallet's trade history (exchange reads) need any membership. Any
   self-registered account could use them before, and grow the shared vault.
+- The wallet research endpoints (`/api/v1/discover/trades`,
+  `/api/v1/discover/wallets`, `/api/v1/discover/wallets/:address`) need
+  sign-in and workspace membership; they were public, and live trades read
+  the exchange's data API on every request. `/api/v1/regime/current` stays
+  public. The dashboard does not call the discover endpoints.
 
 ### API contract changes
 

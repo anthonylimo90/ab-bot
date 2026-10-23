@@ -381,13 +381,6 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
         .route("/ready", get(health::readiness))
         // Bearer-token protected inside the handler; off without METRICS_TOKEN.
         .route("/metrics", get(metrics::metrics))
-        // Discovery/demo endpoints (public for demo purposes)
-        .route("/api/v1/discover/trades", get(discover::get_live_trades))
-        .route("/api/v1/discover/wallets", get(discover::discover_wallets))
-        .route(
-            "/api/v1/discover/wallets/:address",
-            get(discover::get_discovered_wallet),
-        )
         .route("/api/v1/regime/current", get(discover::get_current_regime))
         .route("/api/v1/invites/:token", get(workspaces::get_invite_info))
         .route(
@@ -409,6 +402,13 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
         .route("/api/v1/auth/me", get(auth::get_current_user))
         // Wallet linking (requires auth)
         .route("/api/v1/auth/wallet/link", post(wallet_auth::link_wallet))
+        // Wallet research (workspace members; live trades read the exchange)
+        .route("/api/v1/discover/trades", get(discover::get_live_trades))
+        .route("/api/v1/discover/wallets", get(discover::discover_wallets))
+        .route(
+            "/api/v1/discover/wallets/:address",
+            get(discover::get_discovered_wallet),
+        )
         // Market endpoints (read-only)
         .route("/api/v1/markets", get(markets::list_markets))
         .route("/api/v1/markets/:market_id", get(markets::get_market))

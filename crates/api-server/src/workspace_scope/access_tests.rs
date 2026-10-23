@@ -267,9 +267,15 @@ async fn vault_and_exchange_fetching_routes_need_workspace_membership(pool: PgPo
         ("GET", "/api/v1/markets/unknown-market", None),
         ("GET", "/api/v1/markets/unknown-market/orderbook", None),
         ("GET", "/api/v1/wallets/0xabc/trades", None),
+        ("GET", "/api/v1/discover/trades", None),
+        ("GET", "/api/v1/discover/wallets", None),
+        ("GET", "/api/v1/discover/wallets/0xabc", None),
     ] {
-        let (status, body_out) = fx::call(&app, method, uri, Some(&outsider_token), body).await;
+        let (status, body_out) =
+            fx::call(&app, method, uri, Some(&outsider_token), body.clone()).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {body_out}");
+        let (status, _) = fx::call(&app, method, uri, None, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
     }
 
     // Storing a signing key needs trading rights in the workspace.

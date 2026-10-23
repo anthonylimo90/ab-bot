@@ -13,6 +13,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::workspace_scope::WorkspaceReadAccess;
 use wallet_tracker::discovery::DiscoveryCriteria;
 
 /// A live trade from a wallet.
@@ -232,10 +233,13 @@ pub async fn get_current_regime(
     params(LiveTradesQuery),
     responses(
         (status = 200, description = "List of live trades", body = Vec<LiveTrade>),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn get_live_trades(
+    // Every request is read from the exchange's data API.
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<LiveTradesQuery>,
 ) -> ApiResult<Json<Vec<LiveTrade>>> {
@@ -308,10 +312,12 @@ pub async fn get_live_trades(
     params(DiscoverWalletsQuery),
     responses(
         (status = 200, description = "List of top wallets", body = Vec<DiscoveredWallet>),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn discover_wallets(
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Query(query): Query<DiscoverWalletsQuery>,
 ) -> ApiResult<Json<Vec<DiscoveredWallet>>> {
@@ -568,10 +574,12 @@ fn sort_wallets(wallets: &mut [DiscoveredWallet], sort_by: &str, _period: &str) 
     ),
     responses(
         (status = 200, description = "Discovered wallet profile", body = DiscoveredWallet),
+        (status = 403, description = "Not a member of the trading workspace"),
         (status = 404, description = "Wallet not found in discovery data")
     )
 )]
 pub async fn get_discovered_wallet(
+    _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
 ) -> ApiResult<Json<DiscoveredWallet>> {
