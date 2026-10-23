@@ -9,7 +9,11 @@ import { useAccountHistoryQuery, useAccountSummaryQuery } from "@/hooks/queries/
 import { useTradeFlowSummaryQuery } from "@/hooks/queries/useTradeFlowQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { useRiskStatusQuery, useDynamicTunerQuery } from "@/hooks/queries/useRiskQuery";
+import {
+  useRiskStatusQuery,
+  useDynamicTunerQuery,
+  useServiceStatusQuery,
+} from "@/hooks/queries/useRiskQuery";
 import { useTradingSwitches } from "@/hooks/useTradingSwitches";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { MetricCard } from "@/components/shared/MetricCard";
@@ -95,6 +99,8 @@ export function DashboardHome() {
   const dynamicTunerQuery = useDynamicTunerQuery(currentWorkspace?.id);
   const dynamicTunerStatus = dynamicTunerQuery.data;
   const tradeFlowQuery = useTradeFlowSummaryQuery({ limit: 100 });
+  // The held-entries badge comes from service status.
+  const serviceStatusQuery = useServiceStatusQuery(currentWorkspace?.id);
   const tradeFlowSummary = tradeFlowQuery.data;
   // As the server applies the switches: the environment can hold either on.
   // Until its switches are read, "off in the workspace" is not "paused".
@@ -257,6 +263,7 @@ export function DashboardHome() {
               accountHistoryQuery,
               dynamicTunerQuery,
               tradeFlowQuery,
+              serviceStatusQuery,
             )}
           />
         </div>

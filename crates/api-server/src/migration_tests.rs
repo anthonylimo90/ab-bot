@@ -64,6 +64,71 @@ async fn execution_migrations_preserve_unknown_historical_provenance(pool: PgPoo
 }
 
 #[sqlx::test(migrations = false)]
+async fn paper_inventory_is_merged_under_one_key(pool: PgPool) {
+    use rust_decimal::Decimal;
+    pool.execute(
+        "CREATE TABLE orders (id SERIAL, execution_mode TEXT, wallet_address TEXT);
+         CREATE TABLE manual_inventory (execution_mode TEXT NOT NULL, wallet_address TEXT NOT NULL, \
+             market_id TEXT NOT NULL, outcome TEXT NOT NULL, quantity NUMERIC NOT NULL DEFAULT 0, \
+             cost_basis NUMERIC NOT NULL DEFAULT 0, \
+             PRIMARY KEY (execution_mode, wallet_address, market_id, outcome));
+         INSERT INTO manual_inventory VALUES
+             ('paper', 'unknown', 'm', 'yes', 2, 1),
+             ('paper', '0xabc', 'm', 'yes', 3, 1.5),
+             ('paper', '0xabc', 'm', 'no', 4, 2),
+             ('live', '0xabc', 'm', 'yes', 5, 2.5);
+         INSERT INTO orders (execution_mode, wallet_address) VALUES
+             ('paper', '0xabc'), ('paper', NULL), ('live', '0xabc');",
+    )
+    .await
+    .unwrap();
+    pool.execute(include_str!(
+        "../../../migrations/102_paper_inventory_one_key.sql"
+    ))
+    .await
+    .unwrap();
+    let inventory: Vec<(String, String, String, Decimal, Decimal)> = sqlx::query_as(
+        "SELECT execution_mode, wallet_address, outcome, quantity, cost_basis \
+         FROM manual_inventory ORDER BY execution_mode, outcome",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        inventory,
+        vec![
+            (
+                "live".into(),
+                "0xabc".into(),
+                "yes".into(),
+                Decimal::from(5),
+                Decimal::new(25, 1)
+            ),
+            (
+                "paper".into(),
+                "unknown".into(),
+                "no".into(),
+                Decimal::from(4),
+                Decimal::from(2)
+            ),
+            (
+                "paper".into(),
+                "unknown".into(),
+                "yes".into(),
+                Decimal::from(5),
+                Decimal::new(25, 1)
+            ),
+        ]
+    );
+    let wallets: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT wallet_address FROM orders ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(wallets, vec![None, None, Some("0xabc".into())]);
+}
+
+#[sqlx::test(migrations = false)]
 #[ignore = "requires an isolated TimescaleDB test service"]
 async fn complete_schema_migrates_with_sqlx_transactions(pool: PgPool) {
     let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(

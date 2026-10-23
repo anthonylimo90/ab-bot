@@ -331,20 +331,22 @@ async fn reserve_and_execute_order(
     state: Arc<AppState>,
     request: PlaceOrderRequest,
 ) -> ApiResult<Json<OrderResponse>> {
-    let wallet = state.order_executor.wallet_address().await;
+    // The order takes this process's mode now; a paper order holds nothing in
+    // any wallet (paper inventory is kept under one key), whether or not a
+    // signer is loaded for live positions' exits.
+    let live = state.order_executor.is_live();
+    let wallet = if live {
+        state.order_executor.wallet_address().await
+    } else {
+        None
+    };
     let max_exposure = if let Some(cfg) = &state.arb_executor_config {
         cfg.read().await.max_total_exposure
     } else {
         crate::arb_executor::ArbExecutorConfig::from_env().max_total_exposure
     };
-    let (order_id, fresh) = reserve_order(
-        &state.pool,
-        &request,
-        state.order_executor.is_live(),
-        wallet.as_deref(),
-        max_exposure,
-    )
-    .await?;
+    let (order_id, fresh) =
+        reserve_order(&state.pool, &request, live, wallet.as_deref(), max_exposure).await?;
     if !fresh {
         return Ok(Json(load_order(&state.pool, order_id).await?.into()));
     }

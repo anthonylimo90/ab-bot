@@ -202,7 +202,8 @@ async fn refresh_inventory(
     let Some(wallet_address) = resolve_canonical_wallet_address(state).await? else {
         return Ok(None);
     };
-    if !state.order_executor.is_live_ready().await {
+    // Whatever the live switch: the exits of what the wallet holds run.
+    if !state.order_executor.has_live_signer().await {
         return Ok(None);
     }
     refresh::coordinate(
@@ -554,7 +555,8 @@ pub async fn recover_wallet_orphan_inventory(
     signal_tx: Option<&broadcast::Sender<SignalUpdate>>,
     circuit_breaker: Option<&CircuitBreaker>,
 ) -> anyhow::Result<OrphanRecoveryResult> {
-    if !order_executor.is_live_ready().await {
+    // Whatever the live switch, as the exits of positions.
+    if !order_executor.has_live_signer().await {
         return Ok(OrphanRecoveryResult::default());
     }
 

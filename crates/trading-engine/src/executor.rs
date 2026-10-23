@@ -321,7 +321,7 @@ impl OrderExecutor {
 
     /// Whether the trading wallet's signer and API credentials are loaded,
     /// whatever the live switch says now.
-    async fn has_live_signer(&self) -> bool {
+    pub async fn has_live_signer(&self) -> bool {
         let slot = self.auth_client.read().await;
         slot.as_ref().map(|c| c.has_credentials()).unwrap_or(false)
     }
@@ -333,13 +333,9 @@ impl OrderExecutor {
     }
 
     /// Hot-reload the live trading wallet signer and API credentials.
+    /// Loaded whatever the live switch says: the exits of live positions
+    /// need it while live trading is off (new live entries need the switch).
     pub async fn reload_wallet(&self, wallet: TradingWallet) -> Result<String> {
-        if !self.is_live() {
-            return Err(anyhow::anyhow!(
-                "Executor is not in live mode; set LIVE_TRADING=true"
-            ));
-        }
-
         let mut auth_client = Self::build_auth_client(wallet, self.clob_client.as_ref().clone());
         let address = auth_client.address();
         auth_client
@@ -488,6 +484,22 @@ impl OrderExecutor {
                 .bind(position.id).fetch_one(&mut *tx).await?;
             if pending {
                 anyhow::bail!("{SUBMISSION_UNKNOWN}: position has an unresolved order");
+            }
+            // Switching live trading off stops new live entries, whenever
+            // the entry chose its mode: a buy goes out only for a position
+            // whose entry has already sent one (the second leg of a pair),
+            // never as an entry's first order. Sales always go out.
+            if order.side == OrderSide::Buy && !self.is_live() {
+                let started: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM position_order_links \
+                     WHERE position_id=$1 AND side='buy')",
+                )
+                .bind(position.id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !started {
+                    anyhow::bail!("Live trading is switched off; no new live entry is started");
+                }
             }
             sqlx::query("INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity) VALUES($1,$2,$3,$4,$5)")
                 .bind(id).bind(position.id).bind(leg).bind(if order.side == OrderSide::Buy { "buy" } else { "sell" }).bind(order.quantity)

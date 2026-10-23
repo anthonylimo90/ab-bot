@@ -258,17 +258,26 @@ impl DynamicTuner {
     }
 
     pub async fn start(self: Arc<Self>) {
-        // Seeded whether or not the tuner runs: every process applies the
-        // stored values, so a row nothing has changed must follow the
-        // environment's default rather than an old seed.
-        if let Err(e) = self.seed_defaults().await {
-            warn!(error = %e, "Failed seeding dynamic defaults");
-        }
         if !self.config.enabled {
             info!("Dynamic tuner is disabled");
+            // Rows nothing has changed hold the seed of an earlier run (or a
+            // migration's): left, every process would apply them over its
+            // environment, clamped to the tuning bounds. Without them the
+            // environment applies; an operator's values, and the tuner's
+            // own from when it ran, stay.
+            if let Err(e) = sqlx::query("DELETE FROM dynamic_config WHERE updated_by = 'bootstrap'")
+                .execute(&self.pool)
+                .await
+            {
+                warn!(error = %e, "Could not clear untouched dynamic config seeds");
+            }
             self.persist_runtime_state("disabled", "dynamic tuner disabled", None)
                 .await;
             return;
+        }
+
+        if let Err(e) = self.seed_defaults().await {
+            warn!(error = %e, "Failed seeding dynamic defaults");
         }
         if let Err(e) = self.publish_current_snapshot().await {
             warn!(error = %e, "Failed publishing startup dynamic config snapshot");
@@ -359,6 +368,10 @@ impl DynamicTuner {
         }
 
         let mut metrics = self.collect_metrics(redis_manager.as_mut()).await?;
+        // Judged before any freeze, so the stored verdict is this cycle's.
+        metrics.no_trade_watchdog = metrics.attempts_last_window
+            >= self.config.no_trade_min_attempts as f64
+            && metrics.fills_last_window <= EPSILON;
         let current_regime = *self.current_regime.read().await;
         let resolved = self.resolve_regime(
             current_regime,
@@ -405,10 +418,7 @@ impl DynamicTuner {
         let mut recommended_count = 0usize;
         let bootstrap_active = self.config.bootstrap_enabled
             && metrics.attempts_last_window < self.config.bootstrap_max_attempts as f64;
-        let no_trade_watchdog = metrics.attempts_last_window
-            >= self.config.no_trade_min_attempts as f64
-            && metrics.fills_last_window <= EPSILON;
-        metrics.no_trade_watchdog = no_trade_watchdog;
+        let no_trade_watchdog = metrics.no_trade_watchdog;
         let top_skip_reason = metrics
             .top_skip_reason
             .clone()

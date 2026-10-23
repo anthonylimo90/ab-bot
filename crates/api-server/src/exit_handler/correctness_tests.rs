@@ -1077,6 +1077,71 @@ async fn a_pair_resolved_without_a_winner_pays_only_what_the_wallet_holds(pool: 
 }
 
 #[sqlx::test(migrations = false)]
+async fn switching_live_off_stops_an_entrys_first_buy_not_its_second_leg(pool: PgPool) {
+    let service = setup(&pool).await;
+    let balance = Arc::new(std::sync::Mutex::new(String::new()));
+    let (h, wallet, server) = live_handler(&pool, balance).await;
+    let mut p = position();
+    p.id = uuid::Uuid::new_v4();
+    p.state = PositionState::Pending;
+    p.execution_mode = "live".into();
+    p.wallet_address = Some(wallet.clone());
+    service.repo().insert(&p).await.unwrap();
+    let p = service.repo().get(p.id).await.unwrap().unwrap();
+    let buy = || {
+        MarketOrder::new(
+            "market".into(),
+            "yes".into(),
+            polymarket_core::types::OrderSide::Buy,
+            Decimal::TEN,
+        )
+    };
+    // The handler's exchange, with the order journal.
+    let executor = OrderExecutor::new(
+        h.clob_client.clone(),
+        trading_engine::executor::ExecutorConfig {
+            live_trading: true,
+            ..Default::default()
+        },
+    )
+    .with_database(pool.clone());
+    executor
+        .reload_wallet(auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap())
+        .await
+        .unwrap();
+    // Paused after the entry chose live: its first buy is not sent.
+    executor.set_live_mode(false);
+    let refused = executor
+        .execute_market_order_for_position(buy(), &p, "yes")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("switched off"), "{refused}");
+    let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_order_links")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(links, 0);
+    // A pair whose first leg went out still sends its second.
+    sqlx::query(
+        "INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity,settled) \
+         VALUES($1,$2,'yes','buy',10,TRUE)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(p.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second = executor
+        .execute_market_order_for_position(buy(), &p, "no")
+        .await;
+    assert!(second
+        .as_ref()
+        .err()
+        .is_none_or(|error| !error.to_string().contains("switched off")));
+    server.abort();
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_resolved_winner_pays_what_the_wallet_holds_shared_among_its_positions(pool: PgPool) {
     let service = setup(&pool).await;
     let balance = Arc::new(std::sync::Mutex::new(String::new()));

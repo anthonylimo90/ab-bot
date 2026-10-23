@@ -438,6 +438,21 @@ impl AppState {
                 "Live trading enabled — initializing wallet"
             );
             initialize_trading_signer(&pool, &key_vault, &field_keys, &order_executor).await?;
+        } else if live_exposure_remains(&pool).await {
+            // Off, but the wallet still holds live positions or orders: the
+            // signer is loaded for their exits and reconciliation (new live
+            // entries need the switch).
+            tracing::info!(
+                live_env = live_trading_env,
+                live_workspace = live_trading_workspace,
+                "Live trading NOT enabled; live positions or orders remain, so the trading \
+                 signer is loaded for their exits"
+            );
+            if let Err(error) =
+                initialize_trading_signer(&pool, &key_vault, &field_keys, &order_executor).await
+            {
+                tracing::error!(%error, "Could not load the trading signer for the live exposure that remains");
+            }
         } else {
             tracing::info!(
                 live_env = live_trading_env,
@@ -953,6 +968,19 @@ static SIGNER_SERVICES_STARTED: std::sync::atomic::AtomicBool =
 /// How often the keeper looks for a live executor without its signer.
 const SIGNER_KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Whether the trading wallet still holds live positions, orders or
+/// unresolved submissions ([`STARTUP_EXPOSURE_SQL`]). Unreadable counts as
+/// none: the keeper looks again.
+async fn live_exposure_remains(pool: &PgPool) -> bool {
+    sqlx::query_scalar(STARTUP_EXPOSURE_SQL)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Could not check for live exposure");
+            false
+        })
+}
+
 /// Loads the trading signer again while live trading is on without one: a
 /// startup whose exchange or database call failed, or live trading switched
 /// on after a paper start. Without it every live order, exits included,
@@ -964,12 +992,19 @@ pub fn spawn_signer_keeper(state: Arc<AppState>) {
         let mut tries: u64 = 0;
         loop {
             tokio::time::sleep(SIGNER_KEEPER_INTERVAL).await;
-            if !state.order_executor.is_live() || state.order_executor.is_live_ready().await {
+            // Wanted while live trading is on, or while live exposure
+            // remains (its exits need the signer whatever the switch).
+            if state.order_executor.has_live_signer().await
+                || (!state.order_executor.is_live() && !live_exposure_remains(&state.pool).await)
+            {
                 tries = 0;
                 continue;
             }
             if tries.is_multiple_of(20) {
-                tracing::warn!("Live trading is on without a loaded trading signer; loading it");
+                tracing::warn!(
+                    "Live trading is on, or live positions remain, without a loaded trading \
+                     signer; loading it"
+                );
             }
             tries += 1;
             if let Err(error) = initialize_trading_signer(

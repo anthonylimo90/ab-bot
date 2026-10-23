@@ -1008,21 +1008,28 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - A tuner change whose Redis publish fails stays stored (every process
   re-reads the stored config within seconds); it used to be reverted, so a
   Redis outage froze the tuner.
-- Untouched dynamic config rows follow the environment's defaults even
-  with `DYNAMIC_TUNER_ENABLED=false` (the stored seed, such as
-  `QUANT_BASE_POSITION_SIZE=30`, overrode the environment).
+- With `DYNAMIC_TUNER_ENABLED=false`, the API removes at start the dynamic
+  config rows still holding their seed (an earlier run's or a migration's,
+  such as `QUANT_BASE_POSITION_SIZE=30`), which every process applied over
+  its environment; the environment applies instead. Values an operator set,
+  or the tuner set when it ran, stay.
 - Migration 101 deletes the `QUANT_MIN_CONFIDENCE`, `FLOW_MIN_IMBALANCE`
   and `MEAN_REV_MIN_MOVE_PCT` rows: nothing read them (their environment
   settings apply, unchanged), yet the tuner table listed them.
 
 ### Positions trade in their own mode; replay proof; paper fidelity
 
-- Switching live trading off (Pause) stops new live entries only. Exits,
-  the second leg of a pair already started, recovery sales and orphan sales
-  of live positions keep running as long as the trading signer is loaded
-  (they used to be refused, leaving live positions unsold). Paper positions
-  likewise still exit while live trading is on. Their trade events carry
-  the position's own mode.
+- Switching live trading off (Pause) stops new live entries only, including
+  one that chose live just before (its first buy is not sent; a pair whose
+  first leg went out still sends its second). Exits, recovery sales and
+  orphan sales of live positions keep running (they used to be refused,
+  leaving live positions unsold): the trading signer is loaded at start, and
+  kept loaded, while live positions, orders or unresolved submissions
+  remain, whatever the switch. Paper positions likewise still exit while
+  live trading is on. Their trade events carry the position's own mode.
+- Paper manual orders are recorded without a wallet, and migration 102
+  merges paper inventory kept under a wallet address (paper orders placed
+  while a signer was loaded) into the single paper key.
 - Open paper positions no longer block pinning or changing the trading
   signer at start (they hold nothing in any wallet).
 - A live arbitrage pair checks its cash again, after its entry is
