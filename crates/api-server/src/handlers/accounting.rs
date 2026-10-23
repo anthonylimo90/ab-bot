@@ -341,12 +341,13 @@ pub async fn get_account_history(
         })
         .collect();
 
-    // The current valuation joins the curve only with its cash, as the
-    // stored snapshots do.
-    let newer = equity_curve
-        .last()
-        .map(|point| point.snapshot_time < summary.snapshot_time)
-        .unwrap_or(true);
+    // The current valuation joins the curve only when complete, as the
+    // stored snapshots are.
+    let newer = summary.equity_complete
+        && equity_curve
+            .last()
+            .map(|point| point.snapshot_time < summary.snapshot_time)
+            .unwrap_or(true);
     if let (true, Some(cash_balance), Some(total_equity)) =
         (newer, summary.cash_balance, summary.total_equity)
     {

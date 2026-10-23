@@ -1020,10 +1020,14 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   settings apply, unchanged), yet the tuner table listed them.
 - The no-trade watchdog also counts arbitrage signals skipped below the
   profit threshold or for thin books (they never become positions, so it
-  could not see them before). It relaxes only the setting that blocked, as
-  before, and only while nothing fills.
+  could not see them before). It relaxes the setting that held back more
+  signals in its window and traded mode, even when another skip reason
+  (such as an existing position) is more common, and only while nothing
+  fills. The most common skip reason shown is now for that same window and
+  mode.
 - A book depth floor the watchdog relaxed returns toward its default once
-  depth stops blocking entries; a floor above the default is left alone.
+  no signal in the window was skipped for depth; a floor above the default
+  is left alone.
 - The tuner grows `ARB_MONITOR_MAX_MARKETS` to at most twice its default.
 - A tuner change applies only if the row is as the tuner read it, including
   who last set it: a value an operator saves meanwhile is kept. Saving a
@@ -1034,7 +1038,8 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Equity history stores only complete live valuations (cash, and live
   inventory read in full); readings in the same minute replace each other.
   Expect gaps while the balance or inventory cannot be read, and none while
-  trading on paper.
+  trading on paper. The current valuation is added to the chart under the
+  same rule.
 - Trade flow: arbitrage "executed" counts only entries that filled; net P&L
   is the realized result of closes in the window, zero included; the
   arbitrage market scorecard leaves paper results out while trading live.

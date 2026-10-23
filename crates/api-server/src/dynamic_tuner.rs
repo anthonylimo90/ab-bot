@@ -70,6 +70,9 @@ struct TuningMetrics {
     /// positions, so the watchdog would not see them otherwise.
     #[serde(default)]
     gated_skips_last_window: f64,
+    /// Of those, the ones skipped for a thin book.
+    #[serde(default)]
+    depth_skips_last_window: f64,
     top_skip_reason: Option<String>,
     realized_slippage_p90: f64,
     depth_proxy: f64,
@@ -710,11 +713,13 @@ impl DynamicTuner {
             .unwrap_or(300.0);
 
         let no_trade_watchdog = self.no_trade_watchdog(metrics);
-        let top_skip = metrics
-            .top_skip_reason
-            .as_deref()
-            .unwrap_or("none")
-            .to_string();
+        // Which of the tuner's gates held back more signals in the window
+        // (other skip reasons, however frequent, are not the tuner's to fix).
+        let depth_skips = metrics.depth_skips_last_window;
+        let threshold_skips = metrics.gated_skips_last_window - depth_skips;
+        let threshold_blocks =
+            no_trade_watchdog && threshold_skips >= 1.0 && threshold_skips >= depth_skips;
+        let depth_blocks = no_trade_watchdog && depth_skips >= 1.0 && depth_skips > threshold_skips;
 
         let (_, _, regime_safety_margin) = match regime {
             MarketRegime::BullCalm => (0.95_f64, 0.0012_f64, 0.0010_f64),
@@ -747,7 +752,7 @@ impl DynamicTuner {
             // skipped for falling short of the threshold justify lowering it;
             // skips for an existing position, a stale signal, the circuit
             // breaker, depth or slippage say nothing about the threshold.
-            if no_trade_watchdog && top_skip == "below_min_profit" {
+            if threshold_blocks {
                 desired_arb_profit *= 0.90;
             }
             if metrics.realized_slippage_p90 <= 0.0 {
@@ -766,18 +771,21 @@ impl DynamicTuner {
         // ARB_MIN_BOOK_DEPTH: relax when watchdog says depth is the blocking reason.
         // This targets the actual gating parameter instead of reducing the profit
         // threshold, which would push into lower-quality opportunities. Once
-        // depth no longer blocks, a relaxed floor returns toward its default
-        // (apply_step_limit bounds the pace); one above the default is held.
+        // depth no longer blocks anything, a relaxed floor returns toward its
+        // default (apply_step_limit bounds the pace); one above it is held.
         if let Some(row) = rows.get(KEY_ARB_MIN_BOOK_DEPTH) {
             let current_depth = decimal_to_f64(row.current_value);
             let default_depth = decimal_to_f64(row.default_value);
-            if no_trade_watchdog && top_skip == "insufficient_depth" {
+            if depth_blocks {
                 // 5% a step, and never below a set share of the default:
                 // failing entries are not cured by ever thinner books.
                 let floor = default_depth * MIN_DEPTH_FLOOR_SHARE;
                 let relaxed_depth = (current_depth * 0.95).max(floor.min(current_depth));
                 targets.insert(KEY_ARB_MIN_BOOK_DEPTH.to_string(), relaxed_depth);
-            } else if current_depth + EPSILON < default_depth {
+            } else if current_depth + EPSILON < default_depth && depth_skips <= EPSILON {
+                // Only once no signal was held back for depth in the window:
+                // restoring while books are still thin re-blocks the entries
+                // the relaxation let through.
                 targets.insert(KEY_ARB_MIN_BOOK_DEPTH.to_string(), default_depth);
             }
         }
@@ -995,9 +1003,12 @@ impl DynamicTuner {
         .await
         .unwrap_or((Decimal::ZERO, 0));
 
-        let gated_skips_last_window: f64 = sqlx::query_scalar(
+        let traded_mode = self.traded_mode().await;
+        let (gated_skips_last_window, depth_skips_last_window): (f64, f64) = sqlx::query_as(
             r#"
-            SELECT COUNT(*)::double precision
+            SELECT
+                COUNT(*)::double precision,
+                COUNT(*) FILTER (WHERE reason = 'insufficient_depth')::double precision
             FROM trade_events
             WHERE source = 'arb'
               AND event_type = 'signal_skipped'
@@ -1008,12 +1019,13 @@ impl DynamicTuner {
         )
         .bind(self.config.no_trade_window_minutes)
         .bind(&GATED_SKIP_REASONS[..])
-        .bind(self.traded_mode().await)
+        .bind(traded_mode)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(0.0);
+        .unwrap_or((0.0, 0.0));
 
-        // Query the most common arb skip reason from recent trade events.
+        // The most common arb skip reason in the same window and mode, for
+        // the history and the dashboard.
         let top_skip_reason: Option<String> = sqlx::query_scalar(
             r#"
             SELECT reason
@@ -1021,12 +1033,15 @@ impl DynamicTuner {
             WHERE source = 'arb'
               AND event_type = 'signal_skipped'
               AND reason IS NOT NULL
-              AND occurred_at >= NOW() - INTERVAL '120 minutes'
+              AND execution_mode = $2
+              AND occurred_at >= NOW() - ($1::bigint * INTERVAL '1 minute')
             GROUP BY reason
             ORDER BY COUNT(*) DESC
             LIMIT 1
             "#,
         )
+        .bind(self.config.no_trade_window_minutes)
+        .bind(traded_mode)
         .fetch_optional(&self.pool)
         .await
         .ok()
@@ -1039,6 +1054,7 @@ impl DynamicTuner {
             attempts_last_window,
             fills_last_window,
             gated_skips_last_window,
+            depth_skips_last_window,
             top_skip_reason,
             realized_slippage_p90: 0.0,
             depth_proxy,
@@ -1906,9 +1922,20 @@ mod tests {
     }
 
     fn idle_metrics(top_skip: &str) -> TuningMetrics {
+        let gated = if GATED_SKIP_REASONS.contains(&top_skip) {
+            50.0
+        } else {
+            0.0
+        };
         TuningMetrics {
             attempts_last_window: 50.0,
             fills_last_window: 0.0,
+            gated_skips_last_window: gated,
+            depth_skips_last_window: if top_skip == "insufficient_depth" {
+                gated
+            } else {
+                0.0
+            },
             top_skip_reason: Some(top_skip.to_string()),
             depth_proxy: 1.0,
             updates_per_minute: 60.0,
@@ -1938,6 +1965,24 @@ mod tests {
         let target = tuner.compute_targets(&rows, &skipped, MarketRegime::Ranging)
             [KEY_ARB_MIN_PROFIT_THRESHOLD];
         assert!(target < 0.005);
+        // Another reason being more common does not stop the relaxation
+        // (no stored row here, so the floor does not mask it).
+        let crowded = TuningMetrics {
+            top_skip_reason: Some("active_position_exists".to_string()),
+            ..skipped.clone()
+        };
+        let unrelaxed = TuningMetrics {
+            gated_skips_last_window: 0.0,
+            attempts_last_window: 1.0,
+            ..crowded.clone()
+        };
+        let none = HashMap::new();
+        assert!(
+            tuner.compute_targets(&none, &crowded, MarketRegime::Ranging)
+                [KEY_ARB_MIN_PROFIT_THRESHOLD]
+                < tuner.compute_targets(&none, &unrelaxed, MarketRegime::Ranging)
+                    [KEY_ARB_MIN_PROFIT_THRESHOLD]
+        );
 
         // A fill in the window means trades are happening.
         let filled = TuningMetrics {
@@ -1964,6 +2009,16 @@ mod tests {
             tuner.compute_targets(&rows, &clear, MarketRegime::Ranging)[KEY_ARB_MIN_BOOK_DEPTH],
             100.0
         );
+        // Not while signals are still held back for depth, even with fills.
+        let still_thin = TuningMetrics {
+            fills_last_window: 3.0,
+            gated_skips_last_window: 5.0,
+            depth_skips_last_window: 5.0,
+            ..clear.clone()
+        };
+        assert!(!tuner
+            .compute_targets(&rows, &still_thin, MarketRegime::Ranging)
+            .contains_key(KEY_ARB_MIN_BOOK_DEPTH));
         // One an operator set above the default is left alone.
         let raised = HashMap::from([(
             KEY_ARB_MIN_BOOK_DEPTH.to_string(),
