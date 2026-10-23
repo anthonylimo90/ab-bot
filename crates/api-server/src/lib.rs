@@ -803,6 +803,8 @@ fn spawn_trading_tasks(
     intent_reconciler::spawn(state.clone());
     // Resolve every journaled on-chain withdrawal from the chain.
     crate::withdrawals::spawn_withdrawal_reconciler(state.clone());
+    // Record live manual sales' results with the circuit breaker.
+    spawn_manual_result_recorder(state.clone());
 
     // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
     let account_snapshot_config = AccountSnapshotConfig::from_env();
@@ -888,6 +890,25 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
 const MISSED_CLOSES_HOLD: &str = "missed_closes";
 /// The entry hold unreadable settings set, in every process.
 const UNREADABLE_SETTINGS_HOLD: &str = "unreadable_settings";
+
+/// Every 15 seconds while this process leads, records with the circuit
+/// breaker the results of live manual sales filled since (in any process).
+fn spawn_manual_result_recorder(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if !state.circuit_breaker.is_leader() {
+                return;
+            }
+            if let Err(error) =
+                crate::exit_handler::record_manual_results(&state.pool, &state.circuit_breaker)
+                    .await
+            {
+                tracing::warn!(%error, "Could not record manual sales with the circuit breaker; retrying");
+            }
+        }
+    });
+}
 
 /// Retries recording the closes the circuit breaker missed until it works,
 /// then lifts the hold on new entries. Only closes made before `closed_before`

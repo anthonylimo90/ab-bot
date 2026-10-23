@@ -1046,6 +1046,25 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   with `JWT_SECRET`) and are encrypted under the new key when saved again.
   A key shorter than 32 characters is reported at start, not refused.
 
+### Manual sales count toward the circuit breaker (105)
+
+- Each confirmed fill of a live manual sell order now records its realized
+  result (proceeds less the cost basis it releases from manual inventory,
+  before fees) in `manual_realized_results`. The trading leader adds it to
+  the circuit breaker's daily P&L and loss streak within 15 seconds, and
+  at takeover; a manual loss can trip the breaker, which holds new entries,
+  manual buys included. Each result is counted once, marked by the save
+  that stores the counters.
+- A fill whose price was not reported is counted at the order's limit (a
+  sale never fills below it), or as nothing received for a market order:
+  a loss is never understated. A result from an earlier day is marked
+  without counting, with a warning.
+- Manual shares held to resolution are not sold, so they record no
+  result: their value reaches the breaker through the equity valuation
+  (drawdown), not the daily loss limit.
+- Paper manual sales reach no breaker. Deploy stop-then-start: 105
+  replaces the fill trigger.
+
 ### Equity history and trade-flow figures
 
 - Equity history stores only complete live valuations (cash, and live

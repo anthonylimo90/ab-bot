@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::circuit_breaker_repo::CircuitBreakerRepository;
+use crate::circuit_breaker_repo::{CircuitBreakerRepository, RecordedClose};
 
 /// Reason for circuit breaker activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,7 +308,7 @@ pub struct CircuitBreaker {
     unsaved: AtomicBool,
     /// Closes ([`Self::record_close`]) the in-memory counters hold that no
     /// save has stored yet; each save marks them in its transaction.
-    unsaved_closes: std::sync::Mutex<Vec<uuid::Uuid>>,
+    unsaved_closes: std::sync::Mutex<Vec<RecordedClose>>,
     /// When the stored state was last checked by [`Self::sync`].
     synced_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// Holds on new entries in this process ([`Self::hold_entries`]), by key.
@@ -588,11 +588,12 @@ impl CircuitBreaker {
     /// Whether this process counted the close and still owes its mark (a
     /// save, or the mark within it, has not stored it yet): a replay of
     /// unmarked closes in this process must not count it again.
-    pub fn counted_unsaved(&self, position_id: uuid::Uuid) -> bool {
+    pub fn counted_unsaved(&self, id: uuid::Uuid) -> bool {
         self.unsaved_closes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&position_id)
+            .iter()
+            .any(|close| close.id() == id)
     }
 
     /// Store what this leader still owes (a failed save, closes not yet
@@ -905,7 +906,20 @@ impl CircuitBreaker {
         pnl: Decimal,
         position_id: uuid::Uuid,
     ) -> Result<Option<TripReason>> {
-        self.record_result(pnl, Some(position_id)).await
+        self.record_result(pnl, Some(RecordedClose::Position(position_id)))
+            .await
+    }
+
+    /// Record a live manual sale's realized result (a row of
+    /// `manual_realized_results`), marked recorded by the save that stores
+    /// it, as [`Self::record_close`] does a position's.
+    pub async fn record_manual_fill(
+        &self,
+        pnl: Decimal,
+        fill_id: uuid::Uuid,
+    ) -> Result<Option<TripReason>> {
+        self.record_result(pnl, Some(RecordedClose::ManualFill(fill_id)))
+            .await
     }
 
     pub async fn record_trade(&self, pnl: Decimal) -> Result<Option<TripReason>> {
@@ -915,7 +929,7 @@ impl CircuitBreaker {
     async fn record_result(
         &self,
         pnl: Decimal,
-        close: Option<uuid::Uuid>,
+        close: Option<RecordedClose>,
     ) -> Result<Option<TripReason>> {
         let config = self.config.read().await.clone();
         if !config.enabled {
@@ -923,7 +937,7 @@ impl CircuitBreaker {
             // it either.
             if let (Some(close), Some(repo)) = (close, &self.repo) {
                 if let Err(error) = repo.mark_closes(&[close]).await {
-                    warn!(%error, position_id = %close, "Could not mark a close the switched-off breaker left out");
+                    warn!(%error, id = %close.id(), "Could not mark a close the switched-off breaker left out");
                 }
             }
             return Ok(None);

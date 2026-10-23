@@ -32,6 +32,98 @@ async fn setup(pool: &PgPool) {
     ))
     .await
     .unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/105_manual_realized_results.sql"
+    ))
+    .await
+    .unwrap();
+}
+
+/// A manual order of `mode`, filled by later updates.
+async fn manual_order(pool: &PgPool, mode: &str, side: &str, price: Option<Decimal>) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, execution_mode, wallet_address, market_id, outcome, side, \
+         order_type, status, quantity, price) \
+         VALUES ($1, $2, '0xw', 'm', 'yes', $3, 'limit', 'open', 10, $4)",
+    )
+    .bind(id)
+    .bind(mode)
+    .bind(side)
+    .bind(price)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn fill(pool: &PgPool, id: uuid::Uuid, filled: i64, avg: Option<Decimal>) {
+    sqlx::query("UPDATE orders SET filled_quantity = $2, avg_fill_price = $3 WHERE id = $1")
+        .bind(id)
+        .bind(Decimal::from(filled))
+        .bind(avg)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn live_manual_sales_record_their_realized_result(pool: PgPool) {
+    setup(&pool).await;
+    // 10 shares bought at 0.50: $5 of basis.
+    let buy = manual_order(&pool, "live", "buy", Some(Decimal::new(5, 1))).await;
+    fill(&pool, buy, 10, Some(Decimal::new(5, 1))).await;
+    let results = || async {
+        sqlx::query_as::<_, (Decimal, Decimal, Decimal, Decimal, bool)>(
+            "SELECT quantity, proceeds, released_cost, realized_pnl, priced \
+             FROM manual_realized_results ORDER BY occurred_at, quantity",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(results().await.is_empty());
+
+    // 4 sold at 0.40: $1.60 for $2 of basis, a $0.40 loss.
+    let priced = manual_order(&pool, "live", "sell", Some(Decimal::new(4, 1))).await;
+    fill(&pool, priced, 4, Some(Decimal::new(4, 1))).await;
+    // 3 more by an order whose fill price was not reported: at its 0.30
+    // limit, the least it sold for.
+    let unpriced = manual_order(&pool, "live", "sell", Some(Decimal::new(3, 1))).await;
+    fill(&pool, unpriced, 3, None).await;
+    let rows = results().await;
+    assert_eq!(rows.len(), 2);
+    let (q, proceeds, released, pnl, was_priced) = rows[0];
+    assert_eq!(q, Decimal::from(4));
+    assert_eq!(proceeds.normalize(), Decimal::new(16, 1));
+    assert_eq!(released.normalize(), Decimal::from(2));
+    assert_eq!(pnl.normalize(), Decimal::new(-4, 1));
+    assert!(was_priced);
+    let (q, proceeds, released, pnl, was_priced) = rows[1];
+    assert_eq!(q, Decimal::from(3));
+    assert_eq!(proceeds.normalize(), Decimal::new(9, 1));
+    assert_eq!(released.normalize(), Decimal::new(15, 1));
+    assert_eq!(pnl.normalize(), Decimal::new(-6, 1));
+    assert!(!was_priced);
+
+    // A market order with no reported price: counted as nothing received.
+    let market = manual_order(&pool, "live", "sell", None).await;
+    fill(&pool, market, 1, None).await;
+    assert_eq!(results().await.len(), 3);
+    let worst: Decimal =
+        sqlx::query_scalar("SELECT realized_pnl FROM manual_realized_results WHERE order_id = $1")
+            .bind(market)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(worst.normalize(), Decimal::new(-5, 1));
+
+    // Paper sales reach no breaker.
+    let paper_buy = manual_order(&pool, "paper", "buy", Some(Decimal::new(5, 1))).await;
+    fill(&pool, paper_buy, 2, Some(Decimal::new(5, 1))).await;
+    let paper_sell = manual_order(&pool, "paper", "sell", Some(Decimal::new(1, 1))).await;
+    fill(&pool, paper_sell, 2, Some(Decimal::new(1, 1))).await;
+    assert_eq!(results().await.len(), 3);
 }
 
 fn order() -> PlaceOrderRequest {

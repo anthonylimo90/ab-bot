@@ -2545,6 +2545,57 @@ pub(crate) async fn record_missed_closes(
             mark_breaker_recorded(pool, close.id).await;
         }
     }
+    // Manual sales are only ever recorded by a scan, so no cutoff applies.
+    record_manual_results(pool, breaker).await
+}
+
+/// Serializes [`record_manual_results`] within a process: two scans at once
+/// could both find a result unmarked and not yet counted, and count it twice.
+static MANUAL_RESULTS_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Records with the circuit breaker the realized results of live manual
+/// sales (`manual_realized_results`, written by the fill trigger) it has not
+/// recorded yet. Only the trading leader calls it; each result is marked by
+/// the save that stores the counters holding it. A result from an earlier day
+/// is marked without counting (the daily counters have moved on), with a
+/// warning; a loss is never dropped for want of a day, as there always is one.
+pub(crate) async fn record_manual_results(
+    pool: &PgPool,
+    breaker: &CircuitBreaker,
+) -> anyhow::Result<()> {
+    let _scan = MANUAL_RESULTS_SCAN.lock().await;
+    let unrecorded: Vec<(uuid::Uuid, Decimal, chrono::DateTime<chrono::Utc>, bool)> =
+        sqlx::query_as(
+            "SELECT id, realized_pnl, occurred_at, priced FROM manual_realized_results \
+             WHERE breaker_recorded_at IS NULL ORDER BY occurred_at, id",
+        )
+        .fetch_all(pool)
+        .await?;
+    let today = chrono::Utc::now().date_naive();
+    for (id, pnl, occurred_at, priced) in unrecorded {
+        if breaker.counted_unsaved(id) {
+            continue;
+        }
+        if occurred_at.date_naive() == today {
+            if !priced {
+                warn!(fill_id = %id, %pnl, "A manual sale with no reported price is counted at its limit");
+            }
+            breaker.record_manual_fill(pnl, id).await?;
+        } else {
+            warn!(
+                fill_id = %id,
+                %pnl,
+                "A manual sale from an earlier day was never recorded with the circuit breaker"
+            );
+            sqlx::query(
+                "UPDATE manual_realized_results SET breaker_recorded_at = NOW() \
+                 WHERE id = $1 AND breaker_recorded_at IS NULL",
+            )
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -2709,17 +2760,8 @@ mod strategy_exit_tests {
 mod tests {
     use super::*;
 
-    #[sqlx::test(migrations = false)]
-    async fn closes_the_breaker_missed_are_recorded_once_by_the_next_leader(pool: PgPool) {
-        sqlx::raw_sql(
-            "CREATE TABLE positions (id UUID PRIMARY KEY, state SMALLINT, realized_pnl NUMERIC, \
-                 execution_mode TEXT, exit_timestamp TIMESTAMPTZ, breaker_recorded_at TIMESTAMPTZ, \
-                 resolution_winner TEXT); \
-             CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB);",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+    /// The circuit breaker's stored state, as the migrations leave it.
+    async fn breaker_schema(pool: &PgPool) {
         sqlx::raw_sql(
             "CREATE TABLE circuit_breaker_state (id INTEGER PRIMARY KEY DEFAULT 1, \
                  tripped BOOLEAN NOT NULL DEFAULT FALSE, trip_reason VARCHAR(50), \
@@ -2733,7 +2775,7 @@ mod tests {
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); \
              INSERT INTO circuit_breaker_state (id) VALUES (1);",
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
         for migration in [
@@ -2742,8 +2784,85 @@ mod tests {
             include_str!("../../../migrations/099_circuit_breaker_leader_fence.sql"),
             include_str!("../../../migrations/100_circuit_breaker_marked_write.sql"),
         ] {
-            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+            sqlx::raw_sql(migration).execute(pool).await.unwrap();
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn manual_sales_are_recorded_once_and_only_today(pool: PgPool) {
+        breaker_schema(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TABLE positions (id UUID, state SMALLINT, breaker_recorded_at TIMESTAMPTZ); \
+             CREATE TABLE manual_realized_results (id UUID PRIMARY KEY, realized_pnl NUMERIC, \
+                 occurred_at TIMESTAMPTZ, priced BOOLEAN, breaker_recorded_at TIMESTAMPTZ);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Away from midnight UTC: the results below are today's.
+        loop {
+            use chrono::Timelike;
+            let now = chrono::Utc::now().num_seconds_from_midnight();
+            if (10..86_390).contains(&now) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        }
+        let result = |pnl: i64, seconds_ago: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO manual_realized_results (id, realized_pnl, occurred_at, priced) \
+                     VALUES (gen_random_uuid(), $1, NOW() - $2 * INTERVAL '1 second', TRUE)",
+                )
+                .bind(Decimal::from(pnl))
+                .bind(seconds_ago as f64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        result(-12, 2).await;
+        result(4, 1).await;
+        // An earlier day's: marked, not counted.
+        result(-50, 2 * 24 * 3600).await;
+
+        let breaker = CircuitBreaker::with_persistence(Default::default(), pool.clone());
+        breaker.lead().await.unwrap();
+        record_manual_results(&pool, &breaker).await.unwrap();
+        record_manual_results(&pool, &breaker).await.unwrap();
+        let state = breaker.state().await;
+        assert_eq!(state.daily_pnl, Decimal::from(-8));
+        // The win after the loss ended the streak.
+        assert_eq!(state.consecutive_losses, 0);
+        let unmarked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM manual_realized_results WHERE breaker_recorded_at IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unmarked, 0);
+        // A new leader finds nothing left to count.
+        let next = CircuitBreaker::with_persistence(Default::default(), pool.clone());
+        next.lead().await.unwrap();
+        record_manual_results(&pool, &next).await.unwrap();
+        assert_eq!(next.state().await.daily_pnl, Decimal::from(-8));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn closes_the_breaker_missed_are_recorded_once_by_the_next_leader(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE positions (id UUID PRIMARY KEY, state SMALLINT, realized_pnl NUMERIC, \
+                 execution_mode TEXT, exit_timestamp TIMESTAMPTZ, breaker_recorded_at TIMESTAMPTZ, \
+                 resolution_winner TEXT); \
+             CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB); \
+             CREATE TABLE manual_realized_results (id UUID PRIMARY KEY, realized_pnl NUMERIC, \
+                 occurred_at TIMESTAMPTZ, priced BOOLEAN, breaker_recorded_at TIMESTAMPTZ);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        breaker_schema(&pool).await;
         // A leader of this version has led before (a claim after an earlier
         // version's write marks every close left unmarked: see
         // claim_leadership).
