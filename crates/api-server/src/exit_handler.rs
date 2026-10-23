@@ -1656,11 +1656,15 @@ impl ExitHandler {
         quant_ctx: &QuantExitContext,
         _cfg: &ExitHandlerConfig,
     ) -> anyhow::Result<bool> {
+        // Only a window the flow calculator writes (any other would never
+        // be measured, and read as flow drying up).
         let window_minutes = quant_ctx
             .metadata
             .get("window_minutes")
             .and_then(|value| value.as_i64())
-            .unwrap_or(60) as i32;
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| matches!(value, 15 | 60 | 240))
+            .unwrap_or(60);
         let entry_imbalance =
             json_decimal_abs(&quant_ctx.metadata, "imbalance_ratio").unwrap_or(Decimal::ZERO);
 
@@ -1688,10 +1692,23 @@ impl ExitHandler {
         let Some((imbalance_ratio,)) = latest_row else {
             // No flow measured lately (a window is written only for a
             // market that traded in it): once two windows have passed since
-            // the entry, the flow it followed has dried up.
+            // the entry, the flow it followed has dried up. Only while the
+            // calculator is measuring other markets: a stalled calculator or
+            // trade feed is not this market going quiet, and must not exit
+            // every flow position at once.
             let quiet_since_entry = Utc::now().signed_duration_since(position.entry_timestamp)
                 > chrono::Duration::minutes(i64::from(window_minutes) * 2);
-            return Ok(quiet_since_entry);
+            if !quiet_since_entry {
+                return Ok(false);
+            }
+            let measuring: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM market_flow_features \
+                 WHERE window_minutes = $1 AND window_end > NOW() - make_interval(mins => $1))",
+            )
+            .bind(window_minutes)
+            .fetch_one(&self.pool)
+            .await?;
+            return Ok(measuring);
         };
 
         let original_sign = direction_sign(quant_ctx.direction);

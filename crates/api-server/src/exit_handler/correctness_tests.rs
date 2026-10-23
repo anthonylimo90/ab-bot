@@ -2060,9 +2060,22 @@ async fn a_flow_exit_ignores_windows_from_before_the_entry_or_gone_stale(pool: P
     assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
     flipped(3 * 60).await;
     assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
-    // Five hours in with no flow measured for two windows: it dried up.
+    // Five hours in with no flow measured for two windows: dried up, but
+    // only once the calculator is seen measuring other markets (a stalled
+    // calculator is not the market going quiet).
     p.entry_timestamp = Utc::now() - chrono::Duration::hours(5);
+    assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
+    sqlx::query("INSERT INTO market_flow_features VALUES ('elsewhere', 60, NOW() - INTERVAL '5 minutes', 0.3)")
+        .execute(&pool)
+        .await
+        .unwrap();
     assert!(h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
+    // A window the calculator never writes is read as its default (60).
+    let odd = QuantExitContext {
+        metadata: serde_json::json!({"window_minutes": 7, "imbalance_ratio": 0.4}),
+        ..ctx.clone()
+    };
+    assert!(h.flow_strategy_exit(&p, &odd, &cfg).await.unwrap());
     // Selling flow measured ten minutes ago turns the entry's thesis.
     flipped(10).await;
     assert!(h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());

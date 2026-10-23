@@ -1136,7 +1136,8 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   its entry and within two windows of now (it read the newest row of any
   age, including the windows the signal was made of). No flow measured for
   two windows since the entry (the market stopped trading) is itself an
-  exit.
+  exit, but only while the flow calculator is writing that window for other
+  markets: a stalled calculator or trade feed exits nothing.
 
 ### API contract changes
 
