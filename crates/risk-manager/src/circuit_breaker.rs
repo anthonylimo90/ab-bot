@@ -6,7 +6,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -35,7 +35,7 @@ pub enum TripReason {
 }
 
 /// Configuration for circuit breaker thresholds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
     /// Maximum daily loss before halt (absolute value).
     pub max_daily_loss: Decimal,
@@ -295,6 +295,34 @@ pub struct CircuitBreaker {
     hard_kill_breaches: AtomicU32,
     /// Database repository for persistence.
     repo: Option<CircuitBreakerRepository>,
+    /// Whether this process keeps the persisted state. One process trades
+    /// and saves it; another (an API process beside it, during a deploy)
+    /// follows the stored state and stores only operator changes.
+    leader: AtomicBool,
+    /// The operator epoch of the stored state this process last saw.
+    operator_epoch: AtomicI64,
+    /// A save of the leader's state failed and is still owed.
+    unsaved: AtomicBool,
+    /// When the stored state was last checked by [`Self::sync`].
+    synced_at: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// How often a follower re-reads the stored state.
+const FOLLOWER_SYNC: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often the leader looks for an operator change made elsewhere.
+pub(crate) const LEADER_SYNC: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take an operator's change (trip, reset) from `stored` into `state`,
+/// keeping the counters the leader has kept since.
+fn adopt_operator_change(state: &mut CircuitBreakerState, stored: CircuitBreakerState) {
+    state.tripped = stored.tripped;
+    state.trip_reason = stored.trip_reason;
+    state.tripped_at = stored.tripped_at;
+    state.resume_at = stored.resume_at;
+    state.recovery_state = stored.recovery_state;
+    state.peak_value = stored.peak_value;
+    state.drawdown_peak = stored.drawdown_peak;
+    state.trips_today = stored.trips_today;
 }
 
 /// Consecutive equity snapshots beyond the hard-kill drawdown required before
@@ -311,18 +339,95 @@ impl CircuitBreaker {
             is_tripped: AtomicBool::new(false),
             hard_kill_breaches: AtomicU32::new(0),
             repo: None,
+            leader: AtomicBool::new(true),
+            operator_epoch: AtomicI64::new(0),
+            unsaved: AtomicBool::new(false),
+            synced_at: std::sync::Mutex::new(None),
         }
     }
 
     /// Create a new circuit breaker with database persistence.
     pub fn with_persistence(config: CircuitBreakerConfig, pool: PgPool) -> Self {
         Self {
-            config: Arc::new(RwLock::new(config)),
-            state: Arc::new(RwLock::new(CircuitBreakerState::default())),
-            is_tripped: AtomicBool::new(false),
-            hard_kill_breaches: AtomicU32::new(0),
             repo: Some(CircuitBreakerRepository::new(pool)),
+            ..Self::new(config)
         }
+    }
+
+    /// Start as a follower of the stored state: until [`Self::lead`], this
+    /// process saves only operator changes and re-reads the rest.
+    pub fn following(self) -> Self {
+        self.leader.store(false, Ordering::SeqCst);
+        self
+    }
+
+    /// Stop keeping the persisted state (another process may lead now).
+    pub fn step_down(&self) {
+        self.leader.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this process keeps the persisted state.
+    pub fn is_leader(&self) -> bool {
+        self.leader.load(Ordering::SeqCst)
+    }
+
+    /// Take over the persisted state: reload it (the previous leader's last
+    /// save included) and keep it from now on.
+    pub async fn lead(&self) -> Result<bool> {
+        self.leader.store(true, Ordering::SeqCst);
+        self.load_state().await
+    }
+
+    /// Bring this process's view up to date with the stored state, at most
+    /// every few seconds. A follower takes the whole stored state; the leader
+    /// takes an operator change made through another process, and retries a
+    /// save that failed. Errors leave the current view in place.
+    pub async fn sync(&self) {
+        let Some(repo) = &self.repo else { return };
+        let leader = self.is_leader();
+        {
+            let mut synced_at = self.synced_at.lock().unwrap_or_else(|e| e.into_inner());
+            let every = if leader { LEADER_SYNC } else { FOLLOWER_SYNC };
+            if synced_at.is_some_and(|at| at.elapsed() < every) {
+                return;
+            }
+            *synced_at = Some(std::time::Instant::now());
+        }
+        if !leader {
+            if let Err(error) = self.mirror().await {
+                warn!(%error, "Could not re-read the circuit breaker's stored state");
+            }
+            return;
+        }
+        let stored_epoch = match repo.operator_epoch().await {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                warn!(%error, "Could not check the circuit breaker for operator changes");
+                return;
+            }
+        };
+        let mut state = self.state.write().await;
+        if stored_epoch.is_some_and(|epoch| epoch != self.operator_epoch.load(Ordering::SeqCst))
+            || self.unsaved.load(Ordering::SeqCst)
+        {
+            // persist_state adopts an operator change it finds first.
+            self.persist_state(&mut state).await;
+        }
+    }
+
+    /// A follower's view: the whole stored state.
+    async fn mirror(&self) -> Result<()> {
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        if let Some((mut stored, epoch)) = repo.load().await? {
+            stored.roll_daily_counters(Utc::now().date_naive());
+            let mut state = self.state.write().await;
+            self.is_tripped.store(stored.tripped, Ordering::SeqCst);
+            *state = stored;
+            self.operator_epoch.store(epoch, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Load state from database on startup.
@@ -338,18 +443,19 @@ impl CircuitBreaker {
             }
         };
 
-        let Some(mut loaded) = repo.load().await? else {
+        let Some((mut loaded, epoch)) = repo.load().await? else {
             return Ok(false);
         };
         loaded.roll_daily_counters(Utc::now().date_naive());
 
         let mut state = self.state.write().await;
         *state = loaded;
+        self.operator_epoch.store(epoch, Ordering::SeqCst);
         self.is_tripped.store(state.tripped, Ordering::SeqCst);
         if state.trip_reason == Some(TripReason::HardKillSwitch) {
             warn!("Hard kill switch is active — trading halted until manual reset");
         }
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
         Ok(true)
     }
 
@@ -364,6 +470,7 @@ impl CircuitBreaker {
     /// non-latching trip's cooldown has elapsed, trading resumes (in gradual
     /// recovery when enabled); recovery stages advance as their time comes.
     pub async fn can_trade(&self) -> bool {
+        self.sync().await;
         if !self.config.read().await.enabled {
             // Switching the breaker off stops its limits, not a latch the
             // hard kill or an operator set: only a reset lifts that.
@@ -430,7 +537,7 @@ impl CircuitBreaker {
         if Self::check_loss_thresholds(&config, &state) == Some(TripReason::DailyLossLimit) {
             if state.trip_reason != Some(TripReason::DailyLossLimit) || rolled {
                 state.trip_reason = Some(TripReason::DailyLossLimit);
-                self.persist_state(&state).await;
+                self.persist_state(&mut state).await;
             }
             return false;
         }
@@ -459,7 +566,7 @@ impl CircuitBreaker {
             info!("Cooldown elapsed, circuit breaker reset");
         }
 
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
         true
     }
 
@@ -478,7 +585,7 @@ impl CircuitBreaker {
         if recovery.is_fully_recovered() {
             info!("Recovery complete, exiting recovery mode");
             state.recovery_state = None;
-            self.persist_state(&state).await;
+            self.persist_state(&mut state).await;
             return true;
         }
 
@@ -513,7 +620,7 @@ impl CircuitBreaker {
                 state.recovery_state = None;
             }
 
-            self.persist_state(&state).await;
+            self.persist_state(&mut state).await;
             return true;
         }
 
@@ -541,7 +648,7 @@ impl CircuitBreaker {
         }
 
         state.recovery_state = None;
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
     }
 
     /// Record a realized trade result and check the loss thresholds.
@@ -608,7 +715,7 @@ impl CircuitBreaker {
         if let Some(reason) = &reason {
             self.trip_internal(&mut state, reason.clone(), &config);
         }
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
         Ok(reason)
     }
 
@@ -683,7 +790,7 @@ impl CircuitBreaker {
         if let Some(reason) = &reason {
             self.trip_internal(&mut state, reason.clone(), &config);
         }
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
         Ok(reason)
     }
 
@@ -722,19 +829,49 @@ impl CircuitBreaker {
         if let Some(reason) = &reason {
             warn!(%best_case, ?reason, "Drawdown breached even counting withdrawals in doubt");
             self.trip_internal(&mut state, reason.clone(), &config);
-            self.persist_state(&state).await;
+            self.persist_state(&mut state).await;
         }
         Ok(reason)
     }
 
     /// Manually trip the circuit breaker. A manual trip latches until reset.
-    pub async fn manual_trip(&self, reason: Option<String>) {
+    /// It holds in this process at once; an error means it could not be
+    /// stored, so neither a restart nor another API process would keep it.
+    pub async fn manual_trip(&self, reason: Option<String>) -> Result<()> {
         let config = self.config.read().await.clone();
-        let mut state = self.state.write().await;
-
         warn!(reason = ?reason, "Manual circuit breaker trip");
-        self.trip_internal(&mut state, TripReason::Manual, &config);
-        self.persist_state(&state).await;
+        self.operator_change(|breaker, state| {
+            breaker.trip_internal(state, TripReason::Manual, &config)
+        })
+        .await
+    }
+
+    /// Apply an operator's change to the current state (the stored one, for
+    /// a follower) and store it, counting the operator epoch up.
+    async fn operator_change(
+        &self,
+        change: impl FnOnce(&Self, &mut CircuitBreakerState),
+    ) -> Result<()> {
+        if !self.is_leader() {
+            self.mirror().await?;
+        }
+        let mut state = self.state.write().await;
+        change(self, &mut state);
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        match repo.save_operator_change(&state).await {
+            Ok(epoch) => {
+                self.operator_epoch.store(epoch, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(error) => {
+                error!(%error, "Failed to store an operator change to the circuit breaker");
+                // The leader's next save carries it, without the epoch.
+                self.unsaved.store(true, Ordering::SeqCst);
+                Err(error)
+            }
+        }
     }
 
     /// Trip due to connectivity issues.
@@ -744,32 +881,28 @@ impl CircuitBreaker {
 
         error!(error = %error, "Circuit breaker tripped due to connectivity");
         self.trip_internal(&mut state, TripReason::Connectivity, &config);
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
     }
 
     /// Operator reset: clears any trip (including latches) and recovery, and
-    /// accepts current equity as the new drawdown baseline.
-    pub async fn reset(&self) {
-        let mut state = self.state.write().await;
-
-        state.tripped = false;
-        state.trip_reason = None;
-        state.tripped_at = None;
-        state.resume_at = None;
-        state.recovery_state = None;
-        if state.portfolio_value_seeded {
-            state.peak_value = state.current_value;
-            state.drawdown_peak = state.current_value;
-        }
-        self.hard_kill_breaches.store(0, Ordering::SeqCst);
-        self.is_tripped.store(false, Ordering::SeqCst);
-
-        self.persist_state(&state).await;
-
-        info!(
-            baseline = %state.current_value,
-            "Circuit breaker reset"
-        );
+    /// accepts current equity as the new drawdown baseline. An error means
+    /// the reset holds in this process only.
+    pub async fn reset(&self) -> Result<()> {
+        self.operator_change(|breaker, state| {
+            state.tripped = false;
+            state.trip_reason = None;
+            state.tripped_at = None;
+            state.resume_at = None;
+            state.recovery_state = None;
+            if state.portfolio_value_seeded {
+                state.peak_value = state.current_value;
+                state.drawdown_peak = state.current_value;
+            }
+            breaker.hard_kill_breaches.store(0, Ordering::SeqCst);
+            breaker.is_tripped.store(false, Ordering::SeqCst);
+            info!(baseline = %state.current_value, "Circuit breaker reset");
+        })
+        .await
     }
 
     /// Reset daily counters (call at start of trading day).
@@ -781,13 +914,14 @@ impl CircuitBreaker {
         state.trips_today = 0;
         state.last_reset_date = Utc::now().date_naive();
 
-        self.persist_state(&state).await;
+        self.persist_state(&mut state).await;
 
         info!("Circuit breaker daily reset");
     }
 
     /// Get current state.
     pub async fn state(&self) -> CircuitBreakerState {
+        self.sync().await;
         self.state.read().await.clone()
     }
 
@@ -805,11 +939,49 @@ impl CircuitBreaker {
 
     // Private methods
 
-    /// Persist current state to database (if configured).
-    async fn persist_state(&self, state: &CircuitBreakerState) {
-        if let Some(repo) = &self.repo {
-            if let Err(e) = repo.save(state).await {
+    /// Persist current state to database (if configured and this process
+    /// is the leader). An operator change stored through another process
+    /// since this one last looked is adopted into `state` first, then saved
+    /// with what this process counted since; a failed save is retried by
+    /// [`Self::sync`].
+    async fn persist_state(&self, state: &mut CircuitBreakerState) {
+        let Some(repo) = &self.repo else { return };
+        if !self.is_leader() {
+            return;
+        }
+        let saved = match repo
+            .save(state, self.operator_epoch.load(Ordering::SeqCst))
+            .await
+        {
+            Ok(false) => match repo.load().await {
+                Ok(Some((stored, epoch))) => {
+                    warn!(
+                        tripped = stored.tripped,
+                        trip_reason = ?stored.trip_reason,
+                        "Adopting a circuit breaker change made through another process"
+                    );
+                    if !stored.tripped {
+                        self.hard_kill_breaches.store(0, Ordering::SeqCst);
+                    }
+                    adopt_operator_change(state, stored);
+                    self.is_tripped.store(state.tripped, Ordering::SeqCst);
+                    self.operator_epoch.store(epoch, Ordering::SeqCst);
+                    repo.save(state, epoch).await
+                }
+                Ok(None) => Ok(false),
+                Err(error) => Err(error),
+            },
+            other => other,
+        };
+        match saved {
+            Ok(true) => self.unsaved.store(false, Ordering::SeqCst),
+            Ok(false) => {
+                warn!("Circuit breaker state changed again while saving; retrying later");
+                self.unsaved.store(true, Ordering::SeqCst);
+            }
+            Err(e) => {
                 error!(error = %e, "Failed to persist circuit breaker state");
+                self.unsaved.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -1114,11 +1286,11 @@ mod tests {
         assert!(!breaker.is_tripped());
         assert!(breaker.can_trade().await);
 
-        breaker.manual_trip(Some("Test".to_string())).await;
+        breaker.manual_trip(Some("Test".to_string())).await.unwrap();
         assert!(breaker.is_tripped());
         assert!(!breaker.can_trade().await);
 
-        breaker.reset().await;
+        breaker.reset().await.unwrap();
         assert!(!breaker.is_tripped());
         assert!(breaker.can_trade().await);
     }
@@ -1141,12 +1313,12 @@ mod tests {
     #[tokio::test]
     async fn switching_the_breaker_off_does_not_lift_a_latch() {
         let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
-        breaker.manual_trip(None).await;
+        breaker.manual_trip(None).await.unwrap();
         let mut config = breaker.config().await;
         config.enabled = false;
         breaker.update_config(config).await;
         assert!(!breaker.can_trade().await);
-        breaker.reset().await;
+        breaker.reset().await.unwrap();
         assert!(breaker.can_trade().await);
     }
 
@@ -1413,11 +1585,11 @@ mod tests {
         let breaker = CircuitBreaker::new(latching_config());
         enter_recovery(&breaker).await;
 
-        breaker.manual_trip(None).await;
+        breaker.manual_trip(None).await.unwrap();
         assert!(!breaker.can_trade().await);
         assert!(!breaker.is_in_recovery().await);
 
-        breaker.reset().await;
+        breaker.reset().await.unwrap();
         enter_recovery(&breaker).await;
         breaker
             .update_portfolio_value(Decimal::new(1000, 0))
@@ -1436,7 +1608,7 @@ mod tests {
     #[tokio::test]
     async fn manual_trip_latches_until_reset() {
         let breaker = CircuitBreaker::new(latching_config());
-        breaker.manual_trip(Some("operator".into())).await;
+        breaker.manual_trip(Some("operator".into())).await.unwrap();
 
         let state = breaker.state().await;
         assert_eq!(state.resume_at, None);
@@ -1448,7 +1620,7 @@ mod tests {
         assert_eq!(breaker.state().await.trip_reason, Some(TripReason::Manual));
         assert!(!breaker.can_trade().await);
 
-        breaker.reset().await;
+        breaker.reset().await.unwrap();
         assert!(breaker.can_trade().await);
     }
 
@@ -1673,7 +1845,7 @@ mod tests {
             Some(TripReason::HardKillSwitch)
         );
 
-        breaker.reset().await;
+        breaker.reset().await.unwrap();
         assert_eq!(
             breaker
                 .update_portfolio_value(Decimal::new(500, 0))

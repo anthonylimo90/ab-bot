@@ -246,7 +246,7 @@ pub async fn manual_trip_circuit_breaker(
         ));
     }
 
-    state
+    let stored = state
         .circuit_breaker
         .manual_trip(Some("Manual trip from dashboard".to_string()))
         .await;
@@ -255,9 +255,17 @@ pub async fn manual_trip_circuit_breaker(
         user_id,
         ::auth::AuditAction::CircuitBreakerTripped,
         "circuit_breaker",
-        serde_json::json!({ "manual": true }),
+        serde_json::json!({ "manual": true, "stored": stored.is_ok() }),
     )
     .await;
+    if let Err(error) = stored {
+        tracing::error!(%error, "A manual trip holds on this server only");
+        return Err(ApiError::ServiceUnavailable(
+            "Trading is halted on this server, but the trip could not be saved: a restart or \
+             another server would not keep it. Trip again once the database is reachable."
+                .into(),
+        ));
+    }
 
     Ok(Json(CircuitBreakerResponse::current(&state).await))
 }
@@ -434,7 +442,7 @@ pub async fn reset_circuit_breaker(
     }
 
     let before = state.circuit_breaker.state().await;
-    state.circuit_breaker.reset().await;
+    let stored = state.circuit_breaker.reset().await;
     super::audit_change(
         &state,
         user_id,
@@ -443,9 +451,18 @@ pub async fn reset_circuit_breaker(
         serde_json::json!({
             "was_tripped": before.tripped,
             "trip_reason": before.trip_reason.as_ref().map(trip_reason_to_string),
+            "stored": stored.is_ok(),
         }),
     )
     .await;
+    if let Err(error) = stored {
+        tracing::error!(%error, "A circuit breaker reset holds on this server only");
+        return Err(ApiError::ServiceUnavailable(
+            "The reset could not be saved; a restart or another server keeps the trip. Retry \
+             once the database is reachable."
+                .into(),
+        ));
+    }
 
     Ok(Json(CircuitBreakerResponse::current(&state).await))
 }

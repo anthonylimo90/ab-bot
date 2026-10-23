@@ -211,6 +211,108 @@ pub struct AppState {
     pub siwe_site: Option<crate::handlers::wallet_auth::SiteBinding>,
 }
 
+/// The circuit breaker's limits: the defaults, then the `CB_*` environment,
+/// then the limits saved on the canonical workspace. A value that does not
+/// parse is refused, not skipped, and so is a start that cannot read the
+/// saved limits after a few tries: a limit the operator set must hold.
+pub(crate) async fn circuit_breaker_config(pool: &PgPool) -> anyhow::Result<CircuitBreakerConfig> {
+    fn env_value<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>> {
+        match polymarket_core::config::env_set(name) {
+            Some(raw) => raw
+                .parse::<T>()
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!("{name}={raw} is not a valid value")),
+            None => Ok(None),
+        }
+    }
+    #[derive(sqlx::FromRow)]
+    struct CbOverrideRow {
+        cb_max_daily_loss: Option<rust_decimal::Decimal>,
+        cb_max_drawdown_pct: Option<rust_decimal::Decimal>,
+        cb_max_consecutive_losses: Option<i32>,
+        cb_cooldown_minutes: Option<i32>,
+        cb_enabled: Option<bool>,
+    }
+    async fn saved_limits(pool: &PgPool) -> Result<Option<CbOverrideRow>, sqlx::Error> {
+        let Some(workspace_id) =
+            crate::workspace_scope::resolve_canonical_workspace_id(pool).await?
+        else {
+            return Ok(None);
+        };
+        sqlx::query_as::<_, CbOverrideRow>(
+            r#"
+            SELECT cb_max_daily_loss, cb_max_drawdown_pct, cb_max_consecutive_losses,
+                   cb_cooldown_minutes, cb_enabled
+            FROM workspaces
+            WHERE id = $1
+            "#,
+        )
+        .bind(workspace_id)
+        .fetch_optional(pool)
+        .await
+    }
+
+    let mut config = CircuitBreakerConfig::default();
+    if let Some(d) = env_value("CB_MAX_DAILY_LOSS")? {
+        config.max_daily_loss = d;
+    }
+    if let Some(d) = env_value("CB_MAX_DRAWDOWN_PCT")? {
+        config.max_drawdown_pct = d;
+    }
+    if let Some(n) = env_value("CB_MAX_CONSECUTIVE_LOSSES")? {
+        config.max_consecutive_losses = n;
+    }
+    if let Some(n) = env_value("CB_COOLDOWN_MINUTES")? {
+        config.cooldown_minutes = n;
+    }
+    if let Some(d) = env_value("CB_HARD_KILL_DRAWDOWN_PCT")? {
+        config.hard_kill_drawdown_pct = d;
+    }
+
+    // The workspace's saved limits take priority over the environment.
+    let mut attempt = 0;
+    let saved = loop {
+        attempt += 1;
+        match saved_limits(pool).await {
+            Ok(saved) => break saved,
+            Err(error) if attempt < 5 => {
+                tracing::warn!(attempt, %error, "Could not read the saved circuit breaker limits; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => anyhow::bail!(
+                "Could not read the circuit breaker limits saved on the canonical workspace: {error}"
+            ),
+        }
+    };
+    if let Some(row) = saved {
+        if let Some(v) = row.cb_max_daily_loss {
+            config.max_daily_loss = v;
+        }
+        if let Some(v) = row.cb_max_drawdown_pct {
+            config.max_drawdown_pct = v;
+        }
+        if let Some(v) = row.cb_max_consecutive_losses {
+            config.max_consecutive_losses = v as u32;
+        }
+        if let Some(v) = row.cb_cooldown_minutes {
+            config.cooldown_minutes = v as i64;
+        }
+        if let Some(v) = row.cb_enabled {
+            config.enabled = v;
+        }
+    }
+
+    // Limits that cannot guard trading (a drawdown of 20 meant as 20%
+    // never trips) stop the start rather than trade unguarded.
+    config.validate().map_err(|error| {
+        anyhow::anyhow!(
+            "Invalid circuit breaker limits (CB_* environment or the workspace's saved \
+             limits): {error}"
+        )
+    })?;
+    Ok(config)
+}
+
 impl AppState {
     /// Create a new application state.
     #[allow(clippy::too_many_arguments)]
@@ -487,111 +589,13 @@ impl AppState {
             );
         }
 
-        // Create circuit breaker for risk management. A value that does not
-        // parse is refused, not skipped: a limit the operator set must hold.
-        let mut circuit_breaker_config = CircuitBreakerConfig::default();
-        fn env_value<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>> {
-            match polymarket_core::config::env_set(name) {
-                Some(raw) => raw
-                    .parse::<T>()
-                    .map(Some)
-                    .map_err(|_| anyhow::anyhow!("{name}={raw} is not a valid value")),
-                None => Ok(None),
-            }
-        }
-        if let Some(d) = env_value("CB_MAX_DAILY_LOSS")? {
-            circuit_breaker_config.max_daily_loss = d;
-        }
-        if let Some(d) = env_value("CB_MAX_DRAWDOWN_PCT")? {
-            circuit_breaker_config.max_drawdown_pct = d;
-        }
-        if let Some(n) = env_value("CB_MAX_CONSECUTIVE_LOSSES")? {
-            circuit_breaker_config.max_consecutive_losses = n;
-        }
-        if let Some(n) = env_value("CB_COOLDOWN_MINUTES")? {
-            circuit_breaker_config.cooldown_minutes = n;
-        }
-        if let Some(d) = env_value("CB_HARD_KILL_DRAWDOWN_PCT")? {
-            circuit_breaker_config.hard_kill_drawdown_pct = d;
-        }
-
-        // Apply DB overrides (workspace-level CB config takes priority over env vars)
-        #[derive(sqlx::FromRow)]
-        struct CbOverrideRow {
-            cb_max_daily_loss: Option<rust_decimal::Decimal>,
-            cb_max_drawdown_pct: Option<rust_decimal::Decimal>,
-            cb_max_consecutive_losses: Option<i32>,
-            cb_cooldown_minutes: Option<i32>,
-            cb_enabled: Option<bool>,
-        }
-        match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
-            Ok(Some(workspace_id)) => {
-                match sqlx::query_as::<_, CbOverrideRow>(
-                    r#"
-                    SELECT cb_max_daily_loss, cb_max_drawdown_pct, cb_max_consecutive_losses,
-                           cb_cooldown_minutes, cb_enabled
-                    FROM workspaces
-                    WHERE id = $1
-                    "#,
-                )
-                .bind(workspace_id)
-                .fetch_optional(&pool)
-                .await
-                {
-                    Ok(Some(row)) => {
-                        if let Some(v) = row.cb_max_daily_loss {
-                            circuit_breaker_config.max_daily_loss = v;
-                        }
-                        if let Some(v) = row.cb_max_drawdown_pct {
-                            circuit_breaker_config.max_drawdown_pct = v;
-                        }
-                        if let Some(v) = row.cb_max_consecutive_losses {
-                            circuit_breaker_config.max_consecutive_losses = v as u32;
-                        }
-                        if let Some(v) = row.cb_cooldown_minutes {
-                            circuit_breaker_config.cooldown_minutes = v as i64;
-                        }
-                        if let Some(v) = row.cb_enabled {
-                            circuit_breaker_config.enabled = v;
-                        }
-                        tracing::info!(
-                            workspace_id = %workspace_id,
-                            "Loaded circuit breaker config overrides from canonical workspace"
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            workspace_id = %workspace_id,
-                            "No canonical workspace row found for circuit breaker overrides"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to load canonical workspace CB overrides from DB, using env/defaults: {e}");
-                    }
-                }
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    "No canonical workspace found, using env/default circuit breaker values"
-                );
-            }
-            Err(e) => {
-                tracing::warn!("Failed to resolve canonical workspace for CB overrides, using env/defaults: {e}");
-            }
-        }
-
-        // Limits that cannot guard trading (a drawdown of 20 meant as 20%
-        // never trips) stop the start rather than trade unguarded.
-        circuit_breaker_config.validate().map_err(|error| {
-            anyhow::anyhow!(
-                "Invalid circuit breaker limits (CB_* environment or the workspace's saved \
-                 limits): {error}"
-            )
-        })?;
-        let circuit_breaker = Arc::new(CircuitBreaker::with_persistence(
-            circuit_breaker_config,
-            pool.clone(),
-        ));
+        // Create circuit breaker for risk management. It follows the stored
+        // state until this process becomes the trading leader (see
+        // `trading_leader`), which reloads it then.
+        let circuit_breaker_config = circuit_breaker_config(&pool).await?;
+        let circuit_breaker = Arc::new(
+            CircuitBreaker::with_persistence(circuit_breaker_config, pool.clone()).following(),
+        );
 
         // Load persisted circuit breaker state from DB (daily P&L, drawdown,
         // a latched trip). Never start without it: a fresh breaker would

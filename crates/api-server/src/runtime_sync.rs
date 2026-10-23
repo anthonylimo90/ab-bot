@@ -37,59 +37,47 @@ pub(crate) fn env_enabled(name: &str) -> bool {
 /// Reconcile runtime service toggles from the canonical workspace's flags.
 /// As at startup, a service the environment switches on stays on: the
 /// workspace flag can add a service, not remove one the operator configured.
+/// Runs on every workspace save and every few seconds on the trading
+/// leader, so only a change is logged.
 pub async fn reconcile_runtime_service_toggles(state: &AppState) {
-    match canonical_workspace_arb_enabled(&state.pool).await {
-        Ok(enabled) => {
-            let enabled = enabled || env_enabled("ARB_AUTO_EXECUTE");
-            if let Some(ref arb_config) = state.arb_executor_config {
-                arb_config.write().await.enabled = enabled;
-                tracing::info!(
-                    arb_auto_execute = enabled,
-                    "Reconciled arb executor runtime state"
-                );
-            }
-        }
+    let flags = match load_canonical_workspace_flags(&state.pool).await {
+        Ok(flags) => flags,
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to reconcile arb executor runtime state"
-            );
+            tracing::warn!(%error, "Failed to reconcile runtime service toggles");
+            return;
         }
-    }
+    };
+    let arb = flags.as_ref().is_some_and(|f| f.arb_auto_execute) || env_enabled("ARB_AUTO_EXECUTE");
+    let exit_handler = flags.as_ref().is_some_and(|f| f.exit_handler_enabled)
+        || env_enabled("EXIT_HANDLER_ENABLED");
+    let live =
+        flags.as_ref().is_some_and(|f| f.live_trading_enabled) || env_enabled("LIVE_TRADING");
 
-    match canonical_workspace_exit_handler_enabled(&state.pool).await {
-        Ok(enabled) => {
-            let enabled = enabled || env_enabled("EXIT_HANDLER_ENABLED");
-            if let Some(ref eh_config) = state.exit_handler_config {
-                eh_config.write().await.enabled = enabled;
-                tracing::info!(
-                    exit_handler_enabled = enabled,
-                    "Reconciled exit handler runtime state"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to reconcile exit handler runtime state"
-            );
-        }
-    }
-
-    match canonical_workspace_live_enabled(&state.pool).await {
-        Ok(enabled) => {
-            let enabled = enabled || env_enabled("LIVE_TRADING");
-            state.order_executor.set_live_mode(enabled);
+    if let Some(ref arb_config) = state.arb_executor_config {
+        let mut config = arb_config.write().await;
+        if config.enabled != arb {
+            config.enabled = arb;
             tracing::info!(
-                live_trading_enabled = enabled,
-                "Reconciled live trading runtime state"
+                arb_auto_execute = arb,
+                "Reconciled arb executor runtime state"
             );
         }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "Failed to reconcile live trading runtime state"
+    }
+    if let Some(ref eh_config) = state.exit_handler_config {
+        let mut config = eh_config.write().await;
+        if config.enabled != exit_handler {
+            config.enabled = exit_handler;
+            tracing::info!(
+                exit_handler_enabled = exit_handler,
+                "Reconciled exit handler runtime state"
             );
         }
+    }
+    if state.order_executor.is_live() != live {
+        state.order_executor.set_live_mode(live);
+        tracing::info!(
+            live_trading_enabled = live,
+            "Reconciled live trading runtime state"
+        );
     }
 }

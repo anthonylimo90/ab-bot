@@ -1,7 +1,6 @@
 //! Database repository for circuit breaker state persistence.
 
 use anyhow::Result;
-use chrono::NaiveDate;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
@@ -18,15 +17,16 @@ impl CircuitBreakerRepository {
         Self { pool }
     }
 
-    /// Load state from database.
-    pub async fn load(&self) -> Result<Option<CircuitBreakerState>> {
+    /// Load state from database, with its operator epoch.
+    pub async fn load(&self) -> Result<Option<(CircuitBreakerState, i64)>> {
         let row = sqlx::query(
             r#"
             SELECT
                 tripped, trip_reason, tripped_at, resume_at,
                 daily_pnl, peak_value, drawdown_peak, current_value,
                 consecutive_losses, trips_today, last_reset_date,
-                portfolio_value_seeded, recovery_state, cash_flows_applied_through
+                portfolio_value_seeded, recovery_state, cash_flows_applied_through,
+                operator_epoch
             FROM circuit_breaker_state
             WHERE id = 1
             "#,
@@ -53,7 +53,7 @@ impl CircuitBreakerRepository {
                     }
                 });
 
-            CircuitBreakerState {
+            let state = CircuitBreakerState {
                 tripped,
                 trip_reason,
                 tripped_at: r.get("tripped_at"),
@@ -68,10 +68,11 @@ impl CircuitBreakerRepository {
                 last_reset_date: r.get("last_reset_date"),
                 portfolio_value_seeded: r.get("portfolio_value_seeded"),
                 cash_flows_applied_through: r.get("cash_flows_applied_through"),
-            }
+            };
+            (state, r.get::<i64, _>("operator_epoch"))
         });
 
-        if let Some(ref s) = state {
+        if let Some((ref s, _)) = state {
             info!(
                 tripped = s.tripped,
                 daily_pnl = %s.daily_pnl,
@@ -83,21 +84,31 @@ impl CircuitBreakerRepository {
         Ok(state)
     }
 
-    /// Save state to database. The single row is written whether or not it
-    /// exists yet: a missing row must never make a save (a latched trip) a
-    /// silent no-op.
-    pub async fn save(&self, state: &CircuitBreakerState) -> Result<()> {
+    /// The operator epoch stored now, if the row exists.
+    pub async fn operator_epoch(&self) -> Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT operator_epoch FROM circuit_breaker_state WHERE id = 1")
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Save the whole state, provided no operator change has been stored
+    /// since `epoch`. Returns whether it was saved. The single row is written
+    /// whether or not it exists yet: a missing row must never make a save (a
+    /// latched trip) a silent no-op.
+    pub async fn save(&self, state: &CircuitBreakerState, epoch: i64) -> Result<bool> {
         let trip_reason_str = state.trip_reason.as_ref().map(Self::trip_reason_to_string);
 
-        sqlx::query(
+        let saved = sqlx::query(
             r#"
             INSERT INTO circuit_breaker_state (
                 id, tripped, trip_reason, tripped_at, resume_at, daily_pnl, peak_value,
                 current_value, consecutive_losses, trips_today, last_reset_date,
                 drawdown_peak, portfolio_value_seeded, recovery_state,
-                cash_flows_applied_through, updated_at
+                cash_flows_applied_through, operator_epoch, updated_at
             )
-            VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
             ON CONFLICT (id) DO UPDATE SET
                 tripped = EXCLUDED.tripped,
                 trip_reason = EXCLUDED.trip_reason,
@@ -114,6 +125,7 @@ impl CircuitBreakerRepository {
                 recovery_state = EXCLUDED.recovery_state,
                 cash_flows_applied_through = EXCLUDED.cash_flows_applied_through,
                 updated_at = NOW()
+            WHERE circuit_breaker_state.operator_epoch = EXCLUDED.operator_epoch
             "#,
         )
         .bind(state.tripped)
@@ -136,33 +148,77 @@ impl CircuitBreakerRepository {
                 .transpose()?,
         )
         .bind(state.cash_flows_applied_through)
+        .bind(epoch)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected()
+            > 0;
 
-        debug!(tripped = state.tripped, "Saved circuit breaker state");
-        Ok(())
+        debug!(
+            tripped = state.tripped,
+            saved, "Saved circuit breaker state"
+        );
+        Ok(saved)
     }
 
-    /// Check if daily reset is needed and get last reset date.
-    pub async fn get_last_reset_date(&self) -> Result<Option<NaiveDate>> {
-        let row = sqlx::query("SELECT last_reset_date FROM circuit_breaker_state WHERE id = 1")
-            .fetch_optional(&self.pool)
-            .await?;
+    /// Store an operator's change (a manual trip or a reset): the trip, the
+    /// recovery stage, the drawdown references and the day's trip count,
+    /// leaving the counters the trading process keeps. Counts the operator
+    /// epoch up and returns it.
+    pub async fn save_operator_change(&self, state: &CircuitBreakerState) -> Result<i64> {
+        let trip_reason_str = state.trip_reason.as_ref().map(Self::trip_reason_to_string);
 
-        Ok(row.map(|r| r.get("last_reset_date")))
-    }
-
-    /// Update last reset date after daily reset.
-    pub async fn update_last_reset_date(&self, date: NaiveDate) -> Result<()> {
-        sqlx::query(
-            "UPDATE circuit_breaker_state SET last_reset_date = $1, updated_at = NOW() WHERE id = 1",
+        let epoch = sqlx::query_scalar(
+            r#"
+            INSERT INTO circuit_breaker_state (
+                id, tripped, trip_reason, tripped_at, resume_at, daily_pnl, peak_value,
+                current_value, consecutive_losses, trips_today, last_reset_date,
+                drawdown_peak, portfolio_value_seeded, recovery_state,
+                cash_flows_applied_through, operator_epoch, updated_at
+            )
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 1, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                tripped = EXCLUDED.tripped,
+                trip_reason = EXCLUDED.trip_reason,
+                tripped_at = EXCLUDED.tripped_at,
+                resume_at = EXCLUDED.resume_at,
+                peak_value = EXCLUDED.peak_value,
+                drawdown_peak = EXCLUDED.drawdown_peak,
+                trips_today = EXCLUDED.trips_today,
+                recovery_state = EXCLUDED.recovery_state,
+                operator_epoch = circuit_breaker_state.operator_epoch + 1,
+                updated_at = NOW()
+            RETURNING operator_epoch
+            "#,
         )
-        .bind(date)
-        .execute(&self.pool)
+        .bind(state.tripped)
+        .bind(&trip_reason_str)
+        .bind(state.tripped_at)
+        .bind(state.resume_at)
+        .bind(state.daily_pnl)
+        .bind(state.peak_value)
+        .bind(state.current_value)
+        .bind(i32::try_from(state.consecutive_losses).unwrap_or(i32::MAX))
+        .bind(i32::try_from(state.trips_today).unwrap_or(i32::MAX))
+        .bind(state.last_reset_date)
+        .bind(state.drawdown_peak)
+        .bind(state.portfolio_value_seeded)
+        .bind(
+            state
+                .recovery_state
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
+        .bind(state.cash_flows_applied_through)
+        .fetch_one(&self.pool)
         .await?;
 
-        info!(date = %date, "Updated circuit breaker last reset date");
-        Ok(())
+        info!(
+            tripped = state.tripped,
+            epoch, "Saved an operator change to the circuit breaker"
+        );
+        Ok(epoch)
     }
 
     /// Parse trip reason from string.
@@ -243,12 +299,12 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../../../migrations/079_circuit_breaker_full_state.sql"
-        ))
-        .execute(pool)
-        .await
-        .unwrap();
+        for migration in [
+            include_str!("../../../migrations/079_circuit_breaker_full_state.sql"),
+            include_str!("../../../migrations/094_circuit_breaker_operator_epoch.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(pool).await.unwrap();
+        }
     }
 
     #[sqlx::test(migrations = false)]
@@ -259,11 +315,57 @@ mod tests {
             .await
             .unwrap();
         let breaker = crate::CircuitBreaker::with_persistence(config(), pool.clone());
-        breaker.manual_trip(Some("operator".into())).await;
+        breaker.manual_trip(Some("operator".into())).await.unwrap();
         let restarted = crate::CircuitBreaker::with_persistence(config(), pool);
         assert!(restarted.load_state().await.unwrap());
         assert!(restarted.is_tripped());
         assert!(!restarted.can_trade().await);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_trip_made_through_a_follower_is_adopted_not_overwritten(pool: PgPool) {
+        use crate::CircuitBreaker;
+        use rust_decimal::Decimal;
+
+        create_schema(&pool).await;
+        let leader = CircuitBreaker::with_persistence(config(), pool.clone());
+        leader.load_state().await.unwrap();
+        leader
+            .update_portfolio_value(Decimal::new(1000, 0))
+            .await
+            .unwrap();
+        let follower = CircuitBreaker::with_persistence(config(), pool.clone()).following();
+        follower.load_state().await.unwrap();
+
+        // The follower counts nothing into the stored state...
+        follower.record_trade(Decimal::new(-50, 0)).await.unwrap();
+        // ...but its operator trip is stored at once.
+        follower.manual_trip(Some("operator".into())).await.unwrap();
+
+        // The leader's next save finds the trip, takes it, and keeps the
+        // loss it counted itself.
+        leader.record_trade(Decimal::new(-5, 0)).await.unwrap();
+        assert!(leader.is_tripped());
+        assert!(!leader.can_trade().await);
+        let (stored, epoch) = CircuitBreakerRepository::new(pool.clone())
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.tripped);
+        assert_eq!(stored.trip_reason, Some(TripReason::Manual));
+        assert_eq!(stored.daily_pnl, Decimal::new(-5, 0));
+        assert_eq!(stored.peak_value, Decimal::new(1000, 0));
+        assert_eq!(epoch, 1);
+
+        // A reset through the follower reaches the leader without a save.
+        follower.reset().await.unwrap();
+        let reader = CircuitBreaker::with_persistence(config(), pool).following();
+        assert!(reader.can_trade().await);
+        assert!(leader.is_tripped());
+        tokio::time::sleep(crate::circuit_breaker::LEADER_SYNC).await;
+        assert!(leader.can_trade().await);
+        assert!(!leader.is_tripped());
     }
 
     fn config() -> crate::CircuitBreakerConfig {
@@ -322,7 +424,7 @@ mod tests {
         assert_eq!(state.last_reset_date, chrono::Utc::now().date_naive());
         assert!(!restarted.can_trade().await);
 
-        let persisted: NaiveDate =
+        let persisted: chrono::NaiveDate =
             sqlx::query_scalar("SELECT last_reset_date FROM circuit_breaker_state WHERE id = 1")
                 .fetch_one(&pool)
                 .await

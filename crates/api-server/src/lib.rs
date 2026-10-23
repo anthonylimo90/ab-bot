@@ -58,6 +58,7 @@ pub mod strategy_health_calculator;
 pub mod strategy_modes;
 pub mod strategy_pnl_calculator;
 pub mod trade_events;
+pub mod trading_leader;
 pub mod wallet_harvester;
 pub mod wallet_inventory;
 pub mod websocket;
@@ -435,34 +436,34 @@ impl ApiServer {
             state.exit_handler_heartbeat.clone(),
         );
 
-        // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
-        // It and the exit handler share the one market catalog.
-        spawn_arb_auto_executor(
-            arb_config_arc.clone(),
-            state.subscribe_arb_entry(),
-            state.signal_tx.clone(),
-            state.trade_event_tx.clone(),
-            state.order_executor.clone(),
-            state.circuit_breaker.clone(),
-            state.market_catalog.clone(),
-            state.pool.clone(),
-            state.arb_executor_heartbeat.clone(),
-            state.arb_executor_status.clone(),
-            exit_readiness.clone(),
-        );
-
-        // Spawn exit handler unconditionally (per-tick guard checks enabled)
-        spawn_exit_handler(
-            exit_handler_config,
-            state.order_executor.clone(),
-            state.circuit_breaker.clone(),
-            state.clob_client.clone(),
-            state.signal_tx.clone(),
-            state.trade_event_tx.clone(),
-            state.pool.clone(),
-            state.exit_handler_heartbeat.clone(),
-            state.market_catalog.clone(),
-        );
+        // ── Trading: run by the trading leader only ──
+        // Another API process (the next version, while a deploy overlaps the
+        // two) serves requests and waits; it starts trading once this one
+        // lets go of the lock, on the state this one last stored.
+        let leadership_lost = Arc::new(tokio::sync::Notify::new());
+        {
+            let state = state.clone();
+            let lost = leadership_lost.clone();
+            let arb_config_arc = arb_config_arc.clone();
+            let quant_config = quant_config.clone();
+            tokio::spawn(async move {
+                let leadership = trading_leader::acquire(&state.pool).await;
+                if let Err(error) = take_over_trading(&state).await {
+                    tracing::error!(%error, "Could not take over trading; stopping");
+                    lost.notify_one();
+                    return;
+                }
+                spawn_trading_tasks(
+                    state.clone(),
+                    arb_config_arc,
+                    exit_handler_config,
+                    quant_config,
+                    exit_readiness,
+                );
+                spawn_operator_sync(state);
+                leadership.watch(lost);
+            });
+        }
 
         // Subscribe local runtime to dynamic updates (arb executor config knobs)
         let redis_url = std::env::var("DYNAMIC_CONFIG_REDIS_URL")
@@ -474,18 +475,6 @@ impl ApiServer {
             state.arb_executor_config.clone(),
             Some(quant_config.clone()),
         );
-
-        // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
-        // so startup sync publications are not missed by local runtime.
-        let tuner = Arc::new(
-            DynamicTuner::new(
-                state.pool.clone(),
-                state.current_regime.clone(),
-                state.circuit_breaker.clone(),
-            )
-            .with_order_executor(state.order_executor.clone()),
-        );
-        tokio::spawn(tuner.start());
 
         // Spawn wallet harvester (discovers wallets from CLOB trades)
         let harvester_config = WalletHarvesterConfig::from_env();
@@ -500,62 +489,9 @@ impl ApiServer {
         let gamma_config = GammaSyncerConfig::from_env();
         spawn_gamma_syncer(gamma_config, state.pool.clone(), db_semaphore.clone());
 
-        let wallet_inventory_config = WalletInventoryConfig::from_env();
-        spawn_wallet_inventory_reconciler(wallet_inventory_config, state.clone());
-
         // Spawn flow feature calculator (5 min, aggregates wallet_trades → market_flow_features)
         let flow_config = FlowFeatureConfig::from_env();
         spawn_flow_feature_calculator(flow_config, state.pool.clone(), db_semaphore.clone());
-
-        // ── Quant signal system: executor + generators ──
-        // Executor receives QuantSignal from broadcast channel and evaluates/executes.
-        spawn_quant_signal_executor(
-            quant_config,
-            state.quant_signal_tx.subscribe(),
-            state.signal_tx.clone(),
-            state.trade_event_tx.clone(),
-            state.order_executor.clone(),
-            state.circuit_breaker.clone(),
-            state.market_catalog.clone(),
-            state.pool.clone(),
-            state.quant_executor_heartbeat.clone(),
-            exit_readiness,
-        );
-
-        // Signal generators — each polls feature tables and emits QuantSignal
-        use signals::{
-            cross_market_signal::CrossMarketSignalConfig, flow_signal::FlowSignalConfig,
-            mean_reversion_signal::MeanReversionSignalConfig,
-            resolution_signal::ResolutionSignalConfig,
-        };
-
-        let flow_signal_config = FlowSignalConfig::from_env();
-        spawn_flow_signal_generator(
-            flow_signal_config,
-            state.pool.clone(),
-            state.quant_signal_tx.clone(),
-        );
-
-        let resolution_config = ResolutionSignalConfig::from_env();
-        spawn_resolution_signal_generator(
-            resolution_config,
-            state.pool.clone(),
-            state.quant_signal_tx.clone(),
-        );
-
-        let mean_rev_config = MeanReversionSignalConfig::from_env();
-        spawn_mean_reversion_signal_generator(
-            mean_rev_config,
-            state.pool.clone(),
-            state.quant_signal_tx.clone(),
-        );
-
-        let cross_market_config = CrossMarketSignalConfig::from_env();
-        spawn_cross_market_signal_generator(
-            cross_market_config,
-            state.pool.clone(),
-            state.quant_signal_tx.clone(),
-        );
 
         // Spawn strategy P&L calculator (6h, computes per-strategy performance snapshots)
         let pnl_config = StrategyPnlConfig::from_env();
@@ -576,37 +512,6 @@ impl ApiServer {
         // Reconcile open-position marks and expose legacy one-legged rows to recovery.
         let position_reconciler_config = PositionReconcilerConfig::from_env();
         spawn_position_reconciler(position_reconciler_config, state.pool.clone());
-        intent_reconciler::spawn(state.clone());
-        // Resolve every journaled on-chain withdrawal from the chain.
-        crate::withdrawals::spawn_withdrawal_reconciler(state.clone());
-
-        // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
-        let account_snapshot_config = AccountSnapshotConfig::from_env();
-        spawn_account_snapshot_calculator(account_snapshot_config, state.clone());
-
-        // Spawn CEX latency arbitrage system (Binance WS → price tracker → executor)
-        let latency_arb_config = LatencyArbExecutorConfig::from_env();
-        if latency_arb_config.enabled {
-            let binance_config = BinanceWsConfig::from_env();
-            let tracker_config = cex::PriceTrackerConfig::from_env();
-            let gamma_client = Arc::new(polymarket_core::api::GammaClient::new(None));
-            let market_mapper = Arc::new(cex::MarketMapper::new(gamma_client, 300));
-            market_mapper.clone().spawn_refresh_loop();
-
-            let (price_tx, price_rx) = tokio::sync::mpsc::channel(2000);
-            spawn_binance_ws_client(binance_config, price_tx);
-            spawn_latency_arb_executor(
-                latency_arb_config,
-                tracker_config,
-                price_rx,
-                market_mapper,
-                state.circuit_breaker.clone(),
-                state.pool.clone(),
-            );
-            info!("CEX latency arbitrage system started (Binance WS + executor)");
-        } else {
-            info!("CEX latency arbitrage disabled (LATENCY_ARB_ENABLED != true)");
-        }
 
         // Spawn automated backtest scheduler (polls due schedules and reuses the backtest runner)
         let backtest_automation_config = BacktestAutomationConfig::from_env();
@@ -649,6 +554,7 @@ impl ApiServer {
         tokio::pin!(server);
 
         let mut server_error = None;
+        let mut leadership_failed = false;
         let signalled = tokio::select! {
             result = &mut server => {
                 if let Err(error) = result {
@@ -658,6 +564,14 @@ impl ApiServer {
                 false
             }
             () = stop.recv() => true,
+            () = leadership_lost.notified() => {
+                // Another process may lead now: store nothing more, drain,
+                // and exit so a restart waits its turn.
+                tracing::error!("Trading leadership lost; draining and stopping");
+                state.circuit_breaker.step_down();
+                leadership_failed = true;
+                true
+            }
         };
 
         // No new trading operation starts from here; started ones (an arb
@@ -696,9 +610,201 @@ impl ApiServer {
         }
         match server_error {
             Some(error) => Err(error.into()),
+            None if leadership_failed => Err(anyhow::anyhow!("trading leadership lost")),
             None => Ok(()),
         }
     }
+}
+
+/// The tasks that trade or keep trading state (the circuit breaker's feed
+/// included): run by the trading leader only, see [`trading_leader`].
+fn spawn_trading_tasks(
+    state: Arc<AppState>,
+    arb_config_arc: Arc<RwLock<ArbExecutorConfig>>,
+    exit_handler_config: Arc<RwLock<ExitHandlerConfig>>,
+    quant_config: Arc<RwLock<QuantSignalExecutorConfig>>,
+    exit_readiness: crate::exit_handler::ExitReadiness,
+) {
+    // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
+    // It and the exit handler share the one market catalog.
+    spawn_arb_auto_executor(
+        arb_config_arc.clone(),
+        state.subscribe_arb_entry(),
+        state.signal_tx.clone(),
+        state.trade_event_tx.clone(),
+        state.order_executor.clone(),
+        state.circuit_breaker.clone(),
+        state.market_catalog.clone(),
+        state.pool.clone(),
+        state.arb_executor_heartbeat.clone(),
+        state.arb_executor_status.clone(),
+        exit_readiness.clone(),
+    );
+
+    // Spawn exit handler unconditionally (per-tick guard checks enabled)
+    spawn_exit_handler(
+        exit_handler_config,
+        state.order_executor.clone(),
+        state.circuit_breaker.clone(),
+        state.clob_client.clone(),
+        state.signal_tx.clone(),
+        state.trade_event_tx.clone(),
+        state.pool.clone(),
+        state.exit_handler_heartbeat.clone(),
+        state.market_catalog.clone(),
+    );
+
+    // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
+    // so startup sync publications are not missed by local runtime.
+    let tuner = Arc::new(
+        DynamicTuner::new(
+            state.pool.clone(),
+            state.current_regime.clone(),
+            state.circuit_breaker.clone(),
+        )
+        .with_order_executor(state.order_executor.clone()),
+    );
+    tokio::spawn(tuner.start());
+
+    let wallet_inventory_config = WalletInventoryConfig::from_env();
+    spawn_wallet_inventory_reconciler(wallet_inventory_config, state.clone());
+
+    // ── Quant signal system: executor + generators ──
+    // Executor receives QuantSignal from broadcast channel and evaluates/executes.
+    spawn_quant_signal_executor(
+        quant_config,
+        state.quant_signal_tx.subscribe(),
+        state.signal_tx.clone(),
+        state.trade_event_tx.clone(),
+        state.order_executor.clone(),
+        state.circuit_breaker.clone(),
+        state.market_catalog.clone(),
+        state.pool.clone(),
+        state.quant_executor_heartbeat.clone(),
+        exit_readiness,
+    );
+
+    // Signal generators — each polls feature tables and emits QuantSignal
+    use signals::{
+        cross_market_signal::CrossMarketSignalConfig, flow_signal::FlowSignalConfig,
+        mean_reversion_signal::MeanReversionSignalConfig,
+        resolution_signal::ResolutionSignalConfig,
+    };
+
+    let flow_signal_config = FlowSignalConfig::from_env();
+    spawn_flow_signal_generator(
+        flow_signal_config,
+        state.pool.clone(),
+        state.quant_signal_tx.clone(),
+    );
+
+    let resolution_config = ResolutionSignalConfig::from_env();
+    spawn_resolution_signal_generator(
+        resolution_config,
+        state.pool.clone(),
+        state.quant_signal_tx.clone(),
+    );
+
+    let mean_rev_config = MeanReversionSignalConfig::from_env();
+    spawn_mean_reversion_signal_generator(
+        mean_rev_config,
+        state.pool.clone(),
+        state.quant_signal_tx.clone(),
+    );
+
+    let cross_market_config = CrossMarketSignalConfig::from_env();
+    spawn_cross_market_signal_generator(
+        cross_market_config,
+        state.pool.clone(),
+        state.quant_signal_tx.clone(),
+    );
+
+    intent_reconciler::spawn(state.clone());
+    // Resolve every journaled on-chain withdrawal from the chain.
+    crate::withdrawals::spawn_withdrawal_reconciler(state.clone());
+
+    // Spawn canonical account snapshot calculator (wallet cash + marked exposure)
+    let account_snapshot_config = AccountSnapshotConfig::from_env();
+    spawn_account_snapshot_calculator(account_snapshot_config, state.clone());
+
+    // Spawn CEX latency arbitrage system (Binance WS → price tracker → executor)
+    let latency_arb_config = LatencyArbExecutorConfig::from_env();
+    if latency_arb_config.enabled {
+        let binance_config = BinanceWsConfig::from_env();
+        let tracker_config = cex::PriceTrackerConfig::from_env();
+        let gamma_client = Arc::new(polymarket_core::api::GammaClient::new(None));
+        let market_mapper = Arc::new(cex::MarketMapper::new(gamma_client, 300));
+        market_mapper.clone().spawn_refresh_loop();
+
+        let (price_tx, price_rx) = tokio::sync::mpsc::channel(2000);
+        spawn_binance_ws_client(binance_config, price_tx);
+        spawn_latency_arb_executor(
+            latency_arb_config,
+            tracker_config,
+            price_rx,
+            market_mapper,
+            state.circuit_breaker.clone(),
+            state.pool.clone(),
+        );
+        info!("CEX latency arbitrage system started (Binance WS + executor)");
+    } else {
+        info!("CEX latency arbitrage disabled (LATENCY_ARB_ENABLED != true)");
+    }
+}
+
+/// Become the trading leader: reload what another process may have changed
+/// since this one started, the circuit breaker's stored state (the previous
+/// leader's last save included), its saved limits and the service toggles.
+async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match state.circuit_breaker.lead().await {
+            Ok(_) => break,
+            Err(error) if attempt < 5 => {
+                tracing::warn!(attempt, %error, "Could not load the circuit breaker's state; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error.context("loading the circuit breaker's state")),
+        }
+    }
+    let limits = crate::state::circuit_breaker_config(&state.pool).await?;
+    state.circuit_breaker.update_config(limits).await;
+    crate::dynamic_tuner::apply_dynamic_config_snapshot(
+        &state.pool,
+        state.arb_executor_config.as_ref(),
+        state.quant_executor_config.as_ref(),
+    )
+    .await;
+    crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
+    Ok(())
+}
+
+/// While leading, take up every few seconds what operators change through
+/// any API process: circuit breaker trips, resets and limits, and the
+/// workspace's service toggles.
+fn spawn_operator_sync(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            background::pass("operator_sync", sync_operator_settings(&state)).await;
+        }
+    });
+}
+
+async fn sync_operator_settings(state: &AppState) {
+    state.circuit_breaker.sync().await;
+    match crate::state::circuit_breaker_config(&state.pool).await {
+        Ok(limits) if limits != state.circuit_breaker.config().await => {
+            info!("Applying circuit breaker limits saved through another process");
+            state.circuit_breaker.update_config(limits).await;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "Could not re-read the circuit breaker limits"),
+    }
+    crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
 }
 
 /// How long open HTTP requests may finish after a shutdown request.

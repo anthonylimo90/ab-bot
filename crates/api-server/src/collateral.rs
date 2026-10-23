@@ -133,6 +133,13 @@ impl Sweeper {
         wallet: &TradingWallet,
     ) -> anyhow::Result<WrapOutcome> {
         let address = wallet.address_string();
+        // The lock is kept only while a wrap waits. Holding it with none (a
+        // pass that panicked after taking the wrap up) would refuse this
+        // process's own next take and every withdrawal: let it go.
+        if self.pending.is_none() && self.lock.is_some() {
+            warn!("Letting go of a spend lock no waiting wrap needs");
+            self.release().await;
+        }
         // A held lock whose session no longer answers may hold nothing, or
         // live on at the server: that session is ended and the lock taken
         // again, waiting a moment for the server to let go of it.

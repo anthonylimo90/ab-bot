@@ -1957,6 +1957,9 @@ const KEY_ARB_MIN_NET_PROFIT: &str = "ARB_MIN_NET_PROFIT";
 const KEY_ARB_MIN_BOOK_DEPTH: &str = "ARB_MIN_BOOK_DEPTH";
 const KEY_ARB_MAX_SIGNAL_AGE_SECS: &str = "ARB_MAX_SIGNAL_AGE_SECS";
 const ARB_RUNTIME_STATS_LATEST: &str = "arb:runtime:stats:latest";
+/// Why a service is not running in an API process that is not trading.
+const WAITING_TO_TRADE: &str =
+    "Another server process is trading; this one takes over when that one stops";
 
 #[derive(Debug, sqlx::FromRow)]
 struct DynamicConfigStatusRow {
@@ -2461,6 +2464,8 @@ pub async fn get_service_status(
             running: arb_runtime_enabled && arb_task_alive,
             reason: if !arb_runtime_enabled {
                 Some("Arb auto-executor is disabled (workspace and env)".to_string())
+            } else if !state.circuit_breaker.is_leader() {
+                Some(WAITING_TO_TRADE.to_string())
             } else if !arb_task_alive {
                 Some("Arb auto-executor task is not responding (heartbeat stale)".to_string())
             } else {
@@ -2471,6 +2476,8 @@ pub async fn get_service_status(
             running: exit_handler_runtime_enabled && exit_task_alive,
             reason: if !exit_handler_runtime_enabled {
                 Some("Exit handler is disabled (workspace and env)".to_string())
+            } else if !state.circuit_breaker.is_leader() {
+                Some(WAITING_TO_TRADE.to_string())
             } else if !exit_task_alive {
                 Some("Exit handler task is not responding (heartbeat stale)".to_string())
             } else {

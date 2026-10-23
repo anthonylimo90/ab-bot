@@ -174,6 +174,13 @@ pub async fn run_recovery(
     // operator decisions, so the runtime status is only reported back below.
     let workspace_id =
         authorize_recovery(&state.pool, &claims, RecoveryAccess::OwnerOrAdmin).await?;
+    // Only the trading process records what recovery sells into the circuit
+    // breaker; another (the next version, during a deploy) would not.
+    if !state.circuit_breaker.is_leader() {
+        return Err(ApiError::ServiceUnavailable(
+            "Another server process is trading; retry recovery in a minute".into(),
+        ));
+    }
 
     force_refresh_canonical_wallet_inventory(state.as_ref())
         .await

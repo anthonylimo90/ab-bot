@@ -585,6 +585,30 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   key). A vault file written under an empty key no longer opens: reconnect
   those wallets after setting a real key.
 
+### One trading process (094)
+
+- Only one API process trades: the one holding the Postgres advisory lock
+  `trading-leader` on a connection of its own. Another process (the new
+  version while a deploy overlaps the two, or a second replica) serves
+  requests and waits; it starts the executors, exits, reconcilers and the
+  circuit breaker's bookkeeping when the first one stops, reloading the
+  breaker's stored state, its saved limits, the stored dynamic config and
+  the workspace's service toggles first. Its service status says so.
+- The leader re-reads every 5 s what operators change through any process:
+  circuit breaker trips, resets and limits, and the service toggles.
+  A trip or reset made through the waiting process is stored at once
+  (`circuit_breaker_state.operator_epoch` counts these) and the leader adopts
+  it rather than overwriting it with its own next save.
+- A trip or reset that cannot be stored answers 503 (the trip still holds in
+  the process that took it). The saved breaker limits must be readable at
+  start; a start that cannot read them stops.
+- If the leader's lock connection fails, it stops trading, drains and exits
+  non-zero, so a restart waits its turn.
+- Recovery runs only on the trading process (503 elsewhere).
+- The first deploy of this change still overlaps: the outgoing version does
+  not take the lock. Trip the breaker before that deploy if no trade may run
+  on two processes at once.
+
 ### API contract changes
 
 - `GET .../risk/status` and the trip/reset responses add `drawdown_peak`
