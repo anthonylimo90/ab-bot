@@ -217,8 +217,10 @@ export default function SettingsPage() {
       // Stored as saved: a re-read that started before the save cannot
       // put the old ID back.
       setCurrentWorkspace(
+        // Sent as entered: an empty ID clears it (undefined would be
+        // dropped from the request and change nothing).
         await api.updateWorkspace(currentWorkspace.id, {
-          walletconnect_project_id: walletConnectProjectId || undefined,
+          walletconnect_project_id: walletConnectProjectId.trim(),
         }),
       );
       toast.success('WalletConnect settings saved', 'Your wallet connection is now configured');

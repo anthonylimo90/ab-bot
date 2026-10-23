@@ -126,6 +126,36 @@ export default function RiskPage() {
   // Holds the answering server keeps on new entries whatever the trip says;
   // a reset does not lift them.
   const entryHolds = cb?.entry_holds ?? [];
+  // A switched-off breaker stops enforcing its limits, not a latched trip
+  // (the hard kill, a manual trip): as the server's can_trade reads it.
+  const tripBlocks =
+    cb?.tripped === true &&
+    (cb.config.enabled ||
+      cb.trip_reason === "manual" ||
+      cb.trip_reason === "hard_kill_switch");
+  const tripNotEnforced = cb?.tripped === true && !tripBlocks;
+  const halted = tripBlocks || entryHolds.length > 0;
+  // One state for the status card: the most severe first.
+  const cardState: "hard_kill" | "tripped" | "held" | "unenforced" | "recovery" | "disabled" | "operational" =
+    cb?.trip_reason === "hard_kill_switch" && tripBlocks
+      ? "hard_kill"
+      : tripBlocks
+        ? "tripped"
+        : entryHolds.length > 0
+          ? "held"
+          : tripNotEnforced
+            ? "unenforced"
+            : cb?.recovery_state
+              ? "recovery"
+              : breakerDisabled
+                ? "disabled"
+                : "operational";
+  const cardTone =
+    cardState === "hard_kill" || cardState === "tripped" || cardState === "held"
+      ? "loss"
+      : cardState === "operational"
+        ? "profit"
+        : "warning";
 
   return (
     <ErrorBoundary>
@@ -141,10 +171,10 @@ export default function RiskPage() {
               </p>
             </div>
           </div>
-          {cb && !cb.tripped && entryHolds.length === 0 && (
+          {cb && !halted && (
             <LiveIndicator />
           )}
-          {(cb?.tripped || entryHolds.length > 0) && (
+          {halted && (
             <div className="flex items-center gap-1.5">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-loss opacity-75" />
@@ -196,9 +226,9 @@ export default function RiskPage() {
           <Card
             className={cn(
               "border-2",
-              cb.tripped
+              cardTone === "loss"
                 ? "border-loss bg-loss/5"
-                : cb.recovery_state || breakerDisabled
+                : cardTone === "warning"
                   ? "border-yellow-500 bg-yellow-500/5"
                   : "border-profit bg-profit/5",
             )}
@@ -206,11 +236,11 @@ export default function RiskPage() {
             <CardContent className="p-6">
               <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                 <div className="flex items-center gap-3">
-                  {cb.trip_reason === "hard_kill_switch" ? (
+                  {cardState === "hard_kill" ? (
                     <ShieldAlert className="h-8 w-8 text-loss animate-pulse" />
-                  ) : cb.tripped ? (
+                  ) : cardTone === "loss" ? (
                     <ShieldOff className="h-8 w-8 text-loss" />
-                  ) : cb.recovery_state || breakerDisabled ? (
+                  ) : cardTone === "warning" ? (
                     <AlertTriangle className="h-8 w-8 text-yellow-500" />
                   ) : (
                     <ShieldCheck className="h-8 w-8 text-profit" />
@@ -220,24 +250,24 @@ export default function RiskPage() {
                       <span
                         className={cn(
                           "text-lg font-bold",
-                          cb.trip_reason === "hard_kill_switch"
+                          cardTone === "loss"
                             ? "text-loss"
-                            : cb.tripped
-                              ? "text-loss"
-                              : cb.recovery_state || breakerDisabled
-                                ? "text-yellow-500"
-                                : "text-profit",
+                            : cardTone === "warning"
+                              ? "text-yellow-500"
+                              : "text-profit",
                         )}
                       >
-                        {cb.trip_reason === "hard_kill_switch"
-                          ? "HARD KILL \u2014 TRADING HALTED UNTIL RESET"
-                          : cb.tripped
-                            ? "CIRCUIT BREAKER TRIPPED"
-                            : cb.recovery_state
-                              ? "RECOVERY MODE"
-                              : breakerDisabled
-                                ? "DISABLED"
-                                : "OPERATIONAL"}
+                        {
+                          {
+                            hard_kill: "HARD KILL \u2014 TRADING HALTED UNTIL RESET",
+                            tripped: "CIRCUIT BREAKER TRIPPED",
+                            held: "NEW ENTRIES HELD",
+                            unenforced: "TRIPPED \u2014 NOT ENFORCED (BREAKER OFF)",
+                            recovery: "RECOVERY MODE",
+                            disabled: "DISABLED",
+                            operational: "OPERATIONAL",
+                          }[cardState]
+                        }
                       </span>
                       {cb.tripped && cb.trip_reason && cb.trip_reason !== "hard_kill_switch" && (
                         <Badge variant="destructive" className="text-xs">
@@ -287,7 +317,8 @@ export default function RiskPage() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  {!cb.tripped && (
+                  {/* A manual trip takes over a trip the switched-off breaker does not enforce. */}
+                  {!tripBlocks && (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
                         <Button
@@ -327,7 +358,14 @@ export default function RiskPage() {
                         <Button
                           variant="outline"
                           size="sm"
-                          disabled={resetMutation.isPending}
+                          // The server refuses a reset while entries are held:
+                          // it would clear the trip and leave nothing able to trade.
+                          disabled={resetMutation.isPending || entryHolds.length > 0}
+                          title={
+                            entryHolds.length > 0
+                              ? "New entries are held on this server; a reset is refused until the hold is lifted"
+                              : undefined
+                          }
                         >
                           Reset
                         </Button>
@@ -336,10 +374,11 @@ export default function RiskPage() {
                         <AlertDialogHeader>
                           <AlertDialogTitle>Reset Circuit Breaker?</AlertDialogTitle>
                           <AlertDialogDescription>
-                            Trading resumes at once, ending this trip
-                            {cb.trip_reason ? ` (${TRIP_REASON_LABELS[cb.trip_reason]})` : ""} and
-                            its cooldown. Reset only once the cause is
-                            understood.
+                            {tripNotEnforced
+                              ? "The breaker is switched off, so this trip is not enforced; a reset clears it."
+                              : `Trading resumes at once, ending this trip${
+                                  cb.trip_reason ? ` (${TRIP_REASON_LABELS[cb.trip_reason]})` : ""
+                                } and its cooldown. Reset only once the cause is understood.`}
                           </AlertDialogDescription>
                         </AlertDialogHeader>
                         <AlertDialogFooter>

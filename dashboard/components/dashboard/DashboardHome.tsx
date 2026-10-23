@@ -87,7 +87,11 @@ export function DashboardHome() {
     hours: 24,
     limit: 288,
   });
-  const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
+  const {
+    data: riskStatus,
+    isPending: riskPending,
+    isError: riskFailed,
+  } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
   const { data: tradeFlowSummary } = useTradeFlowSummaryQuery({ limit: 100 });
   // As the server applies the switches: the environment can hold either on.
@@ -132,13 +136,20 @@ export function DashboardHome() {
           tooltip:
             "The circuit breaker is active, so automated trading is paused until the risk controls allow it again.",
         }
-      : !breaker
+      : riskPending
+      ? {
+          label: "Checking",
+          variant: "outline" as const,
+          className: "text-xs",
+          tooltip: "Reading the circuit breaker's status.",
+        }
+      : !breaker || riskFailed
       ? {
           label: "Risk status unavailable",
           variant: "warning" as const,
           className: "text-xs",
           tooltip:
-            "The circuit breaker's status could not be read, so whether it is blocking trading is unknown.",
+            "The circuit breaker's status could not be read (or not lately), so whether it is blocking trading is unknown.",
         }
       : breakerOff && !isTradingManuallyPaused
       ? {

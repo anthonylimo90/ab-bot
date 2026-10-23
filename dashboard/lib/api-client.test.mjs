@@ -147,6 +147,9 @@ test('an error body in plain text is the error message', async () => {
   // The rate limiter's 429 carries no content type.
   const limited = loadApi(() => textResponse('Too Many Requests! Wait for 12s', 429, ''));
   await assert.rejects(limited.api.getPositions(), (error) => error.message === 'Too Many Requests! Wait for 12s');
+  // A page sent without a type is reported by its status.
+  const untypedPage = loadApi(() => textResponse('<html><body>Gateway timeout</body></html>', 504, ''));
+  await assert.rejects(untypedPage.api.getPositions(), (error) => error.message === 'HTTP 504');
   const bare = loadApi(() => jsonResponse(null, 500));
   await assert.rejects(bare.api.getPositions(), (error) => error.name === 'ApiHttpError' && error.message === 'HTTP 500');
 });

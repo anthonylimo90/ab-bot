@@ -131,8 +131,10 @@ export function Header() {
       }
     },
     onError: (error) => {
-      // The saved switches may differ from what this page shows: read them again.
+      // The saved switches, and the environment's, may differ from what
+      // this page shows: read them again.
       void refreshCurrentWorkspace();
+      queryClient.invalidateQueries({ queryKey: queryKeys.runtime.serviceStatus() });
       toast.error(
         "Failed to update trading state",
         error instanceof Error ? error.message : undefined,

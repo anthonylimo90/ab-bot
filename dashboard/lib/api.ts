@@ -545,8 +545,11 @@ class ApiClient {
           details: fields.details,
         };
       } else if (
-        (contentType === "" || contentType.startsWith("text/plain")) &&
-        body.trim()
+        body.trim() &&
+        (contentType.startsWith("text/plain") ||
+          // Untyped text only: a page or binary body sent without a type
+          // is reported by its status.
+          (contentType === "" && !/^\s*</.test(body) && !/[\u0000-\u0008\u000e-\u001f]/.test(body)))
       ) {
         error = { code: "UNKNOWN_ERROR", message: body.trim().slice(0, 300) };
       }
