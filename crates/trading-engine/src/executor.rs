@@ -984,6 +984,14 @@ impl OrderExecutor {
             balance = snapshot.balance_in_units();
             allowance = snapshot.allowance_in_units();
             anyhow::ensure!(balance.is_some(), "Invalid CLOB balance after refresh");
+            // A buy is not sent on an allowance still unknown: the exchange
+            // could refuse it after an earlier leg of a pair filled. (A sell
+            // the exchange refuses costs nothing, and exits must not wait on
+            // an allowance the exchange may not report.)
+            anyhow::ensure!(
+                allowance.is_some() || side == OrderSide::Sell,
+                "CLOB collateral allowance unknown after refresh"
+            );
         }
 
         if let Some(value) = balance {
@@ -1348,6 +1356,7 @@ impl OrderExecutor {
             &order.outcome_id,
             order.side,
             order.quantity,
+            true,
             &response,
         );
         if report.status == OrderStatus::Pending {
@@ -1497,6 +1506,7 @@ impl OrderExecutor {
             &order.outcome_id,
             order.side,
             order.quantity,
+            kind == OrderType::Fok,
             &response,
         );
         if kind == OrderType::Fok && report.status == OrderStatus::Pending {
@@ -1614,6 +1624,11 @@ impl OrderExecutor {
         Ok(client.order_has_trades(order_id, asset_id, after).await?)
     }
 
+    /// The report of an order the exchange answered. A fill-or-kill order
+    /// matched with its amounts filled in full, though its signed amount
+    /// (rounded to what the exchange accepts) may buy slightly fewer shares
+    /// than `quantity`.
+    #[allow(clippy::too_many_arguments)]
     fn report_from_exchange_response(
         &self,
         id: Uuid,
@@ -1621,6 +1636,7 @@ impl OrderExecutor {
         outcome: &str,
         side: OrderSide,
         quantity: Decimal,
+        fill_or_kill: bool,
         response: &polymarket_core::api::clob::PostOrderResponse,
     ) -> ExecutionReport {
         let mut report = ExecutionReport::pending(
@@ -1660,7 +1676,7 @@ impl OrderExecutor {
                     && value > Decimal::ZERO
                     && value <= filled
                 {
-                    report.status = if filled >= quantity {
+                    report.status = if filled >= quantity || fill_or_kill {
                         OrderStatus::Filled
                     } else {
                         OrderStatus::PartiallyFilled
@@ -2134,6 +2150,7 @@ mod tests {
                 "token",
                 OrderSide::Buy,
                 Decimal::TEN,
+                false,
                 &response,
             );
             assert_eq!(report.status, OrderStatus::Pending);
@@ -2153,10 +2170,29 @@ mod tests {
                 "token",
                 side,
                 Decimal::TEN,
+                false,
                 &response,
             );
             assert_eq!(report.status, expected);
             assert_eq!(report.average_price, Decimal::new(5, 1));
+        }
+        // A fill-or-kill buy whose cent-rounded amount bought 9.99 of 10
+        // shares filled in full; the same answer to a resting order did not.
+        let response: PostOrderResponse = serde_json::from_value(serde_json::json!({"orderID":"exchange-id","status":"matched","makingAmount":"4.995","takingAmount":"9.99"})).unwrap();
+        for (fill_or_kill, expected) in [
+            (true, OrderStatus::Filled),
+            (false, OrderStatus::PartiallyFilled),
+        ] {
+            let report = executor.report_from_exchange_response(
+                Uuid::new_v4(),
+                "market",
+                "token",
+                OrderSide::Buy,
+                Decimal::TEN,
+                fill_or_kill,
+                &response,
+            );
+            assert_eq!(report.status, expected);
         }
         // A buy given a better price receives more shares than it asked for:
         // filled, with every share it received. A sell never fills beyond
@@ -2172,6 +2208,7 @@ mod tests {
                 "token",
                 side,
                 Decimal::TEN,
+                false,
                 &response,
             );
             assert_eq!(report.status, expected);

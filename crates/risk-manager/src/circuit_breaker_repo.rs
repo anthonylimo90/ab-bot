@@ -83,29 +83,37 @@ impl CircuitBreakerRepository {
         Ok(state)
     }
 
-    /// Save state to database.
+    /// Save state to database. The single row is written whether or not it
+    /// exists yet: a missing row must never make a save (a latched trip) a
+    /// silent no-op.
     pub async fn save(&self, state: &CircuitBreakerState) -> Result<()> {
         let trip_reason_str = state.trip_reason.as_ref().map(Self::trip_reason_to_string);
 
         sqlx::query(
             r#"
-            UPDATE circuit_breaker_state SET
-                tripped = $1,
-                trip_reason = $2,
-                tripped_at = $3,
-                resume_at = $4,
-                daily_pnl = $5,
-                peak_value = $6,
-                current_value = $7,
-                consecutive_losses = $8,
-                trips_today = $9,
-                last_reset_date = $10,
-                drawdown_peak = $11,
-                portfolio_value_seeded = $12,
-                recovery_state = $13,
-                cash_flows_applied_through = $14,
+            INSERT INTO circuit_breaker_state (
+                id, tripped, trip_reason, tripped_at, resume_at, daily_pnl, peak_value,
+                current_value, consecutive_losses, trips_today, last_reset_date,
+                drawdown_peak, portfolio_value_seeded, recovery_state,
+                cash_flows_applied_through, updated_at
+            )
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                tripped = EXCLUDED.tripped,
+                trip_reason = EXCLUDED.trip_reason,
+                tripped_at = EXCLUDED.tripped_at,
+                resume_at = EXCLUDED.resume_at,
+                daily_pnl = EXCLUDED.daily_pnl,
+                peak_value = EXCLUDED.peak_value,
+                current_value = EXCLUDED.current_value,
+                consecutive_losses = EXCLUDED.consecutive_losses,
+                trips_today = EXCLUDED.trips_today,
+                last_reset_date = EXCLUDED.last_reset_date,
+                drawdown_peak = EXCLUDED.drawdown_peak,
+                portfolio_value_seeded = EXCLUDED.portfolio_value_seeded,
+                recovery_state = EXCLUDED.recovery_state,
+                cash_flows_applied_through = EXCLUDED.cash_flows_applied_through,
                 updated_at = NOW()
-            WHERE id = 1
             "#,
         )
         .bind(state.tripped)
@@ -241,6 +249,21 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_latch_saved_without_its_row_survives_restart(pool: PgPool) {
+        create_schema(&pool).await;
+        sqlx::query("DELETE FROM circuit_breaker_state")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let breaker = crate::CircuitBreaker::with_persistence(config(), pool.clone());
+        breaker.manual_trip(Some("operator".into())).await;
+        let restarted = crate::CircuitBreaker::with_persistence(config(), pool);
+        assert!(restarted.load_state().await.unwrap());
+        assert!(restarted.is_tripped());
+        assert!(!restarted.can_trade().await);
     }
 
     fn config() -> crate::CircuitBreakerConfig {

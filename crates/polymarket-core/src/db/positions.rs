@@ -17,6 +17,28 @@ const ACTIVE_IN_MARKET_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE 
 /// Why an exclusive entry was refused: a position in its market is active.
 pub const MARKET_TAKEN: &str = "An active position already holds this market";
 
+/// Why a quant entry was refused: the quant executor holds its limit of
+/// open positions.
+pub const QUANT_LIMIT_REACHED: &str = "The quant executor holds its limit of open positions";
+
+/// Executor-owned quant positions that still occupy capacity.
+const ACTIVE_QUANT_POSITIONS_SQL: &str = "SELECT COUNT(*) FROM positions \
+     WHERE source = $1 AND source_signal_id IS NOT NULL AND exit_strategy = 1 \
+       AND state IN (0, 1, 2, 3, 6, 7)";
+
+/// What an entry must fit within, decided under the lock every entry takes
+/// (across processes), so concurrent entries cannot all pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EntryLimits {
+    /// The most total active exposure may reach with this entry.
+    pub max_exposure: Option<Decimal>,
+    /// Refused ([`MARKET_TAKEN`]) while any position in its market is active.
+    pub exclusive_market: bool,
+    /// Refused ([`QUANT_LIMIT_REACHED`]) while this many quant positions are
+    /// open.
+    pub max_open_quant: Option<i64>,
+}
+
 /// Read a smallint column that may have been widened to integer by pg_restore.
 /// Tries i16 first (SMALLINT), falls back to i32 (INTEGER) and truncates.
 fn get_smallint(r: &sqlx::postgres::PgRow, col: &str) -> i16 {
@@ -32,6 +54,9 @@ fn get_opt_smallint(r: &sqlx::postgres::PgRow, col: &str) -> Option<i16> {
 
 // Explicit holdings remain exposure in every lifecycle state. Pending entries
 // reserve their full requested cost, including their not-yet-filled legs.
+// Unresolved buys with neither a link nor an order row count too, but only
+// the engine's own (signed without an expiry): a browser-wallet order spends
+// a user's wallet, not the bot's.
 pub const TOTAL_ACTIVE_EXPOSURE_SQL: &str = r#"
 SELECT COALESCE((SELECT SUM(CASE WHEN state=0 THEN GREATEST(
     quantity * COALESCE(NULLIF(yes_entry_price + no_entry_price,0),1),
@@ -45,6 +70,7 @@ SELECT COALESCE((SELECT SUM(CASE WHEN state=0 THEN GREATEST(
  + COALESCE((SELECT SUM(cost_basis) FROM manual_inventory),0)
  + COALESCE((SELECT SUM((signed_order->>'makerAmount')::numeric/1000000)
  FROM execution_intents WHERE status IN ('submitting','unknown') AND signed_order->>'side'='BUY'
+ AND COALESCE(NULLIF(signed_order->>'expiration',''),'0')='0'
  AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.id=execution_intents.id)
  AND NOT EXISTS (SELECT 1 FROM position_order_links WHERE position_order_links.id=execution_intents.id)),0)
 "#;
@@ -87,27 +113,29 @@ impl PositionRepository {
         source: i16,
         source_signal_id: Option<Uuid>,
     ) -> Result<()> {
-        self.insert_with_source_and_limit(position, source, source_signal_id, None, false)
-            .await
+        self.insert_with_source_and_limit(
+            position,
+            source,
+            source_signal_id,
+            EntryLimits::default(),
+        )
+        .await
     }
 
-    /// Atomically reserve a pending position within the prospective exposure cap
-    /// and, when `exclusive_market`, only while no position in its market is
-    /// active ([`MARKET_TAKEN`] otherwise). Every entry insertion takes the
-    /// same database lock, across processes.
+    /// Atomically reserve a pending position within `limits`. Every entry
+    /// insertion takes the same database lock, across processes.
     pub async fn insert_with_source_and_limit(
         &self,
         position: &Position,
         source: i16,
         source_signal_id: Option<Uuid>,
-        max_exposure: Option<Decimal>,
-        exclusive_market: bool,
+        limits: EntryLimits,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
             .execute(&mut *tx)
             .await?;
-        if exclusive_market {
+        if limits.exclusive_market {
             let taken: bool = sqlx::query_scalar(ACTIVE_IN_MARKET_SQL)
                 .bind(&position.market_id)
                 .fetch_one(&mut *tx)
@@ -116,7 +144,16 @@ impl PositionRepository {
                 return Err(crate::Error::Position(MARKET_TAKEN.into()));
             }
         }
-        if let Some(limit) = max_exposure {
+        if let Some(max_open) = limits.max_open_quant {
+            let open: i64 = sqlx::query_scalar(ACTIVE_QUANT_POSITIONS_SQL)
+                .bind(SOURCE_RECOMMENDATION)
+                .fetch_one(&mut *tx)
+                .await?;
+            if open >= max_open {
+                return Err(crate::Error::Position(QUANT_LIMIT_REACHED.into()));
+            }
+        }
+        if let Some(limit) = limits.max_exposure {
             let current: Decimal = sqlx::query_scalar(TOTAL_ACTIVE_EXPOSURE_SQL)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -728,19 +765,10 @@ impl PositionRepository {
     /// only counts positions still occupying an execution slot, including
     /// recovery states where inventory is still held by the wallet.
     pub async fn count_active_quant_executor_positions(&self) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM positions
-            WHERE source = $1
-              AND source_signal_id IS NOT NULL
-              AND exit_strategy = 1
-              AND state IN (0, 1, 2, 3, 6, 7)
-            "#,
-        )
-        .bind(SOURCE_RECOMMENDATION)
-        .fetch_one(&self.pool)
-        .await?;
+        let count: i64 = sqlx::query_scalar(ACTIVE_QUANT_POSITIONS_SQL)
+            .bind(SOURCE_RECOMMENDATION)
+            .fetch_one(&self.pool)
+            .await?;
 
         Ok(count)
     }

@@ -215,6 +215,18 @@ fn latches(reason: &TripReason) -> bool {
     matches!(reason, TripReason::HardKillSwitch | TripReason::Manual)
 }
 
+/// How strongly a loss limit holds trading back among trips of equal
+/// severity: the day's loss (until the UTC day ends), then a run of losses,
+/// then a drawdown.
+fn loss_rank(reason: &TripReason) -> u8 {
+    match reason {
+        TripReason::DailyLossLimit => 3,
+        TripReason::ConsecutiveLosses => 2,
+        TripReason::MaxDrawdown => 1,
+        _ => 0,
+    }
+}
+
 /// Whether a new trip reason supersedes the current one.
 fn severity(reason: &TripReason) -> u8 {
     match reason {
@@ -368,11 +380,12 @@ impl CircuitBreaker {
         if !due {
             return !state.tripped;
         }
+        // A day's loss over the limit (losses recorded during this trip
+        // included) holds the trip for the rest of its UTC day.
         let rolled = state.roll_daily_counters(Utc::now().date_naive());
-        if state.trip_reason == Some(TripReason::DailyLossLimit)
-            && Self::check_loss_thresholds(&config, &state) == Some(TripReason::DailyLossLimit)
-        {
-            if rolled {
+        if Self::check_loss_thresholds(&config, &state) == Some(TripReason::DailyLossLimit) {
+            if state.trip_reason != Some(TripReason::DailyLossLimit) || rolled {
+                state.trip_reason = Some(TripReason::DailyLossLimit);
                 self.persist_state(&state).await;
             }
             return false;
@@ -772,8 +785,11 @@ impl CircuitBreaker {
 
     /// Trips the breaker. Re-evaluating an active trip is a no-op, so repeated
     /// threshold breaches cannot postpone resumption; only a more severe reason
-    /// (manual, then hard kill) replaces the current one. Any trip ends
-    /// gradual recovery.
+    /// (manual, then hard kill) replaces the current one. A loss limit
+    /// breached during a lesser trip (a run of losses during a drawdown
+    /// cooldown, the day's loss during either) takes the trip over once, with
+    /// a fresh cooldown, so losses recorded while halted are never dropped.
+    /// Any trip ends gradual recovery.
     fn trip_internal(
         &self,
         state: &mut CircuitBreakerState,
@@ -781,13 +797,32 @@ impl CircuitBreaker {
         config: &CircuitBreakerConfig,
     ) {
         let was_tripped = state.tripped;
-        if was_tripped
-            && state
-                .trip_reason
+        if was_tripped {
+            let current = state.trip_reason.clone();
+            let outranks = current
                 .as_ref()
-                .is_some_and(|current| severity(&reason) <= severity(current))
-        {
-            return;
+                .is_none_or(|current| severity(&reason) > severity(current));
+            let escalates = current.as_ref().is_some_and(|current| {
+                severity(&reason) == severity(current)
+                    && !latches(current)
+                    && loss_rank(&reason) > loss_rank(current)
+            });
+            if escalates {
+                let resume_at = Utc::now() + Duration::minutes(config.cooldown_minutes);
+                state.resume_at = Some(state.resume_at.map_or(resume_at, |at| at.max(resume_at)));
+                state.trip_reason = Some(reason.clone());
+                warn!(
+                    reason = ?reason,
+                    previous = ?current,
+                    daily_pnl = %state.daily_pnl,
+                    consecutive_losses = state.consecutive_losses,
+                    "A loss limit was breached while tripped; the trip takes its reason"
+                );
+                return;
+            }
+            if !outranks {
+                return;
+            }
         }
 
         let now = Utc::now();
@@ -871,6 +906,72 @@ mod tests {
         assert!(breaker.can_trade().await);
         assert!(!breaker.is_tripped());
         assert_eq!(breaker.state().await.daily_pnl, Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn losses_recorded_during_another_trip_are_weighed_before_resuming() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            max_daily_loss: Decimal::new(2500, 0),
+            max_consecutive_losses: 3,
+            cooldown_minutes: 0,
+            enabled: true,
+            ..Default::default()
+        });
+        // Tripped for drawdown; three losing closes come in meanwhile.
+        {
+            let mut state = breaker.state.write().await;
+            let config = breaker.config.read().await.clone();
+            breaker.trip_internal(&mut state, TripReason::MaxDrawdown, &config);
+        }
+        for loss in [-1000, -900, -800] {
+            breaker.record_trade(Decimal::from(loss)).await.unwrap();
+        }
+        // Over the day's limit: the trip holds, under its true reason.
+        assert!(!breaker.can_trade().await);
+        assert_eq!(
+            breaker.state().await.trip_reason,
+            Some(TripReason::DailyLossLimit)
+        );
+
+        // Within the day's limit but a run of losses: its own cooldown.
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            max_daily_loss: Decimal::new(100000, 0),
+            max_consecutive_losses: 3,
+            cooldown_minutes: 30,
+            enabled: true,
+            ..Default::default()
+        });
+        {
+            let mut state = breaker.state.write().await;
+            let config = breaker.config.read().await.clone();
+            breaker.trip_internal(&mut state, TripReason::MaxDrawdown, &config);
+            state.resume_at = Some(Utc::now());
+        }
+        for _ in 0..3 {
+            breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        }
+        assert!(!breaker.can_trade().await);
+        let state = breaker.state().await;
+        assert_eq!(state.trip_reason, Some(TripReason::ConsecutiveLosses));
+        assert!(state.resume_at.unwrap() > Utc::now() + Duration::minutes(29));
+
+        // A run already served is not served again after a later trip.
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            max_daily_loss: Decimal::new(100000, 0),
+            max_consecutive_losses: 2,
+            cooldown_minutes: 0,
+            enabled: true,
+            ..Default::default()
+        });
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        assert!(breaker.can_trade().await);
+        {
+            let mut state = breaker.state.write().await;
+            let config = breaker.config.read().await.clone();
+            breaker.trip_internal(&mut state, TripReason::MaxDrawdown, &config);
+        }
+        assert!(breaker.can_trade().await);
     }
 
     #[tokio::test]
@@ -1376,16 +1477,26 @@ mod tests {
             .await
             .unwrap();
         let first = breaker.state().await;
+        // The same breach again neither extends nor restarts the trip.
         breaker
             .update_portfolio_value(Decimal::new(770, 0))
             .await
             .unwrap();
+        let again = breaker.state().await;
+        assert_eq!(again.trip_reason, Some(TripReason::MaxDrawdown));
+        assert_eq!(again.resume_at, first.resume_at);
+        assert_eq!(again.tripped_at, first.tripped_at);
+
+        // A run of losses reaching its limit meanwhile takes the trip over,
+        // once, with its own cooldown; more losses do not extend it.
         breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
+        let taken = breaker.state().await;
+        assert_eq!(taken.trip_reason, Some(TripReason::ConsecutiveLosses));
+        assert!(taken.resume_at >= first.resume_at);
         breaker.record_trade(Decimal::NEGATIVE_ONE).await.unwrap();
         let later = breaker.state().await;
-
-        assert_eq!(later.trip_reason, Some(TripReason::MaxDrawdown));
-        assert_eq!(later.resume_at, first.resume_at);
+        assert_eq!(later.resume_at, taken.resume_at);
         assert_eq!(later.tripped_at, first.tripped_at);
         assert_eq!(later.trips_today, 1);
     }

@@ -390,3 +390,19 @@ fn an_amount_too_large_to_scale_is_refused_not_a_panic() {
     assert!(decimal_to_usdc_units(Decimal::MAX).is_err());
     assert!(decimal_to_usdc_units("80000000000000000000000".parse().unwrap()).is_err());
 }
+
+#[test]
+fn a_checksummed_address_with_a_typo_is_refused() {
+    // EIP-55's own example, checksummed, and the same address in one case.
+    let checksummed = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+    let lower = checksummed.to_lowercase();
+    assert_eq!(validate_wallet_address(checksummed).unwrap(), lower);
+    assert_eq!(validate_wallet_address(&lower).unwrap(), lower);
+    assert_eq!(
+        validate_wallet_address(&format!("0x{}", lower[2..].to_uppercase())).unwrap(),
+        lower
+    );
+    // One character changed in the checksummed form: refused.
+    let typo = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAee";
+    assert!(validate_wallet_address(typo).is_err());
+}

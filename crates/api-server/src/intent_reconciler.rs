@@ -82,10 +82,12 @@ pub fn spawn(state: Arc<AppState>) {
     });
 }
 
-pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
+/// Settle what the order journal can decide without the exchange: expired
+/// browser-wallet orders, links and rows of refused or never-sent orders,
+/// and interrupted local bookkeeping. `wallet` is the trading wallet.
+async fn housekeeping(state: &AppState, wallet: Option<&str>) -> anyhow::Result<()> {
     // Retire only attempts which never crossed the durable POST boundary. The
     // submitter checks these markers while holding the same lock before POST.
-    let wallet = state.order_executor.wallet_address().await;
     let mut tx = state.pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('live-order-submission'))")
         .execute(&mut *tx)
@@ -97,7 +99,7 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     // engine's own orders never match: every one is signed without an
     // expiry (fill-or-kill or good-till-cancelled).
     let expired = sqlx::query("UPDATE execution_intents i SET status='reconciled',updated_at=NOW() WHERE i.status IN ('submitting','unknown') AND ($1::text IS NULL OR LOWER(i.signed_order->>'maker')<>LOWER($1)) AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.id=i.id) AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AND (CASE WHEN i.signed_order->>'expiration' ~ '^[0-9]{1,15}$' THEN (i.signed_order->>'expiration')::bigint END) BETWEEN 1 AND EXTRACT(EPOCH FROM NOW())::bigint-$2")
-        .bind(wallet.as_deref())
+        .bind(wallet)
         .bind(EXPIRED_WALLET_ORDER_GRACE_SECS)
         .execute(&mut *tx)
         .await?
@@ -115,6 +117,10 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     sqlx::query("UPDATE position_order_links l SET settled=TRUE FROM execution_intents i WHERE i.id=l.id AND i.status='rejected' AND NOT l.settled")
         .execute(&mut *tx).await?;
     sqlx::query("UPDATE orders o SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='live' AND created_at<NOW()-INTERVAL '10 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=o.id)")
+        .execute(&mut *tx).await?;
+    // An order the exchange refused whose row the request did not get to
+    // update holds a reservation for nothing: it is rejected too.
+    sqlx::query("UPDATE orders o SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='live' AND created_at<NOW()-INTERVAL '10 minutes' AND EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=o.id AND i.status='rejected')")
         .execute(&mut *tx).await?;
     tx.commit().await?;
     // Finish interrupted local bookkeeping after all order receipts are settled:
@@ -158,6 +164,15 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     )
     .execute(&state.pool)
     .await?;
+    Ok(())
+}
+
+pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
+    let wallet = state.order_executor.wallet_address().await;
+    // Housekeeping that fails is said so; the intents are still reconciled.
+    if let Err(error) = housekeeping(state, wallet.as_deref()).await {
+        tracing::warn!(%error, "Order journal housekeeping failed; reconciling intents anyway");
+    }
     let Some(wallet) = wallet else {
         return Ok(());
     };
@@ -775,6 +790,36 @@ mod tests {
         assert!(fence_alert_due(id));
         assert!(!fence_alert_due(id));
         assert!(fence_alert_due(Uuid::new_v4()));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_refused_manual_order_left_pending_is_rejected(pool: PgPool) {
+        let (clob, server) = exchange(None, serde_json::json!([])).await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let refused = journal(&pool, &maker, None, "rejected", 20).await;
+        let waiting = journal(&pool, &maker, None, "acknowledged", 20).await;
+        for id in [refused, waiting] {
+            sqlx::query("INSERT INTO orders(id,status,execution_mode,quantity,filled_quantity,created_at) VALUES($1,'pending','live',10,0,NOW()-INTERVAL '20 minutes')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        reconcile(&state).await.unwrap();
+        let status = |id| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM orders WHERE id=$1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(status(refused).await, "rejected");
+        // One the exchange took keeps its reservation.
+        assert_eq!(status(waiting).await, "pending");
+        server.abort();
     }
 
     #[sqlx::test(migrations = false)]

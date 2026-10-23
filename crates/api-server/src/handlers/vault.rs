@@ -162,7 +162,8 @@ async fn require_canonical_workspace_member(
 }
 
 fn validate_wallet_address(address: &str) -> ApiResult<String> {
-    let normalized = address.trim().to_lowercase();
+    let trimmed = address.trim();
+    let normalized = trimmed.to_lowercase();
     let is_valid = normalized.len() == 42
         && normalized.starts_with("0x")
         && normalized
@@ -172,6 +173,18 @@ fn validate_wallet_address(address: &str) -> ApiResult<String> {
 
     if !is_valid {
         return Err(ApiError::BadRequest("Invalid wallet address format".into()));
+    }
+    // Mixed case carries an EIP-55 checksum: a mistyped character in it
+    // would otherwise name an address nobody controls, and funds sent there
+    // are lost. Single-case addresses carry none to check.
+    let hex = &trimmed[2..];
+    let mixed_case =
+        hex.bytes().any(|b| b.is_ascii_uppercase()) && hex.bytes().any(|b| b.is_ascii_lowercase());
+    if mixed_case && alloy_primitives::Address::parse_checksummed(format!("0x{hex}"), None).is_err()
+    {
+        return Err(ApiError::BadRequest(
+            "Wallet address checksum does not match; check the address".into(),
+        ));
     }
 
     Ok(normalized)

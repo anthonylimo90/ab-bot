@@ -5,7 +5,7 @@
 //! are committed atomically; analytics events are published after persistence.
 
 use anyhow::anyhow;
-use polymarket_core::db::positions::PositionRepository;
+use polymarket_core::db::positions::{EntryLimits, PositionRepository};
 use polymarket_core::types::{
     ArbOpportunity, ExitStrategy, FailureReason, Position, PositionState,
 };
@@ -69,6 +69,9 @@ pub struct CreatePositionParams {
     /// Only while no position in the market is active, decided under the
     /// lock every entry takes (across processes).
     pub exclusive_market: bool,
+    /// Only while fewer quant positions than this are open, decided under
+    /// the same lock.
+    pub max_open_quant: Option<i64>,
 }
 
 /// Context fields for trade event recording.
@@ -155,8 +158,11 @@ impl PositionService {
                 &position,
                 params.source,
                 params.source_signal_id,
-                max_exposure,
-                params.exclusive_market,
+                EntryLimits {
+                    max_exposure,
+                    exclusive_market: params.exclusive_market,
+                    max_open_quant: params.max_open_quant,
+                },
             )
             .await
             .map_err(|e| anyhow!("insert position: {}", e))?;

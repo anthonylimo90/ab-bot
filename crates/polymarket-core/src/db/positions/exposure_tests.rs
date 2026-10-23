@@ -68,15 +68,19 @@ async fn concurrent_entries_reserve_prospective_exposure_atomically(pool: PgPool
             &first,
             SOURCE_ARBITRAGE,
             None,
-            Some(Decimal::from(15)),
-            false
+            EntryLimits {
+                max_exposure: Some(Decimal::from(15)),
+                ..Default::default()
+            }
         ),
         repo.insert_with_source_and_limit(
             &second,
             SOURCE_RECOMMENDATION,
             None,
-            Some(Decimal::from(15)),
-            false
+            EntryLimits {
+                max_exposure: Some(Decimal::from(15)),
+                ..Default::default()
+            }
         )
     );
     assert_ne!(a.is_ok(), b.is_ok());
@@ -131,20 +135,109 @@ async fn concurrent_exclusive_entries_take_a_market_once(pool: PgPool) {
     };
     let (first, second) = (entry(), entry());
     let (a, b) = tokio::join!(
-        repo.insert_with_source_and_limit(&first, SOURCE_ARBITRAGE, None, None, true),
-        repo.insert_with_source_and_limit(&second, SOURCE_ARBITRAGE, None, None, true)
+        repo.insert_with_source_and_limit(
+            &first,
+            SOURCE_ARBITRAGE,
+            None,
+            EntryLimits {
+                exclusive_market: true,
+                ..Default::default()
+            }
+        ),
+        repo.insert_with_source_and_limit(
+            &second,
+            SOURCE_ARBITRAGE,
+            None,
+            EntryLimits {
+                exclusive_market: true,
+                ..Default::default()
+            }
+        )
     );
     assert_ne!(a.is_ok(), b.is_ok());
     let refused = a.err().or(b.err()).unwrap();
     assert!(refused.to_string().contains(MARKET_TAKEN), "{refused}");
     // An entry that is not exclusive is not refused.
-    repo.insert_with_source_and_limit(&entry(), SOURCE_RECOMMENDATION, None, None, false)
-        .await
-        .unwrap();
+    repo.insert_with_source_and_limit(
+        &entry(),
+        SOURCE_RECOMMENDATION,
+        None,
+        EntryLimits::default(),
+    )
+    .await
+    .unwrap();
     // Another market is free.
     let mut elsewhere = entry();
     elsewhere.market_id = "other".into();
-    repo.insert_with_source_and_limit(&elsewhere, SOURCE_ARBITRAGE, None, None, true)
+    repo.insert_with_source_and_limit(
+        &elsewhere,
+        SOURCE_ARBITRAGE,
+        None,
+        EntryLimits {
+            exclusive_market: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_quant_limit_is_decided_with_the_entry(pool: PgPool) {
+    setup(&pool).await;
+    let repo = PositionRepository::new(pool.clone());
+    let quant = |market: &str| {
+        Position::new(
+            market.into(),
+            Decimal::new(4, 1),
+            Decimal::ZERO,
+            Decimal::TEN,
+            ExitStrategy::ExitOnCorrection,
+        )
+    };
+    let limits = EntryLimits {
+        max_open_quant: Some(1),
+        ..Default::default()
+    };
+    // Two at once against a limit of one: one entered, one refused.
+    let (first, second) = (quant("a"), quant("b"));
+    let (a, b) = tokio::join!(
+        repo.insert_with_source_and_limit(
+            &first,
+            SOURCE_RECOMMENDATION,
+            Some(Uuid::new_v4()),
+            limits
+        ),
+        repo.insert_with_source_and_limit(
+            &second,
+            SOURCE_RECOMMENDATION,
+            Some(Uuid::new_v4()),
+            limits
+        )
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let refused = a.err().or(b.err()).unwrap();
+    assert!(
+        refused.to_string().contains(QUANT_LIMIT_REACHED),
+        "{refused}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_browser_wallet_buy_is_not_the_bots_exposure(pool: PgPool) {
+    setup(&pool).await;
+    // The engine's own unresolved buy (no expiry) of $20, and a browser
+    // wallet's (signed with an expiry) of $30.
+    pool.execute("INSERT INTO execution_intents(id,market_id,signed_order,status) VALUES
+        (gen_random_uuid(),'market','{\"makerAmount\":\"20000000\",\"side\":\"BUY\",\"expiration\":\"0\"}','unknown'),
+        (gen_random_uuid(),'market','{\"makerAmount\":\"30000000\",\"side\":\"BUY\",\"expiration\":\"1900000000\"}','unknown')")
         .await
         .unwrap();
+    assert_eq!(
+        PositionRepository::new(pool)
+            .get_total_active_exposure()
+            .await
+            .unwrap(),
+        Decimal::from(20)
+    );
 }

@@ -5,7 +5,9 @@
 //! market orders. Structural copy of `arb_executor.rs` adapted for quant signals.
 
 use chrono::Utc;
-use polymarket_core::db::positions::{PositionRepository, SOURCE_RECOMMENDATION};
+use polymarket_core::db::positions::{
+    PositionRepository, MARKET_TAKEN, QUANT_LIMIT_REACHED, SOURCE_RECOMMENDATION,
+};
 use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
 use polymarket_core::types::{ExitStrategy, MarketOrder, OrderBook, OrderSide, Position};
 use risk_manager::circuit_breaker::CircuitBreaker;
@@ -1155,7 +1157,7 @@ impl QuantSignalExecutor {
             strategy: signal.kind.as_str().to_string(),
             source_label: "quant".to_string(),
         };
-        let mut position = self
+        let position = self
             .position_service
             .create_position_with_limit(
                 CreatePositionParams {
@@ -1169,7 +1171,11 @@ impl QuantSignalExecutor {
                     arb_opportunity: None,
                     expected_edge: expected_edge_from_signal(&signal),
                     observed_edge: None,
-                    exclusive_market: false,
+                    // One position per market, and the quant limit, decided
+                    // under the lock every entry takes: two processes acting
+                    // on one signal open one position.
+                    exclusive_market: true,
+                    max_open_quant: Some(cfg.max_quant_positions as i64),
                 },
                 &ctx,
                 serde_json::json!({
@@ -1181,7 +1187,31 @@ impl QuantSignalExecutor {
                 }),
                 Some(cfg.max_total_exposure),
             )
-            .await?;
+            .await;
+        let mut position = match position {
+            Ok(position) => position,
+            Err(error) => {
+                let message = error.to_string();
+                let reason = if message.contains(MARKET_TAKEN) {
+                    "duplicate"
+                } else if message.contains(QUANT_LIMIT_REACHED) {
+                    "max_positions_reached"
+                } else {
+                    return Err(error);
+                };
+                debug!(signal_id = %signal.id, reason, "Quant entry refused at reservation, skipping");
+                self.update_signal_status(signal.id, "skipped", Some(reason))
+                    .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some(reason),
+                )
+                .await;
+                return Ok(());
+            }
+        };
 
         info!(
             signal_id = %signal.id,

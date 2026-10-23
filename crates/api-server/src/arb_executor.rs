@@ -1034,12 +1034,14 @@ impl ArbAutoExecutor {
         // Both legs must be executable at their best ask under the executor's
         // own rules before the first leg is sent, or the second could be
         // rejected after the first fills. Trade only what both books offer.
+        // In whole hundredths of a share, as the exchange sizes orders.
         let quantity = executable_pair_quantity(
             position_size / arb.total_cost,
             &yes_book,
             &no_book,
             self.order_executor.min_book_depth(),
-        );
+        )
+        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
         if !legs_meet_minimum(quantity, arb.yes_ask, arb.no_ask) {
             let mut runtime = self.runtime_status.write().await;
             runtime.depth_skips = runtime.depth_skips.saturating_add(1);
@@ -1189,6 +1191,7 @@ impl ArbAutoExecutor {
                     expected_edge: Some(arb.net_profit),
                     observed_edge: Some(arb.gross_profit),
                     exclusive_market: true,
+                    max_open_quant: None,
                 },
                 &ctx,
                 create_metadata,
