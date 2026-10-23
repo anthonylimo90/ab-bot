@@ -1289,6 +1289,20 @@ async fn reserve_withdrawal(
     client: &PolygonClient,
     request: &WithdrawalRequest,
 ) -> ApiResult<Reservation> {
+    // The wallet may have been disconnected while this request waited for
+    // the lock; its key may be erased right after.
+    let connected: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM user_wallets WHERE user_id = $1 AND address = $2)",
+    )
+    .bind(request.user_id)
+    .bind(&request.source)
+    .fetch_one(lock.conn())
+    .await?;
+    if !connected {
+        return Err(ApiError::Conflict(
+            "The wallet was disconnected; nothing was sent".into(),
+        ));
+    }
     // A concurrent request with the same id may have held the lock first.
     if let Some(row) = existing_withdrawal(
         lock.conn(),

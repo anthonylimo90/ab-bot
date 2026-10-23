@@ -4,7 +4,11 @@ use polymarket_core::signing::SignedOrder;
 
 /// How long a submission waits for another order of the same wallet that is
 /// mid-POST, and how often it looks again.
-const FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long the second leg of a pair waits: as long as a POST may take (the
+/// CLOB client's 30-second timeout). With its own POST that stays within the
+/// executor's safety timeout (three times its 30-second default).
+pub(super) const PAIR_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const FENCE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Counts a live submission from admission until it is dropped.
@@ -31,8 +35,9 @@ impl OrderExecutor {
         market_id: &str,
         signed: SignedOrder,
         kind: OrderType,
+        fence_wait: std::time::Duration,
     ) -> Result<PostOrderResponse> {
-        self.submit_once(id, market_id, &signed, || {
+        self.submit_once(id, market_id, &signed, fence_wait, || {
             client.post_order(signed.clone(), kind)
         })
         .await
@@ -46,7 +51,7 @@ impl OrderExecutor {
         credentials: &polymarket_core::api::clob::ApiCredentials,
     ) -> Result<PostOrderResponse> {
         let address = signed.maker.clone();
-        self.submit_once(id, &signed.token_id, &signed, || {
+        self.submit_once(id, &signed.token_id, &signed, FENCE_WAIT, || {
             client.post_signed_order(&address, credentials, signed.clone(), OrderType::Gtd)
         })
         .await
@@ -59,6 +64,7 @@ impl OrderExecutor {
         id: Uuid,
         market_id: &str,
         signed: &SignedOrder,
+        fence_wait: std::time::Duration,
         operation: F,
     ) -> Result<PostOrderResponse>
     where
@@ -78,7 +84,7 @@ impl OrderExecutor {
         let _in_flight = InFlight::enter(&self.submissions_in_flight);
         // Another order for this wallet that is mid-POST resolves within
         // moments: wait briefly instead of failing every concurrent strategy.
-        let wait_until = std::time::Instant::now() + FENCE_WAIT;
+        let wait_until = std::time::Instant::now() + fence_wait;
         loop {
             let mut tx = pool.begin().await?;
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext('live-order-submission'))")
@@ -244,7 +250,7 @@ mod tests {
         let count = AtomicUsize::new(0);
         let id = Uuid::new_v4();
         let error = make_executor()
-            .submit_once(id, "market", &signed, || async {
+            .submit_once(id, "market", &signed, FENCE_WAIT, || async {
                 count.fetch_add(1, Ordering::SeqCst);
                 Err(polymarket_core::Error::Api {
                     message: "gateway lost accepted response".into(),
@@ -261,7 +267,7 @@ mod tests {
             (Uuid::new_v4(), SUBMISSION_FENCE_BUSY),
         ] {
             let error = make_executor()
-                .submit_once(next_id, "market", &signed, || async {
+                .submit_once(next_id, "market", &signed, FENCE_WAIT, || async {
                     count.fetch_add(1, Ordering::SeqCst);
                     unreachable!()
                 })
@@ -334,7 +340,7 @@ mod tests {
             let id = Uuid::new_v4();
             let response = answer(json);
             executor
-                .submit_once(id, "market", &signed, || async { Ok(response) })
+                .submit_once(id, "market", &signed, FENCE_WAIT, || async { Ok(response) })
                 .await
                 .unwrap();
             let row: (String, String) = sqlx::query_as(
@@ -378,7 +384,7 @@ mod tests {
             let id = Uuid::new_v4();
             let response = answer(json);
             let error = executor
-                .submit_once(id, "market", &signed, || async { Ok(response) })
+                .submit_once(id, "market", &signed, FENCE_WAIT, || async { Ok(response) })
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains(SUBMISSION_UNKNOWN));
@@ -394,12 +400,18 @@ mod tests {
             assert_eq!(row.2["orderID"], "0xnamed");
             let posts = AtomicUsize::new(0);
             let fenced = executor
-                .submit_once(Uuid::new_v4(), "market", &sign("4").await, || async {
-                    posts.fetch_add(1, Ordering::SeqCst);
-                    Ok(answer(
-                        serde_json::json!({"success": true, "status": "live"}),
-                    ))
-                })
+                .submit_once(
+                    Uuid::new_v4(),
+                    "market",
+                    &sign("4").await,
+                    FENCE_WAIT,
+                    || async {
+                        posts.fetch_add(1, Ordering::SeqCst);
+                        Ok(answer(
+                            serde_json::json!({"success": true, "status": "live"}),
+                        ))
+                    },
+                )
                 .await
                 .unwrap_err();
             assert!(fenced.to_string().contains(SUBMISSION_FENCE_BUSY));
@@ -411,6 +423,97 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn an_order_waits_out_another_mid_post_only_as_long_as_it_may(pool: sqlx::PgPool) {
+        pool.execute(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute("CREATE TABLE position_order_links(id UUID,settled BOOLEAN)")
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE orders(id UUID,status TEXT)")
+            .await
+            .unwrap();
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(None, None)),
+            ExecutorConfig::default(),
+        )
+        .with_database(pool.clone());
+        let signer = OrderSigner::new(
+            TradingWallet::from_private_key(&format!("{:064x}", 3))
+                .unwrap()
+                .signer()
+                .clone(),
+        );
+        let sign = |token: &'static str| {
+            let order = signer
+                .order_builder()
+                .token_id_str(token)
+                .side(SigningOrderSide::Buy)
+                .price(Decimal::new(5, 1))
+                .size(Decimal::ONE)
+                .expires_at(0)
+                .build()
+                .unwrap();
+            let signer = &signer;
+            async move { signer.sign_order(&order).await.unwrap() }
+        };
+        // Another order of the wallet is being posted right now.
+        let posting = sign("1").await;
+        let posting_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO execution_intents (id, market_id, exchange_order_id, signed_order, status) VALUES ($1, 'market', $2, $3, 'submitting')")
+            .bind(posting_id)
+            .bind(&posting.order_hash)
+            .bind(serde_json::to_value(&posting).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let answer = || {
+            serde_json::from_value::<polymarket_core::api::clob::PostOrderResponse>(
+                serde_json::json!({"success": true, "status": "matched"}),
+            )
+            .unwrap()
+        };
+        // An order that may not wait is refused, unsent.
+        let refused = executor
+            .submit_once(
+                Uuid::new_v4(),
+                "market",
+                &sign("2").await,
+                std::time::Duration::ZERO,
+                || async { Ok(answer()) },
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains(SUBMISSION_FENCE_BUSY));
+        // One that may is sent once the other's answer is recorded.
+        let answered = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                sqlx::query("UPDATE execution_intents SET status='acknowledged' WHERE id=$1")
+                    .bind(posting_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            })
+        };
+        executor
+            .submit_once(
+                Uuid::new_v4(),
+                "market",
+                &sign("3").await,
+                std::time::Duration::from_secs(5),
+                || async { Ok(answer()) },
+            )
+            .await
+            .unwrap();
+        answered.await.unwrap();
+        assert!(PAIR_FENCE_WAIT > FENCE_WAIT);
     }
 
     #[sqlx::test(migrations = false)]
@@ -444,7 +547,7 @@ mod tests {
         signed.order_hash = None;
         let posts = AtomicUsize::new(0);
         let error = executor
-            .submit_once(Uuid::new_v4(), "market", &signed, || async {
+            .submit_once(Uuid::new_v4(), "market", &signed, FENCE_WAIT, || async {
                 posts.fetch_add(1, Ordering::SeqCst);
                 Err(polymarket_core::Error::Api {
                     message: "unreachable".into(),
@@ -519,14 +622,20 @@ mod tests {
             let executor = executor.clone();
             tokio::spawn(async move {
                 let result = executor
-                    .submit_once(Uuid::new_v4(), "market", &signed, || async move {
-                        posting_tx.send(()).unwrap();
-                        release_rx.await.unwrap();
-                        Err(polymarket_core::Error::Api {
-                            message: "rejected".into(),
-                            status: Some(400),
-                        })
-                    })
+                    .submit_once(
+                        Uuid::new_v4(),
+                        "market",
+                        &signed,
+                        FENCE_WAIT,
+                        || async move {
+                            posting_tx.send(()).unwrap();
+                            release_rx.await.unwrap();
+                            Err(polymarket_core::Error::Api {
+                                message: "rejected".into(),
+                                status: Some(400),
+                            })
+                        },
+                    )
                     .await;
                 drop(operation);
                 result

@@ -1602,10 +1602,19 @@ where
     Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
+/// A list field the exchange may send as `null`: read as empty.
+fn null_as_empty<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// Confirmed exchange snapshot. Limit price is not an average execution price.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangeOrder {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub associate_trades: Vec<String>,
     pub id: String,
     pub status: String,
@@ -2868,6 +2877,26 @@ mod authenticated_tests {
         assert!(price_on_tick(d("0.01"), d("0.01")) && price_on_tick(d("0.99"), d("0.01")));
         assert!(!price_on_tick(d("0.005"), d("0.01")) && !price_on_tick(d("0.995"), d("0.01")));
         assert!(price_on_tick(d("0.1"), d("0.1")) && price_on_tick(d("0.9"), d("0.1")));
+    }
+
+    #[test]
+    fn an_exchange_order_without_trades_reads_whether_listed_empty_null_or_left_out() {
+        for trades in [
+            r#""associate_trades":[],"#,
+            r#""associate_trades":null,"#,
+            "",
+        ] {
+            let order: ExchangeOrder = serde_json::from_str(&format!(
+                r#"{{{trades}"id":"0xabc","status":"LIVE","original_size":"10","size_matched":"0"}}"#
+            ))
+            .unwrap();
+            assert!(order.associate_trades.is_empty(), "{trades}");
+        }
+        let order: ExchangeOrder = serde_json::from_str(
+            r#"{"associate_trades":["t1"],"id":"0xabc","status":"MATCHED","original_size":"10","size_matched":"10"}"#,
+        )
+        .unwrap();
+        assert_eq!(order.associate_trades, vec!["t1".to_string()]);
     }
 
     #[test]

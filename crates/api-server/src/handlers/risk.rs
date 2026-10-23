@@ -336,8 +336,11 @@ pub async fn update_circuit_breaker_config(
         config.max_consecutive_losses = v;
     }
     if let Some(v) = req.cooldown_minutes {
-        if v < 0 {
-            return Err(ApiError::BadRequest("cooldown_minutes must be >= 0".into()));
+        let most = risk_manager::circuit_breaker::MAX_WAIT_MINUTES;
+        if !(0..=most).contains(&v) {
+            return Err(ApiError::BadRequest(format!(
+                "cooldown_minutes must be between 0 and {most} (a week)"
+            )));
         }
         config.cooldown_minutes = v;
     }

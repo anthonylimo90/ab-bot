@@ -54,10 +54,13 @@ async fn run_loop(config: PositionReconcilerConfig, pool: PgPool) {
     }
 
     loop {
-        match reconcile_cycle(&pool).await {
-            Ok(updated_rows) => info!(updated_rows, "Position reconciler cycle completed"),
-            Err(error) => warn!(error = %error, "Position reconciler cycle failed"),
-        }
+        crate::background::pass("position reconciler", async {
+            match reconcile_cycle(&pool).await {
+                Ok(updated_rows) => info!(updated_rows, "Position reconciler cycle completed"),
+                Err(error) => warn!(error = %error, "Position reconciler cycle failed"),
+            }
+        })
+        .await;
 
         tokio::time::sleep(time::Duration::from_secs(config.interval_secs)).await;
     }
@@ -75,6 +78,8 @@ pub(crate) async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
         WITH marks AS (
             SELECT
                 p.id,
+                p.version,
+                p.state,
                 (p.state IN (0,1,2,3) OR p.held_yes_qty > 0 OR p.held_no_qty > 0) AS is_open,
                 -- Rounded to the columns' scale, so an unchanged mark compares
                 -- equal to the stored one.
@@ -113,6 +118,10 @@ pub(crate) async fn reconcile_cycle(pool: &PgPool) -> Result<i64, sqlx::Error> {
                 unrealized_pnl = k.unrealized_pnl
             FROM marks k
             WHERE k.id = p.id
+              -- A row changed since it was marked (closed, say) is marked
+              -- again next cycle, never with marks of what it was.
+              AND p.version = k.version
+              AND p.state = k.state
               AND (p.is_open IS DISTINCT FROM k.is_open
                    OR p.current_price IS DISTINCT FROM k.current_price
                    OR p.unrealized_pnl IS DISTINCT FROM k.unrealized_pnl)

@@ -148,7 +148,8 @@ impl MetricsCalculator {
         }
 
         // Then resume the normal interval
-        let mut interval = time::interval(time::Duration::from_secs(self.config.interval_secs));
+        let mut interval =
+            time::interval(time::Duration::from_secs(self.config.interval_secs.max(1)));
         // After an overrun, wait a full period instead of catching up.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the first immediate tick so we don't double-run

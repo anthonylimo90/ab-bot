@@ -116,7 +116,8 @@ pub fn spawn_cross_market_signal_generator(
         // give the pool and continuous aggregates time to settle before first run.
         tokio::time::sleep(time::Duration::from_secs(60)).await;
 
-        let mut interval = tokio::time::interval(time::Duration::from_secs(config.interval_secs));
+        let mut interval =
+            tokio::time::interval(time::Duration::from_secs(config.interval_secs.max(1)));
 
         // After an overrun, wait a full period instead of catching up.
 

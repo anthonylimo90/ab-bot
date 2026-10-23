@@ -77,6 +77,11 @@ pub struct MarketOrder {
     /// Expected execution price at signal detection time (for slippage checks).
     #[serde(default)]
     pub expected_price: Decimal,
+    /// The second leg of a pair whose first leg has filled: it waits as long
+    /// as another order's POST may take for the wallet's submission fence,
+    /// since giving up leaves the pair one-legged.
+    #[serde(default)]
+    pub completes_pair: bool,
 }
 
 impl MarketOrder {
@@ -91,7 +96,14 @@ impl MarketOrder {
             status: OrderStatus::Created,
             max_slippage: None,
             expected_price: Decimal::ZERO,
+            completes_pair: false,
         }
+    }
+
+    /// Mark the order as the second leg of a pair (see `completes_pair`).
+    pub fn completing_pair(mut self) -> Self {
+        self.completes_pair = true;
+        self
     }
 
     pub fn with_slippage(mut self, slippage: Decimal) -> Self {

@@ -1307,6 +1307,11 @@ impl OrderExecutor {
                 &order.market_id,
                 signed_order,
                 OrderType::Fok,
+                if order.completes_pair {
+                    submission::PAIR_FENCE_WAIT
+                } else {
+                    submission::FENCE_WAIT
+                },
             )
             .await
         {
@@ -1467,7 +1472,14 @@ impl OrderExecutor {
 
         // Post the order (GTC for limit orders)
         let response = match self
-            .submit_live_once(client, order.id, &order.market_id, signed_order, kind)
+            .submit_live_once(
+                client,
+                order.id,
+                &order.market_id,
+                signed_order,
+                kind,
+                submission::FENCE_WAIT,
+            )
             .await
         {
             Ok(response) => response,

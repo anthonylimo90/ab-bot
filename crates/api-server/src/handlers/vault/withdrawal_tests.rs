@@ -2,6 +2,7 @@
 use super::*;
 use crate::withdrawals::tests::{insert, mock_node, setup, status, Chain, Row, DEST};
 use auth::TradingWallet;
+use sqlx::Executor;
 use std::sync::Mutex;
 
 // A public test key only; never fund this address.
@@ -21,6 +22,15 @@ async fn fixture(pool: PgPool) -> Fixture {
     let (user, workspace) = setup(&pool).await;
     let wallet = TradingWallet::from_private_key(KEY).unwrap();
     sqlx::query("UPDATE workspaces SET trading_wallet_address = $1")
+        .bind(wallet.address_string().to_lowercase())
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.execute("CREATE TABLE user_wallets (user_id UUID, address TEXT)")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_wallets VALUES ($1, $2)")
+        .bind(user)
         .bind(wallet.address_string().to_lowercase())
         .execute(&pool)
         .await
@@ -104,6 +114,22 @@ async fn a_sent_withdrawal_is_journaled_settled_and_replayed(pool: PgPool) {
         f.submit(11, request_id).await,
         Err(ApiError::Conflict(_))
     ));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_wallet_disconnected_while_the_request_waited_sends_nothing(pool: PgPool) {
+    let f = fixture(pool.clone()).await;
+    pool.execute("DELETE FROM user_wallets").await.unwrap();
+    assert!(matches!(
+        f.submit(10, Uuid::new_v4()).await,
+        Err(ApiError::Conflict(_))
+    ));
+    assert_eq!(f.broadcasts(), 0);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallet_withdrawals")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
 }
 
 #[sqlx::test(migrations = false)]

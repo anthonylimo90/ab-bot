@@ -685,8 +685,9 @@ unsigned). Fees are set by the exchange when an order matches.
   one, a pair pays a dollar a pair while its measured legs are equal, and
   otherwise waits for the winner. A resolution close waits, and logs
   why, while an order of the wallet on the market may still settle, and for
-  up to an hour while the balance cannot be read (a live executor whose
-  signer failed to load counts as unreadable: a restart may load it). A
+  up to an hour while the balance or the market's tokens cannot be read (a
+  live executor whose signer failed to load counts as unreadable: a restart
+  may load it). A
   balance far below the record (shares redeemed or moved), one still
   unreadable after that hour, a position of another wallet than the
   trading wallet, or a paper executor (it never loads a wallet) leaves the
@@ -731,16 +732,23 @@ unsigned). Fees are set by the exchange when an order matches.
   entry itself is refused under the lock every entry takes when its market
   is taken meanwhile, so two API processes acting on one signal open one
   pair. Each leg must be at least the exchange's one-dollar minimum market
-  buy at its ask, or the pair is skipped.
+  buy, or the pair is skipped: the YES leg at its ask, and the NO leg (sent
+  second) at the shares the YES leg's whole cents buy, priced at an ask the
+  default slippage (1%) below its own. The NO leg waits up to 30 seconds
+  (other orders five) for another order of the wallet still being posted,
+  so a slow answer to another strategy's order does not leave the pair
+  one-legged.
 - A buy the exchange fills with more shares than it signed for (a better
   price passed on to the taker) counts as filled with every share; a sell
   never fills beyond its size. A manual market order matched in full reads
   as filled though its signed size was rounded.
 - An order of unknown outcome holds back the wallet's live orders until it
-  is reconciled, and a position's order that stays unresolved holds its
-  position (its exposure and its market). Either one still unresolved after
-  a quarter of an hour is warned about every ten minutes ("An order still
-  unresolved holds back..."). A live entry stopped before linking its first
+  is reconciled, a position's order that stays unresolved holds its
+  position (its exposure and its market), and a manual order that cannot be
+  settled keeps its cash reserved. Any of them still unresolved after a
+  quarter of an hour (a manual order resting on the exchange aside) is
+  warned about every ten minutes ("An order still unresolved holds
+  back..."). A live entry stopped before linking its first
   order (it never sent one) fails after five minutes.
 - The reconciler releases an order the exchange never received only after
   ten minutes and only when no trade of the wallet names it. It cannot
@@ -781,6 +789,21 @@ unsigned). Fees are set by the exchange when an order matches.
   reorganised. A token held by several positions (or a position and manual
   inventory) carries all their cost. Orphan sales and inventory refreshes
   of one wallet do not run at once: a sale waits for a refresh in flight.
+  A token the wallet held none of at its last read, and that no position,
+  manual holding or new transfer points at, is read again only hourly.
+- Orphan recovery never sells a token whose market or outcome is unknown,
+  nor one in a market where a position's tokens could not be looked up
+  (they may be that position's shares), nor one matching manual inventory
+  that awaits wallet verification (`wallet_address = 'unknown'`). An orphan
+  sale's P&L charges the market's taker fee terms (the highest published
+  rate when they cannot be read).
+- The circuit breaker's drawdown guard is fed only from a snapshot whose
+  inventory scan completed: one that failed values only the positions'
+  shares and would read orphan, manual and unredeemed shares as a loss.
+  The snapshot's 24-hour realized P&L leaves paper results out when
+  trading live.
+- A circuit breaker cooldown is at most a week (`cooldown_minutes` above
+  10080 is refused; a larger configured value is held to a week).
 - A panic in one pass of a background task (order and withdrawal
   reconcilers, account snapshots, the collateral sweeper, wallet inventory,
   exits and resolutions) is logged as "A background pass panicked" and the
@@ -788,7 +811,9 @@ unsigned). Fees are set by the exchange when an order matches.
 - Manual cash-flow entries take an `idempotency_key` (the dashboard sends
   one per entry): an entry sent again records nothing more. Withdrawals made
   through the API are recorded automatically; recording them by hand too
-  counts them twice.
+  counts them twice. A deposit's amount must be positive and a withdrawal's
+  negative (the dashboard signs them by type): the circuit breaker reads
+  outflows by their sign.
 - Preparing a browser-wallet order reads the market's tick size and refuses
   a price outside one tick of either end or with more decimals than the
   tick has (as Polymarket's own clients round), before the wallet signs.

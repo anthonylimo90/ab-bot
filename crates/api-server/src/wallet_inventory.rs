@@ -146,9 +146,12 @@ pub fn spawn_wallet_inventory_reconciler(config: WalletInventoryConfig, state: A
     }
 
     tokio::spawn(async move {
-        if let Err(error) = refresh_canonical_wallet_inventory(state.as_ref()).await {
-            warn!(error = %error, "Initial wallet inventory refresh failed");
-        }
+        crate::background::pass("wallet inventory", async {
+            if let Err(error) = refresh_canonical_wallet_inventory(state.as_ref()).await {
+                warn!(error = %error, "Initial wallet inventory refresh failed");
+            }
+        })
+        .await;
 
         let interval = time::Duration::from_secs(config.interval_secs);
         loop {
@@ -277,20 +280,29 @@ async fn refresh_wallet_inventory(
         .iter()
         .map(|(market, outcome, _)| (market.clone(), outcome.clone()))
         .collect();
+    // Markets something holds whose tokens could not be looked up: a token
+    // of one is never taken for an orphan, as its holder cannot be matched.
+    let mut unmatched_markets = HashSet::new();
+    // Tokens something holds now or a new transfer moved: always read.
+    let mut current = HashSet::new();
     for (market, outcome, basis) in manual {
-        if let Some((yes, no)) = state.market_catalog.hydrate_market(&market).await? {
-            merge_candidate(
-                &mut candidates,
-                InventoryCandidate {
-                    token_id: if outcome == "yes" { yes } else { no },
-                    condition_id: Some(market),
-                    outcome: Some(outcome),
-                    cost_basis: Some(basis),
-                    discovery_source: "manual_order".into(),
-                    ..Default::default()
-                },
-            );
-        }
+        let Some((yes, no)) = state.market_catalog.hydrate_market(&market).await? else {
+            unmatched_markets.insert(market);
+            continue;
+        };
+        let token_id = if outcome == "yes" { yes } else { no };
+        current.insert(token_id.clone());
+        merge_candidate(
+            &mut candidates,
+            InventoryCandidate {
+                token_id,
+                condition_id: Some(market),
+                outcome: Some(outcome),
+                cost_basis: Some(basis),
+                discovery_source: "manual_order".into(),
+                ..Default::default()
+            },
+        );
     }
 
     for position in load_effective_open_positions(&state.pool, wallet_address).await? {
@@ -299,10 +311,17 @@ async fn refresh_wallet_inventory(
             .hydrate_market(&position.market_id)
             .await?
         else {
+            warn!(
+                position_id = %position.id,
+                market_id = %position.market_id,
+                "Could not look up a held position's tokens; its market's shares are not taken for orphans"
+            );
+            unmatched_markets.insert(position.market_id.clone());
             continue;
         };
 
         if holds_yes(&position) {
+            current.insert(yes_token_id.clone());
             merge_candidate(
                 &mut candidates,
                 InventoryCandidate {
@@ -317,6 +336,7 @@ async fn refresh_wallet_inventory(
         }
 
         if holds_no(&position) {
+            current.insert(no_token_id.clone());
             merge_candidate(
                 &mut candidates,
                 InventoryCandidate {
@@ -344,6 +364,7 @@ async fn refresh_wallet_inventory(
                 phase2_to_block = discovery.scanned_to_block;
                 phase2_cursor = Some(discovery.cursor);
                 for token_id in discovery.token_ids {
+                    current.insert(token_id.clone());
                     merge_candidate(
                         &mut candidates,
                         InventoryCandidate {
@@ -363,6 +384,17 @@ async fn refresh_wallet_inventory(
             }
         }
     }
+
+    // Every token the wallet ever held or traded stays a candidate, and each
+    // read is a request to the exchange. One it held none of when last read,
+    // and that nothing holds or moved since, is read again hourly.
+    let reread_after = now - chrono::Duration::hours(1);
+    candidates.retain(|token, _| {
+        current.contains(token)
+            || !existing_by_token.get(token).is_some_and(|entry| {
+                entry.quantity <= Decimal::ZERO && entry.last_observed_at > reread_after
+            })
+    });
 
     if candidates.is_empty() {
         save_phase2_cursor(&repo, wallet_address, phase2_cursor).await?;
@@ -411,8 +443,14 @@ async fn refresh_wallet_inventory(
             .is_some_and(|(market, outcome)| {
                 manual_keys.contains(&(market.clone(), outcome.clone()))
             });
-        let is_orphan =
-            quantity > Decimal::ZERO && candidate.linked_position_id.is_none() && !is_manual;
+        let holder_unknown = candidate
+            .condition_id
+            .as_ref()
+            .is_some_and(|market| unmatched_markets.contains(market));
+        let is_orphan = quantity > Decimal::ZERO
+            && candidate.linked_position_id.is_none()
+            && !is_manual
+            && !holder_unknown;
         if is_orphan {
             orphan_tokens += 1;
         }
@@ -610,13 +648,22 @@ pub async fn recover_wallet_orphan_inventory(
                 .await?;
                 result.succeeded += 1;
 
+                // The taker fee as the market charges it; terms that cannot
+                // be read are taken at the highest published rate, which
+                // never understates a loss.
+                let fee_terms = match clob_client.get_fee_schedule(&market_id).await {
+                    Ok(terms) => terms,
+                    Err(error) => {
+                        warn!(%market_id, %error, "Could not read the market's fee terms; an orphan sale's fee is taken at the highest rate");
+                        polymarket_core::types::FeeSchedule::CONSERVATIVE
+                    }
+                };
+                let fee = report.filled_quantity * fee_terms.fee_per_share(report.average_price);
                 // A partial fill only disposes of its share of the cost basis.
                 let realized_pnl = entry.cost_basis.and_then(|cost_basis| {
                     (entry.quantity > Decimal::ZERO).then(|| {
                         let filled = report.filled_quantity.min(entry.quantity);
-                        report.total_value()
-                            - report.fees_paid
-                            - cost_basis * filled / entry.quantity
+                        report.total_value() - fee - cost_basis * filled / entry.quantity
                     })
                 });
 

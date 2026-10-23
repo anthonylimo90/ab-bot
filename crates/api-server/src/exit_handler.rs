@@ -204,15 +204,16 @@ impl ExitHandler {
             "Exit handler: using shared token cache from arb executor"
         );
 
+        // A zero period (from the environment) would panic the ticker.
         let mut exit_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
-            startup_cfg.exit_poll_interval_secs,
+            startup_cfg.exit_poll_interval_secs.max(1),
         ));
 
         // After an overrun, wait a full period instead of catching up.
 
         exit_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut resolution_ticker = tokio::time::interval(tokio::time::Duration::from_secs(
-            startup_cfg.resolution_check_secs,
+            startup_cfg.resolution_check_secs.max(1),
         ));
         // After an overrun, wait a full period instead of catching up.
         resolution_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1088,11 +1089,24 @@ impl ExitHandler {
                     Leg::Yes => position.held_yes_qty > Decimal::ZERO,
                     Leg::No => position.held_no_qty > Decimal::ZERO,
                 };
-                unmeasured.extend(
-                    legs.into_iter()
-                        .filter(held)
-                        .map(|leg| (leg, "the market's tokens are unknown")),
-                );
+                // A failed lookup of the market may pass: the record stands
+                // only once it has failed as long as an unreadable balance.
+                let mut waiting = false;
+                for leg in legs.into_iter().filter(held) {
+                    if self.unreadable_for(position.id, leg) >= UNREADABLE_BALANCE_GRACE {
+                        unmeasured.push((leg, "the market's tokens are unknown"));
+                    } else {
+                        waiting = true;
+                    }
+                }
+                if waiting {
+                    warn!(
+                        position_id = %position.id,
+                        market_id = %market_id,
+                        "A resolved position waits for its market's tokens to be looked up"
+                    );
+                    return Ok(false);
+                }
             }
             None => {}
         }
@@ -1650,6 +1664,7 @@ impl ExitHandler {
         position: &Position,
     ) -> anyhow::Result<polymarket_core::types::ExecutionReport> {
         let order = MarketOrder::new(market_id.to_string(), token_id.to_string(), side, quantity);
+        let first_attempt = order.id;
 
         match self
             .order_executor
@@ -1658,6 +1673,17 @@ impl ExitHandler {
         {
             Ok(report) => Ok(report),
             Err(error) if is_not_found_error(&error) => {
+                // Only a sale that never reached the exchange is tried again:
+                // one journaled may have been placed.
+                let journaled: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM execution_intents WHERE id = $1)",
+                )
+                .bind(first_attempt)
+                .fetch_one(&self.pool)
+                .await?;
+                if journaled {
+                    return Err(error);
+                }
                 warn!(
                     market_id = %market_id,
                     token_id = %token_id,

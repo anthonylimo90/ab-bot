@@ -177,9 +177,12 @@ pub fn spawn_account_snapshot_calculator(config: AccountSnapshotConfig, state: A
 }
 
 async fn run_loop(config: AccountSnapshotConfig, state: Arc<AppState>) {
-    if let Err(error) = snapshot_canonical_workspace(&state).await {
-        warn!(error = %error, "Initial account snapshot cycle failed");
-    }
+    crate::background::pass("account snapshot", async {
+        if let Err(error) = snapshot_canonical_workspace(&state).await {
+            warn!(error = %error, "Initial account snapshot cycle failed");
+        }
+    })
+    .await;
 
     let interval = time::Duration::from_secs(config.interval_secs);
     loop {
@@ -236,7 +239,7 @@ pub async fn load_live_account_snapshot(
     };
 
     let valuation = load_account_valuation(state, inventory_refreshed).await?;
-    let realized_pnl_24h = load_realized_pnl_24h(&state.pool).await?;
+    let realized_pnl_24h = load_realized_pnl_24h(&state.pool, live).await?;
     let net_cash_flows_24h = load_net_cash_flows_24h(&state.pool, workspace_id).await?;
     // On the database's clock, as cash flows are stamped: the cursor of
     // applied flows is never compared across two clocks.
@@ -262,7 +265,10 @@ pub async fn load_live_account_snapshot(
         open_markets: valuation.open_markets,
         unpriced_open_positions: valuation.unpriced_open_positions,
         unpriced_position_cost_basis: valuation.unpriced_position_cost_basis,
-        equity_complete: live && observed_cash.is_some(),
+        // Without a completed inventory scan the valuation counts only the
+        // positions' shares: orphan, manual and unredeemed shares would read
+        // as a drawdown.
+        equity_complete: live && observed_cash.is_some() && inventory_refreshed,
         cash_observed_at,
     }))
 }
@@ -279,8 +285,9 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
         } else if state.order_executor.is_live_ready().await {
             warn!(
                 wallet = ?snapshot.wallet_address,
-                "Trading live without an observed wallet balance: the circuit breaker's \
-                 drawdown guard is not fed (configure a Polygon RPC)"
+                "Trading live without an observed wallet balance or a completed inventory \
+                 scan: the circuit breaker's drawdown guard is not fed (check the Polygon RPC \
+                 and the inventory refresh errors above)"
             );
         }
     }
@@ -556,15 +563,19 @@ async fn load_wallet_balance(
     Ok(Some(cash.total()))
 }
 
-async fn load_realized_pnl_24h(pool: &PgPool) -> anyhow::Result<Decimal> {
+/// The P&L closed in the last day, of the positions the valuation counts:
+/// a live account leaves paper results out.
+async fn load_realized_pnl_24h(pool: &PgPool, live: bool) -> anyhow::Result<Decimal> {
     let value: Option<Decimal> = sqlx::query_scalar(
         r#"
         SELECT COALESCE(SUM(realized_pnl), 0)
         FROM positions
         WHERE state = 4
           AND COALESCE(updated_at, exit_timestamp, entry_timestamp) >= NOW() - INTERVAL '24 hours'
+          AND ($1 OR execution_mode <> 'paper')
         "#,
     )
+    .bind(!live)
     .fetch_one(pool)
     .await?;
 

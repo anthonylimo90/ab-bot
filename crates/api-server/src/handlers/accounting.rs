@@ -433,6 +433,11 @@ pub async fn create_cash_flow(
     if req.amount == Decimal::ZERO {
         return Err(ApiError::BadRequest("amount must be non-zero".into()));
     }
+    // The circuit breaker reads outflows by their sign: a withdrawal entered
+    // as positive would read as a trading loss.
+    if let Some(error) = cash_flow_sign_error(&event_type, req.amount) {
+        return Err(ApiError::BadRequest(error.into()));
+    }
 
     let entry = NewCashFlow {
         id: req.idempotency_key.unwrap_or_else(Uuid::new_v4),
@@ -444,6 +449,18 @@ pub async fn create_cash_flow(
         created_by: user_id,
     };
     Ok(Json(record_cash_flow(&state.pool, entry).await?))
+}
+
+/// Why a cash flow's sign contradicts its type: money in is positive, money
+/// out negative. Transfers, fees and adjustments may go either way.
+fn cash_flow_sign_error(event_type: &str, amount: Decimal) -> Option<&'static str> {
+    match event_type {
+        "deposit" if amount < Decimal::ZERO => Some("a deposit's amount must be positive"),
+        "withdrawal" if amount > Decimal::ZERO => {
+            Some("a withdrawal's amount must be negative (money leaving the wallet)")
+        }
+        _ => None,
+    }
 }
 
 /// A manually recorded cash flow.
@@ -609,6 +626,19 @@ async fn load_recent_trade_events(
 mod cash_flow_tests {
     use super::*;
     use sqlx::Executor;
+
+    #[test]
+    fn money_in_is_positive_and_money_out_negative() {
+        let amount = |v: i64| Decimal::from(v);
+        assert!(cash_flow_sign_error("withdrawal", amount(8000)).is_some());
+        assert!(cash_flow_sign_error("withdrawal", amount(-8000)).is_none());
+        assert!(cash_flow_sign_error("deposit", amount(-5)).is_some());
+        assert!(cash_flow_sign_error("deposit", amount(5)).is_none());
+        for either_way in ["transfer", "fee", "adjustment"] {
+            assert!(cash_flow_sign_error(either_way, amount(5)).is_none());
+            assert!(cash_flow_sign_error(either_way, amount(-5)).is_none());
+        }
+    }
 
     #[sqlx::test(migrations = false)]
     async fn a_cash_flow_sent_again_is_recorded_once(pool: sqlx::PgPool) {

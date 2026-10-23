@@ -80,14 +80,25 @@ impl Default for ArbExecutorConfig {
 const MIN_LEG_NOTIONAL: Decimal = Decimal::ONE;
 
 /// Whether both legs of a pair of `quantity` are market buys the exchange
-/// accepts: each one's amount at its ask, in whole cents as signed, at least
-/// [`MIN_LEG_NOTIONAL`]. A leg that falls short would leave the pair
-/// one-legged once the other has filled.
-fn legs_meet_minimum(quantity: Decimal, yes_ask: Decimal, no_ask: Decimal) -> bool {
-    [yes_ask, no_ask].into_iter().all(|ask| {
-        (quantity * ask).round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
-            >= MIN_LEG_NOTIONAL
-    })
+/// accepts: each one's amount, in whole cents as signed, at least
+/// [`MIN_LEG_NOTIONAL`]. The YES leg goes first and spends its whole cents;
+/// the NO leg then buys the shares those bought, and is checked at that size
+/// and at an ask `tolerance` below its own (a better price is a smaller
+/// buy). A NO leg that falls short would leave the pair one-legged.
+fn legs_meet_minimum(
+    quantity: Decimal,
+    yes_ask: Decimal,
+    no_ask: Decimal,
+    tolerance: Decimal,
+) -> bool {
+    let cents =
+        |amount: Decimal| amount.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+    let yes_amount = cents(quantity * yes_ask);
+    if yes_ask <= Decimal::ZERO || yes_amount < MIN_LEG_NOTIONAL {
+        return false;
+    }
+    let yes_shares = yes_amount / yes_ask;
+    cents(yes_shares * no_ask * (Decimal::ONE - tolerance.max(Decimal::ZERO))) >= MIN_LEG_NOTIONAL
 }
 
 /// USDC a pair buy needs before its first leg is sent: what each leg's own
@@ -1042,7 +1053,12 @@ impl ArbAutoExecutor {
             self.order_executor.min_book_depth(),
         )
         .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
-        if !legs_meet_minimum(quantity, arb.yes_ask, arb.no_ask) {
+        if !legs_meet_minimum(
+            quantity,
+            arb.yes_ask,
+            arb.no_ask,
+            self.order_executor.default_slippage(),
+        ) {
             let mut runtime = self.runtime_status.write().await;
             runtime.depth_skips = runtime.depth_skips.saturating_add(1);
             runtime.record_decision(
@@ -1313,7 +1329,8 @@ impl ArbAutoExecutor {
             yes_report.filled_quantity,
         )
         .with_expected_price(arb.no_ask)
-        .with_slippage(self.order_executor.default_slippage());
+        .with_slippage(self.order_executor.default_slippage())
+        .completing_pair();
         let no_order_started_at = std::time::Instant::now();
         telemetry.inter_leg_gap_ms = Some(
             no_order_started_at
@@ -1584,12 +1601,24 @@ mod tests {
     #[test]
     fn each_leg_must_meet_the_minimum_market_buy() {
         let d = |v: &str| v.parse::<Decimal>().unwrap();
+        let none = Decimal::ZERO;
+        let one_pct = d("0.01");
         // $5 at 0.96 + 0.02: the NO leg would be a $0.10 buy.
-        assert!(!legs_meet_minimum(d("5.1"), d("0.96"), d("0.02")));
+        assert!(!legs_meet_minimum(d("5.1"), d("0.96"), d("0.02"), none));
         // Both legs at least a dollar, in whole cents.
-        assert!(legs_meet_minimum(d("50"), d("0.96"), d("0.02")));
-        assert!(!legs_meet_minimum(d("49.99"), d("0.96"), d("0.02")));
-        assert!(legs_meet_minimum(d("10"), d("0.48"), d("0.50")));
+        assert!(legs_meet_minimum(d("50"), d("0.96"), d("0.02"), none));
+        assert!(!legs_meet_minimum(d("49.99"), d("0.96"), d("0.02"), none));
+        assert!(legs_meet_minimum(d("10"), d("0.48"), d("0.50"), none));
+        // Room for the NO ask to improve by the tolerance.
+        assert!(!legs_meet_minimum(d("50"), d("0.96"), d("0.02"), one_pct));
+        assert!(legs_meet_minimum(d("51"), d("0.96"), d("0.02"), one_pct));
+        // The NO leg buys what the YES leg's whole cents bought: 1.06 at 0.33
+        // is 3.2121 shares, and 3.2121 at 0.31 is $0.99 though 3.23 at 0.31
+        // is a dollar.
+        assert!(!legs_meet_minimum(d("3.23"), d("0.33"), d("0.31"), none));
+        assert!(legs_meet_minimum(d("3.27"), d("0.33"), d("0.31"), none));
+        // A YES leg below a dollar is refused before anything is sent.
+        assert!(!legs_meet_minimum(d("3"), d("0.33"), d("0.60"), none));
     }
 
     fn book(asks: &[(i64, i64)]) -> OrderBook {

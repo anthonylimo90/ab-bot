@@ -152,7 +152,7 @@ impl RecoveryState {
             total_stages,
             started_at: now,
             stage_started_at: now,
-            next_stage_at: Some(now + Duration::minutes(stage_minutes)),
+            next_stage_at: Some(after_minutes(now, stage_minutes)),
             had_profit_this_stage: false,
             trades_this_stage: 0,
             recovery_pnl: Decimal::ZERO,
@@ -213,6 +213,15 @@ impl CircuitBreakerState {
 /// Trips that halt trading until an operator resets the breaker.
 fn latches(reason: &TripReason) -> bool {
     matches!(reason, TripReason::HardKillSwitch | TripReason::Manual)
+}
+
+/// The longest wait the breaker schedules: a week. A configured period
+/// beyond it (a typo, or one meant as "forever") would overflow the clock.
+pub const MAX_WAIT_MINUTES: i64 = 7 * 24 * 60;
+
+/// `now` plus `minutes`, held to between zero and [`MAX_WAIT_MINUTES`].
+fn after_minutes(now: DateTime<Utc>, minutes: i64) -> DateTime<Utc> {
+    now + Duration::minutes(minutes.clamp(0, MAX_WAIT_MINUTES))
 }
 
 /// How strongly a loss limit holds trading back among trips of equal
@@ -449,7 +458,7 @@ impl CircuitBreaker {
         if time_ready && profit_ready {
             recovery.current_stage += 1;
             recovery.stage_started_at = now;
-            recovery.next_stage_at = Some(now + Duration::minutes(config.recovery_stage_minutes));
+            recovery.next_stage_at = Some(after_minutes(now, config.recovery_stage_minutes));
             recovery.had_profit_this_stage = false;
             recovery.trades_this_stage = 0;
 
@@ -808,7 +817,7 @@ impl CircuitBreaker {
                     && loss_rank(&reason) > loss_rank(current)
             });
             if escalates {
-                let resume_at = Utc::now() + Duration::minutes(config.cooldown_minutes);
+                let resume_at = after_minutes(Utc::now(), config.cooldown_minutes);
                 state.resume_at = Some(state.resume_at.map_or(resume_at, |at| at.max(resume_at)));
                 state.trip_reason = Some(reason.clone());
                 warn!(
@@ -845,7 +854,7 @@ impl CircuitBreaker {
                 "Circuit breaker LATCHED - trading halted until manual reset"
             );
         } else {
-            let resume_at = now + Duration::minutes(config.cooldown_minutes);
+            let resume_at = after_minutes(now, config.cooldown_minutes);
             state.resume_at = Some(resume_at);
             error!(
                 reason = ?reason,
@@ -1499,6 +1508,31 @@ mod tests {
         assert_eq!(later.resume_at, taken.resume_at);
         assert_eq!(later.tripped_at, first.tripped_at);
         assert_eq!(later.trips_today, 1);
+    }
+
+    #[tokio::test]
+    async fn an_absurd_cooldown_is_held_to_a_week() {
+        let now = Utc::now();
+        assert_eq!(
+            after_minutes(now, i64::MAX),
+            now + Duration::minutes(MAX_WAIT_MINUTES)
+        );
+        assert_eq!(after_minutes(now, -5), now);
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            cooldown_minutes: 1_000_000_000_000,
+            ..latching_config()
+        });
+        breaker
+            .update_portfolio_value(Decimal::new(1000, 0))
+            .await
+            .unwrap();
+        breaker
+            .update_portfolio_value(Decimal::new(780, 0))
+            .await
+            .unwrap();
+        let state = breaker.state().await;
+        assert!(state.tripped);
+        assert!(state.resume_at.unwrap() <= Utc::now() + Duration::minutes(MAX_WAIT_MINUTES));
     }
 
     #[tokio::test]

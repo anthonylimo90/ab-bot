@@ -14,6 +14,8 @@ use uuid::Uuid;
 /// A `submitting`/`unknown` intent that the exchange still has no record of
 /// after this long, and that no trade involves, was never executed.
 const ABSENCE_GRACE_MINUTES: i64 = 10;
+/// Why an order is left for a later look while it rests on the exchange.
+const ORDER_RESTING: &str = "Exchange order remains active";
 /// How long an order of unknown outcome may hold the wallet's live orders
 /// back before it is warned about, and how often it is warned about again.
 const FENCE_ALERT_MINUTES: i64 = 15;
@@ -186,23 +188,25 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     for intent in intents {
         let id = intent.id;
         // An order of unknown outcome holds back every live order of the
-        // wallet, and a position's order (fill-or-kill: it never rests) that
-        // stays unresolved holds the position, its exposure and its market:
-        // either is said so when it lasts, not only traced.
+        // wallet, a position's order (fill-or-kill: it never rests) that
+        // stays unresolved holds the position, its exposure and its market,
+        // and a manual order that cannot be settled keeps its cash reserved:
+        // each is said so when it lasts, not only traced. A manual order
+        // resting on the exchange is merely waiting.
         let fencing = matches!(intent.status.as_str(), "submitting" | "unknown");
         let holds_position = intent.position_id.is_some();
+        let manual = intent.has_order;
         let age = Utc::now() - intent.created_at;
         if let Err(error) = reconcile_one(state, intent).await {
-            if (fencing || holds_position)
-                && age > Duration::minutes(FENCE_ALERT_MINUTES)
-                && fence_alert_due(id)
-            {
+            let stuck = fencing || holds_position || (manual && error.to_string() != ORDER_RESTING);
+            if stuck && age > Duration::minutes(FENCE_ALERT_MINUTES) && fence_alert_due(id) {
                 tracing::warn!(
                     intent_id = %id,
                     minutes = age.num_minutes(),
                     holds_position,
                     %error,
-                    "An order still unresolved holds back the wallet's live orders or its position"
+                    "An order still unresolved holds back the wallet's live orders, its position \
+                     or its reserved cash"
                 );
             } else {
                 tracing::debug!(%error, "Intent still awaiting authoritative reconciliation");
@@ -280,7 +284,7 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
                         .execute(&state.pool)
                         .await?;
                 }
-                anyhow::bail!("Exchange order remains active");
+                anyhow::bail!(ORDER_RESTING);
             }
             let (quantity, price) = state
                 .order_executor

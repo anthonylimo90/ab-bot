@@ -77,11 +77,18 @@ export default function HistoryPage() {
   );
 
   const handleCreateCashFlow = async () => {
-    const amount = Number(cashFlowAmount);
-    if (!Number.isFinite(amount) || amount === 0) {
+    const entered = Number(cashFlowAmount);
+    if (!Number.isFinite(entered) || entered === 0) {
       toast.error("Invalid amount", "Enter a non-zero cash flow amount");
       return;
     }
+    // Money in is positive and money out negative, whatever sign was typed.
+    const amount =
+      cashFlowType === "withdrawal"
+        ? -Math.abs(entered)
+        : cashFlowType === "deposit"
+          ? Math.abs(entered)
+          : entered;
 
     try {
       await createCashFlowMutation.mutateAsync({
@@ -332,7 +339,11 @@ export default function HistoryPage() {
                         <Input
                           value={cashFlowAmount}
                           onChange={(e) => setCashFlowAmount(e.target.value)}
-                          placeholder="100 or -25"
+                          placeholder={
+                            cashFlowType === "deposit" || cashFlowType === "withdrawal"
+                              ? "100"
+                              : "100 or -25"
+                          }
                         />
                       </label>
                       <label className="space-y-2 text-sm">

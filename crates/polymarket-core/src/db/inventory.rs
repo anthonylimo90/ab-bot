@@ -171,8 +171,16 @@ impl WalletInventoryRepository {
               -- Balances under one sellable lot (0.01 shares) cannot be sold.
               AND quantity >= 0.01
               AND is_orphan = TRUE
+              -- Owners are matched by market and outcome: a token whose
+              -- market or outcome is unknown cannot be told apart from one a
+              -- position or manual order holds, so it is never sold here.
+              AND condition_id IS NOT NULL
+              AND outcome IN ('yes', 'no')
+              -- Manual inventory awaiting wallet verification may be this
+              -- wallet's too.
               AND NOT EXISTS (SELECT 1 FROM manual_inventory mi
-                  WHERE mi.execution_mode='live' AND mi.wallet_address=LOWER(wallet_inventory.wallet_address)
+                  WHERE mi.execution_mode IN ('live','unknown')
+                    AND mi.wallet_address IN (LOWER(wallet_inventory.wallet_address),'unknown')
                     AND mi.market_id=wallet_inventory.condition_id AND mi.outcome=wallet_inventory.outcome AND mi.quantity>0)
               AND NOT EXISTS (SELECT 1 FROM orders o
                   WHERE o.execution_mode='live' AND o.status IN ('pending','open','partially_filled')
