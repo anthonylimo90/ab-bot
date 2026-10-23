@@ -819,9 +819,18 @@ pub(crate) async fn initialize_trading_signer(
 
     // Ensure on-chain Polymarket approvals are set for the trading wallet.
     // This is a one-time operation per wallet; existing approvals are detected and skipped.
-    // Approvals and the collateral sweeper start once per process, with the
-    // first signer loaded.
-    if order_executor.is_live_ready().await
+    // Approvals and the collateral sweeper start once per process, under
+    // live trading, for the signer this call loaded and the executor signs
+    // with (a call that loaded none, or another, leaves them for the next).
+    let signer_loaded_here = match (
+        startup_wallet.as_ref(),
+        order_executor.wallet_address().await,
+    ) {
+        (Some(wallet), Some(loaded)) => loaded.eq_ignore_ascii_case(&wallet.address_string()),
+        _ => false,
+    };
+    if signer_loaded_here
+        && order_executor.is_live_ready().await
         && !SIGNER_SERVICES_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst)
     {
         // The environment's RPC, else the canonical workspace's (as
@@ -1008,16 +1017,18 @@ pub fn spawn_signer_keeper(state: Arc<AppState>) {
                 tries = 0;
                 continue;
             }
-            if services_due {
-                tracing::info!(
-                    "Live trading is on: starting the trading signer's approvals and collateral \
-                     sweeper"
-                );
-            } else if tries.is_multiple_of(20) {
-                tracing::warn!(
-                    "Live trading is on, or live positions remain, without a loaded trading \
-                     signer; loading it"
-                );
+            if tries.is_multiple_of(20) {
+                if services_due {
+                    tracing::info!(
+                        "Live trading is on: starting the trading signer's approvals and \
+                         collateral sweeper"
+                    );
+                } else {
+                    tracing::warn!(
+                        "Live trading is on, or live positions remain, without a loaded \
+                         trading signer; loading it"
+                    );
+                }
             }
             tries += 1;
             if let Err(error) = initialize_trading_signer(

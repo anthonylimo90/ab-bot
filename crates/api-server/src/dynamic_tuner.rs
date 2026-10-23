@@ -1382,10 +1382,6 @@ pub fn spawn_dynamic_config_subscriber(
     info!("Dynamic config subscriber spawned");
 }
 
-/// Apply the stored dynamic config (manual overrides and tuned values) to
-/// the executors. Called before they start, so they never trade on
-/// environment defaults while Redis is unreachable, and on each subscriber
-/// (re)connect.
 /// With the tuner switched off, remove the dynamic config rows still holding
 /// their seed (an earlier run's or a migration's): left, every process would
 /// apply them over its environment, clamped to the tuning bounds. Without
@@ -1410,6 +1406,10 @@ pub async fn clear_untouched_seeds_when_disabled(pool: &PgPool) {
     }
 }
 
+/// Apply the stored dynamic config (manual overrides and tuned values) to
+/// the executors. Called before they start, so they never trade on
+/// environment defaults while Redis is unreachable, and on each subscriber
+/// (re)connect.
 pub async fn apply_dynamic_config_snapshot(
     pool: &PgPool,
     arb_executor_config: Option<&Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
