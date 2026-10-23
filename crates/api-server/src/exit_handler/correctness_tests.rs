@@ -978,8 +978,9 @@ async fn fee_shares_are_written_off_only_once_the_token_has_settled(pool: PgPool
 
     // The wallet's other positions and manual orders hold the token too: the
     // first position 96.5, another 50 and manual orders 20. With 263 in the
-    // wallet, 3.5 of the 266.5 they all record is missing, and this position
-    // answers for its share of it.
+    // wallet, 3.5 of the 266.5 they all record is missing. Manual orders are
+    // not written off, so the positions (246.5) answer for all of it, this
+    // one for its share.
     let mut other = live(50);
     other.id = uuid::Uuid::new_v4();
     service.repo().insert(&other).await.unwrap();
@@ -992,18 +993,20 @@ async fn fee_shares_are_written_off_only_once_the_token_has_settled(pool: PgPool
     h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
         .await
         .unwrap();
-    let share = Decimal::new(35, 1) * Decimal::from(100) / Decimal::new(2665, 1);
+    let share = Decimal::new(35, 1) * Decimal::from(100) / Decimal::new(2465, 1);
     assert_eq!(held(&p), Decimal::from(100) - share);
     assert_eq!(p.exited_yes_qty, share);
 
-    // A gap no fee explains is left for reconciliation: 300 of the 365.2 or
-    // so that the holders record.
+    // A gap no fee explains is left for reconciliation (300 of the 365.2 or
+    // so that the holders record), and the sale refused: selling the record
+    // would take the other holders' shares.
     let mut p = live(100);
     service.repo().insert(&p).await.unwrap();
     set_balance("300");
-    h.align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
+    assert!(h
+        .align_leg_with_wallet(&mut p, Leg::Yes, "yes", &ctx)
         .await
-        .unwrap();
+        .is_err());
     assert_eq!(held(&p), Decimal::from(100));
 
     // A position of another wallet is never measured against this one.
