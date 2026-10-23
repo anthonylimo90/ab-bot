@@ -1359,7 +1359,7 @@ impl ExitHandler {
             // a split payout. Never booked at a guessed payout: the position
             // waits, the first such look recorded for an operator.
             let waited = self.waited_for_winner(position, &ctx).await?;
-            if waited > chrono::Duration::hours(24) {
+            if waited > chrono::Duration::hours(24) && winner_wait_alert_due(position.id) {
                 // A day on, the winner is not coming by itself: a split or
                 // invalid payout, for an operator to settle.
                 error!(
@@ -1715,7 +1715,7 @@ impl ExitHandler {
             }
             let measuring: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM market_flow_features \
-                 WHERE window_minutes = $1 AND window_end > NOW() - make_interval(mins => $1))",
+                 WHERE window_minutes = $1 AND window_end > NOW() - make_interval(mins => $1 * 2))",
             )
             .bind(window_minutes)
             .fetch_one(&self.pool)
@@ -2242,6 +2242,27 @@ fn parse_signal_direction(direction: &str) -> Option<SignalDirection> {
         "buy_yes" => Some(SignalDirection::BuyYes),
         "buy_no" => Some(SignalDirection::BuyNo),
         _ => None,
+    }
+}
+
+/// Whether a position waiting over a day for its market's winner is due an
+/// error again: once, then hourly (it is looked at every pass).
+fn winner_wait_alert_due(position_id: uuid::Uuid) -> bool {
+    static ALERTED: std::sync::OnceLock<std::sync::Mutex<HashMap<uuid::Uuid, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    const REPEAT: std::time::Duration = std::time::Duration::from_secs(3600);
+    let mut alerted = ALERTED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    alerted.retain(|_, at| now.duration_since(*at) < REPEAT * 2);
+    match alerted.get(&position_id) {
+        Some(at) if now.duration_since(*at) < REPEAT => false,
+        _ => {
+            alerted.insert(position_id, now);
+            true
+        }
     }
 }
 

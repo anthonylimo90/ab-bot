@@ -1141,9 +1141,10 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Resolved shares are not redeemed by this system. The wallet inventory
   refresh now logs a warning with the value of resolved-market shares still
   in the wallet ("await redemption"), and values a pair closed at resolution
-  with no winner named at a dollar a pair (it used stale market prices). A
-  position whose resolved market has named no winner for over a day (legs
-  differ) is logged as an error for an operator to settle.
+  with no winner named at a dollar a pair (it used stale market prices),
+  unless the market's stored price already names the outcome. A position
+  whose resolved market has named no winner for over a day (legs differ) is
+  logged as an error for an operator to settle, at most hourly per position.
 
 ### API contract changes
 

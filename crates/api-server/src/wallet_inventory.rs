@@ -1305,7 +1305,20 @@ async fn load_market_prices(
     .await?;
     let half = Decimal::new(5, 1);
     for (market_id,) in split {
+        // A stored price that already names the outcome is kept: a winner
+        // missed at the close is still a winner.
+        let decided = prices.get(&market_id).is_some_and(|row| {
+            let at = |price: Option<Decimal>, bound: Decimal, above: bool| {
+                price.is_some_and(|p| if above { p >= bound } else { p <= bound })
+            };
+            let (high, low) = (Decimal::new(99, 2), Decimal::new(1, 2));
+            (at(row.yes_price, high, true) && at(row.no_price, low, false))
+                || (at(row.no_price, high, true) && at(row.yes_price, low, false))
+        });
         resolved_markets.insert(market_id.clone());
+        if decided {
+            continue;
+        }
         prices.insert(
             market_id.clone(),
             MarketPriceRow {
@@ -1461,7 +1474,8 @@ mod tests {
              CREATE TABLE positions (id UUID, market_id TEXT, resolution_winner TEXT, \
                  last_updated TIMESTAMPTZ); \
              CREATE TABLE trade_events (position_id UUID, event_type TEXT); \
-             INSERT INTO markets VALUES ('won', 0.97, 0.03), ('split', 0.9, 0.1), ('open', 0.4, 0.6)",
+             INSERT INTO markets VALUES ('won', 0.97, 0.03), ('split', 0.9, 0.1), ('open', 0.4, 0.6), \
+                 ('later', 0.5, 0.5), ('priced', 0.995, 0.005)",
         )
         .await
         .unwrap();
@@ -1481,19 +1495,45 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let candidates: HashMap<String, InventoryCandidate> = ["won", "split", "open"]
-            .into_iter()
-            .map(|market| {
-                (
-                    market.to_string(),
-                    InventoryCandidate {
-                        token_id: market.to_string(),
-                        condition_id: Some(market.to_string()),
-                        ..InventoryCandidate::default()
-                    },
-                )
-            })
-            .collect();
+        // 'later': a split close, then another position recorded a winner.
+        // 'priced': a split close, but the stored price names the outcome.
+        let (later_split, later_won, priced) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        sqlx::query(
+            "INSERT INTO positions VALUES ($1, 'later', NULL, NOW() - INTERVAL '1 hour'), \
+             ($2, 'later', 'NO', NOW()), ($3, 'priced', NULL, NOW())",
+        )
+        .bind(later_split)
+        .bind(later_won)
+        .bind(priced)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO trade_events VALUES ($1, 'closed_via_resolution'), ($2, 'closed_via_resolution')",
+        )
+        .bind(later_split)
+        .bind(priced)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let candidates: HashMap<String, InventoryCandidate> =
+            ["won", "split", "open", "later", "priced"]
+                .into_iter()
+                .map(|market| {
+                    (
+                        market.to_string(),
+                        InventoryCandidate {
+                            token_id: market.to_string(),
+                            condition_id: Some(market.to_string()),
+                            ..InventoryCandidate::default()
+                        },
+                    )
+                })
+                .collect();
         let (prices, resolved) = load_market_prices(&pool, &candidates).await.unwrap();
         let price = |market: &str| (prices[market].yes_price, prices[market].no_price);
         assert_eq!(price("won"), (Some(Decimal::ONE), Some(Decimal::ZERO)));
@@ -1503,6 +1543,11 @@ mod tests {
         assert_eq!(
             price("open"),
             (Some(Decimal::new(4, 1)), Some(Decimal::new(6, 1)))
+        );
+        assert_eq!(price("later"), (Some(Decimal::ZERO), Some(Decimal::ONE)));
+        assert_eq!(
+            price("priced"),
+            (Some(Decimal::new(995, 3)), Some(Decimal::new(5, 3)))
         );
         assert!(resolved.contains("won") && resolved.contains("split"));
         assert!(!resolved.contains("open"));
