@@ -1437,6 +1437,7 @@ impl OrderExecutor {
             &order.outcome_id,
             order.side,
             order.quantity,
+            (order.side == OrderSide::Buy).then_some(market_amount),
             true,
             &response,
         );
@@ -1594,6 +1595,7 @@ impl OrderExecutor {
             &order.outcome_id,
             order.side,
             order.quantity,
+            (order.side == OrderSide::Buy).then(|| order.quantity * order.price),
             kind == OrderType::Fok,
             &response,
         );
@@ -1759,7 +1761,10 @@ impl OrderExecutor {
     /// The report of an order the exchange answered. A fill-or-kill order
     /// matched with its amounts filled in full, though its signed amount
     /// (rounded to what the exchange accepts) may buy slightly fewer shares
-    /// than `quantity`.
+    /// than `quantity`. `max_spend` is the most USDC a buy signed for (its
+    /// quantity at its limit price): an answer that spent more is not read
+    /// as a fill (the order stays pending for the reconciler, which books
+    /// settled trades), so amounts read in the wrong units cannot over-book.
     #[allow(clippy::too_many_arguments)]
     fn report_from_exchange_response(
         &self,
@@ -1768,6 +1773,7 @@ impl OrderExecutor {
         outcome: &str,
         side: OrderSide,
         quantity: Decimal,
+        max_spend: Option<Decimal>,
         fill_or_kill: bool,
         response: &polymarket_core::api::clob::PostOrderResponse,
     ) -> ExecutionReport {
@@ -1807,6 +1813,8 @@ impl OrderExecutor {
                     && (side == OrderSide::Buy || filled <= quantity)
                     && value > Decimal::ZERO
                     && value <= filled
+                    // The cent the signed amount is rounded by.
+                    && max_spend.is_none_or(|cap| value <= cap + Decimal::new(1, 2))
                 {
                     report.status = if filled >= quantity || fill_or_kill {
                         OrderStatus::Filled
@@ -2339,6 +2347,7 @@ mod tests {
                 "token",
                 OrderSide::Buy,
                 Decimal::TEN,
+                None,
                 false,
                 &response,
             );
@@ -2359,6 +2368,7 @@ mod tests {
                 "token",
                 side,
                 Decimal::TEN,
+                None,
                 false,
                 &response,
             );
@@ -2378,6 +2388,7 @@ mod tests {
                 "token",
                 OrderSide::Buy,
                 Decimal::TEN,
+                None,
                 fill_or_kill,
                 &response,
             );
@@ -2397,6 +2408,7 @@ mod tests {
                 "token",
                 side,
                 Decimal::TEN,
+                None,
                 false,
                 &response,
             );
@@ -2404,6 +2416,26 @@ mod tests {
             if expected == OrderStatus::Filled {
                 assert_eq!(report.filled_quantity, "10.2".parse::<Decimal>().unwrap());
             }
+        }
+        // A buy signed for 5 USDC: an answer within it (a cent of rounding
+        // included) fills; one spending more, as amounts read in the wrong
+        // units would, stays pending.
+        for (maker, taker, expected) in [
+            ("5.01", "10", OrderStatus::Filled),
+            ("5000000", "10000000", OrderStatus::Pending),
+        ] {
+            let response: PostOrderResponse = serde_json::from_value(serde_json::json!({"orderID":"exchange-id","status":"matched","makingAmount":maker,"takingAmount":taker})).unwrap();
+            let report = executor.report_from_exchange_response(
+                Uuid::new_v4(),
+                "market",
+                "token",
+                OrderSide::Buy,
+                Decimal::TEN,
+                Some(Decimal::new(5, 0)),
+                true,
+                &response,
+            );
+            assert_eq!(report.status, expected);
         }
     }
 
