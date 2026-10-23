@@ -2529,6 +2529,9 @@ pub(crate) async fn record_missed_closes(
             .exit_timestamp
             .is_none_or(|at| at.date_naive() == today);
         if today_close && breaker_counts_close(&close.execution_mode, pnl, close.confirmed) {
+            if close.exit_timestamp.is_none() {
+                warn!(position_id = %close.id, %pnl, "A close with no exit time is counted as today's");
+            }
             breaker.record_close(pnl, close.id).await?;
             warn!(position_id = %close.id, %pnl, "Recorded a close the circuit breaker had missed");
         } else {
