@@ -384,6 +384,9 @@ impl CircuitBreaker {
     /// Stop keeping the persisted state (another process may lead now).
     pub fn step_down(&self) {
         self.leader.store(false, Ordering::SeqCst);
+        // The next check re-reads the stored state at once, rather than
+        // answer from this process's own view until the next sync is due.
+        *self.synced_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Whether this process keeps the persisted state.

@@ -414,12 +414,14 @@ async fn execute_reserved_order(
         let cb_state = state.circuit_breaker.state().await;
         if !cb_state.tripped {
             return Err(ApiError::ServiceUnavailable(
-                "The circuit breaker's trip has just been lifted; try again".into(),
+                "The circuit breaker's state changed while this order was checked; try again"
+                    .into(),
             ));
         }
         let max_daily_loss = state.circuit_breaker.config().await.max_daily_loss;
+        let now = Utc::now();
         // Counters of a day that has ended are not this day's loss.
-        let day_pnl = if cb_state.last_reset_date < Utc::now().date_naive() {
+        let day_pnl = if cb_state.last_reset_date < now.date_naive() {
             Decimal::ZERO
         } else {
             cb_state.daily_pnl
@@ -430,7 +432,7 @@ async fn execute_reserved_order(
             // A trip holds while the day's loss is over the limit: until
             // the UTC day ends.
             Some(at) if day_loss_over_limit => {
-                let day_ends = Utc::now()
+                let day_ends = now
                     .date_naive()
                     .succ_opt()
                     .map(|day| day.and_time(chrono::NaiveTime::MIN).and_utc())
@@ -440,7 +442,7 @@ async fn execute_reserved_order(
                     at.max(day_ends).to_rfc3339()
                 )
             }
-            Some(at) if at > Utc::now() => format!("Resumes at {}", at.to_rfc3339()),
+            Some(at) if at > now => format!("Resumes at {}", at.to_rfc3339()),
             // A process that does not lead follows the trading process
             // within seconds of it lifting the trip.
             Some(_) => "The cooldown is over; trading resumes once the trading process lifts \
