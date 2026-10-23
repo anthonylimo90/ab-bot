@@ -905,6 +905,34 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn the_leaders_clock_ends_a_cooldown_with_nothing_asking_to_trade(pool: PgPool) {
+        use rust_decimal::Decimal;
+        create_schema(&pool).await;
+        create_positions(&pool).await;
+        let config = crate::CircuitBreakerConfig {
+            cooldown_minutes: 0,
+            ..config()
+        };
+        let leader = crate::CircuitBreaker::with_persistence(config.clone(), pool.clone());
+        leader.lead().await.unwrap();
+        for _ in 0..3 {
+            leader.record_trade(Decimal::from(-5)).await.unwrap();
+        }
+        assert!(leader.is_tripped());
+        let follower =
+            crate::CircuitBreaker::with_persistence(config.clone(), pool.clone()).following();
+        assert!(!follower.can_trade().await);
+        // The follower's clock does not resume it; the leader's does, with
+        // no trade asked of it.
+        follower.tick().await;
+        assert!(follower.is_tripped());
+        leader.tick().await;
+        assert!(!leader.is_tripped());
+        let later = crate::CircuitBreaker::with_persistence(config, pool.clone()).following();
+        assert!(later.can_trade().await);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn a_trip_made_through_a_follower_is_adopted_not_overwritten(pool: PgPool) {
         use crate::CircuitBreaker;
         use rust_decimal::Decimal;

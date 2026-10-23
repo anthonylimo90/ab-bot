@@ -979,7 +979,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   state (a takeover retried after a failed read could save its earlier view
   over it). A process that does not lead resumes after a trip's cooldown,
   and advances recovery stages, only when the leader has stored it: on its
-  own it could resume while the leader stays tripped.
+  own it could resume while the leader stays tripped. The leader does both
+  on time (every 5 s), whether or not anything asks it to trade (it used
+  to wait for a trade attempt, which never came with the executors off).
 - The bound of 20 wallet orders awaiting a signature per user now holds
   for requests made at once (checked again under a per-user lock as the
   order is stored).

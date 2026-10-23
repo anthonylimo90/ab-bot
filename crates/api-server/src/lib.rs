@@ -948,7 +948,9 @@ async fn halt_for_unreadable_settings(state: &AppState, unreadable: &[String]) {
 
 /// Take up every few seconds what operators change through any API process:
 /// circuit breaker trips, resets and limits, the workspace's service
-/// toggles and the stored dynamic config.
+/// toggles and the stored dynamic config. The trading leader's breaker also
+/// ends a cooldown and advances recovery here, on time, whether or not
+/// anything asks to trade.
 fn spawn_operator_sync(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -961,7 +963,7 @@ fn spawn_operator_sync(state: Arc<AppState>) {
 }
 
 async fn sync_operator_settings(state: &AppState) {
-    state.circuit_breaker.sync().await;
+    state.circuit_breaker.tick().await;
     match crate::state::circuit_breaker_config(&state.pool).await {
         Ok(limits) if limits != state.circuit_breaker.config().await => {
             info!("Applying circuit breaker limits saved through another process");

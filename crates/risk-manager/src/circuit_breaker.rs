@@ -400,12 +400,17 @@ impl CircuitBreaker {
             self.leader_epoch
                 .store(repo.claim_leadership().await?, Ordering::SeqCst);
         }
+        // Read before the state is locked, so a slow read stalls no reader.
+        // Nothing is saved over it meanwhile: this process does not lead
+        // yet, the claim fences the previous leader, and the first save
+        // adopts an operator change made since.
+        let stored = self.read_stored().await?;
         let mut state = self.state.write().await;
         self.leader_holds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        let loaded = self.load_into(&mut state).await?;
+        let loaded = self.adopt_stored(&mut state, stored);
         self.leader.store(true, Ordering::SeqCst);
         if loaded {
             self.persist_state(&mut state).await;
@@ -480,25 +485,34 @@ impl CircuitBreaker {
     /// The persisted trip, latch, drawdown references and recovery stage are
     /// always restored; a new UTC day only clears the per-day counters.
     pub async fn load_state(&self) -> Result<bool> {
+        let stored = self.read_stored().await?;
         let mut state = self.state.write().await;
-        let loaded = self.load_into(&mut state).await?;
+        let loaded = self.adopt_stored(&mut state, stored);
         if loaded {
             self.persist_state(&mut state).await;
         }
         Ok(loaded)
     }
 
-    /// Replace `state` with the stored state; returns whether there was one.
-    async fn load_into(&self, state: &mut CircuitBreakerState) -> Result<bool> {
+    /// The stored state, if there is a store and a row.
+    async fn read_stored(&self) -> Result<Option<crate::StoredState>> {
         let Some(repo) = &self.repo else {
             warn!("Cannot load state: no database connection configured");
-            return Ok(false);
+            return Ok(None);
         };
+        repo.load().await
+    }
 
+    /// Replace `state` with the stored state; returns whether there was one.
+    fn adopt_stored(
+        &self,
+        state: &mut CircuitBreakerState,
+        stored: Option<crate::StoredState>,
+    ) -> bool {
         // The stored holds were the previous leader's: this one's own are
         // stored by the save that follows.
-        let Some(stored) = repo.load().await? else {
-            return Ok(false);
+        let Some(stored) = stored else {
+            return false;
         };
         let mut loaded = stored.state;
         loaded.roll_daily_counters(Utc::now().date_naive());
@@ -516,7 +530,7 @@ impl CircuitBreaker {
         if state.trip_reason == Some(TripReason::HardKillSwitch) {
             warn!("Hard kill switch is active — trading halted until manual reset");
         }
-        Ok(true)
+        true
     }
 
     /// Hold new entries in this process, under `key`, until
@@ -633,17 +647,40 @@ impl CircuitBreaker {
             // A follower resumes with the leader, from its stored state: on
             // its own it could resume while the leader stays tripped on
             // losses its failing saves have not stored yet.
-            if !self.is_leader() {
+            if !self.keeps_course() {
                 return false;
             }
             return self.resume_if_cooldown_elapsed().await;
         }
 
         // Recovery stages likewise advance in the leader only.
-        if self.is_leader() && self.state.read().await.recovery_state.is_some() {
+        if self.keeps_course() && self.state.read().await.recovery_state.is_some() {
             self.try_advance_recovery().await;
         }
         true
+    }
+
+    /// Whether this process runs the breaker's clock (a cooldown's end,
+    /// recovery stages): the leader, or a breaker with no stored state to
+    /// follow.
+    fn keeps_course(&self) -> bool {
+        self.is_leader() || self.repo.is_none()
+    }
+
+    /// Run the breaker's clock whether or not anything asks to trade: sync
+    /// with the stored state, and in the leader end a cooldown that is over
+    /// and advance recovery stages (the other processes take both from its
+    /// stored state). Called every few seconds.
+    pub async fn tick(&self) {
+        self.sync().await;
+        if !self.keeps_course() || !self.config.read().await.enabled {
+            return;
+        }
+        if self.is_tripped.load(Ordering::SeqCst) {
+            self.resume_if_cooldown_elapsed().await;
+        } else if self.state.read().await.recovery_state.is_some() {
+            self.try_advance_recovery().await;
+        }
     }
 
     /// Get current trading capacity (0.0 to 1.0).

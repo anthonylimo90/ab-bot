@@ -412,15 +412,20 @@ async fn execute_reserved_order(
             )));
         }
         let cb_state = state.circuit_breaker.state().await;
+        let resumes = match cb_state.resume_at {
+            Some(at) if at > Utc::now() => format!("Resumes at {}", at.to_rfc3339()),
+            // The trading process lifts it (a daily loss limit holds until
+            // the UTC day ends); this one follows within seconds.
+            Some(_) => "The cooldown is over; trading resumes when the trading process lifts \
+                        the trip"
+                .to_string(),
+            None => "Holds until an owner or admin resets it".to_string(),
+        };
         return Err(ApiError::ServiceUnavailable(format!(
-            "Trading halted: {:?}. Resumes at {:?}",
+            "Trading halted: {:?}. {resumes}",
             cb_state
                 .trip_reason
                 .unwrap_or(risk_manager::circuit_breaker::TripReason::Manual),
-            cb_state
-                .resume_at
-                .map(|t| t.to_rfc3339())
-                .unwrap_or_else(|| "unknown".to_string())
         )));
     }
 
