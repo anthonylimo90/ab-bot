@@ -963,7 +963,7 @@ fn spawn_operator_sync(state: Arc<AppState>) {
 }
 
 async fn sync_operator_settings(state: &AppState) {
-    state.circuit_breaker.tick().await;
+    // The limits first: the breaker's clock judges a cooldown's end by them.
     match crate::state::circuit_breaker_config(&state.pool).await {
         Ok(limits) if limits != state.circuit_breaker.config().await => {
             info!("Applying circuit breaker limits saved through another process");
@@ -972,6 +972,7 @@ async fn sync_operator_settings(state: &AppState) {
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "Could not re-read the circuit breaker limits"),
     }
+    state.circuit_breaker.tick().await;
     crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
     crate::dynamic_tuner::apply_dynamic_config_snapshot(
         &state.pool,

@@ -670,10 +670,15 @@ impl CircuitBreaker {
     /// Run the breaker's clock whether or not anything asks to trade: sync
     /// with the stored state, and in the leader end a cooldown that is over
     /// and advance recovery stages (the other processes take both from its
-    /// stored state). Called every few seconds.
+    /// stored state). Called every few seconds. The clock stops while
+    /// entries are held, as in [`Self::can_trade`]: recovery stages must not
+    /// run out while nothing can trade (closes uncounted, settings unread).
     pub async fn tick(&self) {
         self.sync().await;
-        if !self.keeps_course() || !self.config.read().await.enabled {
+        if !self.keeps_course()
+            || !self.entry_holds().is_empty()
+            || !self.config.read().await.enabled
+        {
             return;
         }
         if self.is_tripped.load(Ordering::SeqCst) {

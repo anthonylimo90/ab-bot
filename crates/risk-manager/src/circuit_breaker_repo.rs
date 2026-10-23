@@ -926,6 +926,12 @@ mod tests {
         // no trade asked of it.
         follower.tick().await;
         assert!(follower.is_tripped());
+        // Not while entries are held: nothing can trade, so neither the
+        // cooldown nor recovery stages run out.
+        leader.hold_entries("missed_closes", "closes not yet counted");
+        leader.tick().await;
+        assert!(leader.is_tripped());
+        leader.release_entries("missed_closes");
         leader.tick().await;
         assert!(!leader.is_tripped());
         let later = crate::CircuitBreaker::with_persistence(config, pool.clone()).following();
