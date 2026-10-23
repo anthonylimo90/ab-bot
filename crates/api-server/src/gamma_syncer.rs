@@ -27,14 +27,8 @@ impl GammaSyncerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("GAMMA_SYNCER_ENABLED", true),
-            interval_secs: std::env::var("GAMMA_SYNCER_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(3600),
-            page_size: std::env::var("GAMMA_SYNCER_PAGE_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
+            interval_secs: polymarket_core::config::env_count("GAMMA_SYNCER_INTERVAL_SECS", 3600),
+            page_size: polymarket_core::config::env_count("GAMMA_SYNCER_PAGE_SIZE", 100),
         }
     }
 }
@@ -154,6 +148,7 @@ async fn sync_cycle(
     // Step 4: Batch UPSERT into market_metadata (chunks of 50 to stay under param limit)
     const BATCH_SIZE: usize = 50;
     let mut upserted = 0usize;
+    let mut all_stored = true;
 
     for chunk in parsed.chunks(BATCH_SIZE) {
         match upsert_market_metadata(pool, chunk).await {
@@ -161,6 +156,7 @@ async fn sync_cycle(
                 upserted += changed as usize;
             }
             Err(e) => {
+                all_stored = false;
                 warn!(
                     error = %e,
                     chunk_size = chunk.len(),
@@ -173,6 +169,15 @@ async fn sync_cycle(
         tokio::task::yield_now().await;
     }
 
+    // Markets that left the active listing are closed: without this their
+    // rows stayed active for good, and the signal generators reading
+    // `active` kept treating resolved markets as tradable.
+    if all_stored {
+        if let Err(error) = deactivate_unlisted(pool, &parsed).await {
+            warn!(%error, "Failed to mark closed markets inactive in market_metadata");
+        }
+    }
+
     // Step 5: Release semaphore (explicit drop for clarity)
     drop(_permit);
 
@@ -181,6 +186,40 @@ async fn sync_cycle(
         upserted,
         backfilled: 0,
     })
+}
+
+/// Marks active rows missing from a complete listing inactive, unless the
+/// listing is under half the active rows: more likely a partial answer than
+/// half the markets closing at once.
+async fn deactivate_unlisted(
+    pool: &PgPool,
+    listed: &[polymarket_core::api::gamma::ParsedGammaMarket],
+) -> Result<(), sqlx::Error> {
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM market_metadata WHERE active")
+        .fetch_one(pool)
+        .await?;
+    if (listed.len() as i64) * 2 < active {
+        warn!(
+            listed = listed.len(),
+            active, "Gamma listing is under half the active markets; not marking any closed"
+        );
+        return Ok(());
+    }
+    let ids: Vec<&str> = listed.iter().map(|m| m.condition_id.as_str()).collect();
+    let closed = sqlx::query(
+        "UPDATE market_metadata SET active = FALSE WHERE active AND NOT (condition_id = ANY($1))",
+    )
+    .bind(ids)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if closed > 0 {
+        debug!(
+            closed,
+            "Marked markets that left the Gamma listing inactive"
+        );
+    }
+    Ok(())
 }
 
 /// Upsert a batch of market metadata, rewriting only rows whose values
@@ -289,6 +328,41 @@ mod tests {
         assert_eq!(upsert("12.345678901234").await, 1);
         assert_eq!(upsert("12.345678901234").await, 0);
         assert_eq!(upsert("13").await, 1);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn markets_that_leave_the_listing_become_inactive(pool: PgPool) {
+        sqlx::raw_sql(include_str!("../../../migrations/038_market_metadata.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let market = |id: &str| polymarket_core::api::gamma::ParsedGammaMarket {
+            condition_id: id.into(),
+            question: "Will it?".into(),
+            category: None,
+            tags: Vec::new(),
+            end_date: None,
+            volume: Decimal::ONE,
+            liquidity: Decimal::ONE,
+            active: true,
+        };
+        let listing: Vec<_> = ["c1", "c2", "c3"].into_iter().map(market).collect();
+        upsert_market_metadata(&pool, &listing).await.unwrap();
+        let active = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT condition_id FROM market_metadata WHERE active ORDER BY condition_id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        };
+
+        // c3 closed: it leaves the listing.
+        deactivate_unlisted(&pool, &listing[..2]).await.unwrap();
+        assert_eq!(active(pool.clone()).await, ["c1", "c2"]);
+        // A listing under half the active markets marks nothing.
+        deactivate_unlisted(&pool, &[]).await.unwrap();
+        assert_eq!(active(pool.clone()).await, ["c1", "c2"]);
     }
 
     #[sqlx::test(migrations = false)]

@@ -292,21 +292,15 @@ impl GammaClient {
 
     fn capped_page_size(page_size: u32) -> u32 {
         page_size.max(1).min(
-            std::env::var("GAMMA_MAX_PAGE_SIZE")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(DEFAULT_MAX_PAGE_SIZE)
-                .max(1),
+            crate::config::env_count::<u32>("GAMMA_MAX_PAGE_SIZE", DEFAULT_MAX_PAGE_SIZE).max(1),
         )
     }
 
     fn page_delay() -> StdDuration {
-        StdDuration::from_millis(
-            std::env::var("GAMMA_PAGE_DELAY_MS")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_PAGE_DELAY_MS),
-        )
+        StdDuration::from_millis(crate::config::env_count::<u64>(
+            "GAMMA_PAGE_DELAY_MS",
+            DEFAULT_PAGE_DELAY_MS,
+        ))
     }
 
     /// Execute an HTTP GET with retry and exponential backoff.
@@ -397,11 +391,20 @@ impl GammaClient {
         })?;
         let rows_returned = rows.len();
         let mut markets = Vec::with_capacity(rows_returned);
+        let mut skipped = 0usize;
+        let mut first_error = None;
         for row in rows {
             match serde_json::from_value::<GammaMarket>(row) {
                 Ok(market) => markets.push(market),
-                Err(error) => warn!(%error, offset, "Skipping a Gamma market that cannot be read"),
+                Err(error) => {
+                    skipped += 1;
+                    first_error.get_or_insert(error);
+                }
             }
+        }
+        // One line a page: a format change would otherwise log every row.
+        if let Some(error) = first_error {
+            warn!(%error, offset, skipped, rows_returned, "Skipped Gamma markets that cannot be read");
         }
 
         debug!(

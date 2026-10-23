@@ -43,18 +43,15 @@ impl WalletHarvesterConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("HARVESTER_ENABLED", true),
-            interval_secs: std::env::var("HARVESTER_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(120),
-            trades_per_fetch: std::env::var("HARVESTER_TRADES_PER_FETCH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1000),
-            max_new_per_cycle: std::env::var("HARVESTER_MAX_NEW_PER_CYCLE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1500),
+            interval_secs: polymarket_core::config::env_count("HARVESTER_INTERVAL_SECS", 120),
+            trades_per_fetch: polymarket_core::config::env_count(
+                "HARVESTER_TRADES_PER_FETCH",
+                1000,
+            ),
+            max_new_per_cycle: polymarket_core::config::env_count(
+                "HARVESTER_MAX_NEW_PER_CYCLE",
+                1500,
+            ),
         }
     }
 }

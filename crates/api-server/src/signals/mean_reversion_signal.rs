@@ -40,15 +40,9 @@ impl MeanReversionSignalConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("MEAN_REVERSION_SIGNAL_ENABLED", true),
-            interval_secs: std::env::var("MEAN_REVERSION_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600),
-            min_move_pct: std::env::var("MEAN_REV_MIN_MOVE_PCT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.10),
-            base_position_size_usd: polymarket_core::config::env_decimal(
+            interval_secs: polymarket_core::config::env_count("MEAN_REVERSION_INTERVAL_SECS", 600),
+            min_move_pct: polymarket_core::config::env_number("MEAN_REV_MIN_MOVE_PCT", 0.10),
+            base_position_size_usd: polymarket_core::config::env_positive_decimal(
                 "QUANT_BASE_POSITION_SIZE",
                 Decimal::new(30, 0),
             ),

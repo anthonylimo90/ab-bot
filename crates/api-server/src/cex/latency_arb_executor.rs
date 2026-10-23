@@ -49,42 +49,27 @@ impl LatencyArbExecutorConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_switch("LATENCY_ARB_ENABLED"),
-            min_edge: std::env::var("LATENCY_ARB_MIN_EDGE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.10),
-            max_signal_age_ms: std::env::var("LATENCY_ARB_MAX_SIGNAL_AGE_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1500),
-            kelly_fraction: std::env::var("LATENCY_ARB_KELLY_FRACTION")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.10),
-            kelly_bankroll: std::env::var("LATENCY_ARB_KELLY_BANKROLL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(1000, 0)),
-            max_position_size: std::env::var("LATENCY_ARB_MAX_POSITION_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(100, 0)),
-            min_position_size: std::env::var("LATENCY_ARB_MIN_POSITION_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(5, 0)),
-            min_yes_price: std::env::var("LATENCY_ARB_MIN_YES_PRICE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.05),
-            max_yes_price: std::env::var("LATENCY_ARB_MAX_YES_PRICE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.95),
-            cooldown_ms: std::env::var("LATENCY_ARB_COOLDOWN_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30000),
+            min_edge: polymarket_core::config::env_number("LATENCY_ARB_MIN_EDGE", 0.10),
+            max_signal_age_ms: polymarket_core::config::env_count(
+                "LATENCY_ARB_MAX_SIGNAL_AGE_MS",
+                1500,
+            ),
+            kelly_fraction: polymarket_core::config::env_number("LATENCY_ARB_KELLY_FRACTION", 0.10),
+            kelly_bankroll: polymarket_core::config::env_number(
+                "LATENCY_ARB_KELLY_BANKROLL",
+                Decimal::new(1000, 0),
+            ),
+            max_position_size: polymarket_core::config::env_number(
+                "LATENCY_ARB_MAX_POSITION_SIZE",
+                Decimal::new(100, 0),
+            ),
+            min_position_size: polymarket_core::config::env_number(
+                "LATENCY_ARB_MIN_POSITION_SIZE",
+                Decimal::new(5, 0),
+            ),
+            min_yes_price: polymarket_core::config::env_number("LATENCY_ARB_MIN_YES_PRICE", 0.05),
+            max_yes_price: polymarket_core::config::env_number("LATENCY_ARB_MAX_YES_PRICE", 0.95),
+            cooldown_ms: polymarket_core::config::env_count("LATENCY_ARB_COOLDOWN_MS", 30000),
         }
     }
 }

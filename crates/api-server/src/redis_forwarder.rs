@@ -63,10 +63,7 @@ impl RedisForwarderConfig {
                 "REDIS_SUBSCRIBE_ORDERBOOK",
                 true,
             ),
-            reconnect_delay_secs: std::env::var("REDIS_RECONNECT_DELAY")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5),
+            reconnect_delay_secs: polymarket_core::config::env_count("REDIS_RECONNECT_DELAY", 5),
         }
     }
 }

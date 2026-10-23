@@ -2652,8 +2652,9 @@ pub async fn get_dynamic_tuner_status(
     };
 
     let current_regime = format!("{:?}", *state.current_regime.read().await);
-    let enabled = env_bool("DYNAMIC_TUNER_ENABLED", true);
-    let apply_changes = env_bool("DYNAMIC_TUNER_APPLY", true);
+    // As the tuner reads them.
+    let enabled = polymarket_core::config::env_flag("DYNAMIC_TUNER_ENABLED", true);
+    let apply_changes = polymarket_core::config::env_flag("DYNAMIC_TUNER_APPLY", true);
     let (last_run_at, last_run_status, last_run_reason, last_metrics) = match runtime_state {
         Some(row) => (
             row.last_run_at,
@@ -3123,21 +3124,8 @@ pub async fn get_dynamic_tuning_history(
     Ok(Json(history))
 }
 
-fn env_bool(name: &str, fallback: bool) -> bool {
-    std::env::var(name)
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            normalized == "1" || normalized == "true" || normalized == "yes"
-        })
-        .unwrap_or(fallback)
-}
-
 fn env_aggressiveness_level() -> f64 {
-    match std::env::var("ARB_MONITOR_AGGRESSIVENESS")
-        .unwrap_or_else(|_| "balanced".to_string())
-        .to_lowercase()
-        .as_str()
-    {
+    match polymarket_core::config::env_choice("ARB_MONITOR_AGGRESSIVENESS", "balanced").as_str() {
         "stable" | "conservative" => 0.0,
         "discovery" | "aggressive" => 2.0,
         _ => 1.0,

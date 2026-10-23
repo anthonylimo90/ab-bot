@@ -26,10 +26,10 @@ impl AccountSnapshotConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("ACCOUNT_SNAPSHOT_ENABLED", true),
-            interval_secs: std::env::var("ACCOUNT_SNAPSHOT_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+            interval_secs: polymarket_core::config::env_count(
+                "ACCOUNT_SNAPSHOT_INTERVAL_SECS",
+                300,
+            ),
         }
     }
 }

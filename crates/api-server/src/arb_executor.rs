@@ -172,37 +172,31 @@ impl ArbExecutorConfig {
             enabled: polymarket_core::config::env_switch("ARB_AUTO_EXECUTE"),
             allow_live_execution: polymarket_core::config::env_switch("ARB_ALLOW_LIVE_EXECUTION"),
             // The dynamic config's default, inside its $5-$25 bounds.
-            position_size: polymarket_core::config::env_decimal(
+            position_size: polymarket_core::config::env_positive_decimal(
                 "ARB_POSITION_SIZE",
                 Decimal::new(10, 0),
             ),
-            min_net_profit: polymarket_core::config::env_decimal(
+            min_net_profit: polymarket_core::config::env_number(
                 "ARB_MIN_NET_PROFIT",
                 Decimal::new(1, 3),
             ),
-            max_signal_age_secs: std::env::var("ARB_MAX_SIGNAL_AGE_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
-            cache_refresh_secs: std::env::var("ARB_CACHE_REFRESH_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300),
+            max_signal_age_secs: polymarket_core::config::env_count("ARB_MAX_SIGNAL_AGE_SECS", 30),
+            cache_refresh_secs: polymarket_core::config::env_count("ARB_CACHE_REFRESH_SECS", 300),
             dynamic_sizing: polymarket_core::config::env_flag("ARB_DYNAMIC_SIZING", true),
-            min_position_size: polymarket_core::config::env_decimal(
+            min_position_size: polymarket_core::config::env_positive_decimal(
                 "ARB_MIN_POSITION_SIZE",
                 Decimal::new(5, 0),
             ), // $5 floor (small wallet)
-            max_position_size: polymarket_core::config::env_decimal(
+            max_position_size: polymarket_core::config::env_positive_decimal(
                 "ARB_MAX_POSITION_SIZE",
                 Decimal::new(25, 0),
             ), // $25 ceiling (small wallet)
-            min_book_depth: polymarket_core::config::env_decimal(
+            min_book_depth: polymarket_core::config::env_positive_decimal(
                 "ARB_MIN_BOOK_DEPTH",
                 Decimal::new(25, 0),
             ), // $25 min depth (small wallet)
             fee_rate: Decimal::new(2, 2), // Always 2% on Polymarket
-            max_total_exposure: polymarket_core::config::env_decimal(
+            max_total_exposure: polymarket_core::config::env_positive_decimal(
                 "ARB_MAX_TOTAL_EXPOSURE",
                 Decimal::new(25000, 0),
             ), // $25,000 default

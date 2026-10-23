@@ -419,10 +419,10 @@ impl AppState {
         }
         let executor_config = ExecutorConfig {
             live_trading,
-            min_book_depth: std::env::var("EXECUTOR_MIN_BOOK_DEPTH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(rust_decimal::Decimal::new(100, 0)),
+            min_book_depth: polymarket_core::config::env_number(
+                "EXECUTOR_MIN_BOOK_DEPTH",
+                rust_decimal::Decimal::new(100, 0),
+            ),
             ..Default::default()
         };
         let order_executor = Arc::new(

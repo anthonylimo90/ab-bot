@@ -29,24 +29,20 @@ impl BacktestAutomationConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("BACKTEST_AUTOMATION_ENABLED", true),
-            interval_secs: std::env::var("BACKTEST_AUTOMATION_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
-            startup_delay_secs: std::env::var("BACKTEST_AUTOMATION_STARTUP_DELAY_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(180),
-            claim_limit: std::env::var("BACKTEST_AUTOMATION_CLAIM_LIMIT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4),
+            interval_secs: polymarket_core::config::env_count(
+                "BACKTEST_AUTOMATION_INTERVAL_SECS",
+                300,
+            ),
+            startup_delay_secs: polymarket_core::config::env_count(
+                "BACKTEST_AUTOMATION_STARTUP_DELAY_SECS",
+                180,
+            ),
+            claim_limit: polymarket_core::config::env_count("BACKTEST_AUTOMATION_CLAIM_LIMIT", 4),
             // Bounded (30 days) so the interval arithmetic can never overflow.
-            stale_run_timeout_minutes: std::env::var("BACKTEST_STALE_RUN_TIMEOUT_MINUTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|minutes| (1..=43_200).contains(minutes))
-                .unwrap_or(DEFAULT_STALE_RUN_TIMEOUT_MINUTES),
+            stale_run_timeout_minutes: polymarket_core::config::env_count(
+                "BACKTEST_STALE_RUN_TIMEOUT_MINUTES",
+                DEFAULT_STALE_RUN_TIMEOUT_MINUTES,
+            ),
         }
     }
 }

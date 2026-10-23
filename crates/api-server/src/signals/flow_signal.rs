@@ -72,60 +72,45 @@ impl FlowSignalConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("FLOW_SIGNAL_ENABLED", true),
-            interval_secs: std::env::var("FLOW_SIGNAL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
-            min_imbalance: std::env::var("FLOW_MIN_IMBALANCE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.25),
-            min_smart_money_flow: std::env::var("FLOW_MIN_SMART_MONEY_USD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Decimal::new(500, 0)),
-            min_trade_count: std::env::var("FLOW_MIN_TRADE_COUNT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
-            min_score: std::env::var("FLOW_MIN_SCORE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.58),
-            min_expected_edge_bps: std::env::var("FLOW_MIN_EXPECTED_EDGE_BPS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(35.0),
-            min_smart_money_share: std::env::var("FLOW_MIN_SMART_MONEY_SHARE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.35),
-            min_bot_score_coverage: std::env::var("FLOW_MIN_BOT_SCORE_COVERAGE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.50),
+            interval_secs: polymarket_core::config::env_count("FLOW_SIGNAL_INTERVAL_SECS", 300),
+            min_imbalance: polymarket_core::config::env_number("FLOW_MIN_IMBALANCE", 0.25),
+            min_smart_money_flow: polymarket_core::config::env_number(
+                "FLOW_MIN_SMART_MONEY_USD",
+                Decimal::new(500, 0),
+            ),
+            min_trade_count: polymarket_core::config::env_count("FLOW_MIN_TRADE_COUNT", 5),
+            min_score: polymarket_core::config::env_number("FLOW_MIN_SCORE", 0.58),
+            min_expected_edge_bps: polymarket_core::config::env_number(
+                "FLOW_MIN_EXPECTED_EDGE_BPS",
+                35.0,
+            ),
+            min_smart_money_share: polymarket_core::config::env_number(
+                "FLOW_MIN_SMART_MONEY_SHARE",
+                0.35,
+            ),
+            min_bot_score_coverage: polymarket_core::config::env_number(
+                "FLOW_MIN_BOT_SCORE_COVERAGE",
+                0.50,
+            ),
             require_yes_price: polymarket_core::config::env_flag("FLOW_REQUIRE_YES_PRICE", true),
-            max_signals_per_cycle: std::env::var("FLOW_MAX_SIGNALS_PER_CYCLE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(15),
-            window_minutes: std::env::var("FLOW_SIGNAL_WINDOW_MINUTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
-            base_position_size_usd: polymarket_core::config::env_decimal(
+            max_signals_per_cycle: polymarket_core::config::env_count(
+                "FLOW_MAX_SIGNALS_PER_CYCLE",
+                15,
+            ),
+            window_minutes: polymarket_core::config::env_count("FLOW_SIGNAL_WINDOW_MINUTES", 60),
+            base_position_size_usd: polymarket_core::config::env_positive_decimal(
                 "QUANT_BASE_POSITION_SIZE",
                 Decimal::new(30, 0),
             ),
             expiry_minutes: 30,
-            calibration_lookback_days: std::env::var("FLOW_CALIBRATION_LOOKBACK_DAYS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(14),
-            calibration_min_closed_trades: std::env::var("FLOW_CALIBRATION_MIN_CLOSED_TRADES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8),
+            calibration_lookback_days: polymarket_core::config::env_count(
+                "FLOW_CALIBRATION_LOOKBACK_DAYS",
+                14,
+            ),
+            calibration_min_closed_trades: polymarket_core::config::env_count(
+                "FLOW_CALIBRATION_MIN_CLOSED_TRADES",
+                8,
+            ),
             require_calibration: polymarket_core::config::env_flag(
                 "FLOW_REQUIRE_CALIBRATION",
                 true,
@@ -682,7 +667,14 @@ async fn load_flow_calibration(
         WITH closed_flow AS (
             SELECT
                 qs.direction,
-                p.quantity * (p.yes_entry_price + p.no_entry_price) AS size_usd,
+                -- As Position::entry_cost: the filled legs when recorded.
+                CASE
+                    WHEN p.held_yes_qty + p.exited_yes_qty > 0
+                      OR p.held_no_qty + p.exited_no_qty > 0
+                    THEN p.yes_entry_price * (p.held_yes_qty + p.exited_yes_qty)
+                       + p.no_entry_price * (p.held_no_qty + p.exited_no_qty)
+                    ELSE (p.yes_entry_price + p.no_entry_price) * p.quantity
+                END AS size_usd,
                 p.realized_pnl,
                 COALESCE(
                     NULLIF(qs.metadata ->> 'raw_expected_edge_bps', ''),
@@ -880,7 +872,9 @@ mod tests {
             r#"
             CREATE TABLE positions (
                 id UUID, state SMALLINT, realized_pnl NUMERIC, source_signal_id UUID,
-                quantity NUMERIC, yes_entry_price NUMERIC, no_entry_price NUMERIC
+                quantity NUMERIC, yes_entry_price NUMERIC, no_entry_price NUMERIC,
+                held_yes_qty NUMERIC DEFAULT 0, exited_yes_qty NUMERIC DEFAULT 0,
+                held_no_qty NUMERIC DEFAULT 0, exited_no_qty NUMERIC DEFAULT 0
             );
             CREATE TABLE quant_signals (
                 id UUID, kind TEXT, direction TEXT, size_usd NUMERIC, metadata JSONB,
@@ -901,7 +895,8 @@ mod tests {
             async move {
                 let signal_id = uuid::Uuid::new_v4();
                 let position_id = uuid::Uuid::new_v4();
-                // The signal suggested $30; the position cost 10 x 0.90 = $9.
+                // The signal suggested $30; 10 were asked for at 0.90, all
+                // filled and sold: the position cost $9.
                 sqlx::query(
                     "INSERT INTO quant_signals VALUES
                      ($1, 'flow', 'buy_yes', 30, $2, 'executed', NOW())",
@@ -914,13 +909,15 @@ mod tests {
                 .execute(&pool)
                 .await
                 .unwrap();
-                sqlx::query("INSERT INTO positions VALUES ($1, 4, $2, $3, 10, 0.90, 0)")
-                    .bind(position_id)
-                    .bind(pnl)
-                    .bind(signal_id)
-                    .execute(&pool)
-                    .await
-                    .unwrap();
+                sqlx::query(
+                    "INSERT INTO positions VALUES ($1, 4, $2, $3, 10, 0.90, 0, 0, 10, 0, 0)",
+                )
+                .bind(position_id)
+                .bind(pnl)
+                .bind(signal_id)
+                .execute(&pool)
+                .await
+                .unwrap();
                 position_id
             }
         };

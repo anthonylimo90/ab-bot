@@ -234,23 +234,16 @@ impl ServerConfig {
         Self {
             host: std::env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             // Check PORT first (Railway), then API_PORT, then default to 3000
-            port: std::env::var("PORT")
-                .or_else(|_| std::env::var("API_PORT"))
-                .ok()
-                .and_then(|p| p.parse().ok())
+            port: polymarket_core::config::env_count_opt("PORT")
+                .or_else(|| polymarket_core::config::env_count_opt("API_PORT"))
                 .unwrap_or(3000),
-            cors_permissive: std::env::var("CORS_PERMISSIVE")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            cors_permissive: polymarket_core::config::env_flag("CORS_PERMISSIVE", true),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .map(|raw| parse_origin_list(&raw))
                 .unwrap_or_default(),
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
-            ws_channel_capacity: std::env::var("WS_CHANNEL_CAPACITY")
-                .ok()
-                .and_then(|c| c.parse().ok())
-                .unwrap_or(1000),
+            ws_channel_capacity: polymarket_core::config::env_count("WS_CHANNEL_CAPACITY", 1000),
         }
     }
 
@@ -296,11 +289,20 @@ impl ApiServer {
     }
 
     /// Run the server.
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
         // Listen for stop signals before anything trades: one arriving while
         // the executors start must still lead to a drain.
-        let mut stop = polymarket_core::shutdown::StopSignals::install()?;
+        let stop = polymarket_core::shutdown::StopSignals::install()?;
+        self.run_until(stop).await
+    }
 
+    /// Run the server until `stop` receives a stop signal, then drain. A
+    /// caller that listened while starting hands its listener over, so a
+    /// signal it already received is not lost.
+    pub async fn run_until(
+        mut self,
+        mut stop: polymarket_core::shutdown::StopSignals,
+    ) -> anyhow::Result<()> {
         // ── Pre-create arb executor config Arc (must happen before Arc-wrapping state) ──
         let mut arb_config_pre = ArbExecutorConfig::from_env();
         if !arb_config_pre.enabled {

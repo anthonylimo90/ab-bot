@@ -23,10 +23,10 @@ impl StrategyHealthConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("STRATEGY_HEALTH_ENABLED", true),
-            interval_secs: std::env::var("STRATEGY_HEALTH_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(21600),
+            interval_secs: polymarket_core::config::env_count(
+                "STRATEGY_HEALTH_INTERVAL_SECS",
+                21600,
+            ),
             periods: vec![7, 30],
         }
     }

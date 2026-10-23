@@ -497,11 +497,10 @@ const ARGON2_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 fn argon2_permits() -> &'static Arc<tokio::sync::Semaphore> {
     static PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     PERMITS.get_or_init(|| {
-        let limit = std::env::var("ARGON2_MAX_CONCURRENCY")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .map(|limit| limit.max(1))
-            .unwrap_or(DEFAULT_ARGON2_MAX_CONCURRENCY);
+        let limit = polymarket_core::config::env_count(
+            "ARGON2_MAX_CONCURRENCY",
+            DEFAULT_ARGON2_MAX_CONCURRENCY,
+        );
         Arc::new(tokio::sync::Semaphore::new(limit))
     })
 }

@@ -75,46 +75,34 @@ impl QuantSignalExecutorConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_switch("QUANT_EXECUTOR_ENABLED"),
-            base_position_size_usd: polymarket_core::config::env_decimal(
+            base_position_size_usd: polymarket_core::config::env_positive_decimal(
                 "QUANT_BASE_POSITION_SIZE",
                 Decimal::new(30, 0),
             ),
-            min_confidence: std::env::var("QUANT_MIN_CONFIDENCE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.65),
-            max_signal_age_secs: std::env::var("QUANT_MAX_SIGNAL_AGE_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(120),
+            min_confidence: polymarket_core::config::env_number("QUANT_MIN_CONFIDENCE", 0.65),
+            max_signal_age_secs: polymarket_core::config::env_count(
+                "QUANT_MAX_SIGNAL_AGE_SECS",
+                120,
+            ),
             // Generators read hourly bars. A bar is materialized up to two
             // hours after it starts (an hourly refresh lagging an hour) and
             // stays the newest for another hour, so the newest bar is up to
             // four hours old; the drift check below bounds how far the price
             // has moved since.
-            max_reference_age_secs: std::env::var("QUANT_MAX_REFERENCE_AGE_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .filter(|secs| *secs > 0)
-                .unwrap_or(5 * 3600),
-            max_reference_drift: std::env::var("QUANT_MAX_REFERENCE_DRIFT")
-                .ok()
-                .and_then(|s| s.parse::<Decimal>().ok())
-                .filter(|drift| *drift > Decimal::ZERO && *drift < Decimal::ONE)
-                .unwrap_or(Decimal::new(3, 2)),
-            cache_refresh_secs: std::env::var("QUANT_CACHE_REFRESH_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300),
-            max_quant_positions: std::env::var("QUANT_MAX_POSITIONS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(20),
-            reentry_cooldown_minutes: std::env::var("QUANT_REENTRY_COOLDOWN_MINUTES")
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .map(|minutes| minutes.max(0))
-                .unwrap_or(60),
+            max_reference_age_secs: polymarket_core::config::env_count(
+                "QUANT_MAX_REFERENCE_AGE_SECS",
+                5 * 3600,
+            ),
+            max_reference_drift: polymarket_core::config::env_number(
+                "QUANT_MAX_REFERENCE_DRIFT",
+                Decimal::new(3, 2),
+            ),
+            cache_refresh_secs: polymarket_core::config::env_count("QUANT_CACHE_REFRESH_SECS", 300),
+            max_quant_positions: polymarket_core::config::env_count("QUANT_MAX_POSITIONS", 20),
+            reentry_cooldown_minutes: polymarket_core::config::env_count::<i64>(
+                "QUANT_REENTRY_COOLDOWN_MINUTES",
+                60,
+            ),
             flow_allocation_pct: polymarket_core::config::env_share_f64(
                 "QUANT_FLOW_ALLOCATION_PCT",
                 0.40,
@@ -134,26 +122,26 @@ impl QuantSignalExecutorConfig {
                 "QUANT_RESOLUTION_ALLOCATION_PCT",
                 0.0,
             ),
-            min_book_depth: polymarket_core::config::env_decimal(
+            min_book_depth: polymarket_core::config::env_positive_decimal(
                 "QUANT_MIN_BOOK_DEPTH",
                 Decimal::new(50, 0),
             ),
-            max_total_exposure: polymarket_core::config::env_decimal(
+            max_total_exposure: polymarket_core::config::env_positive_decimal(
                 "ARB_MAX_TOTAL_EXPOSURE",
                 Decimal::new(25000, 0),
             ),
-            strategy_max_daily_loss_usd: polymarket_core::config::env_decimal(
+            strategy_max_daily_loss_usd: polymarket_core::config::env_positive_decimal(
                 "QUANT_STRATEGY_MAX_DAILY_LOSS",
                 Decimal::new(200, 0),
             ),
-            strategy_max_consecutive_losses: std::env::var("QUANT_STRATEGY_MAX_CONSECUTIVE_LOSSES")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5),
-            strategy_halt_cooldown_secs: std::env::var("QUANT_STRATEGY_HALT_COOLDOWN_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3600),
+            strategy_max_consecutive_losses: polymarket_core::config::env_count(
+                "QUANT_STRATEGY_MAX_CONSECUTIVE_LOSSES",
+                5,
+            ),
+            strategy_halt_cooldown_secs: polymarket_core::config::env_count(
+                "QUANT_STRATEGY_HALT_COOLDOWN_SECS",
+                3600,
+            ),
         }
     }
 
@@ -720,6 +708,21 @@ impl QuantSignalExecutor {
                 &execution_mode,
                 "signal_skipped",
                 Some("uncalibrated"),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // Step 1c: a strategy given no allocation sizes every order at
+        // nothing; it is skipped before any book is fetched.
+        if cfg.allocation_for(signal.kind) <= 0.0 {
+            self.update_signal_status(signal.id, "skipped", Some("not_allocated"))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("not_allocated"),
             )
             .await;
             return Ok(());

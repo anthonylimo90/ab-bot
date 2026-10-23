@@ -152,8 +152,9 @@ fn is_non_trader(address: &str) -> bool {
 /// a score from its first trades would otherwise stand for good.
 const RESCORE_AFTER: Duration = Duration::from_secs(24 * 3600);
 /// How soon a wallet that could not be scored (too few transfers, or a failed
-/// analysis) is tried again: it may have enough soon.
-const RECHECK_AFTER: Duration = Duration::from_secs(3600);
+/// analysis) is tried again: it may have enough soon. Each try costs an
+/// Alchemy transfer history call.
+const RECHECK_AFTER: Duration = Duration::from_secs(6 * 3600);
 
 /// Bounded set of recently seen wallet addresses with least-recently-seen
 /// eviction, each with when it is next due for analysis.
@@ -592,7 +593,7 @@ mod tests {
     fn wallets_are_analyzed_again_when_due() {
         let mut set = RecentWallets::new(10);
         let start = Instant::now();
-        // Not scored (too few transfers): tried again after an hour.
+        // Not scored (too few transfers): tried again after six hours.
         assert!(set.observe("0xa", start));
         assert!(!set.observe("0xa", start + RECHECK_AFTER - Duration::from_secs(1)));
         assert!(set.observe("0xa", start + RECHECK_AFTER));

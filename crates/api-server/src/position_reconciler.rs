@@ -19,14 +19,14 @@ impl PositionReconcilerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("POSITION_RECONCILER_ENABLED", true),
-            interval_secs: std::env::var("POSITION_RECONCILER_INTERVAL_SECS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(300),
-            startup_delay_secs: std::env::var("POSITION_RECONCILER_STARTUP_DELAY_SECS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            interval_secs: polymarket_core::config::env_count(
+                "POSITION_RECONCILER_INTERVAL_SECS",
+                300,
+            ),
+            startup_delay_secs: polymarket_core::config::env_count(
+                "POSITION_RECONCILER_STARTUP_DELAY_SECS",
+                0,
+            ),
         }
     }
 }

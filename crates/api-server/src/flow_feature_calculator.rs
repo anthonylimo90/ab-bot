@@ -68,21 +68,17 @@ impl FlowFeatureConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("FLOW_FEATURE_ENABLED", true),
-            interval_secs: std::env::var("FLOW_FEATURE_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+            interval_secs: polymarket_core::config::env_count("FLOW_FEATURE_INTERVAL_SECS", 300),
             windows: vec![15, 60, 240],
-            smart_money_threshold: std::env::var("SMART_MONEY_BOT_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+            smart_money_threshold: polymarket_core::config::env_count(
+                "SMART_MONEY_BOT_THRESHOLD",
+                30,
+            ),
             // Bounded so the cutoff date arithmetic can never overflow.
-            retention_days: std::env::var("FLOW_FEATURE_RETENTION_DAYS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .filter(|days| (1..=3650).contains(days))
-                .unwrap_or(DEFAULT_RETENTION_DAYS),
+            retention_days: polymarket_core::config::env_count(
+                "FLOW_FEATURE_RETENTION_DAYS",
+                DEFAULT_RETENTION_DAYS,
+            ),
         }
     }
 

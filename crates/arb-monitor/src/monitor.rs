@@ -62,10 +62,7 @@ enum AggressivenessProfile {
 
 impl AggressivenessProfile {
     fn from_env() -> Self {
-        match std::env::var("ARB_MONITOR_AGGRESSIVENESS")
-            .unwrap_or_else(|_| "balanced".to_string())
-            .to_lowercase()
-            .as_str()
+        match polymarket_core::config::env_choice("ARB_MONITOR_AGGRESSIVENESS", "balanced").as_str()
         {
             "stable" | "conservative" => Self::Stable,
             "discovery" | "aggressive" => Self::Discovery,
@@ -356,6 +353,12 @@ pub struct ArbMonitor {
 /// Fetch the tradable markets from Gamma, which is authoritative for active
 /// discovery: CLOB `/markets?active=true` includes many closed historical
 /// markets and starves the websocket selection.
+/// Whether a second short listing of `listed` markets confirms one of `seen`:
+/// within a tenth of it. Two partial answers of different sizes do not.
+fn confirms_listing(seen: usize, listed: usize) -> bool {
+    seen.abs_diff(listed) * 10 <= seen.max(1)
+}
+
 /// Distinct two-outcome markets in a listing, as `apply_universe` keeps them.
 fn binary_market_count(markets: &[polymarket_core::types::Market]) -> usize {
     markets
@@ -367,10 +370,8 @@ fn binary_market_count(markets: &[polymarket_core::types::Market]) -> usize {
 }
 
 async fn fetch_universe(gamma: &GammaClient) -> Result<Vec<polymarket_core::types::Market>> {
-    let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(200);
+    let gamma_page_size =
+        polymarket_core::config::env_count::<u32>("GAMMA_ARB_MARKET_PAGE_SIZE", 200);
     Ok(gamma.get_all_tradable_markets(gamma_page_size).await?)
 }
 
@@ -396,15 +397,22 @@ impl ArbMonitor {
         let dynamic_bounds = load_dynamic_bounds(&pool).await;
         let dynamic_values = load_dynamic_values(&pool).await;
         let min_profit_env =
-            polymarket_core::config::env_decimal(KEY_ARB_MIN_PROFIT_THRESHOLD, Decimal::new(5, 3));
-        let min_book_depth = std::env::var("ARB_MONITOR_MIN_BOOK_DEPTH")
-            .or_else(|_| std::env::var("ARB_MIN_BOOK_DEPTH"))
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MIN_BOOK_DEPTH_USD);
-        let max_markets_env = std::env::var(KEY_ARB_MONITOR_MAX_MARKETS)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+            polymarket_core::config::env_number(KEY_ARB_MIN_PROFIT_THRESHOLD, Decimal::new(5, 3));
+        // Its own setting when set, else the arbitrage one.
+        let min_book_depth =
+            if polymarket_core::config::env_set("ARB_MONITOR_MIN_BOOK_DEPTH").is_some() {
+                polymarket_core::config::env_positive_decimal(
+                    "ARB_MONITOR_MIN_BOOK_DEPTH",
+                    DEFAULT_MIN_BOOK_DEPTH_USD,
+                )
+            } else {
+                polymarket_core::config::env_positive_decimal(
+                    "ARB_MIN_BOOK_DEPTH",
+                    DEFAULT_MIN_BOOK_DEPTH_USD,
+                )
+            };
+        let max_markets_env =
+            polymarket_core::config::env_count_opt::<usize>(KEY_ARB_MONITOR_MAX_MARKETS);
         let min_profit_threshold = dynamic_values
             .get(KEY_ARB_MIN_PROFIT_THRESHOLD)
             .copied()
@@ -437,9 +445,8 @@ impl ArbMonitor {
             .map(AggressivenessProfile::from_level)
             .unwrap_or_else(AggressivenessProfile::from_env);
         let scoring_weights = ScoringWeights::for_profile(aggressiveness_profile);
-        let exploration_slots_env = std::env::var(KEY_ARB_MONITOR_EXPLORATION_SLOTS)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+        let exploration_slots_env =
+            polymarket_core::config::env_count_opt::<usize>(KEY_ARB_MONITOR_EXPLORATION_SLOTS);
         let exploration_slots = dynamic_values
             .get(KEY_ARB_MONITOR_EXPLORATION_SLOTS)
             .copied()
@@ -449,33 +456,26 @@ impl ArbMonitor {
             .and_then(decimal_to_cap)
             .or(exploration_slots_env)
             .unwrap_or(aggressiveness_profile.default_exploration_slots());
-        let selection_resubscribe_min_market_delta =
-            std::env::var("ARB_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA);
-        let selection_resubscribe_min_delta_ratio =
-            std::env::var("ARB_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .unwrap_or(DEFAULT_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO);
-        let selection_force_refresh_secs = std::env::var("ARB_SELECTION_FORCE_REFRESH_SECS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_SELECTION_FORCE_REFRESH_SECS);
-        let exploration_hold_secs = std::env::var("ARB_EXPLORATION_HOLD_SECS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_EXPLORATION_HOLD_SECS);
-        let exploration_swap_min_score_delta =
-            std::env::var("ARB_EXPLORATION_SWAP_MIN_SCORE_DELTA")
-                .ok()
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .unwrap_or(DEFAULT_EXPLORATION_SWAP_MIN_SCORE_DELTA);
+        let selection_resubscribe_min_market_delta = polymarket_core::config::env_count::<usize>(
+            "ARB_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA",
+            DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA,
+        );
+        let selection_resubscribe_min_delta_ratio = polymarket_core::config::env_number(
+            "ARB_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO",
+            DEFAULT_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO,
+        );
+        let selection_force_refresh_secs = polymarket_core::config::env_count::<i64>(
+            "ARB_SELECTION_FORCE_REFRESH_SECS",
+            DEFAULT_SELECTION_FORCE_REFRESH_SECS,
+        );
+        let exploration_hold_secs = polymarket_core::config::env_count::<i64>(
+            "ARB_EXPLORATION_HOLD_SECS",
+            DEFAULT_EXPLORATION_HOLD_SECS,
+        );
+        let exploration_swap_min_score_delta = polymarket_core::config::env_number(
+            "ARB_EXPLORATION_SWAP_MIN_SCORE_DELTA",
+            DEFAULT_EXPLORATION_SWAP_MIN_SCORE_DELTA,
+        );
 
         let dynamic_redis_url =
             std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
@@ -582,17 +582,17 @@ impl ArbMonitor {
             tokio::task::JoinHandle<Result<Vec<polymarket_core::types::Market>>>,
         > = None;
         let universe_refresh_interval = StdDuration::from_secs(
-            std::env::var("ARB_UNIVERSE_REFRESH_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|secs| *secs > 0)
-                .unwrap_or(1800),
+            polymarket_core::config::env_count::<u64>("ARB_UNIVERSE_REFRESH_SECS", 1800),
         );
         let mut next_universe_refresh = tokio::time::Instant::now() + universe_refresh_interval;
+        // After a failed or doubtful refresh, how long until the next: it
+        // doubles from `UNIVERSE_RETRY_AFTER` up to the refresh interval, as
+        // each refresh pages through the whole listing.
+        let mut universe_retry_after = UNIVERSE_RETRY_AFTER;
         // A listing under half the size of the one in use is more likely a
         // partial answer than half the markets closing at once: it is applied
-        // only when the next refresh confirms it.
-        let mut shrunken_listing_seen = false;
+        // only when the next listing confirms it, at about the same size.
+        let mut shrunken_listing: Option<usize> = None;
         self.position_tracker.load_active_positions().await?;
         self.position_tracker.log_summary();
         let _ = self.rebuild_eligible_markets(SelectionRebuildReason::Startup);
@@ -623,10 +623,8 @@ impl ArbMonitor {
             .subscribe_orderbook(self.active_subscription_asset_ids())
             .await?;
         self.last_resubscribe_at = Some(Utc::now());
-        let update_timeout_secs = std::env::var("ARB_UPDATE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
+        let update_timeout_secs =
+            polymarket_core::config::env_count::<u64>("ARB_UPDATE_TIMEOUT_SECS", 120);
 
         info!("Subscribed to order book updates, monitoring for arbitrage...");
 
@@ -724,9 +722,10 @@ impl ArbMonitor {
                     if universe_fetch.is_some() =>
                 {
                     universe_fetch = None;
-                    // A failed refresh is retried soon rather than after a
-                    // whole interval on the previous set.
-                    next_universe_refresh = tokio::time::Instant::now() + UNIVERSE_RETRY_AFTER;
+                    // A failed refresh is retried sooner than a whole interval
+                    // on the previous set.
+                    next_universe_refresh = tokio::time::Instant::now() + universe_retry_after;
+                    universe_retry_after = (universe_retry_after * 2).min(universe_refresh_interval);
                     match fetched {
                         // An empty answer is a failed listing, not a market
                         // with nothing to trade: it would unsubscribe every book.
@@ -734,10 +733,11 @@ impl ArbMonitor {
                             "Arb market universe refresh returned no markets; keeping previous set"
                         ),
                         Ok(Ok(markets))
-                            if !shrunken_listing_seen
-                                && binary_market_count(&markets) * 2 < self.all_market_ids.len() =>
+                            if binary_market_count(&markets) * 2 < self.all_market_ids.len()
+                                && !shrunken_listing
+                                    .is_some_and(|seen| confirms_listing(seen, binary_market_count(&markets))) =>
                         {
-                            shrunken_listing_seen = true;
+                            shrunken_listing = Some(binary_market_count(&markets));
                             warn!(
                                 listed = binary_market_count(&markets),
                                 in_use = self.all_market_ids.len(),
@@ -746,7 +746,8 @@ impl ArbMonitor {
                             );
                         }
                         Ok(Ok(markets)) => {
-                            shrunken_listing_seen = false;
+                            shrunken_listing = None;
+                            universe_retry_after = UNIVERSE_RETRY_AFTER;
                             next_universe_refresh = tokio::time::Instant::now() + universe_refresh_interval;
                             self.apply_universe(markets);
                             info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe");
@@ -1597,8 +1598,9 @@ async fn load_dynamic_values(pool: &sqlx::PgPool) -> HashMap<String, Decimal> {
 }
 
 fn load_allowed_dynamic_sources() -> HashSet<String> {
-    std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
-        .unwrap_or_else(|_| {
+    // Blank is unset: an empty list would refuse every update.
+    polymarket_core::config::env_set("DYNAMIC_CONFIG_ALLOWED_SOURCES")
+        .unwrap_or_else(|| {
             "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync,workspace_manual".to_string()
         })
         .split(',')
@@ -2123,6 +2125,14 @@ mod tests {
 
     fn profile(liquidity: f64, volume: f64) -> MarketProfile {
         MarketProfile { liquidity, volume }
+    }
+
+    #[test]
+    fn a_short_listing_is_confirmed_only_by_one_of_about_its_size() {
+        assert!(confirms_listing(1000, 1000));
+        assert!(confirms_listing(1000, 1090));
+        assert!(!confirms_listing(1000, 1200));
+        assert!(!confirms_listing(1000, 400));
     }
 
     #[test]

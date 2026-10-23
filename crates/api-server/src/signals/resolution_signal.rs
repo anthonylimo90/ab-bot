@@ -50,18 +50,18 @@ impl ResolutionSignalConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("RESOLUTION_SIGNAL_ENABLED", true),
-            interval_secs: std::env::var("RESOLUTION_SIGNAL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(900),
+            interval_secs: polymarket_core::config::env_count(
+                "RESOLUTION_SIGNAL_INTERVAL_SECS",
+                900,
+            ),
             min_days_remaining: 1,
             max_days_remaining: 7,
             min_price_deviation: 0.15,
-            min_volume: std::env::var("RESOLUTION_MIN_VOLUME_USD")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Decimal::new(1000, 0)),
-            base_position_size_usd: polymarket_core::config::env_decimal(
+            min_volume: polymarket_core::config::env_number(
+                "RESOLUTION_MIN_VOLUME_USD",
+                Decimal::new(1000, 0),
+            ),
+            base_position_size_usd: polymarket_core::config::env_positive_decimal(
                 "QUANT_BASE_POSITION_SIZE",
                 Decimal::new(30, 0),
             ),

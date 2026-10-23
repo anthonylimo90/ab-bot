@@ -40,10 +40,10 @@ impl WalletInventoryConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("WALLET_INVENTORY_ENABLED", true),
-            interval_secs: std::env::var("WALLET_INVENTORY_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(180),
+            interval_secs: polymarket_core::config::env_count(
+                "WALLET_INVENTORY_INTERVAL_SECS",
+                180,
+            ),
             initial_phase2_lookback_blocks: std::env::var(
                 "WALLET_INVENTORY_INITIAL_LOOKBACK_BLOCKS",
             )
@@ -56,10 +56,10 @@ impl WalletInventoryConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-            phase2_chunk_blocks: std::env::var("WALLET_INVENTORY_PHASE2_CHUNK_BLOCKS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2_000_000),
+            phase2_chunk_blocks: polymarket_core::config::env_count(
+                "WALLET_INVENTORY_PHASE2_CHUNK_BLOCKS",
+                2_000_000,
+            ),
             phase2_backfill_chunks_per_refresh: std::env::var(
                 "WALLET_INVENTORY_PHASE2_BACKFILL_CHUNKS_PER_REFRESH",
             )

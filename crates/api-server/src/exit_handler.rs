@@ -184,16 +184,16 @@ impl ExitHandlerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_switch("EXIT_HANDLER_ENABLED"),
-            exit_poll_interval_secs: std::env::var("EXIT_POLL_INTERVAL_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(30),
-            resolution_check_secs: std::env::var("EXIT_RESOLUTION_CHECK_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300),
+            exit_poll_interval_secs: polymarket_core::config::env_count(
+                "EXIT_POLL_INTERVAL_SECS",
+                30,
+            ),
+            resolution_check_secs: polymarket_core::config::env_count(
+                "EXIT_RESOLUTION_CHECK_SECS",
+                300,
+            ),
             // A gain can exceed the cost: 1.5 takes profit at +150%.
-            quant_take_profit_pct: polymarket_core::config::env_positive_decimal(
+            quant_take_profit_pct: polymarket_core::config::env_number(
                 "QUANT_TAKE_PROFIT_PCT",
                 Decimal::new(15, 2),
             ),
@@ -201,14 +201,11 @@ impl ExitHandlerConfig {
                 "QUANT_STOP_LOSS_PCT",
                 Decimal::new(10, 2),
             ),
-            quant_max_hold_hours: std::env::var("QUANT_MAX_HOLD_HOURS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(24),
-            failed_exit_retry_backoff_secs: std::env::var("EXIT_FAILED_RETRY_BACKOFF_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(300),
+            quant_max_hold_hours: polymarket_core::config::env_count("QUANT_MAX_HOLD_HOURS", 24),
+            failed_exit_retry_backoff_secs: polymarket_core::config::env_count(
+                "EXIT_FAILED_RETRY_BACKOFF_SECS",
+                300,
+            ),
         }
     }
 }

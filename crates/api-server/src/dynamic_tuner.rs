@@ -123,47 +123,44 @@ impl DynamicTunerConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("DYNAMIC_TUNER_ENABLED", true),
-            interval_secs: std::env::var("DYNAMIC_TUNER_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+            interval_secs: polymarket_core::config::env_count("DYNAMIC_TUNER_INTERVAL_SECS", 300),
             apply_changes: polymarket_core::config::env_flag("DYNAMIC_TUNER_APPLY", true),
-            regime_hysteresis_intervals: std::env::var("DYNAMIC_TUNER_REGIME_STREAK")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2),
-            max_drawdown_freeze: std::env::var("DYNAMIC_TUNER_FREEZE_DRAWDOWN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.20),
-            evaluation_delay_minutes: std::env::var("DYNAMIC_TUNER_EVAL_DELAY_MINUTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
-            fill_rate_degrade_delta: std::env::var("DYNAMIC_TUNER_FILL_DEGRADE_DELTA")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.08),
-            pnl_degrade_delta: std::env::var("DYNAMIC_TUNER_PNL_DEGRADE_DELTA")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(75.0),
+            regime_hysteresis_intervals: polymarket_core::config::env_count(
+                "DYNAMIC_TUNER_REGIME_STREAK",
+                2,
+            ),
+            max_drawdown_freeze: polymarket_core::config::env_number(
+                "DYNAMIC_TUNER_FREEZE_DRAWDOWN",
+                0.20,
+            ),
+            evaluation_delay_minutes: polymarket_core::config::env_count(
+                "DYNAMIC_TUNER_EVAL_DELAY_MINUTES",
+                10,
+            ),
+            fill_rate_degrade_delta: polymarket_core::config::env_number(
+                "DYNAMIC_TUNER_FILL_DEGRADE_DELTA",
+                0.08,
+            ),
+            pnl_degrade_delta: polymarket_core::config::env_number(
+                "DYNAMIC_TUNER_PNL_DEGRADE_DELTA",
+                75.0,
+            ),
             bootstrap_enabled: polymarket_core::config::env_flag(
                 "DYNAMIC_TUNER_BOOTSTRAP_ENABLED",
                 true,
             ),
-            bootstrap_max_attempts: std::env::var("DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
-            no_trade_window_minutes: std::env::var("DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(120),
-            no_trade_min_attempts: std::env::var("DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20),
+            bootstrap_max_attempts: polymarket_core::config::env_count(
+                "DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS",
+                100,
+            ),
+            no_trade_window_minutes: polymarket_core::config::env_count(
+                "DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES",
+                120,
+            ),
+            no_trade_min_attempts: polymarket_core::config::env_count(
+                "DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS",
+                20,
+            ),
             redis_url: std::env::var("DYNAMIC_TUNER_REDIS_URL")
                 .or_else(|_| std::env::var("REDIS_URL"))
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
@@ -193,6 +190,11 @@ const MANUAL_HOLD_HOURS: i64 = 24;
 /// The tuner never relaxes the book depth floor below this share of its
 /// default, however long entries keep failing.
 const MIN_DEPTH_FLOOR_SHARE: f64 = 0.6;
+/// The share of its default the arbitrage profit threshold may be relaxed
+/// to. Slippage is not measured yet (`realized_slippage_p90` is 0), so the
+/// target rests on an assumed figure and is not trusted far below the
+/// configured default.
+const MIN_PROFIT_FLOOR_SHARE: f64 = 0.8;
 /// Closed quant trades in seven days needed before their profit grows the
 /// base size, and the most the tuner grows it to (as a multiple of default).
 const QUANT_SIZE_MIN_TRADES: i64 = 10;
@@ -723,6 +725,10 @@ impl DynamicTuner {
             if no_trade_watchdog && top_skip == "below_min_profit" {
                 desired_arb_profit *= 0.90;
             }
+            if let Some(row) = rows.get(KEY_ARB_MIN_PROFIT_THRESHOLD) {
+                let floor = decimal_to_f64(row.default_value) * MIN_PROFIT_FLOOR_SHARE;
+                desired_arb_profit = desired_arb_profit.max(floor);
+            }
             // No ratchet floor — apply_step_limit already caps movement
             // to max_step_pct (12%) per cycle, which is sufficient.
             // The old `.max(current * 0.7)` prevented the tuner from
@@ -1016,7 +1022,10 @@ impl DynamicTuner {
         let seeds = vec![
             ConfigSeed {
                 key: KEY_ARB_MIN_PROFIT_THRESHOLD,
-                default_value: env_decimal("ARB_MIN_PROFIT_THRESHOLD", Decimal::new(5, 3)),
+                default_value: polymarket_core::config::env_number(
+                    "ARB_MIN_PROFIT_THRESHOLD",
+                    Decimal::new(5, 3),
+                ),
                 min_value: Decimal::new(2, 3),
                 // Hard-cap at 0.005 (0.5%) — real arb spreads are 0.5-2%.
                 // Higher values create a death spiral: no signals → tuner raises → even fewer signals.
@@ -1025,14 +1034,20 @@ impl DynamicTuner {
             },
             ConfigSeed {
                 key: KEY_ARB_MONITOR_MAX_MARKETS,
-                default_value: env_decimal("ARB_MONITOR_MAX_MARKETS", Decimal::new(300, 0)),
+                default_value: Decimal::from(polymarket_core::config::env_count::<i64>(
+                    "ARB_MONITOR_MAX_MARKETS",
+                    300,
+                )),
                 min_value: Decimal::new(25, 0),
                 max_value: Decimal::new(1500, 0),
                 max_step_pct: Decimal::new(15, 2),
             },
             ConfigSeed {
                 key: KEY_ARB_MONITOR_EXPLORATION_SLOTS,
-                default_value: env_decimal("ARB_MONITOR_EXPLORATION_SLOTS", Decimal::new(5, 0)),
+                default_value: Decimal::from(polymarket_core::config::env_count::<i64>(
+                    "ARB_MONITOR_EXPLORATION_SLOTS",
+                    5,
+                )),
                 min_value: Decimal::new(1, 0),
                 max_value: Decimal::new(500, 0),
                 max_step_pct: Decimal::new(25, 2),
@@ -1047,28 +1062,40 @@ impl DynamicTuner {
             // ── Arb executor tuning knobs ──
             ConfigSeed {
                 key: KEY_ARB_POSITION_SIZE,
-                default_value: env_decimal("ARB_POSITION_SIZE", Decimal::new(10, 0)),
+                default_value: polymarket_core::config::env_positive_decimal(
+                    "ARB_POSITION_SIZE",
+                    Decimal::new(10, 0),
+                ),
                 min_value: Decimal::new(5, 0),  // $5 floor
                 max_value: Decimal::new(25, 0), // $25 ceiling (small wallet)
                 max_step_pct: Decimal::new(20, 2),
             },
             ConfigSeed {
                 key: KEY_ARB_MIN_NET_PROFIT,
-                default_value: env_decimal("ARB_MIN_NET_PROFIT", Decimal::new(1, 3)),
+                default_value: polymarket_core::config::env_number(
+                    "ARB_MIN_NET_PROFIT",
+                    Decimal::new(1, 3),
+                ),
                 min_value: Decimal::new(5, 4), // 0.0005 floor
                 max_value: Decimal::new(5, 2), // 0.05 ceiling
                 max_step_pct: Decimal::new(15, 2),
             },
             ConfigSeed {
                 key: KEY_ARB_MIN_BOOK_DEPTH,
-                default_value: env_decimal("ARB_MIN_BOOK_DEPTH", Decimal::new(25, 0)),
+                default_value: polymarket_core::config::env_positive_decimal(
+                    "ARB_MIN_BOOK_DEPTH",
+                    Decimal::new(25, 0),
+                ),
                 min_value: Decimal::new(10, 0),  // $10 floor
                 max_value: Decimal::new(200, 0), // $200 ceiling (small wallet)
                 max_step_pct: Decimal::new(20, 2),
             },
             ConfigSeed {
                 key: KEY_ARB_MAX_SIGNAL_AGE_SECS,
-                default_value: env_decimal("ARB_MAX_SIGNAL_AGE_SECS", Decimal::new(30, 0)),
+                default_value: Decimal::from(polymarket_core::config::env_count::<i64>(
+                    "ARB_MAX_SIGNAL_AGE_SECS",
+                    30,
+                )),
                 min_value: Decimal::new(5, 0),   // 5s floor
                 max_value: Decimal::new(300, 0), // 300s ceiling
                 max_step_pct: Decimal::new(25, 2),
@@ -1076,7 +1103,10 @@ impl DynamicTuner {
             // ── Quant signal executor tuning knob ──
             ConfigSeed {
                 key: KEY_QUANT_BASE_POSITION_SIZE,
-                default_value: env_decimal("QUANT_BASE_POSITION_SIZE", Decimal::new(30, 0)),
+                default_value: polymarket_core::config::env_positive_decimal(
+                    "QUANT_BASE_POSITION_SIZE",
+                    Decimal::new(30, 0),
+                ),
                 min_value: Decimal::new(10, 0),    // $10 floor
                 max_value: Decimal::new(200, 0),   // $200 ceiling
                 max_step_pct: Decimal::new(15, 2), // 15% per cycle
@@ -1687,8 +1717,9 @@ async fn apply_startup_snapshot_to_quant_executor(
 }
 
 fn load_allowed_update_sources() -> Vec<String> {
-    std::env::var("DYNAMIC_CONFIG_ALLOWED_SOURCES")
-        .unwrap_or_else(|_| {
+    // Blank is unset: an empty list would refuse every update.
+    polymarket_core::config::env_set("DYNAMIC_CONFIG_ALLOWED_SOURCES")
+        .unwrap_or_else(|| {
             "dynamic_tuner,dynamic_tuner_rollback,dynamic_tuner_sync,workspace_manual".to_string()
         })
         .split(',')
@@ -1765,16 +1796,8 @@ fn clamp_to_bounds(value: Decimal, min: Decimal, max: Decimal) -> Decimal {
     value.max(min).min(max)
 }
 
-fn env_decimal(name: &str, fallback: Decimal) -> Decimal {
-    polymarket_core::config::env_decimal(name, fallback)
-}
-
 fn env_aggressiveness_level() -> Decimal {
-    match std::env::var("ARB_MONITOR_AGGRESSIVENESS")
-        .unwrap_or_else(|_| "balanced".to_string())
-        .to_lowercase()
-        .as_str()
-    {
+    match polymarket_core::config::env_choice("ARB_MONITOR_AGGRESSIVENESS", "balanced").as_str() {
         "stable" | "conservative" => Decimal::ZERO,
         "discovery" | "aggressive" => Decimal::new(2, 0),
         _ => Decimal::new(1, 0),

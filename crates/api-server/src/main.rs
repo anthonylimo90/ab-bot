@@ -80,33 +80,28 @@ async fn main() -> anyhow::Result<()> {
             "Trading switches set in the environment (the workspace's settings can also \
              switch services on)"
         );
+        if env_switch("LIVE_TRADING")
+            && !polymarket_core::config::env_flag("ACCOUNT_SNAPSHOT_ENABLED", true)
+        {
+            tracing::error!(
+                "LIVE_TRADING is on with ACCOUNT_SNAPSHOT_ENABLED off: the circuit breaker gets \
+                 no equity readings, so its drawdown limits and its trip for an account that \
+                 cannot be valued never act"
+            );
+        }
     }
 
     // Create database connection pool with retry
     let db_config = DatabaseConfig {
         url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
-        max_connections: std::env::var("DATABASE_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(20),
-        max_retries: std::env::var("DB_RETRY_MAX_ATTEMPTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5),
-        retry_base_delay_ms: std::env::var("DB_RETRY_BASE_DELAY_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000),
-        retry_max_delay_ms: std::env::var("DB_RETRY_MAX_DELAY_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30000),
-        acquire_timeout_secs: Some(
-            std::env::var("DB_ACQUIRE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5),
-        ),
+        max_connections: polymarket_core::config::env_count("DATABASE_MAX_CONNECTIONS", 20),
+        max_retries: polymarket_core::config::env_count("DB_RETRY_MAX_ATTEMPTS", 5),
+        retry_base_delay_ms: polymarket_core::config::env_count("DB_RETRY_BASE_DELAY_MS", 1000),
+        retry_max_delay_ms: polymarket_core::config::env_count("DB_RETRY_MAX_DELAY_MS", 30000),
+        acquire_timeout_secs: Some(polymarket_core::config::env_count(
+            "DB_ACQUIRE_TIMEOUT_SECS",
+            5,
+        )),
     };
     // The server waits for a database that is down at start rather than
     // exiting: each exit spends one of the platform's restarts, and a long
@@ -164,9 +159,8 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             };
-            // The server listens for stop signals itself from its first step.
-            drop(stop);
-            server.run().await?;
+            // The server takes over the listener, with any signal it holds.
+            server.run_until(stop).await?;
         }
     }
 

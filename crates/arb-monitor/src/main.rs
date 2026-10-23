@@ -23,9 +23,12 @@ const HEALTH_FILE: &str = "/tmp/healthy";
 /// process exits for its supervisor to restart it. The loop shows life at
 /// least once a minute.
 const LOOP_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long the monitor may take from the watchdog's start to its first loop.
+const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(1_800);
 
 /// When the monitoring loop last showed life, in milliseconds since
-/// `PROCESS_START`, plus one; zero until the loop starts.
+/// `PROCESS_START` (the watchdog's start), plus one; zero until the loop
+/// starts.
 static LOOP_ALIVE_AT: AtomicU64 = AtomicU64::new(0);
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
@@ -51,6 +54,15 @@ fn spawn_loop_watchdog() {
         std::thread::sleep(std::time::Duration::from_secs(30));
         let alive_at = LOOP_ALIVE_AT.load(Ordering::Relaxed);
         if alive_at == 0 {
+            // Still starting (loading the market universe): a start that
+            // hangs is given far longer than the loop, but not forever.
+            if PROCESS_START.elapsed() > STARTUP_LIMIT {
+                tracing::error!(
+                    "Arbitrage monitor has not finished starting in 30 minutes; exiting so it \
+                     is restarted"
+                );
+                std::process::exit(1);
+            }
             continue;
         }
         let now = PROCESS_START.elapsed().as_millis() as u64;

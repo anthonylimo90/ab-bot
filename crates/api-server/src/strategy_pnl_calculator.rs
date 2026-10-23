@@ -31,10 +31,7 @@ impl StrategyPnlConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("STRATEGY_PNL_ENABLED", true),
-            interval_secs: std::env::var("STRATEGY_PNL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(21600), // 6 hours
+            interval_secs: polymarket_core::config::env_count("STRATEGY_PNL_INTERVAL_SECS", 21600), // 6 hours
             periods: vec![7, 30],
         }
     }

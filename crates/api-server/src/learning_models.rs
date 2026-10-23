@@ -91,10 +91,7 @@ impl LearningModelRuntime {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            refresh_secs: std::env::var("LEARNING_MODEL_REFRESH_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+            refresh_secs: polymarket_core::config::env_count("LEARNING_MODEL_REFRESH_SECS", 30),
             cache: Arc::new(RwLock::new(None)),
         }
     }

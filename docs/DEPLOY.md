@@ -828,15 +828,32 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 
 ### Settings checked at start, the arb monitor and signal analytics
 
-- **A setting that cannot be read stops the API and the arb monitor at
-  start**, naming it and what it expects: a yes/no value such as
-  `disabled`, a money switch other than `true`/`false` (`TRUE`, `1`), a
-  number with a comma or unit, a fraction written as a percentage. Before,
-  such a value fell back to the setting's default, which left a service
-  meant off running. `ARB_ALLOW_LIVE_EXECUTION=1` was accepted as on and is
+- **A setting that cannot be read, or is out of its range, stops the API
+  and the arb monitor at start**, naming it and what it expects: a yes/no
+  value such as `disabled`, a money switch other than `true`/`false`
+  (`TRUE`, `1`), a number with a comma or unit, a fraction written as a
+  percentage, a decimal where a whole number goes, or a value that cannot be
+  meant: a zero loop interval (it would spin), `QUANT_MAX_HOLD_HOURS=0`
+  (every quant entry sold at once), `EXIT_POLL_INTERVAL_SECS` above 300,
+  `ARB_UPDATE_TIMEOUT_SECS` under 10 (reconnecting without pause), a
+  non-positive size, exposure, depth or daily loss, `ARB_MIN_NET_PROFIT` of
+  0 or less, `QUANT_TAKE_PROFIT_PCT` above 10, `ARB_MIN_POSITION_SIZE` above
+  `ARB_MAX_POSITION_SIZE`, or `VAULT_PROVIDER` other than `file` or
+  `environment` (`aws` is not implemented). Every numeric setting is
+  checked, about 150 in all (`SETTINGS` in
+  `crates/polymarket-core/src/config.rs` lists them with their ranges); a
+  test keeps that list in step with the code and checks `.env.example`
+  against it. Before, such a value fell back to the setting's default,
+  which left a service meant off running. A blank value is unset. `ARB_ALLOW_LIVE_EXECUTION=1` was accepted as on and is
   now refused: write `true`. Check every service's settings before
   upgrading: a service that refuses to start leaves open positions without
   their exits until it is corrected.
+- Starting with `LIVE_TRADING=true` and `ACCOUNT_SNAPSHOT_ENABLED=false`
+  logs an error: the circuit breaker then gets no equity readings.
+- The status page reads `DYNAMIC_TUNER_ENABLED`/`DYNAMIC_TUNER_APPLY` as
+  the tuner does (`on` is on; blank is the default). A blank
+  `DYNAMIC_CONFIG_ALLOWED_SOURCES` is unset rather than an empty list that
+  refused every dynamic update.
 - The default log filters now start with `warn`
   (`warn,api_server=info,auth=info,risk_manager=info,trading_engine=info,...`):
   the old filters dropped the circuit breaker's and the order executor's

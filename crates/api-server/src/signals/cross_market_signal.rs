@@ -46,22 +46,13 @@ impl CrossMarketSignalConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_switch("CROSS_MARKET_SIGNAL_ENABLED"),
-            interval_secs: std::env::var("CROSS_MARKET_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(900),
-            min_correlation: std::env::var("CROSS_MARKET_MIN_CORRELATION")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.70),
-            min_lead_move: std::env::var("CROSS_MARKET_MIN_LEAD_MOVE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.05),
-            max_lag_move: std::env::var("CROSS_MARKET_MAX_LAG_MOVE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.02),
+            interval_secs: polymarket_core::config::env_count("CROSS_MARKET_INTERVAL_SECS", 900),
+            min_correlation: polymarket_core::config::env_number(
+                "CROSS_MARKET_MIN_CORRELATION",
+                0.70,
+            ),
+            min_lead_move: polymarket_core::config::env_number("CROSS_MARKET_MIN_LEAD_MOVE", 0.05),
+            max_lag_move: polymarket_core::config::env_number("CROSS_MARKET_MAX_LAG_MOVE", 0.02),
             base_position_size_usd: Decimal::new(30, 0),
             expiry_minutes: 60,
         }

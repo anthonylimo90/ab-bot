@@ -52,18 +52,12 @@ impl MetricsCalculatorConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("METRICS_CALCULATOR_ENABLED", true),
-            interval_secs: std::env::var("METRICS_CALCULATOR_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(900),
-            batch_size: std::env::var("METRICS_CALCULATOR_BATCH_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(50),
-            recalc_after_hours: std::env::var("METRICS_RECALC_AFTER_HOURS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(6),
+            interval_secs: polymarket_core::config::env_count(
+                "METRICS_CALCULATOR_INTERVAL_SECS",
+                900,
+            ),
+            batch_size: polymarket_core::config::env_count("METRICS_CALCULATOR_BATCH_SIZE", 50),
+            recalc_after_hours: polymarket_core::config::env_count("METRICS_RECALC_AFTER_HOURS", 6),
         }
     }
 }

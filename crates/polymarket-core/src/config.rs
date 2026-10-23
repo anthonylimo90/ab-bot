@@ -149,8 +149,91 @@ pub fn env_share_f64(name: &str, default: f64) -> f64 {
     default
 }
 
+/// A whole-number setting (a count, or seconds, minutes, hours) with
+/// `default` when unset. A value that is not a whole number, or is outside
+/// the range [`SETTINGS`] gives the name, stops a start; read later it keeps
+/// the default and is reported.
+pub fn env_count<T>(name: &str, default: T) -> T
+where
+    T: TryFrom<i64> + Copy + std::fmt::Display,
+{
+    env_count_opt(name).unwrap_or(default)
+}
+
+/// As [`env_count`], `None` when unset (or unreadable, which is reported).
+pub fn env_count_opt<T>(name: &str) -> Option<T>
+where
+    T: TryFrom<i64> + Copy + std::fmt::Display,
+{
+    let value = env_set(name)?;
+    let kind = setting_kind(name);
+    let read = value
+        .parse::<i64>()
+        .ok()
+        .filter(|_| kind.is_none_or(|kind| kind.reads(&value)))
+        .and_then(|count| T::try_from(count).ok());
+    if read.is_none() {
+        report_once(name, || {
+            format!(
+                "{name}={value} is not {}; using its default",
+                kind.map_or_else(|| "a whole number".to_string(), SettingKind::expected)
+            )
+        });
+    }
+    read
+}
+
+/// A number setting (an `f64` or a `Decimal`) with `default` when unset;
+/// scientific notation is read. A value that is not a number, or is outside
+/// the range [`SETTINGS`] gives the name, stops a start; read later it keeps
+/// the default and is reported.
+pub fn env_number<T>(name: &str, default: T) -> T
+where
+    T: TryFrom<rust_decimal::Decimal> + Copy + std::fmt::Display,
+{
+    let Some(value) = env_set(name) else {
+        return default;
+    };
+    let kind = setting_kind(name);
+    match parse_decimal(&value)
+        .filter(|_| kind.is_none_or(|kind| kind.reads(&value)))
+        .and_then(|number| T::try_from(number).ok())
+    {
+        Some(number) => number,
+        None => {
+            report_once(name, || {
+                format!(
+                    "{name}={value} is not {}; using its default ({default})",
+                    kind.map_or_else(|| "a number".to_string(), SettingKind::expected)
+                )
+            });
+            default
+        }
+    }
+}
+
+/// One of a setting's words (any case), lowercased, with `default` when
+/// unset. Another word stops a start; read later it keeps the default and is
+/// reported.
+pub fn env_choice(name: &str, default: &str) -> String {
+    let Some(value) = env_set(name) else {
+        return default.to_string();
+    };
+    let kind = setting_kind(name);
+    if kind.is_none_or(|kind| kind.reads(&value)) {
+        return value.to_ascii_lowercase();
+    }
+    report_once(name, || {
+        format!(
+            "{name}={value} is not {}; using its default ({default})",
+            kind.map_or_else(String::new, SettingKind::expected)
+        )
+    });
+    default.to_string()
+}
+
 /// How a setting read through the helpers above is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingKind {
     /// [`env_flag`]
     Flag,
@@ -164,10 +247,48 @@ pub enum SettingKind {
     PositiveDecimal,
     /// [`env_share_f64`]
     Share,
+    /// A whole number from `min` to `max` ([`env_count`], [`env_count_opt`]).
+    Count { min: i64, max: i64 },
+    /// One of the listed whole numbers ([`env_count`]).
+    CountOf(&'static [i64]),
+    /// A number at most `max`, and above `min` (when `above`) or at least it
+    /// ([`env_number`]).
+    Number { min: f64, max: f64, above: bool },
+    /// One of the listed words, in any case ([`env_choice`]).
+    Choice(&'static [&'static str]),
 }
+
+/// A number above `min`, at most `max`.
+const fn above(min: f64, max: f64) -> SettingKind {
+    SettingKind::Number {
+        min,
+        max,
+        above: true,
+    }
+}
+
+/// A number from `min` to `max`.
+const fn between(min: f64, max: f64) -> SettingKind {
+    SettingKind::Number {
+        min,
+        max,
+        above: false,
+    }
+}
+
+const fn count(min: i64, max: i64) -> SettingKind {
+    SettingKind::Count { min, max }
+}
+
+/// Seconds between the passes of a background loop: at least one (zero would
+/// spin it), at most a week.
+const LOOP_SECS: SettingKind = count(1, 604_800);
+/// A delay before a background loop's first pass, up to a day.
+const STARTUP_DELAY_SECS: SettingKind = count(0, 86_400);
 
 impl SettingKind {
     fn reads(self, value: &str) -> bool {
+        use rust_decimal::prelude::ToPrimitive;
         use rust_decimal::Decimal;
         match self {
             SettingKind::Flag => parse_flag(value).is_some(),
@@ -180,91 +301,329 @@ impl SettingKind {
             SettingKind::Share => {
                 parse_decimal(value).is_some_and(|v| v >= Decimal::ZERO && v <= Decimal::ONE)
             }
+            SettingKind::Count { min, max } => value
+                .parse::<i64>()
+                .is_ok_and(|count| (min..=max).contains(&count)),
+            SettingKind::CountOf(allowed) => value
+                .parse::<i64>()
+                .is_ok_and(|count| allowed.contains(&count)),
+            SettingKind::Number { min, max, above } => parse_decimal(value)
+                .and_then(|number| number.to_f64())
+                .is_some_and(|number| {
+                    (if above { number > min } else { number >= min }) && number <= max
+                }),
+            SettingKind::Choice(words) => words.iter().any(|word| value.eq_ignore_ascii_case(word)),
         }
     }
 
-    fn expected(self) -> &'static str {
+    fn expected(self) -> String {
         match self {
-            SettingKind::Flag => "true or false (also 1/0, yes/no, on/off)",
-            SettingKind::Switch => "exactly true or false",
-            SettingKind::Decimal => "a number",
-            SettingKind::Fraction => "a fraction above 0 and at most 1 (0.10 for 10%)",
-            SettingKind::PositiveDecimal => "a number above 0 (0.15 for 15%)",
-            SettingKind::Share => "a share from 0 to 1 (0.40 for 40%)",
+            SettingKind::Flag => "true or false (also 1/0, yes/no, on/off)".into(),
+            SettingKind::Switch => "exactly true or false".into(),
+            SettingKind::Decimal => "a number".into(),
+            SettingKind::Fraction => "a fraction above 0 and at most 1 (0.10 for 10%)".into(),
+            SettingKind::PositiveDecimal => "a number above 0".into(),
+            SettingKind::Share => "a share from 0 to 1 (0.40 for 40%)".into(),
+            SettingKind::Count { min, max } => format!("a whole number from {min} to {max}"),
+            SettingKind::CountOf(allowed) => format!(
+                "one of {}",
+                allowed
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            SettingKind::Number { min, max, above } => {
+                let low = if above { "above" } else { "at least" };
+                if max.is_finite() {
+                    format!("a number {low} {min} and at most {max}")
+                } else {
+                    format!("a number {low} {min}")
+                }
+            }
+            SettingKind::Choice(words) => format!("one of {}", words.join(", ")),
+        }
+    }
+
+    /// The helper that reads a setting of this kind.
+    #[cfg(test)]
+    fn helper(self) -> &'static str {
+        match self {
+            SettingKind::Flag => "env_flag",
+            SettingKind::Switch => "env_switch",
+            SettingKind::Decimal => "env_decimal",
+            SettingKind::Fraction => "env_fraction",
+            SettingKind::PositiveDecimal => "env_positive_decimal",
+            SettingKind::Share => "env_share_f64",
+            SettingKind::Count { .. } | SettingKind::CountOf(_) => "env_count",
+            SettingKind::Number { .. } => "env_number",
+            SettingKind::Choice(_) => "env_choice",
         }
     }
 }
 
-/// Every setting the services read through the helpers above. A test keeps
-/// this list in step with the code.
+fn setting_kind(name: &str) -> Option<SettingKind> {
+    SETTINGS
+        .iter()
+        .find(|(listed, _)| *listed == name)
+        .map(|(_, kind)| *kind)
+}
+
+/// Every setting the services read through the helpers above, with the
+/// values it takes. A range rejects only values that cannot be meant (a zero
+/// interval, 15 written for 15%), not unusual ones. A test keeps this list
+/// in step with the code.
 pub const SETTINGS: &[(&str, SettingKind)] = &[
     ("ACCOUNT_SNAPSHOT_ENABLED", SettingKind::Flag),
+    ("ACCOUNT_SNAPSHOT_INTERVAL_SECS", count(30, 900)),
+    ("API_PORT", count(1, 65_535)),
     ("ARB_ALLOW_LIVE_EXECUTION", SettingKind::Switch),
     ("ARB_AUTO_EXECUTE", SettingKind::Switch),
+    ("ARB_CACHE_REFRESH_SECS", count(1, 3_600)),
     ("ARB_DYNAMIC_SIZING", SettingKind::Flag),
-    ("ARB_MAX_POSITION_SIZE", SettingKind::Decimal),
-    ("ARB_MAX_SIGNAL_AGE_SECS", SettingKind::Decimal),
-    ("ARB_MAX_TOTAL_EXPOSURE", SettingKind::Decimal),
-    ("ARB_MIN_BOOK_DEPTH", SettingKind::Decimal),
-    ("ARB_MIN_NET_PROFIT", SettingKind::Decimal),
-    ("ARB_MIN_POSITION_SIZE", SettingKind::Decimal),
-    ("ARB_MIN_PROFIT_THRESHOLD", SettingKind::Decimal),
-    ("ARB_MONITOR_EXPLORATION_SLOTS", SettingKind::Decimal),
-    ("ARB_MONITOR_MAX_MARKETS", SettingKind::Decimal),
-    ("ARB_POSITION_SIZE", SettingKind::Decimal),
+    ("ARB_EXPLORATION_HOLD_SECS", count(1, 604_800)),
+    (
+        "ARB_EXPLORATION_SWAP_MIN_SCORE_DELTA",
+        between(0.0, f64::INFINITY),
+    ),
+    ("ARB_MAX_POSITION_SIZE", SettingKind::PositiveDecimal),
+    ("ARB_MAX_SIGNAL_AGE_SECS", count(1, 3_600)),
+    ("ARB_MAX_TOTAL_EXPOSURE", SettingKind::PositiveDecimal),
+    ("ARB_MIN_BOOK_DEPTH", SettingKind::PositiveDecimal),
+    ("ARB_MIN_NET_PROFIT", above(0.0, 0.5)),
+    ("ARB_MIN_POSITION_SIZE", SettingKind::PositiveDecimal),
+    ("ARB_MIN_PROFIT_THRESHOLD", above(0.0, 0.5)),
+    (
+        "ARB_MONITOR_AGGRESSIVENESS",
+        SettingKind::Choice(&[
+            "stable",
+            "conservative",
+            "balanced",
+            "discovery",
+            "aggressive",
+        ]),
+    ),
+    ("ARB_MONITOR_EXPLORATION_SLOTS", count(0, 10_000)),
+    ("ARB_MONITOR_MAX_MARKETS", count(1, 100_000)),
+    ("ARB_MONITOR_MIN_BOOK_DEPTH", SettingKind::PositiveDecimal),
+    ("ARB_POSITION_SIZE", SettingKind::PositiveDecimal),
+    ("ARB_SELECTION_FORCE_REFRESH_SECS", count(1, 604_800)),
+    (
+        "ARB_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO",
+        between(0.0, f64::INFINITY),
+    ),
+    (
+        "ARB_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA",
+        count(0, 100_000),
+    ),
+    ("ARB_UNIVERSE_REFRESH_SECS", LOOP_SECS),
+    // Zero would reconnect the order book stream without pause.
+    ("ARB_UPDATE_TIMEOUT_SECS", count(10, 3_600)),
+    ("ARGON2_MAX_CONCURRENCY", count(1, 1_024)),
+    ("BACKTEST_AUTOMATION_CLAIM_LIMIT", count(1, 1_000)),
     ("BACKTEST_AUTOMATION_ENABLED", SettingKind::Flag),
+    ("BACKTEST_AUTOMATION_INTERVAL_SECS", LOOP_SECS),
+    ("BACKTEST_AUTOMATION_STARTUP_DELAY_SECS", STARTUP_DELAY_SECS),
+    ("BACKTEST_STALE_RUN_TIMEOUT_MINUTES", count(1, 43_200)),
+    ("CLOB_MARKET_LIMIT", count(1, 10_000_000)),
+    ("CLOB_WS_PING_INTERVAL_SECS", count(1, 600)),
+    ("CLOB_WS_READ_TIMEOUT_SECS", count(5, 3_600)),
+    ("CORS_PERMISSIVE", SettingKind::Flag),
+    ("CROSS_MARKET_INTERVAL_SECS", LOOP_SECS),
+    ("CROSS_MARKET_MAX_LAG_MOVE", above(0.0, 1.0)),
+    ("CROSS_MARKET_MIN_CORRELATION", above(0.0, 1.0)),
+    ("CROSS_MARKET_MIN_LEAD_MOVE", above(0.0, 1.0)),
     ("CROSS_MARKET_SIGNAL_ENABLED", SettingKind::Switch),
+    ("DATABASE_MAX_CONNECTIONS", count(1, 1_000)),
+    ("DB_ACQUIRE_TIMEOUT_SECS", count(1, 3_600)),
+    ("DB_RETRY_BASE_DELAY_MS", count(0, 600_000)),
+    ("DB_RETRY_MAX_ATTEMPTS", count(0, 30)),
+    ("DB_RETRY_MAX_DELAY_MS", count(0, 3_600_000)),
     ("DYNAMIC_TUNER_APPLY", SettingKind::Flag),
     ("DYNAMIC_TUNER_BOOTSTRAP_ENABLED", SettingKind::Flag),
+    ("DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS", count(0, 1_000_000)),
     ("DYNAMIC_TUNER_ENABLED", SettingKind::Flag),
+    ("DYNAMIC_TUNER_EVAL_DELAY_MINUTES", count(0, 10_080)),
+    ("DYNAMIC_TUNER_FILL_DEGRADE_DELTA", above(0.0, 1.0)),
+    ("DYNAMIC_TUNER_FREEZE_DRAWDOWN", above(0.0, 1.0)),
+    ("DYNAMIC_TUNER_INTERVAL_SECS", LOOP_SECS),
+    ("DYNAMIC_TUNER_NO_TRADE_MIN_ATTEMPTS", count(1, 1_000_000)),
+    ("DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES", count(1, 10_080)),
+    ("DYNAMIC_TUNER_PNL_DEGRADE_DELTA", above(0.0, f64::INFINITY)),
+    ("DYNAMIC_TUNER_REGIME_STREAK", count(1, 1_000)),
+    ("EXECUTOR_MIN_BOOK_DEPTH", above(0.0, f64::INFINITY)),
+    ("EXIT_FAILED_RETRY_BACKOFF_SECS", count(1, 86_400)),
     ("EXIT_HANDLER_ENABLED", SettingKind::Switch),
+    // Stop-losses and take-profits are checked once a pass.
+    ("EXIT_POLL_INTERVAL_SECS", count(1, 300)),
+    ("EXIT_RESOLUTION_CHECK_SECS", count(1, 86_400)),
+    ("FLOW_CALIBRATION_LOOKBACK_DAYS", count(1, 365)),
+    ("FLOW_CALIBRATION_MIN_CLOSED_TRADES", count(1, 100_000)),
     ("FLOW_FEATURE_ENABLED", SettingKind::Flag),
+    ("FLOW_FEATURE_INTERVAL_SECS", LOOP_SECS),
+    ("FLOW_FEATURE_RETENTION_DAYS", count(1, 3_650)),
+    ("FLOW_MAX_SIGNALS_PER_CYCLE", count(1, 10_000)),
+    ("FLOW_MIN_BOT_SCORE_COVERAGE", between(0.0, 1.0)),
+    ("FLOW_MIN_EXPECTED_EDGE_BPS", between(0.0, 10_000.0)),
+    ("FLOW_MIN_IMBALANCE", between(0.0, 1.0)),
+    ("FLOW_MIN_SCORE", between(0.0, 1.0)),
+    ("FLOW_MIN_SMART_MONEY_SHARE", between(0.0, 1.0)),
+    ("FLOW_MIN_SMART_MONEY_USD", between(0.0, f64::INFINITY)),
+    ("FLOW_MIN_TRADE_COUNT", count(0, 1_000_000)),
     ("FLOW_REQUIRE_CALIBRATION", SettingKind::Flag),
     ("FLOW_REQUIRE_YES_PRICE", SettingKind::Flag),
     ("FLOW_SIGNAL_ENABLED", SettingKind::Flag),
+    ("FLOW_SIGNAL_INTERVAL_SECS", LOOP_SECS),
+    // The windows the flow features are computed for.
+    (
+        "FLOW_SIGNAL_WINDOW_MINUTES",
+        SettingKind::CountOf(&[15, 60, 240]),
+    ),
+    ("GAMMA_ARB_MARKET_PAGE_SIZE", count(1, 1_000)),
+    ("GAMMA_MAX_PAGE_SIZE", count(1, 1_000)),
+    ("GAMMA_PAGE_DELAY_MS", count(0, 60_000)),
     ("GAMMA_SYNCER_ENABLED", SettingKind::Flag),
+    ("GAMMA_SYNCER_INTERVAL_SECS", LOOP_SECS),
+    ("GAMMA_SYNCER_PAGE_SIZE", count(1, 1_000)),
     ("HARVESTER_ENABLED", SettingKind::Flag),
+    ("HARVESTER_INTERVAL_SECS", LOOP_SECS),
+    ("HARVESTER_MAX_NEW_PER_CYCLE", count(0, 1_000_000)),
+    ("HARVESTER_TRADES_PER_FETCH", count(1, 100_000)),
+    ("LATENCY_ARB_COOLDOWN_MS", count(0, 86_400_000)),
+    ("LATENCY_ARB_DIVERGENCE_THRESHOLD", above(0.0, 1.0)),
+    ("LATENCY_ARB_EMA_ALPHA", above(0.0, 1.0)),
     ("LATENCY_ARB_ENABLED", SettingKind::Switch),
+    ("LATENCY_ARB_KELLY_BANKROLL", above(0.0, f64::INFINITY)),
+    ("LATENCY_ARB_KELLY_FRACTION", above(0.0, 1.0)),
+    ("LATENCY_ARB_MAX_POSITION_SIZE", above(0.0, f64::INFINITY)),
+    ("LATENCY_ARB_MAX_SIGNAL_AGE_MS", count(1, 600_000)),
+    ("LATENCY_ARB_MAX_YES_PRICE", between(0.0, 1.0)),
+    ("LATENCY_ARB_MIN_EDGE", above(0.0, 1.0)),
+    ("LATENCY_ARB_MIN_POSITION_SIZE", above(0.0, f64::INFINITY)),
+    ("LATENCY_ARB_MIN_YES_PRICE", between(0.0, 1.0)),
+    ("LATENCY_ARB_WARMUP_TICKS", count(0, 1_000_000)),
     ("LEARNING_EVALUATOR_ENABLED", SettingKind::Flag),
+    ("LEARNING_EVALUATOR_INTERVAL_SECS", LOOP_SECS),
+    ("LEARNING_EVALUATOR_LOOKBACK_HOURS", count(1, 87_600)),
+    ("LEARNING_EVALUATOR_MAX_MODELS", count(1, 10_000)),
+    ("LEARNING_EVALUATOR_STARTUP_DELAY_SECS", STARTUP_DELAY_SECS),
+    ("LEARNING_MODEL_REFRESH_SECS", count(1, 86_400)),
     ("LEARNING_ROLLOUT_OBSERVER_ENABLED", SettingKind::Flag),
+    ("LEARNING_ROLLOUT_OBSERVER_INTERVAL_SECS", LOOP_SECS),
+    (
+        "LEARNING_ROLLOUT_OBSERVER_STARTUP_DELAY_SECS",
+        STARTUP_DELAY_SECS,
+    ),
+    ("LEARNING_ROLLOUT_REFRESH_SECS", count(1, 86_400)),
     ("LEARNING_SHADOW_ENABLED", SettingKind::Flag),
     ("LIVE_TRADING", SettingKind::Switch),
+    ("MEAN_REVERSION_INTERVAL_SECS", LOOP_SECS),
     ("MEAN_REVERSION_SIGNAL_ENABLED", SettingKind::Flag),
+    ("MEAN_REV_MIN_MOVE_PCT", above(0.0, 1.0)),
+    ("METRICS_CALCULATOR_BATCH_SIZE", count(1, 100_000)),
     ("METRICS_CALCULATOR_ENABLED", SettingKind::Flag),
+    ("METRICS_CALCULATOR_INTERVAL_SECS", LOOP_SECS),
+    ("METRICS_RECALC_AFTER_HOURS", count(0, 8_760)),
     ("PG_MEMORY_TUNING", SettingKind::Flag),
+    ("PORT", count(1, 65_535)),
     ("POSITION_RECONCILER_ENABLED", SettingKind::Flag),
-    ("QUANT_BASE_POSITION_SIZE", SettingKind::Decimal),
+    ("POSITION_RECONCILER_INTERVAL_SECS", LOOP_SECS),
+    ("POSITION_RECONCILER_STARTUP_DELAY_SECS", STARTUP_DELAY_SECS),
+    ("QUANT_BASE_POSITION_SIZE", SettingKind::PositiveDecimal),
+    ("QUANT_CACHE_REFRESH_SECS", count(1, 3_600)),
     ("QUANT_CROSS_MARKET_ALLOCATION_PCT", SettingKind::Share),
     ("QUANT_EXECUTOR_ENABLED", SettingKind::Switch),
     ("QUANT_FLOW_ALLOCATION_PCT", SettingKind::Share),
+    // Zero would sell every quant position at its first exit pass.
+    ("QUANT_MAX_HOLD_HOURS", count(1, 8_760)),
+    ("QUANT_MAX_POSITIONS", count(1, 1_000)),
+    ("QUANT_MAX_REFERENCE_AGE_SECS", count(1, 86_400)),
+    ("QUANT_MAX_REFERENCE_DRIFT", above(0.0, 0.5)),
+    ("QUANT_MAX_SIGNAL_AGE_SECS", count(1, 3_600)),
     ("QUANT_MEAN_REVERSION_ALLOCATION_PCT", SettingKind::Share),
-    ("QUANT_MIN_BOOK_DEPTH", SettingKind::Decimal),
+    ("QUANT_MIN_BOOK_DEPTH", SettingKind::PositiveDecimal),
+    ("QUANT_MIN_CONFIDENCE", above(0.0, 1.0)),
+    ("QUANT_REENTRY_COOLDOWN_MINUTES", count(0, 10_080)),
     ("QUANT_RESOLUTION_ALLOCATION_PCT", SettingKind::Share),
     ("QUANT_STOP_LOSS_PCT", SettingKind::Fraction),
-    ("QUANT_STRATEGY_MAX_DAILY_LOSS", SettingKind::Decimal),
-    ("QUANT_TAKE_PROFIT_PCT", SettingKind::PositiveDecimal),
+    ("QUANT_STRATEGY_HALT_COOLDOWN_SECS", count(0, 604_800)),
+    ("QUANT_STRATEGY_MAX_CONSECUTIVE_LOSSES", count(1, 1_000)),
+    (
+        "QUANT_STRATEGY_MAX_DAILY_LOSS",
+        SettingKind::PositiveDecimal,
+    ),
+    // A gain can exceed the cost (1.5 is +150%); 15 meant as 15% cannot.
+    ("QUANT_TAKE_PROFIT_PCT", above(0.0, 10.0)),
+    ("REDIS_RECONNECT_DELAY", count(1, 3_600)),
     ("REDIS_SUBSCRIBE_ARB", SettingKind::Flag),
     ("REDIS_SUBSCRIBE_ORDERBOOK", SettingKind::Flag),
+    ("RESOLUTION_MIN_VOLUME_USD", between(0.0, f64::INFINITY)),
     ("RESOLUTION_SIGNAL_ENABLED", SettingKind::Flag),
+    ("RESOLUTION_SIGNAL_INTERVAL_SECS", LOOP_SECS),
     ("SKIP_MIGRATIONS", SettingKind::Flag),
+    ("SMART_MONEY_BOT_THRESHOLD", count(0, 100)),
     ("STRATEGY_HEALTH_ENABLED", SettingKind::Flag),
+    ("STRATEGY_HEALTH_INTERVAL_SECS", LOOP_SECS),
     ("STRATEGY_PNL_ENABLED", SettingKind::Flag),
+    ("STRATEGY_PNL_INTERVAL_SECS", LOOP_SECS),
+    ("TRUSTED_PROXY_HOPS", count(0, 10)),
     ("WALLET_INVENTORY_ENABLED", SettingKind::Flag),
+    ("WALLET_INVENTORY_INTERVAL_SECS", LOOP_SECS),
+    (
+        "WALLET_INVENTORY_PHASE2_CHUNK_BLOCKS",
+        count(1, 1_000_000_000),
+    ),
+    ("WS_CHANNEL_CAPACITY", count(1, 1_000_000)),
+];
+
+/// Settings read by a crate that cannot use the helpers above (`auth`),
+/// checked at start all the same.
+const CHECKED_ELSEWHERE: &[(&str, SettingKind)] = &[
+    // `aws` is not implemented; another word would quietly use the
+    // read-only environment vault.
+    (
+        "VAULT_PROVIDER",
+        SettingKind::Choice(&["file", "environment"]),
+    ),
+];
+
+/// Pairs of settings where the first must not exceed the second, checked when
+/// both are set.
+const ORDERED_PAIRS: &[(&str, &str)] = &[
+    ("ARB_MIN_POSITION_SIZE", "ARB_MAX_POSITION_SIZE"),
+    ("CLOB_WS_PING_INTERVAL_SECS", "CLOB_WS_READ_TIMEOUT_SECS"),
+    (
+        "LATENCY_ARB_MIN_POSITION_SIZE",
+        "LATENCY_ARB_MAX_POSITION_SIZE",
+    ),
+    ("LATENCY_ARB_MIN_YES_PRICE", "LATENCY_ARB_MAX_YES_PRICE"),
 ];
 
 /// The settings in [`SETTINGS`] that are set to a value their helper cannot
-/// read, each with what it expects. A service checks them before it starts
-/// and refuses to start on any: the helpers would otherwise run on a default
-/// the operator did not choose (`disabled` would leave a service on, `10`
-/// meant as 10% would be replaced).
+/// read, each with what it expects, and set pairs out of order. A service
+/// checks them before it starts and refuses to start on any: the helpers
+/// would otherwise run on a default the operator did not choose (`disabled`
+/// would leave a service on, `10` meant as 10% would be replaced).
 pub fn unreadable_settings() -> Vec<String> {
-    SETTINGS
+    let mut problems: Vec<String> = SETTINGS
         .iter()
+        .chain(CHECKED_ELSEWHERE)
         .filter_map(|(name, kind)| {
             let value = env_set(name)?;
             (!kind.reads(&value)).then(|| format!("{name}={value} (expected {})", kind.expected()))
         })
-        .collect()
+        .collect();
+    for (low, high) in ORDERED_PAIRS {
+        let read = |name: &str| env_set(name).and_then(|value| parse_decimal(&value));
+        if let (Some(low_value), Some(high_value)) = (read(low), read(high)) {
+            if low_value > high_value {
+                problems.push(format!(
+                    "{low} ({low_value}) is above {high} ({high_value})"
+                ));
+            }
+        }
+    }
+    problems
 }
 
 /// Application configuration.
@@ -332,25 +691,11 @@ impl Config {
                 url: env::var("DATABASE_URL").map_err(|_| Error::Config {
                     message: "DATABASE_URL environment variable not set".to_string(),
                 })?,
-                max_connections: env::var("DATABASE_MAX_CONNECTIONS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(5),
-                max_retries: env::var("DB_RETRY_MAX_ATTEMPTS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(5),
-                retry_base_delay_ms: env::var("DB_RETRY_BASE_DELAY_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000),
-                retry_max_delay_ms: env::var("DB_RETRY_MAX_DELAY_MS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(30000),
-                acquire_timeout_secs: env::var("DB_ACQUIRE_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok()),
+                max_connections: crate::config::env_count("DATABASE_MAX_CONNECTIONS", 5),
+                max_retries: crate::config::env_count("DB_RETRY_MAX_ATTEMPTS", 5),
+                retry_base_delay_ms: crate::config::env_count("DB_RETRY_BASE_DELAY_MS", 1000),
+                retry_max_delay_ms: crate::config::env_count("DB_RETRY_MAX_DELAY_MS", 30000),
+                acquire_timeout_secs: env_count_opt("DB_ACQUIRE_TIMEOUT_SECS"),
             },
             redis: RedisConfig {
                 url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
@@ -482,25 +827,89 @@ mod env_tests {
             (SettingKind::Fraction, "0.25", "10"),
             (SettingKind::PositiveDecimal, "1.5", "0"),
             (SettingKind::Share, "0", "40"),
+            (count(1, 300), "300", "0"),
+            (count(1, 300), "1", "30.5"),
+            (SettingKind::CountOf(&[15, 60, 240]), "60", "30"),
+            (above(0.0, 10.0), "1.5", "15"),
+            (above(0.0, 10.0), "1e-3", "0"),
+            (between(0.0, 1.0), "0", "-0.1"),
+            (SettingKind::Choice(&["file", "environment"]), "File", "aws"),
         ] {
             assert!(kind.reads(readable), "{kind:?} {readable}");
             assert!(!kind.reads(unreadable), "{kind:?} {unreadable}");
         }
     }
 
+    #[test]
+    fn counts_and_numbers_keep_their_default_outside_their_range() {
+        // Unlisted names read any whole number or number.
+        std::env::set_var("ENV_TESTS_COUNT", "45");
+        assert_eq!(env_count("ENV_TESTS_COUNT", 30_u64), 45);
+        std::env::set_var("ENV_TESTS_COUNT", "-5");
+        assert_eq!(env_count("ENV_TESTS_COUNT", 30_u64), 30);
+        std::env::set_var("ENV_TESTS_COUNT", "1.5");
+        assert_eq!(env_count_opt::<i64>("ENV_TESTS_COUNT"), None);
+        std::env::set_var("ENV_TESTS_NUMBER", "0.25");
+        assert_eq!(env_number("ENV_TESTS_NUMBER", 0.5_f64), 0.25);
+        std::env::set_var("ENV_TESTS_NUMBER", "ten");
+        assert_eq!(env_number("ENV_TESTS_NUMBER", Decimal::ONE), Decimal::ONE);
+        std::env::set_var("ENV_TESTS_CHOICE", "Balanced");
+        assert_eq!(env_choice("ENV_TESTS_CHOICE", "stable"), "balanced");
+    }
+
+    #[test]
+    fn listed_ranges_hold_at_read_time() {
+        // A listed name is held to its range when read, too.
+        assert_eq!(setting_kind("EXIT_POLL_INTERVAL_SECS"), Some(count(1, 300)));
+        let kind = setting_kind("QUANT_MAX_HOLD_HOURS").unwrap();
+        assert!(!kind.reads("0"));
+    }
+
+    /// `.env.example`, copied as is, must start.
+    #[test]
+    fn the_example_settings_are_all_readable() {
+        let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env.example");
+        let mut checked = 0;
+        for item in dotenvy::from_path_iter(&example).unwrap() {
+            let (name, value) = item.unwrap();
+            let value = value.trim();
+            if let Some(kind) = SETTINGS
+                .iter()
+                .chain(CHECKED_ELSEWHERE)
+                .find(|(listed, _)| *listed == name)
+                .map(|(_, kind)| *kind)
+            {
+                checked += 1;
+                assert!(
+                    value.is_empty() || kind.reads(value),
+                    "{name}={value} (expected {})",
+                    kind.expected()
+                );
+            }
+        }
+        assert!(checked > 20, "only {checked} example settings checked");
+    }
+
     /// Every setting read through a helper is in `SETTINGS`, as that helper
     /// reads it, so a start checks it.
     #[test]
     fn the_settings_list_matches_the_code() {
-        const HELPERS: &[(&str, SettingKind)] = &[
-            ("env_flag(", SettingKind::Flag),
-            ("env_switch(", SettingKind::Switch),
+        const HELPERS: &[(&str, &str)] = &[
+            ("env_flag(", "env_flag"),
+            ("env_switch(", "env_switch"),
             // runtime_sync's wrapper for env_switch.
-            ("env_enabled(", SettingKind::Switch),
-            ("env_decimal(", SettingKind::Decimal),
-            ("env_fraction(", SettingKind::Fraction),
-            ("env_positive_decimal(", SettingKind::PositiveDecimal),
-            ("env_share_f64(", SettingKind::Share),
+            ("env_enabled(", "env_switch"),
+            ("env_decimal(", "env_decimal"),
+            ("env_fraction(", "env_fraction"),
+            ("env_positive_decimal(", "env_positive_decimal"),
+            ("env_share_f64(", "env_share_f64"),
+            ("env_count(", "env_count"),
+            ("env_count_opt(", "env_count"),
+            ("env_count::<", "env_count"),
+            ("env_count_opt::<", "env_count"),
+            ("env_number(", "env_number"),
+            ("env_number::<", "env_number"),
+            ("env_choice(", "env_choice"),
         ];
 
         fn constant(text: &str, name: &str) -> Option<String> {
@@ -510,7 +919,7 @@ mod env_tests {
             Some(text[start..start + end].to_string())
         }
 
-        fn scan(text: &str, found: &mut Vec<(String, SettingKind)>) {
+        fn scan(text: &str, found: &mut Vec<(String, &'static str)>) {
             for (helper, kind) in HELPERS {
                 for (at, _) in text.match_indices(helper) {
                     // Not a longer name, nor this test's own list.
@@ -518,7 +927,15 @@ mod env_tests {
                     if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"') {
                         continue;
                     }
-                    let rest = text[at + helper.len()..].trim_start();
+                    let mut rest = &text[at + helper.len()..];
+                    // Past a type argument (`env_count::<u64>(`).
+                    if helper.ends_with('<') {
+                        let Some(open) = rest.find('(') else {
+                            continue;
+                        };
+                        rest = &rest[open + 1..];
+                    }
+                    let rest = rest.trim_start();
                     let name = if let Some(quoted) = rest.strip_prefix('"') {
                         quoted.split('"').next().map(str::to_string)
                     } else {
@@ -554,20 +971,22 @@ mod env_tests {
             }
         }
 
-        let listed: std::collections::BTreeMap<&str, SettingKind> =
-            SETTINGS.iter().copied().collect();
+        let listed: std::collections::BTreeMap<&str, &str> = SETTINGS
+            .iter()
+            .map(|(name, kind)| (*name, kind.helper()))
+            .collect();
         assert_eq!(listed.len(), SETTINGS.len(), "a setting is listed twice");
-        let mut read: std::collections::BTreeMap<String, SettingKind> = Default::default();
-        for (name, kind) in found {
-            if let Some(other) = read.insert(name.clone(), kind) {
-                assert_eq!(other, kind, "{name} is read as two kinds of setting");
+        let mut read: std::collections::BTreeMap<String, &str> = Default::default();
+        for (name, helper) in found {
+            if let Some(other) = read.insert(name.clone(), helper) {
+                assert_eq!(other, helper, "{name} is read by two kinds of helper");
             }
         }
-        let read: Vec<(&str, SettingKind)> = read
+        let read: Vec<(&str, &str)> = read
             .iter()
-            .map(|(name, kind)| (name.as_str(), *kind))
+            .map(|(name, helper)| (name.as_str(), *helper))
             .collect();
-        let listed: Vec<(&str, SettingKind)> = listed.into_iter().collect();
+        let listed: Vec<(&str, &str)> = listed.into_iter().collect();
         assert_eq!(read, listed);
     }
 }

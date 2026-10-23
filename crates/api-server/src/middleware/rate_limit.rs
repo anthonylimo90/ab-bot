@@ -39,16 +39,11 @@ impl TrustedProxyKeyExtractor {
 
     /// Read `TRUSTED_PROXY_HOPS` (default 1).
     pub fn from_env() -> Self {
-        let hops = match std::env::var("TRUSTED_PROXY_HOPS") {
-            Ok(raw) => raw.trim().parse::<usize>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    value = %raw,
-                    default = DEFAULT_TRUSTED_PROXY_HOPS,
-                    "Invalid TRUSTED_PROXY_HOPS, using default"
-                );
-                DEFAULT_TRUSTED_PROXY_HOPS
-            }),
-            Err(_) => {
+        let hops = match polymarket_core::config::env_set("TRUSTED_PROXY_HOPS") {
+            Some(_) => {
+                polymarket_core::config::env_count("TRUSTED_PROXY_HOPS", DEFAULT_TRUSTED_PROXY_HOPS)
+            }
+            None => {
                 tracing::warn!(
                     default = DEFAULT_TRUSTED_PROXY_HOPS,
                     "TRUSTED_PROXY_HOPS is unset: trusting one reverse proxy's X-Forwarded-For. \

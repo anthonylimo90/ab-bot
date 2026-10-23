@@ -388,10 +388,7 @@ impl ClobClient {
         let mut all_markets = Vec::new();
         let mut cursor: Option<String> = None;
         // Safety valve: configurable via CLOB_MARKET_LIMIT env var (default 200,000).
-        let limit: usize = std::env::var("CLOB_MARKET_LIMIT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(200_000);
+        let limit: usize = crate::config::env_count("CLOB_MARKET_LIMIT", 200_000);
         let mut pages = 0u32;
 
         loop {
@@ -689,14 +686,8 @@ impl ClobClient {
             })??;
         let connection = NEXT_WS_CONNECTION.fetch_add(1, Ordering::Relaxed);
         let (mut write, mut read) = ws_stream.split();
-        let read_timeout_secs = std::env::var("CLOB_WS_READ_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(120_u64);
-        let ping_interval_secs = std::env::var("CLOB_WS_PING_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10_u64);
+        let read_timeout_secs = crate::config::env_count("CLOB_WS_READ_TIMEOUT_SECS", 120_u64);
+        let ping_interval_secs = crate::config::env_count("CLOB_WS_PING_INTERVAL_SECS", 10_u64);
         let mut ping_tick =
             tokio::time::interval(StdDuration::from_secs(ping_interval_secs.max(1)));
         // After an overrun, wait a full period instead of catching up.

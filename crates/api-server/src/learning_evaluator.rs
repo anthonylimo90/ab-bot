@@ -23,22 +23,22 @@ impl LearningEvaluatorConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("LEARNING_EVALUATOR_ENABLED", true),
-            interval_secs: std::env::var("LEARNING_EVALUATOR_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1800),
-            startup_delay_secs: std::env::var("LEARNING_EVALUATOR_STARTUP_DELAY_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(240),
-            lookback_hours: std::env::var("LEARNING_EVALUATOR_LOOKBACK_HOURS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(168),
-            max_models_per_cycle: std::env::var("LEARNING_EVALUATOR_MAX_MODELS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(24),
+            interval_secs: polymarket_core::config::env_count(
+                "LEARNING_EVALUATOR_INTERVAL_SECS",
+                1800,
+            ),
+            startup_delay_secs: polymarket_core::config::env_count(
+                "LEARNING_EVALUATOR_STARTUP_DELAY_SECS",
+                240,
+            ),
+            lookback_hours: polymarket_core::config::env_count(
+                "LEARNING_EVALUATOR_LOOKBACK_HOURS",
+                168,
+            ),
+            max_models_per_cycle: polymarket_core::config::env_count(
+                "LEARNING_EVALUATOR_MAX_MODELS",
+                24,
+            ),
         }
     }
 }

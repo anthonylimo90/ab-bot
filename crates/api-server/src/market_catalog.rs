@@ -117,10 +117,8 @@ impl OutcomeTokenCache {
             ));
         }
         let started = Instant::now();
-        let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(200);
+        let gamma_page_size =
+            polymarket_core::config::env_count::<u32>("GAMMA_ARB_MARKET_PAGE_SIZE", 200);
         let source = self.gamma_client.get_all_markets(gamma_page_size).await?;
         // Reject an unexpectedly empty upstream snapshot; retain known data.
         anyhow::ensure!(!source.is_empty(), "Gamma returned an empty market catalog");

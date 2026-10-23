@@ -68,10 +68,7 @@ impl LearningRolloutController {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool: pool.clone(),
-            refresh_secs: std::env::var("LEARNING_ROLLOUT_REFRESH_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(30),
+            refresh_secs: polymarket_core::config::env_count("LEARNING_ROLLOUT_REFRESH_SECS", 30),
             schema_missing: Arc::new(AtomicBool::new(false)),
             cache: Arc::new(RwLock::new(None)),
             runtime: LearningModelRuntime::new(pool.clone()),
@@ -263,14 +260,14 @@ impl LearningRolloutObserverConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_flag("LEARNING_ROLLOUT_OBSERVER_ENABLED", true),
-            interval_secs: std::env::var("LEARNING_ROLLOUT_OBSERVER_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(900),
-            startup_delay_secs: std::env::var("LEARNING_ROLLOUT_OBSERVER_STARTUP_DELAY_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+            interval_secs: polymarket_core::config::env_count(
+                "LEARNING_ROLLOUT_OBSERVER_INTERVAL_SECS",
+                900,
+            ),
+            startup_delay_secs: polymarket_core::config::env_count(
+                "LEARNING_ROLLOUT_OBSERVER_STARTUP_DELAY_SECS",
+                300,
+            ),
         }
     }
 }

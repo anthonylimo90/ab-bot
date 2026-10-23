@@ -90,18 +90,12 @@ pub struct PriceTrackerConfig {
 impl PriceTrackerConfig {
     pub fn from_env() -> Self {
         Self {
-            ema_alpha: std::env::var("LATENCY_ARB_EMA_ALPHA")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.3),
-            divergence_threshold: std::env::var("LATENCY_ARB_DIVERGENCE_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.003),
-            min_warmup_ticks: std::env::var("LATENCY_ARB_WARMUP_TICKS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10),
+            ema_alpha: polymarket_core::config::env_number("LATENCY_ARB_EMA_ALPHA", 0.3),
+            divergence_threshold: polymarket_core::config::env_number(
+                "LATENCY_ARB_DIVERGENCE_THRESHOLD",
+                0.003,
+            ),
+            min_warmup_ticks: polymarket_core::config::env_count("LATENCY_ARB_WARMUP_TICKS", 10),
         }
     }
 }
