@@ -112,6 +112,7 @@ export default function RiskPage() {
     isLoading,
     error,
     isError: riskFailed,
+    fetchStatus: riskFetchStatus,
     dataUpdatedAt,
   } = useRiskStatusQuery(workspaceId);
   const { data: serviceStatus } = useServiceStatusQuery(workspaceId);
@@ -146,8 +147,9 @@ export default function RiskPage() {
   const latched =
     cb?.tripped === true &&
     (cb.trip_reason === "manual" || cb.trip_reason === "hard_kill_switch");
-  // The last read failed: what shows is the previous one.
-  const stale = riskFailed && riskStatus != null;
+  // The last read failed, or reads are paused (offline): what shows is the
+  // previous one.
+  const stale = (riskFailed || riskFetchStatus === "paused") && riskStatus != null;
   // One state for the status card: the most severe first.
   const cardState: "hard_kill" | "tripped" | "held" | "unenforced" | "recovery" | "disabled" | "operational" =
     cb?.trip_reason === "hard_kill_switch" && tripBlocks

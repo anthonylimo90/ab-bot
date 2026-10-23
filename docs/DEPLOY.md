@@ -610,8 +610,8 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - A trip or reset that cannot be stored answers 503 (the trip still holds in
   the process that took it). The saved breaker limits must be readable at
   start; a start that cannot read them stops.
-- If the leader's lock connection fails, it stops trading, drains and exits
-  non-zero, so a restart waits its turn.
+- If the leader's lock connection fails, it stops trading and exits non-zero
+  at once (without draining, mid-shutdown too), so a restart waits its turn.
 - Recovery runs only on the trading process (503 elsewhere).
 - The first deploy of this change still overlaps: the outgoing version does
   not take the lock. Trip the breaker before that deploy if no trade may run

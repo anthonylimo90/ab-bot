@@ -158,12 +158,11 @@ export default function SettingsPage() {
     }
   }, [riskConfigKey]);
 
-  // Initialize walletConnectProjectId from workspace
+  // Initialize walletConnectProjectId from the saved workspace, cleared
+  // included (another owner's clear must not leave the old ID to save back).
   useEffect(() => {
-    if (currentWorkspace?.walletconnect_project_id) {
-      setWalletConnectProjectId(currentWorkspace.walletconnect_project_id);
-    }
-  }, [currentWorkspace?.walletconnect_project_id]);
+    setWalletConnectProjectId(currentWorkspace?.walletconnect_project_id ?? '');
+  }, [currentWorkspace?.id, currentWorkspace?.walletconnect_project_id]);
 
   // Initialize the trading config from the saved workspace, each field again
   // only when its saved value changes: a poll that reads the same workspace
