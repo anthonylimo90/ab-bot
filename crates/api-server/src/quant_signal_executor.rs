@@ -1047,13 +1047,26 @@ impl QuantSignalExecutor {
         // price has to be recent, and the token's live price close to it:
         // a move either way since the generator read the market (a flip, or
         // the expected move already priced in) invalidates the signal.
-        if let Some(reason) = reference_rejection(
+        let reference_reason = reference_rejection(
             &signal,
             &book,
             Utc::now(),
             cfg.max_reference_age_secs,
             cfg.max_reference_drift,
-        ) {
+        )
+        .or_else(|| {
+            // A move already undone within the drift allowance: held, the
+            // position would meet its own exit at once and be sold back.
+            let bid = book.best_bid()?;
+            crate::exit_handler::entry_meets_strategy_exit(
+                signal.kind,
+                signal.direction,
+                &signal.metadata,
+                bid,
+            )
+            .then_some("target_already_reached")
+        });
+        if let Some(reason) = reference_reason {
             debug!(
                 signal_id = %signal.id,
                 reason,

@@ -2205,6 +2205,38 @@ fn parse_signal_direction(direction: &str) -> Option<SignalDirection> {
     }
 }
 
+/// Whether a quant entry would meet its own strategy exit the moment it is
+/// held, priced at the bid of the token it buys (`bid`): it would be sold on
+/// the next pass for the spread and both taker fees. Flow exits read flow
+/// features, not prices, and are not judged here.
+pub(crate) fn entry_meets_strategy_exit(
+    kind: QuantSignalKind,
+    direction: SignalDirection,
+    metadata: &serde_json::Value,
+    bid: Decimal,
+) -> bool {
+    let quant_ctx = QuantExitContext {
+        signal_id: uuid::Uuid::nil(),
+        kind,
+        direction,
+        metadata: metadata.clone(),
+    };
+    let (yes_bid, no_bid) = match direction {
+        SignalDirection::BuyYes => (bid, Decimal::ZERO),
+        SignalDirection::BuyNo => (Decimal::ZERO, bid),
+    };
+    let current_yes = infer_yes_price(yes_bid, no_bid);
+    let current_no = infer_no_price(yes_bid, no_bid);
+    match kind {
+        QuantSignalKind::Flow => false,
+        QuantSignalKind::MeanReversion => {
+            mean_reversion_target_hit(&quant_ctx, current_yes, current_no)
+        }
+        QuantSignalKind::CrossMarket => cross_market_target_hit(&quant_ctx, current_yes),
+        QuantSignalKind::ResolutionProximity => resolution_lean_decay(&quant_ctx, current_yes),
+    }
+}
+
 fn infer_yes_price(yes_bid: Decimal, no_bid: Decimal) -> Decimal {
     if yes_bid > Decimal::ZERO {
         yes_bid
@@ -2487,6 +2519,57 @@ mod strategy_exit_tests {
             direction,
             metadata,
         }
+    }
+
+    #[test]
+    fn an_entry_already_at_its_strategy_exit_is_recognised_at_the_bid() {
+        let d = |v: &str| v.parse::<Decimal>().unwrap();
+        // A spike 0.30 -> 0.36: reversion buys NO, whose target is
+        // 1 - 0.33 = 0.67.
+        let spike = json!({"current_price": "0.36", "previous_price": "0.30"});
+        let buy_no = |bid| {
+            entry_meets_strategy_exit(
+                QuantSignalKind::MeanReversion,
+                SignalDirection::BuyNo,
+                &spike,
+                d(bid),
+            )
+        };
+        assert!(!buy_no("0.64"));
+        assert!(buy_no("0.67"));
+        // A drop 0.40 -> 0.30 buys YES, target 0.35.
+        let drop = json!({"current_price": "0.30", "previous_price": "0.40"});
+        let buy_yes = |bid| {
+            entry_meets_strategy_exit(
+                QuantSignalKind::MeanReversion,
+                SignalDirection::BuyYes,
+                &drop,
+                d(bid),
+            )
+        };
+        assert!(!buy_yes("0.31"));
+        assert!(buy_yes("0.35"));
+        // Resolution lean: entered at a 0.30 deviation, halved by 0.65.
+        let lean = json!({"deviation": "0.30"});
+        assert!(entry_meets_strategy_exit(
+            QuantSignalKind::ResolutionProximity,
+            SignalDirection::BuyYes,
+            &lean,
+            d("0.64")
+        ));
+        assert!(!entry_meets_strategy_exit(
+            QuantSignalKind::ResolutionProximity,
+            SignalDirection::BuyYes,
+            &lean,
+            d("0.79")
+        ));
+        // Flow exits are not price targets.
+        assert!(!entry_meets_strategy_exit(
+            QuantSignalKind::Flow,
+            SignalDirection::BuyYes,
+            &json!({}),
+            d("0.99")
+        ));
     }
 
     #[test]
