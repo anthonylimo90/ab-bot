@@ -345,20 +345,23 @@ async fn reserve_and_execute_order(
     };
     // Shares a live order bought are sold live while the signer that holds
     // them is loaded, whatever the live switch: switched off, new orders are
-    // paper, and these shares would have no way out.
+    // paper, and these shares would have no way out. A sale the paper
+    // inventory covers stays paper.
     if !live && request.side == OrderSide::Sell && state.order_executor.has_live_signer().await {
         if let Some(signer) = state.order_executor.wallet_address().await {
-            let holds_live: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode = 'live' \
-                 AND wallet_address = LOWER($1) AND market_id = $2 AND outcome = $3 \
-                 AND quantity > 0)",
+            let (paper, holds_live): (Decimal, bool) = sqlx::query_as(
+                "SELECT COALESCE((SELECT quantity FROM manual_inventory WHERE execution_mode = 'paper' \
+                     AND wallet_address = 'unknown' AND market_id = $2 AND outcome = $3), 0), \
+                 EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode = 'live' \
+                     AND wallet_address = LOWER($1) AND market_id = $2 AND outcome = $3 \
+                     AND quantity > 0)",
             )
             .bind(&signer)
             .bind(&request.market_id)
             .bind(&request.outcome)
             .fetch_one(&state.pool)
             .await?;
-            if holds_live {
+            if holds_live && paper < request.quantity {
                 live = true;
                 wallet = Some(signer);
             }

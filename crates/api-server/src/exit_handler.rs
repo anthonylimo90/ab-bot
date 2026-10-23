@@ -974,8 +974,11 @@ impl ExitHandler {
     /// Before a live sale, write off what the wallet lacks of a token when
     /// the gap is small (see [`fee_shortfall`]): buy fees the V1 exchange
     /// kept in shares, or rounding dust. A larger gap is left for
-    /// reconciliation and the sale is refused: selling the record would take
-    /// other holders' shares. See [`Self::measure_leg`].
+    /// reconciliation and the sale goes ahead as recorded, for the balance
+    /// preflight to refuse. All the wallet's holders of a token share one
+    /// balance: a sale is never held back on another holder's record, so an
+    /// exit (a stop-loss included) is not blocked by a stale one. See
+    /// [`Self::measure_leg`].
     async fn align_leg_with_wallet(
         &self,
         position: &mut Position,
@@ -984,13 +987,6 @@ impl ExitHandler {
         ctx: &EventContext,
     ) -> anyhow::Result<()> {
         match self.measure_leg(position, leg, token_id, ctx).await? {
-            // Selling the recorded holding would take shares other positions
-            // or manual orders hold (or be refused for want of them): the
-            // holding needs reconciling first.
-            Measured::Unmeasured(FAR_FEWER_THAN_RECORDED) => anyhow::bail!(
-                "The wallet holds far fewer {leg} shares than this position and the wallet's \
-                 other holders record; not sold until reconciled"
-            ),
             Measured::Unmeasured(why)
             | Measured::Waiting(why @ (BALANCE_UNREADABLE | SIGNER_NOT_LOADED)) => warn!(
                 position_id = %position.id,
@@ -1101,23 +1097,13 @@ impl ExitHandler {
         .bind(leg.to_string())
         .fetch_all(&self.pool)
         .await?;
-        // Shared among the positions only: manual inventory is not written
-        // off, so the positions take the whole shortfall (each at most its
-        // holding), and a sale never reaches into manual shares.
-        let mut loaded = Vec::new();
-        let mut positions_held = held;
+        // Shared by every holder's record, manual orders' included (theirs
+        // is not written off here), so no position answers for a shortfall
+        // that is another holder's.
+        let share = |of: Decimal| shortfall * of / recorded;
+        let mut write_offs = Vec::new();
         for id in siblings {
             let sibling = self.position_service.load(id).await?;
-            positions_held += match leg {
-                Leg::Yes => sibling.held_yes_qty,
-                Leg::No => sibling.held_no_qty,
-            };
-            loaded.push(sibling);
-        }
-        let share = |of: Decimal| (shortfall * of / positions_held).min(of);
-        let mut write_offs = Vec::new();
-        for sibling in loaded {
-            let id = sibling.id;
             let sibling_held = match leg {
                 Leg::Yes => sibling.held_yes_qty,
                 Leg::No => sibling.held_no_qty,
