@@ -1075,7 +1075,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   session. Removing one takes effect at once. Additions and removals are in
   the audit log (`withdrawal_destination_added`, `_removed`).
 - A workspace withdraws at most `WITHDRAWAL_DAILY_CAP_USD` (1000 by default)
-  in any 24 hours, counting every withdrawal not failed. The list and the
+  in any 24 hours, counting every withdrawal but those that failed and
+  moved nothing (a failed transfer that was signed and did not revert may
+  still be mined, so it counts). The list and the
   limit are checked when the withdrawal is reserved, under a workspace lock,
   so two at once cannot both pass on room for one.
 - After deploying, the list is empty: no withdrawal can go until an address

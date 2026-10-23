@@ -150,21 +150,27 @@ async fn only_listed_destinations_past_their_delay_receive_withdrawals(pool: PgP
     assert_eq!(rows, 0);
 }
 
+/// What the reconciler records for a transfer that reverted.
+const REVERTED: &str = "Transaction reverted on-chain; no USDC moved";
+
 #[sqlx::test(migrations = false)]
 async fn withdrawals_stop_at_the_daily_cap(pool: PgPool) {
     let f = fixture(pool.clone()).await;
     f.chain.lock().unwrap().mine_on_send = true;
-    // 995 USDC left in the last 24 hours (a failed one, and one older, do
-    // not count).
-    for (amount, status, hours_ago) in [
-        (995, "confirmed", 23),
-        (500, "failed", 1),
-        (500, "confirmed", 25),
+    // 995 USDC taken, or perhaps taken, in the last 24 hours: one confirmed,
+    // and one failed whose signed transfer may still be mined. One failed
+    // unsigned, one that reverted, and one older do not count.
+    for (amount, status, hours_ago, tx_hash, error) in [
+        (695, "confirmed", 23, Some("0xa1"), None),
+        (300, "failed", 2, Some("0xa2"), Some("Superseded")),
+        (500, "failed", 1, None, Some("never signed")),
+        (400, "failed", 1, Some("0xa3"), Some(REVERTED)),
+        (500, "confirmed", 25, Some("0xa4"), None),
     ] {
         sqlx::query(
             "INSERT INTO wallet_withdrawals (user_id, workspace_id, wallet_address, \
-             destination_address, amount, status, requested_at) \
-             VALUES ($1, $2, '0xelsewhere', $3, $4, $5, NOW() - $6 * INTERVAL '1 hour')",
+             destination_address, amount, status, requested_at, tx_hash, error) \
+             VALUES ($1, $2, '0xelsewhere', $3, $4, $5, NOW() - $6 * INTERVAL '1 hour', $7, $8)",
         )
         .bind(f.user)
         .bind(f.workspace)
@@ -172,6 +178,8 @@ async fn withdrawals_stop_at_the_daily_cap(pool: PgPool) {
         .bind(Decimal::from(amount))
         .bind(status)
         .bind(hours_ago as f64)
+        .bind(tx_hash)
+        .bind(error)
         .execute(&pool)
         .await
         .unwrap();

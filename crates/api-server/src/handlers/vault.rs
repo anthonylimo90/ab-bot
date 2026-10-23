@@ -2179,7 +2179,13 @@ pub async fn remove_withdrawal_destination(
             "No such address on the withdrawal address list".into(),
         ));
     };
-    audit_destination_change(&state, user_id, "withdrawal_destination_removed", &removed).await?;
+    // Committed first (it only narrows where funds may go, and the
+    // workspace's withdrawals wait on its lock), then audited.
     tx.commit().await?;
+    if let Err(error) =
+        audit_destination_change(&state, user_id, "withdrawal_destination_removed", &removed).await
+    {
+        tracing::error!(%error, address = %removed.address, "A withdrawal address was removed but not audited");
+    }
     Ok(StatusCode::NO_CONTENT)
 }

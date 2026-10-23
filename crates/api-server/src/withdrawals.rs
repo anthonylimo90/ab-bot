@@ -145,17 +145,22 @@ impl From<PolicyRefusal> for crate::error::ApiError {
 }
 
 /// What a workspace's withdrawals in the last 24 hours took, or may still
-/// take: every one but those that failed (which moved nothing).
+/// take: every one but those that failed and moved nothing. A failed one
+/// that was signed and did not revert counts: its transfer may still be
+/// mined (the reconciler gives it a second chance).
 pub(crate) async fn withdrawn_last_day(
     conn: &mut PgConnection,
     workspace_id: Uuid,
 ) -> Result<Decimal, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT COALESCE(SUM(amount), 0)::numeric FROM wallet_withdrawals \
-         WHERE workspace_id = $1 AND status <> 'failed' \
+         WHERE workspace_id = $1 \
+           AND (status <> 'failed' \
+                OR (tx_hash IS NOT NULL AND error IS DISTINCT FROM $2)) \
            AND requested_at > NOW() - INTERVAL '24 hours'",
     )
     .bind(workspace_id)
+    .bind(REVERTED_ERROR)
     .fetch_one(conn)
     .await
 }
