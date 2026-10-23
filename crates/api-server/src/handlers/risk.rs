@@ -38,6 +38,22 @@ pub struct CircuitBreakerConfigResponse {
     pub max_consecutive_losses: u32,
     pub cooldown_minutes: i64,
     pub enabled: bool,
+    /// Drawdown from the all-time peak that latches a halt until manual
+    /// reset; 0 means off.
+    pub hard_kill_drawdown_pct: Decimal,
+}
+
+impl From<&risk_manager::circuit_breaker::CircuitBreakerConfig> for CircuitBreakerConfigResponse {
+    fn from(config: &risk_manager::circuit_breaker::CircuitBreakerConfig) -> Self {
+        Self {
+            max_daily_loss: config.max_daily_loss,
+            max_drawdown_pct: config.max_drawdown_pct,
+            max_consecutive_losses: config.max_consecutive_losses,
+            cooldown_minutes: config.cooldown_minutes,
+            enabled: config.enabled,
+            hard_kill_drawdown_pct: config.hard_kill_drawdown_pct,
+        }
+    }
 }
 
 /// Recovery state response.
@@ -60,13 +76,53 @@ pub struct CircuitBreakerResponse {
     pub tripped_at: Option<DateTime<Utc>>,
     pub resume_at: Option<DateTime<Utc>>,
     pub daily_pnl: Decimal,
+    /// All-time equity peak: the hard kill switch's reference.
     pub peak_value: Decimal,
+    /// Reference for the soft max-drawdown trip; rebased when trading
+    /// resumes after a drawdown cooldown and on reset.
+    pub drawdown_peak: Decimal,
     pub current_value: Decimal,
+    /// Whether the equity values come from real snapshots. Until then the
+    /// drawdown guards are not evaluated.
+    pub equity_seeded: bool,
     pub consecutive_losses: u32,
     pub trips_today: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_state: Option<RecoveryStateResponse>,
     pub config: CircuitBreakerConfigResponse,
+}
+
+impl CircuitBreakerResponse {
+    async fn current(state: &AppState) -> Self {
+        let cb_state = state.circuit_breaker.state().await;
+        let cb_config = state.circuit_breaker.config().await;
+        Self {
+            tripped: cb_state.tripped,
+            trip_reason: cb_state.trip_reason.as_ref().map(trip_reason_to_string),
+            tripped_at: cb_state.tripped_at,
+            resume_at: cb_state.resume_at,
+            daily_pnl: cb_state.daily_pnl,
+            peak_value: cb_state.peak_value,
+            drawdown_peak: cb_state.drawdown_peak,
+            current_value: cb_state.current_value,
+            equity_seeded: cb_state.portfolio_value_seeded,
+            consecutive_losses: cb_state.consecutive_losses,
+            trips_today: cb_state.trips_today,
+            recovery_state: cb_state
+                .recovery_state
+                .as_ref()
+                .map(|r| RecoveryStateResponse {
+                    current_stage: r.current_stage,
+                    total_stages: r.total_stages,
+                    capacity_pct: r.capacity_pct(),
+                    started_at: r.started_at,
+                    next_stage_at: r.next_stage_at,
+                    trades_this_stage: r.trades_this_stage,
+                    recovery_pnl: r.recovery_pnl,
+                }),
+            config: CircuitBreakerConfigResponse::from(&cb_config),
+        }
+    }
 }
 
 /// A recently executed stop-loss rule.
@@ -140,41 +196,7 @@ pub async fn get_risk_status(
     require_canonical_workspace_member(&state.pool, user_id).await?;
 
     // Read circuit breaker state from AppState (in-memory, no DB hit)
-    let cb_state = state.circuit_breaker.state().await;
-    let cb_config = state.circuit_breaker.config().await;
-
-    let recovery_response = cb_state
-        .recovery_state
-        .as_ref()
-        .map(|r| RecoveryStateResponse {
-            current_stage: r.current_stage,
-            total_stages: r.total_stages,
-            capacity_pct: r.capacity_pct(),
-            started_at: r.started_at,
-            next_stage_at: r.next_stage_at,
-            trades_this_stage: r.trades_this_stage,
-            recovery_pnl: r.recovery_pnl,
-        });
-
-    let circuit_breaker = CircuitBreakerResponse {
-        tripped: cb_state.tripped,
-        trip_reason: cb_state.trip_reason.as_ref().map(trip_reason_to_string),
-        tripped_at: cb_state.tripped_at,
-        resume_at: cb_state.resume_at,
-        daily_pnl: cb_state.daily_pnl,
-        peak_value: cb_state.peak_value,
-        current_value: cb_state.current_value,
-        consecutive_losses: cb_state.consecutive_losses,
-        trips_today: cb_state.trips_today,
-        recovery_state: recovery_response,
-        config: CircuitBreakerConfigResponse {
-            max_daily_loss: cb_config.max_daily_loss,
-            max_drawdown_pct: cb_config.max_drawdown_pct,
-            max_consecutive_losses: cb_config.max_consecutive_losses,
-            cooldown_minutes: cb_config.cooldown_minutes,
-            enabled: cb_config.enabled,
-        },
-    };
+    let circuit_breaker = CircuitBreakerResponse::current(&state).await;
 
     // TODO: stop_loss_rules table has been dropped with the copy-trading system.
     // Return zeroed stats until a replacement stop-loss mechanism is implemented.
@@ -237,41 +259,7 @@ pub async fn manual_trip_circuit_breaker(
     )
     .await;
 
-    let cb_state = state.circuit_breaker.state().await;
-    let cb_config = state.circuit_breaker.config().await;
-
-    let recovery_response = cb_state
-        .recovery_state
-        .as_ref()
-        .map(|r| RecoveryStateResponse {
-            current_stage: r.current_stage,
-            total_stages: r.total_stages,
-            capacity_pct: r.capacity_pct(),
-            started_at: r.started_at,
-            next_stage_at: r.next_stage_at,
-            trades_this_stage: r.trades_this_stage,
-            recovery_pnl: r.recovery_pnl,
-        });
-
-    Ok(Json(CircuitBreakerResponse {
-        tripped: cb_state.tripped,
-        trip_reason: cb_state.trip_reason.as_ref().map(trip_reason_to_string),
-        tripped_at: cb_state.tripped_at,
-        resume_at: cb_state.resume_at,
-        daily_pnl: cb_state.daily_pnl,
-        peak_value: cb_state.peak_value,
-        current_value: cb_state.current_value,
-        consecutive_losses: cb_state.consecutive_losses,
-        trips_today: cb_state.trips_today,
-        recovery_state: recovery_response,
-        config: CircuitBreakerConfigResponse {
-            max_daily_loss: cb_config.max_daily_loss,
-            max_drawdown_pct: cb_config.max_drawdown_pct,
-            max_consecutive_losses: cb_config.max_consecutive_losses,
-            cooldown_minutes: cb_config.cooldown_minutes,
-            enabled: cb_config.enabled,
-        },
-    }))
+    Ok(Json(CircuitBreakerResponse::current(&state).await))
 }
 
 /// Request to update circuit breaker configuration.
@@ -413,13 +401,7 @@ pub async fn update_circuit_breaker_config(
         "Circuit breaker config updated via dashboard"
     );
 
-    Ok(Json(CircuitBreakerConfigResponse {
-        max_daily_loss: config.max_daily_loss,
-        max_drawdown_pct: config.max_drawdown_pct,
-        max_consecutive_losses: config.max_consecutive_losses,
-        cooldown_minutes: config.cooldown_minutes,
-        enabled: config.enabled,
-    }))
+    Ok(Json(CircuitBreakerConfigResponse::from(&config)))
 }
 
 /// Reset the circuit breaker.
@@ -465,26 +447,5 @@ pub async fn reset_circuit_breaker(
     )
     .await;
 
-    let cb_state = state.circuit_breaker.state().await;
-    let cb_config = state.circuit_breaker.config().await;
-
-    Ok(Json(CircuitBreakerResponse {
-        tripped: cb_state.tripped,
-        trip_reason: cb_state.trip_reason.as_ref().map(trip_reason_to_string),
-        tripped_at: cb_state.tripped_at,
-        resume_at: cb_state.resume_at,
-        daily_pnl: cb_state.daily_pnl,
-        peak_value: cb_state.peak_value,
-        current_value: cb_state.current_value,
-        consecutive_losses: cb_state.consecutive_losses,
-        trips_today: cb_state.trips_today,
-        recovery_state: None,
-        config: CircuitBreakerConfigResponse {
-            max_daily_loss: cb_config.max_daily_loss,
-            max_drawdown_pct: cb_config.max_drawdown_pct,
-            max_consecutive_losses: cb_config.max_consecutive_losses,
-            cooldown_minutes: cb_config.cooldown_minutes,
-            enabled: cb_config.enabled,
-        },
-    }))
+    Ok(Json(CircuitBreakerResponse::current(&state).await))
 }

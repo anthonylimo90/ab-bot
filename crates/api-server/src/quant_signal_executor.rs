@@ -47,6 +47,10 @@ pub struct QuantSignalExecutorConfig {
     pub cache_refresh_secs: u64,
     /// Maximum simultaneous quant positions.
     pub max_quant_positions: usize,
+    /// How long after a quant position in a market closes before another
+    /// may enter it: a generator re-fires on its trailing window, which
+    /// still holds the evidence the closed position traded on.
+    pub reentry_cooldown_minutes: i64,
     /// Strategy allocation weights (should sum to ~1.0).
     pub flow_allocation_pct: f64,
     pub cross_market_allocation_pct: f64,
@@ -105,6 +109,11 @@ impl QuantSignalExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(20),
+            reentry_cooldown_minutes: std::env::var("QUANT_REENTRY_COOLDOWN_MINUTES")
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|minutes| minutes.max(0))
+                .unwrap_or(60),
             flow_allocation_pct: std::env::var("QUANT_FLOW_ALLOCATION_PCT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -784,6 +793,36 @@ impl QuantSignalExecutor {
                 &execution_mode,
                 "signal_skipped",
                 Some("below_confidence"),
+            )
+            .await;
+            return Ok(());
+        }
+
+        // Step 6a: not back into a market the executor just left.
+        let recently_closed: Result<bool, sqlx::Error> = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM positions WHERE market_id = $1 AND source = $2 \
+             AND state IN (4, 5) AND COALESCE(exit_timestamp, last_updated) \
+             > NOW() - make_interval(mins => $3))",
+        )
+        .bind(&signal.condition_id)
+        .bind(polymarket_core::db::positions::SOURCE_RECOMMENDATION)
+        .bind(i32::try_from(cfg.reentry_cooldown_minutes).unwrap_or(i32::MAX))
+        .fetch_one(&self.pool)
+        .await;
+        if !matches!(recently_closed, Ok(false)) {
+            let reason = if recently_closed.is_ok() {
+                "reentry_cooldown"
+            } else {
+                "dedup_check_failed"
+            };
+            debug!(signal_id = %signal.id, reason, "Market recently left, skipping");
+            self.update_signal_status(signal.id, "skipped", Some(reason))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some(reason),
             )
             .await;
             return Ok(());

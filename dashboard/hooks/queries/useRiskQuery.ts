@@ -3,6 +3,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { queryKeys } from "@/lib/queryClient";
+import { useToastStore } from "@/stores/toast-store";
 import type { UpdateOpportunitySelectionRequest } from "@/types/api";
 
 export function useRiskStatusQuery(workspaceId: string | undefined) {
@@ -37,10 +38,14 @@ export function useServiceStatusQuery(workspaceId: string | undefined) {
 
 export function useManualTripMutation(workspaceId: string | undefined) {
   const queryClient = useQueryClient();
+  const toast = useToastStore();
   return useMutation({
     mutationFn: () => api.manualTripCircuitBreaker(workspaceId!),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.all() });
+    },
+    onError: (error: Error) => {
+      toast.error("Circuit breaker trip failed", error.message);
     },
   });
 }
@@ -49,10 +54,14 @@ export function useResetCircuitBreakerMutation(
   workspaceId: string | undefined,
 ) {
   const queryClient = useQueryClient();
+  const toast = useToastStore();
   return useMutation({
     mutationFn: () => api.resetCircuitBreaker(workspaceId!),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.all() });
+    },
+    onError: (error: Error) => {
+      toast.error("Circuit breaker reset failed", error.message);
     },
   });
 }
@@ -61,6 +70,7 @@ export function useUpdateOpportunitySelectionMutation(
   workspaceId: string | undefined,
 ) {
   const queryClient = useQueryClient();
+  const toast = useToastStore();
   return useMutation({
     mutationFn: (params: UpdateOpportunitySelectionRequest) =>
       api.updateOpportunitySelection(workspaceId!, params),
@@ -69,6 +79,9 @@ export function useUpdateOpportunitySelectionMutation(
         queryKey: queryKeys.dynamicTuning.all(),
       });
     },
+    onError: (error: Error) => {
+      toast.error("Opportunity selection not saved", error.message);
+    },
   });
 }
 
@@ -76,6 +89,7 @@ export function useUpdateArbExecutorMutation(
   workspaceId: string | undefined,
 ) {
   const queryClient = useQueryClient();
+  const toast = useToastStore();
   return useMutation({
     mutationFn: (params: {
       position_size?: number;
@@ -87,6 +101,9 @@ export function useUpdateArbExecutorMutation(
       queryClient.invalidateQueries({
         queryKey: queryKeys.dynamicTuning.all(),
       });
+    },
+    onError: (error: Error) => {
+      toast.error("Arb executor settings not saved", error.message);
     },
   });
 }

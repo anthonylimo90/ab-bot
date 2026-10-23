@@ -86,15 +86,16 @@ services:
       # Live entries wait while the exit handler is off: it flattens failed
       # pairs and exits quant positions.
       EXIT_HANDLER_ENABLED: ${EXIT_HANDLER_ENABLED:-false}
-      # The live signer and the chain it reads (empty: paper only, or the
-      # workspace's saved RPC settings).
-      TRADING_WALLET_ADDRESS: ${TRADING_WALLET_ADDRESS:-}
-      WALLET_PRIVATE_KEY: ${WALLET_PRIVATE_KEY:-}
-      POLYGON_RPC_URL: ${POLYGON_RPC_URL:-}
-      ALCHEMY_API_KEY: ${ALCHEMY_API_KEY:-}
+      # The live signer and the chain it reads, passed through only when set
+      # in the environment (no value: left unset, never set empty). Unset, the
+      # API trades paper or uses the workspace's saved RPC settings.
+      TRADING_WALLET_ADDRESS:
+      WALLET_PRIVATE_KEY:
+      POLYGON_RPC_URL:
+      ALCHEMY_API_KEY:
       # The key vault: a file vault keeps its file in the api_data volume.
-      VAULT_PROVIDER: ${VAULT_PROVIDER:-}
-      VAULT_MASTER_KEY: ${VAULT_MASTER_KEY:-}
+      VAULT_PROVIDER:
+      VAULT_MASTER_KEY:
       VAULT_FILE_PATH: ${VAULT_FILE_PATH:-/app/data/vault.enc}
       EXECUTOR_MIN_BOOK_DEPTH: ${EXECUTOR_MIN_BOOK_DEPTH:-100}
       DYNAMIC_TUNER_BOOTSTRAP_ENABLED: ${DYNAMIC_TUNER_BOOTSTRAP_ENABLED:-true}

@@ -32,7 +32,7 @@ import {
   useResetCircuitBreakerMutation,
 } from "@/hooks/queries/useRiskQuery";
 import { useWorkspaceStore } from "@/stores/workspace-store";
-import { formatCurrency, formatPercent, cn } from "@/lib/utils";
+import { formatCurrency, formatCurrencyOrDash, formatFixed, formatPercent, cn } from "@/lib/utils";
 import {
   ShieldAlert,
   ShieldCheck,
@@ -116,10 +116,13 @@ export default function RiskPage() {
 
   const cb = riskStatus?.circuit_breaker;
 
-  const drawdownPct =
-    cb && cb.peak_value > 0
-      ? ((cb.peak_value - cb.current_value) / cb.peak_value) * 100
-      : 0;
+  // The trip measures from `drawdown_peak` (rebased on resume and reset);
+  // the hard kill measures from the all-time `peak_value`.
+  const drawdownFrom = (peak: number) =>
+    cb && peak > 0 ? ((peak - cb.current_value) / peak) * 100 : 0;
+  const drawdownPct = cb ? drawdownFrom(cb.drawdown_peak) : 0;
+  const peakDrawdownPct = cb ? drawdownFrom(cb.peak_value) : 0;
+  const breakerDisabled = cb ? !cb.config.enabled && !cb.tripped : false;
 
   return (
     <ErrorBoundary>
@@ -168,7 +171,7 @@ export default function RiskPage() {
               "border-2",
               cb.tripped
                 ? "border-loss bg-loss/5"
-                : cb.recovery_state
+                : cb.recovery_state || breakerDisabled
                   ? "border-yellow-500 bg-yellow-500/5"
                   : "border-profit bg-profit/5",
             )}
@@ -180,7 +183,7 @@ export default function RiskPage() {
                     <ShieldAlert className="h-8 w-8 text-loss animate-pulse" />
                   ) : cb.tripped ? (
                     <ShieldOff className="h-8 w-8 text-loss" />
-                  ) : cb.recovery_state ? (
+                  ) : cb.recovery_state || breakerDisabled ? (
                     <AlertTriangle className="h-8 w-8 text-yellow-500" />
                   ) : (
                     <ShieldCheck className="h-8 w-8 text-profit" />
@@ -194,18 +197,20 @@ export default function RiskPage() {
                             ? "text-loss"
                             : cb.tripped
                               ? "text-loss"
-                              : cb.recovery_state
+                              : cb.recovery_state || breakerDisabled
                                 ? "text-yellow-500"
                                 : "text-profit",
                         )}
                       >
                         {cb.trip_reason === "hard_kill_switch"
-                          ? "HARD KILL \u2014 TRADING PERMANENTLY HALTED"
+                          ? "HARD KILL \u2014 TRADING HALTED UNTIL RESET"
                           : cb.tripped
                             ? "CIRCUIT BREAKER TRIPPED"
                             : cb.recovery_state
                               ? "RECOVERY MODE"
-                              : "OPERATIONAL"}
+                              : breakerDisabled
+                                ? "DISABLED"
+                                : "OPERATIONAL"}
                       </span>
                       {cb.tripped && cb.trip_reason && cb.trip_reason !== "hard_kill_switch" && (
                         <Badge variant="destructive" className="text-xs">
@@ -218,9 +223,26 @@ export default function RiskPage() {
                         Drawdown exceeded the hard kill threshold. Manual reset required to resume trading.
                       </p>
                     )}
-                    {cb.tripped && cb.trip_reason !== "hard_kill_switch" && cb.resume_at && (
+                    {cb.trip_reason === "manual" && (
                       <p className="text-sm text-muted-foreground">
-                        Resumes in {formatTimeRemaining(cb.resume_at)}
+                        Holds until an owner or admin resets it.
+                      </p>
+                    )}
+                    {cb.tripped && cb.resume_at && (
+                      <p className="text-sm text-muted-foreground">
+                        Cooldown ends in {formatTimeRemaining(cb.resume_at)}
+                      </p>
+                    )}
+                    {cb.trip_reason === "daily_loss_limit" && (
+                      <p className="text-sm text-muted-foreground">
+                        Holds while today&apos;s loss is over the limit; the
+                        day&apos;s counters reset at 00:00 UTC.
+                      </p>
+                    )}
+                    {breakerDisabled && (
+                      <p className="text-sm text-muted-foreground">
+                        Loss limits are not enforced. Manual and hard kill
+                        trips still halt trading.
                       </p>
                     )}
                     {cb.recovery_state && (
@@ -252,10 +274,9 @@ export default function RiskPage() {
                             Trip Circuit Breaker?
                           </AlertDialogTitle>
                           <AlertDialogDescription>
-                            This will immediately halt all trading activity. The
-                            system will enter a cooldown period of{" "}
-                            {cb.config.cooldown_minutes} minutes before
-                            recovery.
+                            This halts automated trading at once. A manual
+                            trip does not expire: trading stays halted until
+                            an owner or admin resets the breaker.
                           </AlertDialogDescription>
                         </AlertDialogHeader>
                         <AlertDialogFooter>
@@ -286,7 +307,7 @@ export default function RiskPage() {
                           <AlertDialogTitle>Reset Circuit Breaker?</AlertDialogTitle>
                           <AlertDialogDescription>
                             Trading resumes at once, ending this trip
-                            {cb.trip_reason ? ` (${cb.trip_reason})` : ""} and
+                            {cb.trip_reason ? ` (${TRIP_REASON_LABELS[cb.trip_reason]})` : ""} and
                             its cooldown. Reset only once the cause is
                             understood.
                           </AlertDialogDescription>
@@ -348,12 +369,21 @@ export default function RiskPage() {
               trend={cb.consecutive_losses > 0 ? "down" : "neutral"}
               changeLabel={`Limit: ${cb.config.max_consecutive_losses}`}
             />
-            <MetricCard
-              title="Drawdown"
-              value={formatPercent(drawdownPct)}
-              trend={drawdownPct > 0 ? "down" : "neutral"}
-              changeLabel={`Trip: ${formatPercent(cb.config.max_drawdown_pct * 100)}${cb.config.hard_kill_drawdown_pct ? ` | Kill: ${formatPercent(cb.config.hard_kill_drawdown_pct * 100)}` : ""}`}
-            />
+            {cb.equity_seeded ? (
+              <MetricCard
+                title="Drawdown"
+                value={formatPercent(drawdownPct)}
+                trend={drawdownPct > 0 ? "down" : "neutral"}
+                changeLabel={`Trip: ${formatPercent(cb.config.max_drawdown_pct * 100)}${cb.config.hard_kill_drawdown_pct > 0 ? ` | From peak: ${formatPercent(peakDrawdownPct)} of ${formatPercent(cb.config.hard_kill_drawdown_pct * 100)} kill` : ""}`}
+              />
+            ) : (
+              <MetricCard
+                title="Drawdown"
+                value="Not checked"
+                trend="neutral"
+                changeLabel="No equity snapshot yet; drawdown limits are idle"
+              />
+            )}
             <MetricCard
               title="Trips Today"
               value={String(cb.trips_today)}
@@ -373,7 +403,8 @@ export default function RiskPage() {
           </CardHeader>
           <CardContent>
             <p className="text-sm text-muted-foreground mb-4">
-              Filters applied before arb entry signals are published.
+              Filters arb-monitor applies before it publishes an entry
+              signal. A dash means the monitor is not reporting.
             </p>
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <div className="rounded-lg border p-3">
@@ -381,7 +412,7 @@ export default function RiskPage() {
                   Min Net Profit
                 </p>
                 <p className="text-lg font-bold tabular-nums">
-                  {(dynamicTunerStatus?.signal_thresholds.min_net_profit_threshold_pct ?? 0.5).toFixed(2)}%
+                  {formatFixed(dynamicTunerStatus?.signal_thresholds.min_net_profit_threshold_pct, 2, "%")}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Must clear fees + slippage
@@ -392,7 +423,7 @@ export default function RiskPage() {
                   Signal Cooldown
                 </p>
                 <p className="text-lg font-bold tabular-nums">
-                  {dynamicTunerStatus?.signal_thresholds.signal_cooldown_secs ?? 60}s
+                  {formatFixed(dynamicTunerStatus?.signal_thresholds.signal_cooldown_secs, 0, "s")}
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Per-market dedup window
@@ -403,21 +434,20 @@ export default function RiskPage() {
                   Min Depth
                 </p>
                 <p className="text-lg font-bold tabular-nums">
-                  {formatCurrency(dynamicTunerStatus?.signal_thresholds.min_depth_usd ?? 100)}
+                  {formatCurrencyOrDash(dynamicTunerStatus?.signal_thresholds.min_depth_usd)}
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  Both sides at best ask
+                  Each side, up to the entry price
                 </p>
               </div>
               <div className="rounded-lg border p-3">
                 <p className="text-xs text-muted-foreground mb-1">
                   Trading Fee
                 </p>
-                <p className="text-lg font-bold tabular-nums">
-                  {((dynamicTunerStatus?.signal_thresholds.trading_fee_pct ?? 0.02) * 100).toFixed(2)}%
-                </p>
+                <p className="text-lg font-bold">Per market</p>
                 <p className="text-xs text-muted-foreground">
-                  Applied to notional cost
+                  Taker fee rate &times; p(1&minus;p) per share; 7% rate when a
+                  market does not report its terms
                 </p>
               </div>
             </div>
@@ -446,6 +476,10 @@ export default function RiskPage() {
                 <ServicePill
                   name="Arb Executor"
                   status={serviceStatus.arb_executor}
+                />
+                <ServicePill
+                  name="Exit Handler"
+                  status={serviceStatus.exit_handler}
                 />
                 <ServicePill
                   name="Live Trading"

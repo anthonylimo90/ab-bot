@@ -159,13 +159,10 @@ function rolloutDefaultAuthority(mode: RolloutMode): AuthorityLevel {
 }
 
 function buildBounds(
-  threshold: string,
   maxSizeReductionPct: string,
 ): Record<string, number> | undefined {
   const bounds: Record<string, number> = {};
-  const parsedThreshold = parseNumberInput(threshold);
   const parsedMaxSizeReductionPct = parseNumberInput(maxSizeReductionPct);
-  if (parsedThreshold != null) bounds.threshold = parsedThreshold;
   if (parsedMaxSizeReductionPct != null) {
     bounds.max_size_reduction_pct = parsedMaxSizeReductionPct;
   }
@@ -397,7 +394,6 @@ export default function LearningLoopPage() {
   const [createAuthorityLevel, setCreateAuthorityLevel] =
     useState<AuthorityLevel>("tail_reject");
   const [createBaselineWindowHours, setCreateBaselineWindowHours] = useState("24");
-  const [createThreshold, setCreateThreshold] = useState("0.6");
   const [createMaxSizeReductionPct, setCreateMaxSizeReductionPct] = useState("0.2");
   const [createMaxFailureRate, setCreateMaxFailureRate] = useState("0.15");
   const [createMaxOneLeggedRate, setCreateMaxOneLeggedRate] = useState("0.05");
@@ -408,7 +404,6 @@ export default function LearningLoopPage() {
   const [editAuthorityLevel, setEditAuthorityLevel] =
     useState<AuthorityLevel>("tail_reject");
   const [editBaselineWindowHours, setEditBaselineWindowHours] = useState("24");
-  const [editThreshold, setEditThreshold] = useState("");
   const [editMaxSizeReductionPct, setEditMaxSizeReductionPct] = useState("");
   const [editMaxFailureRate, setEditMaxFailureRate] = useState("");
   const [editMaxOneLeggedRate, setEditMaxOneLeggedRate] = useState("");
@@ -479,7 +474,6 @@ export default function LearningLoopPage() {
     setEditRolloutMode(rolloutDetail.rollout.rollout_mode as RolloutMode);
     setEditAuthorityLevel(rolloutDetail.rollout.authority_level as AuthorityLevel);
     setEditBaselineWindowHours(String(rolloutDetail.rollout.baseline_window_hours));
-    setEditThreshold(asNumber(bounds.threshold));
     setEditMaxSizeReductionPct(asNumber(bounds.max_size_reduction_pct));
     setEditMaxFailureRate(asNumber(guardrails.max_failure_rate));
     setEditMaxOneLeggedRate(asNumber(guardrails.max_one_legged_rate));
@@ -581,7 +575,7 @@ export default function LearningLoopPage() {
         rollout_mode: createRolloutMode,
         authority_level: createAuthorityLevel,
         baseline_window_hours: parseNumberInput(createBaselineWindowHours),
-        bounds: buildBounds(createThreshold, createMaxSizeReductionPct),
+        bounds: buildBounds(createMaxSizeReductionPct),
         guardrails: buildGuardrails(
           createMaxFailureRate,
           createMaxOneLeggedRate,
@@ -606,7 +600,7 @@ export default function LearningLoopPage() {
           rollout_mode: editRolloutMode,
           authority_level: editAuthorityLevel,
           baseline_window_hours: parseNumberInput(editBaselineWindowHours),
-          bounds: buildBounds(editThreshold, editMaxSizeReductionPct),
+          bounds: buildBounds(editMaxSizeReductionPct),
           guardrails: buildGuardrails(
             editMaxFailureRate,
             editMaxOneLeggedRate,
@@ -1114,11 +1108,7 @@ export default function LearningLoopPage() {
                 <p className="text-sm font-medium">Bounds</p>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
                   <div className="grid gap-2">
-                    <Label>Decision Threshold</Label>
-                    <Input value={createThreshold} onChange={(event) => setCreateThreshold(event.target.value)} />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>Max Size Reduction</Label>
+                    <Label>Max Size Reduction (fraction, 0–0.95)</Label>
                     <Input
                       value={createMaxSizeReductionPct}
                       onChange={(event) => setCreateMaxSizeReductionPct(event.target.value)}
@@ -1130,18 +1120,18 @@ export default function LearningLoopPage() {
                 <p className="text-sm font-medium">Guardrails</p>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
                   <div className="grid gap-2">
-                    <Label>Max Failure Rate</Label>
+                    <Label>Max Failure Rate (fraction, 0–1)</Label>
                     <Input value={createMaxFailureRate} onChange={(event) => setCreateMaxFailureRate(event.target.value)} />
                   </div>
                   <div className="grid gap-2">
-                    <Label>Max One-Legged Rate</Label>
+                    <Label>Max One-Legged Rate (fraction, 0–1)</Label>
                     <Input
                       value={createMaxOneLeggedRate}
                       onChange={(event) => setCreateMaxOneLeggedRate(event.target.value)}
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label>Max Drawdown</Label>
+                    <Label>Max Drawdown (fraction of size, 0–1)</Label>
                     <Input value={createMaxDrawdownPct} onChange={(event) => setCreateMaxDrawdownPct(event.target.value)} />
                   </div>
                   <div className="grid gap-2">
@@ -1152,7 +1142,7 @@ export default function LearningLoopPage() {
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label>Min Edge Capture Ratio</Label>
+                    <Label>Min Edge Capture (realized ÷ expected)</Label>
                     <Input
                       value={createMinEdgeCaptureRatio}
                       onChange={(event) => setCreateMinEdgeCaptureRatio(event.target.value)}
@@ -1378,11 +1368,7 @@ export default function LearningLoopPage() {
                         <p className="text-sm font-medium">Bounds</p>
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
                           <div className="grid gap-2">
-                            <Label>Decision Threshold</Label>
-                            <Input value={editThreshold} onChange={(event) => setEditThreshold(event.target.value)} />
-                          </div>
-                          <div className="grid gap-2">
-                            <Label>Max Size Reduction</Label>
+                            <Label>Max Size Reduction (fraction, 0–0.95)</Label>
                             <Input
                               value={editMaxSizeReductionPct}
                               onChange={(event) => setEditMaxSizeReductionPct(event.target.value)}
@@ -1394,18 +1380,18 @@ export default function LearningLoopPage() {
                         <p className="text-sm font-medium">Guardrails</p>
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
                           <div className="grid gap-2">
-                            <Label>Max Failure Rate</Label>
+                            <Label>Max Failure Rate (fraction, 0–1)</Label>
                             <Input value={editMaxFailureRate} onChange={(event) => setEditMaxFailureRate(event.target.value)} />
                           </div>
                           <div className="grid gap-2">
-                            <Label>Max One-Legged Rate</Label>
+                            <Label>Max One-Legged Rate (fraction, 0–1)</Label>
                             <Input
                               value={editMaxOneLeggedRate}
                               onChange={(event) => setEditMaxOneLeggedRate(event.target.value)}
                             />
                           </div>
                           <div className="grid gap-2">
-                            <Label>Max Drawdown</Label>
+                            <Label>Max Drawdown (fraction of size, 0–1)</Label>
                             <Input value={editMaxDrawdownPct} onChange={(event) => setEditMaxDrawdownPct(event.target.value)} />
                           </div>
                           <div className="grid gap-2">
@@ -1416,7 +1402,7 @@ export default function LearningLoopPage() {
                             />
                           </div>
                           <div className="grid gap-2">
-                            <Label>Min Edge Capture Ratio</Label>
+                            <Label>Min Edge Capture (realized ÷ expected)</Label>
                             <Input
                               value={editMinEdgeCaptureRatio}
                               onChange={(event) => setEditMinEdgeCaptureRatio(event.target.value)}

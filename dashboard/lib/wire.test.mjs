@@ -116,9 +116,9 @@ const backtestFixture = () => ({
   strategy: { type: 'arbitrage', min_spread: '0.02', max_position: '1000' },
   start_date: '2026-01-01T00:00:00Z', end_date: '2026-02-01T00:00:00Z',
   initial_capital: '1000', final_value: '1100.50', total_return: '100.50',
-  total_return_pct: '10.05', annualized_return: '120.1', sharpe_ratio: '1.85',
-  sortino_ratio: '2.4', max_drawdown: '50', max_drawdown_pct: '5.0',
-  total_trades: 12, winning_trades: 8, losing_trades: 4, win_rate: '66.7',
+  total_return_pct: '0.1005', annualized_return: '1.201', sharpe_ratio: '1.85',
+  sortino_ratio: '2.4', max_drawdown: '0.05', max_drawdown_pct: '5.0',
+  total_trades: 12, winning_trades: 8, losing_trades: 4, win_rate: '0.667',
   avg_win: '25.5', avg_loss: '-10.25', profit_factor: '2.5', total_fees: '3.2',
   created_at: '2026-02-01T01:00:00Z', status: 'completed', trigger_mode: 'manual',
   expectancy: '8.37', calmar_ratio: '24.0', var_95: '-0.03', cvar_95: '-0.05',
@@ -151,7 +151,7 @@ test('parseBacktestResult converts every Decimal metric so page .toFixed calls w
     assert.equal(typeof result[key], 'number', key);
   }
   assert.equal(result.sharpe_ratio.toFixed(2), '1.85');
-  assert.equal(result.total_return_pct.toFixed(1), '10.1');
+  assert.equal(result.total_return_pct.toFixed(4), '0.1005');
   assert.equal(result.avg_loss, -10.25);
   assert.deepEqual(result.strategy, { type: 'arbitrage', min_spread: 0.02, max_position: 1000 });
   assert.equal(result.total_trades, 12);
@@ -193,7 +193,7 @@ test('parseBacktestResult preserves null metrics (non-finite values) instead of 
   assert.equal(result.expectancy, null);
   assert.equal(result.equity_curve[1].value, null);
   // Untouched metrics still convert.
-  assert.equal(result.total_return_pct, 10.05);
+  assert.equal(result.total_return_pct, 0.1005);
 });
 
 test('parseBacktestResult tolerates a result without optional collections', () => {
@@ -229,18 +229,21 @@ test('risk status parsers convert Decimal fields and map a missing recovery_stat
 test('parseCircuitBreakerStatus converts recovery state decimals', () => {
   const cb = parseCircuitBreakerStatus({
     tripped: true, trip_reason: 'manual', tripped_at: 't', resume_at: 't2',
-    daily_pnl: '0', peak_value: '1', current_value: '1', consecutive_losses: 0, trips_today: 1,
+    daily_pnl: '0', peak_value: '1', drawdown_peak: '0.9', current_value: '1', equity_seeded: true, consecutive_losses: 0, trips_today: 1,
     recovery_state: { current_stage: 1, total_stages: 4, capacity_pct: '0.25', started_at: 't', next_stage_at: null, trades_this_stage: 2, recovery_pnl: '-3.5' },
-    config: { max_daily_loss: '100', max_drawdown_pct: '0.1', max_consecutive_losses: 3, cooldown_minutes: 5, enabled: false },
+    config: { max_daily_loss: '100', max_drawdown_pct: '0.1', max_consecutive_losses: 3, cooldown_minutes: 5, enabled: false, hard_kill_drawdown_pct: '0' },
   });
+  assert.equal(cb.drawdown_peak, 0.9);
+  assert.equal(cb.equity_seeded, true);
+  assert.equal(cb.config.hard_kill_drawdown_pct, 0);
   assert.equal(cb.recovery_state.capacity_pct, 0.25);
   assert.equal(cb.recovery_state.recovery_pnl, -3.5);
   assert.equal((cb.recovery_state.capacity_pct * 100).toFixed(0), '25');
 });
 
 test('parseCircuitBreakerConfig converts the config response', () => {
-  const cfg = parseCircuitBreakerConfig({ max_daily_loss: '2500', max_drawdown_pct: '0.20', max_consecutive_losses: 8, cooldown_minutes: 30, enabled: true });
-  assert.deepEqual(cfg, { max_daily_loss: 2500, max_drawdown_pct: 0.2, max_consecutive_losses: 8, cooldown_minutes: 30, enabled: true });
+  const cfg = parseCircuitBreakerConfig({ max_daily_loss: '2500', max_drawdown_pct: '0.20', max_consecutive_losses: 8, cooldown_minutes: 30, enabled: true, hard_kill_drawdown_pct: '0.40' });
+  assert.deepEqual(cfg, { max_daily_loss: 2500, max_drawdown_pct: 0.2, max_consecutive_losses: 8, cooldown_minutes: 30, enabled: true, hard_kill_drawdown_pct: 0.4 });
 });
 
 test('parseActivity converts an optional pnl and leaves other fields', () => {

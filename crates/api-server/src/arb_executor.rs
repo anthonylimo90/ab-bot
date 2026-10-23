@@ -112,12 +112,15 @@ fn pair_collateral(quantity: Decimal, yes_ask: Decimal, no_ask: Decimal) -> Deci
 }
 
 /// Re-prices an opportunity on fresh books under the fee terms it was
-/// detected with; `None` when it no longer clears `min_net_profit`.
+/// detected with and the exchange's own (`exchange_terms`), whichever
+/// leaves less edge: the detected terms come from the market listing and can
+/// be stale or missing. `None` when it no longer clears `min_net_profit`.
 fn reprice_on_fresh_books(
     signal: &ArbOpportunity,
     yes_book: &OrderBook,
     no_book: &OrderBook,
     min_net_profit: Decimal,
+    exchange_terms: FeeSchedule,
 ) -> Option<ArbOpportunity> {
     let book = BinaryMarketBook {
         market_id: signal.market_id.clone(),
@@ -125,10 +128,18 @@ fn reprice_on_fresh_books(
         yes_book: yes_book.clone(),
         no_book: no_book.clone(),
     };
-    let schedule = signal.fee_schedule.unwrap_or(FeeSchedule::CONSERVATIVE);
-    ArbOpportunity::calculate_with_fee_schedule(&book, schedule)
+    let detected = signal.fee_schedule.unwrap_or(FeeSchedule::CONSERVATIVE);
+    [detected, exchange_terms]
+        .into_iter()
+        .map(|schedule| ArbOpportunity::calculate_with_fee_schedule(&book, schedule))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min_by_key(|priced| priced.net_profit)
         .filter(|fresh| fresh.net_profit >= min_net_profit)
 }
+
+/// How long the exchange's fee terms for a market are reused.
+const FEE_TERMS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Largest pair quantity (up to `desired`) that both legs can buy at their
 /// best ask under the executor's market-buy rules: at least `min_depth`
@@ -358,9 +369,40 @@ pub struct ArbAutoExecutor {
     /// When set, live pairs are entered only while the exit handler can
     /// flatten one whose second leg fails.
     exit_readiness: Option<crate::exit_handler::ExitReadiness>,
+    /// The exchange's fee terms by market, with when they were read.
+    fee_terms:
+        tokio::sync::Mutex<std::collections::HashMap<String, (FeeSchedule, std::time::Instant)>>,
 }
 
 impl ArbAutoExecutor {
+    /// The fee terms the exchange charges in `market_id`, read at most every
+    /// [`FEE_TERMS_TTL`]; the highest published rate when they cannot be read.
+    async fn exchange_fee_terms(&self, market_id: &str) -> FeeSchedule {
+        if let Some((terms, read_at)) = self.fee_terms.lock().await.get(market_id) {
+            if read_at.elapsed() < FEE_TERMS_TTL {
+                return *terms;
+            }
+        }
+        match self
+            .order_executor
+            .clob_client()
+            .get_fee_schedule(market_id)
+            .await
+        {
+            Ok(terms) => {
+                self.fee_terms
+                    .lock()
+                    .await
+                    .insert(market_id.to_string(), (terms, std::time::Instant::now()));
+                terms
+            }
+            Err(error) => {
+                warn!(%market_id, %error, "Could not read the market's fee terms; pricing at the highest rate");
+                FeeSchedule::CONSERVATIVE
+            }
+        }
+    }
+
     /// Enter live pairs only while `readiness` allows (see the field).
     pub fn with_exit_readiness(mut self, readiness: crate::exit_handler::ExitReadiness) -> Self {
         self.exit_readiness = Some(readiness);
@@ -400,6 +442,7 @@ impl ArbAutoExecutor {
             heartbeat,
             runtime_status,
             exit_readiness: None,
+            fee_terms: Default::default(),
         }
     }
 
@@ -985,8 +1028,14 @@ impl ArbAutoExecutor {
 
         // Re-price the opportunity on the books that will actually be traded,
         // under the fee terms it was detected with: the signal may be stale.
-        let Some(fresh) = reprice_on_fresh_books(&arb, &yes_book, &no_book, cfg.min_net_profit)
-        else {
+        let exchange_terms = self.exchange_fee_terms(market_id).await;
+        let Some(fresh) = reprice_on_fresh_books(
+            &arb,
+            &yes_book,
+            &no_book,
+            cfg.min_net_profit,
+            exchange_terms,
+        ) else {
             let mut runtime = self.runtime_status.write().await;
             runtime.record_decision(market_id, "skipped: edge gone on fresh books");
             telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
@@ -1704,15 +1753,44 @@ mod tests {
         let signal = signal(FeeSchedule::FREE);
         let min = Decimal::new(5, 3);
         // Asks moved up a cent each: 0.46 + 0.51 still leaves 3 cents.
+        let free = FeeSchedule::FREE;
         let fresh =
-            reprice_on_fresh_books(&signal, &book(&[(46, 500)]), &book(&[(51, 500)]), min).unwrap();
+            reprice_on_fresh_books(&signal, &book(&[(46, 500)]), &book(&[(51, 500)]), min, free)
+                .unwrap();
         assert_eq!(fresh.yes_ask, Decimal::new(46, 2));
         assert_eq!(fresh.net_profit, Decimal::new(3, 2));
         // 0.49 + 0.51: the edge is gone.
-        assert!(
-            reprice_on_fresh_books(&signal, &book(&[(49, 500)]), &book(&[(51, 500)]), min)
-                .is_none()
-        );
+        assert!(reprice_on_fresh_books(
+            &signal,
+            &book(&[(49, 500)]),
+            &book(&[(51, 500)]),
+            min,
+            free
+        )
+        .is_none());
+        // Detected as fee-free, but the exchange charges: its fees are what
+        // the pair pays.
+        let charged = FeeSchedule::CONSERVATIVE;
+        // 0.40 + 0.50 leaves 10 cents gross, less 0.07 x p(1 - p) a leg.
+        let priced = reprice_on_fresh_books(
+            &signal,
+            &book(&[(40, 500)]),
+            &book(&[(50, 500)]),
+            min,
+            charged,
+        )
+        .unwrap();
+        assert_eq!(priced.net_profit, Decimal::new(657, 4));
+        assert_eq!(priced.fee_schedule, Some(charged));
+        // 2 cents gross does not survive 0.07 x p(1 - p) on both legs.
+        assert!(reprice_on_fresh_books(
+            &signal,
+            &book(&[(48, 500)]),
+            &book(&[(50, 500)]),
+            min,
+            charged
+        )
+        .is_none());
     }
 
     #[test]
@@ -1727,7 +1805,8 @@ mod tests {
             &signal,
             &book(&[(45, 500)]),
             &book(&[(50, 500)]),
-            Decimal::new(5, 3)
+            Decimal::new(5, 3),
+            FeeSchedule::FREE
         )
         .is_some());
         // ...but 2% gross does not.
@@ -1735,7 +1814,8 @@ mod tests {
             &signal,
             &book(&[(48, 500)]),
             &book(&[(50, 500)]),
-            Decimal::new(5, 3)
+            Decimal::new(5, 3),
+            FeeSchedule::FREE
         )
         .is_none());
     }

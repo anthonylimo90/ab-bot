@@ -447,7 +447,7 @@ export default function PositionsPage() {
                                     variant="ghost"
                                     size="sm"
                                     className="h-7 text-xs text-loss hover:text-loss hover:bg-loss/10"
-                                    disabled={closeMutation.isPending}
+                                    disabled={closeMutation.isPending || pos.state === "pending"}
                                   >
                                     Exit
                                   </Button>

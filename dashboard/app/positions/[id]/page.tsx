@@ -23,7 +23,7 @@ import {
 } from "@/hooks/queries/usePositionsQuery";
 import { cn, formatCurrency } from "@/lib/utils";
 import { ArrowLeft, Layers, ExternalLink } from "lucide-react";
-import type { PositionState } from "@/types/api";
+import type { Position, PositionState } from "@/types/api";
 
 const STATE_BADGE_STYLES: Record<
   PositionState,
@@ -105,8 +105,8 @@ function DetailRow({
   );
 }
 
-const isOpen = (state?: PositionState) =>
-  state && !["closed", "entry_failed"].includes(state);
+// The API's own flag: a one-legged failed entry still holds a leg to exit.
+const isOpen = (position: Position) => position.is_open;
 
 export default function PositionDetailPage() {
   const params = useParams<{ id: string }>();
@@ -138,7 +138,7 @@ export default function PositionDetailPage() {
   }
 
   const entryValue = position.entry_price * position.quantity;
-  const pnl = isOpen(position.state)
+  const pnl = isOpen(position)
     ? position.unrealized_pnl
     : (position.realized_pnl ?? 0);
   const pnlPct =
@@ -168,7 +168,7 @@ export default function PositionDetailPage() {
           </div>
           <div className="flex items-center gap-2">
             <StateBadge state={position.state} />
-            {isOpen(position.state) && (
+            {isOpen(position) && position.state !== "pending" && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button
@@ -209,7 +209,7 @@ export default function PositionDetailPage() {
         {/* Metric Cards */}
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <MetricCard
-            title={isOpen(position.state) ? "Unrealized P&L" : "Realized P&L"}
+            title={isOpen(position) ? "Unrealized P&L" : "Realized P&L"}
             value={formatCurrency(pnl, { showSign: true })}
             trend={pnl > 0 ? "up" : pnl < 0 ? "down" : "neutral"}
             changeLabel={`${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`}
@@ -228,7 +228,7 @@ export default function PositionDetailPage() {
             title="Duration"
             value={formatDuration(
               position.opened_at,
-              isOpen(position.state) ? undefined : position.updated_at,
+              isOpen(position) ? undefined : position.updated_at,
             )}
             trend="neutral"
           />
@@ -375,11 +375,11 @@ export default function PositionDetailPage() {
               value={`$${position.entry_price.toFixed(4)}`}
             />
             <DetailRow
-              label={isOpen(position.state) ? "Current Price" : "Exit Price"}
+              label={isOpen(position) ? "Current Price" : "Exit Price"}
               value={position.current_price != null ? `$${position.current_price.toFixed(4)}` : "-"}
             />
             <DetailRow
-              label={isOpen(position.state) ? "Unrealized P&L" : "Realized P&L"}
+              label={isOpen(position) ? "Unrealized P&L" : "Realized P&L"}
               value={formatCurrency(pnl, { showSign: true })}
               className={cn(
                 pnl > 0 ? "text-profit" : pnl < 0 ? "text-loss" : "",
@@ -425,7 +425,7 @@ export default function PositionDetailPage() {
               label="Duration"
               value={formatDuration(
                 position.opened_at,
-                isOpen(position.state) ? undefined : position.updated_at,
+                isOpen(position) ? undefined : position.updated_at,
               )}
             />
           </CardContent>

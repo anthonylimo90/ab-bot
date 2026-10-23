@@ -556,6 +556,13 @@ pub async fn recover_wallet_orphan_inventory(
         return Ok(OrphanRecoveryResult::default());
     }
     let observed = refresh::status(pool, wallet_address).await?;
+    // A refresh in flight finishes first; a later look sells.
+    if observed
+        .as_ref()
+        .is_some_and(|status| status.finished_at.is_none())
+    {
+        return Ok(OrphanRecoveryResult::default());
+    }
     let freshness = WalletInventoryConfig::from_env()
         .interval_secs
         .saturating_mul(2)

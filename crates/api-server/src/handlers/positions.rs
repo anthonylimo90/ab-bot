@@ -76,6 +76,9 @@ pub struct PositionResponse {
     pub resolution_winner: Option<String>,
     /// Exit strategy: "hold_to_resolution" or "exit_on_correction".
     pub exit_strategy: String,
+    /// Whether the position still holds exposure the exit flow manages: every
+    /// state but closed and entry_failed, plus a one-legged failed entry.
+    pub is_open: bool,
 }
 
 /// Summary response for dashboard/overview metrics.
@@ -180,6 +183,58 @@ struct PositionRow {
     no_exit_price: Option<Decimal>,
     resolution_winner: Option<String>,
     exit_strategy: i16,
+    is_open: bool,
+}
+
+/// The columns of a [`PositionRow`], ahead of a `WHERE` clause.
+const POSITION_ROW_SELECT: &str = r#"
+        SELECT id, market_id,
+               COALESCE(outcome, 'both') AS outcome,
+               COALESCE(side, 'long') AS side,
+               quantity,
+               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
+               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
+               unrealized_pnl, stop_loss, take_profit,
+               realized_pnl,
+               state,
+               COALESCE(opened_at, entry_timestamp) AS opened_at,
+               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
+               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
+               yes_exit_price, no_exit_price, resolution_winner,
+               COALESCE(exit_strategy, 0)::smallint AS exit_strategy,
+               is_open
+        FROM positions
+"#;
+
+impl From<PositionRow> for PositionResponse {
+    fn from(row: PositionRow) -> Self {
+        Self {
+            unrealized_pnl_pct: unrealized_pct(row.unrealized_pnl, row.entry_price, row.quantity),
+            id: row.id,
+            market_id: row.market_id,
+            outcome: row.outcome,
+            side: row.side,
+            quantity: row.quantity,
+            entry_price: row.entry_price,
+            current_price: row.current_price,
+            unrealized_pnl: row.unrealized_pnl,
+            stop_loss: row.stop_loss,
+            take_profit: row.take_profit,
+            realized_pnl: row.realized_pnl,
+            state: position_state_name(row.state).to_string(),
+            opened_at: row.opened_at,
+            updated_at: row.updated_at,
+            held_yes_qty: row.held_yes_qty,
+            held_no_qty: row.held_no_qty,
+            exited_yes_qty: row.exited_yes_qty,
+            exited_no_qty: row.exited_no_qty,
+            yes_exit_price: row.yes_exit_price,
+            no_exit_price: row.no_exit_price,
+            resolution_winner: row.resolution_winner,
+            exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
+            is_open: row.is_open,
+        }
+    }
 }
 
 #[derive(Debug, FromRow)]
@@ -303,38 +358,7 @@ pub async fn list_positions(
 ) -> ApiResult<Json<Vec<PositionResponse>>> {
     let rows = load_position_rows(&state.pool, &query).await?;
 
-    let positions: Vec<PositionResponse> = rows
-        .into_iter()
-        .map(|row| {
-            let pnl_pct = unrealized_pct(row.unrealized_pnl, row.entry_price, row.quantity);
-
-            PositionResponse {
-                id: row.id,
-                market_id: row.market_id,
-                outcome: row.outcome,
-                side: row.side,
-                quantity: row.quantity,
-                entry_price: row.entry_price,
-                current_price: row.current_price,
-                unrealized_pnl: row.unrealized_pnl,
-                unrealized_pnl_pct: pnl_pct,
-                stop_loss: row.stop_loss,
-                take_profit: row.take_profit,
-                realized_pnl: row.realized_pnl,
-                state: position_state_name(row.state).to_string(),
-                opened_at: row.opened_at,
-                updated_at: row.updated_at,
-                held_yes_qty: row.held_yes_qty,
-                held_no_qty: row.held_no_qty,
-                exited_yes_qty: row.exited_yes_qty,
-                exited_no_qty: row.exited_no_qty,
-                yes_exit_price: row.yes_exit_price,
-                no_exit_price: row.no_exit_price,
-                resolution_winner: row.resolution_winner,
-                exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
-            }
-        })
-        .collect();
+    let positions: Vec<PositionResponse> = rows.into_iter().map(PositionResponse::from).collect();
 
     Ok(Json(positions))
 }
@@ -350,26 +374,8 @@ async fn load_position_rows(
     }
     let status_filter = validate_status_filter(&query.status)?;
 
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        r#"
-        SELECT id, market_id,
-               COALESCE(outcome, 'both') AS outcome,
-               COALESCE(side, 'long') AS side,
-               quantity,
-               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
-               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
-               unrealized_pnl, stop_loss, take_profit,
-               realized_pnl,
-               state,
-               COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
-               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
-               yes_exit_price, no_exit_price, resolution_winner,
-               COALESCE(exit_strategy, 0)::smallint AS exit_strategy
-        FROM positions
-        WHERE 1 = 1
-        "#,
-    );
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("{POSITION_ROW_SELECT} WHERE 1 = 1"));
 
     if let Some(market_id) = &query.market_id {
         qb.push(" AND market_id = ");
@@ -548,61 +554,15 @@ pub async fn get_position(
     State(state): State<Arc<AppState>>,
     Path(position_id): Path<Uuid>,
 ) -> ApiResult<Json<PositionResponse>> {
-    let row: Option<PositionRow> = sqlx::query_as(
-        r#"
-        SELECT id, market_id,
-               COALESCE(outcome, 'both') AS outcome,
-               COALESCE(side, 'long') AS side,
-               quantity,
-               COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
-               COALESCE(current_price, (yes_entry_price + no_entry_price)) AS current_price,
-               unrealized_pnl, stop_loss, take_profit,
-               realized_pnl,
-               state,
-               COALESCE(opened_at, entry_timestamp) AS opened_at,
-               COALESCE(last_updated, updated_at, entry_timestamp) AS updated_at,
-               held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
-               yes_exit_price, no_exit_price, resolution_winner,
-               COALESCE(exit_strategy, 0)::smallint AS exit_strategy
-        FROM positions
-        WHERE id = $1
-        "#,
-    )
-    .bind(position_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let sql = format!("{POSITION_ROW_SELECT} WHERE id = $1");
+    let row: Option<PositionRow> = sqlx::query_as(&sql)
+        .bind(position_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     match row {
-        Some(row) => {
-            let pnl_pct = unrealized_pct(row.unrealized_pnl, row.entry_price, row.quantity);
-
-            Ok(Json(PositionResponse {
-                id: row.id,
-                market_id: row.market_id,
-                outcome: row.outcome,
-                side: row.side,
-                quantity: row.quantity,
-                entry_price: row.entry_price,
-                current_price: row.current_price,
-                unrealized_pnl: row.unrealized_pnl,
-                unrealized_pnl_pct: pnl_pct,
-                stop_loss: row.stop_loss,
-                take_profit: row.take_profit,
-                realized_pnl: row.realized_pnl,
-                state: position_state_name(row.state).to_string(),
-                opened_at: row.opened_at,
-                updated_at: row.updated_at,
-                held_yes_qty: row.held_yes_qty,
-                held_no_qty: row.held_no_qty,
-                exited_yes_qty: row.exited_yes_qty,
-                exited_no_qty: row.exited_no_qty,
-                yes_exit_price: row.yes_exit_price,
-                no_exit_price: row.no_exit_price,
-                resolution_winner: row.resolution_winner,
-                exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
-            }))
-        }
+        Some(row) => Ok(Json(PositionResponse::from(row))),
         None => Err(ApiError::NotFound(format!(
             "Position {} not found",
             position_id
@@ -799,6 +759,7 @@ pub async fn close_position(
             polymarket_core::types::ExitStrategy::ExitOnCorrection => "exit_on_correction",
         }
         .to_string(),
+        is_open: position.should_persist_as_open(),
     }))
 }
 
@@ -956,6 +917,7 @@ mod tests {
             no_exit_price: None,
             resolution_winner: None,
             exit_strategy: "hold_to_resolution".to_string(),
+            is_open: true,
         };
 
         let json = serde_json::to_string(&position).unwrap();

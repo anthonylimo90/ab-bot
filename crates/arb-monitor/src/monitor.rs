@@ -491,6 +491,8 @@ impl ArbMonitor {
     /// previous one so new markets are watched and closed ones dropped.
     async fn load_universe(&mut self) -> Result<()> {
         let markets = fetch_universe(&self.gamma_client).await?;
+        // An empty answer is a failed listing: the caller retries it.
+        anyhow::ensure!(!markets.is_empty(), "Gamma listed no markets");
         self.apply_universe(markets);
         Ok(())
     }
@@ -672,6 +674,11 @@ impl ArbMonitor {
                 {
                     universe_fetch = None;
                     match fetched {
+                        // An empty answer is a failed listing, not a market
+                        // with nothing to trade: it would unsubscribe every book.
+                        Ok(Ok(markets)) if markets.is_empty() => warn!(
+                            "Arb market universe refresh returned no markets; keeping previous set"
+                        ),
                         Ok(Ok(markets)) => {
                             self.apply_universe(markets);
                             info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe");
@@ -767,6 +774,9 @@ impl ArbMonitor {
                         ws_last_parse_miss_kind: ws_runtime.last_parse_miss_kind.clone(),
                         ws_last_message_kind: ws_runtime.last_message_kind.clone(),
                         selected_markets: self.selection_snapshot.clone(),
+                        min_profit_threshold: self.min_profit_threshold.to_f64(),
+                        min_book_depth_usd: self.min_book_depth.to_f64(),
+                        signal_cooldown_secs: Some(SIGNAL_COOLDOWN_SECS),
                     };
                     if let Err(e) = self.signal_publisher.publish_runtime_stats(&stats).await {
                         warn!(error = %e, "Failed to publish arb runtime stats");
@@ -823,7 +833,6 @@ impl ArbMonitor {
                     selection_suppressed_since_tick = 0;
                     last_selection_market_delta = 0;
                     last_selection_asset_delta = 0;
-                    // Evict expired signal cooldowns to bound memory
                     // Evict expired signal cooldowns to bound memory
                     let signal_eviction_cutoff = Utc::now() - chrono::Duration::seconds(SIGNAL_COOLDOWN_SECS * 2);
                     self.last_signal_time.retain(|_, ts| *ts > signal_eviction_cutoff);

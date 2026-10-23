@@ -178,6 +178,15 @@ pub struct RuntimeStats {
     pub ws_last_message_kind: Option<String>,
     #[serde(default)]
     pub selected_markets: Vec<RuntimeMarketInsight>,
+    /// Minimum net profit per $1 pair a signal must clear.
+    #[serde(default)]
+    pub min_profit_threshold: Option<f64>,
+    /// Depth in USD each side's book must hold at the entry price.
+    #[serde(default)]
+    pub min_book_depth_usd: Option<f64>,
+    /// Seconds before the same market can signal again.
+    #[serde(default)]
+    pub signal_cooldown_secs: Option<i64>,
 }
 
 impl SignalPublisher {

@@ -860,6 +860,51 @@ fn validate_json_object(
     Ok(value)
 }
 
+/// The limits a rollout's `bounds` and `guardrails` objects may carry, each
+/// with its inclusive range. A key outside the list, or a value that is not a
+/// number in range, is refused: the rollout code reads these with `as_f64`
+/// and would silently skip a misspelt or string-valued limit.
+const ROLLOUT_BOUND_LIMITS: &[(&str, f64, f64)] = &[("max_size_reduction_pct", 0.0, 0.95)];
+const ROLLOUT_GUARDRAIL_LIMITS: &[(&str, f64, f64)] = &[
+    ("max_failure_rate", 0.0, 1.0),
+    ("max_one_legged_rate", 0.0, 1.0),
+    ("max_drawdown_pct", 0.0, 1.0),
+    ("max_latency_p90_ms", 1.0, 600_000.0),
+    ("min_edge_capture_ratio", -10.0, 10.0),
+];
+
+/// Bound keys earlier dashboards wrote that nothing reads; dropped on save.
+const IGNORED_ROLLOUT_BOUND_KEYS: &[&str] = &["threshold"];
+
+fn validate_rollout_limits(
+    value: Option<serde_json::Value>,
+    field_name: &str,
+    limits: &[(&str, f64, f64)],
+    ignored: &[&str],
+) -> Result<serde_json::Value, ApiError> {
+    let mut value = validate_json_object(value, field_name)?;
+    let object = value.as_object_mut().expect("validated as an object");
+    object.retain(|key, _| !ignored.contains(&key.as_str()));
+    for (key, entry) in object.iter() {
+        let Some(&(_, min, max)) = limits.iter().find(|(name, _, _)| name == key) else {
+            let known: Vec<&str> = limits.iter().map(|(name, _, _)| *name).collect();
+            return Err(ApiError::BadRequest(format!(
+                "{field_name}.{key} is not a known limit (expected one of: {})",
+                known.join(", ")
+            )));
+        };
+        match entry.as_f64() {
+            Some(number) if (min..=max).contains(&number) => {}
+            _ => {
+                return Err(ApiError::BadRequest(format!(
+                    "{field_name}.{key} must be a number between {min} and {max}"
+                )))
+            }
+        }
+    }
+    Ok(value)
+}
+
 fn validate_rollout_mode(rollout_mode: &str) -> Result<(), ApiError> {
     if ["shadow", "canary", "bounded", "full"].contains(&rollout_mode) {
         Ok(())
@@ -3382,8 +3427,14 @@ pub async fn create_learning_rollout(
     validate_authority_level(&req.authority_level)?;
     validate_rollout_authority_combo(&req.rollout_mode, &req.authority_level)?;
     let baseline_window_hours = validate_baseline_window_hours(req.baseline_window_hours)?;
-    let bounds = validate_json_object(req.bounds, "bounds")?;
-    let guardrails = validate_json_object(req.guardrails, "guardrails")?;
+    let bounds = validate_rollout_limits(
+        req.bounds,
+        "bounds",
+        ROLLOUT_BOUND_LIMITS,
+        IGNORED_ROLLOUT_BOUND_KEYS,
+    )?;
+    let guardrails =
+        validate_rollout_limits(req.guardrails, "guardrails", ROLLOUT_GUARDRAIL_LIMITS, &[])?;
 
     let mut tx = state.pool.begin().await?;
     let model: LearningModelTargetRow = sqlx::query_as(
@@ -3538,9 +3589,18 @@ pub async fn update_learning_rollout(
         req.baseline_window_hours
             .or(Some(current.baseline_window_hours)),
     )?;
-    let bounds = validate_json_object(req.bounds.or(Some(current.bounds)), "bounds")?;
-    let guardrails =
-        validate_json_object(req.guardrails.or(Some(current.guardrails)), "guardrails")?;
+    let bounds = validate_rollout_limits(
+        req.bounds.or(Some(current.bounds)),
+        "bounds",
+        ROLLOUT_BOUND_LIMITS,
+        IGNORED_ROLLOUT_BOUND_KEYS,
+    )?;
+    let guardrails = validate_rollout_limits(
+        req.guardrails.or(Some(current.guardrails)),
+        "guardrails",
+        ROLLOUT_GUARDRAIL_LIMITS,
+        &[],
+    )?;
 
     sqlx::query(
         r#"
@@ -3753,6 +3813,40 @@ pub async fn complete_learning_rollout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollout_limits_refuse_unknown_keys_strings_and_out_of_range_values() {
+        let guardrails = |value: serde_json::Value| {
+            validate_rollout_limits(Some(value), "guardrails", ROLLOUT_GUARDRAIL_LIMITS, &[])
+        };
+        assert!(guardrails(serde_json::json!({
+            "max_failure_rate": 0.15,
+            "max_latency_p90_ms": 900,
+            "min_edge_capture_ratio": 0.6,
+        }))
+        .is_ok());
+        assert!(guardrails(serde_json::json!({ "max_failure_rate": 15 })).is_err());
+        assert!(guardrails(serde_json::json!({ "max_failure_rate": "0.15" })).is_err());
+        assert!(guardrails(serde_json::json!({ "max_falure_rate": 0.15 })).is_err());
+        assert!(guardrails(serde_json::json!({ "max_latency_p90_ms": 0 })).is_err());
+        assert!(guardrails(serde_json::json!([])).is_err());
+
+        let bounds = validate_rollout_limits(
+            Some(serde_json::json!({ "threshold": 0.6, "max_size_reduction_pct": 0.2 })),
+            "bounds",
+            ROLLOUT_BOUND_LIMITS,
+            IGNORED_ROLLOUT_BOUND_KEYS,
+        )
+        .unwrap();
+        assert_eq!(bounds, serde_json::json!({ "max_size_reduction_pct": 0.2 }));
+        assert!(validate_rollout_limits(
+            Some(serde_json::json!({ "max_size_reduction_pct": 1.0 })),
+            "bounds",
+            ROLLOUT_BOUND_LIMITS,
+            IGNORED_ROLLOUT_BOUND_KEYS,
+        )
+        .is_err());
+    }
 
     #[sqlx::test(migrations = false)]
     async fn dataset_readiness_counts_each_view_in_one_pass(pool: sqlx::PgPool) {

@@ -622,6 +622,21 @@ pub async fn update_workspace(
             "Runtime flags can only be enabled on the canonical workspace".into(),
         ));
     }
+    // A service the environment switches on stays on whatever the workspace
+    // says: switching it off here would report success and change nothing.
+    for (requested, variable) in [
+        (req.live_trading_enabled, "LIVE_TRADING"),
+        (req.exit_handler_enabled, "EXIT_HANDLER_ENABLED"),
+        (req.arb_auto_execute, "ARB_AUTO_EXECUTE"),
+    ] {
+        if requested == Some(false) && crate::runtime_sync::env_enabled(variable) {
+            return Err(ApiError::Conflict(format!(
+                "{variable}=true is set in the server's environment, so this cannot be \
+                 switched off here; nothing was changed. Unset {variable} and restart, or \
+                 trip the circuit breaker to stop trading now"
+            )));
+        }
+    }
 
     // Validate WalletConnect project ID format if provided
     if let Some(ref project_id) = req.walletconnect_project_id {
@@ -2065,6 +2080,12 @@ struct ArbRuntimeStatsSnapshot {
     ws_last_message_kind: Option<String>,
     #[serde(default)]
     selected_markets: Vec<ScannerMarketInsightSnapshot>,
+    #[serde(default)]
+    min_profit_threshold: Option<f64>,
+    #[serde(default)]
+    min_book_depth_usd: Option<f64>,
+    #[serde(default)]
+    signal_cooldown_secs: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2083,12 +2104,14 @@ pub struct DynamicConfigItemResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The filters arb-monitor applies before publishing an entry signal. The
+/// depth and cooldown are the monitor's own and are `null` while it is not
+/// reporting.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DynamicSignalThresholdsResponse {
     pub min_net_profit_threshold_pct: f64,
-    pub signal_cooldown_secs: i64,
-    pub min_depth_usd: f64,
-    pub trading_fee_pct: f64,
+    pub signal_cooldown_secs: Option<i64>,
+    pub min_depth_usd: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2367,7 +2390,9 @@ pub async fn get_service_status(
     // Check live trading using actual executor mode/readiness.
     let live_mode = state.order_executor.is_live();
     let live_ready = state.order_executor.is_live_ready().await;
-    let live_running = flags.live_trading_enabled && live_mode && live_ready;
+    // What the executor does, whatever the workspace flag says (the
+    // environment can switch live trading on by itself).
+    let live_running = live_mode && live_ready;
     let quant_executor_enabled = if let Some(ref quant_config) = state.quant_executor_config {
         quant_config.read().await.enabled
     } else {
@@ -2532,11 +2557,16 @@ pub async fn get_dynamic_tuner_status(
         _ => "Balanced discovery and stability.".to_string(),
     };
 
+    let runtime_stats = fetch_arb_runtime_stats(state.redis_conn.as_ref())
+        .await
+        .unwrap_or_default();
     let signal_thresholds = DynamicSignalThresholdsResponse {
-        min_net_profit_threshold_pct: min_profit_ratio * 100.0,
-        signal_cooldown_secs: env_i64("ARB_SIGNAL_COOLDOWN_SECS", 60),
-        min_depth_usd: env_f64("ARB_MIN_BOOK_DEPTH", 25.0),
-        trading_fee_pct: env_f64("ARB_TRADING_FEE_PCT", 0.0),
+        min_net_profit_threshold_pct: runtime_stats
+            .min_profit_threshold
+            .unwrap_or(min_profit_ratio)
+            * 100.0,
+        signal_cooldown_secs: runtime_stats.signal_cooldown_secs,
+        min_depth_usd: runtime_stats.min_book_depth_usd,
     };
 
     let runtime_state: Option<DynamicTunerStateRow> = sqlx::query_as(
@@ -2626,9 +2656,6 @@ pub async fn get_dynamic_tuner_status(
             None => (None, None, None, None),
         };
 
-    let runtime_stats = fetch_arb_runtime_stats(state.redis_conn.as_ref())
-        .await
-        .unwrap_or_default();
     let scanner_status = ScannerStatusResponse {
         monitored_markets: runtime_stats.monitored_markets.round() as i64,
         monitored_assets: runtime_stats.monitored_assets.round() as i64,
@@ -3184,56 +3211,33 @@ pub async fn update_arb_executor_config(
         ));
     }
 
+    // A value outside a key's bounds is refused rather than clamped: saving
+    // something other than what the operator typed would be silent.
+    let requested = [
+        (KEY_ARB_POSITION_SIZE, "position_size", req.position_size),
+        (KEY_ARB_MIN_NET_PROFIT, "min_net_profit", req.min_net_profit),
+        (KEY_ARB_MIN_BOOK_DEPTH, "min_book_depth", req.min_book_depth),
+        (
+            KEY_ARB_MAX_SIGNAL_AGE_SECS,
+            "max_signal_age_secs",
+            req.max_signal_age_secs.map(|secs| secs as f64),
+        ),
+    ];
     let mut updates: Vec<(String, Decimal, String)> = Vec::new();
-
-    if let Some(v) = req.position_size {
-        let (min, max, _) =
-            arb_executor_dynamic_bounds(KEY_ARB_POSITION_SIZE).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid position_size".into()))?;
-        let clamped = dec.max(min).min(max);
+    for (key, field, value) in requested {
+        let Some(value) = value else { continue };
+        let value = Decimal::try_from(value)
+            .map_err(|_| ApiError::BadRequest(format!("Invalid {field}")))?;
+        let (min, max, _) = arb_executor_dynamic_bounds(key).expect("bounds defined");
+        if value < min || value > max {
+            return Err(ApiError::BadRequest(format!(
+                "{field} must be between {min} and {max}, not {value}"
+            )));
+        }
         updates.push((
-            KEY_ARB_POSITION_SIZE.to_string(),
-            clamped,
-            format!("manual workspace update: position_size={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.min_net_profit {
-        let (min, max, _) =
-            arb_executor_dynamic_bounds(KEY_ARB_MIN_NET_PROFIT).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid min_net_profit".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_ARB_MIN_NET_PROFIT.to_string(),
-            clamped,
-            format!("manual workspace update: min_net_profit={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.min_book_depth {
-        let (min, max, _) =
-            arb_executor_dynamic_bounds(KEY_ARB_MIN_BOOK_DEPTH).expect("bounds defined");
-        let dec = Decimal::from_f64_retain(v)
-            .ok_or_else(|| ApiError::BadRequest("Invalid min_book_depth".into()))?;
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_ARB_MIN_BOOK_DEPTH.to_string(),
-            clamped,
-            format!("manual workspace update: min_book_depth={}", clamped),
-        ));
-    }
-
-    if let Some(v) = req.max_signal_age_secs {
-        let (min, max, _) =
-            arb_executor_dynamic_bounds(KEY_ARB_MAX_SIGNAL_AGE_SECS).expect("bounds defined");
-        let dec = Decimal::new(v, 0);
-        let clamped = dec.max(min).min(max);
-        updates.push((
-            KEY_ARB_MAX_SIGNAL_AGE_SECS.to_string(),
-            clamped,
-            format!("manual workspace update: max_signal_age_secs={}", clamped),
+            key.to_string(),
+            value,
+            format!("manual workspace update: {field}={value}"),
         ));
     }
 
@@ -3413,13 +3417,6 @@ fn env_f64(name: &str, fallback: f64) -> f64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
-        .unwrap_or(fallback)
-}
-
-fn env_i64(name: &str, fallback: i64) -> i64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(fallback)
 }
 

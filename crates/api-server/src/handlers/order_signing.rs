@@ -367,16 +367,22 @@ pub async fn prepare_order(
         .map_err(|_| ApiError::BadRequest("Invalid token ID".into()))?;
     // Prepared orders never submitted expire unused: they are cleared, and
     // each user keeps a bounded number awaiting a signature (each one costs
-    // exchange lookups and a stored row).
-    sqlx::query("DELETE FROM pending_wallet_orders WHERE user_id = $1 AND expires_at < NOW()")
-        .bind(user_id)
-        .execute(&state.pool)
-        .await?;
-    let awaiting: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM pending_wallet_orders WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&state.pool)
-            .await?;
+    // exchange lookups and a stored row). A submitted order (its intent
+    // shares its id) is neither: its row answers a retry of the submission.
+    sqlx::query(
+        "DELETE FROM pending_wallet_orders p WHERE p.user_id = $1 AND p.expires_at < NOW() \
+         AND NOT EXISTS (SELECT 1 FROM execution_intents i WHERE i.id = p.id)",
+    )
+    .bind(user_id)
+    .execute(&state.pool)
+    .await?;
+    let awaiting: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_wallet_orders p WHERE p.user_id = $1 \
+         AND NOT EXISTS (SELECT 1 FROM execution_intents i WHERE i.id = p.id)",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
     if awaiting >= MAX_PREPARED_ORDERS_PER_USER {
         return Err(ApiError::Conflict(format!(
             "{MAX_PREPARED_ORDERS_PER_USER} prepared orders already await a signature; submit \

@@ -76,6 +76,9 @@ export function useClosePositionMutation() {
         "The position has been handed to the canonical exit flow and will move through exit-ready or closing states before it is fully closed.",
       );
     },
+    onError: (error: Error) => {
+      toast.error("Exit not requested", error.message);
+    },
   });
 }
 

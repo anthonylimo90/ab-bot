@@ -259,14 +259,36 @@ pub async fn run_recovery(
         ExitHandlerConfig::from_env().failed_exit_retry_backoff_secs
     };
     let orphan_recovery =
-        recover_canonical_orphan_inventory(state.as_ref(), orphan_retry_backoff_secs)
+        recover_canonical_orphan_inventory(state.as_ref(), orphan_retry_backoff_secs).await;
+    let refreshed = match &orphan_recovery {
+        Ok(sold) if sold.succeeded > 0 => force_refresh_canonical_wallet_inventory(state.as_ref())
             .await
-            .map_err(map_anyhow)?;
-    if orphan_recovery.succeeded > 0 {
-        force_refresh_canonical_wallet_inventory(state.as_ref())
-            .await
-            .map_err(map_anyhow)?;
+            .map(drop),
+        _ => Ok(()),
+    };
+    // Recorded whatever came of the run: requeues and sales already happened.
+    if let Ok(user_id) = Uuid::parse_str(&claims.sub) {
+        super::audit_change(
+            &state,
+            user_id,
+            ::auth::AuditAction::Custom("recovery_run".into()),
+            format!("workspace/{workspace_id}"),
+            serde_json::json!({
+                "safe_exit_failures_requeued": safe_exit_failures_requeued,
+                "stalled_positions_reopened": stalled_positions_reopened,
+                "orphan_inventory_attempted": orphan_recovery.as_ref().map(|r| r.attempted).ok(),
+                "orphan_inventory_succeeded": orphan_recovery.as_ref().map(|r| r.succeeded).ok(),
+                "error": orphan_recovery
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .or_else(|| refreshed.as_ref().err().map(ToString::to_string)),
+            }),
+        )
+        .await;
     }
+    let orphan_recovery = orphan_recovery.map_err(map_anyhow)?;
+    refreshed.map_err(map_anyhow)?;
 
     let runtime = runtime_snapshot(state.as_ref(), workspace_id).await?;
     let mut warnings = Vec::new();
@@ -295,22 +317,6 @@ pub async fn run_recovery(
             "Attempted orphan inventory recovery for {} token balances ({} successful submits)",
             orphan_recovery.attempted, orphan_recovery.succeeded
         ));
-    }
-
-    if let Ok(user_id) = Uuid::parse_str(&claims.sub) {
-        super::audit_change(
-            &state,
-            user_id,
-            ::auth::AuditAction::Custom("recovery_run".into()),
-            format!("workspace/{workspace_id}"),
-            serde_json::json!({
-                "safe_exit_failures_requeued": safe_exit_failures_requeued,
-                "stalled_positions_reopened": stalled_positions_reopened,
-                "orphan_inventory_attempted": orphan_recovery.attempted,
-                "orphan_inventory_succeeded": orphan_recovery.succeeded,
-            }),
-        )
-        .await;
     }
 
     Ok(Json(RecoveryRunResponse {
@@ -506,7 +512,7 @@ async fn runtime_snapshot(state: &AppState, workspace_id: Uuid) -> ApiResult<Run
     let live_ready = state.order_executor.is_live_ready().await;
 
     Ok(RuntimeSnapshot {
-        live_running: flags.live_trading_enabled && live_mode && live_ready,
+        live_running: live_mode && live_ready,
         live_ready,
         exit_handler_running: flags.exit_handler_enabled && exit_handler_alive,
         live_trading_enabled: flags.live_trading_enabled,

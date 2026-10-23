@@ -192,15 +192,12 @@ export function parseBacktestResult(raw: BacktestResult): BacktestResult {
 }
 
 export function parseCircuitBreakerConfig(raw: CircuitBreakerConfig): CircuitBreakerConfig {
-  const parsed: CircuitBreakerConfig = {
+  return {
     ...raw,
     max_daily_loss: toNumberOr(raw.max_daily_loss),
     max_drawdown_pct: toNumberOr(raw.max_drawdown_pct),
+    hard_kill_drawdown_pct: toNumberOr(raw.hard_kill_drawdown_pct),
   };
-  if (raw.hard_kill_drawdown_pct !== undefined) {
-    parsed.hard_kill_drawdown_pct = toNumber(raw.hard_kill_drawdown_pct) ?? undefined;
-  }
-  return parsed;
 }
 
 function parseRecoveryState(raw: RecoveryState): RecoveryState {
@@ -216,7 +213,9 @@ export function parseCircuitBreakerStatus(raw: CircuitBreakerStatus): CircuitBre
     ...raw,
     daily_pnl: toNumberOr(raw.daily_pnl),
     peak_value: toNumberOr(raw.peak_value),
+    drawdown_peak: toNumberOr(raw.drawdown_peak),
     current_value: toNumberOr(raw.current_value),
+    equity_seeded: raw.equity_seeded === true,
     // The API omits the field entirely when the breaker is not recovering.
     recovery_state: raw.recovery_state ? parseRecoveryState(raw.recovery_state) : null,
     config: parseCircuitBreakerConfig(raw.config),

@@ -4,6 +4,15 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use std::env;
 
+/// The value of `name`, unless it is unset or blank: a deployment that
+/// passes a variable through empty (`VAR=`) has not configured it.
+pub fn env_set(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Application configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -93,17 +102,17 @@ impl Config {
                 url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
             },
             polygon: PolygonConfig {
-                rpc_url: env::var("POLYGON_RPC_URL").ok(),
-                alchemy_api_key: env::var("ALCHEMY_API_KEY").ok(),
+                rpc_url: env_set("POLYGON_RPC_URL"),
+                alchemy_api_key: env_set("ALCHEMY_API_KEY"),
             },
             polymarket: PolymarketConfig {
-                clob_url: env::var("POLYMARKET_CLOB_URL").ok(),
-                ws_url: env::var("POLYMARKET_WS_URL").ok(),
+                clob_url: env_set("POLYMARKET_CLOB_URL"),
+                ws_url: env_set("POLYMARKET_WS_URL"),
             },
             alerts: AlertsConfig {
-                telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok(),
-                telegram_chat_id: env::var("TELEGRAM_CHAT_ID").ok(),
-                discord_webhook_url: env::var("DISCORD_WEBHOOK_URL").ok(),
+                telegram_bot_token: env_set("TELEGRAM_BOT_TOKEN"),
+                telegram_chat_id: env_set("TELEGRAM_CHAT_ID"),
+                discord_webhook_url: env_set("DISCORD_WEBHOOK_URL"),
             },
         })
     }

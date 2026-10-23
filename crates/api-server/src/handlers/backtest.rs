@@ -127,7 +127,7 @@ pub struct BacktestResultResponse {
     pub final_value: Decimal,
     /// Total return.
     pub total_return: Decimal,
-    /// Total return percentage.
+    /// Total return as a fraction of initial capital (0.10 = 10%).
     pub total_return_pct: Decimal,
     /// Annualized return (`null` when undefined or beyond the storable range).
     pub annualized_return: Option<Decimal>,
@@ -135,9 +135,9 @@ pub struct BacktestResultResponse {
     pub sharpe_ratio: Option<Decimal>,
     /// Sortino ratio (`null` when undefined, e.g. no losing period).
     pub sortino_ratio: Option<Decimal>,
-    /// Maximum drawdown.
+    /// Maximum drawdown as a fraction of the equity peak (0.05 = 5%).
     pub max_drawdown: Decimal,
-    /// Maximum drawdown percentage.
+    /// Maximum drawdown in percent (5.0 = 5%).
     pub max_drawdown_pct: Decimal,
     /// Total number of trades.
     pub total_trades: i64,
@@ -145,7 +145,7 @@ pub struct BacktestResultResponse {
     pub winning_trades: i64,
     /// Losing trades.
     pub losing_trades: i64,
-    /// Win rate percentage.
+    /// Share of closed trades that won, as a fraction (0.6 = 60%).
     pub win_rate: Decimal,
     /// Average profit per winning trade.
     pub avg_win: Decimal,

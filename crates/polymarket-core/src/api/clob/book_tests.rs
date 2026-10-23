@@ -92,6 +92,30 @@ fn websocket_snapshot_is_sorted_best_first() {
 }
 
 #[test]
+fn trades_and_tick_size_changes_leave_the_book_alone() {
+    let mut state = HashMap::new();
+    parse_ws_message(
+        r#"{"event_type":"book","market":"m","asset_id":"a","timestamp":"1",
+            "bids":[{"price":"0.40","size":"2"}],"asks":[{"price":"0.60","size":"4"}]}"#,
+        &mut state,
+    );
+    for event in [
+        r#"{"event_type":"last_trade_price","market":"m","asset_id":"a","price":"0.60",
+            "side":"BUY","size":"1","fee_rate_bps":"0","timestamp":"2"}"#,
+        r#"{"event_type":"tick_size_change","market":"m","asset_id":"a",
+            "old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"3"}"#,
+        r#"[{"event_type":"last_trade_price","market":"m","asset_id":"a","price":"0.60",
+            "side":"BUY","size":"1","timestamp":"4"}]"#,
+        r#"{"market":"m","asset_id":"a","timestamp":"5"}"#,
+    ] {
+        let parsed = parse_ws_message(event, &mut state);
+        assert!(parsed.updates.is_empty(), "{event}");
+    }
+    assert_eq!(prices(&state["a"].bids), vec![dec("0.40")]);
+    assert_eq!(prices(&state["a"].asks), vec![dec("0.60")]);
+}
+
+#[test]
 fn price_change_before_snapshot_is_ignored() {
     let mut state = HashMap::new();
     let parsed = parse_ws_message(

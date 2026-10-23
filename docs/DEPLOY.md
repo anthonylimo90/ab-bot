@@ -551,6 +551,45 @@ conservative basis rather than guessing their remaining lot allocation.
 take-profit API order types now return a validation error; they are not durable
 protective orders. Dashboard development, CI and Docker use Node 24.
 
+### Market data and signals
+
+- The order book stream applies only `book` events as whole books (and
+  `price_change` events to them): trade, tick-size and best-bid/ask events
+  no longer replace a token's book with an empty one.
+- An arbitrage is priced under the fee terms it was detected with (from the
+  market listing) and the exchange's own (`/clob-markets`, reread every ten
+  minutes), whichever leaves less edge; the highest published rate when the
+  exchange's cannot be read.
+- The arb monitor keeps its market universe when a refresh lists none, and
+  does not start on an empty one.
+- After a quant position in a market closes, no quant entry is made there
+  for `QUANT_REENTRY_COOLDOWN_MINUTES` (default 60): the generators re-fire
+  on trailing windows that still hold the same evidence.
+- The quant generators (flow, mean reversion, cross-market, resolution) read
+  `orderbook_hourly`, the hourly aggregate of `orderbook_snapshots`. Nothing
+  in this repository writes `orderbook_snapshots`: without an external feed
+  the generators emit no signals.
+- The risk page's signal thresholds are the arb monitor's own (published
+  with its runtime stats); depth and cooldown show a dash while the monitor
+  is not reporting. `ARB_SIGNAL_COOLDOWN_SECS` and `ARB_TRADING_FEE_PCT`
+  were never read by the monitor and are no longer reported.
+
+### API contract changes
+
+- `GET .../risk/status` and the trip/reset responses add `drawdown_peak`
+  (the soft drawdown trip's reference), `equity_seeded`, and
+  `config.hard_kill_drawdown_pct`.
+- Positions add `is_open`: a one-legged failed entry still holds a leg the
+  exit flow manages and counts as open, as in the `status=open` list.
+- `PUT .../dynamic-tuning/arb-executor` answers 400 for a value outside its
+  bounds instead of storing the nearest bound.
+- Learning rollout `bounds` and `guardrails` accept only their known keys,
+  each a number in range (rates and drawdown are fractions; latency in ms);
+  a misspelt or string-valued guardrail used to be skipped silently. The
+  unused `bounds.threshold` is dropped on save.
+- Backtest `total_return_pct` and `win_rate` are fractions (0.10 = 10%),
+  `max_drawdown_pct` is in percent; the dashboard now shows them so.
+
 ### Controls, audit and sessions
 
 - Circuit breaker limits are checked at startup: a drawdown or hard-kill
@@ -569,7 +608,13 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Workspace toggles for live trading, the exit handler and arb execution
   change the running services only on the canonical workspace, and a
   service the environment switches on (`LIVE_TRADING`,
-  `EXIT_HANDLER_ENABLED`, `ARB_AUTO_EXECUTE`) stays on, as at startup.
+  `EXIT_HANDLER_ENABLED`, `ARB_AUTO_EXECUTE`) stays on, as at startup:
+  switching one off in the workspace then answers 409 and changes nothing
+  (trip the circuit breaker to stop trading at once). Status endpoints
+  report live trading from what the executor does.
+- An environment variable set but empty counts as unset (the trading
+  wallet, its key, the RPC settings, `CB_*` limits, the vault): `docker
+  compose` passes those through only when they are set.
 - Stored dynamic-config values (manual overrides and tuned values) apply
   before the executors start, whether or not Redis is reachable. With
   dynamic arb sizing on (the default), the configured arb position size is
@@ -578,7 +623,8 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Deleting a user with connected wallets or withdrawal records, and
   deleting the canonical workspace, are refused.
 - An account connects at most 20 wallets and holds at most 20 prepared
-  browser-wallet orders awaiting a signature; expired ones are cleared.
+  browser-wallet orders awaiting a signature; expired ones never submitted
+  are cleared (a submitted one is kept: it answers a retry).
 - Rate limits are per minute as configured (auth 5, config 10, admin 30
   per client), not one request a minute after the burst.
 - Request logs carry the matched route template (`/api/v1/invites/:token`),
@@ -857,8 +903,11 @@ unsigned). Fees are set by the exchange when an order matches.
 - Live arb and quant entries are made only while the exit handler is
   enabled (`EXIT_HANDLER_ENABLED`, or the workspace setting) and running:
   it flattens a pair whose second leg failed and takes quant profits and
-  losses. An exit pass that panics holds its heartbeat at zero, so entries
-  wait until a pass runs cleanly. Paper entries are unaffected.
+  losses. An exit or resolution pass that panics holds its heartbeat at
+  zero, so entries wait until both run cleanly (a resolution pass every
+  `EXIT_RESOLUTION_CHECK_SECS`); a heartbeat older than three exit polls
+  (at least five minutes, which a long run of orphan sales can reach) also
+  holds entries back. Paper entries are unaffected.
 - A quant entry is refused when the token's spread alone (its position is
   marked at the best bid) would be half the stop-loss or more, or when the
   token has no bids.

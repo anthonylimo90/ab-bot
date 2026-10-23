@@ -221,10 +221,11 @@ impl DynamicTuner {
         self
     }
 
-    /// The execution mode whose results are tuned on.
-    fn traded_mode(&self) -> &'static str {
+    /// The execution mode whose results are tuned on: live only when the
+    /// executor can trade live, as the entry executors decide it.
+    async fn traded_mode(&self) -> &'static str {
         match &self.order_executor {
-            Some(executor) if executor.is_live() => "live",
+            Some(executor) if executor.is_live_ready().await => "live",
             _ => "paper",
         }
     }
@@ -817,7 +818,7 @@ impl DynamicTuner {
               AND execution_mode = $1
             "#,
         )
-        .bind(self.traded_mode())
+        .bind(self.traded_mode().await)
         .fetch_one(&self.pool)
         .await?;
 
@@ -876,7 +877,7 @@ impl DynamicTuner {
               AND execution_mode = $1
             "#,
         )
-        .bind(self.traded_mode())
+        .bind(self.traded_mode().await)
         .fetch_one(&self.pool)
         .await
         .unwrap_or(Decimal::ZERO);

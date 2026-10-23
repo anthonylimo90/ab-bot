@@ -30,7 +30,7 @@ pub async fn canonical_workspace_live_enabled(pool: &PgPool) -> Result<bool, sql
 }
 
 /// Whether the environment switches `name` on (`name=true`), as startup reads it.
-fn env_enabled(name: &str) -> bool {
+pub(crate) fn env_enabled(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value == "true")
 }
 

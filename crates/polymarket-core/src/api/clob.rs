@@ -1218,6 +1218,20 @@ fn parse_ws_message(text: &str, book_state: &mut HashMap<String, OrderBook>) -> 
 }
 
 fn parse_ws_book_from_value(value: serde_json::Value) -> Option<OrderBookUpdate> {
+    // Only a `book` event is a whole book. The market channel's other events
+    // (`last_trade_price`, `tick_size_change`, `best_bid_ask`) carry the same
+    // market, asset and time, and read as books they would be empty ones,
+    // wiping the real book on every trade.
+    match value.get("event_type").and_then(|kind| kind.as_str()) {
+        Some(kind) if !kind.eq_ignore_ascii_case("book") => return None,
+        None if !["bids", "asks", "buys", "sells"]
+            .iter()
+            .any(|side| value.get(side).is_some()) =>
+        {
+            return None
+        }
+        _ => {}
+    }
     let ws_book = serde_json::from_value::<WsBook>(value).ok()?;
 
     Some(OrderBookUpdate {

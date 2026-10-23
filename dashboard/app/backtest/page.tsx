@@ -37,9 +37,10 @@ const TRADE_LOG_PAGE_SIZE = 20;
 // example a non-finite Sharpe ratio); they render as an em dash.
 const NO_VALUE = "\u2014";
 
+/** A signed fraction as a percent (0.105 -> "+10.5%"). */
 function formatSignedPercent(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return NO_VALUE;
-  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+  return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(1)}%`;
 }
 
 function returnTrend(value: number | null | undefined): "up" | "down" | "neutral" {
@@ -603,7 +604,7 @@ export default function BacktestPage() {
             />
             <MetricCard
               title="Win Rate"
-              value={formatFixed(results.win_rate, 0, "%")}
+              value={formatFixed(results.win_rate == null ? null : results.win_rate * 100, 0, "%")}
               changeLabel={`${results.total_trades} trades`}
               trend="neutral"
             />

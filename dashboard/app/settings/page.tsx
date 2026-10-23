@@ -730,9 +730,17 @@ export default function SettingsPage() {
                   <span>Service Status</span>
                   <InfoTooltip content="These services must be healthy for automated trading to work correctly. A stopped service usually means the bot cannot monitor or execute trades reliably." />
                 </p>
-                {Object.entries(serviceStatus).map(([key, status]) => (
-                  <div key={key} className="flex flex-col gap-1 text-sm sm:flex-row sm:items-center sm:justify-between">
-                <span className="capitalize">{key.replace(/_/g, ' ')}</span>
+                {(
+                  [
+                    ["Harvester", serviceStatus.harvester],
+                    ["Metrics calculator", serviceStatus.metrics_calculator],
+                    ["Arb executor", serviceStatus.arb_executor],
+                    ["Exit handler", serviceStatus.exit_handler],
+                    ["Live trading", serviceStatus.live_trading],
+                  ] as const
+                ).map(([name, status]) => (
+                  <div key={name} className="flex flex-col gap-1 text-sm sm:flex-row sm:items-center sm:justify-between">
+                    <span>{name}</span>
                     <div className="flex items-center gap-2">
                       <span
                         className={`inline-block h-2 w-2 rounded-full ${
@@ -745,6 +753,29 @@ export default function SettingsPage() {
                     </div>
                   </div>
                 ))}
+                {serviceStatus.strategy_modes.length > 0 && (
+                  <div className="space-y-1 border-t pt-3">
+                    <p className="text-xs font-medium text-muted-foreground">Strategy modes</p>
+                    {serviceStatus.strategy_modes.map((strategy) => (
+                      <div
+                        key={strategy.strategy}
+                        className="flex flex-col gap-1 text-sm sm:flex-row sm:items-center sm:justify-between"
+                      >
+                        <span>{strategy.strategy.replace(/_/g, ' ')}</span>
+                        <span
+                          className={
+                            strategy.mode === 'live'
+                              ? 'text-green-600'
+                              : 'text-muted-foreground'
+                          }
+                        >
+                          {strategy.mode}
+                          {strategy.reason ? ` — ${strategy.reason}` : ''}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 

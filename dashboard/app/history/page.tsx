@@ -362,6 +362,14 @@ export default function HistoryPage() {
                           placeholder="Top-up, manual withdrawal, fee adjustment..."
                         />
                       </label>
+                      {cashFlowType === "withdrawal" && (
+                        <p className="text-xs text-muted-foreground md:col-span-2">
+                          Withdrawals sent from the Wallet page are recorded
+                          automatically. Record only a withdrawal made outside
+                          this app; recording one twice understates equity and
+                          the circuit breaker&apos;s drawdown reference.
+                        </p>
+                      )}
                       <div className="md:col-span-2">
                         <Button
                           onClick={handleCreateCashFlow}

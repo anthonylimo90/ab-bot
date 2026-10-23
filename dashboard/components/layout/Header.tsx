@@ -36,6 +36,7 @@ import { RecoveryDialog } from "@/components/wallet/RecoveryDialog";
 import { useToastStore } from "@/stores/toast-store";
 import { MobileNavDrawer } from "@/components/layout/MobileNavDrawer";
 import api from "@/lib/api";
+import { ConfirmAction } from "@/components/shared/ConfirmAction";
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -71,14 +72,18 @@ export function Header() {
     currentWorkspace?.arb_auto_execute ||
     false;
 
+  // Pause switches live trading and arb execution off. Resume switches arb
+  // execution back on only: live trading is switched on in Settings, never
+  // as a side effect of resuming.
   const toggleTradingMutation = useMutation({
     mutationFn: async () => {
       if (!currentWorkspace) throw new Error("No workspace");
-      const pausing = isTradingActive;
-      return api.updateWorkspace(currentWorkspace.id, {
-        live_trading_enabled: !pausing,
-        arb_auto_execute: !pausing,
-      });
+      return isTradingActive
+        ? api.updateWorkspace(currentWorkspace.id, {
+            live_trading_enabled: false,
+            arb_auto_execute: false,
+          })
+        : api.updateWorkspace(currentWorkspace.id, { arb_auto_execute: true });
     },
     onSuccess: (updatedWorkspace) => {
       setCurrentWorkspace(updatedWorkspace);
@@ -88,14 +93,22 @@ export function Header() {
       if (paused) {
         toast.warning(
           "Trading paused",
-          "All automated trading has been paused",
+          "Live trading and arb execution are switched off for this workspace",
         );
       } else {
-        toast.success("Trading resumed", "Automated trading is now active");
+        toast.success(
+          "Arb execution resumed",
+          updatedWorkspace.live_trading_enabled
+            ? "Arbitrage trades with real funds"
+            : "Arbitrage trades on paper; live trading stays off",
+        );
       }
     },
-    onError: () => {
-      toast.error("Failed to update trading state");
+    onError: (error) => {
+      toast.error(
+        "Failed to update trading state",
+        error instanceof Error ? error.message : undefined,
+      );
     },
   });
   const hasWallet = useWalletStore(selectHasConnectedWallet);
@@ -216,6 +229,18 @@ export function Header() {
         <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
           {/* Trading Pause/Resume */}
           {currentWorkspace && (
+            <ConfirmAction
+              title={isTradingActive ? "Pause automated trading?" : "Resume arb execution?"}
+              description={
+                isTradingActive
+                  ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop all trading at once."
+                  : currentWorkspace.live_trading_enabled
+                    ? "Arbitrage resumes with real funds: live trading is on."
+                    : "Arbitrage resumes on paper. Live trading stays off; switch it on in Settings."
+              }
+              confirmLabel={isTradingActive ? "Pause" : "Resume"}
+              onConfirm={() => toggleTradingMutation.mutate()}
+            >
             <Button
               variant="ghost"
               size="sm"
@@ -226,7 +251,6 @@ export function Header() {
                   : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
               )}
               disabled={toggleTradingMutation.isPending}
-              onClick={() => toggleTradingMutation.mutate()}
             >
               {toggleTradingMutation.isPending ? (
                 <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
@@ -237,6 +261,7 @@ export function Header() {
               )}
               <span>{isTradingActive ? "Pause" : "Resume"}</span>
             </Button>
+            </ConfirmAction>
           )}
 
           {/* Signal Bell */}

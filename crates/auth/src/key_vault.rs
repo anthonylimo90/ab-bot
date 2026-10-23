@@ -161,7 +161,11 @@ impl KeyVault {
 
     /// Create a key vault from environment configuration.
     pub fn from_env() -> Result<Self> {
+        // A blank key (`VAULT_MASTER_KEY=` passed through empty) is no key:
+        // keys encrypted under it would be readable by anyone with the file.
         let master_key = std::env::var("VAULT_MASTER_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
             .context("VAULT_MASTER_KEY environment variable not set")?;
         if master_key.len() < 32 {
             warn!(
@@ -178,8 +182,10 @@ impl KeyVault {
             }
             Ok("file") => {
                 let path = std::env::var("VAULT_FILE_PATH")
+                    .ok()
+                    .filter(|path| !path.trim().is_empty())
                     .map(PathBuf::from)
-                    .unwrap_or_else(|_| PathBuf::from("./vault.enc"));
+                    .unwrap_or_else(|| PathBuf::from("./vault.enc"));
                 KeyVaultProvider::EncryptedFile { path }
             }
             _ => KeyVaultProvider::Environment,

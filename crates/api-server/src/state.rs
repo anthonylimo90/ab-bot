@@ -317,12 +317,12 @@ impl AppState {
                 live_workspace = live_trading_workspace,
                 "Live trading enabled — initializing wallet"
             );
-            let configured_address = std::env::var("TRADING_WALLET_ADDRESS").ok();
+            let configured_address = polymarket_core::config::env_set("TRADING_WALLET_ADDRESS");
             let selected_address =
                 resolve_startup_wallet_address(&pool, configured_address.as_deref())
                     .await
                     .context("Failed resolving startup trading wallet address")?;
-            let environment_key = std::env::var("WALLET_PRIVATE_KEY").ok();
+            let environment_key = polymarket_core::config::env_set("WALLET_PRIVATE_KEY");
             let startup_wallet = match load_startup_trading_wallet(
                 &key_vault,
                 selected_address.as_deref(),
@@ -369,12 +369,11 @@ impl AppState {
                         None
                     }
                 };
-                let rpc_url = std::env::var("POLYGON_RPC_URL")
-                    .or_else(|_| {
-                        std::env::var("ALCHEMY_API_KEY")
+                let rpc_url = polymarket_core::config::env_set("POLYGON_RPC_URL")
+                    .or_else(|| {
+                        polymarket_core::config::env_set("ALCHEMY_API_KEY")
                             .map(|k| format!("https://polygon-mainnet.g.alchemy.com/v2/{}", k))
                     })
-                    .ok()
                     .or(workspace_rpc)
                     .unwrap_or_else(|| {
                         tracing::warn!("No Polygon RPC configured; approvals and wraps use the public endpoint");
@@ -492,13 +491,12 @@ impl AppState {
         // parse is refused, not skipped: a limit the operator set must hold.
         let mut circuit_breaker_config = CircuitBreakerConfig::default();
         fn env_value<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>> {
-            match std::env::var(name) {
-                Ok(raw) => raw
-                    .trim()
+            match polymarket_core::config::env_set(name) {
+                Some(raw) => raw
                     .parse::<T>()
                     .map(Some)
                     .map_err(|_| anyhow::anyhow!("{name}={raw} is not a valid value")),
-                Err(_) => Ok(None),
+                None => Ok(None),
             }
         }
         if let Some(d) = env_value("CB_MAX_DAILY_LOSS")? {
@@ -928,10 +926,10 @@ async fn set_approvals(wallet: &TradingWallet, rpc_url: &str, executor: &OrderEx
 }
 
 fn build_polygon_client_for_discovery() -> Option<PolygonClient> {
-    if let Ok(rpc_url) = std::env::var("POLYGON_RPC_URL") {
+    if let Some(rpc_url) = polymarket_core::config::env_set("POLYGON_RPC_URL") {
         return Some(PolygonClient::new(rpc_url));
     }
-    if let Ok(alchemy_api_key) = std::env::var("ALCHEMY_API_KEY") {
+    if let Some(alchemy_api_key) = polymarket_core::config::env_set("ALCHEMY_API_KEY") {
         return Some(PolygonClient::with_alchemy(&alchemy_api_key));
     }
     None

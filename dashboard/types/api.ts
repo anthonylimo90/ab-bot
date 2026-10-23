@@ -103,6 +103,8 @@ export interface Position {
   exit_fees?: number;
   /** Source wallet (legacy, not currently populated) */
   source_wallet?: string;
+  /** Still holds exposure the exit flow manages (includes a one-legged failed entry). */
+  is_open: boolean;
 }
 
 export interface PositionsSummary {
@@ -1069,11 +1071,11 @@ export interface DynamicConfigItem {
   updated_at: string;
 }
 
+/** Arb-monitor's entry filters; depth and cooldown are null while it is not reporting. */
 export interface DynamicSignalThresholds {
   min_net_profit_threshold_pct: number;
-  signal_cooldown_secs: number;
-  min_depth_usd: number;
-  trading_fee_pct: number;
+  signal_cooldown_secs: number | null;
+  min_depth_usd: number | null;
 }
 
 export interface ScannerMarketInsight {
@@ -1216,7 +1218,8 @@ export interface CircuitBreakerConfig {
   max_consecutive_losses: number;
   cooldown_minutes: number;
   enabled: boolean;
-  hard_kill_drawdown_pct?: number;
+  /** Drawdown from the all-time peak that halts until reset; 0 means off. */
+  hard_kill_drawdown_pct: number;
 }
 
 export interface RecoveryState {
@@ -1235,8 +1238,13 @@ export interface CircuitBreakerStatus {
   tripped_at: string | null;
   resume_at: string | null;
   daily_pnl: number;
+  /** All-time equity peak: the hard kill switch's reference. */
   peak_value: number;
+  /** Reference for the max-drawdown trip; rebased on resume and reset. */
+  drawdown_peak: number;
   current_value: number;
+  /** False until real equity snapshots arrive; drawdown is not checked before. */
+  equity_seeded: boolean;
   consecutive_losses: number;
   trips_today: number;
   recovery_state: RecoveryState | null;
