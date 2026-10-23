@@ -1145,6 +1145,17 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   unless the market's stored price already names the outcome. A position
   whose resolved market has named no winner for over a day (legs differ) is
   logged as an error for an operator to settle, at most hourly per position.
+- An exit sale is refused while the wallet holds far fewer shares of the
+  token than the position and the wallet's other holders record (it could
+  take their shares); a fee-sized shortfall is written off among the
+  positions only, never against manual orders' shares.
+- Manual orders: a sale of shares a live manual order bought goes out live
+  while the signer is loaded, even with live trading switched off (new
+  orders are paper then, and those shares had no way out); buys are still
+  refused. Resting live orders have their fills booked by the order
+  reconciler, not only when the order is read. Market ids are stored
+  canonically (trimmed, lowercase hex). An order's own result no longer
+  overwrites a reconciliation that already moved it on.
 
 ### API contract changes
 

@@ -312,6 +312,16 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
                         .bind(&snapshot.id)
                         .execute(&state.pool)
                         .await?;
+                    // What it has filled while resting is booked now, not
+                    // only when someone reads the order: until then those
+                    // shares are neither inventory nor exposure.
+                    if let Err(error) = crate::handlers::trading::refresh_resting_manual_order(
+                        state, intent.id, &snapshot,
+                    )
+                    .await
+                    {
+                        tracing::debug!(intent_id = %intent.id, %error, "Resting manual order fills not booked yet");
+                    }
                 }
                 anyhow::bail!(ORDER_RESTING);
             }

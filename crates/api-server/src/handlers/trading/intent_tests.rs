@@ -402,3 +402,12 @@ async fn unsupported_protective_orders_never_reserve_inventory(pool: PgPool) {
         .unwrap();
     assert_eq!(count, 0);
 }
+
+#[test]
+fn market_ids_are_stored_as_the_catalog_names_them() {
+    assert_eq!(canonical_market_id(" 0xABcd12 "), "0xabcd12");
+    assert_eq!(canonical_market_id("0XAB"), "0xab");
+    // Not a hex condition id: only trimmed.
+    assert_eq!(canonical_market_id(" Market-1 "), "Market-1");
+    assert_eq!(canonical_market_id("0x"), "0x");
+}

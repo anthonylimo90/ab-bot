@@ -291,6 +291,9 @@ pub async fn place_order(
     if request.order_type == OrderType::Market && request.time_in_force == "GTC" {
         request.time_in_force = "FOK".into();
     }
+    // Stored as every other record of the market names it (a condition id
+    // is lowercase hex): inventory, exits and orphan checks match by it.
+    request.market_id = canonical_market_id(&request.market_id);
     validate_order_request(&request)?;
     // Held until the order's outcome is recorded; refused once shutdown began.
     let Some(operation) = state.order_executor.begin_operation() else {
@@ -334,12 +337,33 @@ async fn reserve_and_execute_order(
     // The order takes this process's mode now; a paper order holds nothing in
     // any wallet (paper inventory is kept under one key), whether or not a
     // signer is loaded for live positions' exits.
-    let live = state.order_executor.is_live();
-    let wallet = if live {
+    let mut live = state.order_executor.is_live();
+    let mut wallet = if live {
         state.order_executor.wallet_address().await
     } else {
         None
     };
+    // Shares a live order bought are sold live while the signer that holds
+    // them is loaded, whatever the live switch: switched off, new orders are
+    // paper, and these shares would have no way out.
+    if !live && request.side == OrderSide::Sell && state.order_executor.has_live_signer().await {
+        if let Some(signer) = state.order_executor.wallet_address().await {
+            let holds_live: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode = 'live' \
+                 AND wallet_address = LOWER($1) AND market_id = $2 AND outcome = $3 \
+                 AND quantity > 0)",
+            )
+            .bind(&signer)
+            .bind(&request.market_id)
+            .bind(&request.outcome)
+            .fetch_one(&state.pool)
+            .await?;
+            if holds_live {
+                live = true;
+                wallet = Some(signer);
+            }
+        }
+    }
     let max_exposure = if let Some(cfg) = &state.arb_executor_config {
         cfg.read().await.max_total_exposure
     } else {
@@ -378,6 +402,7 @@ async fn execute_reserved_order(
     // process that has not yet taken up an operator switching live trading
     // off (it re-reads every few seconds) must not send it.
     if origin.execution_mode == "live"
+        && request.side == OrderSide::Buy
         && !workspace_live_enabled
         && !crate::runtime_sync::env_enabled("LIVE_TRADING")
     {
@@ -563,7 +588,8 @@ async fn execute_reserved_order(
 
     // The row was reserved before submission. A persistence failure leaves a
     // replayable pending intent rather than allowing the caller to trade twice.
-    sqlx::query("UPDATE orders SET status=$2, filled_quantity=$3, avg_fill_price=$4, filled_at=$5, updated_at=NOW(), exchange_order_id=COALESCE($6, (SELECT exchange_order_id FROM execution_intents WHERE id=$1)) WHERE id=$1")
+    // Unless a reconciliation already moved it on (a fill, a cancellation).
+    sqlx::query("UPDATE orders SET status=$2, filled_quantity=$3, avg_fill_price=$4, filled_at=$5, updated_at=NOW(), exchange_order_id=COALESCE($6, (SELECT exchange_order_id FROM execution_intents WHERE id=$1)) WHERE id=$1 AND status IN ('pending','open','partially_filled') AND filled_quantity<=$3")
         .bind(order_id).bind(serde_json::to_value(status)?.as_str().unwrap())
         .bind(filled_qty).bind(avg_price).bind(filled_at).bind(&report.exchange_order_id).execute(&state.pool).await?;
 
@@ -698,6 +724,17 @@ async fn load_expected_market_price(
             token_id
         ))
     })
+}
+
+/// A market id as the catalog stores it: trimmed, and lowercase when it is
+/// a hex condition id.
+fn canonical_market_id(market_id: &str) -> String {
+    let trimmed = market_id.trim();
+    if trimmed.len() > 2 && trimmed[..2].eq_ignore_ascii_case("0x") {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn validate_order_request(request: &PlaceOrderRequest) -> ApiResult<()> {
@@ -850,6 +887,23 @@ pub async fn get_order_status(
         }
     }
     Ok(Json(row.into()))
+}
+
+/// Book what a resting live manual order has filled so far, from the
+/// exchange's read of it (the order reconciler's, for an order no one polls).
+pub(crate) async fn refresh_resting_manual_order(
+    state: &AppState,
+    order_id: Uuid,
+    snapshot: &polymarket_core::api::clob::ExchangeOrder,
+) -> ApiResult<()> {
+    let row = load_order(&state.pool, order_id).await?;
+    if row.execution_mode != "live"
+        || !matches!(row.status.as_str(), "pending" | "open" | "partially_filled")
+    {
+        return Ok(());
+    }
+    let fill = confirmed_fill(state, &row, snapshot).await;
+    apply_exchange_snapshot(&state.pool, &row, snapshot, fill).await
 }
 
 /// What the order's settled trades filled and at what average price, or
