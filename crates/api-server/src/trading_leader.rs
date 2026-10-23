@@ -111,7 +111,10 @@ async fn try_acquire(pool: &PgPool) -> Result<Option<Leadership>, sqlx::Error> {
 impl Leadership {
     /// Keep the lock's connection checked; `lost` is notified once it fails,
     /// when another process may take the lock.
-    pub fn watch(mut self, lost: Arc<Notify>) {
+    /// `on_lost` runs first, whatever the rest of the process is doing (a
+    /// shutdown's drain included): it stops this process acting as leader
+    /// before another can take over.
+    pub fn watch(mut self, lost: Arc<Notify>, on_lost: impl FnOnce() + Send + 'static) {
         tokio::spawn(async move {
             let mut slow = 0;
             loop {
@@ -125,6 +128,7 @@ impl Leadership {
                     Ok(Ok(_)) => slow = 0,
                     Ok(Err(error)) => {
                         error!(%error, "The trading leadership's database connection failed; stopping");
+                        on_lost();
                         lost.notify_one();
                         return;
                     }
@@ -136,6 +140,7 @@ impl Leadership {
                                 "The trading leadership's database connection stopped answering; \
                                  stopping"
                             );
+                            on_lost();
                             lost.notify_one();
                             return;
                         }

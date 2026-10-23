@@ -249,6 +249,14 @@ impl OrderExecutor {
         (!self.draining.load(Ordering::SeqCst)).then_some(operation)
     }
 
+    /// Count an operation a drain must wait for but never refuse (one that
+    /// only takes risk away, such as cancelling an order): unlike
+    /// [`Self::begin_operation`], it is counted after shutdown began too.
+    pub fn track_operation(&self) -> TradingOperation {
+        self.operations_in_flight.fetch_add(1, Ordering::SeqCst);
+        TradingOperation(self.operations_in_flight.clone())
+    }
+
     /// Whether shutdown has begun.
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)

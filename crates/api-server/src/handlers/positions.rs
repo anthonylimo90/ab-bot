@@ -839,7 +839,8 @@ pub async fn close_position(
     let pnl_pct = unrealized_pct(position.unrealized_pnl, row.entry_price, row.quantity);
     // The side as stored now: queueing a one-legged pair's exit drops the
     // leg it never held.
-    let outcome: String = sqlx::query_scalar(concat!(
+    // The exit is queued by now: a failed read keeps the side read before.
+    let outcome: String = match sqlx::query_scalar(concat!(
         "SELECT ",
         position_outcome_sql!(),
         " FROM positions WHERE id = $1"
@@ -847,8 +848,14 @@ pub async fn close_position(
     .bind(position_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|e| ApiError::Internal(e.to_string()))?
-    .unwrap_or(row.outcome);
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => row.outcome,
+        Err(error) => {
+            tracing::warn!(%error, %position_id, "Could not re-read a closed position's side");
+            row.outcome
+        }
+    };
 
     Ok(Json(PositionResponse {
         id: row.id,

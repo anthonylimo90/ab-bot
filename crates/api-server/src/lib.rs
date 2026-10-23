@@ -479,6 +479,11 @@ impl ApiServer {
                     return;
                 }
                 halt_for_unreadable_settings(&state, &unreadable_settings).await;
+                // Leadership lost: stop saving the breaker's state and
+                // starting trades at once, even mid-shutdown (where nothing
+                // waits on `lost`), before another process takes over.
+                let breaker = state.circuit_breaker.clone();
+                let executor = state.order_executor.clone();
                 spawn_trading_tasks(
                     state,
                     arb_config_arc,
@@ -486,7 +491,10 @@ impl ApiServer {
                     quant_config,
                     exit_readiness,
                 );
-                leadership.watch(lost);
+                leadership.watch(lost, move || {
+                    breaker.step_down();
+                    executor.begin_draining();
+                });
             });
         }
 

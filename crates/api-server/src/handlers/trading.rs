@@ -403,6 +403,14 @@ async fn execute_reserved_order(
     // and manual holdings have no automatic exit: during a trip (a latched
     // one holds until reset) selling them is how an operator de-risks.
     if request.side == OrderSide::Buy && !state.circuit_breaker.can_trade().await {
+        // A hold (settings unread, closes uncounted) blocks whatever the trip.
+        let holds = state.circuit_breaker.entry_holds();
+        if !holds.is_empty() {
+            return Err(ApiError::ServiceUnavailable(format!(
+                "New entries are held: {}",
+                holds.join("; ")
+            )));
+        }
         let cb_state = state.circuit_breaker.state().await;
         return Err(ApiError::ServiceUnavailable(format!(
             "Trading halted: {:?}. Resumes at {:?}",
@@ -959,9 +967,9 @@ pub async fn cancel_order(
     axum::Extension(claims): axum::Extension<auth::Claims>,
     Path(order_id): Path<Uuid>,
 ) -> ApiResult<Json<OrderResponse>> {
-    // Counted by a shutdown's drain, but never refused by it: a cancellation
-    // only takes risk away.
-    let operation = state.order_executor.begin_operation();
+    // Waited for by a shutdown's drain, but never refused by it: a
+    // cancellation only takes risk away.
+    let operation = state.order_executor.track_operation();
     // As placing an order: runs to the end even if the client goes away, so
     // a cancellation the exchange took is recorded, not left open.
     tokio::spawn(async move {

@@ -681,6 +681,16 @@ mod tests {
             executor.begin_operation().is_none(),
             "no new operation starts"
         );
+        // One that only takes risk away (a cancel) starts and is waited for.
+        let cancel = executor.track_operation();
+        drop(operation);
+        assert!(
+            !executor.drain(std::time::Duration::from_millis(100)).await,
+            "a tracked operation is waited for"
+        );
+        drop(cancel);
+        // The arb, still between its legs, for what follows.
+        let operation = executor.track_operation();
         assert!(
             !executor.drain(std::time::Duration::from_millis(100)).await,
             "the started operation is waited for"
