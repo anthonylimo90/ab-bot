@@ -1058,7 +1058,8 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - A fill whose price was not reported is counted at the order's limit (a
   sale never fills below it), or as nothing received for a market order:
   a loss is never understated. A result from an earlier day is marked
-  without counting, with a warning.
+  without counting, with a warning, unless it is under ten minutes old
+  (a sale just before midnight UTC found just after counts today).
 - Manual shares held to resolution are not sold, so they record no
   result: their value reaches the breaker through the equity valuation
   (drawdown), not the daily loss limit.

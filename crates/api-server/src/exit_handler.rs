@@ -2549,6 +2549,18 @@ pub(crate) async fn record_missed_closes(
     record_manual_results(pool, breaker).await
 }
 
+/// How old a manual sale's result may be and still count after midnight:
+/// well beyond the recorder's 15-second interval.
+const MANUAL_RESULT_GRACE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Whether a manual sale's result found at `now` counts in today's figures.
+fn manual_result_counts(
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    occurred_at.date_naive() == now.date_naive() || now - occurred_at <= MANUAL_RESULT_GRACE
+}
+
 /// Serializes [`record_manual_results`] within a process: two scans at once
 /// could both find a result unmarked and not yet counted, and count it twice.
 static MANUAL_RESULTS_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2558,7 +2570,8 @@ static MANUAL_RESULTS_SCAN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 /// recorded yet. Only the trading leader calls it; each result is marked by
 /// the save that stores the counters holding it. A result from an earlier day
 /// is marked without counting (the daily counters have moved on), with a
-/// warning; a loss is never dropped for want of a day, as there always is one.
+/// warning, unless it is recent: one filled just before midnight and found
+/// just after counts today rather than being lost to the scan's delay.
 pub(crate) async fn record_manual_results(
     pool: &PgPool,
     breaker: &CircuitBreaker,
@@ -2571,12 +2584,12 @@ pub(crate) async fn record_manual_results(
         )
         .fetch_all(pool)
         .await?;
-    let today = chrono::Utc::now().date_naive();
+    let now = chrono::Utc::now();
     for (id, pnl, occurred_at, priced) in unrecorded {
         if breaker.counted_unsaved(id) {
             continue;
         }
-        if occurred_at.date_naive() == today {
+        if manual_result_counts(occurred_at, now) {
             if !priced {
                 warn!(fill_id = %id, %pnl, "A manual sale with no reported price is counted at its limit");
             }
@@ -2970,6 +2983,25 @@ mod tests {
         assert_eq!(next.state().await.daily_pnl, Decimal::ZERO);
         record_missed_closes(&pool, &next, None).await.unwrap();
         assert_eq!(next.state().await.daily_pnl, Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_manual_sale_just_before_midnight_still_counts() {
+        use chrono::TimeZone;
+        let midnight = chrono::Utc.with_ymd_and_hms(2026, 3, 2, 0, 0, 0).unwrap();
+        let after = midnight + chrono::Duration::seconds(3);
+        assert!(manual_result_counts(
+            midnight - chrono::Duration::seconds(10),
+            after
+        ));
+        assert!(!manual_result_counts(
+            midnight - chrono::Duration::hours(1),
+            after
+        ));
+        assert!(manual_result_counts(
+            midnight + chrono::Duration::hours(1),
+            after + chrono::Duration::hours(5)
+        ));
     }
 
     #[test]
