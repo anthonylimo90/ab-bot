@@ -107,7 +107,13 @@ export default function RiskPage() {
   const { currentWorkspace } = useWorkspaceStore();
   const workspaceId = currentWorkspace?.id;
 
-  const { data: riskStatus, isLoading, error } = useRiskStatusQuery(workspaceId);
+  const {
+    data: riskStatus,
+    isLoading,
+    error,
+    isError: riskFailed,
+    dataUpdatedAt,
+  } = useRiskStatusQuery(workspaceId);
   const { data: serviceStatus } = useServiceStatusQuery(workspaceId);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(workspaceId);
 
@@ -135,6 +141,13 @@ export default function RiskPage() {
       cb.trip_reason === "hard_kill_switch");
   const tripNotEnforced = cb?.tripped === true && !tripBlocks;
   const halted = tripBlocks || entryHolds.length > 0;
+  // A latched trip (manual, hard kill) cannot be replaced by a manual one;
+  // any other trip can, which makes it hold until reset.
+  const latched =
+    cb?.tripped === true &&
+    (cb.trip_reason === "manual" || cb.trip_reason === "hard_kill_switch");
+  // The last read failed: what shows is the previous one.
+  const stale = riskFailed && riskStatus != null;
   // One state for the status card: the most severe first.
   const cardState: "hard_kill" | "tripped" | "held" | "unenforced" | "recovery" | "disabled" | "operational" =
     cb?.trip_reason === "hard_kill_switch" && tripBlocks
@@ -171,7 +184,7 @@ export default function RiskPage() {
               </p>
             </div>
           </div>
-          {cb && !halted && (
+          {cb && !halted && !stale && (
             <LiveIndicator />
           )}
           {halted && (
@@ -196,6 +209,19 @@ export default function RiskPage() {
             "If it is tripped, the system has halted automated trading and needs cooldown time or manual intervention."
           ]}
         />
+
+        {stale && (
+          <Card className="border-2 border-yellow-500 bg-yellow-500/5">
+            <CardContent className="flex items-start gap-3 p-4">
+              <AlertTriangle className="h-5 w-5 shrink-0 text-yellow-500" />
+              <p className="text-sm">
+                The risk status could not be refreshed: what shows below is the last read,
+                from {new Date(dataUpdatedAt).toLocaleTimeString()}.
+                {error instanceof Error ? ` ${error.message}` : ""}
+              </p>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Entry holds: new entries stop whatever the breaker says */}
         {entryHolds.length > 0 && (
@@ -285,14 +311,21 @@ export default function RiskPage() {
                         Holds until an owner or admin resets it.
                       </p>
                     )}
-                    {cb.tripped && cb.resume_at && (
+                    {tripBlocks && cb.resume_at && (
                       <p className="text-sm text-muted-foreground">
                         {new Date(cb.resume_at).getTime() > Date.now()
                           ? `Cooldown ends in ${formatTimeRemaining(cb.resume_at)}`
                           : "Cooldown over"}
                       </p>
                     )}
-                    {cb.trip_reason === "daily_loss_limit" && (
+                    {tripNotEnforced && (
+                      <p className="text-sm text-muted-foreground">
+                        The breaker is switched off, so this trip neither halts trading
+                        nor counts down; it stays until reset or the breaker is
+                        switched back on.
+                      </p>
+                    )}
+                    {tripBlocks && cb.trip_reason === "daily_loss_limit" && (
                       <p className="text-sm text-muted-foreground">
                         Holds while today&apos;s loss is over the limit; the
                         day&apos;s counters reset at 00:00 UTC.
@@ -317,8 +350,8 @@ export default function RiskPage() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  {/* A manual trip takes over a trip the switched-off breaker does not enforce. */}
-                  {!tripBlocks && (
+                  {/* A manual trip takes over any trip that does not latch. */}
+                  {!latched && (
                     <AlertDialog>
                       <AlertDialogTrigger asChild>
                         <Button
@@ -335,9 +368,9 @@ export default function RiskPage() {
                             Trip Circuit Breaker?
                           </AlertDialogTitle>
                           <AlertDialogDescription>
-                            This halts automated trading at once. A manual
-                            trip does not expire: trading stays halted until
-                            an owner or admin resets the breaker.
+                            {cb.tripped
+                              ? "This turns the current trip into a manual one, which does not expire: trading stays halted until an owner or admin resets the breaker."
+                              : "This halts automated trading at once. A manual trip does not expire: trading stays halted until an owner or admin resets the breaker."}
                           </AlertDialogDescription>
                         </AlertDialogHeader>
                         <AlertDialogFooter>

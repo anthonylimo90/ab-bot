@@ -475,6 +475,10 @@ impl ApiServer {
                 }
                 if let Err(error) = take_over_trading(&state).await {
                     tracing::error!(%error, "Could not take over trading; stopping");
+                    // The lock goes with `leadership`: stop acting as leader
+                    // first, as on a lost lock.
+                    state.circuit_breaker.step_down();
+                    state.order_executor.begin_draining();
                     lost.notify_one();
                     return;
                 }
@@ -657,6 +661,13 @@ impl ApiServer {
                     "Stop requested again; exiting without waiting. Journaled orders are \
                      reconciled on the next start"
                 );
+            }
+            // Leadership lost while draining: another process may lead now.
+            // Exit at once rather than let this one's background tasks book
+            // closes the next leader cannot see in time.
+            () = leadership_lost.notified() => {
+                tracing::error!("Trading leadership lost while shutting down; stopping now");
+                return Err(anyhow::anyhow!("trading leadership lost"));
             }
         }
         match server_error {

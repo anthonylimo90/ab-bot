@@ -954,8 +954,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Cancelling an order is no longer refused while the server shuts down
   (placing one still is); the shutdown waits for it.
 - A process that loses trading leadership stops saving the circuit breaker
-  and starting trades at once, even mid-shutdown, so it cannot overwrite the
-  next leader's counters.
+  and starting trades at once, and exits, even mid-shutdown (it used to
+  finish draining, its background tasks still booking closes beside the
+  next leader). A failed takeover stops acting as leader the same way.
 - The dashboard shows trading as the server runs it: switches the
   environment holds on (`LIVE_TRADING`, `ARB_AUTO_EXECUTE`,
   `EXIT_HANDLER_ENABLED`) read as on and cannot be switched off there, and

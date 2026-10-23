@@ -216,14 +216,19 @@ export default function SettingsPage() {
     try {
       // Stored as saved: a re-read that started before the save cannot
       // put the old ID back.
-      setCurrentWorkspace(
-        // Sent as entered: an empty ID clears it (undefined would be
-        // dropped from the request and change nothing).
-        await api.updateWorkspace(currentWorkspace.id, {
-          walletconnect_project_id: walletConnectProjectId.trim(),
-        }),
-      );
-      toast.success('WalletConnect settings saved', 'Your wallet connection is now configured');
+      // Sent as entered: an empty ID clears it (undefined would be dropped
+      // from the request and change nothing).
+      const entered = walletConnectProjectId.trim();
+      const saved = await api.updateWorkspace(currentWorkspace.id, {
+        walletconnect_project_id: entered,
+      });
+      setCurrentWorkspace(saved);
+      setWalletConnectProjectId(saved.walletconnect_project_id ?? '');
+      if (entered) {
+        toast.success('WalletConnect settings saved', 'Your wallet connection is now configured');
+      } else {
+        toast.success('WalletConnect project ID cleared', 'Browser wallets use the default configuration');
+      }
       queryClient.invalidateQueries({ queryKey: ['workspace'] });
     } catch (err) {
       toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
@@ -826,7 +831,10 @@ export default function SettingsPage() {
                 />
                 <Button
                   onClick={handleSaveWalletConnect}
-                  disabled={isSavingWalletConnect || walletConnectProjectId === (currentWorkspace.walletconnect_project_id || '')}
+                  disabled={
+                    isSavingWalletConnect ||
+                    walletConnectProjectId.trim() === (currentWorkspace.walletconnect_project_id || '')
+                  }
                   className="w-full sm:w-auto"
                 >
                   {isSavingWalletConnect ? (
@@ -850,7 +858,8 @@ export default function SettingsPage() {
               </p>
             </div>
 
-            {!walletConnectProjectId && !currentWorkspace.walletconnect_project_id && (
+            {/* As saved, not as typed. */}
+            {!currentWorkspace.walletconnect_project_id && (
               <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-3">
                 <p className="text-sm text-yellow-500">
                   Browser wallet sign-in is not ready yet. Add a WalletConnect project ID to enable MetaMask and similar wallets.
@@ -858,7 +867,7 @@ export default function SettingsPage() {
               </div>
             )}
 
-            {(walletConnectProjectId || currentWorkspace.walletconnect_project_id) && (
+            {currentWorkspace.walletconnect_project_id && (
               <div className="rounded-lg border border-green-500/20 bg-green-500/10 p-3">
                 <p className="text-sm text-green-500 flex items-center gap-2">
                   <Check className="h-4 w-4" />
