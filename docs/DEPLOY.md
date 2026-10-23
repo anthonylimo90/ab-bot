@@ -1033,6 +1033,19 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   who last set it: a value an operator saves meanwhile is kept. Saving a
   value from the workspace settings also enables a row that was disabled.
 
+### Accounts by invitation; ENCRYPTION_KEY required
+
+- Outside `ENVIRONMENT=development`, `POST /api/v1/auth/register` answers
+  403, and a wallet sign-in from a wallet no account uses answers 403
+  instead of creating an account. Accounts come from workspace invites
+  (accepting one can create the account), a platform admin, or
+  `seed-admin`. Wallets already linked to an account sign in as before.
+- Outside development the API refuses to start unless `ENCRYPTION_KEY` is
+  set, non-blank and different from `JWT_SECRET`. Set it before deploying
+  (`openssl rand -base64 32`): secrets saved before stay readable (read
+  with `JWT_SECRET`) and are encrypted under the new key when saved again.
+  A key shorter than 32 characters is reported at start, not refused.
+
 ### Equity history and trade-flow figures
 
 - Equity history stores only complete live valuations (cash, and live

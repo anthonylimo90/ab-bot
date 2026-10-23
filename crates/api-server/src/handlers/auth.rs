@@ -140,6 +140,7 @@ impl UserRow {
     responses(
         (status = 201, description = "User registered successfully", body = AuthResponse),
         (status = 400, description = "Invalid request"),
+        (status = 403, description = "Registration is by invitation (outside development)"),
         (status = 409, description = "Email already registered"),
     ),
     tag = "auth"
@@ -153,6 +154,13 @@ pub async fn register(
         tracing::warn!(error = %e, "Register request JSON parsing failed");
         ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
     })?;
+
+    if !state.open_registration {
+        return Err(ApiError::Forbidden(
+            "Accounts are created by invitation; ask a workspace owner or admin for an invite"
+                .into(),
+        ));
+    }
 
     // Validate email format: local@domain with domain containing a dot
     let email_parts: Vec<&str> = req.email.splitn(2, '@').collect();

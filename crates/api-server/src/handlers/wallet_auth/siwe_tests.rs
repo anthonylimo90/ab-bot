@@ -45,8 +45,16 @@ struct Fixture {
 }
 
 async fn fixture(pool: &PgPool) -> Fixture {
+    fixture_with(pool, true).await
+}
+
+/// `open_registration`: whether sign-ins and sign-ups may create accounts.
+async fn fixture_with(pool: &PgPool, open_registration: bool) -> Fixture {
     fx::real_schema(pool).await;
-    let state = AppState::for_tests(pool.clone());
+    let mut state = AppState::for_tests(pool.clone());
+    Arc::get_mut(&mut state)
+        .expect("not shared yet")
+        .open_registration = open_registration;
     let authed = |router: axum::routing::MethodRouter<Arc<AppState>>| {
         router.layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -63,6 +71,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
         .route("/challenge", post(challenge))
         .route("/verify", post(verify))
         .route("/login", post(crate::handlers::auth::login))
+        .route("/register", post(crate::handlers::auth::register))
         .route("/link", authed(post(link_wallet)))
         .route("/me", authed(get(crate::handlers::auth::get_current_user)))
         .route("/users", admin(get(crate::handlers::users::list_users)))
@@ -383,6 +392,38 @@ async fn user_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+#[sqlx::test(migrations = false)]
+async fn accounts_are_not_created_without_an_invite_when_registration_is_closed(pool: PgPool) {
+    let f = fixture_with(&pool, false).await;
+    let (status, body) = wallet_login(&f, &Wallet::new(7)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = fx::call(
+        &f.app,
+        "POST",
+        "/register",
+        None,
+        Some(json!({ "email": "new@example.com", "password": "long-enough-1" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(user_count(&pool).await, 0);
+
+    // A wallet an account already uses still signs in.
+    let wallet = Wallet::new(8);
+    sqlx::query(
+        "INSERT INTO users (id, wallet_address, wallet_linked_at, role, created_at, updated_at) \
+         VALUES ($1, $2, NOW(), 1, NOW(), NOW())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&wallet.address)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, body) = wallet_login(&f, &wallet).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["is_new_user"], false);
 }
 
 #[sqlx::test(migrations = false)]

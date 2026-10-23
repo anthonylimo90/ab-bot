@@ -140,7 +140,7 @@ WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 - WebSocket: `/ws/orderbook`, `/ws/positions`, `/ws/signals`, `/ws/all`
 
 ### Auth
-- register, login, refresh, logout, current-user
+- register (development only; elsewhere accounts come from invites), login, refresh, logout, current-user
 - forgot/reset password
 - wallet challenge / verify / link
 

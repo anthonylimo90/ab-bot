@@ -406,6 +406,7 @@ pub async fn challenge(
         (status = 200, description = "Signature verified, user authenticated", body = VerifyResponse),
         (status = 400, description = "Invalid request or signature"),
         (status = 401, description = "Signature verification failed"),
+        (status = 403, description = "No account uses this wallet (outside development)"),
     ),
     tag = "auth"
 )]
@@ -454,6 +455,16 @@ pub async fn verify(
     let existing_user: Option<UserRow> = find_wallet_user(&mut tx, &address).await?;
     let (user, is_new_user) = match existing_user {
         Some(u) => (u, false),
+        None if !state.open_registration => {
+            // The nonce stays spent; the wallet can be linked to an invited
+            // account instead.
+            tx.commit().await?;
+            return Err(ApiError::Forbidden(
+                "No account uses this wallet. Accounts are created by invitation; \
+                 sign in and link the wallet to your account"
+                    .into(),
+            ));
+        }
         None => {
             // Wallet-only account: no email or password (users.email and
             // users.password_hash are nullable for wallet accounts).

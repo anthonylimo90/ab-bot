@@ -299,6 +299,43 @@ fn validate_jwt_secret(secret: &str, environment: &str) -> Result<Option<String>
     }
 }
 
+/// Validate `ENCRYPTION_KEY`, which encrypts saved workspace secrets.
+///
+/// Outside development it must be set, non-blank and different from
+/// `JWT_SECRET` (unset, those secrets are encrypted under `JWT_SECRET`, so
+/// anyone holding one holds both). A short key is only reported: secrets
+/// already saved under it must keep decrypting.
+fn validate_encryption_key(
+    key: Option<&str>,
+    jwt_secret: &str,
+    environment: &str,
+) -> Result<Option<String>, String> {
+    let problem = match key.map(str::trim) {
+        None | Some("") => {
+            Some("ENCRYPTION_KEY is not set (saved secrets fall back to JWT_SECRET)")
+        }
+        Some(k) if k == jwt_secret.trim() => Some("ENCRYPTION_KEY equals JWT_SECRET"),
+        Some(k) if k.len() < MIN_JWT_SECRET_LEN => {
+            return Ok(Some(format!(
+                "ENCRYPTION_KEY is shorter than {MIN_JWT_SECRET_LEN} characters; \
+                 use a long random value (openssl rand -base64 32)"
+            )));
+        }
+        Some(_) => None,
+    };
+    match problem {
+        None => Ok(None),
+        Some(problem) if is_development_environment(environment) => Ok(Some(format!(
+            "{problem}; acceptable only because ENVIRONMENT={environment}"
+        ))),
+        Some(problem) => Err(format!(
+            "{problem}. Set ENCRYPTION_KEY to its own random value (openssl rand -base64 32); \
+             secrets saved before stay readable and are re-encrypted when saved again \
+             (ENVIRONMENT={environment:?}; only development tolerates this)"
+        )),
+    }
+}
+
 async fn build_server(pool: sqlx::PgPool) -> anyhow::Result<ApiServer> {
     tracing::info!("API Server starting up...");
 
@@ -314,6 +351,15 @@ async fn build_server(pool: sqlx::PgPool) -> anyhow::Result<ApiServer> {
         Err(message) => {
             tracing::error!("{message}");
             tracing::error!("Generate a secure secret: openssl rand -base64 32");
+            anyhow::bail!("{message}");
+        }
+    }
+    let encryption_key = std::env::var("ENCRYPTION_KEY").ok();
+    match validate_encryption_key(encryption_key.as_deref(), &jwt_secret, &environment) {
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Ok(None) => {}
+        Err(message) => {
+            tracing::error!("{message}");
             anyhow::bail!("{message}");
         }
     }
@@ -348,6 +394,34 @@ mod tests {
 
     /// 44 characters of base64 from `openssl rand -base64 32`.
     const GOOD: &str = "k3Vq9uYxT1mZb7PdLw0RhJ8sNcA4eGfU2oXyIvQ6tBE=";
+
+    #[test]
+    fn an_encryption_key_is_required_outside_development() {
+        let other = "Zq8vB2nLx5TgR1yHc7MwK0pDfJ3sUa9eVo6iEt4bNkY=";
+        for environment in ["production", "staging", ""] {
+            assert_eq!(
+                validate_encryption_key(Some(other), GOOD, environment),
+                Ok(None)
+            );
+            for bad in [None, Some(""), Some("  "), Some(GOOD)] {
+                assert!(
+                    validate_encryption_key(bad, GOOD, environment).is_err(),
+                    "{environment}: {bad:?}"
+                );
+            }
+            // Short: reported, not refused (saved secrets must keep decrypting).
+            assert!(
+                validate_encryption_key(Some("short-key"), GOOD, environment)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        for bad in [None, Some(GOOD)] {
+            assert!(validate_encryption_key(bad, GOOD, "development")
+                .unwrap()
+                .is_some());
+        }
+    }
 
     #[test]
     fn a_random_secret_is_accepted_everywhere() {

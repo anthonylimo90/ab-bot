@@ -211,6 +211,10 @@ pub struct AppState {
     /// Site that wallet (SIWE) sign-in messages are bound to; `None` disables
     /// wallet sign-in (not configured outside development).
     pub siwe_site: Option<crate::handlers::wallet_auth::SiteBinding>,
+    /// Whether anyone may create an account without an invite (email
+    /// sign-up, or a first wallet sign-in): only in development. Elsewhere
+    /// accounts come from workspace invites, an admin, or `seed-admin`.
+    pub open_registration: bool,
 }
 
 /// The circuit breaker's limits: the defaults, then the `CB_*` environment,
@@ -602,6 +606,9 @@ impl AppState {
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             siwe_site,
+            open_registration: crate::is_development_environment(
+                &std::env::var("ENVIRONMENT").unwrap_or_default(),
+            ),
         })
     }
 
@@ -683,6 +690,7 @@ impl AppState {
             exit_handler_heartbeat: Arc::new(AtomicI64::new(0)),
             quant_executor_heartbeat: Arc::new(AtomicI64::new(0)),
             siwe_site: Some(crate::handlers::wallet_auth::SiteBinding::development()),
+            open_registration: true,
         })
     }
 
