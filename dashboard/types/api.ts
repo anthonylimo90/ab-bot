@@ -126,15 +126,21 @@ export interface PositionsSummary {
   losses: number;
   flat_closes?: number;
   win_rate: number;
+  /** Rows the closed list pages through: every position no longer open. */
+  closed_list_count?: number;
 }
 
 export interface AccountSummary {
   workspace_id: string;
   snapshot_time: string;
   wallet_address?: string;
-  cash_balance: number;
+  /** Null when the wallet's balance could not be read. */
+  cash_balance: number | null;
   position_value: number;
-  total_equity: number;
+  /** Cash plus positions; null when the cash could not be read. */
+  total_equity: number | null;
+  /** A complete live valuation: live trading, cash read, inventory scanned. */
+  equity_complete: boolean;
   unrealized_pnl: number;
   realized_pnl_24h: number;
   net_cash_flows_24h: number;
@@ -770,6 +776,20 @@ export interface CreateWalletWithdrawalRequest {
   source_address?: string;
   destination_address: string;
   amount: number;
+}
+
+/** What one withdrawal from a wallet could take now, and what blocks it. */
+export interface WithdrawalPreflight {
+  available_usdc: number;
+  in_flight_withdrawals: number;
+  reserved_for_open_buys: number;
+  orphan_exposure: number;
+  /** The most one withdrawal can take now: from its USDC.e or its pUSD. */
+  max_withdrawable: number;
+  inventory_fresh: boolean;
+  inventory_synced_at?: string | null;
+  can_withdraw: boolean;
+  blocking_reasons: string[];
 }
 
 export interface WalletWithdrawal {

@@ -3001,7 +3001,8 @@ pub async fn update_opportunity_selection_settings(
     tx.commit().await?;
 
     // Running executors take the values from Redis at once; failing that,
-    // every process re-reads the stored config within seconds.
+    // every API process re-reads the stored config within seconds and the
+    // arb monitor within half a minute.
     if let Err(error) = publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref()).await {
         tracing::warn!(
             %error,
@@ -3317,6 +3318,9 @@ pub async fn update_arb_executor_config(
             VALUES ($1, $2, $2, $3, $4, $5, TRUE, $2, FALSE, NULL, NULL, 'workspace_manual', $6)
             ON CONFLICT (key) DO UPDATE SET
                 current_value = $2,
+                min_value = $3,
+                max_value = $4,
+                max_step_pct = $5,
                 last_good_value = $2,
                 pending_eval = FALSE,
                 pending_baseline = NULL,
@@ -3353,7 +3357,8 @@ pub async fn update_arb_executor_config(
     tx.commit().await?;
 
     // Running executors take the values from Redis at once; failing that,
-    // every process re-reads the stored config within seconds.
+    // every API process re-reads the stored config within seconds and the
+    // arb monitor within half a minute.
     if let Err(error) = publish_manual_dynamic_updates(&updates, state.redis_conn.as_ref()).await {
         tracing::warn!(
             %error,

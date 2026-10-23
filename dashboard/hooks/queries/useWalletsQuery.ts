@@ -19,6 +19,19 @@ export function useWalletBalanceQuery(address: string | null) {
   });
 }
 
+/** What one withdrawal from `address` could take now (owners and admins). */
+export function useWithdrawalCapacityQuery(address: string | null, enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.wallets.withdrawalCapacity(address),
+    queryFn: () => api.getWithdrawalCapacity(address!),
+    enabled: enabled && Boolean(address),
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: false,
+    retry: 1,
+  });
+}
+
 export function useWalletWithdrawalsQuery(limit = 10) {
   return useQuery({
     queryKey: queryKeys.wallets.withdrawals({ limit }),

@@ -335,9 +335,15 @@ async fn receive<T: Clone>(
 }
 
 type SocketSender = futures_util::stream::SplitSink<WebSocket, Message>;
+/// How long one message may take to reach a client: a client that stops
+/// reading would otherwise hold its connection's task open indefinitely.
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 async fn send(sender: &mut SocketSender, message: WsMessage) -> bool {
     match serde_json::to_string(&message) {
-        Ok(json) => sender.send(Message::Text(json)).await.is_ok(),
+        Ok(json) => matches!(
+            tokio::time::timeout(SEND_TIMEOUT, sender.send(Message::Text(json))).await,
+            Ok(Ok(()))
+        ),
         Err(_) => false,
     }
 }

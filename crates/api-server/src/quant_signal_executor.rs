@@ -899,7 +899,7 @@ impl QuantSignalExecutor {
                 Some(readiness) => readiness.refusal().await,
                 None => None,
             } {
-                warn!(signal_id = %signal.id, reason, "Exit handler not available, skipping live quant entry");
+                debug!(signal_id = %signal.id, reason, "Exits not available, skipping live quant entry");
                 self.update_signal_status(signal.id, "skipped", Some(reason))
                     .await;
                 self.record_signal_outcome_event(
@@ -1066,10 +1066,13 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        // Step 10c: a position is marked at the bid, so one bought across a
-        // spread wide enough would read as a loss at once and be stopped out.
+        // Step 10c: a position is marked at what selling it would realize, so
+        // one bought across a spread (and fees) wide enough would read as a
+        // loss at once and be stopped out.
         if let Some(readiness) = &self.exit_readiness {
-            if let Some(reason) = spread_rejection(&book, readiness.quant_stop_loss().await) {
+            if let Some(reason) =
+                spread_rejection(&book, readiness.quant_stop_loss().await, fee_terms)
+            {
                 debug!(signal_id = %signal.id, reason, "Spread too wide for the stop-loss, skipping");
                 self.update_signal_status(signal.id, "skipped", Some(reason))
                     .await;
@@ -1785,12 +1788,21 @@ fn reference_rejection(
 /// Why a buy at the best ask of `book` must not be made under `stop_loss`
 /// (a fraction of cost), or `None`: marked at the best bid it would already
 /// have lost half the stop-loss or more, or nothing could sell it.
-fn spread_rejection(book: &OrderBook, stop_loss: Decimal) -> Option<&'static str> {
+/// Why an entry would read as most of a stop-loss at once: a position is
+/// marked at what selling it would realize, so buying at the ask and selling
+/// at the bid, with the taker fee `fees` charges on both, is lost the moment
+/// it fills. Half the stop is the most that may go that way.
+fn spread_rejection(
+    book: &OrderBook,
+    stop_loss: Decimal,
+    fees: FeeSchedule,
+) -> Option<&'static str> {
     let ask = book.best_ask().filter(|ask| *ask > Decimal::ZERO)?;
     let Some(bid) = book.best_bid() else {
         return Some("no_bids");
     };
-    ((ask - bid) / ask * Decimal::TWO >= stop_loss).then_some("spread_too_wide")
+    let round_trip = ask - bid + fees.fee_per_share(ask) + fees.fee_per_share(bid);
+    (round_trip / ask * Decimal::TWO >= stop_loss).then_some("spread_too_wide")
 }
 
 fn expected_edge_from_signal(signal: &QuantSignal) -> Option<Decimal> {
@@ -1934,23 +1946,50 @@ mod tests {
         let stop_loss = Decimal::new(10, 2);
         // One tick at 0.10 is a 10% loss marked at the bid.
         assert_eq!(
-            spread_rejection(&quoted_book(Some(9), 10), stop_loss),
+            spread_rejection(&quoted_book(Some(9), 10), stop_loss, FeeSchedule::FREE),
             Some("spread_too_wide")
         );
         // Three cents at 0.50 is 6%, more than half the stop.
         assert_eq!(
-            spread_rejection(&quoted_book(Some(47), 50), stop_loss),
+            spread_rejection(&quoted_book(Some(47), 50), stop_loss, FeeSchedule::FREE),
             Some("spread_too_wide")
         );
         // One cent at 0.50 is 2%.
         assert_eq!(
-            spread_rejection(&quoted_book(Some(49), 50), stop_loss),
+            spread_rejection(&quoted_book(Some(49), 50), stop_loss, FeeSchedule::FREE),
             None
         );
         // Nothing could sell it.
         assert_eq!(
-            spread_rejection(&quoted_book(None, 50), stop_loss),
+            spread_rejection(&quoted_book(None, 50), stop_loss, FeeSchedule::FREE),
             Some("no_bids")
+        );
+        // Fees count too: one cent at 0.50 plus 0.07 x 0.25 each way is 9%,
+        // and at 0.30 the fees alone are about 10%.
+        assert_eq!(
+            spread_rejection(
+                &quoted_book(Some(49), 50),
+                stop_loss,
+                FeeSchedule::CONSERVATIVE
+            ),
+            Some("spread_too_wide")
+        );
+        assert_eq!(
+            spread_rejection(
+                &quoted_book(Some(30), 30),
+                stop_loss,
+                FeeSchedule::CONSERVATIVE
+            ),
+            Some("spread_too_wide")
+        );
+        // A 1% rate at 0.50 with a cent's spread: 3%, under half the stop.
+        let low = FeeSchedule {
+            rate: Decimal::new(1, 2),
+            exponent: Decimal::ONE,
+        };
+        assert_eq!(
+            spread_rejection(&quoted_book(Some(49), 50), stop_loss, low),
+            None
         );
     }
 

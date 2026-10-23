@@ -19,7 +19,14 @@ pub mod channels {
     pub const ARB_PRICES: &str = "arb:prices";
     pub const ARB_ALERTS: &str = "arb:alerts";
     pub const ORDERBOOK_UPDATES: &str = "orderbook:updates";
+    /// The arb monitor's per-minute stats: read here only as its heartbeat.
+    pub const RUNTIME_STATS: &str = "arb:runtime:stats";
 }
+
+/// How long the subscription may stay silent before it is taken for dead
+/// (a half-open connection delivers nothing and reports no error): three of
+/// the arb monitor's per-minute stats messages.
+const SUBSCRIPTION_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Configuration for the Redis forwarder.
 #[derive(Debug, Clone)]
@@ -121,6 +128,7 @@ impl RedisForwarder {
             pubsub.subscribe(channels::ARB_ENTRY).await?;
             pubsub.subscribe(channels::ARB_EXIT).await?;
             pubsub.subscribe(channels::ARB_ALERTS).await?;
+            pubsub.subscribe(channels::RUNTIME_STATS).await?;
             debug!("Subscribed to arbitrage channels");
         }
 
@@ -133,8 +141,22 @@ impl RedisForwarder {
 
         // Process messages
         let mut stream = pubsub.on_message();
-        while let Some(msg) = stream.next().await {
+        loop {
+            let msg = match tokio::time::timeout(SUBSCRIPTION_IDLE_LIMIT, stream.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break,
+                Err(_) if self.config.subscribe_arb => {
+                    anyhow::bail!(
+                        "no message (not even the arb monitor's stats) for {}s; reconnecting",
+                        SUBSCRIPTION_IDLE_LIMIT.as_secs()
+                    );
+                }
+                Err(_) => continue,
+            };
             let channel: String = msg.get_channel_name().to_string();
+            if channel == channels::RUNTIME_STATS {
+                continue;
+            }
             let payload: String = match msg.get_payload() {
                 Ok(p) => p,
                 Err(e) => {
@@ -209,20 +231,10 @@ impl RedisForwarder {
             }),
         };
 
-        // Also send an orderbook update with the arb spread
-        let orderbook_update = OrderbookUpdate {
-            market_id: arb.market_id,
-            timestamp: arb.timestamp,
-            yes_bid: Decimal::ZERO, // Entry signal doesn't have bid info
-            yes_ask: arb.yes_ask,
-            no_bid: Decimal::ZERO,
-            no_ask: arb.no_ask,
-            arb_spread: Some(arb.net_profit),
-        };
-
-        // Forward to WebSocket broadcast channels
+        // Forwarded on the authenticated signals channel only: the public
+        // orderbook channel would hand the opportunity to anyone listening
+        // before the executor has acted on it.
         let _ = self.signal_tx.send(signal);
-        let _ = self.orderbook_tx.send(orderbook_update);
 
         info!(
             market_id = %market_id_log,

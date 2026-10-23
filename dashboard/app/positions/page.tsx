@@ -184,6 +184,8 @@ export default function PositionsPage() {
   // Derived stats
   const loadedClosedCount = closedPositions.length;
   const closedCount = positionsSummary?.closed_positions ?? loadedClosedCount;
+  // The closed list also holds failed entries: its tab and pages count them.
+  const closedListCount = positionsSummary?.closed_list_count ?? closedCount;
   const winCount =
     positionsSummary?.wins ??
     closedPositions.filter((p) => (p.realized_pnl ?? 0) > 0).length;
@@ -201,7 +203,7 @@ export default function PositionsPage() {
   const summaryOpenPositions =
     positionsSummary?.open_positions ?? openPositions.length;
 
-  const totalClosedPages = Math.max(1, Math.ceil(closedCount / PAGE_SIZE));
+  const totalClosedPages = Math.max(1, Math.ceil(closedListCount / PAGE_SIZE));
   useEffect(() => {
     setClosedPage((page) => Math.min(page, totalClosedPages - 1));
   }, [totalClosedPages]);
@@ -282,7 +284,7 @@ export default function PositionsPage() {
               <TabsTrigger value="open">
                 Open ({openPositions.length})
               </TabsTrigger>
-              <TabsTrigger value="closed">Closed ({closedCount})</TabsTrigger>
+              <TabsTrigger value="closed">Closed ({closedListCount})</TabsTrigger>
             </TabsList>
           </div>
         </Tabs>

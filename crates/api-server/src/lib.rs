@@ -509,11 +509,20 @@ impl ApiServer {
 
         // Spawn strategy P&L calculator (6h, computes per-strategy performance snapshots)
         let pnl_config = StrategyPnlConfig::from_env();
-        spawn_strategy_pnl_calculator(pnl_config, state.pool.clone(), db_semaphore.clone());
+        spawn_strategy_pnl_calculator(
+            pnl_config,
+            state.pool.clone(),
+            db_semaphore.clone(),
+            state.order_executor.clone(),
+        );
 
         // Spawn strategy health calculator (6h, summarizes edge capture + failures)
         let health_config = StrategyHealthConfig::from_env();
-        spawn_strategy_health_calculator(health_config, state.pool.clone());
+        spawn_strategy_health_calculator(
+            health_config,
+            state.pool.clone(),
+            state.order_executor.clone(),
+        );
 
         // Spawn learning evaluator (replays shadow predictions against realized outcomes)
         let learning_evaluator_config = LearningEvaluatorConfig::from_env();

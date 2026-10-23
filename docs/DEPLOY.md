@@ -620,9 +620,12 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   Redis publish that fails is a warning, as the processes re-read the
   database.
 - New live entries (arb and quant) wait, with skip reason
-  `live_exits_failing`, while a live position's exit has failed three times
-  in a row or has sat in exit-ready or closing for 30 minutes. Clear the
-  position (recovery, a manual close, or the runbook above) to resume.
+  `live_exits_failing`, while three or more live positions are stuck at
+  once: each has failed to exit three times since its last fill, or has sat
+  in exit-ready or closing for 30 minutes. That is selling failing broadly
+  (an allowance, the wallet, the venue); one market with no bids keeps only
+  its own position stuck. Entries resume once fewer than three are stuck:
+  a position leaves the count when it sells, resolves or is closed.
 - A manual close answers 409 while the exit handler is off. Asking again
   for a position already exiting changes nothing.
 - A matched trade that ends `FAILED` counts as no fill, so an order whose
@@ -639,6 +642,48 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Audit log entries now cover manual orders and cancellations, manual
   closes, wallet-signed orders, submitted withdrawals, cash flows, and every
   workspace update (`workspace/<id>`).
+
+### Reported numbers, tuning and signal transport (095)
+
+- While trading live, the positions summary, trade-flow strategy summaries,
+  and the strategy P&L and health snapshots leave paper positions out, as
+  the account valuation does. A paper account still sees everything.
+- The account summary's `cash_balance` and `total_equity` are `null`, not
+  0, when the trading wallet's balance cannot be read (a failed RPC read no
+  longer fails the request); `equity_complete` says whether the equity is a
+  complete live valuation. Snapshots without the cash are not stored, so
+  equity history no longer charts a missing balance as a loss.
+- Arb execution telemetry, the arb market scorecard and the
+  `canonical_arb_learning_attempts` view (migration 095) count arb entries
+  that failed (`entry_failed`) or were left holding one leg
+  (`one_legged_exit_ready`) as failed attempts, the second as one-legged.
+  They counted none before.
+- The positions summary adds `closed_list_count`, the rows of
+  `status=closed` (failed entries included); the Closed tab pages by it.
+- The arb monitor's entries reach the API only on the Redis signal channel;
+  the public orderbook WebSocket no longer carries them. An entry whose
+  publish fails or takes over 5 s is not counted and does not start its
+  market's cooldown. The API's Redis subscriber reconnects after 3 minutes
+  without a message (the monitor publishes its runtime stats every minute).
+- The arb monitor re-reads its stored dynamic config every 30 s, so it
+  catches up on a Redis update it missed.
+- An arb signal stamped more than 2 s in the future (clock skew) is treated
+  as stale.
+- The dynamic tuner leaves a value set by hand for 24 hours, never changes a
+  key while its previous change is being evaluated, and stores a change only
+  if the value is still the one it read. It relaxes the minimum book depth
+  no lower than 60% of its default, and grows the quant base size only
+  after ten closed quant trades in seven days with a net profit, up to twice
+  its default.
+- `ARB_POSITION_SIZE` defaults to $10, inside its $5-$25 bounds (the
+  example env had $50, which the tuner held to $25). Arb executor updates
+  through the workspace API also store the key's bounds.
+- A WebSocket client that does not take a message within 10 s is
+  disconnected.
+- The withdraw card shows the most one transfer can take now (USDC.e or
+  pUSD, less withdrawals in flight and open buys) and what blocks it.
+- The trading leader's lock session also sets a 30 s TCP user timeout, so
+  the server ends it when the host dies with data unacknowledged.
 
 ### API contract changes
 
@@ -974,9 +1019,10 @@ unsigned). Fees are set by the exchange when an order matches.
   `EXIT_RESOLUTION_CHECK_SECS`); a heartbeat older than three exit polls
   (at least five minutes, which a long run of orphan sales can reach) also
   holds entries back. Paper entries are unaffected.
-- A quant entry is refused when the token's spread alone (its position is
-  marked at the best bid) would be half the stop-loss or more, or when the
-  token has no bids.
+- A quant entry is refused when the token's round trip (the spread, as its
+  position is marked at the best bid, plus the taker fee of buying and of
+  selling under the market's fee terms) would be half the stop-loss or
+  more, or when the token has no bids.
 - Manual holdings under one sellable lot (0.01 shares, left by rounded
   sales) are not exposure and do not pin the trading wallet. Manual shares
   redeemed or moved outside the bot stay recorded until an operator clears

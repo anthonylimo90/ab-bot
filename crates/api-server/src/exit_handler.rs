@@ -54,8 +54,13 @@ pub(crate) fn heartbeat_stale_after_secs(cfg: &ExitHandlerConfig) -> i64 {
     (cfg.exit_poll_interval_secs.saturating_mul(3)).max(300) as i64
 }
 
-/// Live exits failing this many times in a row count as exits not working.
+/// A live exit failing this many times (since its last fill) counts as stuck.
 const STUCK_EXIT_FAILURES: i32 = 3;
+/// Stuck live exits at once that count as exits not working. One market with
+/// no bids, or a delisted one, keeps its own position stuck; a failure of
+/// selling itself (an allowance, the wallet, the venue) shows up across
+/// positions.
+const STUCK_EXIT_POSITIONS: i64 = 3;
 /// A live exit waiting this long without a step counts as stuck.
 const STUCK_EXIT_MINUTES: i32 = 30;
 /// How long the answer to the stuck-exit look is reused.
@@ -78,9 +83,10 @@ impl ExitReadiness {
         self
     }
 
-    /// Whether a live position's exit has failed [`STUCK_EXIT_FAILURES`]
-    /// times in a row, or has waited [`STUCK_EXIT_MINUTES`] without a step:
-    /// the handler runs, but its exits are not getting out.
+    /// Whether [`STUCK_EXIT_POSITIONS`] live positions are stuck at once,
+    /// each having failed to exit [`STUCK_EXIT_FAILURES`] times or waited
+    /// [`STUCK_EXIT_MINUTES`] without a step: the handler runs, but its exits
+    /// are not getting out.
     async fn exits_stuck(&self) -> bool {
         let Some(pool) = &self.pool else {
             return false;
@@ -90,17 +96,17 @@ impl ExitReadiness {
                 return stuck;
             }
         }
-        let stuck = match sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM positions WHERE execution_mode = 'live' \
+        let stuck = match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM positions WHERE execution_mode = 'live' \
              AND ((state = 6 AND retry_count >= $1) \
-                  OR (state IN (2, 3) AND last_updated < NOW() - make_interval(mins => $2))))",
+                  OR (state IN (2, 3) AND last_updated < NOW() - make_interval(mins => $2)))",
         )
         .bind(STUCK_EXIT_FAILURES)
         .bind(STUCK_EXIT_MINUTES)
         .fetch_one(pool)
         .await
         {
-            Ok(stuck) => stuck,
+            Ok(stuck) => stuck >= STUCK_EXIT_POSITIONS,
             Err(error) => {
                 // Unknown is not "working": entries wait for the next look.
                 warn!(%error, "Could not check for stuck live exits");
@@ -2387,31 +2393,34 @@ mod tests {
             || ExitReadiness::new(config.clone(), heartbeat.clone()).watching_exits(pool.clone());
         assert_eq!(fresh().refusal().await, None);
 
-        for (mode, state, retries, minutes_ago, stuck) in [
-            ("live", 6, 2, 0, false),  // failed twice: still trying
-            ("paper", 6, 9, 0, false), // not live
-            ("live", 2, 0, 5, false),  // queued a moment ago
-            ("live", 6, 3, 0, true),   // failed three times in a row
-            ("live", 3, 0, 45, true),  // closing with no step for 45 minutes
+        for (mode, state, retries, minutes_ago, count, stuck) in [
+            ("live", 6, 2, 0, 3, false),  // failed twice: still trying
+            ("paper", 6, 9, 0, 3, false), // not live
+            ("live", 2, 0, 5, 3, false),  // queued a moment ago
+            ("live", 6, 3, 0, 2, false),  // two stuck markets: theirs alone
+            ("live", 6, 3, 0, 3, true),   // three failing: selling is failing
+            ("live", 3, 0, 45, 3, true),  // closing with no step for 45 minutes
         ] {
             sqlx::query("DELETE FROM positions")
                 .execute(&pool)
                 .await
                 .unwrap();
-            sqlx::query(
-                "INSERT INTO positions VALUES ($1, $2, $3, NOW() - make_interval(mins => $4))",
-            )
-            .bind(mode)
-            .bind(state as i16)
-            .bind(retries)
-            .bind(minutes_ago)
-            .execute(&pool)
-            .await
-            .unwrap();
+            for _ in 0..count {
+                sqlx::query(
+                    "INSERT INTO positions VALUES ($1, $2, $3, NOW() - make_interval(mins => $4))",
+                )
+                .bind(mode)
+                .bind(state as i16)
+                .bind(retries)
+                .bind(minutes_ago)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
             assert_eq!(
                 fresh().refusal().await,
                 stuck.then_some("live_exits_failing"),
-                "{mode} {state} {retries} {minutes_ago}"
+                "{mode} {state} {retries} {minutes_ago} x{count}"
             );
         }
     }

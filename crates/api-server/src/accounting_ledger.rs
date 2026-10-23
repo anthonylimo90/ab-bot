@@ -41,8 +41,10 @@ pub struct AccountSnapshotRecord {
     pub workspace_id: Uuid,
     pub snapshot_time: DateTime<Utc>,
     pub wallet_address: Option<String>,
+    /// Zero when the wallet's balance could not be read: see `cash_observed`.
     pub cash_balance: Decimal,
     pub position_value: Decimal,
+    /// Counts no cash when it could not be read: see `cash_observed`.
     pub total_equity: Decimal,
     pub unrealized_pnl: Decimal,
     pub realized_pnl_24h: Decimal,
@@ -54,6 +56,8 @@ pub struct AccountSnapshotRecord {
     /// Whether `total_equity` is a complete live valuation (live trading and
     /// an observed cash balance) that may drive the circuit breaker.
     pub equity_complete: bool,
+    /// Whether the wallet's cash balance was read.
+    pub cash_observed: bool,
     /// Taken before the cash balance read: cash flows recorded up to this
     /// instant are reflected in `cash_balance`.
     pub cash_observed_at: DateTime<Utc>,
@@ -269,13 +273,18 @@ pub async fn load_live_account_snapshot(
         // positions' shares: orphan, manual and unredeemed shares would read
         // as a drawdown.
         equity_complete: live && observed_cash.is_some() && inventory_refreshed,
+        cash_observed: observed_cash.is_some(),
         cash_observed_at,
     }))
 }
 
 async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<()> {
     if let Some(snapshot) = load_live_account_snapshot(state, SNAPSHOT_INVENTORY_MAX_AGE).await? {
-        persist_snapshot(&state.pool, &snapshot).await?;
+        // Equity history holds only valuations that include the cash: one
+        // without it would chart as a loss of the whole balance.
+        if snapshot.cash_observed {
+            persist_snapshot(&state.pool, &snapshot).await?;
+        }
 
         // Only a complete live valuation may drive drawdown: paper fills and
         // an unobserved cash balance do not describe real equity. Trading
@@ -541,7 +550,8 @@ async fn persist_snapshot(pool: &PgPool, snapshot: &AccountSnapshotRecord) -> an
 /// Observed cash of the trading wallet: its USDC.e and its pUSD (the
 /// exchange's collateral, redeemable 1:1), read at one block so a wrap
 /// between two reads is never counted twice or missed. `None` when no wallet
-/// or RPC client is configured, so the balance is unknown rather than zero.
+/// or RPC client is configured, or the read fails, so the balance is unknown
+/// rather than zero.
 async fn load_wallet_balance(
     state: &AppState,
     wallet_address: Option<&str>,
@@ -556,11 +566,13 @@ async fn load_wallet_balance(
         return Ok(None);
     };
 
-    let cash = polygon_client
-        .get_cash_balances(address)
-        .await
-        .with_context(|| format!("failed to fetch the cash balance of {address}"))?;
-    Ok(Some(cash.total()))
+    match polygon_client.get_cash_balances(address).await {
+        Ok(cash) => Ok(Some(cash.total())),
+        Err(error) => {
+            warn!(%error, wallet = %address, "Could not read the trading wallet's cash balance");
+            Ok(None)
+        }
+    }
 }
 
 /// The P&L closed in the last day, of the positions the valuation counts:

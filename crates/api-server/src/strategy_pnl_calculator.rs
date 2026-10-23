@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+use trading_engine::OrderExecutor;
 
 /// Configuration for the strategy P&L calculator.
 #[derive(Debug, Clone)]
@@ -46,6 +47,7 @@ pub fn spawn_strategy_pnl_calculator(
     config: StrategyPnlConfig,
     pool: PgPool,
     db_semaphore: Arc<Semaphore>,
+    order_executor: Arc<OrderExecutor>,
 ) {
     if !config.enabled {
         info!("Strategy P&L calculator disabled (STRATEGY_PNL_ENABLED != true)");
@@ -58,17 +60,24 @@ pub fn spawn_strategy_pnl_calculator(
         "Spawning strategy P&L calculator"
     );
 
-    tokio::spawn(calculator_loop(config, pool, db_semaphore));
+    tokio::spawn(calculator_loop(config, pool, db_semaphore, order_executor));
 }
 
-async fn calculator_loop(config: StrategyPnlConfig, pool: PgPool, db_semaphore: Arc<Semaphore>) {
+async fn calculator_loop(
+    config: StrategyPnlConfig,
+    pool: PgPool,
+    db_semaphore: Arc<Semaphore>,
+    order_executor: Arc<OrderExecutor>,
+) {
     let interval = time::Duration::from_secs(config.interval_secs);
 
     // Startup delay — let positions accumulate
     tokio::time::sleep(time::Duration::from_secs(120)).await;
 
     loop {
-        match compute_cycle(&pool, &db_semaphore, &config).await {
+        // A live account leaves paper results out, as the account valuation does.
+        let live = order_executor.is_live_ready().await;
+        match compute_cycle(&pool, &db_semaphore, &config, live).await {
             Ok(rows) => {
                 info!(rows_upserted = rows, "Strategy P&L computation completed");
             }
@@ -110,6 +119,7 @@ async fn compute_cycle(
     pool: &PgPool,
     db_semaphore: &Semaphore,
     config: &StrategyPnlConfig,
+    live: bool,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let now = Utc::now();
     let mut total_rows = 0usize;
@@ -150,7 +160,9 @@ async fn compute_cycle(
                       AND p.exit_timestamp IS NOT NULL
                 ) AS avg_hold_hours
             FROM quant_signals qs
-            LEFT JOIN positions p ON qs.position_id = p.id
+            LEFT JOIN positions p
+              ON qs.position_id = p.id
+             AND ($3 OR p.execution_mode <> 'paper')
             WHERE qs.generated_at >= $1
               AND qs.generated_at <= $2
             GROUP BY qs.kind
@@ -158,6 +170,7 @@ async fn compute_cycle(
         )
         .bind(window_start)
         .bind(now)
+        .bind(!live)
         .fetch_all(pool)
         .await?;
 
@@ -180,10 +193,12 @@ async fn compute_cycle(
             WHERE source = 1
               AND entry_timestamp >= $1
               AND entry_timestamp <= $2
+              AND ($3 OR execution_mode <> 'paper')
             "#,
         )
         .bind(window_start)
         .bind(now)
+        .bind(!live)
         .fetch_optional(pool)
         .await?;
 
@@ -199,7 +214,7 @@ async fn compute_cycle(
                 None
             };
 
-            let sharpe = compute_sharpe(pool, &row.strategy, window_start, now).await;
+            let sharpe = compute_sharpe(pool, &row.strategy, window_start, now, live).await;
 
             upsert_snapshot(
                 pool,
@@ -268,6 +283,7 @@ async fn compute_sharpe(
     strategy: &str,
     window_start: chrono::DateTime<Utc>,
     window_end: chrono::DateTime<Utc>,
+    live: bool,
 ) -> Option<f64> {
     // Fetch individual realized PnL values for Sharpe calculation
     let returns: Vec<(Decimal,)> = sqlx::query_as(
@@ -281,11 +297,13 @@ async fn compute_sharpe(
           AND qs.generated_at <= $3
           AND p.state = 4
           AND p.realized_pnl IS NOT NULL
+          AND ($4 OR p.execution_mode <> 'paper')
         "#,
     )
     .bind(strategy)
     .bind(window_start)
     .bind(window_end)
+    .bind(!live)
     .fetch_all(pool)
     .await
     .ok()?;

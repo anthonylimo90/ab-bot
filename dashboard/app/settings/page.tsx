@@ -44,6 +44,7 @@ import {
   useCreateWalletWithdrawalMutation,
   useWalletBalanceQuery,
   useWalletWithdrawalsQuery,
+  useWithdrawalCapacityQuery,
 } from '@/hooks/queries/useWalletsQuery';
 import api from '@/lib/api';
 import { queryKeys } from '@/lib/queryClient';
@@ -135,6 +136,10 @@ export default function SettingsPage() {
     data: primaryWalletBalance,
     isPending: isPrimaryWalletBalancePending,
   } = useWalletBalanceQuery(primaryConnectedWallet?.address ?? null);
+  // A withdrawal draws on the wallet's USDC.e or its pUSD, less what is held
+  // for withdrawals in flight and open buys: less than the balance above.
+  const { data: withdrawalCapacity, isError: withdrawalCapacityFailed } =
+    useWithdrawalCapacityQuery(primaryConnectedWallet?.address ?? null, canManageWithdrawals);
   const { data: recentWithdrawals = [], isLoading: withdrawalsLoading } =
     useWalletWithdrawalsQuery(8);
   const createWithdrawalMutation = useCreateWalletWithdrawalMutation();
@@ -533,6 +538,20 @@ export default function SettingsPage() {
                           : 'Balance unavailable'}
                     </div>
                   </div>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {withdrawalCapacity
+                      ? `Up to ${formatCurrency(withdrawalCapacity.max_withdrawable)} can be withdrawn in one transfer now.`
+                      : withdrawalCapacityFailed
+                        ? 'The amount that can be withdrawn now could not be checked.'
+                        : 'Checking how much can be withdrawn now...'}
+                  </p>
+                  {withdrawalCapacity && withdrawalCapacity.blocking_reasons.length > 0 && (
+                    <ul className="mt-1 list-disc pl-5 text-xs text-destructive">
+                      {withdrawalCapacity.blocking_reasons.map((reason) => (
+                        <li key={reason}>{reason}</li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
 
                 <div className="grid gap-3 md:grid-cols-2">

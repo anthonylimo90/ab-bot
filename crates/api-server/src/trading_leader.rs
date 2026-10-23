@@ -87,6 +87,14 @@ async fn try_acquire(pool: &PgPool) -> Result<Option<Leadership>, sqlx::Error> {
             {
                 warn!(%error, "Could not set keepalives on the trading leadership's session");
             }
+            // And one whose host died with data unacknowledged, which
+            // keepalives do not cover (PostgreSQL 12 and later).
+            if let Err(error) = sqlx::query("SELECT set_config('tcp_user_timeout', '30000', false)")
+                .execute(&mut conn)
+                .await
+            {
+                warn!(%error, "Could not set a TCP user timeout on the trading leadership's session");
+            }
             Ok(Some(Leadership { conn }))
         }
         // Without the lock the connection goes back to the pool holding nothing.

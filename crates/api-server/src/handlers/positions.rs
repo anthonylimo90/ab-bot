@@ -120,6 +120,9 @@ pub struct PositionsSummaryResponse {
     pub flat_closes: i64,
     /// Win rate based on resolved non-flat closes only.
     pub win_rate: Decimal,
+    /// Rows the closed list (`status=closed`) pages through: every position
+    /// no longer open, in any state or mode.
+    pub closed_list_count: i64,
 }
 
 /// Request to close a position.
@@ -273,6 +276,7 @@ struct PositionSummaryRow {
     losses: i64,
     flat_closes: i64,
     win_rate: Decimal,
+    closed_list_count: i64,
 }
 
 fn exit_strategy_name(strategy: i16) -> &'static str {
@@ -429,6 +433,8 @@ pub async fn get_positions_summary(
     _access: WorkspaceReadAccess,
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<PositionsSummaryResponse>> {
+    // A live account leaves paper positions out, as the account valuation does.
+    let live = current_execution_mode(state.as_ref()).await == "live";
     let row: PositionSummaryRow = sqlx::query_as(
         r#"
         WITH active_positions AS (
@@ -444,6 +450,7 @@ pub async fn get_positions_summary(
                 COALESCE(last_updated, updated_at, entry_timestamp) AS sort_updated
             FROM positions
             WHERE is_open = TRUE
+              AND ($1 OR execution_mode <> 'paper')
         ),
         ranked_active AS (
             SELECT
@@ -475,6 +482,7 @@ pub async fn get_positions_summary(
                 COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) < 0)::bigint AS losses,
                 COUNT(*) FILTER (WHERE state = 4 AND COALESCE(realized_pnl, 0) = 0)::bigint AS flat_closes
             FROM positions
+            WHERE $1 OR execution_mode <> 'paper'
         )
         SELECT
             COALESCE((SELECT COUNT(*) FROM effective_active), 0)::bigint AS open_positions,
@@ -504,10 +512,12 @@ pub async fn get_positions_summary(
                 WHEN (wins + losses) > 0
                     THEN (wins::numeric / (wins + losses)::numeric) * 100
                 ELSE 0
-            END AS win_rate
+            END AS win_rate,
+            (SELECT COUNT(*) FROM positions WHERE is_open = FALSE)::bigint AS closed_list_count
         FROM closed_stats
         "#,
     )
+    .bind(!live)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -531,6 +541,7 @@ pub async fn get_positions_summary(
         losses: row.losses,
         flat_closes: row.flat_closes,
         win_rate: row.win_rate,
+        closed_list_count: row.closed_list_count,
     }))
 }
 

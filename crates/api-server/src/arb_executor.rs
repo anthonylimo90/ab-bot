@@ -141,6 +141,10 @@ fn reprice_on_fresh_books(
     (worst >= min_net_profit).then_some((charged, worst))
 }
 
+/// How far in the future a signal's timestamp may be (clock drift between
+/// the arb monitor and this process) before its age cannot be trusted.
+const MAX_SIGNAL_CLOCK_SKEW_MS: i64 = 2_000;
+
 /// Largest pair quantity (up to `desired`) that both legs can buy at their
 /// best ask under the executor's market-buy rules: at least `min_depth`
 /// notional at that level and enough size for the whole quantity.
@@ -170,10 +174,11 @@ impl ArbExecutorConfig {
             allow_live_execution: std::env::var("ARB_ALLOW_LIVE_EXECUTION")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            // The dynamic config's default, inside its $5-$25 bounds.
             position_size: std::env::var("ARB_POSITION_SIZE")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(50, 0)),
+                .unwrap_or(Decimal::new(10, 0)),
             min_net_profit: std::env::var("ARB_MIN_NET_PROFIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -635,11 +640,17 @@ impl ArbAutoExecutor {
     async fn process_arb_signal(&self, arb: ArbOpportunity) -> anyhow::Result<()> {
         let process_started_at = std::time::Instant::now();
         let cfg = self.snapshot_config().await;
-        let signal_age_ms = Utc::now()
+        let raw_age_ms = Utc::now()
             .signed_duration_since(arb.timestamp)
-            .num_milliseconds()
-            .max(0);
-        let age_secs = signal_age_ms / 1000;
+            .num_milliseconds();
+        let signal_age_ms = raw_age_ms.max(0);
+        // A signal stamped well in the future means the monitor's clock and
+        // this one disagree, so its age says nothing: it is not taken.
+        let age_secs = if raw_age_ms < -MAX_SIGNAL_CLOCK_SKEW_MS {
+            i64::MAX
+        } else {
+            signal_age_ms / 1000
+        };
         let attempt_id = Uuid::new_v4();
         let mut telemetry = ArbExecutionTelemetry::new(attempt_id, signal_age_ms);
 
@@ -839,8 +850,10 @@ impl ArbAutoExecutor {
                 None => None,
             } {
                 let mut runtime = self.runtime_status.write().await;
-                runtime.record_decision(market_id, "skipped: exit handler not available");
-                warn!(market_id = %market_id, reason, "Exit handler not available, skipping live arb trade");
+                runtime.record_decision(market_id, format!("skipped: {reason}"));
+                // Per signal at debug: the condition itself is logged where it
+                // is found, and a hold can last long enough to flood the logs.
+                debug!(market_id = %market_id, reason, "Exits not available, skipping live arb trade");
                 telemetry.finish_total(&process_started_at);
                 drop(runtime);
                 self.record_skip_event(&arb, execution_mode, reason, &telemetry)

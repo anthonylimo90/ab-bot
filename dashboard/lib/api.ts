@@ -16,6 +16,7 @@ import type {
   StoreWalletRequest,
   CreateWalletWithdrawalRequest,
   WalletWithdrawal,
+  WithdrawalPreflight,
   UserListItem,
   CreateUserRequest,
   UpdateUserRequest,
@@ -159,15 +160,17 @@ function parsePositionsSummary(raw: PositionsSummary): PositionsSummary {
     raw_unrealized_pnl: Number(raw.raw_unrealized_pnl),
     flat_closes: raw.flat_closes != null ? Number(raw.flat_closes) : 0,
     win_rate: Number(raw.win_rate),
+    closed_list_count:
+      raw.closed_list_count != null ? Number(raw.closed_list_count) : undefined,
   };
 }
 
 function parseAccountSummary(raw: AccountSummary): AccountSummary {
   return {
     ...raw,
-    cash_balance: Number(raw.cash_balance),
+    cash_balance: raw.cash_balance != null ? Number(raw.cash_balance) : null,
     position_value: Number(raw.position_value),
-    total_equity: Number(raw.total_equity),
+    total_equity: raw.total_equity != null ? Number(raw.total_equity) : null,
     unrealized_pnl: Number(raw.unrealized_pnl),
     realized_pnl_24h: Number(raw.realized_pnl_24h),
     net_cash_flows_24h: Number(raw.net_cash_flows_24h),
@@ -827,6 +830,21 @@ class ApiClient {
     return this.request<{ address: string; usdc_balance: number }>(
       `/api/v1/vault/wallets/${address}/balance`,
     );
+  }
+
+  /** Capacity of `address` for one withdrawal, probed with the smallest amount. */
+  async getWithdrawalCapacity(address: string): Promise<WithdrawalPreflight> {
+    const raw = await this.request<WithdrawalPreflight>(
+      `/api/v1/vault/withdrawals/preflight?address=${encodeURIComponent(address)}&amount=0.000001`,
+    );
+    return {
+      ...raw,
+      available_usdc: Number(raw.available_usdc),
+      in_flight_withdrawals: Number(raw.in_flight_withdrawals),
+      reserved_for_open_buys: Number(raw.reserved_for_open_buys),
+      orphan_exposure: Number(raw.orphan_exposure),
+      max_withdrawable: Number(raw.max_withdrawable),
+    };
   }
 
   async listWalletWithdrawals(limit = 10): Promise<WalletWithdrawal[]> {

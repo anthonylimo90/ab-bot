@@ -33,7 +33,13 @@ import {
   LineChart,
   BarChart2,
 } from "lucide-react";
-import { cn, formatCurrency, formatTimeAgo, formatWinRatePercent } from "@/lib/utils";
+import {
+  cn,
+  formatCurrency,
+  formatCurrencyOrDash,
+  formatTimeAgo,
+  formatWinRatePercent,
+} from "@/lib/utils";
 import { TimeAgo } from "@/components/shared/TimeAgo";
 
 const activityIcons: Record<string, React.ReactNode> = {
@@ -122,22 +128,26 @@ export function DashboardHome() {
             "Automated trading is enabled and the safety stop is not currently blocking trading.",
         };
   const stats = useMemo(() => {
-    const totalValue = accountSummary?.total_equity ?? 0;
+    // Null until the summary loads, and when the wallet's cash could not be
+    // read: never shown as $0.
+    const totalValue = accountSummary?.total_equity ?? null;
     const totalUnrealizedPnl = accountSummary?.unrealized_pnl ?? 0;
     return {
       total_value: totalValue,
-      cash_balance: accountSummary?.cash_balance ?? 0,
+      cash_unavailable: accountSummary != null && accountSummary.cash_balance == null,
+      cash_balance: accountSummary?.cash_balance ?? null,
       marked_position_value: accountSummary?.position_value ?? 0,
       net_cash_flows_24h: accountSummary?.net_cash_flows_24h ?? 0,
       realized_pnl_24h: accountSummary?.realized_pnl_24h ?? 0,
       unpriced_open_positions: accountSummary?.unpriced_open_positions ?? 0,
       unpriced_position_cost_basis:
         accountSummary?.unpriced_position_cost_basis ?? 0,
-      total_pnl_percent: totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
+      total_pnl_percent:
+        totalValue != null && totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
       total_unrealized_pnl: totalUnrealizedPnl,
       today_pnl: riskStatus?.circuit_breaker?.daily_pnl ?? 0,
       today_pnl_percent:
-        totalValue > 0
+        totalValue != null && totalValue > 0
           ? ((riskStatus?.circuit_breaker?.daily_pnl ?? 0) / totalValue) * 100
           : 0,
       active_positions: accountSummary?.open_positions ?? positionsSummary?.open_positions ?? 0,
@@ -277,12 +287,18 @@ export function DashboardHome() {
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
           title="Account Equity"
-          value={formatCurrency(stats.total_value)}
+          value={
+            stats.cash_unavailable ? "Unavailable" : formatCurrencyOrDash(stats.total_value)
+          }
           change={stats.total_pnl_percent}
           changeLabel={
-            stats.unpriced_open_positions > 0
-              ? `Cash ${formatCurrency(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}. ${stats.unpriced_open_positions} item${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis because no live mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
-              : `Cash ${formatCurrency(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}. Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}`
+            (stats.cash_unavailable
+              ? `The wallet's cash balance could not be read. Reconciled exposure ${formatCurrency(stats.marked_position_value)}.`
+              : `Cash ${formatCurrencyOrDash(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}.`) +
+            ` Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}.` +
+            (stats.unpriced_open_positions > 0
+              ? ` ${stats.unpriced_open_positions} item${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis because no live mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
+              : "")
           }
           trend={stats.total_pnl_percent >= 0 ? "up" : "down"}
         />

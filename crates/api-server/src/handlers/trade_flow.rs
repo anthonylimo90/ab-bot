@@ -1128,20 +1128,22 @@ async fn load_arb_execution_telemetry_summary(
               AND occurred_at >= $1
               AND occurred_at <= $2
         ),
-        attempts AS (
+        failures AS (
+            -- An arb entry fails on its first leg ('entry_failed') or after
+            -- it, leaving one leg to sell ('one_legged_exit_ready').
             SELECT *
             FROM filtered
-            WHERE event_type IN ('position_open', 'position_failed', 'signal_skipped')
+            WHERE event_type IN ('position_failed', 'entry_failed', 'one_legged_exit_ready')
         )
         SELECT
             COUNT(*) FILTER (WHERE event_type = 'entry_requested')::bigint AS entry_requests,
             COUNT(*) FILTER (WHERE event_type = 'position_open')::bigint AS positions_opened,
-            COUNT(*) FILTER (WHERE event_type = 'position_failed')::bigint AS position_failures,
+            (SELECT COUNT(*) FROM failures)::bigint AS position_failures,
             COUNT(*) FILTER (WHERE event_type = 'signal_skipped')::bigint AS signal_skipped,
-            COUNT(*) FILTER (
-                WHERE event_type = 'position_failed'
-                  AND COALESCE((metadata ->> 'one_legged')::boolean, FALSE)
-            )::bigint AS one_legged_failures,
+            (SELECT COUNT(*) FROM failures
+             WHERE event_type = 'one_legged_exit_ready'
+                OR COALESCE((metadata ->> 'one_legged')::boolean, FALSE))::bigint
+                AS one_legged_failures,
             CASE
                 WHEN COUNT(*) FILTER (WHERE event_type = 'entry_requested') = 0 THEN NULL
                 ELSE COUNT(*) FILTER (WHERE event_type = 'position_open')::double precision
@@ -1149,7 +1151,7 @@ async fn load_arb_execution_telemetry_summary(
             END AS success_rate,
             CASE
                 WHEN COUNT(*) FILTER (WHERE event_type = 'entry_requested') = 0 THEN NULL
-                ELSE COUNT(*) FILTER (WHERE event_type = 'position_failed')::double precision
+                ELSE (SELECT COUNT(*) FROM failures)::double precision
                     / COUNT(*) FILTER (WHERE event_type = 'entry_requested')::double precision
             END AS failure_rate,
             CASE
@@ -1219,7 +1221,10 @@ async fn load_arb_execution_latency_breakdown(
             WHERE strategy = 'arb'
               AND occurred_at >= $1
               AND occurred_at <= $2
-              AND event_type IN ('position_open', 'position_failed', 'signal_skipped')
+              AND event_type IN (
+                  'position_open', 'position_failed', 'entry_failed', 'one_legged_exit_ready',
+                  'signal_skipped'
+              )
         ),
         stage_values AS (
             SELECT 'signal_age_ms' AS stage, NULLIF(metadata ->> 'signal_age_ms', '')::double precision AS value FROM attempts
@@ -1284,8 +1289,8 @@ async fn load_arb_execution_outcome_breakdown(
             SELECT
                 CASE
                     WHEN event_type = 'position_open' THEN 'opened'
-                    WHEN event_type = 'position_failed' THEN 'failed'
-                    ELSE 'skipped'
+                    WHEN event_type = 'signal_skipped' THEN 'skipped'
+                    ELSE 'failed'
                 END AS outcome,
                 COALESCE(
                     reason,
@@ -1296,7 +1301,10 @@ async fn load_arb_execution_outcome_breakdown(
             WHERE strategy = 'arb'
               AND occurred_at >= $1
               AND occurred_at <= $2
-              AND event_type IN ('position_open', 'position_failed', 'signal_skipped')
+              AND event_type IN (
+                  'position_open', 'position_failed', 'entry_failed', 'one_legged_exit_ready',
+                  'signal_skipped'
+              )
         )
         SELECT outcome, reason, COUNT(*)::bigint AS count
         FROM attempts
@@ -1333,8 +1341,8 @@ async fn load_arb_execution_recent_attempts(
             position_id,
             CASE
                 WHEN event_type = 'position_open' THEN 'opened'
-                WHEN event_type = 'position_failed' THEN 'failed'
-                ELSE 'skipped'
+                WHEN event_type = 'signal_skipped' THEN 'skipped'
+                ELSE 'failed'
             END AS outcome,
             COALESCE(reason, NULLIF(metadata ->> 'failure_stage', '')) AS reason,
             execution_mode,
@@ -1352,12 +1360,16 @@ async fn load_arb_execution_recent_attempts(
             expected_edge,
             observed_edge,
             NULLIF(metadata ->> 'execution_slippage_bps', '')::double precision AS execution_slippage_bps,
-            COALESCE((metadata ->> 'one_legged')::boolean, FALSE) AS one_legged
+            (event_type = 'one_legged_exit_ready'
+                OR COALESCE((metadata ->> 'one_legged')::boolean, FALSE)) AS one_legged
         FROM trade_events
         WHERE strategy = 'arb'
           AND occurred_at >= $1
           AND occurred_at <= $2
-          AND event_type IN ('position_open', 'position_failed', 'signal_skipped')
+          AND event_type IN (
+              'position_open', 'position_failed', 'entry_failed', 'one_legged_exit_ready',
+              'signal_skipped'
+          )
         ORDER BY occurred_at DESC, id DESC
         LIMIT $3
         "#,
@@ -1903,7 +1915,7 @@ async fn load_arb_market_scorecard_rows(
         failures AS (
             SELECT market_id, COUNT(DISTINCT position_id)::bigint AS entry_failed_positions
             FROM filtered
-            WHERE event_type = 'position_failed'
+            WHERE event_type IN ('position_failed', 'entry_failed', 'one_legged_exit_ready')
               AND position_id IS NOT NULL
             GROUP BY market_id
         ),
@@ -2047,12 +2059,14 @@ fn state_name(state: i16) -> &'static str {
     }
 }
 
+/// `live` leaves paper results out, as the account valuation does.
 async fn load_trade_event_summary_rows(
     pool: &sqlx::PgPool,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     strategy: Option<&str>,
     market_id: Option<&str>,
+    live: bool,
 ) -> Result<Vec<TradeFlowStrategySummary>, sqlx::Error> {
     let rows: Vec<StrategySummaryRow> = sqlx::query_as(
         r#"
@@ -2063,6 +2077,7 @@ async fn load_trade_event_summary_rows(
               AND occurred_at <= $2
               AND ($3::text IS NULL OR strategy = $3)
               AND ($4::text IS NULL OR market_id = $4)
+              AND ($5 OR execution_mode <> 'paper')
         ),
         position_scope AS (
             SELECT DISTINCT position_id
@@ -2177,6 +2192,7 @@ async fn load_trade_event_summary_rows(
     .bind(to)
     .bind(strategy)
     .bind(market_id)
+    .bind(!live)
     .fetch_all(pool)
     .await?;
 
@@ -2201,12 +2217,14 @@ async fn load_trade_event_summary_rows(
         .collect())
 }
 
+/// `live` leaves paper positions out.
 async fn load_derived_summary_rows(
     pool: &sqlx::PgPool,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     strategy: Option<&str>,
     market_id: Option<&str>,
+    live: bool,
 ) -> Result<Vec<TradeFlowStrategySummary>, sqlx::Error> {
     let mut rows = Vec::new();
 
@@ -2229,7 +2247,9 @@ async fn load_derived_summary_rows(
             AVG((EXTRACT(EPOCH FROM (p.exit_timestamp - p.entry_timestamp)) / 3600.0)::double precision)
                 FILTER (WHERE p.state = 4 AND p.exit_timestamp IS NOT NULL) AS avg_hold_hours
         FROM quant_signals qs
-        LEFT JOIN positions p ON p.id = qs.position_id
+        LEFT JOIN positions p
+          ON p.id = qs.position_id
+         AND ($5 OR p.execution_mode <> 'paper')
         WHERE qs.generated_at >= $1
           AND qs.generated_at <= $2
           AND ($3::text IS NULL OR qs.kind = $3)
@@ -2242,6 +2262,7 @@ async fn load_derived_summary_rows(
     .bind(to)
     .bind(strategy)
     .bind(market_id)
+    .bind(!live)
     .fetch_all(pool)
     .await?;
 
@@ -2286,11 +2307,13 @@ async fn load_derived_summary_rows(
               AND entry_timestamp >= $1
               AND entry_timestamp <= $2
               AND ($3::text IS NULL OR market_id = $3)
+              AND ($4 OR execution_mode <> 'paper')
             "#,
         )
         .bind(from)
         .bind(to)
         .bind(market_id)
+        .bind(!live)
         .fetch_all(pool)
         .await?;
 
@@ -2759,12 +2782,13 @@ pub async fn get_trade_flow_summary(
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<TradeFlowSummaryResponse>> {
     let (from, to, _) = effective_window(&query);
+    let live = state.order_executor.is_live_ready().await;
     let canonical =
-        load_trade_event_summary_rows(&state.pool, from, to, query.strategy.as_deref(), None)
+        load_trade_event_summary_rows(&state.pool, from, to, query.strategy.as_deref(), None, live)
             .await
             .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
     let fallback =
-        load_derived_summary_rows(&state.pool, from, to, query.strategy.as_deref(), None)
+        load_derived_summary_rows(&state.pool, from, to, query.strategy.as_deref(), None, live)
             .await
             .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
 
@@ -2835,12 +2859,14 @@ pub async fn get_market_trade_flow(
     Query(query): Query<TradeFlowQuery>,
 ) -> ApiResult<Json<TradeFlowMarketResponse>> {
     let (from, to, limit) = effective_window(&query);
+    let live = state.order_executor.is_live_ready().await;
     let canonical_summary = load_trade_event_summary_rows(
         &state.pool,
         from,
         to,
         query.strategy.as_deref(),
         Some(&market_id),
+        live,
     )
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
@@ -2850,6 +2876,7 @@ pub async fn get_market_trade_flow(
         to,
         query.strategy.as_deref(),
         Some(&market_id),
+        live,
     )
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {e}")))?;
@@ -4202,5 +4229,69 @@ mod tests {
             rows[0].edge_capture_ratio.map(|r| r.round_dp(6)),
             Some(Decimal::new(75, 2))
         );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn arb_telemetry_counts_failed_and_one_legged_entries(pool: sqlx::PgPool) {
+        let schema = include_str!("../../../../migrations/048_trade_events.sql")
+            .replace("uuid_generate_v4()", "gen_random_uuid()");
+        sqlx::Executor::execute(&pool, schema.as_str())
+            .await
+            .unwrap();
+        // Four entries: one opened, one failed on its first leg, one left
+        // holding a leg after the second failed, and one skipped signal.
+        for (event_type, state_to) in [
+            ("entry_requested", Some("pending")),
+            ("position_open", Some("open")),
+            ("entry_requested", Some("pending")),
+            ("entry_failed", Some("entry_failed")),
+            ("entry_requested", Some("pending")),
+            ("one_legged_exit_ready", Some("exit_ready")),
+            ("signal_skipped", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO trade_events (strategy, execution_mode, source, market_id, \
+                 position_id, event_type, state_to) \
+                 VALUES ('arb', 'paper', 'arb', 'm', $1, $2, $3)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(event_type)
+            .bind(state_to)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let from = Utc::now() - chrono::Duration::hours(1);
+        let to = Utc::now() + chrono::Duration::minutes(1);
+
+        let summary = load_arb_execution_telemetry_summary(&pool, from, to)
+            .await
+            .unwrap();
+        assert_eq!(summary.entry_requests, 3);
+        assert_eq!(summary.positions_opened, 1);
+        assert_eq!(summary.position_failures, 2);
+        assert_eq!(summary.one_legged_failures, 1);
+        assert_eq!(summary.signal_skipped, 1);
+        assert_eq!(summary.failure_rate, Some(2.0 / 3.0));
+
+        let outcomes = load_arb_execution_outcome_breakdown(&pool, from, to)
+            .await
+            .unwrap();
+        let count = |outcome: &str| -> i64 {
+            outcomes
+                .iter()
+                .filter(|row| row.outcome == outcome)
+                .map(|row| row.count)
+                .sum()
+        };
+        assert_eq!(
+            (count("opened"), count("failed"), count("skipped")),
+            (1, 2, 1)
+        );
+
+        let attempts = load_arb_execution_recent_attempts(&pool, from, to, 10)
+            .await
+            .unwrap();
+        assert_eq!(attempts.iter().filter(|a| a.one_legged).count(), 1);
     }
 }

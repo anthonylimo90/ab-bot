@@ -1010,16 +1010,28 @@ pub(crate) async fn reconcile_manual_intent(
         .fetch_one(&mut *tx)
         .await?;
     let size = snapshot.original_size.parse::<Decimal>()?;
-    if row.execution_mode != "live" || !snapshot_fits(&row, size, quantity) {
+    // Checked against what the exchange matched (a read of the order may
+    // already have stored that); booked as what confirmed trades filled.
+    let matched = snapshot.size_matched.parse::<Decimal>()?;
+    if row.execution_mode != "live" || !snapshot_fits(&row, size, matched) || quantity > matched {
         anyhow::bail!("Snapshot conflicts with stored manual order");
     }
+    // Fills never decrease (the inventory trigger refuses it): a match a
+    // read of the order already stored stays booked, at its stored price.
+    let confirmed = quantity;
+    let quantity = confirmed.max(row.filled_quantity);
+    let avg_fill_price = if confirmed > Decimal::ZERO && confirmed >= row.filled_quantity {
+        Some(price)
+    } else {
+        row.avg_fill_price
+    };
     let status = if snapshot_complete(&row, size, quantity) {
         "filled"
     } else {
         "cancelled"
     };
     sqlx::query("UPDATE orders SET exchange_order_id=$2,status=$3,filled_quantity=$4,avg_fill_price=$5,updated_at=NOW() WHERE id=$1")
-        .bind(id).bind(&snapshot.id).bind(status).bind(quantity).bind(if quantity>Decimal::ZERO {Some(price)} else {None}).execute(&mut *tx).await?;
+        .bind(id).bind(&snapshot.id).bind(status).bind(quantity).bind(avg_fill_price).execute(&mut *tx).await?;
     sqlx::query("UPDATE execution_intents SET status='reconciled',updated_at=NOW() WHERE id=$1")
         .bind(id)
         .execute(&mut *tx)

@@ -7,8 +7,10 @@ use chrono::{Duration, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{FromRow, PgPool};
+use std::sync::Arc;
 use std::time;
 use tracing::{debug, info, warn};
+use trading_engine::OrderExecutor;
 
 #[derive(Debug, Clone)]
 pub struct StrategyHealthConfig {
@@ -68,7 +70,11 @@ struct LatestBacktestRow {
     created_at: chrono::DateTime<Utc>,
 }
 
-pub fn spawn_strategy_health_calculator(config: StrategyHealthConfig, pool: PgPool) {
+pub fn spawn_strategy_health_calculator(
+    config: StrategyHealthConfig,
+    pool: PgPool,
+    order_executor: Arc<OrderExecutor>,
+) {
     if !config.enabled {
         info!("Strategy health calculator disabled (STRATEGY_HEALTH_ENABLED != true)");
         return;
@@ -80,15 +86,17 @@ pub fn spawn_strategy_health_calculator(config: StrategyHealthConfig, pool: PgPo
         "Spawning strategy health calculator"
     );
 
-    tokio::spawn(run_loop(config, pool));
+    tokio::spawn(run_loop(config, pool, order_executor));
 }
 
-async fn run_loop(config: StrategyHealthConfig, pool: PgPool) {
+async fn run_loop(config: StrategyHealthConfig, pool: PgPool, order_executor: Arc<OrderExecutor>) {
     tokio::time::sleep(time::Duration::from_secs(180)).await;
     let interval = time::Duration::from_secs(config.interval_secs);
 
     loop {
-        match compute_cycle(&pool, &config).await {
+        // A live account leaves paper results out, as the account valuation does.
+        let live = order_executor.is_live_ready().await;
+        match compute_cycle(&pool, &config, live).await {
             Ok(rows) => info!(
                 rows_upserted = rows,
                 "Strategy health computation completed"
@@ -103,6 +111,7 @@ async fn run_loop(config: StrategyHealthConfig, pool: PgPool) {
 async fn compute_cycle(
     pool: &PgPool,
     config: &StrategyHealthConfig,
+    live: bool,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let now = Utc::now();
     let latest_backtests = load_latest_backtests(pool).await?;
@@ -110,7 +119,7 @@ async fn compute_cycle(
 
     for &period_days in &config.periods {
         let window_start = now - Duration::days(period_days as i64);
-        let rows = load_strategy_health(pool, window_start, now).await?;
+        let rows = load_strategy_health(pool, window_start, now, live).await?;
 
         for row in rows {
             let latest_backtest = latest_backtests
@@ -200,10 +209,12 @@ async fn compute_cycle(
     Ok(upserted)
 }
 
+/// `live` leaves paper results out.
 async fn load_strategy_health(
     pool: &PgPool,
     from: chrono::DateTime<Utc>,
     to: chrono::DateTime<Utc>,
+    live: bool,
 ) -> Result<Vec<StrategyHealthAggRow>, sqlx::Error> {
     let canonical: Vec<StrategyHealthAggRow> = sqlx::query_as(
         r#"
@@ -212,6 +223,7 @@ async fn load_strategy_health(
             FROM trade_events
             WHERE occurred_at >= $1
               AND occurred_at <= $2
+              AND ($3 OR execution_mode <> 'paper')
         ),
         latest_positions AS (
             SELECT DISTINCT ON (strategy, position_id)
@@ -277,7 +289,8 @@ async fn load_strategy_health(
             SELECT
                 strategy,
                 COUNT(DISTINCT signal_id) FILTER (WHERE event_type = 'signal_generated')::bigint AS generated_signals,
-                COUNT(DISTINCT signal_id) FILTER (
+                -- Arb entries carry no signal id: their position stands in.
+                COUNT(DISTINCT COALESCE(signal_id, position_id)) FILTER (
                     WHERE event_type IN ('entry_requested', 'entry_filled', 'position_open')
                        OR state_to = 'open'
                 )::bigint AS executed_signals,
@@ -340,10 +353,11 @@ async fn load_strategy_health(
     )
     .bind(from)
     .bind(to)
+    .bind(!live)
     .fetch_all(pool)
     .await?;
 
-    let derived = load_derived_strategy_health(pool, from, to).await?;
+    let derived = load_derived_strategy_health(pool, from, to, live).await?;
     Ok(merge_strategy_health_rows(canonical, derived))
 }
 
@@ -351,6 +365,7 @@ async fn load_derived_strategy_health(
     pool: &PgPool,
     from: chrono::DateTime<Utc>,
     to: chrono::DateTime<Utc>,
+    live: bool,
 ) -> Result<Vec<StrategyHealthAggRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
@@ -394,6 +409,7 @@ async fn load_derived_strategy_health(
         FROM quant_signals qs
         LEFT JOIN positions p
           ON p.id = qs.position_id
+         AND ($3 OR p.execution_mode <> 'paper')
         WHERE qs.generated_at >= $1
           AND qs.generated_at <= $2
         GROUP BY qs.kind
@@ -402,6 +418,7 @@ async fn load_derived_strategy_health(
     )
     .bind(from)
     .bind(to)
+    .bind(!live)
     .fetch_all(pool)
     .await
 }
@@ -981,7 +998,8 @@ mod edge_capture_tests {
                 held_yes_qty NUMERIC NOT NULL DEFAULT 0,
                 held_no_qty NUMERIC NOT NULL DEFAULT 0,
                 exited_yes_qty NUMERIC NOT NULL DEFAULT 0,
-                exited_no_qty NUMERIC NOT NULL DEFAULT 0
+                exited_no_qty NUMERIC NOT NULL DEFAULT 0,
+                execution_mode TEXT NOT NULL DEFAULT 'paper'
             );
             CREATE TABLE quant_signals (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1113,7 +1131,7 @@ mod edge_capture_tests {
         )
         .await;
 
-        let rows = load_strategy_health(&pool, Utc::now() - day(7), Utc::now())
+        let rows = load_strategy_health(&pool, Utc::now() - day(7), Utc::now(), false)
             .await
             .unwrap();
         let arb = rows.iter().find(|r| r.strategy == "arb").unwrap();
@@ -1131,6 +1149,63 @@ mod edge_capture_tests {
         assert!(approx(expected_edge_bps(arb).unwrap(), "421.0526"));
         assert!(approx(realized_edge_bps(arb).unwrap(), "206.8966"));
         assert!(approx(edge_capture_ratio(arb).unwrap(), "0.4914"));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn live_results_leave_paper_out(pool: PgPool) {
+        create_tables(&pool).await;
+        for (mode, pnl) in [("paper", "50"), ("live", "7")] {
+            sqlx::query(
+                "INSERT INTO trade_events (strategy, execution_mode, position_id, event_type, \
+                 state_to, realized_pnl) VALUES ('arb', $1, $2, 'position_closed', 'closed', \
+                 $3::numeric)",
+            )
+            .bind(mode)
+            .bind(Uuid::new_v4())
+            .bind(pnl)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let position = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO positions (id, state, realized_pnl, execution_mode) \
+                 VALUES ($1, 4, $2::numeric, $3)",
+            )
+            .bind(position)
+            .bind(pnl)
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO quant_signals (kind, execution_status, position_id) \
+                 VALUES ('flow', 'executed', $1)",
+            )
+            .bind(position)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let from = Utc::now() - chrono::Duration::days(1);
+        let pnl = |rows: &[StrategyHealthAggRow], strategy: &str| {
+            rows.iter()
+                .find(|r| r.strategy == strategy)
+                .unwrap()
+                .total_realized_pnl
+        };
+
+        let live = load_strategy_health(&pool, from, Utc::now(), true)
+            .await
+            .unwrap();
+        assert_eq!(pnl(&live, "arb"), d("7"));
+        assert_eq!(pnl(&live, "flow"), d("7"));
+
+        // A paper account still sees everything it traded, live leftovers too.
+        let paper = load_strategy_health(&pool, from, Utc::now(), false)
+            .await
+            .unwrap();
+        assert_eq!(pnl(&paper, "arb"), d("57"));
+        assert_eq!(pnl(&paper, "flow"), d("57"));
     }
 
     #[sqlx::test(migrations = false)]
@@ -1179,6 +1254,7 @@ mod edge_capture_tests {
             &pool,
             Utc::now() - chrono::Duration::days(7),
             Utc::now() + chrono::Duration::minutes(1),
+            false,
         )
         .await
         .unwrap();

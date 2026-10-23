@@ -25,6 +25,8 @@ const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false
 
 /// Cooldown period between signals for the same market (seconds).
 const SIGNAL_COOLDOWN_SECS: i64 = 60;
+/// The longest publishing one entry signal may hold up the books.
+const SIGNAL_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Minimum number of market replacements before a periodic rerank triggers a resubscribe.
 const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
@@ -448,7 +450,7 @@ impl ArbMonitor {
 
         let dynamic_redis_url =
             std::env::var("DYNAMIC_CONFIG_REDIS_URL").unwrap_or_else(|_| config.redis.url.clone());
-        let dynamic_config_rx = spawn_dynamic_config_listener(dynamic_redis_url);
+        let dynamic_config_rx = spawn_dynamic_config_listener(dynamic_redis_url, pool.clone());
 
         Ok(Self {
             clob_client,
@@ -1357,12 +1359,33 @@ impl ArbMonitor {
                                 };
 
                                 if should_signal {
-                                    self.last_signal_time
-                                        .insert(arb.market_id.clone(), observed_at);
-                                    self.track_market_signal(&arb.market_id, observed_at);
-                                    arb_telemetry.entry_signals =
-                                        arb_telemetry.entry_signals.saturating_add(1);
-                                    self.handle_arb_opportunity(&arb, observed_at).await?;
+                                    // The cooldown starts only once the signal
+                                    // is out: one that failed to publish may go
+                                    // again on the next book. A publish that
+                                    // hangs must not stall the books either.
+                                    match tokio::time::timeout(
+                                        SIGNAL_PUBLISH_TIMEOUT,
+                                        self.handle_arb_opportunity(&arb, observed_at),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(())) => {
+                                            self.last_signal_time
+                                                .insert(arb.market_id.clone(), observed_at);
+                                            self.track_market_signal(&arb.market_id, observed_at);
+                                            arb_telemetry.entry_signals =
+                                                arb_telemetry.entry_signals.saturating_add(1);
+                                        }
+                                        Ok(Err(error)) => warn!(
+                                            market_id = %arb.market_id,
+                                            %error,
+                                            "Could not publish an entry signal"
+                                        ),
+                                        Err(_) => warn!(
+                                            market_id = %arb.market_id,
+                                            "Publishing an entry signal timed out"
+                                        ),
+                                    }
                                 } else {
                                     arb_telemetry.filtered_by_cooldown =
                                         arb_telemetry.filtered_by_cooldown.saturating_add(1);
@@ -1896,16 +1919,46 @@ fn fallback_bounds_for_key(key: &str) -> Option<(Decimal, Decimal)> {
     }
 }
 
+/// How often the stored dynamic config is read again, for updates whose
+/// publish this process missed (a dropped subscription, a restart of Redis).
+const DYNAMIC_CONFIG_RESYNC: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn spawn_dynamic_config_listener(
     redis_url: String,
+    pool: sqlx::PgPool,
 ) -> mpsc::UnboundedReceiver<DynamicConfigUpdate> {
     let (tx, rx) = mpsc::unbounded_channel();
 
+    let listener_tx = tx.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_dynamic_config_listener_once(&redis_url, &tx).await {
-                warn!(error = %e, "Dynamic config listener failed; reconnecting");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            match run_dynamic_config_listener_once(&redis_url, &listener_tx).await {
+                Err(e) => warn!(error = %e, "Dynamic config listener failed; reconnecting"),
+                Ok(()) => warn!("Dynamic config subscription ended; reconnecting"),
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
+    // The stored values, read again on a timer: they are what the tuner and
+    // operators last set, published or not. Unchanged values are ignored.
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DYNAMIC_CONFIG_RESYNC);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            for (key, value) in load_dynamic_values(&pool).await {
+                if fallback_bounds_for_key(&key).is_none() {
+                    continue;
+                }
+                let update = DynamicConfigUpdate {
+                    key,
+                    value,
+                    source: "dynamic_tuner_sync".to_string(),
+                };
+                if tx.send(update).is_err() {
+                    return;
+                }
             }
         }
     });

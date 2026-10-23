@@ -78,6 +78,8 @@ struct TuningMetrics {
     current_regime: String,
     /// Quant strategy net P&L over the last 7 days.
     quant_pnl_7d: f64,
+    #[serde(default)]
+    quant_closed_7d: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +187,28 @@ struct DynamicConfigRow {
     pending_eval: bool,
     pending_baseline: Option<serde_json::Value>,
     last_applied_at: Option<DateTime<Utc>>,
+    updated_by: Option<String>,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+/// How long the tuner leaves a value an operator set alone.
+const MANUAL_HOLD_HOURS: i64 = 24;
+/// The tuner never relaxes the book depth floor below this share of its
+/// default, however long entries keep failing.
+const MIN_DEPTH_FLOOR_SHARE: f64 = 0.6;
+/// Closed quant trades in seven days needed before their profit grows the
+/// base size, and the most the tuner grows it to (as a multiple of default).
+const QUANT_SIZE_MIN_TRADES: i64 = 10;
+const QUANT_SIZE_MAX_MULTIPLE: f64 = 2.0;
+
+impl DynamicConfigRow {
+    /// Set by an operator recently: the tuner does not move it.
+    fn manually_held(&self) -> bool {
+        self.updated_by.as_deref() == Some("workspace_manual")
+            && self
+                .updated_at
+                .is_some_and(|at| Utc::now() - at < chrono::Duration::hours(MANUAL_HOLD_HOURS))
+    }
 }
 
 pub struct DynamicTuner {
@@ -400,7 +424,7 @@ impl DynamicTuner {
             if !row.enabled {
                 continue;
             }
-            if row.pending_eval {
+            if row.pending_eval || row.manually_held() {
                 continue;
             }
 
@@ -438,7 +462,10 @@ impl DynamicTuner {
             );
 
             if self.config.apply_changes {
-                self.apply_change(row, new_value, &reason, &metrics).await?;
+                if !self.apply_change(row, new_value, &reason, &metrics).await? {
+                    // Changed since it was read (an operator's update): left.
+                    continue;
+                }
                 let publish_result = self
                     .publish_update(
                         redis_manager.as_mut(),
@@ -555,12 +582,13 @@ impl DynamicTuner {
                         pending_baseline = NULL,
                         last_reason = $3,
                         updated_by = 'dynamic_tuner'
-                    WHERE key = $1
+                    WHERE key = $1 AND pending_eval AND current_value = $4
                     "#,
                 )
                 .bind(&row.key)
                 .bind(row.last_good_value)
                 .bind(&reason)
+                .bind(row.current_value)
                 .execute(&self.pool)
                 .await?;
 
@@ -694,7 +722,10 @@ impl DynamicTuner {
         if no_trade_watchdog && top_skip == "insufficient_depth" {
             if let Some(row) = rows.get(KEY_ARB_MIN_BOOK_DEPTH) {
                 let current_depth = decimal_to_f64(row.current_value);
-                let relaxed_depth = current_depth * 0.95; // 5% reduction
+                // 5% a step, and never below a set share of the default:
+                // failing entries are not cured by ever thinner books.
+                let floor = decimal_to_f64(row.default_value) * MIN_DEPTH_FLOOR_SHARE;
+                let relaxed_depth = (current_depth * 0.95).max(floor.min(current_depth));
                 targets.insert(KEY_ARB_MIN_BOOK_DEPTH.to_string(), relaxed_depth);
             }
         }
@@ -739,9 +770,22 @@ impl DynamicTuner {
             .map(|r| decimal_to_f64(r.current_value))
             .unwrap_or(30.0);
 
-        let desired_quant_size = if metrics.quant_pnl_7d > 0.0 {
-            // Quant strategies are profitable — modest 5% raise
-            quant_size_current * 1.05
+        let quant_size_default = rows
+            .get(KEY_QUANT_BASE_POSITION_SIZE)
+            .map(|r| decimal_to_f64(r.default_value))
+            .unwrap_or(30.0);
+        let desired_quant_size = if metrics.quant_pnl_7d > 0.0
+            && metrics.quant_closed_7d >= QUANT_SIZE_MIN_TRADES as f64
+        {
+            // Profitable over enough trades: a modest 5% raise, up to a
+            // multiple of the default. A size already past it (an operator
+            // set more) is held.
+            let cap = quant_size_default * QUANT_SIZE_MAX_MULTIPLE;
+            if quant_size_current >= cap {
+                quant_size_current
+            } else {
+                (quant_size_current * 1.05).min(cap)
+            }
         } else if metrics.quant_pnl_7d < -50.0 {
             // Quant strategies are bleeding — pull back by 10%
             quant_size_current * 0.90
@@ -866,10 +910,10 @@ impl DynamicTuner {
             0.0
         };
 
-        // Quant strategy net P&L over the last 7 days
-        let quant_pnl_7d: Decimal = sqlx::query_scalar(
+        // Quant strategy net P&L over the last 7 days, and how many trades
+        let (quant_pnl_7d, quant_closed_7d): (Decimal, i64) = sqlx::query_as(
             r#"
-            SELECT COALESCE(SUM(realized_pnl), 0)
+            SELECT COALESCE(SUM(realized_pnl), 0), COUNT(*)
             FROM positions
             WHERE source = 3
               AND exit_timestamp >= NOW() - INTERVAL '7 days'
@@ -880,7 +924,7 @@ impl DynamicTuner {
         .bind(self.traded_mode().await)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or(Decimal::ZERO);
+        .unwrap_or((Decimal::ZERO, 0));
 
         // Query the most common arb skip reason from recent trade events.
         let top_skip_reason: Option<String> = sqlx::query_scalar(
@@ -923,6 +967,7 @@ impl DynamicTuner {
             cb_tripped: cb_state.tripped,
             current_regime: "Uncertain".to_string(),
             quant_pnl_7d: decimal_to_f64(quant_pnl_7d),
+            quant_closed_7d: quant_closed_7d as f64,
         })
     }
 
@@ -1065,7 +1110,7 @@ impl DynamicTuner {
             r#"
             SELECT key, current_value, default_value, min_value, max_value,
                    max_step_pct, enabled, last_good_value, pending_eval,
-                   pending_baseline, last_applied_at
+                   pending_baseline, last_applied_at, updated_by, updated_at
             FROM dynamic_config
             ORDER BY key
             "#,
@@ -1081,8 +1126,10 @@ impl DynamicTuner {
         new_value: Decimal,
         reason: &str,
         metrics: &TuningMetrics,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
+    ) -> anyhow::Result<bool> {
+        // Only over the value this pass read: an operator's update since
+        // then stands.
+        let changed = sqlx::query(
             r#"
             UPDATE dynamic_config
             SET current_value = $2,
@@ -1091,15 +1138,20 @@ impl DynamicTuner {
                 last_applied_at = NOW(),
                 last_reason = $4,
                 updated_by = 'dynamic_tuner'
-            WHERE key = $1
+            WHERE key = $1 AND current_value = $5 AND NOT pending_eval
             "#,
         )
         .bind(&row.key)
         .bind(new_value)
         .bind(serde_json::to_value(metrics).unwrap_or(serde_json::json!({})))
         .bind(reason)
+        .bind(row.current_value)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
 
         self.record_history(
             Some(&row.key),
@@ -1119,7 +1171,7 @@ impl DynamicTuner {
             "Dynamic config updated"
         );
 
-        Ok(())
+        Ok(true)
     }
 
     async fn rollback_unpublished_change(
@@ -1141,12 +1193,13 @@ impl DynamicTuner {
                 last_applied_at = NULL,
                 last_reason = $3,
                 updated_by = 'dynamic_tuner'
-            WHERE key = $1
+            WHERE key = $1 AND current_value = $4 AND pending_eval
             "#,
         )
         .bind(&row.key)
         .bind(row.current_value)
         .bind(&revert_reason)
+        .bind(attempted_value)
         .execute(&self.pool)
         .await?;
 
@@ -1283,7 +1336,7 @@ pub fn spawn_dynamic_config_subscriber(
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_dynamic_config_subscriber(
+            match run_dynamic_config_subscriber(
                 redis_url.as_str(),
                 pool.clone(),
                 arb_executor_config.clone(),
@@ -1291,9 +1344,11 @@ pub fn spawn_dynamic_config_subscriber(
             )
             .await
             {
-                error!(error = %e, "Dynamic config subscriber failed, retrying");
-                tokio::time::sleep(TokioDuration::from_secs(5)).await;
+                Err(e) => error!(error = %e, "Dynamic config subscriber failed, retrying"),
+                Ok(()) => warn!("Dynamic config subscription ended; reconnecting"),
             }
+            // Every exit waits before reconnecting, an ended stream included.
+            tokio::time::sleep(TokioDuration::from_secs(5)).await;
         }
     });
 
@@ -1749,6 +1804,8 @@ mod tests {
             pending_eval: false,
             pending_baseline: None,
             last_applied_at: None,
+            updated_by: None,
+            updated_at: None,
         }
     }
 

@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/table";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useStrategyPerformanceQuery } from "@/hooks/queries/useSignalsQuery";
-import { cn, formatWinRatePercent } from "@/lib/utils";
+import { cn, formatCurrency, formatWinRatePercent } from "@/lib/utils";
 
 const STRATEGY_STYLES: Record<string, { label: string; className: string }> = {
   flow: {
@@ -38,11 +38,6 @@ const STRATEGY_STYLES: Record<string, { label: string; className: string }> = {
     className: "bg-cyan-500/10 text-cyan-600 border-cyan-500/20",
   },
 };
-
-function formatPnl(value: number) {
-  const sign = value >= 0 ? "+" : "";
-  return `${sign}$${Math.abs(value).toFixed(2)}`;
-}
 
 export function StrategyPerformanceTable() {
   const [periodDays, setPeriodDays] = useState(7);
@@ -135,7 +130,7 @@ export function StrategyPerformanceTable() {
                           s.net_pnl >= 0 ? "text-profit" : "text-loss",
                         )}
                       >
-                        {formatPnl(s.net_pnl)}
+                        {formatCurrency(s.net_pnl, { showSign: true })}
                       </TableCell>
                       <TableCell
                         className={cn(
@@ -143,7 +138,7 @@ export function StrategyPerformanceTable() {
                           s.avg_pnl >= 0 ? "text-profit" : "text-loss",
                         )}
                       >
-                        {formatPnl(s.avg_pnl)}
+                        {formatCurrency(s.avg_pnl, { showSign: true })}
                       </TableCell>
                       <TableCell className="text-right tabular-nums">
                         {s.sharpe != null ? s.sharpe.toFixed(2) : "\u2014"}

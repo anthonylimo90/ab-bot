@@ -151,12 +151,27 @@ export default function HistoryPage() {
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
               <MetricCard
                 title="Account Equity"
-                value={formatCurrency(summary.total_equity)}
-                trend={summary.total_equity >= 0 ? "up" : "neutral"}
+                value={
+                  summary.total_equity != null
+                    ? formatCurrency(summary.total_equity)
+                    : "Unavailable"
+                }
+                trend={
+                  summary.total_equity != null && summary.total_equity >= 0 ? "up" : "neutral"
+                }
+                changeLabel={
+                  summary.total_equity == null
+                    ? "The wallet's cash balance could not be read"
+                    : undefined
+                }
               />
               <MetricCard
                 title="Cash Balance"
-                value={formatCurrency(summary.cash_balance)}
+                value={
+                  summary.cash_balance != null
+                    ? formatCurrency(summary.cash_balance)
+                    : "Unavailable"
+                }
                 trend="neutral"
               />
               <MetricCard

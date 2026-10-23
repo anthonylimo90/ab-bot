@@ -24,9 +24,14 @@ pub struct AccountSummaryResponse {
     pub workspace_id: String,
     pub snapshot_time: DateTime<Utc>,
     pub wallet_address: Option<String>,
-    pub cash_balance: Decimal,
+    /// `None` when the wallet's balance could not be read.
+    pub cash_balance: Option<Decimal>,
     pub position_value: Decimal,
-    pub total_equity: Decimal,
+    /// Cash plus positions; `None` when the cash could not be read.
+    pub total_equity: Option<Decimal>,
+    /// Whether `total_equity` is a complete live valuation: live trading, the
+    /// cash read and the wallet's inventory scanned.
+    pub equity_complete: bool,
     pub unrealized_pnl: Decimal,
     pub realized_pnl_24h: Decimal,
     pub net_cash_flows_24h: Decimal,
@@ -231,9 +236,10 @@ pub async fn get_account_summary(
         workspace_id: snapshot.workspace_id.to_string(),
         snapshot_time: snapshot.snapshot_time,
         wallet_address: snapshot.wallet_address,
-        cash_balance: snapshot.cash_balance,
+        cash_balance: snapshot.cash_observed.then_some(snapshot.cash_balance),
         position_value: snapshot.position_value,
-        total_equity: snapshot.total_equity,
+        total_equity: snapshot.cash_observed.then_some(snapshot.total_equity),
+        equity_complete: snapshot.equity_complete,
         unrealized_pnl: snapshot.unrealized_pnl,
         realized_pnl_24h: snapshot.realized_pnl_24h,
         net_cash_flows_24h: snapshot.net_cash_flows_24h,
@@ -335,16 +341,20 @@ pub async fn get_account_history(
         })
         .collect();
 
-    if equity_curve
+    // The current valuation joins the curve only with its cash, as the
+    // stored snapshots do.
+    let newer = equity_curve
         .last()
         .map(|point| point.snapshot_time < summary.snapshot_time)
-        .unwrap_or(true)
+        .unwrap_or(true);
+    if let (true, Some(cash_balance), Some(total_equity)) =
+        (newer, summary.cash_balance, summary.total_equity)
     {
         equity_curve.push(AccountEquityPointResponse {
             snapshot_time: summary.snapshot_time,
-            cash_balance: summary.cash_balance,
+            cash_balance,
             position_value: summary.position_value,
-            total_equity: summary.total_equity,
+            total_equity,
             unrealized_pnl: summary.unrealized_pnl,
             realized_pnl_24h: summary.realized_pnl_24h,
             net_cash_flows_24h: summary.net_cash_flows_24h,
