@@ -355,9 +355,18 @@ pub struct ArbAutoExecutor {
     heartbeat: Arc<AtomicI64>,
     /// Shared executor runtime status for dashboard/API inspection.
     runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
+    /// When set, live pairs are entered only while the exit handler can
+    /// flatten one whose second leg fails.
+    exit_readiness: Option<crate::exit_handler::ExitReadiness>,
 }
 
 impl ArbAutoExecutor {
+    /// Enter live pairs only while `readiness` allows (see the field).
+    pub fn with_exit_readiness(mut self, readiness: crate::exit_handler::ExitReadiness) -> Self {
+        self.exit_readiness = Some(readiness);
+        self
+    }
+
     /// Create a new arb auto-executor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -390,6 +399,7 @@ impl ArbAutoExecutor {
             rollout_controller: LearningRolloutController::new(pool.clone()),
             heartbeat,
             runtime_status,
+            exit_readiness: None,
         }
     }
 
@@ -539,9 +549,15 @@ impl ArbAutoExecutor {
                 result = self.arb_entry_rx.recv() => {
                     match result {
                         Ok(arb) => {
-                            if let Err(e) = self.process_arb_signal(arb).await {
-                                error!(error = %e, "Failed to process arb signal");
-                            }
+                            // A panic on one signal (a pair left half built
+                            // is flattened by the reconciler) does not stop
+                            // the executor.
+                            crate::background::pass("arb executor", async {
+                                if let Err(e) = self.process_arb_signal(arb).await {
+                                    error!(error = %e, "Failed to process arb signal");
+                                }
+                            })
+                            .await;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             {
@@ -799,6 +815,24 @@ impl ArbAutoExecutor {
             self.record_skip_event(&arb, execution_mode, "circuit_breaker", &telemetry)
                 .await;
             return Ok(());
+        }
+
+        // A live pair needs the exit handler: a second leg that fails
+        // leaves the first to be flattened.
+        if execution_mode == "live" {
+            if let Some(reason) = match &self.exit_readiness {
+                Some(readiness) => readiness.refusal().await,
+                None => None,
+            } {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.record_decision(market_id, "skipped: exit handler not available");
+                warn!(market_id = %market_id, reason, "Exit handler not available, skipping live arb trade");
+                telemetry.finish_total(&process_started_at);
+                drop(runtime);
+                self.record_skip_event(&arb, execution_mode, reason, &telemetry)
+                    .await;
+                return Ok(());
+            }
         }
 
         // 4a. Total exposure limit check
@@ -1542,6 +1576,7 @@ pub fn spawn_arb_auto_executor(
     pool: PgPool,
     heartbeat: Arc<AtomicI64>,
     runtime_status: Arc<RwLock<ArbExecutorRuntimeStatus>>,
+    exit_readiness: crate::exit_handler::ExitReadiness,
 ) {
     let executor = ArbAutoExecutor::new(
         config,
@@ -1554,7 +1589,8 @@ pub fn spawn_arb_auto_executor(
         token_cache,
         heartbeat,
         runtime_status,
-    );
+    )
+    .with_exit_readiness(exit_readiness);
 
     tokio::spawn(async move {
         if let Err(e) = executor.run().await {

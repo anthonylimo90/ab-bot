@@ -5,9 +5,10 @@ use polymarket_core::signing::SignedOrder;
 /// How long a submission waits for another order of the same wallet that is
 /// mid-POST, and how often it looks again.
 pub(super) const FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-/// How long the second leg of a pair waits: as long as a POST may take (the
-/// CLOB client's 30-second timeout). With its own POST that stays within the
-/// executor's safety timeout (three times its 30-second default).
+/// How long the second leg of a pair waits at most: as long as a POST may
+/// take (the CLOB client's 30-second timeout), and never longer than the
+/// executor's own timeout. At the 30-second default, preparation, the wait
+/// and the POST together stay within the safety timeout (three times it).
 pub(super) const PAIR_FENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const FENCE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 

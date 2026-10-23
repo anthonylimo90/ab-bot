@@ -9,13 +9,18 @@ use futures_util::FutureExt;
 /// Run one pass of the background loop `task`. A panic in it ends only that
 /// pass and is logged, so the loop does not stop for the rest of the
 /// process's life with nothing said. Each pass starts from the database.
-pub(crate) async fn pass<F: Future<Output = ()>>(task: &'static str, work: F) {
-    if let Err(panic) = AssertUnwindSafe(work).catch_unwind().await {
-        tracing::error!(
-            task,
-            panic = %panic_message(panic.as_ref()),
-            "A background pass panicked; the loop goes on"
-        );
+/// Returns whether the pass ran to its end.
+pub(crate) async fn pass<F: Future<Output = ()>>(task: &'static str, work: F) -> bool {
+    match AssertUnwindSafe(work).catch_unwind().await {
+        Ok(()) => true,
+        Err(panic) => {
+            tracing::error!(
+                task,
+                panic = %panic_message(panic.as_ref()),
+                "A background pass panicked; the loop goes on"
+            );
+            false
+        }
     }
 }
 
@@ -36,13 +41,14 @@ mod tests {
     async fn a_panicking_pass_does_not_end_the_loop() {
         let passes = AtomicUsize::new(0);
         for round in 0..3 {
-            pass("test", async {
+            let finished = pass("test", async {
                 passes.fetch_add(1, Ordering::SeqCst);
                 if round == 1 {
                     panic!("odd input");
                 }
             })
             .await;
+            assert_eq!(finished, round != 1);
         }
         assert_eq!(passes.load(Ordering::SeqCst), 3);
         assert_eq!(panic_message(&"text"), "text");

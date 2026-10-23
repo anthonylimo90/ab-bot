@@ -342,7 +342,7 @@ export default function HistoryPage() {
                           placeholder={
                             cashFlowType === "deposit" || cashFlowType === "withdrawal"
                               ? "100"
-                              : "100 or -25"
+                              : "+100 in, -25 out"
                           }
                         />
                       </label>

@@ -26,7 +26,7 @@ use crate::websocket::{OrderbookUpdate, PositionUpdate, SignalUpdate};
 #[path = "state/wallet_selection_tests.rs"]
 mod wallet_selection_tests;
 
-pub(crate) const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled')) OR EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode<>'paper' AND quantity>0)";
+pub(crate) const STARTUP_EXPOSURE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE held_yes_qty > 0 OR held_no_qty > 0 OR state IN (0, 1, 2, 3, 6, 7)) OR EXISTS(SELECT 1 FROM execution_intents WHERE status IN ('submitting','unknown')) OR EXISTS(SELECT 1 FROM orders WHERE execution_mode='live' AND status IN ('pending','open','partially_filled')) OR EXISTS(SELECT 1 FROM manual_inventory WHERE execution_mode<>'paper' AND quantity>=0.01)";
 
 fn normalize_trading_wallet_address(address: &str) -> anyhow::Result<String> {
     let parsed = address

@@ -35,6 +35,39 @@ enum ExitBidStatus {
     Unavailable,
 }
 
+/// Whether the exit handler is there to act on what a live entry may leave
+/// behind: a pair whose second leg failed must be flattened, and a quant
+/// position needs its take-profit, stop-loss and maximum hold.
+#[derive(Clone)]
+pub struct ExitReadiness {
+    config: Arc<RwLock<ExitHandlerConfig>>,
+    heartbeat: Arc<AtomicI64>,
+}
+
+impl ExitReadiness {
+    pub fn new(config: Arc<RwLock<ExitHandlerConfig>>, heartbeat: Arc<AtomicI64>) -> Self {
+        Self { config, heartbeat }
+    }
+
+    /// Why a live entry may not start now, if it may not.
+    pub async fn refusal(&self) -> Option<&'static str> {
+        let cfg = self.config.read().await;
+        if !cfg.enabled {
+            return Some("exit_handler_disabled");
+        }
+        // The handler marks itself alive at least every exit poll; a pass
+        // that panicked clears the mark.
+        let stale_after = (cfg.exit_poll_interval_secs.saturating_mul(3)).max(300) as i64;
+        let age = Utc::now().timestamp() - self.heartbeat.load(Ordering::Relaxed);
+        (age > stale_after).then_some("exit_handler_not_running")
+    }
+
+    /// The loss, as a fraction of cost, at which a quant position is sold.
+    pub async fn quant_stop_loss(&self) -> Decimal {
+        self.config.read().await.quant_stop_loss_pct
+    }
+}
+
 /// Configuration for the exit handler (env-var driven).
 #[derive(Debug, Clone)]
 pub struct ExitHandlerConfig {
@@ -123,6 +156,9 @@ pub struct ExitHandler {
     position_service: crate::position_service::PositionService,
     /// Heartbeat timestamp (epoch secs) — updated every tick to prove liveness.
     heartbeat: Arc<AtomicI64>,
+    /// Whether the latest passes ran to their end; while not, the heartbeat
+    /// is held at zero.
+    passes_clean: std::sync::atomic::AtomicBool,
     /// Since when a resolved position's token balance of a leg (true for
     /// YES) has been unreadable, without a read succeeding since.
     balance_unreadable_since: std::sync::Mutex<HashMap<(uuid::Uuid, bool), std::time::Instant>>,
@@ -164,6 +200,7 @@ impl ExitHandler {
             trade_event_recorder: TradeEventRecorder::new(pool.clone(), trade_event_tx),
             position_service,
             heartbeat,
+            passes_clean: std::sync::atomic::AtomicBool::new(true),
             balance_unreadable_since: Default::default(),
         }
     }
@@ -174,8 +211,12 @@ impl ExitHandler {
     }
 
     fn touch_heartbeat(&self) {
-        self.heartbeat
-            .store(Utc::now().timestamp(), Ordering::Relaxed);
+        let now = if self.passes_clean.load(Ordering::Relaxed) {
+            Utc::now().timestamp()
+        } else {
+            0
+        };
+        self.heartbeat.store(now, Ordering::Relaxed);
     }
 
     /// Main run loop with two tickers.
@@ -222,8 +263,13 @@ impl ExitHandler {
         exit_ticker.tick().await;
         resolution_ticker.tick().await;
 
+        // Whether the latest exit and resolution passes ran to their end. A
+        // pass that panicked clears the heartbeat until one runs cleanly, so
+        // the handler does not read as alive (and live entries wait).
+        let (mut exits_ok, mut resolutions_ok) = (true, true);
         loop {
-            // Update heartbeat to prove liveness
+            self.passes_clean
+                .store(exits_ok && resolutions_ok, Ordering::Relaxed);
             self.touch_heartbeat();
 
             tokio::select! {
@@ -233,14 +279,14 @@ impl ExitHandler {
                     if !cfg.enabled {
                         continue;
                     }
-                    crate::background::pass("exit handler", self.exit_pass(&cfg)).await;
+                    exits_ok = self.exit_pass(&cfg).await;
                 }
                 _ = resolution_ticker.tick() => {
                     // Settled whether or not exits are enabled: booking a
                     // resolved market sends no order, and an unsettled one
                     // keeps its exposure counted and its result from the
                     // circuit breaker.
-                    crate::background::pass("market resolutions", async {
+                    resolutions_ok = crate::background::pass("market resolutions", async {
                         if let Err(e) = self.check_market_resolutions().await {
                             error!(error = %e, "Failed to check market resolutions");
                         }
@@ -251,23 +297,44 @@ impl ExitHandler {
         }
     }
 
-    /// One pass over every position the exit handler moves.
-    async fn exit_pass(&self, cfg: &ExitHandlerConfig) {
-        if let Err(e) = self.evaluate_open_positions(cfg).await {
-            error!(error = %e, "Failed to evaluate open positions for exit");
-        }
-        if let Err(e) = self.process_failed_exits(cfg).await {
-            error!(error = %e, "Failed to process failed exits");
-        }
-        if let Err(e) = self.process_exit_ready().await {
-            error!(error = %e, "Failed to process exit-ready positions");
-        }
-        if let Err(e) = self.process_one_legged_recovery().await {
-            error!(error = %e, "Failed to process one-legged recovery");
-        }
-        if let Err(e) = self.process_orphan_inventory_recovery(cfg).await {
-            error!(error = %e, "Failed to process orphan inventory recovery");
-        }
+    /// One pass over every position the exit handler moves. Each step is
+    /// guarded on its own, so a step that panics does not keep the others
+    /// from running. Returns whether every step ran to its end.
+    async fn exit_pass(&self, cfg: &ExitHandlerConfig) -> bool {
+        use crate::background::pass;
+        let steps = [
+            pass("exit evaluation", async {
+                if let Err(e) = self.evaluate_open_positions(cfg).await {
+                    error!(error = %e, "Failed to evaluate open positions for exit");
+                }
+            })
+            .await,
+            pass("failed exits", async {
+                if let Err(e) = self.process_failed_exits(cfg).await {
+                    error!(error = %e, "Failed to process failed exits");
+                }
+            })
+            .await,
+            pass("exit-ready positions", async {
+                if let Err(e) = self.process_exit_ready().await {
+                    error!(error = %e, "Failed to process exit-ready positions");
+                }
+            })
+            .await,
+            pass("one-legged recovery", async {
+                if let Err(e) = self.process_one_legged_recovery().await {
+                    error!(error = %e, "Failed to process one-legged recovery");
+                }
+            })
+            .await,
+            pass("orphan inventory recovery", async {
+                if let Err(e) = self.process_orphan_inventory_recovery(cfg).await {
+                    error!(error = %e, "Failed to process orphan inventory recovery");
+                }
+            })
+            .await,
+        ];
+        steps.into_iter().all(|finished| finished)
     }
 
     /// Evaluate open ExitOnCorrection positions and promote exit-eligible ones.

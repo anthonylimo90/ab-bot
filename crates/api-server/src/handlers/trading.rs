@@ -992,11 +992,15 @@ fn manual_execution_error(error: anyhow::Error) -> ApiError {
         )
     } else if text.contains("live_submission_fence_busy") {
         ApiError::ServiceUnavailable(
-            "Another live order is still being submitted; nothing was sent, retry shortly".into(),
+            "Another live order is still being submitted; nothing was sent. Retry shortly \
+             with a new client_order_id (this one now names the refused attempt)"
+                .into(),
         )
     } else if text.contains("nothing was sent") {
         ApiError::ServiceUnavailable(
-            "The order could not be prepared in time; nothing was sent, retry shortly".into(),
+            "The order could not be prepared in time; nothing was sent. Retry shortly with a \
+             new client_order_id (this one now names the refused attempt)"
+                .into(),
         )
     } else if text.starts_with("Insufficient ") {
         // Our own balance/allowance preflight: amounts of the caller's wallet.
@@ -1033,6 +1037,8 @@ mod tests {
 
         let busy = map("live_submission_fence_busy: another live order is still being posted; nothing was sent");
         assert!(busy.to_string().contains("nothing was sent"));
+        // Its key now names the refused attempt: a retry needs a new one.
+        assert!(busy.to_string().contains("new client_order_id"));
         let late = map("Live order preparation exceeded its deadline; nothing was sent");
         assert!(late.to_string().contains("nothing was sent"));
         assert!(!late.to_string().contains("Another live order"));

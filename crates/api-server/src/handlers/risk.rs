@@ -228,6 +228,14 @@ pub async fn manual_trip_circuit_breaker(
         .circuit_breaker
         .manual_trip(Some("Manual trip from dashboard".to_string()))
         .await;
+    super::audit_change(
+        &state,
+        user_id,
+        ::auth::AuditAction::CircuitBreakerTripped,
+        "circuit_breaker",
+        serde_json::json!({ "manual": true }),
+    )
+    .await;
 
     let cb_state = state.circuit_breaker.state().await;
     let cb_config = state.circuit_breaker.config().await;
@@ -312,11 +320,14 @@ pub async fn update_circuit_breaker_config(
     let mut config = state.circuit_breaker.config().await;
 
     if let Some(v) = req.max_daily_loss {
-        if v < 0.0 {
-            return Err(ApiError::BadRequest("max_daily_loss must be >= 0".into()));
+        // The stored column is NUMERIC(20, 2).
+        if !(0.0..1e15).contains(&v) {
+            return Err(ApiError::BadRequest(
+                "max_daily_loss must be at least 0 and below 1e15".into(),
+            ));
         }
-        config.max_daily_loss =
-            Decimal::from_f64_retain(v).unwrap_or_else(|| Decimal::new(v as i64, 0));
+        config.max_daily_loss = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("max_daily_loss is not a number".into()))?;
     }
     if let Some(v) = req.max_drawdown_pct {
         if !(0.0..=1.0).contains(&v) {
@@ -324,8 +335,8 @@ pub async fn update_circuit_breaker_config(
                 "max_drawdown_pct must be between 0 and 1 (e.g., 0.20 for 20%)".into(),
             ));
         }
-        config.max_drawdown_pct =
-            Decimal::from_f64_retain(v).unwrap_or_else(|| Decimal::new((v * 100.0) as i64, 2));
+        config.max_drawdown_pct = Decimal::from_f64_retain(v)
+            .ok_or_else(|| ApiError::BadRequest("max_drawdown_pct is not a number".into()))?;
     }
     if let Some(v) = req.max_consecutive_losses {
         if v < 1 {
@@ -348,10 +359,8 @@ pub async fn update_circuit_breaker_config(
         config.enabled = v;
     }
 
-    // Hot-swap the in-memory config
-    state.circuit_breaker.update_config(config.clone()).await;
-
-    // Persist to workspace DB columns so config survives restarts
+    let previous = state.circuit_breaker.config().await;
+    // Stored first, then applied: a failed write changes nothing.
     sqlx::query(
         r#"
         UPDATE workspaces
@@ -372,6 +381,30 @@ pub async fn update_circuit_breaker_config(
     .bind(workspace_id)
     .execute(&state.pool)
     .await?;
+    state.circuit_breaker.update_config(config.clone()).await;
+    super::audit_change(
+        &state,
+        user_id,
+        ::auth::AuditAction::ConfigChange,
+        "circuit_breaker/config",
+        serde_json::json!({
+            "before": {
+                "max_daily_loss": previous.max_daily_loss,
+                "max_drawdown_pct": previous.max_drawdown_pct,
+                "max_consecutive_losses": previous.max_consecutive_losses,
+                "cooldown_minutes": previous.cooldown_minutes,
+                "enabled": previous.enabled,
+            },
+            "after": {
+                "max_daily_loss": config.max_daily_loss,
+                "max_drawdown_pct": config.max_drawdown_pct,
+                "max_consecutive_losses": config.max_consecutive_losses,
+                "cooldown_minutes": config.cooldown_minutes,
+                "enabled": config.enabled,
+            },
+        }),
+    )
+    .await;
 
     tracing::info!(
         workspace_id = %workspace_id,
@@ -417,7 +450,19 @@ pub async fn reset_circuit_breaker(
         ));
     }
 
+    let before = state.circuit_breaker.state().await;
     state.circuit_breaker.reset().await;
+    super::audit_change(
+        &state,
+        user_id,
+        ::auth::AuditAction::CircuitBreakerReset,
+        "circuit_breaker",
+        serde_json::json!({
+            "was_tripped": before.tripped,
+            "trip_reason": before.trip_reason.as_ref().map(trip_reason_to_string),
+        }),
+    )
+    .await;
 
     let cb_state = state.circuit_breaker.state().await;
     let cb_config = state.circuit_breaker.config().await;

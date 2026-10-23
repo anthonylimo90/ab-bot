@@ -480,7 +480,7 @@ The file vault replaces `VAULT_FILE_PATH` by writing a sibling file and renaming
 
 Apply the repository's migrations before starting the updated API. Migrations 069–072 add durable signed-order intents, exchange order identity/provenance, recovery of closed rows with explicit holdings, and persistent session revocation. Migration 068 now preserves unresolved positions instead of closing them by age. If a deployment already recorded the original 068 checksum, SQLx will require a reviewed migration-history repair; back up the database, reconcile the affected positions, and review migration 071 before accepting the revised checksum. Do not disable checksum validation globally.
 
-REST order placement requires a stable `client_order_id`; withdrawals require a stable `client_request_id`. Reuse the same key and original payload through retries, including lost responses. A changed payload requires a new intent. Private WebSocket clients must send `{"action":"authenticate","token":"<JWT>"}` as their first frame within five seconds; only orderbook-only streams remain public. Browser wallet orders also require a fresh wallet-signed ClobAuth proof, which the dashboard supplies.
+REST order placement requires a stable `client_order_id`; withdrawals require a stable `client_request_id`. Reuse the same key and original payload through retries, including lost responses. An order refused before it was sent (its error says nothing was sent) stays refused under its key: send it again under a new one. A changed payload requires a new intent. Private WebSocket clients must send `{"action":"authenticate","token":"<JWT>"}` as their first frame within five seconds; only orderbook-only streams remain public. Browser wallet orders also require a fresh wallet-signed ClobAuth proof, which the dashboard supplies.
 
 Stop all trading workers before changing the pinned signer. A permitted startup selection is saved to the workspace so later restarts recognize the same signer after positions are opened.
 
@@ -763,6 +763,9 @@ unsigned). Fees are set by the exchange when an order matches.
   refused, and the reconciler settles the rest (the position's link, a
   pending order row, and an entry that holds nothing, which fails):
   `UPDATE execution_intents SET status = 'rejected', updated_at = NOW() WHERE id = '<intent id>' AND status IN ('submitting','unknown','acknowledged');`
+  A manual order's row is closed in the same transaction, which releases
+  the cash it reserved:
+  `UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = '<intent id>' AND COALESCE(filled_quantity, 0) = 0;`
   An order that filled is never marked refused: stop the API, correct the
   position's held quantity, entry price and fees from the trades (bumping
   `version`), set the intent `reconciled` and its `position_order_links`
@@ -791,7 +794,8 @@ unsigned). Fees are set by the exchange when an order matches.
   of one wallet do not run at once: a sale waits for a refresh in flight.
   A token the wallet held none of at its last read, and that no position,
   manual holding or new transfer points at, is read again only hourly.
-- Orphan recovery never sells a token whose market or outcome is unknown,
+- Orphan recovery never sells a token whose market or outcome is unknown
+  (it stays counted among the inventory summary's orphans for an operator),
   nor one in a market where a position's tokens could not be looked up
   (they may be that position's shares), nor one matching manual inventory
   that awaits wallet verification (`wallet_address = 'unknown'`). An orphan
@@ -802,6 +806,21 @@ unsigned). Fees are set by the exchange when an order matches.
   shares and would read orphan, manual and unredeemed shares as a loss.
   The snapshot's 24-hour realized P&L leaves paper results out when
   trading live.
+- Live arb and quant entries are made only while the exit handler is
+  enabled (`EXIT_HANDLER_ENABLED`, or the workspace setting) and running:
+  it flattens a pair whose second leg failed and takes quant profits and
+  losses. An exit pass that panics holds its heartbeat at zero, so entries
+  wait until a pass runs cleanly. Paper entries are unaffected.
+- A quant entry is refused when the token's spread alone (its position is
+  marked at the best bid) would be half the stop-loss or more, or when the
+  token has no bids.
+- Manual holdings under one sellable lot (0.01 shares, left by rounded
+  sales) are not exposure and do not pin the trading wallet. Manual shares
+  redeemed or moved outside the bot stay recorded until an operator clears
+  them, after checking the wallet holds none:
+  `UPDATE manual_inventory SET quantity = 0, cost_basis = 0 WHERE wallet_address = '<wallet>' AND market_id = '<market>' AND outcome = '<yes|no>';`
+- The quant executor's per-strategy limits count only results of the mode
+  it trades in, and never a resolution win the wallet could not confirm.
 - A circuit breaker cooldown is at most a week (`cooldown_minutes` above
   10080 is refused; a larger configured value is held to a week).
 - A panic in one pass of a background task (order and withdrawal

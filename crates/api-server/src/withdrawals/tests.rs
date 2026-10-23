@@ -602,6 +602,21 @@ async fn a_safe_block_is_never_past_the_block_balances_are_read_at() {
     assert_eq!(client.safe_block_number().await.unwrap(), 72);
 }
 
+#[tokio::test]
+async fn a_balance_above_any_supply_is_refused_not_used() {
+    let chain = Arc::new(Mutex::new(Chain {
+        usdc_units: 5_000_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    assert_eq!(
+        client.get_cash_balances(TRADING).await.unwrap().usdc_units,
+        5_000_000
+    );
+    chain.lock().unwrap().usdc_units = u128::from(u64::MAX) + 1;
+    assert!(client.get_cash_balances(TRADING).await.is_err());
+}
+
 #[sqlx::test(migrations = false)]
 async fn a_used_nonce_fails_a_transfer_only_on_a_second_look_minutes_later(pool: PgPool) {
     let (user, workspace) = setup(&pool).await;

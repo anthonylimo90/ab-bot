@@ -238,7 +238,8 @@ impl DynamicTuner {
         self.persist_runtime_state("started", "dynamic tuner started", None)
             .await;
 
-        let mut ticker = interval(TokioDuration::from_secs(self.config.interval_secs));
+        // A zero period (from the environment) would panic the ticker.
+        let mut ticker = interval(TokioDuration::from_secs(self.config.interval_secs.max(1)));
         // tokio::time::interval ticks immediately once; consume it so the next
         // tick aligns with the configured interval after the initial cycle.
         ticker.tick().await;

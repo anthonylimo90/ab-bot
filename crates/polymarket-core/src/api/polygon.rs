@@ -821,6 +821,14 @@ impl PolygonClient {
                     status: None,
                 }
             })?;
+        // More than any token's supply: a broken answer, not a balance.
+        // Refused, so nothing sizes a withdrawal or an equity figure on it.
+        if balance > u128::from(u64::MAX) {
+            return Err(Error::Api {
+                message: format!("Implausible token balance {balance} from the node"),
+                status: None,
+            });
+        }
 
         Ok(balance)
     }

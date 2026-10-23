@@ -1309,6 +1309,8 @@ impl OrderExecutor {
                 OrderType::Fok,
                 if order.completes_pair {
                     submission::PAIR_FENCE_WAIT
+                        .min(std::time::Duration::from_millis(self.config.timeout_ms))
+                        .max(submission::FENCE_WAIT)
                 } else {
                     submission::FENCE_WAIT
                 },

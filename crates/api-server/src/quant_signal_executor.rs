@@ -373,9 +373,18 @@ struct QuantSignalExecutor {
     /// UTC date when processed_strategy_outcomes was last cleared.
     processed_outcomes_date: chrono::NaiveDate,
     heartbeat: Arc<AtomicI64>,
+    /// When set, live positions are entered only while the exit handler can
+    /// take their profit, stop their loss and end their hold.
+    exit_readiness: Option<crate::exit_handler::ExitReadiness>,
 }
 
 impl QuantSignalExecutor {
+    /// Enter live positions only while `readiness` allows (see the field).
+    fn with_exit_readiness(mut self, readiness: crate::exit_handler::ExitReadiness) -> Self {
+        self.exit_readiness = Some(readiness);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: Arc<RwLock<QuantSignalExecutorConfig>>,
@@ -417,6 +426,7 @@ impl QuantSignalExecutor {
             processed_strategy_outcomes: HashSet::new(),
             processed_outcomes_date: Utc::now().date_naive(),
             heartbeat,
+            exit_readiness: None,
         }
     }
 
@@ -476,9 +486,13 @@ impl QuantSignalExecutor {
                 result = self.signal_rx.recv() => {
                     match result {
                         Ok(signal) => {
-                            if let Err(e) = self.process_signal(signal).await {
-                                error!(error = %e, "Quant signal processing failed");
-                            }
+                            // A panic on one signal does not stop the executor.
+                            crate::background::pass("quant executor", async {
+                                if let Err(e) = self.process_signal(signal).await {
+                                    error!(error = %e, "Quant signal processing failed");
+                                }
+                            })
+                            .await;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             warn!(skipped = n, "Quant executor lagged, skipped signals");
@@ -516,6 +530,10 @@ impl QuantSignalExecutor {
             today.and_hms_opt(0, 0, 0).expect("valid midnight"),
             Utc,
         );
+        let cfg = self.snapshot_config().await;
+        let execution_mode = self.execution_mode(&cfg).await;
+        // As the main breaker counts them: only the mode being traded, and
+        // never a win a resolution close could not confirm in the wallet.
         let rows: Vec<QuantOutcomeRow> = match sqlx::query_as(
             r#"
             SELECT
@@ -528,10 +546,17 @@ impl QuantSignalExecutor {
               AND p.state = 4
               AND p.realized_pnl IS NOT NULL
               AND p.exit_timestamp >= $1
+              AND p.execution_mode = $2
+              AND NOT (p.realized_pnl > 0 AND EXISTS (
+                  SELECT 1 FROM trade_events te
+                  WHERE te.position_id = p.id
+                    AND te.event_type = 'closed_via_resolution'
+                    AND te.metadata ? 'unmeasured'))
             ORDER BY p.exit_timestamp ASC
             "#,
         )
         .bind(today_start)
+        .bind(execution_mode)
         .fetch_all(&self.pool)
         .await
         {
@@ -542,7 +567,6 @@ impl QuantSignalExecutor {
             }
         };
 
-        let cfg = self.snapshot_config().await;
         for row in rows {
             if !self.processed_strategy_outcomes.insert(row.position_id) {
                 continue;
@@ -823,6 +847,26 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
+        // Step 7a: a live position needs the exit handler for its exits.
+        if execution_mode == "live" {
+            if let Some(reason) = match &self.exit_readiness {
+                Some(readiness) => readiness.refusal().await,
+                None => None,
+            } {
+                warn!(signal_id = %signal.id, reason, "Exit handler not available, skipping live quant entry");
+                self.update_signal_status(signal.id, "skipped", Some(reason))
+                    .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some(reason),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Step 8: Resolve token IDs from OutcomeTokenCache
         let (yes_token_id, no_token_id) = match self.token_cache.get(&signal.condition_id).await {
             Some(tokens) => tokens,
@@ -971,6 +1015,24 @@ impl QuantSignalExecutor {
             )
             .await;
             return Ok(());
+        }
+
+        // Step 10c: a position is marked at the bid, so one bought across a
+        // spread wide enough would read as a loss at once and be stopped out.
+        if let Some(readiness) = &self.exit_readiness {
+            if let Some(reason) = spread_rejection(&book, readiness.quant_stop_loss().await) {
+                debug!(signal_id = %signal.id, reason, "Spread too wide for the stop-loss, skipping");
+                self.update_signal_status(signal.id, "skipped", Some(reason))
+                    .await;
+                self.record_signal_outcome_event(
+                    &signal,
+                    &execution_mode,
+                    "signal_skipped",
+                    Some(reason),
+                )
+                .await;
+                return Ok(());
+            }
         }
 
         // Step 11: Confidence-weighted sizing
@@ -1552,6 +1614,7 @@ pub fn spawn_quant_signal_executor(
     token_cache: Arc<OutcomeTokenCache>,
     pool: PgPool,
     heartbeat: Arc<AtomicI64>,
+    exit_readiness: crate::exit_handler::ExitReadiness,
 ) {
     let executor = QuantSignalExecutor::new(
         config,
@@ -1563,7 +1626,8 @@ pub fn spawn_quant_signal_executor(
         token_cache,
         pool,
         heartbeat,
-    );
+    )
+    .with_exit_readiness(exit_readiness);
 
     tokio::spawn(async move {
         executor.run().await;
@@ -1666,6 +1730,17 @@ fn reference_rejection(
         return Some("price_drifted");
     }
     None
+}
+
+/// Why a buy at the best ask of `book` must not be made under `stop_loss`
+/// (a fraction of cost), or `None`: marked at the best bid it would already
+/// have lost half the stop-loss or more, or nothing could sell it.
+fn spread_rejection(book: &OrderBook, stop_loss: Decimal) -> Option<&'static str> {
+    let ask = book.best_ask().filter(|ask| *ask > Decimal::ZERO)?;
+    let Some(bid) = book.best_bid() else {
+        return Some("no_bids");
+    };
+    ((ask - bid) / ask * Decimal::TWO >= stop_loss).then_some("spread_too_wide")
 }
 
 fn expected_edge_from_signal(signal: &QuantSignal) -> Option<Decimal> {
@@ -1802,6 +1877,31 @@ mod tests {
             bids: bid.map(level).into_iter().collect(),
             asks: vec![level(ask)],
         }
+    }
+
+    #[test]
+    fn a_spread_that_would_stop_the_position_out_refuses_the_entry() {
+        let stop_loss = Decimal::new(10, 2);
+        // One tick at 0.10 is a 10% loss marked at the bid.
+        assert_eq!(
+            spread_rejection(&quoted_book(Some(9), 10), stop_loss),
+            Some("spread_too_wide")
+        );
+        // Three cents at 0.50 is 6%, more than half the stop.
+        assert_eq!(
+            spread_rejection(&quoted_book(Some(47), 50), stop_loss),
+            Some("spread_too_wide")
+        );
+        // One cent at 0.50 is 2%.
+        assert_eq!(
+            spread_rejection(&quoted_book(Some(49), 50), stop_loss),
+            None
+        );
+        // Nothing could sell it.
+        assert_eq!(
+            spread_rejection(&quoted_book(None, 50), stop_loss),
+            Some("no_bids")
+        );
     }
 
     fn referenced_signal(

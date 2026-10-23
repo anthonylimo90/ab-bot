@@ -52,7 +52,9 @@ fn get_opt_smallint(r: &sqlx::postgres::PgRow, col: &str) -> Option<i16> {
         .unwrap_or_else(|_| r.get::<Option<i32>, _>(col).map(|v| v as i16))
 }
 
-// Explicit holdings remain exposure in every lifecycle state. Pending entries
+// Explicit holdings remain exposure in every lifecycle state, but manual
+// holdings under one sellable lot (0.01 shares) are dust left by rounded
+// sales: they can never be sold. Pending entries
 // reserve their full requested cost, including their not-yet-filled legs.
 // Unresolved buys with neither a link nor an order row count too, but only
 // the engine's own (signed without an expiry): a browser-wallet order spends
@@ -67,7 +69,7 @@ SELECT COALESCE((SELECT SUM(CASE WHEN state=0 THEN GREATEST(
  FROM positions WHERE state=0 OR held_yes_qty>0 OR held_no_qty>0),0)
  + COALESCE((SELECT SUM(GREATEST(quantity-filled_quantity,0)*COALESCE(price,1))
  FROM orders WHERE side='buy' AND status IN ('pending','open','partially_filled')),0)
- + COALESCE((SELECT SUM(cost_basis) FROM manual_inventory),0)
+ + COALESCE((SELECT SUM(cost_basis) FROM manual_inventory WHERE quantity >= 0.01),0)
  + COALESCE((SELECT SUM((signed_order->>'makerAmount')::numeric/1000000)
  FROM execution_intents WHERE status IN ('submitting','unknown') AND signed_order->>'side'='BUY'
  AND COALESCE(NULLIF(signed_order->>'expiration',''),'0')='0'

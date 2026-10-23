@@ -396,6 +396,17 @@ impl ApiServer {
             state.arb_entry_tx.clone(),
         );
 
+        // The exit handler's config, shared with the entry executors: a live
+        // entry waits while the handler is off or not running.
+        let exit_handler_config = state
+            .exit_handler_config
+            .clone()
+            .unwrap_or_else(|| Arc::new(RwLock::new(ExitHandlerConfig::from_env())));
+        let exit_readiness = crate::exit_handler::ExitReadiness::new(
+            exit_handler_config.clone(),
+            state.exit_handler_heartbeat.clone(),
+        );
+
         // Spawn arb auto-executor unconditionally (per-signal guard checks enabled).
         // It and the exit handler share the one market catalog.
         spawn_arb_auto_executor(
@@ -409,14 +420,12 @@ impl ApiServer {
             state.pool.clone(),
             state.arb_executor_heartbeat.clone(),
             state.arb_executor_status.clone(),
+            exit_readiness.clone(),
         );
 
         // Spawn exit handler unconditionally (per-tick guard checks enabled)
         spawn_exit_handler(
-            state
-                .exit_handler_config
-                .clone()
-                .unwrap_or_else(|| Arc::new(RwLock::new(ExitHandlerConfig::from_env()))),
+            exit_handler_config,
             state.order_executor.clone(),
             state.circuit_breaker.clone(),
             state.clob_client.clone(),
@@ -479,6 +488,7 @@ impl ApiServer {
             state.market_catalog.clone(),
             state.pool.clone(),
             state.quant_executor_heartbeat.clone(),
+            exit_readiness,
         );
 
         // Signal generators — each polls feature tables and emits QuantSignal

@@ -14,7 +14,7 @@ async fn setup(pool: &PgPool) {
         held_yes_qty NUMERIC DEFAULT 0, held_no_qty NUMERIC DEFAULT 0, exited_yes_qty NUMERIC, exited_no_qty NUMERIC,
         resolution_winner TEXT, is_open BOOLEAN, opened_at TIMESTAMPTZ, source SMALLINT, source_signal_id UUID
     ); CREATE TABLE orders (quantity NUMERIC,filled_quantity NUMERIC,price NUMERIC,side TEXT,status TEXT,id UUID DEFAULT gen_random_uuid())").await.unwrap();
-    pool.execute("CREATE TABLE manual_inventory(cost_basis NUMERIC)")
+    pool.execute("CREATE TABLE manual_inventory(cost_basis NUMERIC, quantity NUMERIC)")
         .await
         .unwrap();
     pool.execute(include_str!(
@@ -34,11 +34,13 @@ async fn exposure_includes_failed_stalled_closed_holdings_and_pending_reservatio
     setup(&pool).await;
     pool.execute("INSERT INTO positions (state,held_yes_qty,held_no_qty,yes_entry_price,no_entry_price,quantity) VALUES
         (6,10,0,0.4,0,100),(7,0,5,0,0.6,100),(4,2,0,0.5,0,100),(0,1,0,0.4,0.5,10),(5,3,0,0.5,0,100);
-        INSERT INTO orders(quantity,filled_quantity,price,side,status) VALUES (10,4,0.5,'buy','partially_filled')").await.unwrap();
+        INSERT INTO orders(quantity,filled_quantity,price,side,status) VALUES (10,4,0.5,'buy','partially_filled');
+        INSERT INTO manual_inventory VALUES (2, 4), (0.003, 0.005)").await.unwrap();
     let repo = PositionRepository::new(pool.clone());
+    // Manual holdings count, but not the dust a rounded sale leaves.
     assert_eq!(
         repo.get_total_active_exposure().await.unwrap(),
-        Decimal::new(215, 1)
+        Decimal::new(235, 1)
     );
     assert!(repo.has_active_in_market("market").await.unwrap());
     pool.execute("DROP TABLE orders").await.unwrap();

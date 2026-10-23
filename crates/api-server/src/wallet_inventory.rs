@@ -555,14 +555,6 @@ pub async fn recover_wallet_orphan_inventory(
     if !acquired {
         return Ok(OrphanRecoveryResult::default());
     }
-    // A refresh in flight read the balances before these sales; writing them
-    // back after would restore the sold shares' cost basis. Let it finish
-    // first, and keep the next one waiting until the sales are recorded.
-    let refresh_idle: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('wallet-inventory-refresh'),hashtext(LOWER($1)))")
-        .bind(wallet_address).fetch_one(&mut *recovery_fence).await?;
-    if !refresh_idle {
-        return Ok(OrphanRecoveryResult::default());
-    }
     let observed = refresh::status(pool, wallet_address).await?;
     let freshness = WalletInventoryConfig::from_env()
         .interval_secs
@@ -577,170 +569,250 @@ pub async fn recover_wallet_orphan_inventory(
         "Inventory must complete a successful refresh before orphan recovery"
     );
     let repo = WalletInventoryRepository::new(pool.clone());
-    let entries = repo
+    let tokens: Vec<String> = repo
         .get_recoverable_orphans(wallet_address, retry_backoff_secs)
-        .await?;
+        .await?
+        .into_iter()
+        .map(|entry| entry.token_id)
+        .collect();
 
     let mut result = OrphanRecoveryResult::default();
-    for entry in entries {
-        let Some(market_id) = entry.condition_id.clone() else {
-            repo.record_recovery_attempt(
-                wallet_address,
-                &entry.token_id,
-                Some("missing condition_id for orphan inventory"),
-            )
-            .await?;
-            continue;
+    for token_id in tokens {
+        // Each sale holds the refresh lock from before its order until its
+        // disposal is recorded: a refresh in flight read the balances before
+        // the sale, and writing them back after would restore the sold
+        // shares and their cost basis. A refresh waits only for this sale.
+        let mut sale_fence = pool.begin().await?;
+        let refresh_idle: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('wallet-inventory-refresh'),hashtext(LOWER($1)))")
+            .bind(wallet_address).fetch_one(&mut *sale_fence).await?;
+        if !refresh_idle {
+            break;
+        }
+        let sale = sell_orphan(
+            &repo,
+            order_executor,
+            clob_client,
+            wallet_address,
+            retry_backoff_secs,
+            &token_id,
+            &mut result,
+        )
+        .await;
+        // Released before the next sale's lock is taken.
+        sale_fence.rollback().await?;
+        let (entry, market_id, report, _operation) = match sale? {
+            OrphanSale::Stop => break,
+            OrphanSale::Skipped => continue,
+            OrphanSale::Sold(sold) => {
+                let OrphanSold {
+                    entry,
+                    market_id,
+                    report,
+                    operation,
+                } = *sold;
+                (entry, market_id, report, operation)
+            }
         };
+        result.succeeded += 1;
 
-        if polymarket_core::types::sellable_shares(entry.quantity) <= Decimal::ZERO {
-            continue;
+        // The taker fee as the market charges it; terms that cannot be read
+        // are taken at the highest published rate, which never understates
+        // a loss.
+        let fee_terms = match clob_client.get_fee_schedule(&market_id).await {
+            Ok(terms) => terms,
+            Err(error) => {
+                warn!(%market_id, %error, "Could not read the market's fee terms; an orphan sale's fee is taken at the highest rate");
+                polymarket_core::types::FeeSchedule::CONSERVATIVE
+            }
+        };
+        let fee = report.filled_quantity * fee_terms.fee_per_share(report.average_price);
+        // A partial fill only disposes of its share of the cost basis.
+        let realized_pnl = entry.cost_basis.and_then(|cost_basis| {
+            (entry.quantity > Decimal::ZERO).then(|| {
+                let filled = report.filled_quantity.min(entry.quantity);
+                report.total_value() - fee - cost_basis * filled / entry.quantity
+            })
+        });
+
+        if let Some(recorder) = trade_event_recorder {
+            recorder
+                .record_warn(
+                    NewTradeEvent::new(
+                        "inventory_recovery",
+                        if order_executor.is_live() {
+                            "live"
+                        } else {
+                            "paper"
+                        },
+                        "inventory",
+                        market_id.clone(),
+                        "orphan_inventory_exit_filled",
+                    )
+                    .with_position(None)
+                    .with_reason(Some(format!(
+                        "Recovered orphan inventory token {}",
+                        entry.token_id
+                    )))
+                    .with_fill(report.average_price, report.total_value())
+                    .with_realized_pnl(realized_pnl)
+                    .with_metadata(serde_json::json!({
+                        "token_id": entry.token_id,
+                        "wallet_address": wallet_address,
+                        "quantity": entry.quantity,
+                        "recovery_status": entry.recovery_status,
+                    })),
+                )
+                .await;
         }
 
-        let Some(_operation) = order_executor.begin_operation() else {
-            break;
-        };
-        result.attempted += 1;
+        if let (Some(cb), Some(realized_pnl)) = (circuit_breaker, realized_pnl) {
+            let _ = cb.record_trade(realized_pnl).await;
+        }
 
-        let expected_price = match load_expected_sell_price(clob_client, &entry.token_id).await {
-            Ok(Some(price)) => price,
-            Ok(None) => {
-                repo.record_recovery_attempt(
-                    wallet_address,
-                    &entry.token_id,
-                    Some("no bids available for orphan inventory exit"),
-                )
-                .await?;
-                continue;
-            }
-            Err(error) => {
-                repo.record_recovery_attempt(
-                    wallet_address,
-                    &entry.token_id,
-                    Some(&format!("failed to load orphan exit orderbook: {error}")),
-                )
-                .await?;
-                continue;
-            }
-        };
-
-        let order = MarketOrder::new(
-            market_id.clone(),
-            entry.token_id.clone(),
-            OrderSide::Sell,
-            polymarket_core::types::sellable_shares(entry.quantity),
-        )
-        .with_expected_price(expected_price)
-        .with_slippage(order_executor.default_slippage());
-
-        match order_executor
-            .execute_reserved_market_order(order, "live", Some(wallet_address))
-            .await
-        {
-            Ok(report) if report.is_success() => {
-                repo.record_recovery_attempt(wallet_address, &entry.token_id, None)
-                    .await?;
-                repo.record_disposal(
-                    wallet_address,
-                    &entry.token_id,
-                    report.filled_quantity.min(entry.quantity),
-                )
-                .await?;
-                result.succeeded += 1;
-
-                // The taker fee as the market charges it; terms that cannot
-                // be read are taken at the highest published rate, which
-                // never understates a loss.
-                let fee_terms = match clob_client.get_fee_schedule(&market_id).await {
-                    Ok(terms) => terms,
-                    Err(error) => {
-                        warn!(%market_id, %error, "Could not read the market's fee terms; an orphan sale's fee is taken at the highest rate");
-                        polymarket_core::types::FeeSchedule::CONSERVATIVE
-                    }
-                };
-                let fee = report.filled_quantity * fee_terms.fee_per_share(report.average_price);
-                // A partial fill only disposes of its share of the cost basis.
-                let realized_pnl = entry.cost_basis.and_then(|cost_basis| {
-                    (entry.quantity > Decimal::ZERO).then(|| {
-                        let filled = report.filled_quantity.min(entry.quantity);
-                        report.total_value() - fee - cost_basis * filled / entry.quantity
-                    })
-                });
-
-                if let Some(recorder) = trade_event_recorder {
-                    recorder
-                        .record_warn(
-                            NewTradeEvent::new(
-                                "inventory_recovery",
-                                if order_executor.is_live() {
-                                    "live"
-                                } else {
-                                    "paper"
-                                },
-                                "inventory",
-                                market_id.clone(),
-                                "orphan_inventory_exit_filled",
-                            )
-                            .with_position(None)
-                            .with_reason(Some(format!(
-                                "Recovered orphan inventory token {}",
-                                entry.token_id
-                            )))
-                            .with_fill(report.average_price, report.total_value())
-                            .with_realized_pnl(realized_pnl)
-                            .with_metadata(serde_json::json!({
-                                "token_id": entry.token_id,
-                                "wallet_address": wallet_address,
-                                "quantity": entry.quantity,
-                                "recovery_status": entry.recovery_status,
-                            })),
-                        )
-                        .await;
-                }
-
-                if let (Some(cb), Some(realized_pnl)) = (circuit_breaker, realized_pnl) {
-                    let _ = cb.record_trade(realized_pnl).await;
-                }
-
-                if let Some(tx) = signal_tx {
-                    let _ = tx.send(SignalUpdate {
-                        signal_id: Uuid::new_v4(),
-                        signal_type: SignalType::Alert,
-                        market_id: market_id.clone(),
-                        outcome_id: entry
-                            .outcome
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        action: "orphan_inventory_recovered".to_string(),
-                        confidence: 1.0,
-                        timestamp: Utc::now(),
-                        metadata: serde_json::json!({
-                            "token_id": entry.token_id,
-                            "wallet_address": wallet_address,
-                            "quantity": entry.quantity,
-                        }),
-                    });
-                }
-            }
-            Ok(report) => {
-                let message = report
-                    .error_message
-                    .unwrap_or_else(|| "orphan inventory exit rejected".to_string());
-                repo.record_recovery_attempt(wallet_address, &entry.token_id, Some(&message))
-                    .await?;
-            }
-            Err(error) => {
-                repo.record_recovery_attempt(
-                    wallet_address,
-                    &entry.token_id,
-                    Some(&format!("orphan inventory exit failed: {error}")),
-                )
-                .await?;
-            }
+        if let Some(tx) = signal_tx {
+            let _ = tx.send(SignalUpdate {
+                signal_id: Uuid::new_v4(),
+                signal_type: SignalType::Alert,
+                market_id: market_id.clone(),
+                outcome_id: entry
+                    .outcome
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                action: "orphan_inventory_recovered".to_string(),
+                confidence: 1.0,
+                timestamp: Utc::now(),
+                metadata: serde_json::json!({
+                    "token_id": entry.token_id,
+                    "wallet_address": wallet_address,
+                    "quantity": entry.quantity,
+                }),
+            });
         }
     }
 
     Ok(result)
+}
+
+/// What one orphan sale came to.
+enum OrphanSale {
+    /// Shutdown has begun: no further sale starts.
+    Stop,
+    /// Nothing was sold (the attempt, if any, is recorded).
+    Skipped,
+    /// Sold and recorded.
+    Sold(Box<OrphanSold>),
+}
+
+/// A recorded orphan sale; the operation stays open for its bookkeeping.
+struct OrphanSold {
+    entry: WalletInventoryEntry,
+    market_id: String,
+    report: polymarket_core::types::ExecutionReport,
+    operation: trading_engine::executor::TradingOperation,
+}
+
+/// Sell the orphan `token_id` if it is still recoverable, recording the
+/// attempt and, on a fill, the disposal. The caller holds the refresh lock.
+async fn sell_orphan(
+    repo: &WalletInventoryRepository,
+    order_executor: &OrderExecutor,
+    clob_client: &ClobClient,
+    wallet_address: &str,
+    retry_backoff_secs: u64,
+    token_id: &str,
+    result: &mut OrphanRecoveryResult,
+) -> anyhow::Result<OrphanSale> {
+    // Read again under the lock: a refresh since the list was read may have
+    // changed the token's balance or found its owner.
+    let Some(entry) = repo
+        .get_recoverable_orphans(wallet_address, retry_backoff_secs)
+        .await?
+        .into_iter()
+        .find(|entry| entry.token_id == token_id)
+    else {
+        return Ok(OrphanSale::Skipped);
+    };
+    // Recoverable orphans always name their market.
+    let Some(market_id) = entry.condition_id.clone() else {
+        return Ok(OrphanSale::Skipped);
+    };
+    if polymarket_core::types::sellable_shares(entry.quantity) <= Decimal::ZERO {
+        return Ok(OrphanSale::Skipped);
+    }
+    let Some(operation) = order_executor.begin_operation() else {
+        return Ok(OrphanSale::Stop);
+    };
+    result.attempted += 1;
+
+    let expected_price = match load_expected_sell_price(clob_client, &entry.token_id).await {
+        Ok(Some(price)) => price,
+        Ok(None) => {
+            repo.record_recovery_attempt(
+                wallet_address,
+                &entry.token_id,
+                Some("no bids available for orphan inventory exit"),
+            )
+            .await?;
+            return Ok(OrphanSale::Skipped);
+        }
+        Err(error) => {
+            repo.record_recovery_attempt(
+                wallet_address,
+                &entry.token_id,
+                Some(&format!("failed to load orphan exit orderbook: {error}")),
+            )
+            .await?;
+            return Ok(OrphanSale::Skipped);
+        }
+    };
+
+    let order = MarketOrder::new(
+        market_id.clone(),
+        entry.token_id.clone(),
+        OrderSide::Sell,
+        polymarket_core::types::sellable_shares(entry.quantity),
+    )
+    .with_expected_price(expected_price)
+    .with_slippage(order_executor.default_slippage());
+
+    match order_executor
+        .execute_reserved_market_order(order, "live", Some(wallet_address))
+        .await
+    {
+        Ok(report) if report.is_success() => {
+            repo.record_recovery_attempt(wallet_address, &entry.token_id, None)
+                .await?;
+            repo.record_disposal(
+                wallet_address,
+                &entry.token_id,
+                report.filled_quantity.min(entry.quantity),
+            )
+            .await?;
+            Ok(OrphanSale::Sold(Box::new(OrphanSold {
+                entry,
+                market_id,
+                report,
+                operation,
+            })))
+        }
+        Ok(report) => {
+            let message = report
+                .error_message
+                .unwrap_or_else(|| "orphan inventory exit rejected".to_string());
+            repo.record_recovery_attempt(wallet_address, &entry.token_id, Some(&message))
+                .await?;
+            Ok(OrphanSale::Skipped)
+        }
+        Err(error) => {
+            repo.record_recovery_attempt(
+                wallet_address,
+                &entry.token_id,
+                Some(&format!("orphan inventory exit failed: {error}")),
+            )
+            .await?;
+            Ok(OrphanSale::Skipped)
+        }
+    }
 }
 
 trait NewTradeEventExt {

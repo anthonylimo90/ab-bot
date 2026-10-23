@@ -679,7 +679,8 @@ impl ClobClient {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(10_u64);
-        let mut ping_tick = tokio::time::interval(StdDuration::from_secs(ping_interval_secs));
+        let mut ping_tick =
+            tokio::time::interval(StdDuration::from_secs(ping_interval_secs.max(1)));
         // After an overrun, wait a full period instead of catching up.
         ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping_tick.tick().await;

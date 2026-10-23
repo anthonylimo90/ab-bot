@@ -198,7 +198,10 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         let manual = intent.has_order;
         let age = Utc::now() - intent.created_at;
         if let Err(error) = reconcile_one(state, intent).await {
-            let stuck = fencing || holds_position || (manual && error.to_string() != ORDER_RESTING);
+            // A manual order found resting was just resolved (it no longer
+            // fences the wallet): it is waiting, not stuck.
+            let resting_manual = manual && !holds_position && error.to_string() == ORDER_RESTING;
+            let stuck = (fencing || holds_position || manual) && !resting_manual;
             if stuck && age > Duration::minutes(FENCE_ALERT_MINUTES) && fence_alert_due(id) {
                 tracing::warn!(
                     intent_id = %id,

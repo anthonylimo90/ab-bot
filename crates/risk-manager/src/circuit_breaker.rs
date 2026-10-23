@@ -333,7 +333,10 @@ impl CircuitBreaker {
     /// recovery when enabled); recovery stages advance as their time comes.
     pub async fn can_trade(&self) -> bool {
         if !self.config.read().await.enabled {
-            return true;
+            // Switching the breaker off stops its limits, not a latch the
+            // hard kill or an operator set: only a reset lifts that.
+            let state = self.state.read().await;
+            return !(state.tripped && state.trip_reason.as_ref().is_some_and(latches));
         }
 
         if self.is_tripped.load(Ordering::SeqCst) {
@@ -1100,6 +1103,18 @@ mod tests {
         // Should not trip when disabled
         breaker.record_trade(Decimal::new(-1000, 0)).await.unwrap();
         assert!(!breaker.is_tripped());
+        assert!(breaker.can_trade().await);
+    }
+
+    #[tokio::test]
+    async fn switching_the_breaker_off_does_not_lift_a_latch() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
+        breaker.manual_trip(None).await;
+        let mut config = breaker.config().await;
+        config.enabled = false;
+        breaker.update_config(config).await;
+        assert!(!breaker.can_trade().await);
+        breaker.reset().await;
         assert!(breaker.can_trade().await);
     }
 
