@@ -877,6 +877,34 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn a_follower_resumes_only_with_the_leader(pool: PgPool) {
+        use rust_decimal::Decimal;
+        create_schema(&pool).await;
+        create_positions(&pool).await;
+        let leader = crate::CircuitBreaker::with_persistence(config(), pool.clone());
+        leader.lead().await.unwrap();
+        for _ in 0..3 {
+            leader.record_trade(Decimal::from(-5)).await.unwrap();
+        }
+        assert!(leader.is_tripped());
+        // The stored cooldown is over, but the leader has not resumed: a
+        // follower stays tripped (it used to resume on its own).
+        sqlx::query(
+            "UPDATE circuit_breaker_state SET resume_at = NOW() - INTERVAL '1 minute' WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let follower = crate::CircuitBreaker::with_persistence(config(), pool.clone()).following();
+        assert!(!follower.can_trade().await);
+        assert!(follower.is_tripped());
+        // Once the leader resumes (here a reset), the follower follows.
+        leader.reset().await.unwrap();
+        let later = crate::CircuitBreaker::with_persistence(config(), pool.clone()).following();
+        assert!(later.can_trade().await);
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn a_trip_made_through_a_follower_is_adopted_not_overwritten(pool: PgPool) {
         use crate::CircuitBreaker;
         use rust_decimal::Decimal;

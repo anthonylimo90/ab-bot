@@ -614,8 +614,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   at once (without draining, mid-shutdown too), so a restart waits its turn.
 - Recovery runs only on the trading process (503 elsewhere).
 - The first deploy of this change still overlaps: the outgoing version does
-  not take the lock. Trip the breaker before that deploy if no trade may run
-  on two processes at once.
+  not take the lock. Stop the outgoing API before the new one starts if no
+  trade may run on two processes at once (a trip stops entries, not exits).
+  While both run, each one's breaker saves overwrite the other's counters,
+  and the new leader's breaker does not see the losses the outgoing process
+  books after the new one took over (until the next takeover's replay).
 
 ### Operator controls on every process; exits that do not get out
 
@@ -968,7 +971,15 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   takeover (a retried one included) counts them again. A close that earlier
   version booked without saving it is not counted. A hand edit of the row
   (anything but this version's code moving `updated_at`) is read the same
-  way: the next claim marks rather than counts the closes left unmarked.
+  way: the next claim marks rather than counts the closes left unmarked,
+  a close this version counted but had not stored when its process died
+  included. Stop this version gracefully before rolling back (it stores
+  what it owes as it stops).
+- A process taking over trading saves nothing until it has read the stored
+  state (a takeover retried after a failed read could save its earlier view
+  over it). A process that does not lead resumes after a trip's cooldown,
+  and advances recovery stages, only when the leader has stored it: on its
+  own it could resume while the leader stays tripped.
 - The bound of 20 wallet orders awaiting a signature per user now holds
   for requests made at once (checked again under a per-user lock as the
   order is stored).

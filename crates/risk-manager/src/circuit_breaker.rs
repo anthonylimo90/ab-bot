@@ -392,16 +392,25 @@ impl CircuitBreaker {
     /// claim comes first: a save the previous leader still has in flight is
     /// refused from then on, so what is read is what it left.
     pub async fn lead(&self) -> Result<bool> {
+        // Leader only once the stored state is loaded: until then a sync
+        // must not save this process's own view (a follower's last read, or
+        // what a failed load left) over the stored one.
+        self.leader.store(false, Ordering::SeqCst);
         if let Some(repo) = &self.repo {
             self.leader_epoch
                 .store(repo.claim_leadership().await?, Ordering::SeqCst);
         }
-        self.leader.store(true, Ordering::SeqCst);
+        let mut state = self.state.write().await;
         self.leader_holds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.load_state().await
+        let loaded = self.load_into(&mut state).await?;
+        self.leader.store(true, Ordering::SeqCst);
+        if loaded {
+            self.persist_state(&mut state).await;
+        }
+        Ok(loaded)
     }
 
     /// Bring this process's view up to date with the stored state, at most
@@ -450,6 +459,10 @@ impl CircuitBreaker {
             let mut loaded = stored.state;
             loaded.roll_daily_counters(Utc::now().date_naive());
             let mut state = self.state.write().await;
+            // Took the lead meanwhile: its own state is the one kept now.
+            if self.is_leader() {
+                return Ok(());
+            }
             self.is_tripped.store(loaded.tripped, Ordering::SeqCst);
             *state = loaded;
             self.operator_epoch
@@ -467,24 +480,29 @@ impl CircuitBreaker {
     /// The persisted trip, latch, drawdown references and recovery stage are
     /// always restored; a new UTC day only clears the per-day counters.
     pub async fn load_state(&self) -> Result<bool> {
-        let repo = match &self.repo {
-            Some(r) => r,
-            None => {
-                warn!("Cannot load state: no database connection configured");
-                return Ok(false);
-            }
+        let mut state = self.state.write().await;
+        let loaded = self.load_into(&mut state).await?;
+        if loaded {
+            self.persist_state(&mut state).await;
+        }
+        Ok(loaded)
+    }
+
+    /// Replace `state` with the stored state; returns whether there was one.
+    async fn load_into(&self, state: &mut CircuitBreakerState) -> Result<bool> {
+        let Some(repo) = &self.repo else {
+            warn!("Cannot load state: no database connection configured");
+            return Ok(false);
         };
 
         // The stored holds were the previous leader's: this one's own are
-        // stored by the save below.
+        // stored by the save that follows.
         let Some(stored) = repo.load().await? else {
             return Ok(false);
         };
-        let epoch = stored.operator_epoch;
         let mut loaded = stored.state;
         loaded.roll_daily_counters(Utc::now().date_naive());
 
-        let mut state = self.state.write().await;
         *state = loaded;
         // Closes counted only in the replaced state are not in the stored
         // counters: left unmarked, a new leader records them.
@@ -492,12 +510,12 @@ impl CircuitBreaker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        self.operator_epoch.store(epoch, Ordering::SeqCst);
+        self.operator_epoch
+            .store(stored.operator_epoch, Ordering::SeqCst);
         self.is_tripped.store(state.tripped, Ordering::SeqCst);
         if state.trip_reason == Some(TripReason::HardKillSwitch) {
             warn!("Hard kill switch is active — trading halted until manual reset");
         }
-        self.persist_state(&mut state).await;
         Ok(true)
     }
 
@@ -612,10 +630,17 @@ impl CircuitBreaker {
         }
 
         if self.is_tripped.load(Ordering::SeqCst) {
+            // A follower resumes with the leader, from its stored state: on
+            // its own it could resume while the leader stays tripped on
+            // losses its failing saves have not stored yet.
+            if !self.is_leader() {
+                return false;
+            }
             return self.resume_if_cooldown_elapsed().await;
         }
 
-        if self.state.read().await.recovery_state.is_some() {
+        // Recovery stages likewise advance in the leader only.
+        if self.is_leader() && self.state.read().await.recovery_state.is_some() {
             self.try_advance_recovery().await;
         }
         true
