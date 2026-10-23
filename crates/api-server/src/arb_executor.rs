@@ -1360,9 +1360,17 @@ impl ArbAutoExecutor {
                 );
                 drop(runtime);
                 warn!(market_id = %market_id, %error, cause, "Pair buying power gone before its first leg");
+                // A balance that could not be read is not a shortfall.
+                let reason = if error.to_string().contains("preflight unavailable") {
+                    FailureReason::ConnectivityError {
+                        message: format!("pair cash recheck: {error}"),
+                    }
+                } else {
+                    FailureReason::InsufficientBalance
+                };
                 let _ = self
                     .position_service
-                    .mark_entry_failed(&mut position, FailureReason::InsufficientBalance, &ctx)
+                    .mark_entry_failed(&mut position, reason, &ctx)
                     .await;
                 return Ok(());
             }
