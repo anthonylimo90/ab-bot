@@ -401,7 +401,7 @@ impl OrderExecutor {
     /// reserved and per-position entry points.
     #[cfg(test)]
     pub async fn execute_market_order(&self, order: MarketOrder) -> Result<ExecutionReport> {
-        self.execute_market_order_bound(order, self.is_live(), None)
+        self.execute_market_order_bound(order, self.is_live(), None, None)
             .await
     }
 
@@ -446,7 +446,7 @@ impl OrderExecutor {
         wallet: Option<&str>,
     ) -> Result<ExecutionReport> {
         self.validate_execution(mode, wallet).await?;
-        self.execute_market_order_bound(order, mode == "live", wallet)
+        self.execute_market_order_bound(order, mode == "live", wallet, None)
             .await
     }
 
@@ -514,6 +514,7 @@ impl OrderExecutor {
                 order,
                 position.execution_mode == "live",
                 position.wallet_address.as_deref(),
+                Some(position.id),
             )
             .await;
         if let Some(pool) = &self.database {
@@ -528,11 +529,14 @@ impl OrderExecutor {
         result
     }
 
+    /// `entry` is the position the order is for: its own pending cost is not
+    /// counted against it (see `pending_entry_reservations`).
     async fn execute_market_order_bound(
         &self,
         order: MarketOrder,
         live: bool,
         wallet: Option<&str>,
+        entry: Option<Uuid>,
     ) -> Result<ExecutionReport> {
         let start = std::time::Instant::now();
 
@@ -566,7 +570,7 @@ impl OrderExecutor {
             .execute_with_retry(
                 || async {
                     if live {
-                        self.execute_live_market_order(&order, wallet).await
+                        self.execute_live_market_order(&order, wallet, entry).await
                     } else {
                         self.simulate_market_order(&order).await
                     }
@@ -883,7 +887,15 @@ impl OrderExecutor {
 
     /// Verify that the live wallet has enough collateral balance and allowance
     /// for a multi-leg buy before any leg is submitted.
-    pub async fn ensure_live_buying_power(&self, required_collateral: Decimal) -> Result<()> {
+    ///
+    /// `entry` is the pair's own recorded entry, once there is one: its cost
+    /// is `required_collateral`, so it is left out of the other pending
+    /// entries counted against the wallet.
+    pub async fn ensure_live_buying_power(
+        &self,
+        required_collateral: Decimal,
+        entry: Option<Uuid>,
+    ) -> Result<()> {
         if required_collateral <= Decimal::ZERO || !self.is_live_ready().await {
             return Ok(());
         }
@@ -896,7 +908,10 @@ impl OrderExecutor {
         };
 
         let withheld = self.collateral_withheld(&client.address()).await?
-            + self.collateral_resting_buys(&client.address()).await?;
+            + self.collateral_resting_buys(&client.address()).await?
+            + self
+                .pending_entry_reservations(&client.address(), entry)
+                .await?;
         Self::ensure_live_order_capacity(
             client,
             Uuid::new_v4(),
@@ -932,6 +947,44 @@ impl OrderExecutor {
         Ok(resting
             .into_iter()
             .map(|(remaining, price)| open_buy_cost(remaining, price))
+            .sum())
+    }
+
+    /// USDC that other recorded live entries from `wallet` (positions still
+    /// pending) are about to spend on legs not yet bought, each leg at its
+    /// expected price plus the most taker fee it can carry. Every live buy
+    /// leaves it alone: an entry is recorded (under the exposure lock) before
+    /// its first order, so of two entries competing for the same cash the
+    /// one checking second sees the other, and a pair's second leg keeps the
+    /// cash its check counted on. `exclude` is the entry the order is for.
+    async fn pending_entry_reservations(
+        &self,
+        wallet: &str,
+        exclude: Option<Uuid>,
+    ) -> Result<Decimal> {
+        let Some(pool) = &self.database else {
+            return Ok(Decimal::ZERO);
+        };
+        let pending: Vec<(Decimal, Decimal, Decimal, Decimal, Decimal)> = sqlx::query_as(
+            "SELECT COALESCE(quantity, 0), COALESCE(held_yes_qty, 0), COALESCE(held_no_qty, 0), \
+                    COALESCE(yes_entry_price, 0), COALESCE(no_entry_price, 0) \
+             FROM positions \
+             WHERE state = 0 AND execution_mode = 'live' \
+               AND (wallet_address IS NULL OR LOWER(wallet_address) = LOWER($1)) \
+               AND ($2::uuid IS NULL OR id <> $2)",
+        )
+        .bind(wallet)
+        .bind(exclude)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("Could not read pending entries for the buy preflight: {e}")
+        })?;
+        Ok(pending
+            .into_iter()
+            .map(|(quantity, held_yes, held_no, yes_price, no_price)| {
+                pending_entry_cost(quantity, held_yes, held_no, yes_price, no_price)
+            })
             .sum())
     }
 
@@ -1301,6 +1354,7 @@ impl OrderExecutor {
         &self,
         order: &MarketOrder,
         wallet: Option<&str>,
+        entry: Option<Uuid>,
     ) -> Result<ExecutionReport> {
         // Check if we have an authenticated client
         let client_guard = self.auth_client.read().await;
@@ -1358,6 +1412,11 @@ impl OrderExecutor {
                 market_amount
                     + taker_fee_allowance(order.quantity, price)
                     + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
+                    + Self::prepare(
+                        deadline,
+                        self.pending_entry_reservations(&client.address(), entry),
+                    )
+                    .await??
             }
             OrderSide::Sell => market_amount,
         };
@@ -1527,6 +1586,11 @@ impl OrderExecutor {
                 order.quantity * order.price
                     + taker_fee_allowance(order.quantity, order.price)
                     + Self::prepare(deadline, self.collateral_withheld(&client.address())).await??
+                    + Self::prepare(
+                        deadline,
+                        self.pending_entry_reservations(&client.address(), None),
+                    )
+                    .await??
             }
             OrderSide::Sell => order.quantity,
         };
@@ -1861,6 +1925,29 @@ pub fn taker_fee_allowance(quantity: Decimal, price: Decimal) -> Decimal {
     quantity * polymarket_core::types::FeeSchedule::CONSERVATIVE.fee_per_share(price)
 }
 
+/// What a pending entry may still spend: each leg it buys (a positive
+/// expected price) for the shares not yet held, plus that leg's most taker
+/// fee. An entry naming no price is held at a dollar a share.
+pub fn pending_entry_cost(
+    quantity: Decimal,
+    held_yes: Decimal,
+    held_no: Decimal,
+    yes_price: Decimal,
+    no_price: Decimal,
+) -> Decimal {
+    if yes_price <= Decimal::ZERO && no_price <= Decimal::ZERO {
+        return open_buy_cost(quantity - held_yes.max(held_no), None);
+    }
+    let leg = |held: Decimal, price: Decimal| {
+        if price > Decimal::ZERO {
+            open_buy_cost(quantity - held, Some(price))
+        } else {
+            Decimal::ZERO
+        }
+    };
+    leg(held_yes, yes_price) + leg(held_no, no_price)
+}
+
 /// The most USDC a resting buy of `remaining` shares may still spend: its
 /// amount plus the most taker fee it can carry. A market buy without a
 /// price is held at a dollar a share, which also covers its fee
@@ -2080,7 +2167,10 @@ mod tests {
         pool.execute(
             "CREATE TABLE position_order_links (id UUID, settled BOOLEAN); \
              CREATE TABLE orders (id UUID, status TEXT); \
-             CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT)",
+             CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT); \
+             CREATE TABLE positions (id UUID, state SMALLINT, execution_mode TEXT, \
+                 wallet_address TEXT, quantity NUMERIC, held_yes_qty NUMERIC, \
+                 held_no_qty NUMERIC, yes_entry_price NUMERIC, no_entry_price NUMERIC)",
         )
         .await
         .unwrap();
@@ -2094,7 +2184,7 @@ mod tests {
                 .take()
                 .map(|body| body["order"]["makerAmount"].as_str().unwrap().to_string())
         };
-        let _ = executor.execute_live_market_order(&buy(), None).await;
+        let _ = executor.execute_live_market_order(&buy(), None, None).await;
         assert_eq!(maker_amount().as_deref(), Some("5000000"));
 
         // A 40 USDC withdrawal in flight: still 5 USDC spent (45 of 50 held).
@@ -2103,7 +2193,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let _ = executor.execute_live_market_order(&buy(), None).await;
+        let _ = executor.execute_live_market_order(&buy(), None, None).await;
         assert_eq!(maker_amount().as_deref(), Some("5000000"));
 
         // 46 USDC in flight leaves less than 5: refused, nothing posted.
@@ -2111,7 +2201,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let refused = executor.execute_live_market_order(&buy(), None).await;
+        let refused = executor.execute_live_market_order(&buy(), None, None).await;
         assert!(refused.is_err() || !refused.unwrap().is_success());
         assert_eq!(maker_amount(), None);
 
@@ -2121,7 +2211,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let refused = executor.execute_live_market_order(&buy(), None).await;
+        let refused = executor.execute_live_market_order(&buy(), None, None).await;
         assert!(refused.is_err() || !refused.unwrap().is_success());
         assert_eq!(maker_amount(), None);
         // 44.8 leaves 5.2: amount and fee fit, and the amount signed is still 5.
@@ -2129,7 +2219,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let _ = executor.execute_live_market_order(&buy(), None).await;
+        let _ = executor.execute_live_market_order(&buy(), None, None).await;
         assert_eq!(maker_amount().as_deref(), Some("5000000"));
 
         // A pair's preflight also holds back what resting buys reserve: 44.8
@@ -2142,7 +2232,7 @@ mod tests {
         .await
         .unwrap();
         assert!(executor
-            .ensure_live_buying_power(Decimal::from(5))
+            .ensure_live_buying_power(Decimal::from(5), None)
             .await
             .is_ok());
         sqlx::query(
@@ -2153,9 +2243,73 @@ mod tests {
         .await
         .unwrap();
         assert!(executor
-            .ensure_live_buying_power(Decimal::from(5))
+            .ensure_live_buying_power(Decimal::from(5), None)
             .await
             .is_err());
+
+        // Another recorded entry about to buy 10 YES @ 0.50 holds that cash
+        // the same way, against a pair's check and against any buy, but not
+        // against its own orders.
+        pool.execute("DELETE FROM orders").await.unwrap();
+        let entry = Uuid::new_v4();
+        sqlx::query("INSERT INTO positions VALUES ($1, 0, 'live', $2, 10, 0, 0, 0.50, 0)")
+            .bind(entry)
+            .bind(&address)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(executor
+            .ensure_live_buying_power(Decimal::from(5), None)
+            .await
+            .is_err());
+        assert!(executor
+            .ensure_live_buying_power(Decimal::from(5), Some(entry))
+            .await
+            .is_ok());
+        let refused = executor.execute_live_market_order(&buy(), None, None).await;
+        assert!(refused.is_err() || !refused.unwrap().is_success());
+        assert_eq!(maker_amount(), None);
+        let _ = executor
+            .execute_live_market_order(&buy(), None, Some(entry))
+            .await;
+        assert_eq!(maker_amount().as_deref(), Some("5000000"));
+        // Once its shares are held it holds nothing back.
+        pool.execute("UPDATE positions SET held_yes_qty = 10")
+            .await
+            .unwrap();
+        let _ = executor.execute_live_market_order(&buy(), None, None).await;
+        assert_eq!(maker_amount().as_deref(), Some("5000000"));
+    }
+
+    #[test]
+    fn a_pending_entry_holds_back_only_the_legs_it_has_not_bought() {
+        let d = |v: &str| v.parse::<Decimal>().unwrap();
+        let fee = |q: &str, p: &str| taker_fee_allowance(d(q), d(p));
+        // A pair of 10 at 0.40 / 0.55, nothing bought yet.
+        assert_eq!(
+            pending_entry_cost(d("10"), d("0"), d("0"), d("0.40"), d("0.55")),
+            d("4") + fee("10", "0.40") + d("5.5") + fee("10", "0.55")
+        );
+        // Its YES leg bought: only the NO leg remains.
+        assert_eq!(
+            pending_entry_cost(d("10"), d("10"), d("0"), d("0.40"), d("0.55")),
+            d("5.5") + fee("10", "0.55")
+        );
+        // A single-leg entry, half bought.
+        assert_eq!(
+            pending_entry_cost(d("10"), d("0"), d("5"), d("0"), d("0.30")),
+            d("1.5") + fee("5", "0.30")
+        );
+        // No price recorded: a dollar a share for what is not held.
+        assert_eq!(
+            pending_entry_cost(d("10"), d("4"), d("0"), d("0"), d("0")),
+            d("6")
+        );
+        // Over-filled legs never count negative.
+        assert_eq!(
+            pending_entry_cost(d("10"), d("12"), d("12"), d("0.40"), d("0.55")),
+            Decimal::ZERO
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -2227,7 +2381,10 @@ mod tests {
         pool.execute(
             "CREATE TABLE position_order_links (id UUID, settled BOOLEAN); \
              CREATE TABLE orders (id UUID, status TEXT); \
-             CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT)",
+             CREATE TABLE wallet_withdrawals (wallet_address TEXT, amount NUMERIC, status TEXT); \
+             CREATE TABLE positions (id UUID, state SMALLINT, execution_mode TEXT, \
+                 wallet_address TEXT, quantity NUMERIC, held_yes_qty NUMERIC, \
+                 held_no_qty NUMERIC, yes_entry_price NUMERIC, no_entry_price NUMERIC)",
         )
         .await
         .unwrap();

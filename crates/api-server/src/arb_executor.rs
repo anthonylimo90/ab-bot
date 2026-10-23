@@ -1209,7 +1209,7 @@ impl ArbAutoExecutor {
             let withdrawals_seen = self.order_executor.withdrawals_in_flight().await.ok();
             if let Err(error) = self
                 .order_executor
-                .ensure_live_buying_power(required_collateral)
+                .ensure_live_buying_power(required_collateral, None)
                 .await
             {
                 let mut runtime = self.runtime_status.write().await;
@@ -1326,40 +1326,45 @@ impl ArbAutoExecutor {
             }
         };
 
-        // From here new withdrawals wait for this entry. One reserved since
-        // the cash was checked (or a read that failed) may have taken the
-        // second leg's cash: check it again before the first leg is bought.
+        // From here new withdrawals and other entries reckon with this one.
+        // Check the cash again now it is recorded: a withdrawal reserved, or
+        // another entry recorded, since the first check may have taken the
+        // second leg's cash. Other pending entries are counted against it.
         if let Some((required_collateral, seen)) = pair_cash {
-            let reserved_since = match (&seen, self.order_executor.withdrawals_in_flight().await) {
+            let withdrawal_since = match (&seen, self.order_executor.withdrawals_in_flight().await)
+            {
                 (Some(seen), Ok(now)) => now.iter().any(|id| !seen.contains(id)),
                 _ => true,
             };
-            if reserved_since {
-                if let Err(error) = self
-                    .order_executor
-                    .ensure_live_buying_power(required_collateral)
-                    .await
-                {
-                    telemetry.failure_stage = Some("pair_capacity_recheck".to_string());
-                    telemetry.finish_total(&process_started_at);
-                    let mut runtime = self.runtime_status.write().await;
-                    runtime.execution_failures = runtime.execution_failures.saturating_add(1);
-                    runtime.record_decision(
-                        market_id,
-                        format!(
-                            "skipped: a withdrawal took the pair's buying power required={} \
-                             error={error}",
-                            required_collateral
-                        ),
-                    );
-                    drop(runtime);
-                    warn!(market_id = %market_id, %error, "Pair buying power gone after a withdrawal");
-                    let _ = self
-                        .position_service
-                        .mark_entry_failed(&mut position, FailureReason::InsufficientBalance, &ctx)
-                        .await;
-                    return Ok(());
-                }
+            if let Err(error) = self
+                .order_executor
+                .ensure_live_buying_power(required_collateral, Some(position.id))
+                .await
+            {
+                telemetry.failure_stage = Some("pair_capacity_recheck".to_string());
+                telemetry.finish_total(&process_started_at);
+                let mut runtime = self.runtime_status.write().await;
+                runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+                let cause = if withdrawal_since {
+                    "a withdrawal"
+                } else {
+                    "another entry or order"
+                };
+                runtime.record_decision(
+                    market_id,
+                    format!(
+                        "skipped: {cause} took the pair's buying power required={} \
+                         error={error}",
+                        required_collateral
+                    ),
+                );
+                drop(runtime);
+                warn!(market_id = %market_id, %error, cause, "Pair buying power gone before its first leg");
+                let _ = self
+                    .position_service
+                    .mark_entry_failed(&mut position, FailureReason::InsufficientBalance, &ctx)
+                    .await;
+                return Ok(());
             }
         }
 

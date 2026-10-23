@@ -1106,6 +1106,13 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   bot's positions. Use the trading page for that wallet. The submit answer
   now says the app does not track fills for browser-wallet orders, and the
   signing summary shows the exact cost.
+- Live buys hold back the cash other recorded entries are about to spend:
+  every live buy, and a pair's cash check, counts each other pending live
+  entry's legs not yet bought (at their expected prices, plus the most taker
+  fee). A pair also checks its cash again every time once its entry is
+  recorded, not only after a withdrawal. A quant entry or manual buy could
+  take a pair's second-leg cash between its check and its second leg,
+  leaving it one-legged; now the entry checking second refuses instead.
 
 ### API contract changes
 
