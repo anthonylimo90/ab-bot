@@ -789,9 +789,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   `ARB_ALLOW_LIVE_EXECUTION`, `QUANT_EXECUTOR_ENABLED`,
   `EXIT_HANDLER_ENABLED`, ...) take only exactly `true` or `false`.
   Scientific notation such as `1e3` is read. `QUANT_STOP_LOSS_PCT` must be
-  a fraction above 0 and at most 1, `QUANT_TAKE_PROFIT_PCT` a number above
-  0 (1.5 takes profit at +150%), and the `QUANT_*_ALLOCATION_PCT` shares 0
-  to 1. A value that cannot be read stops the start (see below).
+  a fraction above 0 and at most 1, `QUANT_TAKE_PROFIT_PCT` above 0 and at
+  most 10 (1.5 takes profit at +150%), and the `QUANT_*_ALLOCATION_PCT`
+  shares 0 to 1. A value that cannot be read halts entries (see below).
 - docker-compose passes every setting in `.env` to the API (`env_file`); it
   used to pass a fixed list, dropping the circuit breaker's `CB_*`, the
   quant and tuner settings among others. **Before upgrading, read `.env`
@@ -828,28 +828,30 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 
 ### Settings checked at start, the arb monitor and signal analytics
 
-- **A setting that cannot be read, or is out of its range, stops the API
-  and the arb monitor at start**, naming it and what it expects: a yes/no
-  value such as `disabled`, a money switch other than `true`/`false`
-  (`TRUE`, `1`), a number with a comma or unit, a fraction written as a
-  percentage, a decimal where a whole number goes, or a value that cannot be
-  meant: a zero loop interval (it would spin), `QUANT_MAX_HOLD_HOURS=0`
-  (every quant entry sold at once), `EXIT_POLL_INTERVAL_SECS` above 300,
-  `ARB_UPDATE_TIMEOUT_SECS` under 10 (reconnecting without pause), a
-  non-positive size, exposure, depth or daily loss, `ARB_MIN_NET_PROFIT` of
-  0 or less, `QUANT_TAKE_PROFIT_PCT` above 10, `ARB_MIN_POSITION_SIZE` above
-  `ARB_MAX_POSITION_SIZE`, or `VAULT_PROVIDER` other than `file` or
-  `environment` (`aws` is not implemented). Every numeric setting is
-  checked, about 150 in all (`SETTINGS` in
-  `crates/polymarket-core/src/config.rs` lists them with their ranges); a
-  test keeps that list in step with the code and checks `.env.example`
-  against it. Before, such a value fell back to the setting's default,
-  which left a service meant off running. A blank value is unset. `ARB_ALLOW_LIVE_EXECUTION=1` was accepted as on and is
-  now refused: write `true`. Check every service's settings before
-  upgrading: a service that refuses to start leaves open positions without
-  their exits until it is corrected.
-- Starting with `LIVE_TRADING=true` and `ACCOUNT_SNAPSHOT_ENABLED=false`
-  logs an error: the circuit breaker then gets no equity readings.
+- **A setting that cannot be read, or is out of its range, halts new
+  entries**: the API logs it, naming the setting and what it expects, and
+  its trading leader trips the circuit breaker (latched, as an operator
+  trip) while exits keep running; correct the setting, restart, and reset
+  the breaker. The arb monitor does not start. Refused: a yes/no value such
+  as `disabled`, a money switch other than `true`/`false` (`TRUE`, `1`), a
+  number with a comma or unit, a fraction written as a percentage, a
+  decimal where a whole number goes, or a value that cannot be meant: a
+  zero loop interval (it would spin), `QUANT_MAX_HOLD_HOURS=0` (every quant
+  entry sold at once), `ARB_UPDATE_TIMEOUT_SECS` under 10 (reconnecting
+  without pause), a negative size, exposure or depth, a non-positive daily
+  loss, `QUANT_TAKE_PROFIT_PCT` above 10, `ARB_MIN_POSITION_SIZE` above
+  `ARB_MAX_POSITION_SIZE` (either side at its default when unset), or
+  `VAULT_PROVIDER` other than `file` or `environment` (`aws` is not
+  implemented). `ARB_MAX_TOTAL_EXPOSURE=0` and `QUANT_MAX_POSITIONS=0`
+  stay valid: they refuse new entries. Every numeric setting is checked,
+  about 150 in all (`SETTINGS` in `crates/polymarket-core/src/config.rs`
+  lists them with their ranges); a test keeps that list in step with the
+  code and checks `.env.example` against it. Before, such a value fell back
+  to the setting's default, which left a service meant off running. A blank
+  value is unset. `ARB_ALLOW_LIVE_EXECUTION=1` was accepted as on and is
+  now refused: write `true`.
+- Live trading with `ACCOUNT_SNAPSHOT_ENABLED=false` logs an error when the
+  trading leader starts: the circuit breaker then gets no equity readings.
 - The status page reads `DYNAMIC_TUNER_ENABLED`/`DYNAMIC_TUNER_APPLY` as
   the tuner does (`on` is on; blank is the default). A blank
   `DYNAMIC_CONFIG_ALLOWED_SOURCES` is unset rather than an empty list that
@@ -876,9 +878,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   side's pre-gap book); a book that turns crossed is dropped until the next
   snapshot; each price-change event is applied whole before it is
   published; an entry signal no API is subscribed to counts as not sent; a
-  failed market listing is retried after two minutes, and one under half
-  the size of the last is applied only once a second listing confirms it;
-  one malformed Gamma market no longer fails its page.
+  failed market listing is retried after two minutes, doubling up to the
+  refresh interval, and one under half the size of the last is applied
+  only once a second listing confirms it at about its size, or after three
+  such listings in a row; one malformed Gamma market no longer fails its
+  page.
 - Quant: the flow strategy's calibration measures returns on what each
   position cost (it used the signal's suggested $30, reading a 4% gain as
   1.2%) against the uncalibrated edge, and leaves out unconfirmed
@@ -889,9 +893,13 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   strategy's default allocation is 0: it follows the favourite with no
   estimate of its own, so it has no modelled edge. Set
   `QUANT_RESOLUTION_ALLOCATION_PCT` to trade it.
-- Bot scores: a wallet is scored again a day after its last score, and one
-  with too few transfers (or a failed analysis) after an hour; before, each
-  wallet was scored once per process.
+- Bot scores: a wallet is scored again a day after its last score, one
+  with too few transfers after six hours, and one whose analysis failed
+  after half an hour; before, each wallet was scored once per process.
+- Market metadata marks a market inactive once two complete Gamma listings
+  in a row leave it out (a listing with unreadable rows, or under half the
+  size of the last, does not count); before, closed markets stayed active
+  for good, and the signal generators reading `active` traded them.
 - The market regime averages only wallets with five or more closed trades
   in 30 days (buy-only wallets read as losers and held it bearish), and the
   tuner's volatility term uses hourly price movement rather than wallets'
@@ -908,10 +916,14 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   order of the wallet, exits included, for at least ten minutes until the
   reconciler cleared it). An exit sale not sent this way is retried next pass.
 - Migration 098 adds `positions.breaker_recorded_at`. Each close is marked
-  once the circuit breaker has taken it in; a new trading leader records the
-  closes a stopped process booked but never recorded (those after the
-  breaker's last save, on the current day) before it trades. Existing closes
-  are marked by the migration.
+  in the same transaction that saves the circuit breaker's counters with it
+  in them; a new trading leader records the closes a stopped process booked
+  but never saved (today's; earlier days' are only marked) before it
+  trades. Existing closes are marked by the migration. During the first
+  upgrade to this version, a close the previous version makes while handing
+  over is counted twice, which errs towards tripping. The 24-hour realized
+  P&L is now dated by close time, so neither the migration nor the marks
+  move closes into it.
 - Orphan recovery no longer sells tokens a position sold in the last 30
   minutes (the balance can still show them until the sale settles), nor
   tokens of a market a position closed at resolution with equal legs.

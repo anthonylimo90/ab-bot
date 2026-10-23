@@ -151,9 +151,11 @@ fn is_non_trader(address: &str) -> bool {
 /// How soon a scored wallet is analyzed again: its behaviour can change, and
 /// a score from its first trades would otherwise stand for good.
 const RESCORE_AFTER: Duration = Duration::from_secs(24 * 3600);
-/// How soon a wallet that could not be scored (too few transfers, or a failed
-/// analysis) is tried again: it may have enough soon. Each try costs an
-/// Alchemy transfer history call.
+/// How soon a wallet whose analysis failed (an Alchemy error, a database
+/// write) is tried again.
+const RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
+/// How soon a wallet with too few transfers to score is looked at again: it
+/// may have enough later. Each look costs an Alchemy transfer history call.
 const RECHECK_AFTER: Duration = Duration::from_secs(6 * 3600);
 
 /// Bounded set of recently seen wallet addresses with least-recently-seen
@@ -178,8 +180,8 @@ impl RecentWallets {
 
     /// Record that `address` was seen at `now`. Returns `true` if it was not
     /// tracked yet or is due for analysis again (the caller should analyze
-    /// it); it is then next due after `RECHECK_AFTER`, unless `scored`
-    /// pushes that back. A known address becomes the most recently seen; when
+    /// it); it is then next due after `RETRY_AFTER`, unless `scored` or
+    /// `too_few_transfers` pushes that back. A known address becomes the most recently seen; when
     /// full, the least recently seen address is evicted first.
     pub fn observe(&mut self, address: &str, now: Instant) -> bool {
         self.tick += 1;
@@ -192,7 +194,7 @@ impl RecentWallets {
             if now < *due {
                 return false;
             }
-            *due = now + RECHECK_AFTER;
+            *due = now + RETRY_AFTER;
             return true;
         }
 
@@ -202,7 +204,7 @@ impl RecentWallets {
             }
         }
         self.by_address
-            .insert(address.to_string(), (tick, now + RECHECK_AFTER));
+            .insert(address.to_string(), (tick, now + RETRY_AFTER));
         self.by_tick.insert(tick, address.to_string());
         true
     }
@@ -210,8 +212,18 @@ impl RecentWallets {
     /// Record that `address` was scored at `now`: it is next due after
     /// `RESCORE_AFTER`.
     pub fn scored(&mut self, address: &str, now: Instant) {
+        self.due_after(address, now + RESCORE_AFTER);
+    }
+
+    /// Record that `address` had too few transfers to score at `now`: it is
+    /// next due after `RECHECK_AFTER`.
+    pub fn too_few_transfers(&mut self, address: &str, now: Instant) {
+        self.due_after(address, now + RECHECK_AFTER);
+    }
+
+    fn due_after(&mut self, address: &str, at: Instant) {
         if let Some((_, due)) = self.by_address.get_mut(address) {
-            *due = now + RESCORE_AFTER;
+            *due = at;
         }
     }
 
@@ -341,7 +353,9 @@ impl TradeIndexer {
             if self.analyzed_wallets.observe(&wallet, Instant::now()) {
                 match self.analyze_wallet(&wallet).await {
                     Ok(true) => self.analyzed_wallets.scored(&wallet, Instant::now()),
-                    Ok(false) => {}
+                    Ok(false) => self
+                        .analyzed_wallets
+                        .too_few_transfers(&wallet, Instant::now()),
                     Err(e) => warn!("Failed to analyze wallet {}: {}", wallet, e),
                 }
             }
@@ -593,12 +607,17 @@ mod tests {
     fn wallets_are_analyzed_again_when_due() {
         let mut set = RecentWallets::new(10);
         let start = Instant::now();
-        // Not scored (too few transfers): tried again after six hours.
+        // A failed analysis: tried again after half an hour.
         assert!(set.observe("0xa", start));
-        assert!(!set.observe("0xa", start + RECHECK_AFTER - Duration::from_secs(1)));
-        assert!(set.observe("0xa", start + RECHECK_AFTER));
+        assert!(!set.observe("0xa", start + RETRY_AFTER - Duration::from_secs(1)));
+        assert!(set.observe("0xa", start + RETRY_AFTER));
+        // Too few transfers: looked at again after six hours.
+        let checked_at = start + RETRY_AFTER;
+        set.too_few_transfers("0xa", checked_at);
+        assert!(!set.observe("0xa", checked_at + RETRY_AFTER));
+        assert!(set.observe("0xa", checked_at + RECHECK_AFTER));
         // Scored: not again for a day.
-        let scored_at = start + RECHECK_AFTER;
+        let scored_at = checked_at + RECHECK_AFTER;
         set.scored("0xa", scored_at);
         assert!(!set.observe("0xa", scored_at + RECHECK_AFTER));
         assert!(set.observe("0xa", scored_at + RESCORE_AFTER));

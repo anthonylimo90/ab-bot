@@ -196,7 +196,7 @@ impl ArbExecutorConfig {
                 Decimal::new(25, 0),
             ), // $25 min depth (small wallet)
             fee_rate: Decimal::new(2, 2), // Always 2% on Polymarket
-            max_total_exposure: polymarket_core::config::env_positive_decimal(
+            max_total_exposure: polymarket_core::config::env_number(
                 "ARB_MAX_TOTAL_EXPOSURE",
                 Decimal::new(25000, 0),
             ), // $25,000 default

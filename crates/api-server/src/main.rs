@@ -58,13 +58,17 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let serving = matches!(cli.command, Some(Commands::Serve) | None);
 
-    // A setting that cannot be read stops the start: run on a default the
-    // operator did not choose, a service meant off could trade.
+    // A setting that cannot be read starts the server halted (see
+    // `ServerConfig::unreadable_settings`): run on a default the operator did
+    // not choose, a service meant off could trade, and not starting at all
+    // would stop exits too.
     if serving {
         let unreadable = polymarket_core::config::unreadable_settings();
         if !unreadable.is_empty() {
-            anyhow::bail!(
-                "Settings that cannot be read (correct or unset them): {}",
+            tracing::error!(
+                "Settings that cannot be read (correct or unset them): {}. New entries are \
+                 halted (the circuit breaker is tripped) until they are corrected, the server \
+                 restarted and the breaker reset; exits keep running",
                 unreadable.join("; ")
             );
         }
@@ -80,15 +84,6 @@ async fn main() -> anyhow::Result<()> {
             "Trading switches set in the environment (the workspace's settings can also \
              switch services on)"
         );
-        if env_switch("LIVE_TRADING")
-            && !polymarket_core::config::env_flag("ACCOUNT_SNAPSHOT_ENABLED", true)
-        {
-            tracing::error!(
-                "LIVE_TRADING is on with ACCOUNT_SNAPSHOT_ENABLED off: the circuit breaker gets \
-                 no equity readings, so its drawdown limits and its trip for an account that \
-                 cannot be valued never act"
-            );
-        }
     }
 
     // Create database connection pool with retry

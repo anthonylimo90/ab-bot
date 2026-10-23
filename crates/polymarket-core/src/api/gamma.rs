@@ -421,6 +421,15 @@ impl GammaClient {
     ///
     /// Stops when a page returns fewer results than the page size.
     pub async fn get_all_markets(&self, page_size: u32) -> Result<Vec<GammaMarket>> {
+        Ok(self.get_all_markets_with_skipped(page_size).await?.0)
+    }
+
+    /// [`Self::get_all_markets`], with how many listed rows could not be read
+    /// (and are missing from the markets).
+    pub async fn get_all_markets_with_skipped(
+        &self,
+        page_size: u32,
+    ) -> Result<(Vec<GammaMarket>, usize)> {
         let capped_page_size = Self::capped_page_size(page_size);
         if capped_page_size != page_size {
             warn!(
@@ -431,6 +440,7 @@ impl GammaClient {
         }
 
         let mut all_markets = Vec::new();
+        let mut skipped = 0usize;
         let mut offset = 0u32;
         let page_delay = Self::page_delay();
 
@@ -438,6 +448,7 @@ impl GammaClient {
             let page = self.get_markets_page(capped_page_size, offset).await?;
             // Rows returned, not rows read: a skipped row is not the end.
             let page_len = page.rows_returned as u32;
+            skipped += page.rows_returned - page.markets.len();
             all_markets.extend(page.markets);
 
             if page_len < capped_page_size {
@@ -453,8 +464,11 @@ impl GammaClient {
             tokio::task::yield_now().await;
         }
 
-        debug!(total = all_markets.len(), "Fetched all Gamma markets");
-        Ok(all_markets)
+        debug!(
+            total = all_markets.len(),
+            skipped, "Fetched all Gamma markets"
+        );
+        Ok((all_markets, skipped))
     }
 
     /// Fetch all currently tradable binary markets from the Gamma API.

@@ -371,11 +371,11 @@ fn setting_kind(name: &str) -> Option<SettingKind> {
 
 /// Every setting the services read through the helpers above, with the
 /// values it takes. A range rejects only values that cannot be meant (a zero
-/// interval, 15 written for 15%), not unusual ones. A test keeps this list
-/// in step with the code.
+/// interval, 15 written for 15%), not unusual ones; a 0 that stops new
+/// entries is allowed. A test keeps this list in step with the code.
 pub const SETTINGS: &[(&str, SettingKind)] = &[
     ("ACCOUNT_SNAPSHOT_ENABLED", SettingKind::Flag),
-    ("ACCOUNT_SNAPSHOT_INTERVAL_SECS", count(30, 900)),
+    ("ACCOUNT_SNAPSHOT_INTERVAL_SECS", count(30, 3_600)),
     ("API_PORT", count(1, 65_535)),
     ("ARB_ALLOW_LIVE_EXECUTION", SettingKind::Switch),
     ("ARB_AUTO_EXECUTE", SettingKind::Switch),
@@ -388,9 +388,10 @@ pub const SETTINGS: &[(&str, SettingKind)] = &[
     ),
     ("ARB_MAX_POSITION_SIZE", SettingKind::PositiveDecimal),
     ("ARB_MAX_SIGNAL_AGE_SECS", count(1, 3_600)),
-    ("ARB_MAX_TOTAL_EXPOSURE", SettingKind::PositiveDecimal),
+    // 0 refuses every new entry: a stop an operator can set at once.
+    ("ARB_MAX_TOTAL_EXPOSURE", between(0.0, f64::INFINITY)),
     ("ARB_MIN_BOOK_DEPTH", SettingKind::PositiveDecimal),
-    ("ARB_MIN_NET_PROFIT", above(0.0, 0.5)),
+    ("ARB_MIN_NET_PROFIT", between(0.0, 0.5)),
     ("ARB_MIN_POSITION_SIZE", SettingKind::PositiveDecimal),
     ("ARB_MIN_PROFIT_THRESHOLD", above(0.0, 0.5)),
     (
@@ -419,7 +420,7 @@ pub const SETTINGS: &[(&str, SettingKind)] = &[
     ("ARB_UNIVERSE_REFRESH_SECS", LOOP_SECS),
     // Zero would reconnect the order book stream without pause.
     ("ARB_UPDATE_TIMEOUT_SECS", count(10, 3_600)),
-    ("ARGON2_MAX_CONCURRENCY", count(1, 1_024)),
+    ("ARGON2_MAX_CONCURRENCY", count(0, 1_024)),
     ("BACKTEST_AUTOMATION_CLAIM_LIMIT", count(1, 1_000)),
     ("BACKTEST_AUTOMATION_ENABLED", SettingKind::Flag),
     ("BACKTEST_AUTOMATION_INTERVAL_SECS", LOOP_SECS),
@@ -451,11 +452,11 @@ pub const SETTINGS: &[(&str, SettingKind)] = &[
     ("DYNAMIC_TUNER_NO_TRADE_WINDOW_MINUTES", count(1, 10_080)),
     ("DYNAMIC_TUNER_PNL_DEGRADE_DELTA", above(0.0, f64::INFINITY)),
     ("DYNAMIC_TUNER_REGIME_STREAK", count(1, 1_000)),
-    ("EXECUTOR_MIN_BOOK_DEPTH", above(0.0, f64::INFINITY)),
+    ("EXECUTOR_MIN_BOOK_DEPTH", between(0.0, f64::INFINITY)),
     ("EXIT_FAILED_RETRY_BACKOFF_SECS", count(1, 86_400)),
     ("EXIT_HANDLER_ENABLED", SettingKind::Switch),
     // Stop-losses and take-profits are checked once a pass.
-    ("EXIT_POLL_INTERVAL_SECS", count(1, 300)),
+    ("EXIT_POLL_INTERVAL_SECS", count(1, 3_600)),
     ("EXIT_RESOLUTION_CHECK_SECS", count(1, 86_400)),
     ("FLOW_CALIBRATION_LOOKBACK_DAYS", count(1, 365)),
     ("FLOW_CALIBRATION_MIN_CLOSED_TRADES", count(1, 100_000)),
@@ -536,13 +537,14 @@ pub const SETTINGS: &[(&str, SettingKind)] = &[
     ("QUANT_FLOW_ALLOCATION_PCT", SettingKind::Share),
     // Zero would sell every quant position at its first exit pass.
     ("QUANT_MAX_HOLD_HOURS", count(1, 8_760)),
-    ("QUANT_MAX_POSITIONS", count(1, 1_000)),
+    // 0 refuses every new quant entry.
+    ("QUANT_MAX_POSITIONS", count(0, 1_000)),
     ("QUANT_MAX_REFERENCE_AGE_SECS", count(1, 86_400)),
     ("QUANT_MAX_REFERENCE_DRIFT", above(0.0, 0.5)),
     ("QUANT_MAX_SIGNAL_AGE_SECS", count(1, 3_600)),
     ("QUANT_MEAN_REVERSION_ALLOCATION_PCT", SettingKind::Share),
     ("QUANT_MIN_BOOK_DEPTH", SettingKind::PositiveDecimal),
-    ("QUANT_MIN_CONFIDENCE", above(0.0, 1.0)),
+    ("QUANT_MIN_CONFIDENCE", between(0.0, 1.0)),
     ("QUANT_REENTRY_COOLDOWN_MINUTES", count(0, 10_080)),
     ("QUANT_RESOLUTION_ALLOCATION_PCT", SettingKind::Share),
     ("QUANT_STOP_LOSS_PCT", SettingKind::Fraction),
@@ -587,23 +589,36 @@ const CHECKED_ELSEWHERE: &[(&str, SettingKind)] = &[
     ),
 ];
 
-/// Pairs of settings where the first must not exceed the second, checked when
-/// both are set.
-const ORDERED_PAIRS: &[(&str, &str)] = &[
-    ("ARB_MIN_POSITION_SIZE", "ARB_MAX_POSITION_SIZE"),
-    ("CLOB_WS_PING_INTERVAL_SECS", "CLOB_WS_READ_TIMEOUT_SECS"),
+/// Pairs of settings where the first must not exceed the second, each with
+/// its default (in the code that reads it), checked when either is set.
+const ORDERED_PAIRS: &[(&str, &str, &str, &str)] = &[
+    ("ARB_MIN_POSITION_SIZE", "5", "ARB_MAX_POSITION_SIZE", "25"),
+    (
+        "CLOB_WS_PING_INTERVAL_SECS",
+        "10",
+        "CLOB_WS_READ_TIMEOUT_SECS",
+        "120",
+    ),
     (
         "LATENCY_ARB_MIN_POSITION_SIZE",
+        "5",
         "LATENCY_ARB_MAX_POSITION_SIZE",
+        "100",
     ),
-    ("LATENCY_ARB_MIN_YES_PRICE", "LATENCY_ARB_MAX_YES_PRICE"),
+    (
+        "LATENCY_ARB_MIN_YES_PRICE",
+        "0.05",
+        "LATENCY_ARB_MAX_YES_PRICE",
+        "0.95",
+    ),
 ];
 
 /// The settings in [`SETTINGS`] that are set to a value their helper cannot
-/// read, each with what it expects, and set pairs out of order. A service
-/// checks them before it starts and refuses to start on any: the helpers
-/// would otherwise run on a default the operator did not choose (`disabled`
-/// would leave a service on, `10` meant as 10% would be replaced).
+/// read, each with what it expects, and pairs out of order. A service checks
+/// them before it starts: the API halts new entries on any, the arbitrage
+/// monitor does not start. The helpers would otherwise run on a default the
+/// operator did not choose (`disabled` would leave a service on, `10` meant
+/// as 10% would be replaced).
 pub fn unreadable_settings() -> Vec<String> {
     let mut problems: Vec<String> = SETTINGS
         .iter()
@@ -613,9 +628,16 @@ pub fn unreadable_settings() -> Vec<String> {
             (!kind.reads(&value)).then(|| format!("{name}={value} (expected {})", kind.expected()))
         })
         .collect();
-    for (low, high) in ORDERED_PAIRS {
-        let read = |name: &str| env_set(name).and_then(|value| parse_decimal(&value));
-        if let (Some(low_value), Some(high_value)) = (read(low), read(high)) {
+    for (low, low_default, high, high_default) in ORDERED_PAIRS {
+        if env_set(low).is_none() && env_set(high).is_none() {
+            continue;
+        }
+        let read = |name: &str, default: &str| {
+            parse_decimal(&env_set(name).unwrap_or_else(|| default.to_string()))
+        };
+        if let (Some(low_value), Some(high_value)) =
+            (read(low, low_default), read(high, high_default))
+        {
             if low_value > high_value {
                 problems.push(format!(
                     "{low} ({low_value}) is above {high} ({high_value})"
@@ -860,7 +882,10 @@ mod env_tests {
     #[test]
     fn listed_ranges_hold_at_read_time() {
         // A listed name is held to its range when read, too.
-        assert_eq!(setting_kind("EXIT_POLL_INTERVAL_SECS"), Some(count(1, 300)));
+        assert_eq!(
+            setting_kind("EXIT_POLL_INTERVAL_SECS"),
+            Some(count(1, 3_600))
+        );
         let kind = setting_kind("QUANT_MAX_HOLD_HOURS").unwrap();
         assert!(!kind.reads("0"));
     }

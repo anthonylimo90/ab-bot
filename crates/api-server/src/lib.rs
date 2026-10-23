@@ -122,6 +122,10 @@ pub struct ServerConfig {
     pub jwt_secret: String,
     /// WebSocket channel capacity.
     pub ws_channel_capacity: usize,
+    /// Settings that cannot be read ([`polymarket_core::config::unreadable_settings`]).
+    /// The trading leader trips the circuit breaker for them: new entries
+    /// halt, exits run.
+    pub unreadable_settings: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -133,6 +137,7 @@ impl Default for ServerConfig {
             cors_allowed_origins: Vec::new(),
             jwt_secret: "development-secret-change-in-production".to_string(),
             ws_channel_capacity: 1000,
+            unreadable_settings: Vec::new(),
         }
     }
 }
@@ -244,6 +249,7 @@ impl ServerConfig {
             jwt_secret: std::env::var("JWT_SECRET")
                 .unwrap_or_else(|_| "development-secret-change-in-production".to_string()),
             ws_channel_capacity: polymarket_core::config::env_count("WS_CHANNEL_CAPACITY", 1000),
+            unreadable_settings: polymarket_core::config::unreadable_settings(),
         }
     }
 
@@ -456,6 +462,7 @@ impl ApiServer {
             let lost = leadership_lost.clone();
             let arb_config_arc = arb_config_arc.clone();
             let quant_config = quant_config.clone();
+            let unreadable_settings = self.config.unreadable_settings.clone();
             tokio::spawn(async move {
                 let executor = state.order_executor.clone();
                 let Some(leadership) =
@@ -472,6 +479,7 @@ impl ApiServer {
                     lost.notify_one();
                     return;
                 }
+                halt_for_unreadable_settings(&state, &unreadable_settings).await;
                 spawn_trading_tasks(
                     state,
                     arb_config_arc,
@@ -799,10 +807,26 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     let limits = crate::state::circuit_breaker_config(&state.pool).await?;
     state.circuit_breaker.update_config(limits).await;
     // Closes a stopped process booked but never recorded count before any
-    // new trade does.
-    crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker)
-        .await
-        .map_err(|error| error.context("recording closes the circuit breaker missed"))?;
+    // new trade does. A failure is logged, not fatal: stopping here would
+    // stop exits too, and the closes stay unmarked for the next leader.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker).await {
+            Ok(()) => break,
+            Err(error) if attempt < 3 => {
+                tracing::warn!(attempt, %error, "Could not record closes the circuit breaker missed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "Could not record closes the circuit breaker missed; trading without them"
+                );
+                break;
+            }
+        }
+    }
     crate::dynamic_tuner::apply_dynamic_config_snapshot(
         &state.pool,
         state.arb_executor_config.as_ref(),
@@ -811,6 +835,30 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     .await;
     crate::runtime_sync::reconcile_runtime_service_toggles(state).await;
     Ok(())
+}
+
+/// Trips the circuit breaker (latched, as an operator trip) when settings
+/// cannot be read: new entries halt and exits keep running, until the
+/// settings are corrected, the server restarted and the breaker reset.
+/// Also flags live trading without the equity feed the breaker's drawdown
+/// limits read.
+async fn halt_for_unreadable_settings(state: &AppState, unreadable: &[String]) {
+    if !unreadable.is_empty() {
+        let reason = format!("settings that cannot be read: {}", unreadable.join("; "));
+        // A failed save still trips this process; its next save stores it.
+        if let Err(error) = state.circuit_breaker.manual_trip(Some(reason)).await {
+            tracing::error!(%error, "Could not store the trip for unreadable settings");
+        }
+    }
+    if state.order_executor.is_live()
+        && !polymarket_core::config::env_flag("ACCOUNT_SNAPSHOT_ENABLED", true)
+    {
+        tracing::error!(
+            "Live trading is on with ACCOUNT_SNAPSHOT_ENABLED off: the circuit breaker gets no \
+             equity readings, so its drawdown limits and its trip for an account that cannot be \
+             valued never act"
+        );
+    }
 }
 
 /// Take up every few seconds what operators change through any API process:

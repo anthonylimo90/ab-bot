@@ -303,6 +303,9 @@ pub struct CircuitBreaker {
     operator_epoch: AtomicI64,
     /// A save of the leader's state failed and is still owed.
     unsaved: AtomicBool,
+    /// Closes ([`Self::record_close`]) the in-memory counters hold that no
+    /// save has stored yet; each save marks them in its transaction.
+    unsaved_closes: std::sync::Mutex<Vec<uuid::Uuid>>,
     /// When the stored state was last checked by [`Self::sync`].
     synced_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -344,6 +347,7 @@ impl CircuitBreaker {
             leader: AtomicBool::new(true),
             operator_epoch: AtomicI64::new(0),
             unsaved: AtomicBool::new(false),
+            unsaved_closes: std::sync::Mutex::new(Vec::new()),
             synced_at: std::sync::Mutex::new(None),
         }
     }
@@ -452,6 +456,12 @@ impl CircuitBreaker {
 
         let mut state = self.state.write().await;
         *state = loaded;
+        // Closes counted only in the replaced state are not in the stored
+        // counters: left unmarked, a new leader records them.
+        self.unsaved_closes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.operator_epoch.store(epoch, Ordering::SeqCst);
         self.is_tripped.store(state.tripped, Ordering::SeqCst);
         if state.trip_reason == Some(TripReason::HardKillSwitch) {
@@ -657,6 +667,22 @@ impl CircuitBreaker {
     ///
     /// Realized P&L never moves the equity values: drawdown is evaluated only
     /// from equity snapshots in [`Self::update_portfolio_value`].
+    /// Record a position's close: [`Self::record_trade`], with the position
+    /// marked recorded (`positions.breaker_recorded_at`) by the save that
+    /// stores it, so a new leader can tell the closes the stored counters
+    /// miss from those they hold.
+    pub async fn record_close(
+        &self,
+        pnl: Decimal,
+        position_id: uuid::Uuid,
+    ) -> Result<Option<TripReason>> {
+        self.unsaved_closes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(position_id);
+        self.record_trade(pnl).await
+    }
+
     pub async fn record_trade(&self, pnl: Decimal) -> Result<Option<TripReason>> {
         let config = self.config.read().await.clone();
         if !config.enabled {
@@ -951,12 +977,23 @@ impl CircuitBreaker {
     /// with what this process counted since; a failed save is retried by
     /// [`Self::sync`].
     async fn persist_state(&self, state: &mut CircuitBreakerState) {
-        let Some(repo) = &self.repo else { return };
+        let Some(repo) = &self.repo else {
+            self.unsaved_closes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            return;
+        };
         if !self.is_leader() {
             return;
         }
+        let closes = self
+            .unsaved_closes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let saved = match repo
-            .save(state, self.operator_epoch.load(Ordering::SeqCst))
+            .save(state, self.operator_epoch.load(Ordering::SeqCst), &closes)
             .await
         {
             Ok(false) => match repo.load().await {
@@ -972,7 +1009,7 @@ impl CircuitBreaker {
                     adopt_operator_change(state, stored);
                     self.is_tripped.store(state.tripped, Ordering::SeqCst);
                     self.operator_epoch.store(epoch, Ordering::SeqCst);
-                    repo.save(state, epoch).await
+                    repo.save(state, epoch, &closes).await
                 }
                 Ok(None) => Ok(false),
                 Err(error) => Err(error),
@@ -980,7 +1017,13 @@ impl CircuitBreaker {
             other => other,
         };
         match saved {
-            Ok(true) => self.unsaved.store(false, Ordering::SeqCst),
+            Ok(true) => {
+                self.unsaved.store(false, Ordering::SeqCst);
+                self.unsaved_closes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|close| !closes.contains(close));
+            }
             Ok(false) => {
                 warn!("Circuit breaker state changed again while saving; retrying later");
                 self.unsaved.store(true, Ordering::SeqCst);

@@ -93,8 +93,17 @@ async fn syncer_loop(config: GammaSyncerConfig, pool: PgPool, db_semaphore: Arc<
     // Startup delay to let the server finish booting
     tokio::time::sleep(Duration::from_secs(15)).await;
 
+    let mut unlisted = UnlistedMarkets::default();
     loop {
-        match sync_cycle(&gamma_client, &pool, &db_semaphore, config.page_size).await {
+        match sync_cycle(
+            &gamma_client,
+            &pool,
+            &db_semaphore,
+            config.page_size,
+            &mut unlisted,
+        )
+        .await
+        {
             Ok(stats) => {
                 info!(
                     upserted = stats.upserted,
@@ -117,15 +126,27 @@ struct SyncStats {
     backfilled: i64,
 }
 
+/// What the last complete listing left out, kept between sync cycles: a
+/// market is marked inactive only when two complete listings in a row leave
+/// it out, so one partial answer closes nothing.
+#[derive(Default)]
+struct UnlistedMarkets {
+    /// Active rows the last complete listing left out.
+    missing: Option<std::collections::HashSet<String>>,
+    /// How many markets it listed.
+    listed: usize,
+}
+
 /// Execute a single sync cycle: fetch from Gamma API and upsert to DB.
 async fn sync_cycle(
     gamma_client: &GammaClient,
     pool: &PgPool,
     db_semaphore: &Semaphore,
     page_size: u32,
+    unlisted: &mut UnlistedMarkets,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> {
     // Step 1: Fetch all active markets from Gamma API (no semaphore — network I/O)
-    let markets = gamma_client.get_all_markets(page_size).await?;
+    let (markets, skipped) = gamma_client.get_all_markets_with_skipped(page_size).await?;
     let total_fetched = markets.len();
     debug!(count = total_fetched, "Fetched markets from Gamma API");
 
@@ -171,11 +192,15 @@ async fn sync_cycle(
 
     // Markets that left the active listing are closed: without this their
     // rows stayed active for good, and the signal generators reading
-    // `active` kept treating resolved markets as tradable.
-    if all_stored {
-        if let Err(error) = deactivate_unlisted(pool, &parsed).await {
-            warn!(%error, "Failed to mark closed markets inactive in market_metadata");
-        }
+    // `active` kept treating resolved markets as tradable. Only a complete
+    // listing counts: one with unreadable rows, or under half the size of the
+    // last, starts the count again.
+    let complete = all_stored && skipped == 0 && parsed.len() * 2 >= unlisted.listed;
+    if !complete {
+        unlisted.missing = None;
+    } else if let Err(error) = deactivate_unlisted(pool, &parsed, unlisted).await {
+        unlisted.missing = None;
+        warn!(%error, "Failed to mark closed markets inactive in market_metadata");
     }
 
     // Step 5: Release semaphore (explicit drop for clarity)
@@ -188,37 +213,42 @@ async fn sync_cycle(
     })
 }
 
-/// Marks active rows missing from a complete listing inactive, unless the
-/// listing is under half the active rows: more likely a partial answer than
-/// half the markets closing at once.
+/// Marks inactive the active rows that this complete listing and the last
+/// both left out, and remembers what this one left out.
 async fn deactivate_unlisted(
     pool: &PgPool,
     listed: &[polymarket_core::api::gamma::ParsedGammaMarket],
+    unlisted: &mut UnlistedMarkets,
 ) -> Result<(), sqlx::Error> {
-    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM market_metadata WHERE active")
-        .fetch_one(pool)
-        .await?;
-    if (listed.len() as i64) * 2 < active {
-        warn!(
-            listed = listed.len(),
-            active, "Gamma listing is under half the active markets; not marking any closed"
-        );
-        return Ok(());
-    }
     let ids: Vec<&str> = listed.iter().map(|m| m.condition_id.as_str()).collect();
-    let closed = sqlx::query(
-        "UPDATE market_metadata SET active = FALSE WHERE active AND NOT (condition_id = ANY($1))",
+    let missing: std::collections::HashSet<String> = sqlx::query_scalar(
+        "SELECT condition_id FROM market_metadata WHERE active AND NOT (condition_id = ANY($1))",
     )
-    .bind(ids)
-    .execute(pool)
+    .bind(&ids)
+    .fetch_all(pool)
     .await?
-    .rows_affected();
-    if closed > 0 {
+    .into_iter()
+    .collect();
+    let closed: Vec<&str> = unlisted
+        .missing
+        .as_ref()
+        .map(|before| missing.intersection(before).map(String::as_str).collect())
+        .unwrap_or_default();
+    if !closed.is_empty() {
+        let closed_count = sqlx::query(
+            "UPDATE market_metadata SET active = FALSE WHERE active AND condition_id = ANY($1)",
+        )
+        .bind(&closed)
+        .execute(pool)
+        .await?
+        .rows_affected();
         debug!(
-            closed,
-            "Marked markets that left the Gamma listing inactive"
+            closed = closed_count,
+            "Marked markets left out of two Gamma listings inactive"
         );
     }
+    unlisted.missing = Some(missing);
+    unlisted.listed = listed.len();
     Ok(())
 }
 
@@ -357,11 +387,24 @@ mod tests {
             .unwrap()
         };
 
-        // c3 closed: it leaves the listing.
-        deactivate_unlisted(&pool, &listing[..2]).await.unwrap();
+        // c3 closed: it leaves the listing, and is marked inactive once a
+        // second complete listing leaves it out too.
+        let mut unlisted = UnlistedMarkets::default();
+        deactivate_unlisted(&pool, &listing[..2], &mut unlisted)
+            .await
+            .unwrap();
+        assert_eq!(active(pool.clone()).await, ["c1", "c2", "c3"]);
+        deactivate_unlisted(&pool, &listing[..2], &mut unlisted)
+            .await
+            .unwrap();
         assert_eq!(active(pool.clone()).await, ["c1", "c2"]);
-        // A listing under half the active markets marks nothing.
-        deactivate_unlisted(&pool, &[]).await.unwrap();
+        // One listing that leaves c2 out, then one that has it: c2 stays.
+        deactivate_unlisted(&pool, &listing[..1], &mut unlisted)
+            .await
+            .unwrap();
+        deactivate_unlisted(&pool, &listing[..2], &mut unlisted)
+            .await
+            .unwrap();
         assert_eq!(active(pool.clone()).await, ["c1", "c2"]);
     }
 

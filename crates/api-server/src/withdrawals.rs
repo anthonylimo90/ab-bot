@@ -347,7 +347,7 @@ impl WithdrawalHolds {
             .await?;
             reserved_for_open_buys = open_buys
                 .into_iter()
-                .map(|(remaining, price)| open_buy_cost(remaining, price))
+                .map(|(remaining, price)| trading_engine::executor::open_buy_cost(remaining, price))
                 .sum();
             // A buy the exchange matched moves the wallet's USDC only when
             // its trade settles on chain; a withdrawal mined first would make
@@ -419,19 +419,6 @@ impl WithdrawalHolds {
 /// leaving the wallet: as long as the exit handler waits for a fill's shares
 /// to settle.
 const SETTLING_BUY_MINUTES: i32 = 30;
-
-/// What the unfilled rest of a live buy can still draw from the wallet: its
-/// amount and the taker fee on it. A market buy has no price and counts at
-/// the $1 maximum, which also covers its fee (p + 0.07·p(1 − p) ≤ 1).
-fn open_buy_cost(remaining: Decimal, price: Option<Decimal>) -> Decimal {
-    let remaining = remaining.max(Decimal::ZERO);
-    match price {
-        Some(price) => {
-            remaining * price + trading_engine::executor::taker_fee_allowance(remaining, price)
-        }
-        None => remaining,
-    }
-}
 
 /// How much may leave a wallet holding `cash`, and what a withdrawal of
 /// `amount` draws on: its USDC.e when that covers it, else its pUSD. One

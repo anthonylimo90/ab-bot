@@ -500,7 +500,8 @@ fn argon2_permits() -> &'static Arc<tokio::sync::Semaphore> {
         let limit = polymarket_core::config::env_count(
             "ARGON2_MAX_CONCURRENCY",
             DEFAULT_ARGON2_MAX_CONCURRENCY,
-        );
+        )
+        .max(1);
         Arc::new(tokio::sync::Semaphore::new(limit))
     })
 }

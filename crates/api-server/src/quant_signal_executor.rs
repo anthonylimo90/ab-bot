@@ -126,7 +126,7 @@ impl QuantSignalExecutorConfig {
                 "QUANT_MIN_BOOK_DEPTH",
                 Decimal::new(50, 0),
             ),
-            max_total_exposure: polymarket_core::config::env_positive_decimal(
+            max_total_exposure: polymarket_core::config::env_number(
                 "ARB_MAX_TOTAL_EXPOSURE",
                 Decimal::new(25000, 0),
             ),

@@ -588,11 +588,14 @@ impl ArbMonitor {
         // After a failed or doubtful refresh, how long until the next: it
         // doubles from `UNIVERSE_RETRY_AFTER` up to the refresh interval, as
         // each refresh pages through the whole listing.
-        let mut universe_retry_after = UNIVERSE_RETRY_AFTER;
+        let first_retry = UNIVERSE_RETRY_AFTER.min(universe_refresh_interval);
+        let mut universe_retry_after = first_retry;
         // A listing under half the size of the one in use is more likely a
         // partial answer than half the markets closing at once: it is applied
-        // only when the next listing confirms it, at about the same size.
+        // only when the next listing confirms it at about the same size, or
+        // after three such listings in a row (markets still closing).
         let mut shrunken_listing: Option<usize> = None;
+        let mut shrunken_listings = 0u32;
         self.position_tracker.load_active_positions().await?;
         self.position_tracker.log_summary();
         let _ = self.rebuild_eligible_markets(SelectionRebuildReason::Startup);
@@ -734,10 +737,12 @@ impl ArbMonitor {
                         ),
                         Ok(Ok(markets))
                             if binary_market_count(&markets) * 2 < self.all_market_ids.len()
+                                && shrunken_listings < 2
                                 && !shrunken_listing
                                     .is_some_and(|seen| confirms_listing(seen, binary_market_count(&markets))) =>
                         {
                             shrunken_listing = Some(binary_market_count(&markets));
+                            shrunken_listings += 1;
                             warn!(
                                 listed = binary_market_count(&markets),
                                 in_use = self.all_market_ids.len(),
@@ -747,7 +752,8 @@ impl ArbMonitor {
                         }
                         Ok(Ok(markets)) => {
                             shrunken_listing = None;
-                            universe_retry_after = UNIVERSE_RETRY_AFTER;
+                            shrunken_listings = 0;
+                            universe_retry_after = first_retry;
                             next_universe_refresh = tokio::time::Instant::now() + universe_refresh_interval;
                             self.apply_universe(markets);
                             info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe");

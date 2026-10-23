@@ -16,6 +16,7 @@ serde_json.workspace = true
 # Types
 chrono.workspace = true
 rust_decimal.workspace = true
+uuid.workspace = true
 
 # Error handling
 anyhow.workspace = true

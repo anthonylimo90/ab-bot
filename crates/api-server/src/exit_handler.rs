@@ -2331,10 +2331,10 @@ pub(crate) async fn record_close_with_breaker(
 ) {
     let pnl = position.realized_pnl.unwrap_or_default();
     if breaker_counts_close(&position.execution_mode, pnl, confirmed) {
-        if let Err(error) = breaker.record_trade(pnl).await {
-            // Left unmarked: the next trading leader records it.
+        // Marked by the save that stores it; a close not stored stays
+        // unmarked, for the next trading leader to record.
+        if let Err(error) = breaker.record_close(pnl, position.id).await {
             warn!(%error, position_id = %position.id, "Failed to record a close with the circuit breaker");
-            return;
         }
     } else {
         debug!(
@@ -2343,8 +2343,8 @@ pub(crate) async fn record_close_with_breaker(
             confirmed,
             "Close left out of the circuit breaker"
         );
+        mark_breaker_recorded(pool, position.id).await;
     }
-    mark_breaker_recorded(pool, position.id).await;
 }
 
 /// Whether a close counts with the circuit breaker: live ones only, and
@@ -2353,26 +2353,27 @@ fn breaker_counts_close(execution_mode: &str, pnl: Decimal, confirmed: bool) -> 
     execution_mode == "live" && (confirmed || pnl <= Decimal::ZERO)
 }
 
+/// Marks a close the circuit breaker does not count as seen.
 async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
-    if let Err(error) =
-        sqlx::query("UPDATE positions SET breaker_recorded_at = NOW() WHERE id = $1")
-            .bind(position_id)
-            .execute(pool)
-            .await
+    if let Err(error) = sqlx::query(
+        "UPDATE positions SET breaker_recorded_at = NOW() \
+         WHERE id = $1 AND breaker_recorded_at IS NULL",
+    )
+    .bind(position_id)
+    .execute(pool)
+    .await
     {
-        // Recorded but not marked: the next leader records it again, which
-        // errs towards tripping.
-        warn!(%error, %position_id, "Could not mark a close as recorded with the circuit breaker");
+        warn!(%error, %position_id, "Could not mark a close as seen by the circuit breaker");
     }
 }
 
-/// Records with the circuit breaker the closes it never took in: a process
-/// that stopped between booking a close and recording it. Counted, in close
-/// order: closes after the breaker's last save (one before it was recorded
-/// in that save, by a process that did not mark it, such as the previous
-/// version during an upgrade), on the current UTC day (the breaker's daily
-/// counters have moved past earlier ones). The rest are only marked. Run by
-/// a new trading leader before it trades.
+/// Records with the circuit breaker the closes its stored counters miss: a
+/// close is marked by the save that stores it, so an unmarked one was booked
+/// by a process that stopped before saving it. Today's count, in close order
+/// (the breaker's daily counters have moved past earlier days'); the rest
+/// are only marked. Run by a new trading leader before it trades. During the
+/// first upgrade to this version, a close the previous version makes while
+/// handing over is counted twice, which errs towards tripping.
 pub(crate) async fn record_missed_closes(
     pool: &PgPool,
     breaker: &CircuitBreaker,
@@ -2401,30 +2402,25 @@ pub(crate) async fn record_missed_closes(
     )
     .fetch_all(pool)
     .await?;
-    if missed.is_empty() {
-        return Ok(());
-    }
-    let saved_at: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT updated_at FROM circuit_breaker_state WHERE id = 1")
-            .fetch_optional(pool)
-            .await?;
     let today = chrono::Utc::now().date_naive();
     for close in missed {
         let pnl = close.realized_pnl.unwrap_or_default();
-        let unsaved_today = close
+        let today_close = close
             .exit_timestamp
-            .is_some_and(|at| at.date_naive() == today && saved_at.is_none_or(|saved| at > saved));
-        if unsaved_today && breaker_counts_close(&close.execution_mode, pnl, close.confirmed) {
-            breaker.record_trade(pnl).await?;
+            .is_some_and(|at| at.date_naive() == today);
+        if today_close && breaker_counts_close(&close.execution_mode, pnl, close.confirmed) {
+            breaker.record_close(pnl, close.id).await?;
             warn!(position_id = %close.id, %pnl, "Recorded a close the circuit breaker had missed");
-        } else if close.execution_mode == "live" {
-            warn!(
-                position_id = %close.id,
-                %pnl,
-                "A close from an earlier day was never recorded with the circuit breaker"
-            );
+        } else {
+            if close.execution_mode == "live" && !today_close {
+                warn!(
+                    position_id = %close.id,
+                    %pnl,
+                    "A close from an earlier day was never recorded with the circuit breaker"
+                );
+            }
+            mark_breaker_recorded(pool, close.id).await;
         }
-        mark_breaker_recorded(pool, close.id).await;
     }
     Ok(())
 }
@@ -2544,9 +2540,7 @@ mod tests {
         sqlx::raw_sql(
             "CREATE TABLE positions (id UUID PRIMARY KEY, state SMALLINT, realized_pnl NUMERIC, \
                  execution_mode TEXT, exit_timestamp TIMESTAMPTZ, breaker_recorded_at TIMESTAMPTZ); \
-             CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB); \
-             CREATE TABLE circuit_breaker_state (id INT, updated_at TIMESTAMPTZ); \
-             INSERT INTO circuit_breaker_state VALUES (1, NOW() - INTERVAL '30 minutes');",
+             CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB);",
         )
         .execute(&pool)
         .await
@@ -2583,18 +2577,45 @@ mod tests {
         .await
         .unwrap();
         close(-40, "paper", 0, false).await;
-        // Unmarked but before the breaker's last save (recorded in it by a
-        // process that did not mark it), missed on an earlier day, and marked
-        // already: none counts.
-        close(-60, "live", 45, false).await;
+        // Missed on an earlier day, and marked already: neither counts.
         close(-70, "live", 2 * 24 * 60, false).await;
         close(-90, "live", 0, true).await;
 
-        let breaker = CircuitBreaker::new(Default::default());
+        sqlx::raw_sql(
+            "CREATE TABLE circuit_breaker_state (id INTEGER PRIMARY KEY DEFAULT 1, \
+                 tripped BOOLEAN NOT NULL DEFAULT FALSE, trip_reason VARCHAR(50), \
+                 tripped_at TIMESTAMPTZ, resume_at TIMESTAMPTZ, \
+                 daily_pnl DECIMAL(18, 8) NOT NULL DEFAULT 0, \
+                 peak_value DECIMAL(18, 8) NOT NULL DEFAULT 0, \
+                 current_value DECIMAL(18, 8) NOT NULL DEFAULT 0, \
+                 consecutive_losses INTEGER NOT NULL DEFAULT 0, \
+                 trips_today INTEGER NOT NULL DEFAULT 0, \
+                 last_reset_date DATE NOT NULL DEFAULT CURRENT_DATE, \
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); \
+             INSERT INTO circuit_breaker_state (id) VALUES (1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for migration in [
+            include_str!("../../../migrations/079_circuit_breaker_full_state.sql"),
+            include_str!("../../../migrations/094_circuit_breaker_operator_epoch.sql"),
+        ] {
+            sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        }
+        let breaker = CircuitBreaker::with_persistence(Default::default(), pool.clone());
+        breaker.lead().await.unwrap();
         record_missed_closes(&pool, &breaker).await.unwrap();
         let state = breaker.state().await;
         assert_eq!(state.daily_pnl, Decimal::from(-30));
         assert_eq!(state.consecutive_losses, 1);
+        // Stored with the counters, and marked with them.
+        let stored: Decimal =
+            sqlx::query_scalar("SELECT daily_pnl FROM circuit_breaker_state WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, Decimal::from(-30));
         let unmarked: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM positions WHERE breaker_recorded_at IS NULL")
                 .fetch_one(&pool)
@@ -2603,8 +2624,10 @@ mod tests {
         assert_eq!(unmarked, 0);
 
         // A second leader finds nothing left to record.
-        record_missed_closes(&pool, &breaker).await.unwrap();
-        assert_eq!(breaker.state().await.daily_pnl, Decimal::from(-30));
+        let next = CircuitBreaker::with_persistence(Default::default(), pool.clone());
+        next.lead().await.unwrap();
+        record_missed_closes(&pool, &next).await.unwrap();
+        assert_eq!(next.state().await.daily_pnl, Decimal::from(-30));
     }
 
     #[test]

@@ -883,18 +883,23 @@ impl OrderExecutor {
         let Some(pool) = &self.database else {
             return Ok(Decimal::ZERO);
         };
-        let resting: Decimal = sqlx::query_scalar(
-            "SELECT COALESCE(SUM((quantity - COALESCE(filled_quantity, 0)) * COALESCE(price, 1)), 0) \
+        // Each at its amount (a market buy without a price at $1 a share),
+        // plus the most taker fee it can carry, as withdrawals hold them.
+        let resting: Vec<(Decimal, Option<Decimal>)> = sqlx::query_as(
+            "SELECT quantity - COALESCE(filled_quantity, 0), price \
              FROM orders \
              WHERE execution_mode = 'live' AND side = 'buy' \
                AND status IN ('pending', 'open', 'partially_filled') \
                AND (wallet_address IS NULL OR LOWER(wallet_address) = LOWER($1))",
         )
         .bind(wallet)
-        .fetch_one(pool)
+        .fetch_all(pool)
         .await
         .map_err(|e| anyhow::anyhow!("Could not read resting buys for the pair preflight: {e}"))?;
-        Ok(resting.max(Decimal::ZERO))
+        Ok(resting
+            .into_iter()
+            .map(|(remaining, price)| open_buy_cost(remaining, price))
+            .sum())
     }
 
     /// USDC that withdrawals from `wallet` still being settled may take: the
@@ -1747,6 +1752,18 @@ impl OrderExecutor {
 /// Every live buy keeps this much room; a multi-leg preflight must too.
 pub fn taker_fee_allowance(quantity: Decimal, price: Decimal) -> Decimal {
     quantity * polymarket_core::types::FeeSchedule::CONSERVATIVE.fee_per_share(price)
+}
+
+/// The most USDC a resting buy of `remaining` shares may still spend: its
+/// amount plus the most taker fee it can carry. A market buy without a
+/// price is held at a dollar a share, which also covers its fee
+/// (p + 0.07·p(1 − p) ≤ 1).
+pub fn open_buy_cost(remaining: Decimal, price: Option<Decimal>) -> Decimal {
+    let remaining = remaining.max(Decimal::ZERO);
+    match price {
+        Some(price) => remaining * price + taker_fee_allowance(remaining, price),
+        None => remaining,
+    }
 }
 
 impl Clone for ExecutionMetrics {

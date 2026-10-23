@@ -726,6 +726,13 @@ async fn wallet_submission_error(pool: &sqlx::PgPool, id: Uuid, error: anyhow::E
                 .into(),
         );
     }
+    if text.contains("the connection to the exchange failed, so nothing was sent") {
+        return ApiError::ServiceUnavailable(
+            "The exchange could not be reached, so nothing was sent; prepare the order again \
+             and retry"
+                .into(),
+        );
+    }
     // Refused by the exchange, or stopped before anything was journaled.
     match sqlx::query_scalar::<_, String>("SELECT status FROM execution_intents WHERE id=$1")
         .bind(id)

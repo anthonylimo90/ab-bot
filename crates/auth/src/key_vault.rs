@@ -174,7 +174,11 @@ impl KeyVault {
             );
         }
 
-        let provider = match std::env::var("VAULT_PROVIDER").as_deref() {
+        // Read as the start check reads it: trimmed, any case.
+        let provider = match std::env::var("VAULT_PROVIDER")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
             Ok("aws") => {
                 let region =
                     std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());

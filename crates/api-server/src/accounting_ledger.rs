@@ -674,7 +674,8 @@ async fn load_realized_pnl_24h(pool: &PgPool, live: bool) -> anyhow::Result<Deci
         SELECT COALESCE(SUM(realized_pnl), 0)
         FROM positions
         WHERE state = 4
-          AND COALESCE(updated_at, exit_timestamp, entry_timestamp) >= NOW() - INTERVAL '24 hours'
+          -- When it closed: a later write to the row (a mark) is not a close.
+          AND COALESCE(exit_timestamp, updated_at, entry_timestamp) >= NOW() - INTERVAL '24 hours'
           AND ($1 OR execution_mode <> 'paper')
         "#,
     )

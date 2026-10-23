@@ -725,9 +725,11 @@ impl DynamicTuner {
             if no_trade_watchdog && top_skip == "below_min_profit" {
                 desired_arb_profit *= 0.90;
             }
-            if let Some(row) = rows.get(KEY_ARB_MIN_PROFIT_THRESHOLD) {
-                let floor = decimal_to_f64(row.default_value) * MIN_PROFIT_FLOOR_SHARE;
-                desired_arb_profit = desired_arb_profit.max(floor);
+            if metrics.realized_slippage_p90 <= 0.0 {
+                if let Some(row) = rows.get(KEY_ARB_MIN_PROFIT_THRESHOLD) {
+                    let floor = decimal_to_f64(row.default_value) * MIN_PROFIT_FLOOR_SHARE;
+                    desired_arb_profit = desired_arb_profit.max(floor);
+                }
             }
             // No ratchet floor — apply_step_limit already caps movement
             // to max_step_pct (12%) per cycle, which is sufficient.

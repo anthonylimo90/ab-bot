@@ -96,10 +96,18 @@ impl CircuitBreakerRepository {
     /// Save the whole state, provided no operator change has been stored
     /// since `epoch`. Returns whether it was saved. The single row is written
     /// whether or not it exists yet: a missing row must never make a save (a
-    /// latched trip) a silent no-op.
-    pub async fn save(&self, state: &CircuitBreakerState, epoch: i64) -> Result<bool> {
+    /// latched trip) a silent no-op. The positions in `closes` (closes the
+    /// state now counts) are marked recorded in the same transaction, so a
+    /// close is marked exactly when the saved counters hold it.
+    pub async fn save(
+        &self,
+        state: &CircuitBreakerState,
+        epoch: i64,
+        closes: &[uuid::Uuid],
+    ) -> Result<bool> {
         let trip_reason_str = state.trip_reason.as_ref().map(Self::trip_reason_to_string);
 
+        let mut tx = self.pool.begin().await?;
         let saved = sqlx::query(
             r#"
             INSERT INTO circuit_breaker_state (
@@ -149,10 +157,31 @@ impl CircuitBreakerRepository {
         )
         .bind(state.cash_flows_applied_through)
         .bind(epoch)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
             > 0;
+        if saved && !closes.is_empty() {
+            // A schema without the mark must not stop the counters saving:
+            // the marks are left out and the closes stay unmarked.
+            sqlx::query("SAVEPOINT close_marks")
+                .execute(&mut *tx)
+                .await?;
+            if let Err(error) = sqlx::query(
+                "UPDATE positions SET breaker_recorded_at = NOW() \
+                 WHERE id = ANY($1) AND breaker_recorded_at IS NULL",
+            )
+            .bind(closes)
+            .execute(&mut *tx)
+            .await
+            {
+                warn!(%error, "Could not mark closes recorded with the circuit breaker");
+                sqlx::query("ROLLBACK TO SAVEPOINT close_marks")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
 
         debug!(
             tripped = state.tripped,
@@ -305,6 +334,44 @@ mod tests {
         ] {
             sqlx::raw_sql(migration).execute(pool).await.unwrap();
         }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn closes_are_marked_only_with_the_save_that_stores_them(pool: PgPool) {
+        create_schema(&pool).await;
+        let repo = CircuitBreakerRepository::new(pool.clone());
+        let close = uuid::Uuid::new_v4();
+        let state = CircuitBreakerState {
+            daily_pnl: rust_decimal::Decimal::from(-5),
+            ..CircuitBreakerState::default()
+        };
+        // No positions table: the counters still save, the mark is left out.
+        assert!(repo.save(&state, 0, &[close]).await.unwrap());
+        sqlx::query(
+            "CREATE TABLE positions (id UUID PRIMARY KEY, breaker_recorded_at TIMESTAMPTZ)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO positions (id) VALUES ($1)")
+            .bind(close)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // A save refused for an operator change marks nothing.
+        assert!(!repo.save(&state, 7, &[close]).await.unwrap());
+        let marked = || async {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT breaker_recorded_at IS NOT NULL FROM positions WHERE id = $1",
+            )
+            .bind(close)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert!(!marked().await);
+        assert!(repo.save(&state, 0, &[close]).await.unwrap());
+        assert!(marked().await);
     }
 
     #[sqlx::test(migrations = false)]
