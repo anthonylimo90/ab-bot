@@ -117,6 +117,44 @@ async fn the_live_signer_keeps_its_key_while_its_trades_are_open(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = false)]
+async fn a_wallet_keeps_its_key_while_a_withdrawal_from_it_is_unconfirmed(pool: PgPool) {
+    let [owner, _, _] = setup(&pool).await;
+    let vault = vault();
+    let wallet = request(KEY_TWO);
+    register_wallet(&pool, &vault, owner, &wallet)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO wallet_withdrawals VALUES ($1, 'submitted')")
+        .bind(wallet.address.to_uppercase().replacen("0X", "0x", 1))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        disconnect_wallet(&pool, &vault, None, owner, &wallet.address).await,
+        Err(ApiError::Conflict(_))
+    ));
+    assert!(vault.has_wallet_key(&wallet.address).await);
+
+    // Settled, but another transaction from it is being sent right now.
+    pool.execute("UPDATE wallet_withdrawals SET status = 'confirmed'")
+        .await
+        .unwrap();
+    let spending = crate::withdrawals::SpendLock::acquire(&pool, &wallet.address)
+        .await
+        .unwrap();
+    assert!(matches!(
+        disconnect_wallet(&pool, &vault, None, owner, &wallet.address).await,
+        Err(ApiError::Conflict(_))
+    ));
+    spending.release().await;
+
+    disconnect_wallet(&pool, &vault, None, owner, &wallet.address)
+        .await
+        .unwrap();
+    assert!(!vault.has_wallet_key(&wallet.address).await);
+}
+
 // Public test keys only; never fund these addresses.
 const KEY_ONE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 const KEY_TWO: &str = "0000000000000000000000000000000000000000000000000000000000000002";
@@ -157,6 +195,9 @@ async fn setup(pool: &PgPool) -> [Uuid; 3] {
     ))
     .await
     .unwrap();
+    pool.execute("CREATE TABLE wallet_withdrawals (wallet_address TEXT, status TEXT)")
+        .await
+        .unwrap();
     let users = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
     for user in users {
         sqlx::query("INSERT INTO users (id) VALUES ($1)")

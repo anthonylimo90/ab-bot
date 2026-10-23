@@ -1,7 +1,7 @@
 //! Canonical wallet inventory reconciliation and orphan recovery helpers.
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use polymarket_core::api::{ClobClient, PolygonClient};
 use polymarket_core::db::inventory::{
     WalletInventoryEntry, WalletInventoryRepository, WalletInventorySummary, WalletInventoryUpsert,
@@ -127,6 +127,16 @@ struct Phase2DiscoveryResult {
     token_ids: Vec<String>,
     scanned_from_block: Option<u64>,
     scanned_to_block: Option<u64>,
+    /// Where the next scan resumes. Saved only once the tokens found here
+    /// are stored, so a failed refresh scans the same blocks again.
+    cursor: Phase2Cursor,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Phase2Cursor {
+    last_scanned_block: u64,
+    backfill_cursor_block: Option<u64>,
+    backfill_completed_at: Option<DateTime<Utc>>,
 }
 
 pub fn spawn_wallet_inventory_reconciler(config: WalletInventoryConfig, state: Arc<AppState>) {
@@ -143,9 +153,12 @@ pub fn spawn_wallet_inventory_reconciler(config: WalletInventoryConfig, state: A
         let interval = time::Duration::from_secs(config.interval_secs);
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(error) = refresh_canonical_wallet_inventory(state.as_ref()).await {
-                warn!(error = %error, "Wallet inventory refresh failed");
-            }
+            crate::background::pass("wallet inventory", async {
+                if let Err(error) = refresh_canonical_wallet_inventory(state.as_ref()).await {
+                    warn!(error = %error, "Wallet inventory refresh failed");
+                }
+            })
+            .await;
         }
     });
 }
@@ -320,6 +333,7 @@ async fn refresh_wallet_inventory(
 
     let mut phase2_from_block = None;
     let mut phase2_to_block = None;
+    let mut phase2_cursor = None;
     if let Some(polygon_client) = state.polygon_client.as_ref() {
         let inventory_config = WalletInventoryConfig::from_env();
         match discover_phase2_token_ids(polygon_client, &repo, wallet_address, &inventory_config)
@@ -328,6 +342,7 @@ async fn refresh_wallet_inventory(
             Ok(discovery) => {
                 phase2_from_block = discovery.scanned_from_block;
                 phase2_to_block = discovery.scanned_to_block;
+                phase2_cursor = Some(discovery.cursor);
                 for token_id in discovery.token_ids {
                     merge_candidate(
                         &mut candidates,
@@ -350,6 +365,7 @@ async fn refresh_wallet_inventory(
     }
 
     if candidates.is_empty() {
+        save_phase2_cursor(&repo, wallet_address, phase2_cursor).await?;
         return Ok(Some(WalletInventoryRefreshResult {
             wallet_address: wallet_address.to_owned(),
             phase2_from_block,
@@ -435,6 +451,7 @@ async fn refresh_wallet_inventory(
     }
 
     repo.upsert_entries(&rows).await?;
+    save_phase2_cursor(&repo, wallet_address, phase2_cursor).await?;
 
     Ok(Some(WalletInventoryRefreshResult {
         wallet_address: wallet_address.to_owned(),
@@ -498,6 +515,14 @@ pub async fn recover_wallet_orphan_inventory(
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('orphan-inventory-recovery'),hashtext(LOWER($1)))")
         .bind(wallet_address).fetch_one(&mut *recovery_fence).await?;
     if !acquired {
+        return Ok(OrphanRecoveryResult::default());
+    }
+    // A refresh in flight read the balances before these sales; writing them
+    // back after would restore the sold shares' cost basis. Let it finish
+    // first, and keep the next one waiting until the sales are recorded.
+    let refresh_idle: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtext('wallet-inventory-refresh'),hashtext(LOWER($1)))")
+        .bind(wallet_address).fetch_one(&mut *recovery_fence).await?;
+    if !refresh_idle {
         return Ok(OrphanRecoveryResult::default());
     }
     let observed = refresh::status(pool, wallet_address).await?;
@@ -767,7 +792,9 @@ async fn discover_phase2_token_ids(
     wallet_address: &str,
     config: &WalletInventoryConfig,
 ) -> anyhow::Result<Phase2DiscoveryResult> {
-    let current_block = polygon_client.get_block_number().await?;
+    // Scan only to a block that will not be reorganised, so a transfer is
+    // never in a block the cursor has already passed.
+    let current_block = polygon_client.safe_block_number().await?;
     let sync_state = repo.get_sync_state(wallet_address).await?;
     let recent_from_block = sync_state
         .as_ref()
@@ -822,19 +849,38 @@ async fn discover_phase2_token_ids(
         backfill_complete = outcome.completed;
     }
 
-    repo.upsert_sync_state(
-        wallet_address,
-        current_block,
-        backfill_cursor_block,
-        backfill_complete.then(Utc::now),
-    )
-    .await?;
-
     Ok(Phase2DiscoveryResult {
         token_ids: token_ids.into_iter().collect(),
         scanned_from_block,
         scanned_to_block,
+        cursor: Phase2Cursor {
+            // The safe block can trail a cursor saved from an earlier head.
+            last_scanned_block: current_block.max(recent_from_block.saturating_sub(1)),
+            backfill_cursor_block,
+            backfill_completed_at: backfill_complete.then(|| {
+                sync_state
+                    .and_then(|state| state.backfill_completed_at)
+                    .unwrap_or_else(Utc::now)
+            }),
+        },
     })
+}
+
+async fn save_phase2_cursor(
+    repo: &WalletInventoryRepository,
+    wallet_address: &str,
+    cursor: Option<Phase2Cursor>,
+) -> anyhow::Result<()> {
+    if let Some(cursor) = cursor {
+        repo.upsert_sync_state(
+            wallet_address,
+            cursor.last_scanned_block,
+            cursor.backfill_cursor_block,
+            cursor.backfill_completed_at,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1108,9 +1154,13 @@ fn merge_candidate(
     candidates: &mut HashMap<String, InventoryCandidate>,
     incoming: InventoryCandidate,
 ) {
-    let entry = candidates
-        .entry(incoming.token_id.clone())
-        .or_insert_with(|| incoming.clone());
+    let entry = match candidates.entry(incoming.token_id.clone()) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(incoming);
+            return;
+        }
+        std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+    };
 
     if entry.condition_id.is_none() {
         entry.condition_id = incoming.condition_id.clone();
@@ -1121,9 +1171,12 @@ fn merge_candidate(
     if entry.linked_position_id.is_none() {
         entry.linked_position_id = incoming.linked_position_id;
     }
-    if entry.cost_basis.is_none() {
-        entry.cost_basis = incoming.cost_basis;
-    }
+    // The wallet's balance holds every holder's shares, so it carries the
+    // cost of all of them.
+    entry.cost_basis = match (entry.cost_basis, incoming.cost_basis) {
+        (Some(held), Some(more)) => Some(held + more),
+        (held, more) => held.or(more),
+    };
     if entry.discovery_source == "inventory" || incoming.discovery_source == "open_position" {
         entry.discovery_source = incoming.discovery_source;
     }
@@ -1236,5 +1289,27 @@ mod tests {
             None
         );
         assert_eq!(kept_cost_basis(None, None), None);
+    }
+
+    #[test]
+    fn a_token_held_twice_carries_both_costs() {
+        let held = |basis: Option<i64>, source: &str| InventoryCandidate {
+            token_id: "token".into(),
+            cost_basis: basis.map(Decimal::from),
+            discovery_source: source.into(),
+            ..Default::default()
+        };
+        let mut candidates = HashMap::new();
+        merge_candidate(&mut candidates, held(Some(4), "open_position"));
+        merge_candidate(&mut candidates, held(None, "chain_log"));
+        assert_eq!(candidates["token"].cost_basis, Some(Decimal::from(4)));
+        merge_candidate(&mut candidates, held(Some(6), "manual_order"));
+        assert_eq!(candidates["token"].cost_basis, Some(Decimal::TEN));
+
+        let mut unknown_first = HashMap::new();
+        merge_candidate(&mut unknown_first, held(None, "inventory"));
+        merge_candidate(&mut unknown_first, held(Some(3), "open_position"));
+        assert_eq!(unknown_first["token"].cost_basis, Some(Decimal::from(3)));
+        assert_eq!(unknown_first["token"].discovery_source, "open_position");
     }
 }

@@ -232,32 +232,40 @@ impl ExitHandler {
                     if !cfg.enabled {
                         continue;
                     }
-                    if let Err(e) = self.evaluate_open_positions(&cfg).await {
-                        error!(error = %e, "Failed to evaluate open positions for exit");
-                    }
-                    if let Err(e) = self.process_failed_exits(&cfg).await {
-                        error!(error = %e, "Failed to process failed exits");
-                    }
-                    if let Err(e) = self.process_exit_ready().await {
-                        error!(error = %e, "Failed to process exit-ready positions");
-                    }
-                    if let Err(e) = self.process_one_legged_recovery().await {
-                        error!(error = %e, "Failed to process one-legged recovery");
-                    }
-                    if let Err(e) = self.process_orphan_inventory_recovery(&cfg).await {
-                        error!(error = %e, "Failed to process orphan inventory recovery");
-                    }
+                    crate::background::pass("exit handler", self.exit_pass(&cfg)).await;
                 }
                 _ = resolution_ticker.tick() => {
-                    // Per-tick guard: skip when disabled at runtime
-                    if !self.snapshot_config().await.enabled {
-                        continue;
-                    }
-                    if let Err(e) = self.check_market_resolutions().await {
-                        error!(error = %e, "Failed to check market resolutions");
-                    }
+                    // Settled whether or not exits are enabled: booking a
+                    // resolved market sends no order, and an unsettled one
+                    // keeps its exposure counted and its result from the
+                    // circuit breaker.
+                    crate::background::pass("market resolutions", async {
+                        if let Err(e) = self.check_market_resolutions().await {
+                            error!(error = %e, "Failed to check market resolutions");
+                        }
+                    })
+                    .await;
                 }
             }
+        }
+    }
+
+    /// One pass over every position the exit handler moves.
+    async fn exit_pass(&self, cfg: &ExitHandlerConfig) {
+        if let Err(e) = self.evaluate_open_positions(cfg).await {
+            error!(error = %e, "Failed to evaluate open positions for exit");
+        }
+        if let Err(e) = self.process_failed_exits(cfg).await {
+            error!(error = %e, "Failed to process failed exits");
+        }
+        if let Err(e) = self.process_exit_ready().await {
+            error!(error = %e, "Failed to process exit-ready positions");
+        }
+        if let Err(e) = self.process_one_legged_recovery().await {
+            error!(error = %e, "Failed to process one-legged recovery");
+        }
+        if let Err(e) = self.process_orphan_inventory_recovery(cfg).await {
+            error!(error = %e, "Failed to process orphan inventory recovery");
         }
     }
 

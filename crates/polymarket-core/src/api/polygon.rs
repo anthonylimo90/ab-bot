@@ -83,8 +83,17 @@ impl CashBalances {
 
     /// The total in USDC.
     pub fn total(&self) -> Decimal {
-        Decimal::from_i128_with_scale(i128::try_from(self.total_units()).unwrap_or(i128::MAX), 6)
+        usdc_units_to_decimal(self.total_units())
     }
+}
+
+/// `units` of a 6-decimal token in whole tokens. A count too large for a
+/// `Decimal` (no real balance) reads as `Decimal::MAX` rather than panicking.
+pub fn usdc_units_to_decimal(units: u128) -> Decimal {
+    i128::try_from(units)
+        .ok()
+        .and_then(|units| Decimal::try_from_i128_with_scale(units, 6).ok())
+        .unwrap_or(Decimal::MAX)
 }
 
 /// Where a withdrawal's USDC.e comes from.
@@ -582,7 +591,7 @@ impl PolygonClient {
             None => self.get_nonce(&sender, "pending").await?,
         };
         let gas_price = self.get_gas_price_wei().await?;
-        let gas_price = (gas_price + gas_price / 5).max(min_gas_price);
+        let gas_price = gas_price.saturating_add(gas_price / 5).max(min_gas_price);
         if gas_price > MAX_GAS_PRICE_WEI {
             return Err(Error::Api {
                 message: format!(
@@ -1208,6 +1217,16 @@ mod tests {
         };
         assert_eq!(cash.total_units(), 3_750_001);
         assert_eq!(cash.total(), rust_decimal::Decimal::new(3_750_001, 6));
+        let absurd = super::CashBalances {
+            usdc_units: u128::MAX,
+            pusd_units: 1,
+            block: 9,
+        };
+        assert_eq!(absurd.total(), rust_decimal::Decimal::MAX);
+        assert_eq!(
+            super::usdc_units_to_decimal(1 << 100),
+            rust_decimal::Decimal::MAX
+        );
     }
 
     #[test]

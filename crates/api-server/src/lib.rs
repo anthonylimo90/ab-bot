@@ -21,6 +21,7 @@
 
 pub mod accounting_ledger;
 pub mod arb_executor;
+mod background;
 pub mod backtest_automation;
 pub mod cex;
 pub mod collateral;

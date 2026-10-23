@@ -356,7 +356,8 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
         },
     )
     .await;
-    // 7 of 10 shares still to buy at 0.50, and a market buy of 2 (no price).
+    // 7 of 10 shares still to buy at 0.50 (with up to 0.07 × 0.25 a share
+    // in fees), and a market buy of 2 (no price, counted at $1).
     pool.execute(
         "INSERT INTO orders VALUES \
          (10, 3, 0.5, 'buy', 'open', 'live', NULL), \
@@ -373,8 +374,8 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
     let capacity = holds.capacity(balance_units);
     assert_eq!(capacity.available_usdc, Decimal::from(100));
     assert_eq!(capacity.in_flight_withdrawals, Decimal::from(5));
-    assert_eq!(capacity.reserved_for_open_buys, Decimal::new(55, 1));
-    assert_eq!(capacity.max_withdrawable, Decimal::new(895, 1));
+    assert_eq!(capacity.reserved_for_open_buys, Decimal::new(56225, 4));
+    assert_eq!(capacity.max_withdrawable, Decimal::new(893775, 4));
     assert!(capacity.blocking_reasons.is_empty());
 
     // Another vault wallet carries no trading reserve.

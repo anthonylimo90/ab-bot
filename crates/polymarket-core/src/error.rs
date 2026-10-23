@@ -57,8 +57,10 @@ impl From<tokio_tungstenite::tungstenite::Error> for Error {
 }
 
 impl From<reqwest::Error> for Error {
+    /// The URL is left out: an RPC endpoint's carries its API key, and these
+    /// errors are logged.
     fn from(e: reqwest::Error) -> Self {
-        Self::Http(Box::new(e))
+        Self::Http(Box::new(e.without_url()))
     }
 }
 

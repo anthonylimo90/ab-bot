@@ -184,9 +184,12 @@ async fn run_loop(config: AccountSnapshotConfig, state: Arc<AppState>) {
     let interval = time::Duration::from_secs(config.interval_secs);
     loop {
         tokio::time::sleep(interval).await;
-        if let Err(error) = snapshot_canonical_workspace(&state).await {
-            warn!(error = %error, "Account snapshot cycle failed");
-        }
+        crate::background::pass("account snapshot", async {
+            if let Err(error) = snapshot_canonical_workspace(&state).await {
+                warn!(error = %error, "Account snapshot cycle failed");
+            }
+        })
+        .await;
     }
 }
 

@@ -491,16 +491,19 @@ pub fn spawn_collateral_sweeper(
     tokio::spawn(async move {
         let mut sweeper = Sweeper::default();
         loop {
-            match sweeper.look(&pool, &client, &wallet).await {
-                Ok(WrapOutcome::Wrapped(units)) => {
-                    info!(units, "Wrapped the trading wallet's USDC.e into pUSD");
-                    if let Err(error) = executor.refresh_clob_allowance_cache().await {
-                        warn!(%error, "Could not refresh the exchange's view of the wallet");
+            crate::background::pass("collateral sweeper", async {
+                match sweeper.look(&pool, &client, &wallet).await {
+                    Ok(WrapOutcome::Wrapped(units)) => {
+                        info!(units, "Wrapped the trading wallet's USDC.e into pUSD");
+                        if let Err(error) = executor.refresh_clob_allowance_cache().await {
+                            warn!(%error, "Could not refresh the exchange's view of the wallet");
+                        }
                     }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Could not wrap the trading wallet's USDC.e"),
                 }
-                Ok(_) => {}
-                Err(error) => warn!(%error, "Could not wrap the trading wallet's USDC.e"),
-            }
+            })
+            .await;
             let interval = if sweeper.waiting() {
                 FOLLOW_UP_INTERVAL
             } else {

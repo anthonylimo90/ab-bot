@@ -333,17 +333,20 @@ impl WithdrawalHolds {
                     "Live orders are still being submitted or reconciled; retry shortly".into(),
                 );
             }
-            // A market buy has no price; count it at the $1 maximum.
-            reserved_for_open_buys = sqlx::query_scalar(
-                "SELECT COALESCE(SUM((quantity - COALESCE(filled_quantity, 0)) * COALESCE(price, 1)), 0) \
+            let open_buys: Vec<(Decimal, Option<Decimal>)> = sqlx::query_as(
+                "SELECT quantity - COALESCE(filled_quantity, 0), price \
                  FROM orders \
                  WHERE execution_mode = 'live' AND side = 'buy' \
                    AND status IN ('pending', 'open', 'partially_filled') \
                    AND (wallet_address IS NULL OR LOWER(wallet_address) = LOWER($1))",
             )
             .bind(source)
-            .fetch_one(&mut *conn)
+            .fetch_all(&mut *conn)
             .await?;
+            reserved_for_open_buys = open_buys
+                .into_iter()
+                .map(|(remaining, price)| open_buy_cost(remaining, price))
+                .sum();
         }
         Ok(Self {
             in_flight_withdrawals,
@@ -355,7 +358,7 @@ impl WithdrawalHolds {
 
     /// The capacity of the wallet given its on-chain balance in USDC units.
     pub(crate) fn capacity(&self, balance_units: u128) -> WithdrawalCapacity {
-        let available_usdc = Decimal::from(balance_units) / Decimal::from(1_000_000u64);
+        let available_usdc = polymarket_core::api::polygon::usdc_units_to_decimal(balance_units);
         WithdrawalCapacity {
             available_usdc,
             in_flight_withdrawals: self.in_flight_withdrawals,
@@ -366,6 +369,19 @@ impl WithdrawalHolds {
                 .max(Decimal::ZERO),
             blocking_reasons: self.blocking_reasons.clone(),
         }
+    }
+}
+
+/// What the unfilled rest of a live buy can still draw from the wallet: its
+/// amount and the taker fee on it. A market buy has no price and counts at
+/// the $1 maximum, which also covers its fee (p + 0.07·p(1 − p) ≤ 1).
+fn open_buy_cost(remaining: Decimal, price: Option<Decimal>) -> Decimal {
+    let remaining = remaining.max(Decimal::ZERO);
+    match price {
+        Some(price) => {
+            remaining * price + trading_engine::executor::taker_fee_allowance(remaining, price)
+        }
+        None => remaining,
     }
 }
 
@@ -597,9 +613,12 @@ impl UnresolvedWithdrawal {
 pub fn spawn_withdrawal_reconciler(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = reconcile_withdrawals(&state).await {
-                warn!(%error, "Withdrawal reconciliation failed");
-            }
+            crate::background::pass("withdrawal reconciler", async {
+                if let Err(error) = reconcile_withdrawals(&state).await {
+                    warn!(%error, "Withdrawal reconciliation failed");
+                }
+            })
+            .await;
             tokio::time::sleep(RECONCILE_INTERVAL).await;
         }
     });

@@ -711,6 +711,20 @@ unsigned). Fees are set by the exchange when an order matches.
   API does not start while the breaker's stored state cannot be read (it
   retries for a few seconds first): a fresh breaker would trade through a
   latched trip and overwrite it.
+- Losses recorded while the breaker is already tripped still count. One
+  that breaches a stronger loss limit than the trip's own (the day's loss
+  over a run of losses, a run of losses over a drawdown) gives the trip
+  that reason: the cooldown restarts from then (never ends sooner), and a
+  daily loss trip holds to the end of the UTC day. A manual or kill-switch
+  trip is never relabelled. When a cooldown ends, the day's loss is weighed
+  again first, so a trip never resumes into a day already over its limit.
+- Markets are checked for resolution, and resolved positions settled,
+  whether or not the exit handler is enabled: settling sends no order, and
+  an unsettled position keeps its exposure counted and its market taken.
+- A quant signal enters only a market where no position (of any source) is
+  active, and only while the quant executor holds fewer open positions than
+  its limit. Both are decided with the entry, under the lock every entry
+  takes, so concurrent signals or API processes cannot exceed them.
 - An arb signal is skipped while any position in its market is still active,
   read from the database (an entry still settling included), so a restart
   or a reconciled entry never lets a second pair into the same market. The
@@ -723,14 +737,54 @@ unsigned). Fees are set by the exchange when an order matches.
   never fills beyond its size. A manual market order matched in full reads
   as filled though its signed size was rounded.
 - An order of unknown outcome holds back the wallet's live orders until it
-  is reconciled; one still unresolved after a quarter of an hour is warned
-  about every ten minutes. A live entry stopped before linking its first
+  is reconciled, and a position's order that stays unresolved holds its
+  position (its exposure and its market). Either one still unresolved after
+  a quarter of an hour is warned about every ten minutes ("An order still
+  unresolved holds back..."). A live entry stopped before linking its first
   order (it never sent one) fails after five minutes.
+- The reconciler releases an order the exchange never received only after
+  ten minutes and only when no trade of the wallet names it. It cannot
+  decide an order the exchange acknowledged and no longer returns, or one
+  whose trades name an order the exchange cannot find; those wait for an
+  operator, and the warning above names each (`intent_id`). Look it up with
+  `SELECT id, position_id, exchange_order_id, status, created_at FROM execution_intents WHERE id = '<intent id>';`
+  then in the exchange's open orders for the wallet (a resting order is
+  not stuck: cancel it first if it should go), its trade history (the
+  CLOB's `/data/trades`, by `exchange_order_id`) and its token transfers on
+  Polygonscan. Only when the order is not open and filled nothing, mark it
+  refused, and the reconciler settles the rest (the position's link, a
+  pending order row, and an entry that holds nothing, which fails):
+  `UPDATE execution_intents SET status = 'rejected', updated_at = NOW() WHERE id = '<intent id>' AND status IN ('submitting','unknown','acknowledged');`
+  An order that filled is never marked refused: stop the API, correct the
+  position's held quantity, entry price and fees from the trades (bumping
+  `version`), set the intent `reconciled` and its `position_order_links`
+  row `settled` in the same transaction, then start the API. A missing
+  order or a 404 alone proves nothing.
 - The circuit breaker's equity feed reads the wallet through the same chain
   client as withdrawals (environment, else the canonical workspace); trading
   live without an observed balance is warned about at every snapshot. A
   withdrawal failed by an earlier verdict and then seen mined holds the
   feed like an unsettled one.
+- A withdrawal keeps back what open live buys can still spend, their taker
+  fee included (at the highest published rate), so a withdrawal cannot
+  leave a resting buy short of its fee.
+- A vault wallet cannot be disconnected while a withdrawal from it is
+  unconfirmed (re-sending or raising its gas needs the key) or while a
+  transaction from it is being sent; retry once it settles.
+- RPC errors are logged without the endpoint's URL, which carries the
+  provider's API key.
+- A withdrawal destination written in mixed case must carry a valid EIP-55
+  checksum (a mistyped address is refused); an all-lowercase or
+  all-uppercase address is taken as written.
+- The wallet inventory's chain scan advances its cursor only once the
+  tokens it found are stored, and scans only to a block that will not be
+  reorganised. A token held by several positions (or a position and manual
+  inventory) carries all their cost. Orphan sales and inventory refreshes
+  of one wallet do not run at once: a sale waits for a refresh in flight.
+- A panic in one pass of a background task (order and withdrawal
+  reconcilers, account snapshots, the collateral sweeper, wallet inventory,
+  exits and resolutions) is logged as "A background pass panicked" and the
+  task goes on with its next pass.
 - Manual cash-flow entries take an `idempotency_key` (the dashboard sends
   one per entry): an entry sent again records nothing more. Withdrawals made
   through the API are recorded automatically; recording them by hand too

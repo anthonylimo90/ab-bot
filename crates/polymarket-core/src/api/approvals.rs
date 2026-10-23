@@ -92,7 +92,7 @@ async fn get_nonce(http: &reqwest::Client, rpc_url: &str, address: &Address) -> 
         "params": [addr, "pending"]
     });
 
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
     let hex = rpc_result_hex(&resp, "eth_getTransactionCount")?;
     Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
@@ -106,7 +106,7 @@ async fn get_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
         "params": []
     });
 
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
     let hex = rpc_result_hex(&resp, "eth_gasPrice")?;
     Ok(u128::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
@@ -115,12 +115,30 @@ async fn get_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
 /// faster inclusion.
 async fn offered_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
     let network = get_gas_price(http, rpc_url).await?;
-    let offered = network + network / 5;
+    let offered = network.saturating_add(network / 5);
     anyhow::ensure!(
         offered <= crate::api::polygon::MAX_GAS_PRICE_WEI,
         "Gas price {offered} wei is above the ceiling; no approval was signed"
     );
     Ok(offered)
+}
+
+/// POST a JSON-RPC request and decode the answer. A transport error leaves
+/// out the URL, which can hold the provider's API key.
+async fn post_rpc(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    Ok(http
+        .post(rpc_url)
+        .json(body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?
+        .json()
+        .await
+        .map_err(reqwest::Error::without_url)?)
 }
 
 /// Extract hex string from JSON-RPC result, surfacing provider errors explicitly.
@@ -169,7 +187,7 @@ async fn send_raw_tx(
         "params": [raw_hex]
     });
 
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
 
     if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
         let msg = err["message"].as_str().unwrap_or("unknown");
@@ -289,7 +307,7 @@ async fn transaction_known(http: &reqwest::Client, rpc_url: &str, hash: &str) ->
         "method": "eth_getTransactionByHash",
         "params": [hash]
     });
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
     if let Some(err) = resp.get("error").filter(|err| !err.is_null()) {
         anyhow::bail!("eth_getTransactionByHash error: {err}");
     }
@@ -312,9 +330,7 @@ async fn any_receipt(
                 "method": "eth_getTransactionReceipt",
                 "params": [hash]
             });
-            let response: Result<serde_json::Value> =
-                async { Ok(http.post(rpc_url).json(&body).send().await?.json().await?) }.await;
-            match response {
+            match post_rpc(http, rpc_url, &body).await {
                 Ok(response) => {
                     if let Some(receipt) = response.get("result").filter(|r| !r.is_null()) {
                         return Some((hash.clone(), receipt["status"].as_str() == Some("0x1")));
@@ -371,7 +387,7 @@ async fn check_erc20_allowance(
         ]
     });
 
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
     let hex_val = rpc_result_hex(&resp, "eth_call allowance")?;
     let val = U256::from_str_radix(hex_val.trim_start_matches("0x"), 16)
         .context("Failed to parse allowance hex result")?;
@@ -402,7 +418,7 @@ async fn check_erc1155_approval(
         ]
     });
 
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
     let hex_val = rpc_result_hex(&resp, "eth_call isApprovedForAll")?;
     // Non-zero means approved
     let approved = !hex_val
@@ -425,7 +441,7 @@ async fn get_native_balance(
         "params": [format!("{:?}", address), "latest"]
     });
 
-    let resp: serde_json::Value = http.post(rpc_url).json(&body).send().await?.json().await?;
+    let resp = post_rpc(http, rpc_url, &body).await?;
     let hex = rpc_result_hex(&resp, "eth_getBalance")?;
     u128::from_str_radix(hex.trim_start_matches("0x"), 16)
         .context("Failed to parse eth_getBalance result")

@@ -670,6 +670,19 @@ async fn disconnect_wallet(
 
     let mut tx = pool.begin().await?;
     lock_wallet_mutation(&mut tx, user_id, &address).await?;
+    // Withdrawals journal under the wallet's spend lock; holding it keeps a
+    // new one from starting while this decides whether the key may go.
+    // Taken before the entry lock, in the order withdrawals take them.
+    let spend_idle: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(crate::withdrawals::wallet_lock_key(&address))
+            .fetch_one(&mut *tx)
+            .await?;
+    if !spend_idle {
+        return Err(ApiError::Conflict(
+            "A transaction from this wallet is being sent; retry when it is done".into(),
+        ));
+    }
 
     // Check if wallet exists
     let wallet: Option<(Uuid, bool)> = sqlx::query_as(
@@ -721,6 +734,23 @@ async fn disconnect_wallet(
     .fetch_one(&mut *tx)
     .await?;
     if !shared {
+        // An unconfirmed withdrawal may need its fee raised or its transfer
+        // sent again, which takes the key.
+        let withdrawing: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM wallet_withdrawals \
+             WHERE LOWER(wallet_address) = $1 AND status = ANY($2))",
+        )
+        .bind(&address)
+        .bind(&crate::withdrawals::UNRESOLVED_STATUSES[..])
+        .fetch_one(&mut *tx)
+        .await?;
+        if withdrawing {
+            return Err(ApiError::Conflict(
+                "A withdrawal from this wallet is not confirmed yet; disconnect it once the \
+                 withdrawal settles"
+                    .into(),
+            ));
+        }
         // Its key is about to go: the next start must not look for it.
         sqlx::query(
             "UPDATE workspaces SET trading_wallet_address = NULL \

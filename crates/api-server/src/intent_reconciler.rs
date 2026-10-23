@@ -74,9 +74,12 @@ struct Outcome {
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) = reconcile(&state).await {
-                tracing::warn!(%error, "Intent reconciliation failed; reservations retained");
-            }
+            crate::background::pass("intent reconciler", async {
+                if let Err(error) = reconcile(&state).await {
+                    tracing::warn!(%error, "Intent reconciliation failed; reservations retained");
+                }
+            })
+            .await;
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
@@ -182,17 +185,24 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         .bind(wallet).fetch_all(&state.pool).await?;
     for intent in intents {
         let id = intent.id;
+        // An order of unknown outcome holds back every live order of the
+        // wallet, and a position's order (fill-or-kill: it never rests) that
+        // stays unresolved holds the position, its exposure and its market:
+        // either is said so when it lasts, not only traced.
         let fencing = matches!(intent.status.as_str(), "submitting" | "unknown");
+        let holds_position = intent.position_id.is_some();
         let age = Utc::now() - intent.created_at;
         if let Err(error) = reconcile_one(state, intent).await {
-            // An order of unknown outcome holds back every live order of the
-            // wallet: one that stays unresolved is said so, not only traced.
-            if fencing && age > Duration::minutes(FENCE_ALERT_MINUTES) && fence_alert_due(id) {
+            if (fencing || holds_position)
+                && age > Duration::minutes(FENCE_ALERT_MINUTES)
+                && fence_alert_due(id)
+            {
                 tracing::warn!(
                     intent_id = %id,
                     minutes = age.num_minutes(),
+                    holds_position,
                     %error,
-                    "An order of unknown outcome still holds back the wallet's live orders"
+                    "An order still unresolved holds back the wallet's live orders or its position"
                 );
             } else {
                 tracing::debug!(%error, "Intent still awaiting authoritative reconciliation");
