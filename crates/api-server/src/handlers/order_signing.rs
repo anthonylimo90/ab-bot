@@ -424,10 +424,13 @@ pub async fn prepare_order(
     validate_order_terms(req.price, req.size)?;
 
     // Validate maker address
-    req.maker_address
+    let maker = req
+        .maker_address
         .parse::<Address>()
         .map_err(|_| ApiError::BadRequest("Invalid maker address".into()))?;
-    refuse_trading_wallet_maker(&state, &req.maker_address).await?;
+    // Compared in canonical form: the parse also takes forms the raw string
+    // would not match (no 0x prefix, mixed case).
+    refuse_trading_wallet_maker(&state, &maker.to_string()).await?;
     req.token_id
         .parse::<alloy_primitives::U256>()
         .map_err(|_| ApiError::BadRequest("Invalid token ID".into()))?;
