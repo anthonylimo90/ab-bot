@@ -683,8 +683,10 @@ async fn load_flow_calibration(
             FROM quant_signals qs
             JOIN positions p
               ON p.source_signal_id = qs.id
+            -- Any position the signal opened counts, including one whose
+            -- fill was settled later by the order reconciler (its signal is
+            -- never marked executed).
             WHERE qs.kind = 'flow'
-              AND qs.execution_status = 'executed'
               AND p.state = 4
               AND p.realized_pnl IS NOT NULL
               AND qs.generated_at >= $1
@@ -890,7 +892,7 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn calibration_measures_returns_on_cost_against_the_raw_edge(pool: PgPool) {
         create_calibration_tables(&pool).await;
-        let closed = |pnl: Decimal, raw_edge: f64, calibrated_edge: f64| {
+        let closed = |pnl: Decimal, raw_edge: f64, calibrated_edge: f64, status: &'static str| {
             let pool = pool.clone();
             async move {
                 let signal_id = uuid::Uuid::new_v4();
@@ -899,13 +901,14 @@ mod tests {
                 // filled and sold: the position cost $9.
                 sqlx::query(
                     "INSERT INTO quant_signals VALUES
-                     ($1, 'flow', 'buy_yes', 30, $2, 'executed', NOW())",
+                     ($1, 'flow', 'buy_yes', 30, $2, $3, NOW())",
                 )
                 .bind(signal_id)
                 .bind(serde_json::json!({
                     "raw_expected_edge_bps": raw_edge,
                     "expected_edge_bps": calibrated_edge,
                 }))
+                .bind(status)
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -922,9 +925,12 @@ mod tests {
             }
         };
         // +$0.36 on $9 is +400 bps, exactly the raw edge predicted.
-        closed(Decimal::new(36, 2), 400.0, 120.0).await;
+        closed(Decimal::new(36, 2), 400.0, 120.0, "executed").await;
+        // An entry the order reconciler settled later (its signal never
+        // marked executed) counts the same.
+        closed(Decimal::new(36, 2), 400.0, 120.0, "pending").await;
         // A resolution win the wallet could not confirm does not count.
-        let unmeasured = closed(Decimal::new(900, 2), 400.0, 120.0).await;
+        let unmeasured = closed(Decimal::new(900, 2), 400.0, 120.0, "executed").await;
         sqlx::query(
             "INSERT INTO trade_events VALUES
              ($1, 'closed_via_resolution', '{\"unmeasured\": true}')",
@@ -938,7 +944,7 @@ mod tests {
             .await
             .unwrap();
         let stats = snapshot.buy_yes.unwrap();
-        assert_eq!(stats.closed_trades, 1);
+        assert_eq!(stats.closed_trades, 2);
         assert!((stats.avg_realized_return_bps - 400.0).abs() < 1e-6);
         assert!((stats.edge_capture_ratio - 1.0).abs() < 1e-9);
     }
