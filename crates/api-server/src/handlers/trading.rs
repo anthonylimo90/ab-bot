@@ -1436,6 +1436,7 @@ mod tests {
             liquidity: Decimal::ZERO,
             end_date: None,
             resolved: false,
+            accepting_orders: None,
             resolution: None,
             category: None,
             tags: Vec::new(),

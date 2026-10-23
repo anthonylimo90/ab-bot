@@ -245,6 +245,7 @@ impl GammaMarket {
             end_date: self.end_date.and_then(|value| value.parse().ok()),
             resolved: self.closed || self.archived,
             resolution: None,
+            accepting_orders: Some(self.accepting_orders),
             category: self.category,
             tags: self.tags,
             fees_enabled: self.fees_enabled,

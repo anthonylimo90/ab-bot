@@ -957,6 +957,17 @@ impl ArbAutoExecutor {
             }
         };
         telemetry.token_lookup_ms = Some(token_lookup_started_at.elapsed().as_millis() as i64);
+        // A market that closed or stopped taking orders since it was listed
+        // takes no new pair.
+        if !self.token_cache.is_tradable(market_id).await {
+            telemetry.finish_total(&process_started_at);
+            let mut runtime = self.runtime_status.write().await;
+            runtime.record_decision(market_id, "skipped: market not accepting orders");
+            drop(runtime);
+            self.record_skip_event(&arb, execution_mode, "market_not_tradable", &telemetry)
+                .await;
+            return Ok(());
+        }
 
         // 6. Market quality check — verify orderbook depth on both sides
         let depth_check_started_at = std::time::Instant::now();

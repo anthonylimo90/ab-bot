@@ -1075,6 +1075,7 @@ impl From<ClobMarket> for Market {
                 || m.archived
                 || (!m.accepting_orders && !m.enable_order_book && !m.active),
             resolution: None,
+            accepting_orders: Some(m.accepting_orders),
             category: None,
             tags: Vec::new(),
             fees_enabled: false,

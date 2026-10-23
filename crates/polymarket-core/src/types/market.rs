@@ -17,6 +17,10 @@ pub struct Market {
     pub end_date: Option<DateTime<Utc>>,
     pub resolved: bool,
     pub resolution: Option<String>,
+    /// Whether the exchange takes orders on it now, when known: a halted
+    /// market is not resolved, yet takes none.
+    #[serde(default)]
+    pub accepting_orders: Option<bool>,
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
@@ -48,6 +52,12 @@ pub fn yes_no_indices(outcomes: &[Outcome]) -> Option<(usize, usize)> {
 }
 
 impl Market {
+    /// Whether a new position may be entered: not resolved, and not known to
+    /// refuse orders.
+    pub fn is_tradable(&self) -> bool {
+        !self.resolved && self.accepting_orders != Some(false)
+    }
+
     /// The YES and NO token ids of a binary market, under [`yes_no_indices`].
     pub fn yes_no_token_ids(&self) -> Option<(String, String)> {
         yes_no_indices(&self.outcomes).map(|(yes, no)| {
@@ -381,6 +391,7 @@ mod tests {
             end_date: None,
             resolved: false,
             resolution: None,
+            accepting_orders: None,
             category: None,
             tags: vec![],
             fees_enabled: false,
@@ -589,6 +600,7 @@ mod tests {
             end_date: None,
             resolved: false,
             resolution: None,
+            accepting_orders: None,
             category: None,
             tags: vec![],
             fees_enabled: false,

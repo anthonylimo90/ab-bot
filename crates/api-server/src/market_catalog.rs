@@ -140,10 +140,10 @@ impl OutcomeTokenCache {
             let mut recent = self.recent_hydrations.lock().await;
             recent.retain(|_, (_, observed)| *observed >= started);
             for (id, (market, _)) in recent.iter() {
-                if market.resolved {
-                    tradable_ids.remove(id);
-                } else {
+                if market.is_tradable() {
                     tradable_ids.insert(id.clone());
+                } else {
+                    tradable_ids.remove(id);
                 }
                 unique.insert(id.clone(), market.clone());
             }
@@ -270,6 +270,13 @@ impl OutcomeTokenCache {
         Ok(result)
     }
 
+    /// Whether a new position may enter the market: tradable at the last
+    /// catalog refresh or single-market read. A market read since as resolved
+    /// or not accepting orders is not, though its tokens stay cached.
+    pub(crate) async fn is_tradable(&self, market_id: &str) -> bool {
+        self.active_clob_markets.read().await.contains(market_id)
+    }
+
     /// Number of cached market → token mappings.
     pub(crate) async fn len(&self) -> usize {
         self.tokens.read().await.len()
@@ -291,15 +298,17 @@ impl OutcomeTokenCache {
         let mut tokens = self.tokens.write().await;
         let mut active_markets = self.active_clob_markets.write().await;
 
-        if market.resolved {
-            active_markets.remove(&market.id);
-            for outcome in &market.outcomes {
-                active_markets.remove(&outcome.token_id);
-            }
-        } else {
+        // The active set holds the markets a new position may enter; the
+        // tokens below are kept either way (exits and resolution need them).
+        if market.is_tradable() {
             active_markets.insert(market.id.clone());
             for outcome in &market.outcomes {
                 active_markets.insert(outcome.token_id.clone());
+            }
+        } else {
+            active_markets.remove(&market.id);
+            for outcome in &market.outcomes {
+                active_markets.remove(&outcome.token_id);
             }
         }
 
@@ -403,6 +412,7 @@ mod tests {
                 get(|| async {
                     Json(
                         serde_json::json!({"condition_id":"late","question":"Late?","active":true,
+                    "accepting_orders":true,"enable_order_book":true,
                     "tokens":[{"token_id":"3","outcome":"Yes"},{"token_id":"4","outcome":"No"}]}),
                     )
                 }),
@@ -473,5 +483,51 @@ mod tests {
         catalog.gamma_client = GammaClient::new(Some("http://127.0.0.1:0".into()));
         assert!(catalog.refresh_if_stale(Duration::ZERO).await.is_err());
         assert!(catalog.get("shared").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_halted_market_keeps_its_tokens_but_takes_no_entry() {
+        let accepting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = accepting.clone();
+        let app = Router::new().route(
+            "/markets/halted",
+            get(move || {
+                let accepting = flag.load(Ordering::SeqCst);
+                async move {
+                    Json(serde_json::json!({
+                        "condition_id":"halted","question":"Halted?","active":true,
+                        "closed":false,"enable_order_book":true,
+                        "accepting_orders":accepting,
+                        "tokens":[{"token_id":"5","outcome":"Yes"},{"token_id":"6","outcome":"No"}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let catalog = OutcomeTokenCache::new(
+            Arc::new(ClobClient::new(Some(url), None)),
+            Arc::new(RwLock::new(HashSet::new())),
+        );
+
+        // Exits still find the tokens; entries see a market that takes no orders.
+        assert_eq!(
+            catalog.hydrate_market("halted").await.unwrap(),
+            Some(("5".into(), "6".into()))
+        );
+        assert!(!catalog.is_tradable("halted").await);
+
+        // Once the exchange takes orders again, a fresh read admits entries.
+        accepting.store(true, Ordering::SeqCst);
+        catalog.refresh_market("halted").await.unwrap();
+        assert!(catalog.is_tradable("halted").await);
+
+        // And a halt read later withdraws it again.
+        accepting.store(false, Ordering::SeqCst);
+        catalog.refresh_market("halted").await.unwrap();
+        assert!(!catalog.is_tradable("halted").await);
+        assert!(catalog.get("halted").await.is_some());
+        server.abort();
     }
 }

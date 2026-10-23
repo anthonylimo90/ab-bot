@@ -1054,6 +1054,14 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   book's prices; one that would rest is refused (it used to fill at its own
   limit price, whatever the book).
 
+### Entries, access checks and monitor health
+
+- Arbitrage and quant entries skip a market that has closed or stopped
+  taking orders (`market_not_tradable`) since the last market catalog
+  refresh or single-market read; they used to buy from cached tokens until
+  the next refresh and have the order refused, or a pair left one-legged.
+  Exits still find those markets' tokens.
+
 ### API contract changes
 
 - Service status adds `live_entries_held`: why the trading process refuses

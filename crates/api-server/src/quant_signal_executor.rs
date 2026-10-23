@@ -965,6 +965,21 @@ impl QuantSignalExecutor {
             }
         };
 
+        // A market that closed or stopped taking orders since its signal was
+        // made takes no new position.
+        if !self.token_cache.is_tradable(&signal.condition_id).await {
+            self.update_signal_status(signal.id, "skipped", Some("market_not_tradable"))
+                .await;
+            self.record_signal_outcome_event(
+                &signal,
+                &execution_mode,
+                "signal_skipped",
+                Some("market_not_tradable"),
+            )
+            .await;
+            return Ok(());
+        }
+
         // Step 9: Determine which token to buy based on direction
         let (target_token_id, outcome_name) = match signal.direction {
             SignalDirection::BuyYes => (yes_token_id, "Yes"),
