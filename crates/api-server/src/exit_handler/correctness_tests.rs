@@ -2053,11 +2053,16 @@ async fn a_flow_exit_ignores_windows_from_before_the_entry_or_gone_stale(pool: P
                 .unwrap();
         }
     };
-    // Selling flow from before the entry, then from three hours ago.
+    // Selling flow from before the entry, then from three hours ago, while
+    // the entry is recent: not evidence either way.
+    p.entry_timestamp = Utc::now() - chrono::Duration::minutes(30);
     flipped(6 * 60).await;
     assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
     flipped(3 * 60).await;
     assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
+    // Five hours in with no flow measured for two windows: it dried up.
+    p.entry_timestamp = Utc::now() - chrono::Duration::hours(5);
+    assert!(h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
     // Selling flow measured ten minutes ago turns the entry's thesis.
     flipped(10).await;
     assert!(h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());

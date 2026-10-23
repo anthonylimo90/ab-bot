@@ -1686,7 +1686,12 @@ impl ExitHandler {
         .await?;
 
         let Some((imbalance_ratio,)) = latest_row else {
-            return Ok(false);
+            // No flow measured lately (a window is written only for a
+            // market that traded in it): once two windows have passed since
+            // the entry, the flow it followed has dried up.
+            let quiet_since_entry = Utc::now().signed_duration_since(position.entry_timestamp)
+                > chrono::Duration::minutes(i64::from(window_minutes) * 2);
+            return Ok(quiet_since_entry);
         };
 
         let original_sign = direction_sign(quant_ctx.direction);

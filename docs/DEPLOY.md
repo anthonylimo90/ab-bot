@@ -1119,6 +1119,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   day's closes over the saved state on every start, which could re-halt a
   strategy whose losing streak had already been reset and restarted a
   halt's cooldown. The migration marks closes made before it as counted.
+  Deploy it stop-then-start: an older process still trading after the
+  migration counts closes without marking them, and the new one would count
+  them again.
 - The order reconciler treats an order the exchange reports MATCHED as done
   even when its matched size is a rounding short of its size (it stayed
   unresolved, fencing every live order of the wallet), and measures order
@@ -1131,7 +1134,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   later (it counted only immediate fills).
 - A flow position's strategy exit reads only flow windows that ended after
   its entry and within two windows of now (it read the newest row of any
-  age, including the windows the signal was made of).
+  age, including the windows the signal was made of). No flow measured for
+  two windows since the entry (the market stopped trading) is itself an
+  exit.
 
 ### API contract changes
 
