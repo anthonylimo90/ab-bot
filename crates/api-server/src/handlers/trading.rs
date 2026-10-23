@@ -770,9 +770,7 @@ async fn apply_exchange_snapshot(
         .parse::<Decimal>()
         .map_err(|_| ApiError::ServiceUnavailable("Invalid exchange size".into()))?;
     if Some(snapshot.id.as_str()) != row.exchange_order_id.as_deref()
-        || filled < row.filled_quantity
-        || filled > row.quantity
-        || size != row.quantity
+        || !snapshot_fits(row, size, filled)
     {
         return Err(ApiError::ServiceUnavailable(
             "Exchange order does not match stored intent".into(),
@@ -780,7 +778,7 @@ async fn apply_exchange_snapshot(
     }
     let state = snapshot.state();
     let status = match state.as_str() {
-        _ if filled == row.quantity => "filled",
+        _ if snapshot_complete(row, size, filled) => "filled",
         "expired" => "expired",
         _ if snapshot.is_closed() => "cancelled",
         _ if filled > Decimal::ZERO => "partially_filled",
@@ -794,6 +792,24 @@ async fn apply_exchange_snapshot(
     sqlx::query("UPDATE orders SET status=$2, avg_fill_price=CASE WHEN $3>filled_quantity THEN NULL ELSE avg_fill_price END, filled_quantity=$3, filled_at=CASE WHEN $2='filled' THEN COALESCE(filled_at,NOW()) ELSE filled_at END, updated_at=NOW() WHERE id=$1 AND filled_quantity<=$3 AND (status NOT IN ('filled','cancelled','expired') OR $2='filled')")
         .bind(row.id).bind(status).bind(filled).execute(pool).await?;
     Ok(())
+}
+
+/// Whether an exchange snapshot of size `size`, `filled` matched, can be
+/// this manual order's. A limit order is signed for exactly its quantity; a
+/// market order's signed size is its quantity rounded as the exchange
+/// accepts it, so it is not compared. A buy may receive more shares than it
+/// asked for (the exchange passes a better price on as shares); a sell never
+/// parts with more than its quantity. Confirmed fills never go back.
+fn snapshot_fits(row: &OrderRow, size: Decimal, filled: Decimal) -> bool {
+    (row.order_type == "market" || size == row.quantity)
+        && filled >= row.filled_quantity
+        && (row.side == "buy" || filled <= row.quantity)
+}
+
+/// Whether a snapshot shows the order filled in full: all of the size the
+/// exchange holds it to, or all of its quantity.
+fn snapshot_complete(row: &OrderRow, size: Decimal, filled: Decimal) -> bool {
+    filled > Decimal::ZERO && (filled >= size || filled >= row.quantity)
 }
 
 fn parse_order_side(s: &str) -> OrderSide {
@@ -943,10 +959,11 @@ pub(crate) async fn reconcile_manual_intent(
         .fetch_one(&mut *tx)
         .await?;
     let quantity = snapshot.size_matched.parse::<Decimal>()?;
-    if row.execution_mode != "live" || quantity < row.filled_quantity || quantity > row.quantity {
+    let size = snapshot.original_size.parse::<Decimal>()?;
+    if row.execution_mode != "live" || !snapshot_fits(&row, size, quantity) {
         anyhow::bail!("Snapshot conflicts with stored manual order");
     }
-    let status = if quantity == row.quantity {
+    let status = if snapshot_complete(&row, size, quantity) {
         "filled"
     } else {
         "cancelled"

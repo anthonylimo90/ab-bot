@@ -145,7 +145,9 @@ impl OrderExecutor {
                 // identity. One the exchange refused outright is rejected; an
                 // answer that is neither a refusal nor an acceptance leaves
                 // the order's existence unknown, for the reconciler to read
-                // from the exchange under the order's own hash.
+                // from the exchange under the order's own hash. Only a
+                // submission still `submitting` takes the answer: the
+                // reconciler may have settled it from the exchange already.
                 let status = if response.refused() {
                     "rejected"
                 } else if response.unclear() {
@@ -153,7 +155,7 @@ impl OrderExecutor {
                 } else {
                     "acknowledged"
                 };
-                sqlx::query("UPDATE execution_intents SET status = $4, exchange_order_id = CASE WHEN $4 = 'unknown' THEN COALESCE(exchange_order_id, NULLIF($2, '')) ELSE COALESCE(NULLIF($2, ''), exchange_order_id) END, response = $3, updated_at = NOW() WHERE id = $1")
+                sqlx::query("UPDATE execution_intents SET status = $4, exchange_order_id = CASE WHEN $4 = 'unknown' THEN COALESCE(exchange_order_id, NULLIF($2, '')) ELSE COALESCE(NULLIF($2, ''), exchange_order_id) END, response = $3, updated_at = NOW() WHERE id = $1 AND status = 'submitting'")
                     .bind(id).bind(&response.order_id).bind(serde_json::to_value(&response)?).bind(status)
                     .execute(pool).await.map_err(|e| anyhow::anyhow!("{SUBMISSION_UNKNOWN}: acknowledgement persistence failed: {e}"))?;
                 if status == "unknown" {
@@ -174,7 +176,8 @@ impl OrderExecutor {
                 let rejected = matches!(&error, polymarket_core::Error::Api { status: Some(code), .. } if (400..500).contains(code) && *code != 408);
                 let status = if rejected { "rejected" } else { "unknown" };
                 if let Err(db_error) = sqlx::query(
-                    "UPDATE execution_intents SET status = $2, updated_at = NOW() WHERE id = $1",
+                    "UPDATE execution_intents SET status = $2, updated_at = NOW() \
+                     WHERE id = $1 AND status = 'submitting'",
                 )
                 .bind(id)
                 .bind(status)

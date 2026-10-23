@@ -1362,8 +1362,12 @@ impl OrderExecutor {
     /// rather than resting as an acknowledged order that may never be found.
     async fn mark_fok_acceptance_unresolved(&self, order_id: Uuid) -> Result<()> {
         if let Some(pool) = &self.database {
-            sqlx::query("UPDATE execution_intents SET status='unknown' WHERE id=$1")
-                .bind(order_id)
+            // Only the acknowledgement just stored: never a submission the
+            // reconciler has settled since.
+            sqlx::query(
+                "UPDATE execution_intents SET status='unknown' WHERE id=$1 AND status='acknowledged'",
+            )
+            .bind(order_id)
                 .execute(pool)
                 .await
                 .map_err(|error| {
@@ -1648,12 +1652,15 @@ impl OrderExecutor {
                     OrderSide::Buy => (taker, maker),
                     OrderSide::Sell => (maker, taker),
                 };
+                // A buy can receive more shares than it asked for: the
+                // exchange passes a better price on to the taker as shares.
+                // A sell never parts with more than it signed.
                 if filled > Decimal::ZERO
-                    && filled <= quantity
+                    && (side == OrderSide::Buy || filled <= quantity)
                     && value > Decimal::ZERO
                     && value <= filled
                 {
-                    report.status = if filled == quantity {
+                    report.status = if filled >= quantity {
                         OrderStatus::Filled
                     } else {
                         OrderStatus::PartiallyFilled
@@ -2150,6 +2157,27 @@ mod tests {
             );
             assert_eq!(report.status, expected);
             assert_eq!(report.average_price, Decimal::new(5, 1));
+        }
+        // A buy given a better price receives more shares than it asked for:
+        // filled, with every share it received. A sell never fills beyond
+        // what it signed.
+        for (side, maker, taker, expected) in [
+            (OrderSide::Buy, "5", "10.2", OrderStatus::Filled),
+            (OrderSide::Sell, "10.2", "5", OrderStatus::Pending),
+        ] {
+            let response: PostOrderResponse = serde_json::from_value(serde_json::json!({"orderID":"exchange-id","status":"matched","makingAmount":maker,"takingAmount":taker})).unwrap();
+            let report = executor.report_from_exchange_response(
+                Uuid::new_v4(),
+                "market",
+                "token",
+                side,
+                Decimal::TEN,
+                &response,
+            );
+            assert_eq!(report.status, expected);
+            if expected == OrderStatus::Filled {
+                assert_eq!(report.filled_quantity, "10.2".parse::<Decimal>().unwrap());
+            }
         }
     }
 

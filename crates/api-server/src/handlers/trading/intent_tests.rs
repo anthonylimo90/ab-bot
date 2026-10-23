@@ -155,6 +155,63 @@ async fn exchange_snapshots_record_only_confirmed_quantities_and_keep_progress(p
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_rounded_market_buy_and_a_buy_given_more_shares_count_as_filled(pool: PgPool) {
+    setup(&pool).await;
+    let reserve = |key: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut request = order();
+            request.client_order_id = Some(key.into());
+            let (id, _) =
+                reserve_order(&pool, &request, true, Some("0xreview"), Decimal::from(1000))
+                    .await
+                    .unwrap();
+            sqlx::query(
+                "UPDATE orders SET exchange_order_id='exchange-id', status='open' WHERE id=$1",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let snapshot = |size: &str, matched: &str| polymarket_core::api::clob::ExchangeOrder {
+        associate_trades: vec![],
+        id: "exchange-id".into(),
+        status: "MATCHED".into(),
+        original_size: size.into(),
+        size_matched: matched.into(),
+    };
+    // A market buy of 10, signed (as the exchange rounds it) for 9.99 shares
+    // and matched in full: filled, not cancelled.
+    let market = reserve("market-buy").await;
+    let mut row = load_order(&pool, market).await.unwrap();
+    row.order_type = "market".into();
+    apply_exchange_snapshot(&pool, &row, &snapshot("9.99", "9.99"))
+        .await
+        .unwrap();
+    assert_eq!(load_order(&pool, market).await.unwrap().status, "filled");
+    // A buy given a better price as more shares: filled, all of them kept.
+    let limit = reserve("limit-buy").await;
+    let row = load_order(&pool, limit).await.unwrap();
+    apply_exchange_snapshot(&pool, &row, &snapshot("10", "10.2"))
+        .await
+        .unwrap();
+    let stored = load_order(&pool, limit).await.unwrap();
+    assert_eq!(stored.status, "filled");
+    assert_eq!(stored.filled_quantity, "10.2".parse::<Decimal>().unwrap());
+    // A sell never parts with more than its quantity.
+    let mut sell = load_order(&pool, reserve("sell").await).await.unwrap();
+    sell.side = "sell".into();
+    assert!(
+        apply_exchange_snapshot(&pool, &sell, &snapshot("10", "10.2"))
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn an_order_closed_by_the_exchange_keeps_its_fills_and_its_close(pool: PgPool) {
     setup(&pool).await;
     for closed in [

@@ -14,6 +14,10 @@ use uuid::Uuid;
 /// A `submitting`/`unknown` intent that the exchange still has no record of
 /// after this long, and that no trade involves, was never executed.
 const ABSENCE_GRACE_MINUTES: i64 = 10;
+/// How long an order of unknown outcome may hold the wallet's live orders
+/// back before it is warned about, and how often it is warned about again.
+const FENCE_ALERT_MINUTES: i64 = 15;
+const FENCE_ALERT_REPEAT: std::time::Duration = std::time::Duration::from_secs(600);
 /// How long after its expiry a browser-wallet order of unknown outcome
 /// still fences its wallet.
 const EXPIRED_WALLET_ORDER_GRACE_SECS: i64 = 600;
@@ -31,9 +35,32 @@ struct Intent {
     side: Option<String>,
     applied_quantity: Option<Decimal>,
     has_order: bool,
+    /// The side the order was signed for (`BUY` or `SELL`).
+    signed_side: Option<String>,
     /// The order id the exchange's answer named, when it differs from the
     /// order's own hash recorded as its identity.
     named_order_id: Option<String>,
+}
+
+/// Whether an unresolved order is due another warning: the first time, then
+/// every [`FENCE_ALERT_REPEAT`].
+fn fence_alert_due(id: Uuid) -> bool {
+    static WARNED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    warned.retain(|_, at| now.duration_since(*at) < FENCE_ALERT_REPEAT * 6);
+    match warned.get(&id) {
+        Some(at) if now.duration_since(*at) < FENCE_ALERT_REPEAT => false,
+        _ => {
+            warned.insert(id, now);
+            true
+        }
+    }
 }
 
 /// Authoritative execution outcome of one exchange order.
@@ -106,6 +133,18 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     )
     .execute(&state.pool)
     .await?;
+    // A live entry stopped between reserving its position and linking its
+    // first order (a link is stored before any order is sent) never sent
+    // one and holds nothing: it has failed, and no longer counts as
+    // exposure or holds its market.
+    sqlx::query(
+        "UPDATE positions p SET state=5,version=version+1,last_updated=NOW() \
+         WHERE state=0 AND execution_mode='live' AND last_updated<NOW()-INTERVAL '5 minutes' \
+           AND held_yes_qty=0 AND held_no_qty=0 AND exited_yes_qty=0 AND exited_no_qty=0 \
+           AND NOT EXISTS(SELECT 1 FROM position_order_links l WHERE l.position_id=p.id)",
+    )
+    .execute(&state.pool)
+    .await?;
     // Paper fills are simulated synchronously and leave no order links, so a
     // paper entry or exit still in flight after five minutes was interrupted.
     sqlx::query(
@@ -124,12 +163,25 @@ pub async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     };
     // Every intent of the trading wallet is reconciled, including orphan
     // inventory sells that have neither a position link nor an order row.
-    let intents: Vec<Intent> = sqlx::query_as("SELECT i.id,i.status,i.created_at,i.exchange_order_id,i.response->>'orderID' AS named_order_id,i.signed_order->>'maker' AS maker,i.signed_order->>'tokenId' AS token_id,l.position_id,l.leg,l.side,l.applied_quantity,EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AS has_order FROM execution_intents i LEFT JOIN position_order_links l ON l.id=i.id WHERE LOWER(i.signed_order->>'maker')=LOWER($1) AND i.status IN ('submitting','unknown','acknowledged') AND i.updated_at<NOW()-INTERVAL '30 seconds' AND (l.id IS NULL OR NOT l.settled) ORDER BY CASE WHEN i.status IN ('submitting','unknown') THEN 0 WHEN l.id IS NOT NULL THEN 1 ELSE 2 END,i.updated_at,i.id LIMIT 100")
+    let intents: Vec<Intent> = sqlx::query_as("SELECT i.id,i.status,i.created_at,i.exchange_order_id,i.response->>'orderID' AS named_order_id,i.signed_order->>'maker' AS maker,i.signed_order->>'tokenId' AS token_id,l.position_id,l.leg,l.side,l.applied_quantity,EXISTS(SELECT 1 FROM orders o WHERE o.id=i.id) AS has_order,i.signed_order->>'side' AS signed_side FROM execution_intents i LEFT JOIN position_order_links l ON l.id=i.id WHERE LOWER(i.signed_order->>'maker')=LOWER($1) AND i.status IN ('submitting','unknown','acknowledged') AND i.updated_at<NOW()-INTERVAL '30 seconds' AND (l.id IS NULL OR NOT l.settled) ORDER BY CASE WHEN i.status IN ('submitting','unknown') THEN 0 WHEN l.id IS NOT NULL THEN 1 ELSE 2 END,i.updated_at,i.id LIMIT 100")
         .bind(wallet).fetch_all(&state.pool).await?;
     for intent in intents {
         let id = intent.id;
+        let fencing = matches!(intent.status.as_str(), "submitting" | "unknown");
+        let age = Utc::now() - intent.created_at;
         if let Err(error) = reconcile_one(state, intent).await {
-            tracing::debug!(%error, "Intent still awaiting authoritative reconciliation");
+            // An order of unknown outcome holds back every live order of the
+            // wallet: one that stays unresolved is said so, not only traced.
+            if fencing && age > Duration::minutes(FENCE_ALERT_MINUTES) && fence_alert_due(id) {
+                tracing::warn!(
+                    intent_id = %id,
+                    minutes = age.num_minutes(),
+                    %error,
+                    "An order of unknown outcome still holds back the wallet's live orders"
+                );
+            } else {
+                tracing::debug!(%error, "Intent still awaiting authoritative reconciliation");
+            }
             // Rotate resting orders and unavailable snapshots through the queue;
             // this is a polling timestamp, never a release of their reservation.
             sqlx::query("UPDATE execution_intents SET updated_at=NOW() WHERE id=$1 AND status IN ('submitting','unknown','acknowledged')")
@@ -178,10 +230,17 @@ async fn reconcile_one(state: &AppState, intent: Intent) -> anyhow::Result<()> {
             }
             let filled = snapshot.size_matched.parse::<Decimal>()?;
             let original = snapshot.original_size.parse::<Decimal>()?;
-            if original <= Decimal::ZERO || filled < Decimal::ZERO || filled > original {
+            // A buy may receive more shares than it signed for (the
+            // exchange passes a better price on as shares); a sell never.
+            let buying = intent
+                .signed_side
+                .as_deref()
+                .is_some_and(|side| side.eq_ignore_ascii_case("buy"));
+            if original <= Decimal::ZERO || filled < Decimal::ZERO || (filled > original && !buying)
+            {
                 anyhow::bail!("Invalid fill quantity");
             }
-            let terminal = filled == original || snapshot.is_closed();
+            let terminal = filled >= original || snapshot.is_closed();
             if !terminal {
                 // The exchange holds the order, so it is no longer in doubt:
                 // a manual order, whose row keeps its cash reserved, stops
@@ -622,9 +681,10 @@ mod tests {
             sqlx::query("INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity) VALUES($1,$2,$3,$4,10)")
                 .bind(id).bind(position_id).bind(leg).bind(side).execute(pool).await.unwrap();
         }
+        let side = position.map_or("BUY".to_string(), |(_, _, side)| side.to_uppercase());
         sqlx::query("INSERT INTO execution_intents(id,market_id,exchange_order_id,signed_order,status,created_at,updated_at) VALUES($1,'market','exchange',$2,$3,NOW()-make_interval(mins=>$4::int),NOW()-make_interval(mins=>$4::int))")
             .bind(id)
-            .bind(serde_json::json!({"maker": maker, "tokenId": "token"}))
+            .bind(serde_json::json!({"maker": maker, "tokenId": "token", "side": side}))
             .bind(status)
             .bind(age_minutes as i32)
             .execute(pool)
@@ -667,6 +727,75 @@ mod tests {
             (stored.held_yes_qty, stored.held_no_qty),
             (Decimal::TEN, Decimal::TEN)
         );
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_buy_given_more_shares_than_it_signed_for_keeps_them_all(pool: PgPool) {
+        // The exchange passed a better price on as shares: 10.2 for 10.
+        let (clob, server) = exchange(
+            Some(serde_json::json!({"id":"exchange","status":"MATCHED","original_size":"10","size_matched":"10.2","associate_trades":["trade"]})),
+            serde_json::json!([{"id":"trade","taker_order_id":"exchange","status":"CONFIRMED","size":"10.2","price":"0.49"}]),
+        )
+        .await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let mut position = live_position(&state, &maker, 48, 49).await;
+        position.held_yes_qty = "10.2".parse().unwrap();
+        state
+            .position_service
+            .repo()
+            .update(&mut position)
+            .await
+            .unwrap();
+        let intent = journal(
+            &pool,
+            &maker,
+            Some((position.id, "no", "buy")),
+            "unknown",
+            1,
+        )
+        .await;
+
+        reconcile(&state).await.unwrap();
+
+        let stored = state.position_service.load(position.id).await.unwrap();
+        assert_eq!(stored.held_no_qty, "10.2".parse::<Decimal>().unwrap());
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(intent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "reconciled");
+        server.abort();
+    }
+
+    #[test]
+    fn an_unresolved_order_is_warned_about_once_then_every_ten_minutes() {
+        let id = Uuid::new_v4();
+        assert!(fence_alert_due(id));
+        assert!(!fence_alert_due(id));
+        assert!(fence_alert_due(Uuid::new_v4()));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_live_entry_that_never_linked_an_order_fails(pool: PgPool) {
+        let (clob, server) = exchange(None, serde_json::json!([])).await;
+        let (state, maker) = live_state(&pool, clob).await;
+        let stalled = live_position(&state, &maker, 48, 49).await;
+        let fresh = live_position(&state, &maker, 48, 49).await;
+        sqlx::query("UPDATE positions SET last_updated=NOW()-INTERVAL '10 minutes' WHERE id=$1")
+            .bind(stalled.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        reconcile(&state).await.unwrap();
+        let load = |id| state.position_service.load(id);
+        assert_eq!(
+            load(stalled.id).await.unwrap().state,
+            PositionState::EntryFailed
+        );
+        // One just reserved may still be linking its first order.
+        assert_eq!(load(fresh.id).await.unwrap().state, PositionState::Pending);
         server.abort();
     }
 
