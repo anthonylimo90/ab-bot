@@ -18,13 +18,6 @@ export function isArbitrageActivity(activity: ActivityLike) {
   );
 }
 
-export function isRiskActivity(activity: ActivityLike) {
-  return (
-    activity.type === "STOP_LOSS_TRIGGERED" ||
-    activity.type === "TAKE_PROFIT_TRIGGERED"
-  );
-}
-
 export function isFailedActivity(activity: ActivityLike) {
   return (
     activity.type === "ARB_EXECUTION_FAILED" ||

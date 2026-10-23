@@ -213,7 +213,6 @@ test('risk status parsers convert Decimal fields and map a missing recovery_stat
       consecutive_losses: 1, trips_today: 0,
       config: { max_daily_loss: '2500', max_drawdown_pct: '0.20', max_consecutive_losses: 8, cooldown_minutes: 30, enabled: true },
     },
-    stop_loss: { total_rules: 0, active_rules: 0, executed_rules: 0, fixed_stops: 0, percentage_stops: 0, trailing_stops: 0, time_based_stops: 0, recent_executions: [] },
   });
   const cb = status.circuit_breaker;
   assert.equal(cb.daily_pnl, -125.5);
@@ -227,7 +226,6 @@ test('risk status parsers convert Decimal fields and map a missing recovery_stat
   assert.equal(cb.config.max_daily_loss, 2500);
   assert.equal(cb.config.max_drawdown_pct, 0.2);
   assert.equal(cb.config.max_consecutive_losses, 8);
-  assert.equal(status.stop_loss.total_rules, 0);
 });
 
 test('parseCircuitBreakerStatus converts recovery state decimals', () => {

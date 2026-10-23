@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
-import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { LiveIndicator, anyStale } from "@/components/shared/LiveIndicator";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { PageIntro } from "@/components/shared/PageIntro";
 import {
@@ -429,9 +429,10 @@ export default function LearningLoopPage() {
     };
   }, [windowKey]);
 
-  const { data, isLoading } = useLearningOverviewQuery(params);
-  const { data: rolloutDetail, isLoading: isRolloutDetailLoading } =
-    useLearningRolloutDetailQuery(selectedRolloutId, { limit: 24 });
+  const overviewQuery = useLearningOverviewQuery(params);
+  const { data, isLoading } = overviewQuery;
+  const rolloutDetailQuery = useLearningRolloutDetailQuery(selectedRolloutId, { limit: 24 });
+  const { data: rolloutDetail, isLoading: isRolloutDetailLoading } = rolloutDetailQuery;
   const createModelMutation = useCreateLearningModelMutation();
   const updateModelMutation = useUpdateLearningModelMutation();
   const createRolloutMutation = useCreateLearningRolloutMutation();
@@ -635,7 +636,7 @@ export default function LearningLoopPage() {
             </p>
           </div>
         </div>
-        <LiveIndicator />
+        <LiveIndicator stale={anyStale(overviewQuery, rolloutDetailQuery)} />
       </div>
 
       <PageIntro

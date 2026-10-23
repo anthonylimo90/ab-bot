@@ -1042,12 +1042,6 @@ class ApiClient {
     return parseWorkspace(raw);
   }
 
-  async switchWorkspace(workspaceId: string): Promise<void> {
-    return this.request<void>(`/api/v1/workspaces/${workspaceId}/switch`, {
-      method: "POST",
-    });
-  }
-
   async listWorkspaceMembers(workspaceId: string): Promise<WorkspaceMember[]> {
     return this.request<WorkspaceMember[]>(
       `/api/v1/workspaces/${workspaceId}/members`,

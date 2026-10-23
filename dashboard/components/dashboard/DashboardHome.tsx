@@ -17,14 +17,13 @@ import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
 import { PageIntro } from "@/components/shared/PageIntro";
 import { Badge } from "@/components/ui/badge";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
-import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { LiveIndicator, anyStale } from "@/components/shared/LiveIndicator";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { PortfolioChart } from "@/components/charts/PortfolioChart";
 import {
   Activity,
   ArrowRight,
-  TrendingDown,
   Zap,
   DollarSign,
   CheckCircle2,
@@ -44,7 +43,6 @@ import {
 import { TimeAgo } from "@/components/shared/TimeAgo";
 
 const activityIcons: Record<string, React.ReactNode> = {
-  STOP_LOSS_TRIGGERED: <TrendingDown className="h-4 w-4 text-loss" />,
   ARBITRAGE_DETECTED: <Zap className="h-4 w-4 text-yellow-500" />,
   ARB_POSITION_OPENED: <DollarSign className="h-4 w-4 text-profit" />,
   ARB_POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
@@ -66,7 +64,6 @@ const STRATEGY_PNL_LABELS: Record<string, string> = {
 };
 
 const activityLabels: Record<string, string> = {
-  STOP_LOSS_TRIGGERED: "Stop Loss Triggered",
   ARBITRAGE_DETECTED: "Arbitrage Found",
   ARB_POSITION_OPENED: "Arbitrage Opened",
   ARB_POSITION_CLOSED: "Arbitrage Closed",
@@ -81,28 +78,36 @@ const activityLabels: Record<string, string> = {
 
 export function DashboardHome() {
   const { currentWorkspace } = useWorkspaceStore();
-  const { data: positionsSummary } = usePositionsSummaryQuery();
-  const { data: accountSummary } = useAccountSummaryQuery(currentWorkspace?.id);
-  const { data: accountHistory } = useAccountHistoryQuery(currentWorkspace?.id, {
+  const positionsSummaryQuery = usePositionsSummaryQuery();
+  const positionsSummary = positionsSummaryQuery.data;
+  const accountSummaryQuery = useAccountSummaryQuery(currentWorkspace?.id);
+  const accountSummary = accountSummaryQuery.data;
+  const accountHistoryQuery = useAccountHistoryQuery(currentWorkspace?.id, {
     hours: 24,
     limit: 288,
   });
+  const accountHistory = accountHistoryQuery.data;
   const {
     data: riskStatus,
     isPending: riskPending,
     isError: riskFailed,
   } = useRiskStatusQuery(currentWorkspace?.id);
-  const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
-  const { data: tradeFlowSummary } = useTradeFlowSummaryQuery({ limit: 100 });
+  const dynamicTunerQuery = useDynamicTunerQuery(currentWorkspace?.id);
+  const dynamicTunerStatus = dynamicTunerQuery.data;
+  const tradeFlowQuery = useTradeFlowSummaryQuery({ limit: 100 });
+  const tradeFlowSummary = tradeFlowQuery.data;
   // As the server applies the switches: the environment can hold either on.
   // Until its switches are read, "off in the workspace" is not "paused".
-  const { liveTrading, arbAutoExecute, environmentKnown } = useTradingSwitches();
+  const { liveTrading, arbAutoExecute, environmentKnown, serviceStatus } = useTradingSwitches();
   const switchesOff = Boolean(currentWorkspace) && !liveTrading && !arbAutoExecute;
   const isTradingManuallyPaused = switchesOff && environmentKnown;
   const switchesUnknown = switchesOff && !environmentKnown;
   // Holds the server keeps on new entries whatever the breaker says
   // (settings it cannot read, closes not yet counted).
   const entryHolds = riskStatus?.circuit_breaker?.entry_holds ?? [];
+  // New live entries the trading process refuses whatever the switches say
+  // (exits it cannot run or that keep failing).
+  const liveEntriesHeld = serviceStatus?.live_entries_held ?? null;
   const breaker = riskStatus?.circuit_breaker;
   const isHardKilled = breaker?.tripped === true && breaker.trip_reason === "hard_kill_switch";
   // A switched-off breaker stops its limits, not a latched trip (the hard
@@ -127,6 +132,13 @@ export function DashboardHome() {
           variant: "destructive" as const,
           className: "text-xs",
           tooltip: `New entries are held whatever the circuit breaker says: ${entryHolds.join("; ")}. Exits still run.`,
+        }
+    : liveEntriesHeld
+      ? {
+          label: "Live entries held",
+          variant: "destructive" as const,
+          className: "text-xs",
+          tooltip: `New live entries wait: ${liveEntriesHeld}.`,
         }
     : isCircuitBreakerPaused
       ? {
@@ -238,7 +250,15 @@ export function DashboardHome() {
               Monitor your portfolio and trading activity
             </p>
           </div>
-          <LiveIndicator />
+          <LiveIndicator
+            stale={anyStale(
+              positionsSummaryQuery,
+              accountSummaryQuery,
+              accountHistoryQuery,
+              dynamicTunerQuery,
+              tradeFlowQuery,
+            )}
+          />
         </div>
       </div>
 

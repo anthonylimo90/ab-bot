@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
-import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { LiveIndicator, anyStale } from "@/components/shared/LiveIndicator";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { PageIntro } from "@/components/shared/PageIntro";
 import { useArbExecutionTelemetryQuery } from "@/hooks/queries/useTradeFlowQuery";
@@ -81,7 +81,8 @@ export default function ArbTelemetryPage() {
     };
   }, [windowKey]);
 
-  const { data, isLoading } = useArbExecutionTelemetryQuery(params);
+  const telemetryQuery = useArbExecutionTelemetryQuery(params);
+  const { data, isLoading } = telemetryQuery;
 
   const sortedLatency = useMemo(() => {
     if (!data) return [];
@@ -105,7 +106,7 @@ export default function ArbTelemetryPage() {
             </p>
           </div>
         </div>
-        <LiveIndicator />
+        <LiveIndicator stale={anyStale(telemetryQuery)} />
       </div>
 
       <PageIntro

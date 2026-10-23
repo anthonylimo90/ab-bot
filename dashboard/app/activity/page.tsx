@@ -7,11 +7,10 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { PageIntro } from "@/components/shared/PageIntro";
 import { useActivity } from "@/hooks/useActivity";
-import { isArbitrageActivity, isRiskActivity } from "@/lib/activity";
+import { isArbitrageActivity } from "@/lib/activity";
 import { formatTimeAgo, cn } from "@/lib/utils";
 import {
   Zap,
-  TrendingDown,
   Activity,
   XCircle,
   DollarSign,
@@ -26,8 +25,6 @@ const activityIcons: Record<string, React.ReactNode> = {
   TRADE_EXECUTED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
   TRADE_FAILED: <XCircle className="h-4 w-4 text-red-500" />,
   TRADE_PENDING: <Activity className="h-4 w-4 text-muted-foreground" />,
-  STOP_LOSS_TRIGGERED: <TrendingDown className="h-4 w-4 text-loss" />,
-  TAKE_PROFIT_TRIGGERED: <CheckCircle2 className="h-4 w-4 text-profit" />,
   ARBITRAGE_DETECTED: <Zap className="h-4 w-4 text-yellow-500" />,
   ARB_POSITION_OPENED: <DollarSign className="h-4 w-4 text-profit" />,
   ARB_POSITION_CLOSED: <CheckCircle2 className="h-4 w-4 text-blue-500" />,
@@ -41,8 +38,6 @@ const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
   TRADE_EXECUTED: "Trade Executed",
   TRADE_FAILED: "Trade Failed",
   TRADE_PENDING: "Trade Pending",
-  STOP_LOSS_TRIGGERED: "Stop Loss Triggered",
-  TAKE_PROFIT_TRIGGERED: "Take Profit Triggered",
   ARBITRAGE_DETECTED: "Arbitrage Found",
   ARB_POSITION_OPENED: "Arbitrage Opened",
   ARB_POSITION_CLOSED: "Arbitrage Closed",
@@ -50,7 +45,7 @@ const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
   ARB_EXIT_FAILED: "Exit Failed",
 };
 
-type ActivityFilter = "all" | "Arbitrage" | "StopLoss";
+type ActivityFilter = "all" | "Arbitrage";
 
 export default function ActivityPage() {
   const { activities, status, markAsRead } = useActivity();
@@ -61,13 +56,7 @@ export default function ActivityPage() {
   }, [markAsRead]);
 
   const filtered =
-    filter === "all"
-      ? activities
-      : activities.filter((activity) =>
-          filter === "Arbitrage"
-            ? isArbitrageActivity(activity)
-            : isRiskActivity(activity),
-        );
+    filter === "all" ? activities : activities.filter(isArbitrageActivity);
 
   return (
     <div className="space-y-5 sm:space-y-6">
@@ -92,7 +81,7 @@ export default function ActivityPage() {
         bullets={[
           "Use this page to understand what the system just did in time order.",
           "Arbitrage events are trade opportunities and executions.",
-          "Stop loss and take profit events show when the system exited to protect gains or limit losses."
+          "Failed entries and exits are listed as they happen."
         ]}
       />
 
@@ -104,7 +93,6 @@ export default function ActivityPage() {
           <TabsList className="w-max min-w-full sm:w-auto">
             <TabsTrigger value="all">All</TabsTrigger>
             <TabsTrigger value="Arbitrage">Arbitrage</TabsTrigger>
-            <TabsTrigger value="StopLoss">Stop Loss</TabsTrigger>
           </TabsList>
         </div>
 

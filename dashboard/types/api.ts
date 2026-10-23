@@ -454,8 +454,6 @@ export type ActivityType =
   | "TRADE_EXECUTED"
   | "TRADE_FAILED"
   | "TRADE_PENDING"
-  | "STOP_LOSS_TRIGGERED"
-  | "TAKE_PROFIT_TRIGGERED"
   | "ARBITRAGE_DETECTED"
   | "ARB_POSITION_OPENED"
   | "ARB_POSITION_CLOSED"
@@ -1074,6 +1072,10 @@ export interface ServiceStatus {
   arb_executor: ServiceStatusItem;
   exit_handler: ServiceStatusItem;
   live_trading: ServiceStatusItem;
+  /** Why new live entries wait now whatever the switches say (exit handler
+   * off or not running, live exits failing); null when they do not, or
+   * when the answering server does not trade. */
+  live_entries_held?: string | null;
   strategy_modes: StrategyModeStatus[];
   /** Switches the server's environment turns on: they stay on whatever the workspace says. */
   environment_switches: EnvironmentSwitches;
@@ -1282,28 +1284,8 @@ export interface CircuitBreakerStatus {
   entry_holds?: string[];
 }
 
-export interface RecentStopExecution {
-  id: string;
-  position_id: string;
-  market_id: string;
-  stop_type: string;
-  executed_at: string;
-}
-
-export interface StopLossStats {
-  total_rules: number;
-  active_rules: number;
-  executed_rules: number;
-  fixed_stops: number;
-  percentage_stops: number;
-  trailing_stops: number;
-  time_based_stops: number;
-  recent_executions: RecentStopExecution[];
-}
-
 export interface RiskStatus {
   circuit_breaker: CircuitBreakerStatus;
-  stop_loss: StopLossStats;
 }
 
 // Quant Signal types

@@ -323,7 +323,7 @@ export default function SettingsPage() {
     setIsTrippingCb(true);
     try {
       await api.manualTripCircuitBreaker(currentWorkspace.id);
-      toast.success('Circuit breaker tripped', 'All automated trading has been paused');
+      toast.success('Circuit breaker tripped', 'New entries are stopped; exits and manual sales continue');
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
@@ -964,7 +964,10 @@ export default function SettingsPage() {
               <p className="text-xs text-muted-foreground">
                 Needed for wallet monitoring and blockchain operations. Accepted providers:
                 Alchemy, Infura, Ankr, Polygon, LlamaRPC, DRPC, PublicNode, 1RPC,
-                Tenderly, Particle Network.
+                Tenderly, Particle Network. The server&apos;s own POLYGON_RPC_URL (or
+                ALCHEMY_API_KEY) takes precedence when set, and approvals and the
+                collateral sweeper read their connection at start: a change here
+                applies to them after a restart.
               </p>
             </div>
 
@@ -1217,7 +1220,7 @@ export default function SettingsPage() {
                       <InfoTooltip content="If losses for the day pass this amount, the system pauses automated trading." />
                     </p>
                     <p className="text-sm text-muted-foreground">
-                      Pause automated trading when daily losses pass this amount
+                      Stop new entries when the day&apos;s losses pass this amount
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1336,7 +1339,7 @@ export default function SettingsPage() {
                     <div className="flex gap-2">
                       <ConfirmAction
                         title="Trip the circuit breaker?"
-                        description="All automated trading stops at once and stays stopped until the breaker is reset."
+                        description="New entries stop at once and stay stopped until the breaker is reset. Exits and manual sales continue."
                         confirmLabel="Trip Circuit Breaker"
                         destructive
                         onConfirm={handleTripCircuitBreaker}

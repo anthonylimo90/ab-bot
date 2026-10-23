@@ -222,7 +222,7 @@ export function Header() {
     description: isTradingActive
       ? environmentHold
         ? `Switches off what this workspace holds on. ${environmentHold} To stop new entries at once, trip the circuit breaker on the Risk page (a trip does not stop exits or manual sales).`
-        : "Live trading and arb execution are switched off for this workspace. To stop new entries at once, trip the circuit breaker on the Risk page (a trip does not stop exits or manual sales)."
+        : "Live trading and arb execution are switched off for this workspace: no new live entries. Open live positions keep exiting. To stop new entries at once, trip the circuit breaker on the Risk page (a trip does not stop exits or manual sales)."
       : "Arbitrage resumes on paper: live trading stays off in this workspace's settings.",
     confirmLabel: isTradingActive ? "Pause" : "Resume",
   };

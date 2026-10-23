@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { MetricCard } from "@/components/shared/MetricCard";
-import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { LiveIndicator, anyStale } from "@/components/shared/LiveIndicator";
 import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
@@ -33,7 +33,8 @@ export default function TunerPage() {
   const { currentWorkspace } = useWorkspaceStore();
   const workspaceId = currentWorkspace?.id;
 
-  const { data: tuner, isLoading } = useDynamicTunerQuery(workspaceId);
+  const tunerQuery = useDynamicTunerQuery(workspaceId);
+  const { data: tuner, isLoading } = tunerQuery;
   const oppMutation = useUpdateOpportunitySelectionMutation(workspaceId);
   const arbMutation = useUpdateArbExecutorMutation(workspaceId);
 
@@ -119,7 +120,7 @@ export default function TunerPage() {
           </div>
           <div className="flex items-center gap-3">
             <MarketRegimeBadge />
-            <LiveIndicator />
+            <LiveIndicator stale={anyStale(tunerQuery)} />
           </div>
         </div>
 

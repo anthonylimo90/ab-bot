@@ -21,7 +21,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { MetricCard } from "@/components/shared/MetricCard";
-import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { LiveIndicator, anyStale } from "@/components/shared/LiveIndicator";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { PageIntro } from "@/components/shared/PageIntro";
 import {
@@ -115,8 +115,10 @@ export default function RiskPage() {
     fetchStatus: riskFetchStatus,
     dataUpdatedAt,
   } = useRiskStatusQuery(workspaceId);
-  const { data: serviceStatus } = useServiceStatusQuery(workspaceId);
-  const { data: dynamicTunerStatus } = useDynamicTunerQuery(workspaceId);
+  const serviceStatusQuery = useServiceStatusQuery(workspaceId);
+  const serviceStatus = serviceStatusQuery.data;
+  const dynamicTunerQuery = useDynamicTunerQuery(workspaceId);
+  const dynamicTunerStatus = dynamicTunerQuery.data;
 
   const tripMutation = useManualTripMutation(workspaceId);
   const resetMutation = useResetCircuitBreakerMutation(workspaceId);
@@ -187,7 +189,8 @@ export default function RiskPage() {
             </div>
           </div>
           {cb && !halted && !stale && (
-            <LiveIndicator />
+            // The service pills and thresholds below come from these.
+            <LiveIndicator stale={anyStale(serviceStatusQuery, dynamicTunerQuery)} />
           )}
           {halted && (
             <div className="flex items-center gap-1.5">

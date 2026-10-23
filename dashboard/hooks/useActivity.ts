@@ -110,10 +110,6 @@ export function ActivityProvider({
       case "ARB_EXIT_FAILED":
         toast.error("Trading Error", activity.message);
         break;
-      case "STOP_LOSS_TRIGGERED":
-      case "TAKE_PROFIT_TRIGGERED":
-        toast.warning("Risk Alert", activity.message);
-        break;
     }
   }, []);
 

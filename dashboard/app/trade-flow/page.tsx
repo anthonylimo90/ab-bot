@@ -6,7 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { PageIntro } from "@/components/shared/PageIntro";
-import { LiveIndicator } from "@/components/shared/LiveIndicator";
+import { LiveIndicator, anyStale } from "@/components/shared/LiveIndicator";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { useTradeFlowJourneysQuery, useTradeFlowSummaryQuery } from "@/hooks/queries/useTradeFlowQuery";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -99,14 +99,16 @@ export default function TradeFlowPage() {
     setLiveEvents([]);
   }, [strategy]);
 
-  const { data: summary, isLoading: summaryLoading } = useTradeFlowSummaryQuery({
+  const summaryQuery = useTradeFlowSummaryQuery({
     strategy: queryStrategy,
     limit: 100,
   });
-  const { data: journeys = [], isLoading: journeysLoading } = useTradeFlowJourneysQuery({
+  const { data: summary, isLoading: summaryLoading } = summaryQuery;
+  const journeysQuery = useTradeFlowJourneysQuery({
     strategy: queryStrategy,
     limit: 100,
   });
+  const { data: journeys = [], isLoading: journeysLoading } = journeysQuery;
 
   const metrics = useMemo(() => {
     if (!summary) {
@@ -169,7 +171,7 @@ export default function TradeFlowPage() {
             </p>
           </div>
         </div>
-        <LiveIndicator />
+        <LiveIndicator stale={anyStale(summaryQuery, journeysQuery)} />
       </div>
 
       <PageIntro

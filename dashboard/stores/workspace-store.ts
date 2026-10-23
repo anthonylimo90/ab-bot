@@ -16,7 +16,6 @@ interface WorkspaceStore {
   fetchWorkspaces: () => Promise<void>;
   fetchCurrentWorkspace: () => Promise<void>;
   refreshCurrentWorkspace: () => Promise<void>;
-  switchWorkspace: (workspaceId: string) => Promise<void>;
   setCurrentWorkspace: (workspace: Workspace | null) => void;
   reset: () => void;
 }
@@ -109,26 +108,6 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
         }
       },
 
-      switchWorkspace: async (workspaceId: string) => {
-        set({ isLoading: true, error: null });
-        try {
-          await api.switchWorkspace(workspaceId);
-          // Fetch the new current workspace details
-          const workspace = await api.getWorkspace(workspaceId);
-          set((state) => ({
-            currentWorkspace: workspace,
-            workspaceVersion: state.workspaceVersion + 1,
-            isLoading: false,
-          }));
-        } catch (err) {
-          set({
-            error:
-              err instanceof Error ? err.message : "Failed to switch workspace",
-            isLoading: false,
-          });
-          throw err;
-        }
-      },
 
       setCurrentWorkspace: (workspace) => {
         set((state) => ({
