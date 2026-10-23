@@ -328,6 +328,14 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         // Resolve encryption key for sensitive DB fields
         let encryption_key = std::env::var("ENCRYPTION_KEY").unwrap_or_else(|_| jwt_secret.clone());
+        if encryption_key.trim().is_empty() {
+            // Kept as is: secrets already saved under it must still decrypt.
+            tracing::error!(
+                "ENCRYPTION_KEY is set but empty: saved workspace secrets (RPC URLs, API keys) \
+                 are encrypted under an empty key. Set it to a long random value, or unset it, \
+                 and enter those secrets again."
+            );
+        }
 
         // Create JWT auth handler
         let jwt_config = JwtConfig {
@@ -378,9 +386,7 @@ impl AppState {
         let clob_client = Arc::new(ClobClient::new(clob_url, None));
 
         // Create order executor
-        let live_trading_env = std::env::var("LIVE_TRADING")
-            .map(|v| v == "true")
-            .unwrap_or(false);
+        let live_trading_env = polymarket_core::config::env_switch("LIVE_TRADING");
         let live_trading_workspace = match crate::runtime_sync::canonical_workspace_live_enabled(
             &pool,
         )
@@ -736,8 +742,6 @@ impl AppState {
     }
 }
 
-/// Send the Polymarket approvals the trading wallet lacks (the caller holds
-/// its spend lock), then have the exchange re-read its allowances.
 /// Load the trading signer (the configured or pinned wallet's key and its
 /// exchange credentials) and, once it is loaded, set the wallet's exchange
 /// approvals and start the collateral sweeper (once per process). A signer
@@ -820,8 +824,11 @@ pub(crate) async fn initialize_trading_signer(
             })
             .or(workspace_rpc)
             .unwrap_or_else(|| {
-                tracing::warn!(
-                    "No Polygon RPC configured; approvals and wraps use the public endpoint"
+                tracing::error!(
+                    "No Polygon RPC configured (POLYGON_RPC_URL, ALCHEMY_API_KEY or the \
+                     workspace's): approvals and wraps use the public endpoint, but the account \
+                     cannot be valued, so the circuit breaker trips on connectivity after three \
+                     snapshots"
                 );
                 "https://polygon-rpc.com".to_string()
             });
@@ -940,12 +947,19 @@ const SIGNER_KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// fails until a restart.
 pub fn spawn_signer_keeper(state: Arc<AppState>) {
     tokio::spawn(async move {
+        // Said when the signer first goes missing and every ten minutes after,
+        // not on every try.
+        let mut tries: u64 = 0;
         loop {
             tokio::time::sleep(SIGNER_KEEPER_INTERVAL).await;
             if !state.order_executor.is_live() || state.order_executor.is_live_ready().await {
+                tries = 0;
                 continue;
             }
-            tracing::warn!("Live trading is on without a loaded trading signer; loading it");
+            if tries.is_multiple_of(20) {
+                tracing::warn!("Live trading is on without a loaded trading signer; loading it");
+            }
+            tries += 1;
             if let Err(error) = initialize_trading_signer(
                 &state.pool,
                 &state.key_vault,
@@ -960,6 +974,8 @@ pub fn spawn_signer_keeper(state: Arc<AppState>) {
     });
 }
 
+/// Send the Polymarket approvals the trading wallet lacks (the caller holds
+/// its spend lock), then have the exchange re-read its allowances.
 async fn set_approvals(wallet: &TradingWallet, rpc_url: &str, executor: &OrderExecutor) {
     let signer = wallet.signer();
     match polymarket_core::api::approvals::ensure_polymarket_approvals(signer, rpc_url).await {

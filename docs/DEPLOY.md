@@ -147,7 +147,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    DATABASE_URL=${{TimescaleDB.DATABASE_URL}}
    REDIS_URL=${{Redis.REDIS_URL}}
    DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
-   RUST_LOG=info,arb_monitor=debug
+   RUST_LOG=arb_monitor=info,polymarket_core=warn
    POLYMARKET_CLOB_URL=https://clob.polymarket.com
    ```
 
@@ -216,7 +216,7 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 | `DATABASE_URL` | TimescaleDB connection | `${{TimescaleDB.DATABASE_URL}}` |
 | `REDIS_URL` | Redis connection | `${{Redis.REDIS_URL}}` |
 | `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
-| `RUST_LOG` | Log level | `info,arb_monitor=debug` |
+| `RUST_LOG` | Log level (debug floods Railway's log limit) | `arb_monitor=info,polymarket_core=warn` |
 | `POLYMARKET_CLOB_URL` | Polymarket API | `https://clob.polymarket.com` |
 
 ### Dashboard
@@ -391,8 +391,16 @@ Railway supports multiple environments within a single project, allowing you to 
    | api-server | `DATABASE_URL` | `${{TimescaleDB.DATABASE_URL}}` |
    | api-server | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
    | api-server | `JWT_SECRET` | New unique 32+ char secret |
-   | api-server | `RUST_LOG` | `debug,api_server=debug` |
+   | api-server | `RUST_LOG` | `api_server=debug,tower_http=error,polymarket_core=warn,sqlx=warn` |
    | dashboard | `NEXT_PUBLIC_API_URL` | `https://<staging-api>.railway.app` |
+
+5. **Keep staging off the production wallet.** The trading lock is held
+   in each environment's own database, so a staging deployment with the
+   production signer would trade the same wallet beside production, under
+   its own circuit breaker. In staging, unset (or point at a separate test
+   wallet) `WALLET_PRIVATE_KEY`, `TRADING_WALLET_ADDRESS`, `VAULT_MASTER_KEY`
+   and the vault file, and leave `LIVE_TRADING`, `ARB_AUTO_EXECUTE` and
+   `QUANT_EXECUTOR_ENABLED` off unless that test wallet is meant to trade.
 
 ### Development Workflow
 
@@ -770,6 +778,49 @@ protective orders. Dashboard development, CI and Docker use Node 24.
     dollars per share.
 - Migration 097 indexes `execution_intents` by creation time and, for
   reconciled ones, update time.
+
+### Configuration and operator safeguards
+
+- Settings are read the same way everywhere. Yes/no settings take true, 1,
+  yes or on and false, 0, no or off; any other value keeps the default and
+  is logged as an error (before, `1` or `TRUE` switched off settings that
+  default on, among them `FLOW_REQUIRE_CALIBRATION` and the account
+  snapshot that feeds the circuit breaker). The switches that let the bot
+  spend money (`LIVE_TRADING`, `ARB_AUTO_EXECUTE`, `QUANT_EXECUTOR_ENABLED`,
+  `EXIT_HANDLER_ENABLED`) still turn on only for exactly `true`; another
+  value is logged. A number that cannot be read keeps its default and is
+  logged (scientific notation such as `1e3` is read). `QUANT_STOP_LOSS_PCT`
+  and `QUANT_TAKE_PROFIT_PCT` must be fractions above 0 and at most 1, and
+  the `QUANT_*_ALLOCATION_PCT` shares 0 to 1; a value out of range (10
+  written for 10%) keeps the default and is logged.
+- docker-compose passes every setting in `.env` to the API and the arb
+  monitor (`env_file`); it used to pass a fixed list, dropping the circuit
+  breaker's `CB_*`, the quant and tuner settings among others.
+- `.env.example` documents `ARB_ALLOW_LIVE_EXECUTION` (live arbitrage is
+  skipped without it), `ARB_MAX_TOTAL_EXPOSURE`, the `CB_*` limits and the
+  quant allocations, and no longer ships a placeholder Alchemy key that
+  would be used as one.
+- The service status shows strategies as trading reads the switches (the
+  environment's as well as the workspace's), and arbitrage as disabled while
+  live arbitrage is not acknowledged.
+- Railway restarts the API and the arb monitor always (it was on failure, at
+  most five times): set Restart Policy to Always on services configured by
+  hand. A database or Redis URL that cannot be read stops the process at
+  once instead of being waited on; a stop request ends a wait for the
+  database; the arb monitor writes its health file once it has started.
+- A position whose sales go unsent for ten minutes in a row counts a failed
+  exit and is alerted, rather than being deferred indefinitely.
+- A tripped circuit breaker refuses manual buys but lets manual sales
+  through. A connectivity trip for an account that cannot be valued is
+  made once, not on every snapshot; starting live without any Polygon RPC
+  logs an error saying so.
+- A manual buy's filled cash is held back from withdrawals for at most 30
+  minutes after its last fill was booked.
+- The dashboard offers Polygon only (it also listed a testnet), and its
+  image build takes `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID`. The images no
+  longer set `RUST_LOG=info`, which logged every database query.
+- An `ENCRYPTION_KEY` set but empty is logged as an error at start.
+- Staging: see "Keep staging off the production wallet" above.
 
 ### API contract changes
 

@@ -7,8 +7,9 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile.arb-monitor"
 
 [deploy]
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+# Always restarted, as the API: a capped number of restarts, once spent,
+# would leave arbitrage without signals.
+restartPolicyType = "ALWAYS"
 numReplicas = 1
 drainingSeconds = 30
 

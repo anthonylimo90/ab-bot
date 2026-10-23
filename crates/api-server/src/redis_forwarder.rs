@@ -58,12 +58,11 @@ impl RedisForwarderConfig {
         Self {
             redis_url: std::env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
-            subscribe_arb: std::env::var("REDIS_SUBSCRIBE_ARB")
-                .map(|v| v == "true")
-                .unwrap_or(true),
-            subscribe_orderbook: std::env::var("REDIS_SUBSCRIBE_ORDERBOOK")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            subscribe_arb: polymarket_core::config::env_flag("REDIS_SUBSCRIBE_ARB", true),
+            subscribe_orderbook: polymarket_core::config::env_flag(
+                "REDIS_SUBSCRIBE_ORDERBOOK",
+                true,
+            ),
             reconnect_delay_secs: std::env::var("REDIS_RECONNECT_DELAY")
                 .ok()
                 .and_then(|s| s.parse().ok())

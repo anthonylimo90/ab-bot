@@ -39,9 +39,7 @@ pub struct WalletInventoryConfig {
 impl WalletInventoryConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("WALLET_INVENTORY_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("WALLET_INVENTORY_ENABLED", true),
             interval_secs: std::env::var("WALLET_INVENTORY_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

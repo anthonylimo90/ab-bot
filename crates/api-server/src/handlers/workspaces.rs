@@ -2368,22 +2368,16 @@ pub async fn get_service_status(
     .map_err(|_| ApiError::NotFound("Workspace not found".into()))?;
 
     // Check harvester: enabled by env
-    let harvester_enabled = std::env::var("HARVESTER_ENABLED")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    let harvester_enabled = polymarket_core::config::env_flag("HARVESTER_ENABLED", true);
 
     // Check metrics calculator: enabled by env
-    let metrics_enabled = std::env::var("METRICS_CALCULATOR_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
+    let metrics_enabled = polymarket_core::config::env_flag("METRICS_CALCULATOR_ENABLED", true);
 
     // Check arb executor — read runtime config for actual enabled state
     let arb_runtime_enabled = if let Some(ref arb_config) = state.arb_executor_config {
         arb_config.read().await.enabled
     } else {
-        let arb_env_enabled = std::env::var("ARB_AUTO_EXECUTE")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        let arb_env_enabled = polymarket_core::config::env_switch("ARB_AUTO_EXECUTE");
         arb_env_enabled || flags.arb_auto_execute
     };
 
@@ -2426,29 +2420,36 @@ pub async fn get_service_status(
     let quant_executor_enabled = if let Some(ref quant_config) = state.quant_executor_config {
         quant_config.read().await.enabled
     } else {
-        std::env::var("QUANT_EXECUTOR_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(false)
+        polymarket_core::config::env_switch("QUANT_EXECUTOR_ENABLED")
     };
+    let arb_live_acknowledged = match state.arb_executor_config {
+        Some(ref arb_config) => arb_config.read().await.allow_live_execution,
+        None => crate::arb_executor::ArbExecutorConfig::from_env().allow_live_execution,
+    };
+    // The switches as trading reads them: the environment can turn either on
+    // whatever the workspace says.
     let strategy_modes = resolve_strategy_modes(&StrategyModeInputs {
         arb_enabled: arb_runtime_enabled,
-        workspace_arb_enabled: flags.arb_auto_execute,
-        workspace_live_enabled: flags.live_trading_enabled,
+        workspace_arb_enabled: flags.arb_auto_execute
+            || polymarket_core::config::env_switch("ARB_AUTO_EXECUTE"),
+        workspace_live_enabled: flags.live_trading_enabled
+            || polymarket_core::config::env_switch("LIVE_TRADING"),
+        arb_live_acknowledged,
         live_executor: live_mode,
         live_ready,
         quant_executor_enabled,
-        flow_signal_enabled: std::env::var("FLOW_SIGNAL_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(true),
-        mean_reversion_signal_enabled: std::env::var("MEAN_REVERSION_SIGNAL_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(true),
-        cross_market_signal_enabled: std::env::var("CROSS_MARKET_SIGNAL_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(false),
-        resolution_signal_enabled: std::env::var("RESOLUTION_SIGNAL_ENABLED")
-            .map(|v| v == "true")
-            .unwrap_or(true),
+        flow_signal_enabled: polymarket_core::config::env_flag("FLOW_SIGNAL_ENABLED", true),
+        mean_reversion_signal_enabled: polymarket_core::config::env_flag(
+            "MEAN_REVERSION_SIGNAL_ENABLED",
+            true,
+        ),
+        cross_market_signal_enabled: polymarket_core::config::env_switch(
+            "CROSS_MARKET_SIGNAL_ENABLED",
+        ),
+        resolution_signal_enabled: polymarket_core::config::env_flag(
+            "RESOLUTION_SIGNAL_ENABLED",
+            true,
+        ),
     });
 
     Ok(Json(ServiceStatusResponse {

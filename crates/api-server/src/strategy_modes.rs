@@ -20,8 +20,13 @@ pub struct StrategyModeStatus {
 #[derive(Debug, Clone)]
 pub struct StrategyModeInputs {
     pub arb_enabled: bool,
+    /// Automatic arbitrage switched on, by the workspace or the environment.
     pub workspace_arb_enabled: bool,
+    /// Live trading switched on, by the workspace or the environment.
     pub workspace_live_enabled: bool,
+    /// Whether live arbitrage orders are acknowledged
+    /// (`ARB_ALLOW_LIVE_EXECUTION`): without it, live arbitrage is skipped.
+    pub arb_live_acknowledged: bool,
     pub live_executor: bool,
     pub live_ready: bool,
     pub quant_executor_enabled: bool,
@@ -88,6 +93,18 @@ fn resolve_arb_mode(inputs: &StrategyModeInputs) -> StrategyModeStatus {
             mode: ResolvedStrategyMode::Paper,
             reason: Some(
                 "Live executor is enabled but wallet/API credentials are not ready".to_string(),
+            ),
+        };
+    }
+
+    if !inputs.arb_live_acknowledged {
+        return StrategyModeStatus {
+            strategy: "arb".to_string(),
+            mode: ResolvedStrategyMode::Disabled,
+            reason: Some(
+                "Live arbitrage orders are not acknowledged (ARB_ALLOW_LIVE_EXECUTION): every \
+                 opportunity is skipped"
+                    .to_string(),
             ),
         };
     }
@@ -164,6 +181,7 @@ mod tests {
             arb_enabled: true,
             workspace_arb_enabled: true,
             workspace_live_enabled: true,
+            arb_live_acknowledged: true,
             live_executor: true,
             live_ready: true,
             quant_executor_enabled: true,
@@ -172,6 +190,19 @@ mod tests {
             cross_market_signal_enabled: false,
             resolution_signal_enabled: true,
         }
+    }
+
+    #[test]
+    fn unacknowledged_live_arbitrage_is_shown_disabled() {
+        let modes = resolve_strategy_modes(&StrategyModeInputs {
+            arb_live_acknowledged: false,
+            ..base_inputs()
+        });
+        let arb = modes
+            .into_iter()
+            .find(|item| item.strategy == "arb")
+            .unwrap();
+        assert_eq!(arb.mode, ResolvedStrategyMode::Disabled);
     }
 
     #[test]

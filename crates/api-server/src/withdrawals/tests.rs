@@ -211,7 +211,7 @@ pub(crate) async fn setup(pool: &PgPool) -> (Uuid, Uuid) {
         CREATE TABLE orders (
             quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT,
             status TEXT, execution_mode TEXT, wallet_address TEXT, id UUID,
-            avg_fill_price NUMERIC
+            avg_fill_price NUMERIC, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE TABLE position_order_links (
             id UUID PRIMARY KEY, side TEXT NOT NULL,

@@ -71,9 +71,7 @@ pub struct FlowSignalConfig {
 impl FlowSignalConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("FLOW_SIGNAL_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("FLOW_SIGNAL_ENABLED", true),
             interval_secs: std::env::var("FLOW_SIGNAL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -106,9 +104,7 @@ impl FlowSignalConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.50),
-            require_yes_price: std::env::var("FLOW_REQUIRE_YES_PRICE")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            require_yes_price: polymarket_core::config::env_flag("FLOW_REQUIRE_YES_PRICE", true),
             max_signals_per_cycle: std::env::var("FLOW_MAX_SIGNALS_PER_CYCLE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -130,9 +126,10 @@ impl FlowSignalConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
-            require_calibration: std::env::var("FLOW_REQUIRE_CALIBRATION")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            require_calibration: polymarket_core::config::env_flag(
+                "FLOW_REQUIRE_CALIBRATION",
+                true,
+            ),
         }
     }
 }
@@ -217,7 +214,7 @@ pub fn spawn_flow_signal_generator(
     signal_tx: broadcast::Sender<QuantSignal>,
 ) {
     if !config.enabled {
-        info!("Flow signal generator disabled (FLOW_SIGNAL_ENABLED != true)");
+        info!("Flow signal generator disabled (FLOW_SIGNAL_ENABLED is off)");
         return;
     }
 

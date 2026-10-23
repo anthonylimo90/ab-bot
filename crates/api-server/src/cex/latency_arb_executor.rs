@@ -48,9 +48,7 @@ pub struct LatencyArbExecutorConfig {
 impl LatencyArbExecutorConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("LATENCY_ARB_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(false),
+            enabled: polymarket_core::config::env_switch("LATENCY_ARB_ENABLED"),
             min_edge: std::env::var("LATENCY_ARB_MIN_EDGE")
                 .ok()
                 .and_then(|s| s.parse().ok())

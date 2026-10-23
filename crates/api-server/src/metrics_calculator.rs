@@ -51,9 +51,7 @@ impl MetricsCalculatorConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("METRICS_CALCULATOR_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("METRICS_CALCULATOR_ENABLED", true),
             interval_secs: std::env::var("METRICS_CALCULATOR_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

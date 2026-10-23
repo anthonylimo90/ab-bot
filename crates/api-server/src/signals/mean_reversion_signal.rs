@@ -39,9 +39,7 @@ pub struct MeanReversionSignalConfig {
 impl MeanReversionSignalConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("MEAN_REVERSION_SIGNAL_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("MEAN_REVERSION_SIGNAL_ENABLED", true),
             interval_secs: std::env::var("MEAN_REVERSION_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -84,7 +82,7 @@ pub fn spawn_mean_reversion_signal_generator(
     signal_tx: broadcast::Sender<QuantSignal>,
 ) {
     if !config.enabled {
-        info!("Mean reversion signal generator disabled (MEAN_REVERSION_SIGNAL_ENABLED != true)");
+        info!("Mean reversion signal generator disabled (MEAN_REVERSION_SIGNAL_ENABLED is off)");
         return;
     }
 

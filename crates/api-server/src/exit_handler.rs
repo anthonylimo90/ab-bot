@@ -183,9 +183,7 @@ impl ExitHandlerConfig {
     /// Create config from environment variables.
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("EXIT_HANDLER_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(false),
+            enabled: polymarket_core::config::env_switch("EXIT_HANDLER_ENABLED"),
             exit_poll_interval_secs: std::env::var("EXIT_POLL_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -194,14 +192,14 @@ impl ExitHandlerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
-            quant_take_profit_pct: std::env::var("QUANT_TAKE_PROFIT_PCT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(15, 2)),
-            quant_stop_loss_pct: std::env::var("QUANT_STOP_LOSS_PCT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(10, 2)),
+            quant_take_profit_pct: polymarket_core::config::env_fraction(
+                "QUANT_TAKE_PROFIT_PCT",
+                Decimal::new(15, 2),
+            ),
+            quant_stop_loss_pct: polymarket_core::config::env_fraction(
+                "QUANT_STOP_LOSS_PCT",
+                Decimal::new(10, 2),
+            ),
             quant_max_hold_hours: std::env::var("QUANT_MAX_HOLD_HOURS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -238,6 +236,8 @@ pub struct ExitHandler {
     /// Since when a resolved position's token balance of a leg (true for
     /// YES) has been unreadable, without a read succeeding since.
     balance_unreadable_since: std::sync::Mutex<HashMap<(uuid::Uuid, bool), std::time::Instant>>,
+    /// When a position's sales started being deferred unsent, and when last.
+    deferred_since: std::sync::Mutex<HashMap<uuid::Uuid, (std::time::Instant, std::time::Instant)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +278,7 @@ impl ExitHandler {
             heartbeat,
             passes_clean: std::sync::atomic::AtomicBool::new(true),
             balance_unreadable_since: Default::default(),
+            deferred_since: Default::default(),
         }
     }
 
@@ -518,8 +519,34 @@ impl ExitHandler {
     }
 
     /// Puts a closing position whose sale was certainly not sent back in the
-    /// exit queue for the next pass, without counting a failed exit.
-    async fn defer_sale(&self, position: &mut Position, reason: &str, ctx: &EventContext) {
+    /// exit queue for the next pass, without counting a failed exit. False,
+    /// leaving the caller to fail the exit (and alert), once its sales have
+    /// gone unsent for `MAX_EXIT_DEFERRAL` in a row: whatever holds them
+    /// (an order stuck unresolved, a book that cannot be read) is not passing.
+    async fn defer_sale(&self, position: &mut Position, reason: &str, ctx: &EventContext) -> bool {
+        let now = std::time::Instant::now();
+        let first = {
+            let mut deferred = self
+                .deferred_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            deferred.retain(|_, (_, last)| now.duration_since(*last) <= DEFERRAL_GAP);
+            let run = deferred.entry(position.id).or_insert((now, now));
+            run.1 = now;
+            run.0
+        };
+        if now.duration_since(first) >= MAX_EXIT_DEFERRAL {
+            self.deferred_since
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&position.id);
+            warn!(
+                position_id = %position.id,
+                reason,
+                "Exit sales have gone unsent for ten minutes; counting a failed exit"
+            );
+            return false;
+        }
         info!(position_id = %position.id, reason, "Exit sale not sent; it goes again next pass");
         if let Err(error) = self
             .position_service
@@ -528,6 +555,7 @@ impl ExitHandler {
         {
             warn!(position_id = %position.id, %error, "Could not return the position to the exit queue");
         }
+        true
     }
 
     /// Execute the sell orders for a single ExitReady position.
@@ -653,8 +681,9 @@ impl ExitHandler {
                     {
                         return Ok(());
                     }
-                    if nothing_was_sent(&e.to_string()) {
-                        self.defer_sale(position, &e.to_string(), &ctx).await;
+                    if nothing_was_sent(&e.to_string())
+                        && self.defer_sale(position, &e.to_string(), &ctx).await
+                    {
                         return Ok(());
                     }
                     error!(error = %e, market_id = %market_id, "YES sell order error");
@@ -680,8 +709,7 @@ impl ExitHandler {
                 let msg = yes_report
                     .error_message
                     .unwrap_or_else(|| "YES sell not filled".to_string());
-                if nothing_was_sent(&msg) {
-                    self.defer_sale(position, &msg, &ctx).await;
+                if nothing_was_sent(&msg) && self.defer_sale(position, &msg, &ctx).await {
                     return Ok(());
                 }
                 let _ = self
@@ -755,8 +783,9 @@ impl ExitHandler {
                     {
                         return Ok(());
                     }
-                    if nothing_was_sent(&e.to_string()) {
-                        self.defer_sale(position, &e.to_string(), &ctx).await;
+                    if nothing_was_sent(&e.to_string())
+                        && self.defer_sale(position, &e.to_string(), &ctx).await
+                    {
                         return Ok(());
                     }
                     error!(error = %e, market_id = %market_id, "NO sell order error");
@@ -782,8 +811,7 @@ impl ExitHandler {
                 let msg = no_report
                     .error_message
                     .unwrap_or_else(|| "NO sell not filled".to_string());
-                if nothing_was_sent(&msg) {
-                    self.defer_sale(position, &msg, &ctx).await;
+                if nothing_was_sent(&msg) && self.defer_sale(position, &msg, &ctx).await {
                     return Ok(());
                 }
                 let _ = self
@@ -2644,6 +2672,11 @@ const MAX_FEE_SHARE_FRACTION: Decimal = Decimal::from_parts(10, 0, 0, false, 2);
 
 /// Shares bought on a token within this window may still be settling on chain.
 const FEE_WRITE_OFF_SETTLE_MINUTES: i32 = 30;
+
+/// How long a position's sales may go unsent in a row before the exit counts
+/// as failed (and is alerted), and the pause that starts a new run.
+const MAX_EXIT_DEFERRAL: std::time::Duration = std::time::Duration::from_secs(600);
+const DEFERRAL_GAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Whether an order failure says the order certainly never left: another
 /// live order held the wallet's submission fence, or preparing it ran out of

@@ -122,16 +122,12 @@ impl Default for DynamicTunerConfig {
 impl DynamicTunerConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("DYNAMIC_TUNER_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("DYNAMIC_TUNER_ENABLED", true),
             interval_secs: std::env::var("DYNAMIC_TUNER_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
-            apply_changes: std::env::var("DYNAMIC_TUNER_APPLY")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(true),
+            apply_changes: polymarket_core::config::env_flag("DYNAMIC_TUNER_APPLY", true),
             regime_hysteresis_intervals: std::env::var("DYNAMIC_TUNER_REGIME_STREAK")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -152,9 +148,10 @@ impl DynamicTunerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(75.0),
-            bootstrap_enabled: std::env::var("DYNAMIC_TUNER_BOOTSTRAP_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(true),
+            bootstrap_enabled: polymarket_core::config::env_flag(
+                "DYNAMIC_TUNER_BOOTSTRAP_ENABLED",
+                true,
+            ),
             bootstrap_max_attempts: std::env::var("DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1759,10 +1756,7 @@ fn clamp_to_bounds(value: Decimal, min: Decimal, max: Decimal) -> Decimal {
 }
 
 fn env_decimal(name: &str, fallback: Decimal) -> Decimal {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(fallback)
+    polymarket_core::config::env_decimal(name, fallback)
 }
 
 fn env_aggressiveness_level() -> Decimal {

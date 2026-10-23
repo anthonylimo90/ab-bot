@@ -45,9 +45,7 @@ pub struct CrossMarketSignalConfig {
 impl CrossMarketSignalConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("CROSS_MARKET_SIGNAL_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(false),
+            enabled: polymarket_core::config::env_switch("CROSS_MARKET_SIGNAL_ENABLED"),
             interval_secs: std::env::var("CROSS_MARKET_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -99,7 +97,7 @@ pub fn spawn_cross_market_signal_generator(
     signal_tx: broadcast::Sender<QuantSignal>,
 ) {
     if !config.enabled {
-        info!("Cross-market signal generator disabled (CROSS_MARKET_SIGNAL_ENABLED != true)");
+        info!("Cross-market signal generator disabled (CROSS_MARKET_SIGNAL_ENABLED is off)");
         return;
     }
 

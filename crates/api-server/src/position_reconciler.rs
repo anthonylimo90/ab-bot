@@ -18,9 +18,7 @@ pub struct PositionReconcilerConfig {
 impl PositionReconcilerConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("POSITION_RECONCILER_ENABLED")
-                .map(|value| value == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("POSITION_RECONCILER_ENABLED", true),
             interval_secs: std::env::var("POSITION_RECONCILER_INTERVAL_SECS")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -35,7 +33,7 @@ impl PositionReconcilerConfig {
 
 pub fn spawn_position_reconciler(config: PositionReconcilerConfig, pool: PgPool) {
     if !config.enabled {
-        info!("Position reconciler disabled (POSITION_RECONCILER_ENABLED != true)");
+        info!("Position reconciler disabled (POSITION_RECONCILER_ENABLED is off)");
         return;
     }
 

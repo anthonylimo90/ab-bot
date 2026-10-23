@@ -101,7 +101,9 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 # Default environment variables
-ENV RUST_LOG=info
+# RUST_LOG is left unset so the binaries' own filter applies (sqlx and the
+# HTTP stack at warn): a plain `info` logs every query, past Railway's
+# 500 logs/s.
 ENV API_HOST=0.0.0.0
 ENV API_PORT=3000
 ENV SERVICE=api-server

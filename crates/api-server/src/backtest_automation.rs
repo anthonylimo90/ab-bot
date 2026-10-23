@@ -28,9 +28,7 @@ pub struct BacktestAutomationConfig {
 impl BacktestAutomationConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("BACKTEST_AUTOMATION_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("BACKTEST_AUTOMATION_ENABLED", true),
             interval_secs: std::env::var("BACKTEST_AUTOMATION_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -71,7 +69,7 @@ pub fn spawn_backtest_automation(config: BacktestAutomationConfig, pool: PgPool)
     tokio::spawn(run_reaper(config.clone(), pool.clone()));
 
     if !config.enabled {
-        info!("Backtest automation disabled (BACKTEST_AUTOMATION_ENABLED != true)");
+        info!("Backtest automation disabled (BACKTEST_AUTOMATION_ENABLED is off)");
         return;
     }
 

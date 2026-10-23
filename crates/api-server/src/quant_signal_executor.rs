@@ -74,13 +74,11 @@ pub struct QuantSignalExecutorConfig {
 impl QuantSignalExecutorConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("QUANT_EXECUTOR_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(false),
-            base_position_size_usd: std::env::var("QUANT_BASE_POSITION_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(30, 0)),
+            enabled: polymarket_core::config::env_switch("QUANT_EXECUTOR_ENABLED"),
+            base_position_size_usd: polymarket_core::config::env_decimal(
+                "QUANT_BASE_POSITION_SIZE",
+                Decimal::new(30, 0),
+            ),
             min_confidence: std::env::var("QUANT_MIN_CONFIDENCE")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -117,34 +115,34 @@ impl QuantSignalExecutorConfig {
                 .and_then(|s| s.parse::<i64>().ok())
                 .map(|minutes| minutes.max(0))
                 .unwrap_or(60),
-            flow_allocation_pct: std::env::var("QUANT_FLOW_ALLOCATION_PCT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.40),
-            cross_market_allocation_pct: std::env::var("QUANT_CROSS_MARKET_ALLOCATION_PCT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.30),
-            mean_reversion_allocation_pct: std::env::var("QUANT_MEAN_REVERSION_ALLOCATION_PCT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.20),
-            resolution_allocation_pct: std::env::var("QUANT_RESOLUTION_ALLOCATION_PCT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.10),
-            min_book_depth: std::env::var("QUANT_MIN_BOOK_DEPTH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(50, 0)),
-            max_total_exposure: std::env::var("ARB_MAX_TOTAL_EXPOSURE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(25000, 0)),
-            strategy_max_daily_loss_usd: std::env::var("QUANT_STRATEGY_MAX_DAILY_LOSS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(200, 0)),
+            flow_allocation_pct: polymarket_core::config::env_share_f64(
+                "QUANT_FLOW_ALLOCATION_PCT",
+                0.40,
+            ),
+            cross_market_allocation_pct: polymarket_core::config::env_share_f64(
+                "QUANT_CROSS_MARKET_ALLOCATION_PCT",
+                0.30,
+            ),
+            mean_reversion_allocation_pct: polymarket_core::config::env_share_f64(
+                "QUANT_MEAN_REVERSION_ALLOCATION_PCT",
+                0.20,
+            ),
+            resolution_allocation_pct: polymarket_core::config::env_share_f64(
+                "QUANT_RESOLUTION_ALLOCATION_PCT",
+                0.10,
+            ),
+            min_book_depth: polymarket_core::config::env_decimal(
+                "QUANT_MIN_BOOK_DEPTH",
+                Decimal::new(50, 0),
+            ),
+            max_total_exposure: polymarket_core::config::env_decimal(
+                "ARB_MAX_TOTAL_EXPOSURE",
+                Decimal::new(25000, 0),
+            ),
+            strategy_max_daily_loss_usd: polymarket_core::config::env_decimal(
+                "QUANT_STRATEGY_MAX_DAILY_LOSS",
+                Decimal::new(200, 0),
+            ),
             strategy_max_consecutive_losses: std::env::var("QUANT_STRATEGY_MAX_CONSECUTIVE_LOSSES")
                 .ok()
                 .and_then(|s| s.parse().ok())

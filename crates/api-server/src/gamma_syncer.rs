@@ -26,9 +26,7 @@ impl GammaSyncerConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("GAMMA_SYNCER_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("GAMMA_SYNCER_ENABLED", true),
             interval_secs: std::env::var("GAMMA_SYNCER_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -51,7 +49,7 @@ impl GammaSyncerConfig {
 ///   for the next hourly API sync to trigger the backfill.
 pub fn spawn_gamma_syncer(config: GammaSyncerConfig, pool: PgPool, db_semaphore: Arc<Semaphore>) {
     if !config.enabled {
-        info!("Gamma syncer disabled (GAMMA_SYNCER_ENABLED != true)");
+        info!("Gamma syncer disabled (GAMMA_SYNCER_ENABLED is off)");
         return;
     }
 

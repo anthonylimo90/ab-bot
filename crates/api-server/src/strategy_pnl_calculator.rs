@@ -30,9 +30,7 @@ pub struct StrategyPnlConfig {
 impl StrategyPnlConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("STRATEGY_PNL_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("STRATEGY_PNL_ENABLED", true),
             interval_secs: std::env::var("STRATEGY_PNL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -50,7 +48,7 @@ pub fn spawn_strategy_pnl_calculator(
     order_executor: Arc<OrderExecutor>,
 ) {
     if !config.enabled {
-        info!("Strategy P&L calculator disabled (STRATEGY_PNL_ENABLED != true)");
+        info!("Strategy P&L calculator disabled (STRATEGY_PNL_ENABLED is off)");
         return;
     }
 

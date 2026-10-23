@@ -774,7 +774,7 @@ fn spawn_trading_tasks(
         );
         info!("CEX latency arbitrage system started (Binance WS + executor)");
     } else {
-        info!("CEX latency arbitrage disabled (LATENCY_ARB_ENABLED != true)");
+        info!("CEX latency arbitrage disabled (LATENCY_ARB_ENABLED is off)");
     }
 }
 

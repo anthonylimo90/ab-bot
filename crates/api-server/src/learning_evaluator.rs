@@ -22,9 +22,7 @@ pub struct LearningEvaluatorConfig {
 impl LearningEvaluatorConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("LEARNING_EVALUATOR_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("LEARNING_EVALUATOR_ENABLED", true),
             interval_secs: std::env::var("LEARNING_EVALUATOR_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -83,7 +81,7 @@ struct EvaluationPayload {
 
 pub fn spawn_learning_evaluator(config: LearningEvaluatorConfig, pool: PgPool) {
     if !config.enabled {
-        info!("Learning evaluator disabled (LEARNING_EVALUATOR_ENABLED != true)");
+        info!("Learning evaluator disabled (LEARNING_EVALUATOR_ENABLED is off)");
         return;
     }
 

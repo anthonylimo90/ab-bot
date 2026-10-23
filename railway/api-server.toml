@@ -11,8 +11,10 @@ dockerfilePath = "Dockerfile"
 [deploy]
 healthcheckPath = "/health"
 healthcheckTimeout = 120
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 5
+# Always restarted: the trading process exits on purpose when it loses its
+# trading lock (a database blip), and a capped number of restarts would
+# leave open positions without their exit handler once spent.
+restartPolicyType = "ALWAYS"
 # One instance runs the trading loops.
 numReplicas = 1
 # SIGTERM to SIGKILL: open requests get 15s and started trading operations

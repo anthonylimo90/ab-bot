@@ -42,9 +42,7 @@ impl WalletHarvesterConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("HARVESTER_ENABLED")
-                .map(|v| v != "false")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("HARVESTER_ENABLED", true),
             interval_secs: std::env::var("HARVESTER_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

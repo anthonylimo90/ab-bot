@@ -25,9 +25,7 @@ pub struct AccountSnapshotConfig {
 impl AccountSnapshotConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("ACCOUNT_SNAPSHOT_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("ACCOUNT_SNAPSHOT_ENABLED", true),
             interval_secs: std::env::var("ACCOUNT_SNAPSHOT_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -172,7 +170,7 @@ impl MarketHoldings {
 
 pub fn spawn_account_snapshot_calculator(config: AccountSnapshotConfig, state: Arc<AppState>) {
     if !config.enabled {
-        info!("Account snapshot calculator disabled (ACCOUNT_SNAPSHOT_ENABLED != true)");
+        info!("Account snapshot calculator disabled (ACCOUNT_SNAPSHOT_ENABLED is off)");
         return;
     }
 
@@ -349,7 +347,9 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
                  scan: the circuit breaker's drawdown guard is not fed (check the Polygon RPC \
                  and the inventory refresh errors above)"
             );
-            if blind >= MAX_BLIND_READINGS {
+            // Once: a trip already holding (this one, or another) is not
+            // tripped again on every reading.
+            if blind >= MAX_BLIND_READINGS && !state.circuit_breaker.state().await.tripped {
                 // Losses the guard cannot see could grow unchecked: entries
                 // stop until a reading completes (the trip cools down).
                 state

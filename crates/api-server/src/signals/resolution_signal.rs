@@ -46,9 +46,7 @@ pub struct ResolutionSignalConfig {
 impl ResolutionSignalConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("RESOLUTION_SIGNAL_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("RESOLUTION_SIGNAL_ENABLED", true),
             interval_secs: std::env::var("RESOLUTION_SIGNAL_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -89,7 +87,7 @@ pub fn spawn_resolution_signal_generator(
     signal_tx: broadcast::Sender<QuantSignal>,
 ) {
     if !config.enabled {
-        info!("Resolution signal generator disabled (RESOLUTION_SIGNAL_ENABLED != true)");
+        info!("Resolution signal generator disabled (RESOLUTION_SIGNAL_ENABLED is off)");
         return;
     }
 

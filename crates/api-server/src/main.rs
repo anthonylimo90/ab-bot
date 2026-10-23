@@ -85,17 +85,38 @@ async fn main() -> anyhow::Result<()> {
     // exiting: each exit spends one of the platform's restarts, and a long
     // outage would spend them all, leaving the service down once the
     // database is back. A one-off command gives up as before.
+    // As PID 1 the process ignores SIGTERM unless it listens: a stop while
+    // waiting ends the wait.
     let serving = matches!(cli.command, Some(Commands::Serve) | None);
+    // An unreadable URL is a configuration error, not an outage: no wait.
+    db_config
+        .url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|error| anyhow::anyhow!("DATABASE_URL cannot be read: {error}"))?;
+    let mut stop = polymarket_core::shutdown::StopSignals::install()?;
     let pool = loop {
-        match polymarket_core::db::create_pool(&db_config).await {
-            Ok(pool) => break pool,
-            Err(error) if serving => {
-                tracing::error!(%error, "The database is unavailable at startup; waiting for it");
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        tokio::select! {
+            created = polymarket_core::db::create_pool(&db_config) => match created {
+                Ok(pool) => break pool,
+                Err(error) if serving => {
+                    tracing::error!(%error, "The database is unavailable at startup; waiting for it");
+                }
+                Err(error) => return Err(error.into()),
+            },
+            () = stop.recv() => {
+                tracing::info!("Stop requested while waiting for the database");
+                return Ok(());
             }
-            Err(error) => return Err(error.into()),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+            () = stop.recv() => {
+                tracing::info!("Stop requested while waiting for the database");
+                return Ok(());
+            }
         }
     };
+    drop(stop);
 
     // Run migrations
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")

@@ -380,10 +380,8 @@ impl ArbMonitor {
 
         let dynamic_bounds = load_dynamic_bounds(&pool).await;
         let dynamic_values = load_dynamic_values(&pool).await;
-        let min_profit_env = std::env::var(KEY_ARB_MIN_PROFIT_THRESHOLD)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| Decimal::new(5, 3));
+        let min_profit_env =
+            polymarket_core::config::env_decimal(KEY_ARB_MIN_PROFIT_THRESHOLD, Decimal::new(5, 3));
         let min_book_depth = std::env::var("ARB_MONITOR_MIN_BOOK_DEPTH")
             .or_else(|_| std::env::var("ARB_MIN_BOOK_DEPTH"))
             .ok()
@@ -398,6 +396,16 @@ impl ArbMonitor {
             .or(Some(min_profit_env))
             .and_then(|v| clamp_dynamic_value(KEY_ARB_MIN_PROFIT_THRESHOLD, v, &dynamic_bounds))
             .unwrap_or(min_profit_env);
+        if std::env::var(KEY_ARB_MIN_PROFIT_THRESHOLD).is_ok()
+            && min_profit_threshold != min_profit_env
+        {
+            warn!(
+                configured = %min_profit_env,
+                applied = %min_profit_threshold,
+                "ARB_MIN_PROFIT_THRESHOLD from the environment is not the threshold in use: the \
+                 stored dynamic config holds another, or the value is outside its bounds"
+            );
+        }
         let max_markets_cap = dynamic_values
             .get(KEY_ARB_MONITOR_MAX_MARKETS)
             .copied()

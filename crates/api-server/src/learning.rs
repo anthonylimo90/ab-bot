@@ -118,9 +118,7 @@ impl ShadowPredictionRecorder {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool: pool.clone(),
-            enabled: std::env::var("LEARNING_SHADOW_ENABLED")
-                .map(|value| value != "false")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("LEARNING_SHADOW_ENABLED", true),
             schema_missing: Arc::new(AtomicBool::new(false)),
             model_cache: Arc::new(RwLock::new(HashMap::new())),
             runtime: LearningModelRuntime::new(pool.clone()),

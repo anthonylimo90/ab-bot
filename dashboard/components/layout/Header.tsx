@@ -193,7 +193,7 @@ export function Header() {
       ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop all trading at once."
       : currentWorkspace?.live_trading_enabled
         ? "Arbitrage resumes with real funds: live trading is on."
-        : "Arbitrage resumes on paper. Live trading stays off; switch it on in Settings.",
+        : "Arbitrage resumes. Live trading stays off in this workspace's settings, so it trades on paper unless the server's environment switches live trading on (LIVE_TRADING).",
     confirmLabel: isTradingActive ? "Pause" : "Resume",
   };
 

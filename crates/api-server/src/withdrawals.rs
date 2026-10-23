@@ -354,7 +354,9 @@ impl WithdrawalHolds {
             // that settlement fail with the shares already booked. Held: a
             // bot entry's buy from when its fill was booked (its order is
             // done then) for `SETTLING_BUY_MINUTES`, and a manual buy's fills
-            // until its trades are confirmed (its order row holds the rest).
+            // until its trades are confirmed (its order row holds the rest),
+            // at most that long after the last was booked: a buy resting
+            // for days has long settled its early fills.
             // Each at most its amount, plus the most taker fee it can carry.
             let settling: Vec<(Decimal, Decimal)> = sqlx::query_as(
                 "SELECT (i.signed_order->>'makerAmount')::numeric / 1000000, l.applied_quantity \
@@ -373,6 +375,7 @@ impl WithdrawalHolds {
                  WHERE i.status = 'acknowledged' \
                    AND o.side = 'buy' AND o.execution_mode = 'live' \
                    AND o.filled_quantity > 0 \
+                   AND o.updated_at > NOW() - make_interval(mins => $2) \
                    AND LOWER(i.signed_order->>'maker') = LOWER($1)",
             )
             .bind(source)

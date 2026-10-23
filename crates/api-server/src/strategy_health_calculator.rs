@@ -22,9 +22,7 @@ pub struct StrategyHealthConfig {
 impl StrategyHealthConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("STRATEGY_HEALTH_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("STRATEGY_HEALTH_ENABLED", true),
             interval_secs: std::env::var("STRATEGY_HEALTH_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -76,7 +74,7 @@ pub fn spawn_strategy_health_calculator(
     order_executor: Arc<OrderExecutor>,
 ) {
     if !config.enabled {
-        info!("Strategy health calculator disabled (STRATEGY_HEALTH_ENABLED != true)");
+        info!("Strategy health calculator disabled (STRATEGY_HEALTH_ENABLED is off)");
         return;
     }
 

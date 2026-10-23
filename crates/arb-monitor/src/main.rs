@@ -34,7 +34,6 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Starting Arbitrage Monitor");
-    touch_health_file();
 
     // As PID 1 in its container the monitor must handle SIGTERM itself.
     let mut stop = polymarket_core::shutdown::StopSignals::install()?;
@@ -42,9 +41,20 @@ async fn main() -> Result<()> {
     // Load configuration
     let config = Config::from_env()?;
 
+    // A Redis URL that cannot be read is a configuration error, not an
+    // outage: stop at once rather than wait for it.
+    redis::Client::open(config.redis.url.as_str())
+        .map_err(|error| anyhow::anyhow!("REDIS_URL cannot be read: {error}"))?;
+    config
+        .database
+        .url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|error| anyhow::anyhow!("DATABASE_URL cannot be read: {error}"))?;
+
     // Initialize the monitor. Its database or Redis being down at start is
     // waited out rather than exited on: each exit spends one of the
-    // platform's restarts, and a long outage would spend them all.
+    // platform's restarts, and a long outage would spend them all. The
+    // health file is first written once it has started.
     let mut monitor = loop {
         tokio::select! {
             monitor = monitor::ArbMonitor::new(config.clone()) => match monitor {
@@ -66,6 +76,7 @@ async fn main() -> Result<()> {
             }
         }
     };
+    touch_health_file();
 
     // Run the monitoring loop until it fails or the process is asked to stop.
     // The monitor only publishes signals, so stopping needs no draining.

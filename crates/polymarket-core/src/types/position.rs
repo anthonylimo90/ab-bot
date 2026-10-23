@@ -592,8 +592,6 @@ impl Position {
         (yes, no)
     }
 
-    /// Requeues a failed exit for another attempt, regardless of how many
-    /// attempts failed; callers pace retries (see the exit handler backoff).
     /// Returns a closing position to the exit queue when its sale was
     /// certainly not sent (another live order held the wallet's submission
     /// fence): not a failed exit, so its retry count and backoff stand.
@@ -606,6 +604,8 @@ impl Position {
         true
     }
 
+    /// Requeues a failed exit for another attempt, regardless of how many
+    /// attempts failed; callers pace retries (see the exit handler backoff).
     pub fn requeue_failed_exit(&mut self) -> bool {
         if self.state != PositionState::ExitFailed {
             return false;

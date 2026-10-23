@@ -1,5 +1,5 @@
 import { http, createConfig, type Config } from 'wagmi';
-import { polygon, polygonAmoy } from 'wagmi/chains';
+import { polygon } from 'wagmi/chains';
 import { getDefaultConfig } from '@rainbow-me/rainbowkit';
 
 // Default WalletConnect project ID - used as fallback
@@ -13,10 +13,12 @@ export function createWalletConfig(projectId?: string): Config {
   return getDefaultConfig({
     appName: 'AB-Bot Trading',
     projectId: effectiveProjectId,
-    chains: [polygon, polygonAmoy],
+    // Polygon only: the exchange, the trading wallet and sign-in are all
+    // on mainnet, and a wallet left on a testnet would sign for the wrong
+    // chain. Offered alone, the wallet is asked to switch to it.
+    chains: [polygon],
     transports: {
       [polygon.id]: http(),
-      [polygonAmoy.id]: http(),
     },
     ssr: true,
   });
@@ -30,4 +32,4 @@ export function isValidProjectId(projectId?: string | null): boolean {
   return !!projectId && projectId !== 'placeholder-for-build' && projectId.length > 10;
 }
 
-export { polygon, polygonAmoy };
+export { polygon };

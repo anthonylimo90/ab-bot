@@ -56,6 +56,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ab-bot-api
+    # Every setting in .env reaches the service (the circuit breaker's CB_*,
+    # the quant, signal and tuner settings, ...); the entries under
+    # `environment` take precedence over it.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
       REDIS_URL: redis://app:${REDIS_APP_PASSWORD:-app_secret_change_me}@redis:6379
@@ -79,7 +85,7 @@ services:
       RUST_LOG: ${RUST_LOG:-api_server=info,tower_http=info}
       SKIP_MIGRATIONS: ${SKIP_MIGRATIONS:-false}
       ARB_AUTO_EXECUTE: ${ARB_AUTO_EXECUTE:-false}
-      ARB_POSITION_SIZE: ${ARB_POSITION_SIZE:-50}
+      ARB_POSITION_SIZE: ${ARB_POSITION_SIZE:-10}
       ARB_MIN_NET_PROFIT: ${ARB_MIN_NET_PROFIT:-0.001}
       ARB_MIN_BOOK_DEPTH: ${ARB_MIN_BOOK_DEPTH:-100}
       LIVE_TRADING: ${LIVE_TRADING:-false}
@@ -135,6 +141,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ab-bot-arb-monitor
+    # Every setting in .env reaches the service (the circuit breaker's CB_*,
+    # the quant, signal and tuner settings, ...); the entries under
+    # `environment` take precedence over it.
+    env_file:
+      - path: .env
+        required: false
     environment:
       SERVICE: arb-monitor
       DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}

@@ -67,9 +67,7 @@ impl FlowFeatureConfig {
     /// Load configuration from environment variables.
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("FLOW_FEATURE_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("FLOW_FEATURE_ENABLED", true),
             interval_secs: std::env::var("FLOW_FEATURE_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -111,7 +109,7 @@ pub fn spawn_flow_feature_calculator(
     db_semaphore: Arc<Semaphore>,
 ) {
     if !config.enabled {
-        info!("Flow feature calculator disabled (FLOW_FEATURE_ENABLED != true)");
+        info!("Flow feature calculator disabled (FLOW_FEATURE_ENABLED is off)");
         return;
     }
 

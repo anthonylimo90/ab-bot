@@ -31,7 +31,7 @@ pub async fn canonical_workspace_live_enabled(pool: &PgPool) -> Result<bool, sql
 
 /// Whether the environment switches `name` on (`name=true`), as startup reads it.
 pub(crate) fn env_enabled(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| value == "true")
+    polymarket_core::config::env_switch(name)
 }
 
 /// Reconcile runtime service toggles from the canonical workspace's flags.

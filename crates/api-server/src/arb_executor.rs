@@ -169,21 +169,19 @@ impl ArbExecutorConfig {
     /// Create config from environment variables.
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("ARB_AUTO_EXECUTE")
-                .map(|v| v == "true")
-                .unwrap_or(false),
+            enabled: polymarket_core::config::env_switch("ARB_AUTO_EXECUTE"),
             allow_live_execution: std::env::var("ARB_ALLOW_LIVE_EXECUTION")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             // The dynamic config's default, inside its $5-$25 bounds.
-            position_size: std::env::var("ARB_POSITION_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(10, 0)),
-            min_net_profit: std::env::var("ARB_MIN_NET_PROFIT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(1, 3)),
+            position_size: polymarket_core::config::env_decimal(
+                "ARB_POSITION_SIZE",
+                Decimal::new(10, 0),
+            ),
+            min_net_profit: polymarket_core::config::env_decimal(
+                "ARB_MIN_NET_PROFIT",
+                Decimal::new(1, 3),
+            ),
             max_signal_age_secs: std::env::var("ARB_MAX_SIGNAL_AGE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -192,26 +190,24 @@ impl ArbExecutorConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
-            dynamic_sizing: std::env::var("ARB_DYNAMIC_SIZING")
-                .map(|v| v != "false")
-                .unwrap_or(true),
-            min_position_size: std::env::var("ARB_MIN_POSITION_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(5, 0)), // $5 floor (small wallet)
-            max_position_size: std::env::var("ARB_MAX_POSITION_SIZE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(25, 0)), // $25 ceiling (small wallet)
-            min_book_depth: std::env::var("ARB_MIN_BOOK_DEPTH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(25, 0)), // $25 min depth (small wallet)
+            dynamic_sizing: polymarket_core::config::env_flag("ARB_DYNAMIC_SIZING", true),
+            min_position_size: polymarket_core::config::env_decimal(
+                "ARB_MIN_POSITION_SIZE",
+                Decimal::new(5, 0),
+            ), // $5 floor (small wallet)
+            max_position_size: polymarket_core::config::env_decimal(
+                "ARB_MAX_POSITION_SIZE",
+                Decimal::new(25, 0),
+            ), // $25 ceiling (small wallet)
+            min_book_depth: polymarket_core::config::env_decimal(
+                "ARB_MIN_BOOK_DEPTH",
+                Decimal::new(25, 0),
+            ), // $25 min depth (small wallet)
             fee_rate: Decimal::new(2, 2), // Always 2% on Polymarket
-            max_total_exposure: std::env::var("ARB_MAX_TOTAL_EXPOSURE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::new(25000, 0)), // $25,000 default
+            max_total_exposure: polymarket_core::config::env_decimal(
+                "ARB_MAX_TOTAL_EXPOSURE",
+                Decimal::new(25000, 0),
+            ), // $25,000 default
         }
     }
 }

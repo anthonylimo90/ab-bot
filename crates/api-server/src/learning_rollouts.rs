@@ -238,7 +238,7 @@ impl LearningRolloutController {
 pub fn spawn_learning_rollout_observer(config: LearningRolloutObserverConfig, pool: PgPool) {
     if !config.enabled {
         tracing::info!(
-            "Learning rollout observer disabled (LEARNING_ROLLOUT_OBSERVER_ENABLED != true)"
+            "Learning rollout observer disabled (LEARNING_ROLLOUT_OBSERVER_ENABLED is off)"
         );
         return;
     }
@@ -262,9 +262,7 @@ pub struct LearningRolloutObserverConfig {
 impl LearningRolloutObserverConfig {
     pub fn from_env() -> Self {
         Self {
-            enabled: std::env::var("LEARNING_ROLLOUT_OBSERVER_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(true),
+            enabled: polymarket_core::config::env_flag("LEARNING_ROLLOUT_OBSERVER_ENABLED", true),
             interval_secs: std::env::var("LEARNING_ROLLOUT_OBSERVER_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
