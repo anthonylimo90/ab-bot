@@ -1077,6 +1077,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   not the owner. Removing or demoting a member also withdraws the invites
   they sent that are still pending. An invite from a removed admin used to
   grant membership for its full seven days.
+- Outside development (`ENVIRONMENT` other than development/dev/local/test),
+  a startup with no `CORS_ALLOWED_ORIGINS` logs an error: every origin may
+  call the API. Set it to the dashboard's origin.
 
 ### API contract changes
 

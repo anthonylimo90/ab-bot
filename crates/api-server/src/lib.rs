@@ -173,6 +173,8 @@ pub fn is_development_environment(environment: &str) -> bool {
 /// - otherwise `cors_permissive`: any origin (development).
 /// - otherwise: any origin as well, for backward compatibility, which makes
 ///   `CORS_PERMISSIVE=false` a no-op; a startup warning says so.
+///
+/// Every origin outside development logs an error at startup.
 fn build_cors_layer(config: &ServerConfig) -> CorsLayer {
     use axum::http::{header, HeaderValue, Method};
 
@@ -213,6 +215,16 @@ fn build_cors_layer(config: &ServerConfig) -> CorsLayer {
             ])
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
             .max_age(std::time::Duration::from_secs(600));
+    }
+
+    // Every origin from here on. Browsers do not attach the bearer token on
+    // their own, so this is no CSRF hole, but a deployment should name its
+    // dashboard.
+    if !is_development_environment(&std::env::var("ENVIRONMENT").unwrap_or_default()) {
+        tracing::error!(
+            "CORS allows every origin outside development: set CORS_ALLOWED_ORIGINS to the \
+             dashboard's origin(s)"
+        );
     }
 
     if config.cors_permissive {
