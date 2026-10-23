@@ -40,12 +40,7 @@ async fn exposure_includes_failed_stalled_closed_holdings_and_pending_reservatio
         repo.get_total_active_exposure().await.unwrap(),
         Decimal::new(215, 1)
     );
-    assert_eq!(
-        repo.count_active_positions_for_market("market")
-            .await
-            .unwrap(),
-        5
-    );
+    assert!(repo.has_active_in_market("market").await.unwrap());
     pool.execute("DROP TABLE orders").await.unwrap();
     assert!(repo.get_total_active_exposure().await.is_err());
 }
@@ -69,12 +64,19 @@ async fn concurrent_entries_reserve_prospective_exposure_atomically(pool: PgPool
         ExitStrategy::HoldToResolution,
     );
     let (a, b) = tokio::join!(
-        repo.insert_with_source_and_limit(&first, SOURCE_ARBITRAGE, None, Some(Decimal::from(15))),
+        repo.insert_with_source_and_limit(
+            &first,
+            SOURCE_ARBITRAGE,
+            None,
+            Some(Decimal::from(15)),
+            false
+        ),
         repo.insert_with_source_and_limit(
             &second,
             SOURCE_RECOMMENDATION,
             None,
-            Some(Decimal::from(15))
+            Some(Decimal::from(15)),
+            false
         )
     );
     assert_ne!(a.is_ok(), b.is_ok());
@@ -112,4 +114,37 @@ async fn candidate_filter_preserves_all_state_and_basis_combinations(pool: PgPoo
         .await
         .unwrap();
     assert_eq!(after, before);
+}
+
+#[sqlx::test(migrations = false)]
+async fn concurrent_exclusive_entries_take_a_market_once(pool: PgPool) {
+    setup(&pool).await;
+    let repo = PositionRepository::new(pool.clone());
+    let entry = || {
+        Position::new(
+            "market".into(),
+            Decimal::new(4, 1),
+            Decimal::new(5, 1),
+            Decimal::TEN,
+            ExitStrategy::HoldToResolution,
+        )
+    };
+    let (first, second) = (entry(), entry());
+    let (a, b) = tokio::join!(
+        repo.insert_with_source_and_limit(&first, SOURCE_ARBITRAGE, None, None, true),
+        repo.insert_with_source_and_limit(&second, SOURCE_ARBITRAGE, None, None, true)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    let refused = a.err().or(b.err()).unwrap();
+    assert!(refused.to_string().contains(MARKET_TAKEN), "{refused}");
+    // An entry that is not exclusive is not refused.
+    repo.insert_with_source_and_limit(&entry(), SOURCE_RECOMMENDATION, None, None, false)
+        .await
+        .unwrap();
+    // Another market is free.
+    let mut elsewhere = entry();
+    elsewhere.market_id = "other".into();
+    repo.insert_with_source_and_limit(&elsewhere, SOURCE_ARBITRAGE, None, None, true)
+        .await
+        .unwrap();
 }

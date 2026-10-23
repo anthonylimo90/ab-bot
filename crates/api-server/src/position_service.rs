@@ -66,6 +66,9 @@ pub struct CreatePositionParams {
     pub expected_edge: Option<Decimal>,
     /// Gross edge observed at entry (arb: gross profit per share).
     pub observed_edge: Option<Decimal>,
+    /// Only while no position in the market is active, decided under the
+    /// lock every entry takes (across processes).
+    pub exclusive_market: bool,
 }
 
 /// Context fields for trade event recording.
@@ -153,6 +156,7 @@ impl PositionService {
                 params.source,
                 params.source_signal_id,
                 max_exposure,
+                params.exclusive_market,
             )
             .await
             .map_err(|e| anyhow!("insert position: {}", e))?;

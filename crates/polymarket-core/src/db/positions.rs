@@ -9,6 +9,14 @@ use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// Whether a position in market `$1` is still active: in any state but closed
+/// or entry failed, or still holding shares.
+const ACTIVE_IN_MARKET_SQL: &str = "SELECT EXISTS(SELECT 1 FROM positions WHERE market_id = $1 \
+     AND (state NOT IN (4, 5) OR held_yes_qty > 0 OR held_no_qty > 0))";
+
+/// Why an exclusive entry was refused: a position in its market is active.
+pub const MARKET_TAKEN: &str = "An active position already holds this market";
+
 /// Read a smallint column that may have been widened to integer by pg_restore.
 /// Tries i16 first (SMALLINT), falls back to i32 (INTEGER) and truncates.
 fn get_smallint(r: &sqlx::postgres::PgRow, col: &str) -> i16 {
@@ -79,23 +87,35 @@ impl PositionRepository {
         source: i16,
         source_signal_id: Option<Uuid>,
     ) -> Result<()> {
-        self.insert_with_source_and_limit(position, source, source_signal_id, None)
+        self.insert_with_source_and_limit(position, source, source_signal_id, None, false)
             .await
     }
 
-    /// Atomically reserve a pending position within the prospective exposure cap.
-    /// Every entry insertion takes the same database lock, across processes.
+    /// Atomically reserve a pending position within the prospective exposure cap
+    /// and, when `exclusive_market`, only while no position in its market is
+    /// active ([`MARKET_TAKEN`] otherwise). Every entry insertion takes the
+    /// same database lock, across processes.
     pub async fn insert_with_source_and_limit(
         &self,
         position: &Position,
         source: i16,
         source_signal_id: Option<Uuid>,
         max_exposure: Option<Decimal>,
+        exclusive_market: bool,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext('position-exposure'))")
             .execute(&mut *tx)
             .await?;
+        if exclusive_market {
+            let taken: bool = sqlx::query_scalar(ACTIVE_IN_MARKET_SQL)
+                .bind(&position.market_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            if taken {
+                return Err(crate::Error::Position(MARKET_TAKEN.into()));
+            }
+        }
         if let Some(limit) = max_exposure {
             let current: Decimal = sqlx::query_scalar(TOTAL_ACTIVE_EXPOSURE_SQL)
                 .fetch_one(&mut *tx)
@@ -406,13 +426,10 @@ impl PositionRepository {
     /// closed or entry failed, or still holding shares (an entry that failed
     /// after one leg filled, waiting to be flattened).
     pub async fn has_active_in_market(&self, market_id: &str) -> Result<bool> {
-        let active: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM positions WHERE market_id = $1 \
-             AND (state NOT IN (4, 5) OR held_yes_qty > 0 OR held_no_qty > 0))",
-        )
-        .bind(market_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let active: bool = sqlx::query_scalar(ACTIVE_IN_MARKET_SQL)
+            .bind(market_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(active)
     }
 
@@ -674,48 +691,6 @@ impl PositionRepository {
             .collect())
     }
 
-    /// Returns true when a source already has an active position in the market.
-    pub async fn active_position_exists_for_market_source(
-        &self,
-        market_id: &str,
-        source: i16,
-    ) -> Result<bool> {
-        let exists: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1
-                FROM positions
-                WHERE market_id = $1
-                  AND source = $2
-                  AND state NOT IN (4, 5)
-            )
-            "#,
-        )
-        .bind(market_id)
-        .bind(source)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(exists)
-    }
-
-    /// Count active positions for a single source.
-    pub async fn count_active_by_source(&self, source: i16) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM positions
-            WHERE source = $1
-              AND state NOT IN (4, 5)
-            "#,
-        )
-        .bind(source)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(count)
-    }
-
     /// Returns true when the quant executor already has an active position in a market.
     ///
     /// This excludes legacy recommendation rows that share `source = 3` but were
@@ -800,22 +775,5 @@ impl PositionRepository {
         Ok(sqlx::query_scalar(TOTAL_ACTIVE_EXPOSURE_SQL)
             .fetch_one(&self.pool)
             .await?)
-    }
-
-    /// Count active positions for a given market across all sources.
-    pub async fn count_active_positions_for_market(&self, market_id: &str) -> Result<i64> {
-        let count: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM positions
-            WHERE market_id = $1
-              AND (state IN (0, 1, 2, 3, 6, 7) OR held_yes_qty>0 OR held_no_qty>0)
-            "#,
-        )
-        .bind(market_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(count.unwrap_or(0))
     }
 }

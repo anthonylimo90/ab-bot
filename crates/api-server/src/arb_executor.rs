@@ -6,7 +6,7 @@
 //! sequential YES + NO market orders.
 
 use chrono::Utc;
-use polymarket_core::db::positions::{PositionRepository, SOURCE_ARBITRAGE};
+use polymarket_core::db::positions::{PositionRepository, MARKET_TAKEN, SOURCE_ARBITRAGE};
 use polymarket_core::types::{
     ArbOpportunity, BinaryMarketBook, ExitStrategy, FailureReason, FeeSchedule, MarketOrder,
     OrderBook, OrderSide,
@@ -75,8 +75,20 @@ impl Default for ArbExecutorConfig {
     }
 }
 
-/// Smallest pair notional worth sending (the exchange's minimum market buy).
-const MIN_PAIR_NOTIONAL: Decimal = Decimal::ONE;
+/// Smallest amount of each leg worth sending: every leg is its own market
+/// buy, which the exchange refuses below a dollar.
+const MIN_LEG_NOTIONAL: Decimal = Decimal::ONE;
+
+/// Whether both legs of a pair of `quantity` are market buys the exchange
+/// accepts: each one's amount at its ask, in whole cents as signed, at least
+/// [`MIN_LEG_NOTIONAL`]. A leg that falls short would leave the pair
+/// one-legged once the other has filled.
+fn legs_meet_minimum(quantity: Decimal, yes_ask: Decimal, no_ask: Decimal) -> bool {
+    [yes_ask, no_ask].into_iter().all(|ask| {
+        (quantity * ask).round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero)
+            >= MIN_LEG_NOTIONAL
+    })
+}
 
 /// USDC a pair buy needs before its first leg is sent: what each leg's own
 /// capacity check will require, its amount at the best ask and room for the
@@ -1028,10 +1040,13 @@ impl ArbAutoExecutor {
             &no_book,
             self.order_executor.min_book_depth(),
         );
-        if quantity * arb.total_cost < MIN_PAIR_NOTIONAL {
+        if !legs_meet_minimum(quantity, arb.yes_ask, arb.no_ask) {
             let mut runtime = self.runtime_status.write().await;
             runtime.depth_skips = runtime.depth_skips.saturating_add(1);
-            runtime.record_decision(market_id, "skipped: best levels cannot fill both legs");
+            runtime.record_decision(
+                market_id,
+                "skipped: a leg below the exchange's minimum at the best levels",
+            );
             telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
             telemetry.finish_total(&process_started_at);
             drop(runtime);
@@ -1173,6 +1188,7 @@ impl ArbAutoExecutor {
                     arb_opportunity: Some(arb.clone()),
                     expected_edge: Some(arb.net_profit),
                     observed_edge: Some(arb.gross_profit),
+                    exclusive_market: true,
                 },
                 &ctx,
                 create_metadata,
@@ -1181,6 +1197,17 @@ impl ArbAutoExecutor {
             .await
         {
             Ok(pos) => pos,
+            // Another process entered this market since the check above.
+            Err(e) if e.to_string().contains(MARKET_TAKEN) => {
+                let mut runtime = self.runtime_status.write().await;
+                runtime.active_position_skips = runtime.active_position_skips.saturating_add(1);
+                runtime.record_decision(market_id, "skipped: active position exists");
+                telemetry.finish_total(&process_started_at);
+                drop(runtime);
+                self.record_skip_event(&arb, execution_mode, "active_position_exists", &telemetry)
+                    .await;
+                return Ok(());
+            }
             Err(e) => {
                 error!(error = %e, "Failed to persist pending position");
                 return Err(anyhow::anyhow!("Failed to persist position: {e}"));
@@ -1550,6 +1577,17 @@ impl ArbTradeEventExt for NewTradeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_leg_must_meet_the_minimum_market_buy() {
+        let d = |v: &str| v.parse::<Decimal>().unwrap();
+        // $5 at 0.96 + 0.02: the NO leg would be a $0.10 buy.
+        assert!(!legs_meet_minimum(d("5.1"), d("0.96"), d("0.02")));
+        // Both legs at least a dollar, in whole cents.
+        assert!(legs_meet_minimum(d("50"), d("0.96"), d("0.02")));
+        assert!(!legs_meet_minimum(d("49.99"), d("0.96"), d("0.02")));
+        assert!(legs_meet_minimum(d("10"), d("0.48"), d("0.50")));
+    }
 
     fn book(asks: &[(i64, i64)]) -> OrderBook {
         OrderBook {
