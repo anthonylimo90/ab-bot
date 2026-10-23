@@ -321,11 +321,12 @@ async fn withdraw_pending_invites(
 }
 
 /// Whether a member with `inviter_role` may issue an invite for `role`, as
-/// create_invite decides it.
+/// create_invite decides it. Owner invites rest on platform-admin authority,
+/// not membership (see `require_inviter_authority`).
 fn inviter_may_issue(inviter_role: Option<&str>, role: &str) -> bool {
     match inviter_role {
-        Some("owner") => true,
-        Some("admin") => role != "admin",
+        Some("owner") => role != "owner",
+        Some("admin") => role == "member" || role == "viewer",
         _ => false,
     }
 }
@@ -1841,7 +1842,7 @@ pub async fn update_member_role(
         .execute(&mut *tx)
         .await?;
     let withdrawn_invites = withdraw_pending_invites(&mut tx, workspace_id, member_id, |role| {
-        !inviter_may_issue(Some(&new_role), role)
+        role != "owner" && !inviter_may_issue(Some(&new_role), role)
     })
     .await?;
     tx.commit().await?;
@@ -1954,7 +1955,7 @@ pub async fn remove_member(
         .execute(&mut *tx)
         .await?;
     let withdrawn_invites =
-        withdraw_pending_invites(&mut tx, workspace_id, member_id, |_| true).await?;
+        withdraw_pending_invites(&mut tx, workspace_id, member_id, |role| role != "owner").await?;
     tx.commit().await?;
 
     // Clear default workspace if this was it
