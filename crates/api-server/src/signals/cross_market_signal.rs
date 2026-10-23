@@ -5,8 +5,8 @@
 //!
 //! Trigger conditions:
 //!   - Correlation |r| > 0.70 between pair (from market_correlations)
-//!   - Lead market moved > 5% in last 4 hours
-//!   - Lag market moved < 2% in same period
+//!   - Lead market moved > 5% over the four hours to the newest hourly bar
+//!   - Lag market moved < 2% over the same hours (same bars)
 //!   - Both markets have sufficient liquidity
 //!
 //! Direction: towards convergence with the lead market
@@ -143,46 +143,43 @@ async fn generate_signals(
 ) -> anyhow::Result<Vec<QuantSignal>> {
     let now = Utc::now();
 
-    // Find correlated pairs where one market moved significantly in the last
-    // 4 hours and the other didn't follow.
+    // Find correlated pairs where one market moved significantly over four
+    // hours and the other didn't follow.
     //
     // For each pair in market_correlations with |r| >= min_correlation:
-    //   1. Get the 4h price change for both markets from orderbook_hourly
-    //   2. If one moved > min_lead_move and the other < max_lag_move → divergence
+    //   1. Each market's move from the close of the bar four hours before its
+    //      newest bar to the newest bar's close
+    //   2. If one moved > min_lead_move and the other < max_lag_move over the
+    //      same bars → divergence
+    //
+    // The aggregate is materialized an hour behind on an hourly schedule, so
+    // the newest bar usually starts two to four hours ago; anchoring on it
+    // (not on NOW()) keeps the span four hours. A market without both bars
+    // has no move to compare: one bar alone is not "did not move".
     //
     // The orderbook_hourly view uses: market_id, bucket, close (last yes_mid)
     let rows: Vec<DivergenceRow> = sqlx::query_as(
         r#"
-        WITH price_changes AS (
+        WITH latest AS (
+            SELECT market_id, MAX(bucket) AS bucket
+            FROM orderbook_hourly
+            WHERE bucket >= NOW() - INTERVAL '6 hours'
+            GROUP BY market_id
+        ),
+        price_changes AS (
             SELECT
-                oh.market_id,
-                (last_val.close - first_val.close) /
-                    NULLIF(first_val.close, 0) AS price_change,
-                last_val.close AS current_price,
-                last_val.bucket AS current_bucket
-            FROM (
-                SELECT DISTINCT market_id
-                FROM orderbook_hourly
-                WHERE bucket >= NOW() - INTERVAL '4 hours'
-            ) oh
-            CROSS JOIN LATERAL (
-                SELECT close
-                FROM orderbook_hourly
-                WHERE market_id = oh.market_id
-                  AND bucket >= NOW() - INTERVAL '4 hours'
-                ORDER BY bucket ASC
-                LIMIT 1
-            ) first_val
-            CROSS JOIN LATERAL (
-                SELECT close, bucket
-                FROM orderbook_hourly
-                WHERE market_id = oh.market_id
-                  AND bucket >= NOW() - INTERVAL '4 hours'
-                ORDER BY bucket DESC
-                LIMIT 1
-            ) last_val
-            WHERE first_val.close > 0.05
-              AND last_val.close > 0.05
+                l.market_id,
+                (cur.close - base.close) / NULLIF(base.close, 0) AS price_change,
+                cur.close AS current_price,
+                cur.bucket AS current_bucket
+            FROM latest l
+            JOIN orderbook_hourly cur
+              ON cur.market_id = l.market_id AND cur.bucket = l.bucket
+            JOIN orderbook_hourly base
+              ON base.market_id = l.market_id
+             AND base.bucket = l.bucket - INTERVAL '4 hours'
+            WHERE base.close > 0.05
+              AND cur.close > 0.05
         )
         SELECT
             CASE
@@ -221,6 +218,7 @@ async fn generate_signals(
         JOIN price_changes pc_b ON pc_b.market_id = mc.condition_id_b
         WHERE ABS(mc.correlation) >= $1
           AND mc.sample_size >= 168
+          AND pc_a.current_bucket = pc_b.current_bucket
           AND (
               (ABS(pc_a.price_change) >= $2 AND ABS(pc_b.price_change) <= $3)
               OR
@@ -372,19 +370,46 @@ mod tests {
         hourly_bars::create(&pool).await;
         sqlx::query(
             "INSERT INTO market_correlations (condition_id_a, condition_id_b, correlation, sample_size)
-             VALUES ('0xa', '0xb', 0.9, 200)",
+             VALUES ('0xa', '0xb', 0.9, 200), ('0xc', '0xd', 0.9, 200), ('0xe', '0xf', 0.9, 200)",
         )
         .execute(&pool)
         .await
         .unwrap();
-        let now = Utc::now();
-        let start = now - Duration::minutes(200);
-        let latest = now - Duration::minutes(20);
+        use chrono::DurationRound;
+        // As the materialized aggregate holds them: the newest bar started
+        // three hours ago.
+        let hour = Utc::now().duration_trunc(Duration::hours(1)).unwrap();
+        let latest = hour - Duration::hours(3);
+        let start = latest - Duration::hours(4);
         // Lead 0xa rises 0.40 → 0.50 (+25%); lag 0xb stays at 0.60.
         for (market, open, close) in [("0xa", 40, 50), ("0xb", 60, 60)] {
             hourly_bars::insert(&pool, market, start, Decimal::new(open, 2), Decimal::ONE).await;
             hourly_bars::insert(&pool, market, latest, Decimal::new(close, 2), Decimal::ONE).await;
         }
+        // The same lead moves, but 0xd has only its newest bar (no move to
+        // compare), and 0xf's bars are an hour earlier (not the same hours).
+        for lead in ["0xc", "0xe"] {
+            hourly_bars::insert(&pool, lead, start, Decimal::new(40, 2), Decimal::ONE).await;
+            hourly_bars::insert(&pool, lead, latest, Decimal::new(50, 2), Decimal::ONE).await;
+        }
+        hourly_bars::insert(&pool, "0xd", latest, Decimal::new(60, 2), Decimal::ONE).await;
+        let earlier = Duration::hours(1);
+        hourly_bars::insert(
+            &pool,
+            "0xf",
+            start - earlier,
+            Decimal::new(60, 2),
+            Decimal::ONE,
+        )
+        .await;
+        hourly_bars::insert(
+            &pool,
+            "0xf",
+            latest - earlier,
+            Decimal::new(60, 2),
+            Decimal::ONE,
+        )
+        .await;
 
         let config = CrossMarketSignalConfig::from_env();
         let signals = generate_signals(&config, &pool).await.unwrap();

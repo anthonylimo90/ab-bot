@@ -1080,6 +1080,15 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Outside development (`ENVIRONMENT` other than development/dev/local/test),
   a startup with no `CORS_ALLOWED_ORIGINS` logs an error: every origin may
   call the API. Set it to the dashboard's origin.
+- The mean-reversion and cross-market generators read hourly bars as the
+  materialized aggregate holds them: the newest bar usually starts two to
+  four hours ago (it is refreshed hourly, an hour behind). Mean reversion
+  looked back only two hours, so it never found two bars and emitted
+  nothing; it now looks back six hours and compares the two newest bars only
+  when they are adjacent hours. Cross-market measured its "four hour" moves
+  from NOW(), which left one or two bars, so a market with a single bar read
+  as "did not move"; each move is now the four hours to the market's newest
+  bar, needs both bars, and a pair compares the same hours.
 
 ### API contract changes
 

@@ -4,8 +4,12 @@
 //! large price moves on below-median volume — classic mean reversion setups.
 //!
 //! Trigger conditions:
-//!   - Price moved > 10% in the last hour
+//!   - Price moved > 10% between the two newest hourly bars, in adjacent hours
 //!   - Volume is below the market's own 24h median
+//!
+//! The aggregate is materialized an hour behind on an hourly schedule, so the
+//! newest bar usually starts two to four hours ago; the executor's reference
+//! age and drift checks decide whether the move still stands.
 //!
 //! Direction: opposite of the move (bet on reversion)
 //! Confidence: 0.55 + |price_change| * 1.5, capped at 0.80
@@ -127,8 +131,8 @@ async fn scan_and_emit(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let now = Utc::now();
 
-    // Find markets where the most recent hourly price moved > min_move_pct
-    // compared to the previous hour, and the market's rolling 24h volume is
+    // Find markets where the newest hourly bar's close moved > min_move_pct
+    // from the bar the hour before, and the market's rolling 24h volume is
     // not above its median over the day (the move did not come with a surge
     // of trading).
     //
@@ -141,6 +145,10 @@ async fn scan_and_emit(
     //   - bucket: hourly timestamp
     //   - close: last yes_mid price
     //   - avg_volume: average rolling 24h volume
+    //
+    // The window spans the aggregate's materialization lag (the newest bar
+    // starts up to about four hours ago), and the two bars must be adjacent
+    // hours: across a gap the "move" spans more than an hour.
     let rows = sqlx::query_as::<_, MeanReversionRow>(
         r#"
         WITH recent AS (
@@ -151,7 +159,7 @@ async fn scan_and_emit(
                 avg_volume,
                 ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY bucket DESC) AS rn
             FROM orderbook_hourly
-            WHERE bucket >= $1 - INTERVAL '2 hours'
+            WHERE bucket >= $1 - INTERVAL '6 hours'
         ),
         current_prev AS (
             SELECT
@@ -166,6 +174,7 @@ async fn scan_and_emit(
                 c.avg_volume::float8 AS current_volume
             FROM recent c
             JOIN recent p ON c.condition_id = p.condition_id AND p.rn = 2
+                AND p.bucket = c.bucket - INTERVAL '1 hour'
             JOIN market_metadata mm ON mm.condition_id = c.condition_id
             WHERE c.rn = 1
               AND p.mid_price BETWEEN 0.08 AND 0.92
@@ -308,22 +317,32 @@ mod tests {
         )
         .await
         .unwrap();
+        use chrono::DurationRound;
         let now = Utc::now();
-        let current_bucket = now - Duration::minutes(40);
-        // A spike, and moves that are resolution, an ended market, and an
-        // unknown market.
+        // As the materialized aggregate holds them: the newest bar started
+        // three hours ago.
+        let hour = now.duration_trunc(Duration::hours(1)).unwrap();
+        let current_bucket = hour - Duration::hours(3);
+        // A spike, and moves that are resolution, an ended market, an unknown
+        // market, and one whose two newest bars are two hours apart.
         for (market, previous, current, active, ends_in_hours) in [
             ("0xspike", 50, 60, true, Some(240)),
             ("0xresolving", 90, 99, true, Some(240)),
             ("0xclosed", 50, 60, false, Some(240)),
             ("0xending", 50, 60, true, Some(2)),
             ("0xunknown", 50, 60, true, None),
+            ("0xgap", 50, 60, true, Some(240)),
         ] {
-            for (minutes_ago, price) in [(100, previous), (40, current)] {
+            let previous_bucket = if market == "0xgap" {
+                current_bucket - Duration::hours(2)
+            } else {
+                current_bucket - Duration::hours(1)
+            };
+            for (bucket, price) in [(previous_bucket, previous), (current_bucket, current)] {
                 hourly_bars::insert(
                     &pool,
                     market,
-                    now - Duration::minutes(minutes_ago),
+                    bucket,
                     Decimal::new(price, 2),
                     Decimal::from(1000),
                 )
