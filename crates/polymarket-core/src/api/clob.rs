@@ -1031,8 +1031,9 @@ struct ClobMarket {
     closed: bool,
     #[serde(default)]
     archived: bool,
+    /// Unknown when absent, not refused.
     #[serde(default, alias = "accepting_orders")]
-    accepting_orders: bool,
+    accepting_orders: Option<bool>,
     #[serde(default, alias = "enable_order_book")]
     enable_order_book: bool,
     #[serde(default)]
@@ -1073,9 +1074,9 @@ impl From<ClobMarket> for Market {
             // Treat explicit `closed` / `archived` as authoritative for liveness.
             resolved: m.closed
                 || m.archived
-                || (!m.accepting_orders && !m.enable_order_book && !m.active),
+                || (m.accepting_orders != Some(true) && !m.enable_order_book && !m.active),
             resolution: None,
-            accepting_orders: Some(m.accepting_orders),
+            accepting_orders: m.accepting_orders,
             category: None,
             tags: Vec::new(),
             fees_enabled: false,
@@ -3213,12 +3214,38 @@ mod authenticated_tests {
             end_date: Some("2024-01-01T00:00:00Z".to_string()),
             closed: true,
             archived: false,
-            accepting_orders: false,
+            accepting_orders: Some(false),
             enable_order_book: false,
             active: true,
         };
 
         let converted: Market = market.into();
         assert!(converted.resolved);
+    }
+
+    #[test]
+    fn a_market_without_the_accepting_orders_flag_is_not_read_as_halted() {
+        let parse = |json: serde_json::Value| -> Market {
+            serde_json::from_value::<ClobMarket>(json).unwrap().into()
+        };
+        let base = serde_json::json!({
+            "condition_id": "0xc", "question": "q?", "active": true,
+            "enable_order_book": true,
+            "tokens": [{"token_id": "1", "outcome": "Yes"}, {"token_id": "2", "outcome": "No"}]
+        });
+        let unknown = parse(base.clone());
+        assert_eq!(unknown.accepting_orders, None);
+        assert!(unknown.is_tradable());
+
+        let mut halted = base.clone();
+        halted["accepting_orders"] = serde_json::json!(false);
+        let halted = parse(halted);
+        assert_eq!(halted.accepting_orders, Some(false));
+        assert!(!halted.resolved);
+        assert!(!halted.is_tradable());
+
+        let mut open = base;
+        open["accepting_orders"] = serde_json::json!(true);
+        assert!(parse(open).is_tradable());
     }
 }

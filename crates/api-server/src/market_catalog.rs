@@ -62,8 +62,8 @@ pub struct OutcomeTokenCache {
     clob_client: Arc<ClobClient>,
     gamma_client: GammaClient,
     tokens: RwLock<HashMap<String, (String, String)>>,
-    /// Shared set of active (non-resolved) market IDs, populated on each refresh.
-    /// Used to skip resolved markets before hitting CLOB.
+    /// Shared set of the market (and token) IDs a new position may enter:
+    /// not resolved and taking orders at the last refresh or single read.
     active_clob_markets: Arc<RwLock<HashSet<String>>>,
     /// Database pool for persisting token→condition_id mappings.
     pool: Option<PgPool>,
@@ -173,10 +173,10 @@ impl OutcomeTokenCache {
                     token_condition_pairs.push((outcome.token_id.clone(), market.id.clone()));
                 }
             }
-            if let (true, Some((yes, no))) = (
-                tradable_ids.contains(&market.id),
-                yes_no_indices(&market.outcomes),
-            ) {
+            // Tokens are kept for every listed binary market, tradable or
+            // not: exits and resolution need them. Entries check the active
+            // set above.
+            if let Some((yes, no)) = yes_no_indices(&market.outcomes) {
                 map.insert(
                     market.id.clone(),
                     (
@@ -483,6 +483,40 @@ mod tests {
         catalog.gamma_client = GammaClient::new(Some("http://127.0.0.1:0".into()));
         assert!(catalog.refresh_if_stale(Duration::ZERO).await.is_err());
         assert!(catalog.get("shared").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_full_refresh_keeps_a_halted_markets_tokens_out_of_the_active_set() {
+        let app = Router::new().route(
+            "/markets",
+            get(|| async {
+                Json(serde_json::json!([
+                    {"conditionId":"open","question":"Open?","active":true,
+                     "acceptingOrders":true,"enableOrderBook":true,
+                     "outcomes":"[\"Yes\",\"No\"]","clobTokenIds":"[\"1\",\"2\"]"},
+                    {"conditionId":"halted","question":"Halted?","active":true,
+                     "acceptingOrders":false,"enableOrderBook":true,
+                     "outcomes":"[\"Yes\",\"No\"]","clobTokenIds":"[\"3\",\"4\"]"}
+                ]))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut catalog = OutcomeTokenCache::new(
+            Arc::new(ClobClient::new(None, None)),
+            Arc::new(RwLock::new(HashSet::new())),
+        );
+        catalog.gamma_client = GammaClient::new(Some(url));
+        catalog
+            .refresh_if_stale(Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert!(catalog.is_tradable("open").await);
+        assert!(!catalog.is_tradable("halted").await);
+        // Exits find the halted market's tokens without another exchange read.
+        assert_eq!(catalog.get("halted").await, Some(("3".into(), "4".into())));
+        server.abort();
     }
 
     #[tokio::test]
