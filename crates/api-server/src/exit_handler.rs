@@ -478,7 +478,7 @@ impl ExitHandler {
             )
             .await?
         {
-            let execution_mode = self.current_execution_mode().await;
+            let execution_mode = candidate.position.execution_mode.clone();
             let ctx = Self::event_context(&execution_mode, candidate.source, quant_ctx);
             if let Err(e) = self
                 .position_service
@@ -1846,14 +1846,6 @@ impl ExitHandler {
         Ok(())
     }
 
-    async fn current_execution_mode(&self) -> String {
-        if self.order_executor.is_live_ready().await {
-            "live".to_string()
-        } else {
-            "paper".to_string()
-        }
-    }
-
     /// Build an EventContext for PositionService calls from position source and quant context.
     fn event_context(
         execution_mode: &str,
@@ -2024,7 +2016,7 @@ impl ExitHandler {
 
             // Transition EntryFailed → ExitReady via PositionService so
             // mark_closing succeeds and a trade event is recorded.
-            let execution_mode = self.current_execution_mode().await;
+            let execution_mode = position.execution_mode.clone();
             let ctx = Self::event_context(&execution_mode, SOURCE_ARBITRAGE, None);
             if let Err(error) = self
                 .position_service
@@ -2117,7 +2109,7 @@ impl ExitHandler {
                 continue;
             }
 
-            let execution_mode = self.current_execution_mode().await;
+            let execution_mode = position.execution_mode.clone();
             let quant_ctx = self
                 .load_quant_exit_context(position.id)
                 .await
@@ -2349,6 +2341,20 @@ pub(crate) async fn record_close_with_breaker(
 
 /// Whether a close counts with the circuit breaker: live ones only, and
 /// never a win a resolution close could not confirm in the wallet.
+/// Whether a closed position `p`'s result is confirmed, as SQL: its close
+/// event was written (it goes in after the position, so a process that
+/// stopped between the two leaves none) and does not say the payout went
+/// unmeasured. A win counts for the circuit breaker only when confirmed.
+pub(crate) const CLOSE_CONFIRMED_SQL: &str = "(EXISTS (\
+        SELECT 1 FROM trade_events te \
+        WHERE te.position_id = p.id \
+          AND te.event_type IN ('closed_via_exit', 'closed_via_resolution')) \
+    AND NOT EXISTS (\
+        SELECT 1 FROM trade_events te \
+        WHERE te.position_id = p.id \
+          AND te.event_type = 'closed_via_resolution' \
+          AND te.metadata ? 'unmeasured'))";
+
 fn breaker_counts_close(execution_mode: &str, pnl: Decimal, confirmed: bool) -> bool {
     execution_mode == "live" && (confirmed || pnl <= Decimal::ZERO)
 }
@@ -2374,9 +2380,9 @@ async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
 /// are only marked. Run by a new trading leader before it trades; a retry
 /// once it trades passes `closed_before` (it records its own).
 ///
-/// A win from a resolution close with a winner counts only when its close
-/// event says the payout was measured: the event is written after the
-/// position, so a process that stopped between the two leaves no proof.
+/// A win counts only when its close is confirmed ([`CLOSE_CONFIRMED_SQL`]):
+/// the close event is written after the position, so a process that
+/// stopped between the two leaves no proof, and a loss always counts.
 pub(crate) async fn record_missed_closes(
     pool: &PgPool,
     breaker: &CircuitBreaker,
@@ -2390,29 +2396,16 @@ pub(crate) async fn record_missed_closes(
         exit_timestamp: Option<chrono::DateTime<chrono::Utc>>,
         confirmed: bool,
     }
-    let missed: Vec<MissedClose> = sqlx::query_as(
+    let missed: Vec<MissedClose> = sqlx::query_as(&format!(
         r#"
         SELECT p.id, p.realized_pnl, p.execution_mode, p.exit_timestamp,
-               NOT EXISTS (
-                   SELECT 1 FROM trade_events te
-                   WHERE te.position_id = p.id
-                     AND te.event_type = 'closed_via_resolution'
-                     AND te.metadata ? 'unmeasured'
-               )
-               AND (
-                   p.resolution_winner IS NULL
-                   OR EXISTS (
-                       SELECT 1 FROM trade_events te
-                       WHERE te.position_id = p.id
-                         AND te.event_type = 'closed_via_resolution'
-                   )
-               ) AS confirmed
+               {CLOSE_CONFIRMED_SQL} AS confirmed
         FROM positions p
         WHERE p.state = 4 AND p.breaker_recorded_at IS NULL
           AND ($1::timestamptz IS NULL OR p.exit_timestamp IS NULL OR p.exit_timestamp < $1)
         ORDER BY p.exit_timestamp NULLS FIRST, p.id
         "#,
-    )
+    ))
     .bind(closed_before)
     .fetch_all(pool)
     .await?;
@@ -2630,28 +2623,32 @@ mod tests {
                     id
                 }
             };
-        let event = |id: uuid::Uuid, metadata: &'static str| {
+        let event_of = |id: uuid::Uuid, event_type: &'static str, metadata: &'static str| {
             let pool = pool.clone();
             async move {
-                sqlx::query(
-                    "INSERT INTO trade_events VALUES ($1, 'closed_via_resolution', $2::jsonb)",
-                )
-                .bind(id)
-                .bind(metadata)
-                .execute(&pool)
-                .await
-                .unwrap();
+                sqlx::query("INSERT INTO trade_events VALUES ($1, $2, $3::jsonb)")
+                    .bind(id)
+                    .bind(event_type)
+                    .bind(metadata)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             }
         };
-        // Missed today: a live loss and a measured resolution win count; a
-        // live win the wallet could not confirm, a resolution win whose close
-        // event was never written, and a paper loss do not.
+        let event = |id, metadata| event_of(id, "closed_via_resolution", metadata);
+        // Missed today: a live loss, a measured resolution win and a sale's
+        // win count; a live win the wallet could not confirm, wins whose
+        // close event was never written (a resolution's or a sale's), and a
+        // paper loss do not.
         close(-30, "live", 3, false, None).await;
         let measured = close(20, "live", 2, false, Some("yes")).await;
         event(measured, "{}").await;
+        let sold = close(15, "live", 2, false, None).await;
+        event_of(sold, "closed_via_exit", "{}").await;
         let unconfirmed = close(50, "live", 1, false, Some("no")).await;
         event(unconfirmed, "{\"unmeasured\": []}").await;
         close(60, "live", 1, false, Some("yes")).await;
+        close(25, "live", 1, false, None).await;
         close(-40, "paper", 1, false, None).await;
         // Missed on an earlier day, and marked already: neither counts.
         close(-70, "live", 2 * 24 * 3600, false, None).await;
@@ -2667,8 +2664,8 @@ mod tests {
             .await
             .unwrap();
         let state = breaker.state().await;
-        assert_eq!(state.daily_pnl, Decimal::from(-10));
-        // The measured win, after the loss, ended the streak.
+        assert_eq!(state.daily_pnl, Decimal::from(5));
+        // The confirmed wins, after the loss, ended the streak.
         assert_eq!(state.consecutive_losses, 0);
         // Stored with the counters, and marked with them.
         let stored: Decimal =
@@ -2676,7 +2673,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stored, Decimal::from(-10));
+        assert_eq!(stored, Decimal::from(5));
         let unmarked: Vec<uuid::Uuid> =
             sqlx::query_scalar("SELECT id FROM positions WHERE breaker_recorded_at IS NULL")
                 .fetch_all(&pool)
@@ -2689,9 +2686,9 @@ mod tests {
         let next = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         next.lead().await.unwrap();
         record_missed_closes(&pool, &next, None).await.unwrap();
-        assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
+        assert_eq!(next.state().await.daily_pnl, Decimal::ZERO);
         record_missed_closes(&pool, &next, None).await.unwrap();
-        assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
+        assert_eq!(next.state().await.daily_pnl, Decimal::ZERO);
     }
 
     #[test]

@@ -1147,6 +1147,8 @@ impl ArbAutoExecutor {
                 .await;
             return Ok(());
         }
+        // The pair's cash and the withdrawals in flight when it was checked.
+        let mut pair_cash: Option<(Decimal, Option<Vec<uuid::Uuid>>)> = None;
         if live_ready {
             let Some(yes_best_ask) = yes_book.best_ask() else {
                 let mut runtime = self.runtime_status.write().await;
@@ -1191,6 +1193,9 @@ impl ArbAutoExecutor {
             }
 
             let required_collateral = pair_collateral(quantity, yes_best_ask, no_best_ask);
+            // Read first: a withdrawal reserved after this read, before the
+            // entry is recorded, is checked for again once it is.
+            let withdrawals_seen = self.order_executor.withdrawals_in_flight().await.ok();
             if let Err(error) = self
                 .order_executor
                 .ensure_live_buying_power(required_collateral)
@@ -1218,6 +1223,7 @@ impl ArbAutoExecutor {
                 .await;
                 return Ok(());
             }
+            pair_cash = Some((required_collateral, withdrawals_seen));
         }
         telemetry.preflight_ms = Some(process_started_at.elapsed().as_millis() as i64);
 
@@ -1308,6 +1314,43 @@ impl ArbAutoExecutor {
                 return Err(anyhow::anyhow!("Failed to persist position: {e}"));
             }
         };
+
+        // From here new withdrawals wait for this entry. One reserved since
+        // the cash was checked (or a read that failed) may have taken the
+        // second leg's cash: check it again before the first leg is bought.
+        if let Some((required_collateral, seen)) = pair_cash {
+            let reserved_since = match (&seen, self.order_executor.withdrawals_in_flight().await) {
+                (Some(seen), Ok(now)) => now.iter().any(|id| !seen.contains(id)),
+                _ => true,
+            };
+            if reserved_since {
+                if let Err(error) = self
+                    .order_executor
+                    .ensure_live_buying_power(required_collateral)
+                    .await
+                {
+                    telemetry.failure_stage = Some("pair_capacity_recheck".to_string());
+                    telemetry.finish_total(&process_started_at);
+                    let mut runtime = self.runtime_status.write().await;
+                    runtime.execution_failures = runtime.execution_failures.saturating_add(1);
+                    runtime.record_decision(
+                        market_id,
+                        format!(
+                            "skipped: a withdrawal took the pair's buying power required={} \
+                             error={error}",
+                            required_collateral
+                        ),
+                    );
+                    drop(runtime);
+                    warn!(market_id = %market_id, %error, "Pair buying power gone after a withdrawal");
+                    let _ = self
+                        .position_service
+                        .mark_entry_failed(&mut position, FailureReason::InsufficientBalance, &ctx)
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
 
         // 9. Execute YES market order. Its slippage may not consume more than
         // the edge left above the minimum, or the pair would be unprofitable.

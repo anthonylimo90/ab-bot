@@ -537,8 +537,9 @@ impl QuantSignalExecutor {
         let cfg = self.snapshot_config().await;
         let execution_mode = self.execution_mode(&cfg).await;
         // As the main breaker counts them: only the mode being traded, and
-        // never a win a resolution close could not confirm in the wallet.
-        let rows: Vec<QuantOutcomeRow> = match sqlx::query_as(
+        // never a win whose close is not confirmed (no close event, or a
+        // resolution payout that went unmeasured).
+        let rows: Vec<QuantOutcomeRow> = match sqlx::query_as(&format!(
             r#"
             SELECT
                 p.id AS position_id,
@@ -551,14 +552,11 @@ impl QuantSignalExecutor {
               AND p.realized_pnl IS NOT NULL
               AND p.exit_timestamp >= $1
               AND p.execution_mode = $2
-              AND NOT (p.realized_pnl > 0 AND EXISTS (
-                  SELECT 1 FROM trade_events te
-                  WHERE te.position_id = p.id
-                    AND te.event_type = 'closed_via_resolution'
-                    AND te.metadata ? 'unmeasured'))
+              AND NOT (p.realized_pnl > 0 AND NOT {})
             ORDER BY p.exit_timestamp ASC
             "#,
-        )
+            crate::exit_handler::CLOSE_CONFIRMED_SQL
+        ))
         .bind(today_start)
         .bind(execution_mode)
         .fetch_all(&self.pool)

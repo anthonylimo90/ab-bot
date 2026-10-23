@@ -316,9 +316,12 @@ impl OrderExecutor {
 
     /// Check if live trading is initialized and ready.
     pub async fn is_live_ready(&self) -> bool {
-        if !self.is_live() {
-            return false;
-        }
+        self.is_live() && self.has_live_signer().await
+    }
+
+    /// Whether the trading wallet's signer and API credentials are loaded,
+    /// whatever the live switch says now.
+    async fn has_live_signer(&self) -> bool {
         let slot = self.auth_client.read().await;
         slot.as_ref().map(|c| c.has_credentials()).unwrap_or(false)
     }
@@ -414,11 +417,18 @@ impl OrderExecutor {
             .await
     }
 
+    /// Whether an order in `mode` (for `wallet`) can be carried out here. An
+    /// order trades in the mode its position or reservation took: switching
+    /// live trading off stops new live entries (they choose their mode from
+    /// the switch), never the exits, second legs or recovery sales of live
+    /// positions already open, and switching it on does not strand paper
+    /// positions. A live order needs this process's signer, credentials
+    /// loaded, for the same wallet.
     async fn validate_execution(&self, mode: &str, wallet: Option<&str>) -> Result<()> {
         match mode {
-            "paper" if !self.is_live() => Ok(()),
+            "paper" => Ok(()),
             "live"
-                if self.is_live_ready().await
+                if self.has_live_signer().await
                     && wallet.is_some()
                     && self
                         .wallet_address()
@@ -908,6 +918,28 @@ impl OrderExecutor {
             .into_iter()
             .map(|(remaining, price)| open_buy_cost(remaining, price))
             .sum())
+    }
+
+    /// The withdrawals from the live wallet still being settled, by id: a
+    /// pair compares them before and after its entry is recorded (from then
+    /// on new withdrawals wait for it), to check its cash again when one was
+    /// reserved in between.
+    pub async fn withdrawals_in_flight(&self) -> Result<Vec<Uuid>> {
+        let Some(pool) = &self.database else {
+            return Ok(Vec::new());
+        };
+        let Some(wallet) = self.wallet_address().await else {
+            return Ok(Vec::new());
+        };
+        sqlx::query_scalar(
+            "SELECT id FROM wallet_withdrawals \
+             WHERE LOWER(wallet_address) = LOWER($1) \
+               AND status IN ('pending', 'submitting', 'submitted')",
+        )
+        .bind(wallet)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Could not read withdrawals in flight: {e}"))
     }
 
     /// USDC that withdrawals from `wallet` still being settled may take: the
@@ -1601,15 +1633,59 @@ impl OrderExecutor {
     }
 
     async fn simulate_limit_order(&self, order: &LimitOrder) -> Result<ExecutionReport> {
-        // Simulate limit order - assume it fills at limit price
-        let fees = order.quantity * order.price * self.config.fee_rate;
+        // Paper trading has no matching engine: a limit order fills only
+        // when the book can fill all of it now at its limit or better, at
+        // the book's own prices. One that would rest is refused rather than
+        // booked at a price no one offered.
+        let book = self.clob_client.get_order_book(&order.outcome_id).await?;
+        let mut levels: Vec<&polymarket_core::types::PriceLevel> = match order.side {
+            OrderSide::Buy => book
+                .asks
+                .iter()
+                .filter(|level| level.price <= order.price)
+                .collect(),
+            OrderSide::Sell => book
+                .bids
+                .iter()
+                .filter(|level| level.price >= order.price)
+                .collect(),
+        };
+        match order.side {
+            OrderSide::Buy => levels.sort_by_key(|level| level.price),
+            OrderSide::Sell => levels.sort_by_key(|level| std::cmp::Reverse(level.price)),
+        }
+        let mut remaining = order.quantity;
+        let mut value = Decimal::ZERO;
+        for level in levels {
+            if remaining <= Decimal::ZERO {
+                break;
+            }
+            let take = remaining.min(level.size);
+            value += take * level.price;
+            remaining -= take;
+        }
+        if order.quantity <= Decimal::ZERO || remaining > Decimal::ZERO {
+            let report = ExecutionReport::rejected(
+                order.id,
+                order.market_id.clone(),
+                order.outcome_id.clone(),
+                order.side,
+                "Paper trading fills a limit order only when the book can fill all of it now \
+                 at the limit or better; resting orders are not simulated"
+                    .to_string(),
+            );
+            return Ok(report);
+        }
+        let price = value / order.quantity;
+        let fees = value * self.config.fee_rate;
 
         info!(
             order_id = %order.id,
-            price = %order.price,
+            limit = %order.price,
+            price = %price,
             quantity = %order.quantity,
             fees = %fees,
-            "[PAPER] Simulated limit order placement"
+            "[PAPER] Simulated limit order fill"
         );
 
         Ok(ExecutionReport::filled(
@@ -1618,7 +1694,7 @@ impl OrderExecutor {
             order.outcome_id.clone(),
             order.side,
             order.quantity,
-            order.price,
+            price,
             fees,
         ))
     }
@@ -1811,6 +1887,26 @@ mod tests {
             Arc::new(ClobClient::new(None, None)),
             ExecutorConfig::default(),
         )
+    }
+
+    /// A CLOB serving one book: asks 0.50 x 1000, bids 0.49 x 1000.
+    async fn paper_book_client() -> Arc<ClobClient> {
+        use axum::{routing::get, Json, Router};
+        let app = Router::new().route(
+            "/book",
+            get(|| async {
+                Json(serde_json::json!({
+                    "market": "m", "asset_id": "1",
+                    "bids": [{"price": "0.49", "size": "1000"}],
+                    "asks": [{"price": "0.50", "size": "1000"}],
+                    "timestamp": "2026-01-01T00:00:00Z"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Arc::new(ClobClient::new(Some(url), None))
     }
 
     #[tokio::test]
@@ -2381,25 +2477,28 @@ mod tests {
 
     #[tokio::test]
     async fn report_observers_never_block_execution_beyond_capacity() {
+        // Orders over the size limit are reported without a request.
         let executor = OrderExecutor::new(
             Arc::new(ClobClient::new(None, None)),
-            ExecutorConfig::default(),
+            ExecutorConfig {
+                max_order_size: Decimal::ONE,
+                ..Default::default()
+            },
         );
         for observe in [false, true] {
             let _undrained = observe.then(|| executor.subscribe_reports());
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 for _ in 0..2500 {
                     let report = executor
-                        .execute_limit_order(LimitOrder::new(
+                        .execute_market_order(MarketOrder::new(
                             "market".into(),
                             "token".into(),
                             OrderSide::Buy,
-                            Decimal::new(5, 1),
-                            Decimal::ONE,
+                            Decimal::TWO,
                         ))
                         .await
                         .unwrap();
-                    assert_eq!(report.status, OrderStatus::Filled);
+                    assert_eq!(report.status, OrderStatus::Rejected);
                 }
             })
             .await
@@ -2568,29 +2667,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_order_trades_in_its_positions_mode_whatever_the_switch() {
+        let clob_client = paper_book_client().await;
+        let config = ExecutorConfig {
+            live_trading: true,
+            ..Default::default()
+        };
+        let executor = OrderExecutor::new(clob_client, config);
+        let order = || {
+            LimitOrder::new(
+                "market".to_string(),
+                "token".to_string(),
+                OrderSide::Sell,
+                Decimal::new(49, 2),
+                Decimal::new(10, 0),
+            )
+        };
+        // A paper position still exits (simulated) once live trading is on.
+        let report = executor
+            .execute_reserved_limit_order(order(), "paper", None)
+            .await
+            .unwrap();
+        assert_eq!(report.status, OrderStatus::Filled);
+        // A live order needs the signer, whatever the switch says.
+        assert!(executor
+            .execute_reserved_limit_order(order(), "live", Some("0xabc"))
+            .await
+            .is_err());
+        executor.set_live_mode(false);
+        assert!(executor
+            .execute_reserved_limit_order(order(), "live", Some("0xabc"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn test_paper_trading_limit_order_simulates() {
-        let clob_client = Arc::new(ClobClient::new(None, None));
         let config = ExecutorConfig {
             live_trading: false,
             fee_rate: Decimal::new(2, 2), // 2%
             ..Default::default()
         };
-        let executor = OrderExecutor::new(clob_client, config);
+        let executor = OrderExecutor::new(paper_book_client().await, config);
+        let limit = |side, price: i64, quantity: i64| {
+            LimitOrder::new(
+                "market".to_string(),
+                "token".to_string(),
+                side,
+                Decimal::new(price, 2),
+                Decimal::new(quantity, 0),
+            )
+        };
 
-        let order = LimitOrder::new(
-            "market".to_string(),
-            "token".to_string(),
-            OrderSide::Buy,
-            Decimal::new(50, 2), // price 0.50
-            Decimal::new(10, 0), // quantity 10
-        );
-
-        let report = executor.execute_limit_order(order).await.unwrap();
-        // Paper mode should fill at the limit price
+        // A buy that crosses the 0.50 ask fills there, not at its limit.
+        let report = executor
+            .execute_limit_order(limit(OrderSide::Buy, 60, 10))
+            .await
+            .unwrap();
         assert_eq!(report.status, OrderStatus::Filled);
         assert_eq!(report.average_price, Decimal::new(50, 2));
         assert_eq!(report.filled_quantity, Decimal::new(10, 0));
         // Fees: 10 * 0.50 * 0.02 = 0.10
         assert_eq!(report.fees_paid, Decimal::new(10, 2));
+
+        // A sell at or under the 0.49 bid fills at the bid.
+        let report = executor
+            .execute_limit_order(limit(OrderSide::Sell, 40, 10))
+            .await
+            .unwrap();
+        assert_eq!(report.status, OrderStatus::Filled);
+        assert_eq!(report.average_price, Decimal::new(49, 2));
+
+        // Orders that would rest, or that the book cannot fill whole, are
+        // refused rather than filled at a price no one offered.
+        for order in [
+            limit(OrderSide::Buy, 40, 10),
+            limit(OrderSide::Sell, 99, 10),
+            limit(OrderSide::Buy, 50, 2000),
+        ] {
+            let report = executor.execute_limit_order(order).await.unwrap();
+            assert_eq!(report.status, OrderStatus::Rejected);
+        }
     }
 }

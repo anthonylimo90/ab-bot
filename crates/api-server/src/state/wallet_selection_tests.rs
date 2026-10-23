@@ -33,7 +33,8 @@ async fn setup(pool: &PgPool, configured: Option<&str>) -> Uuid {
         CREATE TABLE positions (
             state SMALLINT NOT NULL,
             held_yes_qty NUMERIC NOT NULL DEFAULT 0,
-            held_no_qty NUMERIC NOT NULL DEFAULT 0
+            held_no_qty NUMERIC NOT NULL DEFAULT 0,
+            execution_mode TEXT NOT NULL DEFAULT 'live'
         );
         CREATE TABLE user_wallets (
             address TEXT, is_primary BOOLEAN, updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -213,6 +214,26 @@ async fn signer_rotation_preserves_ambiguous_and_resting_live_order_exposure(poo
             .await
             .is_ok()
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn paper_positions_do_not_hold_the_signer(pool: PgPool) {
+    setup(&pool, Some(&address(KEY_ONE))).await;
+    // An open paper position holds nothing in any wallet.
+    pool.execute(
+        "INSERT INTO positions (state, held_yes_qty, execution_mode) VALUES (1, 10, 'paper')",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        resolve_startup_wallet_address(&pool, Some(&address(KEY_TWO)))
+            .await
+            .unwrap(),
+        Some(address(KEY_TWO))
+    );
+    pin_startup_trading_wallet(&pool, &address(KEY_TWO))
+        .await
+        .unwrap();
 }
 
 #[sqlx::test(migrations = false)]

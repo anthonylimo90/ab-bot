@@ -58,7 +58,8 @@ async fn personal_wallet_preferences_do_not_change_the_workspace_signer(pool: Pg
 async fn the_live_signer_keeps_its_key_while_its_trades_are_open(pool: PgPool) {
     let [owner, _, _] = setup(&pool).await;
     pool.execute(
-        "CREATE TABLE positions (held_yes_qty NUMERIC, held_no_qty NUMERIC, state SMALLINT);
+        "CREATE TABLE positions (held_yes_qty NUMERIC, held_no_qty NUMERIC, state SMALLINT, \
+         execution_mode TEXT NOT NULL DEFAULT 'live');
          CREATE TABLE execution_intents (status TEXT);
          CREATE TABLE orders (execution_mode TEXT, status TEXT);
          CREATE TABLE manual_inventory (execution_mode TEXT, quantity NUMERIC);",

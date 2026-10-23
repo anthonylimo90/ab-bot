@@ -621,11 +621,16 @@ struct UnresolvedWithdrawal {
     signed_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
     superseded_seen_at: Option<DateTime<Utc>>,
+    /// The database's time when the row was read: the times above are the
+    /// database's, so their ages are measured on its clock, not this
+    /// process's.
+    db_now: DateTime<Utc>,
 }
 
 /// The columns of an [`UnresolvedWithdrawal`].
 const UNRESOLVED_COLUMNS: &str = "id, wallet_address, status, tx_hash, \
-    replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, superseded_seen_at";
+    replaced_tx_hashes, nonce, raw_tx, requested_at, signed_at, updated_at, superseded_seen_at, \
+    NOW() AS db_now";
 
 /// The withdrawals the reconciler can decide, given `REVERTED_ERROR` as $1 and
 /// `SECOND_CHANCE_HOURS` as $2.
@@ -898,7 +903,7 @@ async fn reconcile_on_chain(
         .await?;
         // Only an earlier one: the latest (a replacement journaled but never
         // delivered) is sent again, at most once per interval, to replace it.
-        if index > 0 && row.updated_at < Utc::now() - Duration::seconds(REBROADCAST_AFTER_SECS) {
+        if index > 0 && row.updated_at < row.db_now - Duration::seconds(REBROADCAST_AFTER_SECS) {
             resend_latest(conn, client, row, tx_hash).await?;
         }
         return Ok(true);
@@ -925,7 +930,7 @@ async fn reconcile_on_chain(
                 .await?;
             }
             Some(first_seen)
-                if Utc::now() - first_seen >= Duration::minutes(SUPERSEDED_CONFIRM_MINUTES) =>
+                if row.db_now - first_seen >= Duration::minutes(SUPERSEDED_CONFIRM_MINUTES) =>
             {
                 // Still unknown and still superseded minutes later. A last look
                 // for any receipt, then none of them can ever be mined.
@@ -958,7 +963,7 @@ async fn reconcile_on_chain(
     }
     // Still possible: send it again if the node lost it and nothing else
     // holds its nonce in the mempool, at most once per interval.
-    if row.updated_at < Utc::now() - Duration::seconds(REBROADCAST_AFTER_SECS)
+    if row.updated_at < row.db_now - Duration::seconds(REBROADCAST_AFTER_SECS)
         && client
             .transaction_count(&row.wallet_address, "pending")
             .await?
@@ -1004,7 +1009,7 @@ async fn resend_latest(
             warn!(
                 withdrawal_id = %row.id,
                 %reason,
-                unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
+                unresolved_minutes = (row.db_now - row.requested_at).num_minutes(),
                 "Node did not take a re-sent withdrawal; its gas price is raised when the \
                  network asks more, otherwise it blocks this wallet's withdrawals until \
                  mined or superseded (see DEPLOY.md)"
@@ -1014,7 +1019,7 @@ async fn resend_latest(
             warn!(
                 withdrawal_id = %row.id,
                 error = %chain_error_message(&error),
-                unresolved_minutes = (Utc::now() - row.requested_at).num_minutes(),
+                unresolved_minutes = (row.db_now - row.requested_at).num_minutes(),
                 "Re-sending a withdrawal failed"
             )
         }
@@ -1027,7 +1032,7 @@ async fn resend_latest(
 fn fee_bump_due(row: &UnresolvedWithdrawal) -> bool {
     matches!(row.status.as_str(), "submitting" | "submitted")
         && row.signed_at.unwrap_or(row.requested_at)
-            < Utc::now() - Duration::minutes(FEE_BUMP_AFTER_MINUTES)
+            < row.db_now - Duration::minutes(FEE_BUMP_AFTER_MINUTES)
 }
 
 /// A transfer's latest transaction, when the network now asks more for gas

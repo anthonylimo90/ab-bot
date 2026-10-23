@@ -123,6 +123,11 @@ async fn housekeeping(state: &AppState, wallet: Option<&str>) -> anyhow::Result<
         .execute(&mut *tx).await?;
     sqlx::query("UPDATE orders o SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='live' AND created_at<NOW()-INTERVAL '10 minutes' AND NOT EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=o.id)")
         .execute(&mut *tx).await?;
+    // A paper order is simulated within its request: one still pending
+    // minutes later was abandoned (the process stopped first) and must not
+    // hold exposure or inventory.
+    sqlx::query("UPDATE orders SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='paper' AND created_at<NOW()-INTERVAL '10 minutes'")
+        .execute(&mut *tx).await?;
     // An order the exchange refused whose row the request did not get to
     // update holds a reservation for nothing: it is rejected too.
     sqlx::query("UPDATE orders o SET status='rejected',updated_at=NOW() WHERE status='pending' AND execution_mode='live' AND created_at<NOW()-INTERVAL '10 minutes' AND EXISTS(SELECT 1 FROM execution_intents i WHERE i.id=o.id AND i.status='rejected')")
@@ -406,11 +411,29 @@ async fn apply_to_position(
     if applied != Decimal::ZERO {
         anyhow::bail!("Fill already accounted; reload receipt");
     }
+    // The fill and any close belong to the strategy that opened the
+    // position, as the exit handler books them: per-strategy P&L and health
+    // must not lose a close the reconciler settled.
+    let opened_by: Option<(i16, Option<String>)> = sqlx::query_as(
+        "SELECT p.source, qs.kind FROM positions p \
+         LEFT JOIN quant_signals qs ON qs.id = p.source_signal_id WHERE p.id = $1",
+    )
+    .bind(position_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let (strategy, source_label) = match opened_by {
+        Some((_, Some(kind))) => (kind, "quant"),
+        Some((polymarket_core::db::positions::SOURCE_RECOMMENDATION, None)) => {
+            ("quant".to_string(), "quant")
+        }
+        Some(_) => ("arb".to_string(), "arb"),
+        None => ("recovery".to_string(), "recovery"),
+    };
     let ctx = EventContext {
         execution_mode: "live".into(),
         wallet_address: Some(maker.into()),
-        strategy: "recovery".into(),
-        source_label: "recovery".into(),
+        strategy,
+        source_label: source_label.into(),
     };
     let leg = match intent.leg.as_deref() {
         Some("yes") => Leg::Yes,

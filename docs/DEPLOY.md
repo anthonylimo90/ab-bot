@@ -1003,6 +1003,36 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   helper only it used. Its table `latency_arb_signals` (065) stays; drop it
   with a new migration if its rows are not wanted.
 
+### Positions trade in their own mode; replay proof; paper fidelity
+
+- Switching live trading off (Pause) stops new live entries only. Exits,
+  the second leg of a pair already started, recovery sales and orphan sales
+  of live positions keep running as long as the trading signer is loaded
+  (they used to be refused, leaving live positions unsold). Paper positions
+  likewise still exit while live trading is on. Their trade events carry
+  the position's own mode.
+- Open paper positions no longer block pinning or changing the trading
+  signer at start (they hold nothing in any wallet).
+- A live arbitrage pair checks its cash again, after its entry is
+  recorded, when a withdrawal was reserved since the first check (from then
+  on new withdrawals wait for the entry), so a withdrawal can no longer
+  take the second leg's cash in between. A buy placed elsewhere at that
+  moment still can; the pair's one-legged recovery then sells the first
+  leg.
+- Withdrawal timers (the second look at a superseded transfer, rebroadcast
+  and fee bump) measure ages on the database's clock, so a process clock
+  ahead of it no longer cuts the wait short.
+- A sale or close the order reconciler settles is booked under the strategy
+  that opened the position (it was booked as `recovery`).
+- The circuit breaker's replay of missed closes (and the quant strategies'
+  own breakers) counts a win only when its close event was written and
+  does not say the payout went unmeasured; losses always count.
+- Paper manual orders: a pending one abandoned for ten minutes is rejected
+  (it held exposure and inventory for good), and a paper limit order fills
+  only when the book can fill all of it now at its limit or better, at the
+  book's prices; one that would rest is refused (it used to fill at its own
+  limit price, whatever the book).
+
 ### API contract changes
 
 - Service status adds `workspace_id` (the canonical workspace it describes)
