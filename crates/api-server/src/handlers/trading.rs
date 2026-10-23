@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -130,9 +130,13 @@ pub struct OrderResponse {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
-    /// Fill timestamp.
+    /// Fill timestamp: when the order filled completely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filled_at: Option<DateTime<Utc>>,
+    /// Why the exchange or the executor rejected the order, when it did
+    /// (in the response to placing it; not stored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -171,7 +175,8 @@ impl From<OrderRow> for OrderResponse {
             status: parse_order_status(&row.status),
             quantity: row.quantity,
             filled_quantity: row.filled_quantity,
-            remaining_quantity: row.quantity - row.filled_quantity,
+            // A buy may fill a little over its size (fee shares).
+            remaining_quantity: (row.quantity - row.filled_quantity).max(Decimal::ZERO),
             price: row.price,
             avg_fill_price: row.avg_fill_price,
             stop_price: row.stop_price,
@@ -179,6 +184,7 @@ impl From<OrderRow> for OrderResponse {
             created_at: row.created_at,
             updated_at: row.updated_at,
             filled_at: row.filled_at,
+            rejection_reason: None,
         }
     }
 }
@@ -492,11 +498,12 @@ async fn execute_reserved_order(
             Some(report.average_price),
             Some(report.executed_at),
         ),
+        // Filled only in part: no fill time until it fills completely.
         CoreOrderStatus::PartiallyFilled => (
             OrderStatus::PartiallyFilled,
             report.filled_quantity,
             Some(report.average_price),
-            Some(report.executed_at),
+            None,
         ),
         CoreOrderStatus::Rejected => (OrderStatus::Rejected, Decimal::ZERO, None, None),
         _ => (
@@ -516,6 +523,16 @@ async fn execute_reserved_order(
     sqlx::query("UPDATE orders SET status=$2, filled_quantity=$3, avg_fill_price=$4, filled_at=$5, updated_at=NOW(), exchange_order_id=COALESCE($6, (SELECT exchange_order_id FROM execution_intents WHERE id=$1)) WHERE id=$1")
         .bind(order_id).bind(serde_json::to_value(status)?.as_str().unwrap())
         .bind(filled_qty).bind(avg_price).bind(filled_at).bind(&report.exchange_order_id).execute(&state.pool).await?;
+
+    let rejection_reason = (status == OrderStatus::Rejected).then(|| {
+        report
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "rejected without a reason".to_string())
+    });
+    if let Some(reason) = &rejection_reason {
+        warn!(order_id = %order_id, market = %request.market_id, %reason, "Manual order rejected");
+    }
 
     // Log execution
     info!(
@@ -561,7 +578,7 @@ async fn execute_reserved_order(
         status,
         quantity: request.quantity,
         filled_quantity: filled_qty,
-        remaining_quantity: request.quantity - filled_qty,
+        remaining_quantity: (request.quantity - filled_qty).max(Decimal::ZERO),
         price: request.price,
         avg_fill_price: avg_price,
         stop_price: request.stop_price,
@@ -569,6 +586,7 @@ async fn execute_reserved_order(
         created_at: now,
         updated_at: now,
         filled_at,
+        rejection_reason,
     }))
 }
 
@@ -936,19 +954,29 @@ pub async fn cancel_order(
     axum::Extension(claims): axum::Extension<auth::Claims>,
     Path(order_id): Path<Uuid>,
 ) -> ApiResult<Json<OrderResponse>> {
-    let result = cancel_order_inner(&state, order_id).await;
-    super::audit_change(
-        &state,
-        Uuid::parse_str(&claims.sub).unwrap_or_default(),
-        ::auth::AuditAction::Custom("order_cancel_requested".into()),
-        format!("orders/{order_id}"),
-        serde_json::json!({
-            "status": result.as_ref().ok().map(|order| order.status),
-            "error": result.as_ref().err().map(ToString::to_string),
-        }),
-    )
-    .await;
-    result
+    let Some(operation) = state.order_executor.begin_operation() else {
+        return Err(ApiError::ServiceUnavailable(SHUTTING_DOWN.into()));
+    };
+    // As placing an order: runs to the end even if the client goes away, so
+    // a cancellation the exchange took is recorded, not left open.
+    tokio::spawn(async move {
+        let _operation = operation;
+        let result = cancel_order_inner(&state, order_id).await;
+        super::audit_change(
+            &state,
+            Uuid::parse_str(&claims.sub).unwrap_or_default(),
+            ::auth::AuditAction::Custom("order_cancel_requested".into()),
+            format!("orders/{order_id}"),
+            serde_json::json!({
+                "status": result.as_ref().ok().map(|order| order.status),
+                "error": result.as_ref().err().map(ToString::to_string),
+            }),
+        )
+        .await;
+        result
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Cancel task failed: {e}")))?
 }
 
 async fn cancel_order_inner(
@@ -1210,6 +1238,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             filled_at: None,
+            rejection_reason: None,
         };
 
         let json = serde_json::to_string(&order).unwrap();

@@ -441,6 +441,9 @@ impl ApiServer {
         )
         .watching_exits(state.pool.clone());
 
+        // Unreadable settings hold entries in every process, leading or not.
+        hold_for_unreadable_settings(&state, &self.config.unreadable_settings);
+
         // Every process takes up what operators change through any of them:
         // the leader for its trading, another for the checks its own
         // requests make (manual orders, breaker status).
@@ -779,12 +782,20 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     let limits = crate::state::circuit_breaker_config(&state.pool).await?;
     state.circuit_breaker.update_config(limits).await;
     // Closes a stopped process booked but never recorded count before any
-    // new trade does. A failure is logged, not fatal: stopping here would
-    // stop exits too, and the closes stay unmarked for the next leader.
+    // new trade does. A failure does not stop the takeover (exits must
+    // run): new entries are held, and the closes retried in the background,
+    // until they are counted.
+    let takeover_at = chrono::Utc::now();
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker).await {
+        match crate::exit_handler::record_missed_closes(
+            &state.pool,
+            &state.circuit_breaker,
+            takeover_at,
+        )
+        .await
+        {
             Ok(()) => break,
             Err(error) if attempt < 3 => {
                 tracing::warn!(attempt, %error, "Could not record closes the circuit breaker missed; retrying");
@@ -793,7 +804,17 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
             Err(error) => {
                 tracing::error!(
                     %error,
-                    "Could not record closes the circuit breaker missed; trading without them"
+                    "Could not record closes the circuit breaker missed; new entries wait until they are"
+                );
+                state.circuit_breaker.hold_entries(
+                    MISSED_CLOSES_HOLD,
+                    "closes a previous trading process left uncounted by the circuit breaker are \
+                     not counted yet (retried every 30 seconds)",
+                );
+                spawn_missed_close_retry(
+                    state.pool.clone(),
+                    state.circuit_breaker.clone(),
+                    takeover_at,
                 );
                 break;
             }
@@ -809,11 +830,60 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The entry hold a failed replay of missed closes sets.
+const MISSED_CLOSES_HOLD: &str = "missed_closes";
+/// The entry hold unreadable settings set, in every process.
+const UNREADABLE_SETTINGS_HOLD: &str = "unreadable_settings";
+
+/// Retries recording the closes the circuit breaker missed until it works,
+/// then lifts the hold on new entries. Only closes made before the takeover
+/// are looked at: this process records its own. A process that stops leading
+/// lets go (the next leader replays them).
+fn spawn_missed_close_retry(
+    pool: sqlx::PgPool,
+    breaker: Arc<risk_manager::CircuitBreaker>,
+    takeover_at: chrono::DateTime<chrono::Utc>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            if !breaker.is_leader() {
+                breaker.release_entries(MISSED_CLOSES_HOLD);
+                return;
+            }
+            match crate::exit_handler::record_missed_closes(&pool, &breaker, takeover_at).await {
+                Ok(()) => {
+                    info!("Recorded the closes the circuit breaker missed; new entries may resume");
+                    breaker.release_entries(MISSED_CLOSES_HOLD);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Still cannot record the closes the circuit breaker missed; new entries stay held");
+                }
+            }
+        }
+    });
+}
+
+/// Holds new entries in this process while settings cannot be read, so they
+/// never run on a default the operator did not choose. Set before the process
+/// leads or serves orders (a follower's manual buys check it too); a breaker
+/// reset does not lift it, a restart with the settings corrected does.
+fn hold_for_unreadable_settings(state: &AppState, unreadable: &[String]) {
+    if !unreadable.is_empty() {
+        state.circuit_breaker.hold_entries(
+            UNREADABLE_SETTINGS_HOLD,
+            format!("settings that cannot be read: {}", unreadable.join("; ")),
+        );
+    }
+}
+
 /// Trips the circuit breaker (latched, as an operator trip) when settings
-/// cannot be read: new entries halt and exits keep running, until the
-/// settings are corrected, the server restarted and the breaker reset.
-/// Also flags live trading without the equity feed the breaker's drawdown
-/// limits read.
+/// cannot be read, so the halt shows and is stored: new entries halt and
+/// exits keep running, until the settings are corrected, the server
+/// restarted and the breaker reset ([`hold_for_unreadable_settings`] keeps
+/// entries held in this process whatever a reset does). Also flags live
+/// trading without the equity feed the breaker's drawdown limits read.
 async fn halt_for_unreadable_settings(state: &AppState, unreadable: &[String]) {
     if !unreadable.is_empty() {
         let reason = format!("settings that cannot be read: {}", unreadable.join("; "));

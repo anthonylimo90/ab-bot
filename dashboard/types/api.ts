@@ -1278,6 +1278,8 @@ export interface CircuitBreakerStatus {
   trips_today: number;
   recovery_state: RecoveryState | null;
   config: CircuitBreakerConfig;
+  /** Why the answering server holds new entries whatever the trip says; a reset does not lift these. */
+  entry_holds?: string[];
 }
 
 export interface RecentStopExecution {

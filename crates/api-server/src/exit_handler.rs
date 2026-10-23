@@ -2371,12 +2371,18 @@ async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
 /// close is marked by the save that stores it, so an unmarked one was booked
 /// by a process that stopped before saving it. Today's count, in close order
 /// (the breaker's daily counters have moved past earlier days'); the rest
-/// are only marked. Run by a new trading leader before it trades. During the
+/// are only marked. Run by a new trading leader before it trades, for closes
+/// made before `closed_before` (its takeover: it records its own). During the
 /// first upgrade to this version, a close the previous version makes while
 /// handing over is counted twice, which errs towards tripping.
+///
+/// A win from a resolution close with a winner counts only when its close
+/// event says the payout was measured: the event is written after the
+/// position, so a process that stopped between the two leaves no proof.
 pub(crate) async fn record_missed_closes(
     pool: &PgPool,
     breaker: &CircuitBreaker,
+    closed_before: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
     #[derive(sqlx::FromRow)]
     struct MissedClose {
@@ -2394,16 +2400,31 @@ pub(crate) async fn record_missed_closes(
                    WHERE te.position_id = p.id
                      AND te.event_type = 'closed_via_resolution'
                      AND te.metadata ? 'unmeasured'
+               )
+               AND (
+                   p.resolution_winner IS NULL
+                   OR EXISTS (
+                       SELECT 1 FROM trade_events te
+                       WHERE te.position_id = p.id
+                         AND te.event_type = 'closed_via_resolution'
+                   )
                ) AS confirmed
         FROM positions p
         WHERE p.state = 4 AND p.breaker_recorded_at IS NULL
+          AND (p.exit_timestamp IS NULL OR p.exit_timestamp < $1)
         ORDER BY p.exit_timestamp NULLS FIRST, p.id
         "#,
     )
+    .bind(closed_before)
     .fetch_all(pool)
     .await?;
     let today = chrono::Utc::now().date_naive();
     for close in missed {
+        // Counted already by this process, its mark still owed (a retry
+        // after a mark that failed).
+        if breaker.counted_unsaved(close.id) {
+            continue;
+        }
         let pnl = close.realized_pnl.unwrap_or_default();
         let today_close = close
             .exit_timestamp
@@ -2539,47 +2560,65 @@ mod tests {
     async fn closes_the_breaker_missed_are_recorded_once_by_the_next_leader(pool: PgPool) {
         sqlx::raw_sql(
             "CREATE TABLE positions (id UUID PRIMARY KEY, state SMALLINT, realized_pnl NUMERIC, \
-                 execution_mode TEXT, exit_timestamp TIMESTAMPTZ, breaker_recorded_at TIMESTAMPTZ); \
+                 execution_mode TEXT, exit_timestamp TIMESTAMPTZ, breaker_recorded_at TIMESTAMPTZ, \
+                 resolution_winner TEXT); \
              CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB);",
         )
         .execute(&pool)
         .await
         .unwrap();
-        let close = |pnl: i64, mode: &str, minutes_ago: i64, recorded: bool| {
+        let close =
+            |pnl: i64, mode: &str, minutes_ago: i64, recorded: bool, winner: Option<&str>| {
+                let pool = pool.clone();
+                let mode = mode.to_string();
+                let winner = winner.map(str::to_string);
+                async move {
+                    let id = uuid::Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO positions (id, state, realized_pnl, execution_mode, \
+                         exit_timestamp, breaker_recorded_at, resolution_winner) \
+                     VALUES ($1, 4, $2, $3, $4, CASE WHEN $5 THEN NOW() END, $6)",
+                    )
+                    .bind(id)
+                    .bind(Decimal::from(pnl))
+                    .bind(mode)
+                    .bind(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago))
+                    .bind(recorded)
+                    .bind(winner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    id
+                }
+            };
+        let event = |id: uuid::Uuid, metadata: &'static str| {
             let pool = pool.clone();
-            let mode = mode.to_string();
             async move {
-                let id = uuid::Uuid::new_v4();
                 sqlx::query(
-                    "INSERT INTO positions VALUES ($1, 4, $2, $3, $4, \
-                     CASE WHEN $5 THEN NOW() END)",
+                    "INSERT INTO trade_events VALUES ($1, 'closed_via_resolution', $2::jsonb)",
                 )
                 .bind(id)
-                .bind(Decimal::from(pnl))
-                .bind(mode)
-                .bind(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago))
-                .bind(recorded)
+                .bind(metadata)
                 .execute(&pool)
                 .await
                 .unwrap();
-                id
             }
         };
-        // Missed today: a live loss counts; a live win the wallet could not
-        // confirm and a paper loss do not.
-        close(-30, "live", 0, false).await;
-        let unconfirmed = close(50, "live", 0, false).await;
-        sqlx::query(
-            "INSERT INTO trade_events VALUES ($1, 'closed_via_resolution', '{\"unmeasured\": []}')",
-        )
-        .bind(unconfirmed)
-        .execute(&pool)
-        .await
-        .unwrap();
-        close(-40, "paper", 0, false).await;
+        // Missed today: a live loss and a measured resolution win count; a
+        // live win the wallet could not confirm, a resolution win whose close
+        // event was never written, and a paper loss do not.
+        close(-30, "live", 3, false, None).await;
+        let measured = close(20, "live", 2, false, Some("yes")).await;
+        event(measured, "{}").await;
+        let unconfirmed = close(50, "live", 1, false, Some("no")).await;
+        event(unconfirmed, "{\"unmeasured\": []}").await;
+        close(60, "live", 1, false, Some("yes")).await;
+        close(-40, "paper", 0, false, None).await;
         // Missed on an earlier day, and marked already: neither counts.
-        close(-70, "live", 2 * 24 * 60, false).await;
-        close(-90, "live", 0, true).await;
+        close(-70, "live", 2 * 24 * 60, false, None).await;
+        close(-90, "live", 0, true, None).await;
+        // Closed after the takeover: this process records its own.
+        let after_takeover = close(-5, "live", -10, false, None).await;
 
         sqlx::raw_sql(
             "CREATE TABLE circuit_breaker_state (id INTEGER PRIMARY KEY DEFAULT 1, \
@@ -2605,29 +2644,47 @@ mod tests {
         }
         let breaker = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         breaker.lead().await.unwrap();
-        record_missed_closes(&pool, &breaker).await.unwrap();
+        record_missed_closes(&pool, &breaker, chrono::Utc::now())
+            .await
+            .unwrap();
         let state = breaker.state().await;
-        assert_eq!(state.daily_pnl, Decimal::from(-30));
-        assert_eq!(state.consecutive_losses, 1);
+        assert_eq!(state.daily_pnl, Decimal::from(-10));
+        // The measured win, after the loss, ended the streak.
+        assert_eq!(state.consecutive_losses, 0);
         // Stored with the counters, and marked with them.
         let stored: Decimal =
             sqlx::query_scalar("SELECT daily_pnl FROM circuit_breaker_state WHERE id = 1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(stored, Decimal::from(-30));
-        let unmarked: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM positions WHERE breaker_recorded_at IS NULL")
-                .fetch_one(&pool)
+        assert_eq!(stored, Decimal::from(-10));
+        let unmarked: Vec<uuid::Uuid> =
+            sqlx::query_scalar("SELECT id FROM positions WHERE breaker_recorded_at IS NULL")
+                .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(unmarked, 0);
+        assert_eq!(unmarked, vec![after_takeover]);
 
-        // A second leader finds nothing left to record.
+        // A later leader records only what is left: the close made after the
+        // first takeover.
         let next = CircuitBreaker::with_persistence(Default::default(), pool.clone());
         next.lead().await.unwrap();
-        record_missed_closes(&pool, &next).await.unwrap();
-        assert_eq!(next.state().await.daily_pnl, Decimal::from(-30));
+        record_missed_closes(
+            &pool,
+            &next,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
+        record_missed_closes(
+            &pool,
+            &next,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.state().await.daily_pnl, Decimal::from(-15));
     }
 
     #[test]

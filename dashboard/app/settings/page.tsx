@@ -396,10 +396,15 @@ export default function SettingsPage() {
     riskConfig?.hard_kill_drawdown_pct != null
       ? Math.round(riskConfig.hard_kill_drawdown_pct * 10000) / 100
       : null;
+  // Only a changed limit is sent (and checked by the server): a stored one
+  // past the hard kill must not block saving the other fields.
+  const storedDrawdownPct =
+    riskConfig != null ? Math.round(riskConfig.max_drawdown_pct * 10000) / 100 : null;
   const drawdownAtHardKill =
     hardKillPct != null &&
     hardKillPct > 0 &&
     riskMaxDrawdownPct !== '' &&
+    riskMaxDrawdownPct !== storedDrawdownPct &&
     riskMaxDrawdownPct >= hardKillPct;
 
   // Check if risk form has changed from API baseline

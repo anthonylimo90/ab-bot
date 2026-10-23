@@ -195,10 +195,25 @@ struct PositionRow {
     source: i16,
 }
 
+/// The side a position holds. `outcome` is rarely stored, so it is read from
+/// the legs entered: both for an arbitrage pair, one for a quant position.
+macro_rules! position_outcome_sql {
+    () => {
+        "COALESCE(outcome, CASE \
+             WHEN yes_entry_price > 0 AND no_entry_price > 0 THEN 'both' \
+             WHEN no_entry_price > 0 THEN 'no' \
+             WHEN yes_entry_price > 0 THEN 'yes' \
+             ELSE 'both' END)"
+    };
+}
+
 /// The columns of a [`PositionRow`], ahead of a `WHERE` clause.
-const POSITION_ROW_SELECT: &str = r#"
+const POSITION_ROW_SELECT: &str = concat!(
+    r#"
         SELECT id, market_id,
-               COALESCE(outcome, 'both') AS outcome,
+               "#,
+    position_outcome_sql!(),
+    r#" AS outcome,
                COALESCE(side, 'long') AS side,
                quantity,
                COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
@@ -214,7 +229,8 @@ const POSITION_ROW_SELECT: &str = r#"
                is_open, execution_mode,
                COALESCE(source, 0)::smallint AS source
         FROM positions
-"#;
+"#
+);
 
 impl From<PositionRow> for PositionResponse {
     fn from(row: PositionRow) -> Self {
@@ -396,7 +412,7 @@ async fn load_position_rows(
     }
 
     if let Some(outcome) = &query.outcome {
-        qb.push(" AND COALESCE(outcome, 'both') = ");
+        qb.push(concat!(" AND ", position_outcome_sql!(), " = "));
         qb.push_bind(outcome);
     }
 
@@ -855,10 +871,12 @@ async fn load_closeable_position(
     pool: &sqlx::PgPool,
     position_id: Uuid,
 ) -> ApiResult<Option<CloseablePositionRow>> {
-    let row: Option<CloseablePositionRow> = sqlx::query_as(
+    let row: Option<CloseablePositionRow> = sqlx::query_as(concat!(
         r#"
         SELECT id, market_id,
-               COALESCE(outcome, 'both') AS outcome,
+               "#,
+        position_outcome_sql!(),
+        r#" AS outcome,
                COALESCE(side, 'long') AS side,
                quantity,
                COALESCE(entry_price, (yes_entry_price + no_entry_price)) AS entry_price,
@@ -871,7 +889,7 @@ async fn load_closeable_position(
         WHERE id = $1
           AND is_open = TRUE
         "#,
-    )
+    ))
     .bind(position_id)
     .fetch_optional(pool)
     .await
@@ -978,6 +996,53 @@ mod tests {
         assert!(load_position_rows(&pool, &query).await.unwrap().is_empty());
         query.offset = -1;
         assert!(load_position_rows(&pool, &query).await.is_err());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_position_without_a_stored_outcome_reads_its_side_from_its_legs(pool: sqlx::PgPool) {
+        use sqlx::Executor;
+        pool.execute(
+            "CREATE VIEW positions AS SELECT md5(v.n::text)::uuid AS id,
+            v.n AS market_id, NULL::text AS outcome, NULL::text AS side,
+            10::numeric AS quantity, NULL::numeric AS entry_price, NULL::numeric AS current_price,
+            v.yes AS yes_entry_price, v.no AS no_entry_price,
+            0::numeric AS unrealized_pnl, NULL::numeric AS stop_loss, NULL::numeric AS take_profit,
+            NULL::numeric AS realized_pnl, 1::smallint AS state, NOW() AS opened_at,
+            NOW() AS entry_timestamp, NOW() AS updated_at, NULL::timestamptz AS last_updated,
+            0::numeric AS held_yes_qty, 0::numeric AS held_no_qty,
+            0::numeric AS exited_yes_qty, 0::numeric AS exited_no_qty,
+            NULL::numeric AS yes_exit_price, NULL::numeric AS no_exit_price,
+            NULL::text AS resolution_winner, 0::smallint AS exit_strategy, 3::smallint AS source,
+            TRUE AS is_open, 'live'::text AS execution_mode
+            FROM (VALUES ('pair', 0.45::numeric, 0.52::numeric), ('yes', 0.40, 0),
+                         ('no', 0, 0.30)) AS v(n, yes, no)",
+        )
+        .await
+        .unwrap();
+        let mut query = ListPositionsQuery {
+            market_id: None,
+            outcome: None,
+            status: "open".into(),
+            limit: 25,
+            offset: 0,
+        };
+        let mut sides: Vec<(String, String)> = load_position_rows(&pool, &query)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.market_id, row.outcome))
+            .collect();
+        sides.sort();
+        assert_eq!(
+            sides,
+            [("no", "no"), ("pair", "both"), ("yes", "yes")]
+                .map(|(m, o)| (m.to_string(), o.to_string()))
+        );
+        // The outcome filter reads the same side.
+        query.outcome = Some("no".into());
+        let rows = load_position_rows(&pool, &query).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].market_id, "no");
     }
 
     #[test]

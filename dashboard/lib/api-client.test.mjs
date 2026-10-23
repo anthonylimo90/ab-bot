@@ -141,6 +141,11 @@ test('an error body in plain text is the error message', async () => {
   await assert.rejects(json.api.getPositions(), (error) => error.message === 'limit must be 1–500');
   const empty = loadApi(() => textResponse('', 502));
   await assert.rejects(empty.api.getPositions(), (error) => error.message === 'HTTP 502');
+  // A proxy's HTML page, and a JSON body that is not an error object, report the status.
+  const html = loadApi(() => textResponse('<html><body>Bad gateway</body></html>', 502, 'text/html'));
+  await assert.rejects(html.api.getPositions(), (error) => error.message === 'HTTP 502');
+  const bare = loadApi(() => jsonResponse(null, 500));
+  await assert.rejects(bare.api.getPositions(), (error) => error.name === 'ApiHttpError' && error.message === 'HTTP 500');
 });
 
 test('a throwing unauthorized handler does not mask the original 401', async () => {

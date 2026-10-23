@@ -416,12 +416,13 @@ async fn build_recovery_preview(
         match row.state {
             2 | 3 => accumulate(&mut recoverable_now, marked_value),
             7 => accumulate(&mut stalled, marked_value),
+            // A failed exit recovery requeues (a safe retry) counts as
+            // recoverable now, as an orphan with the same failure does.
             6 => match classify_failure_reason(row.failure_reason.as_ref()) {
                 FailureBucket::SuspectInventory => accumulate(&mut suspect_inventory, marked_value),
                 FailureBucket::LiquidityBlocked => accumulate(&mut liquidity_blocked, marked_value),
-                FailureBucket::SafeRetry | FailureBucket::Other => {
-                    accumulate(&mut other_blocked, marked_value)
-                }
+                FailureBucket::SafeRetry => accumulate(&mut recoverable_now, marked_value),
+                FailureBucket::Other => accumulate(&mut other_blocked, marked_value),
             },
             1 => accumulate(&mut open_monitoring, marked_value),
             _ => accumulate(&mut other_blocked, marked_value),

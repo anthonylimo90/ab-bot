@@ -6,6 +6,8 @@ import api from "@/lib/api";
 interface WorkspaceStore {
   workspaces: WorkspaceListItem[];
   currentWorkspace: Workspace | null;
+  /** Counts every change of `currentWorkspace`: a read that started before one is stale. */
+  workspaceVersion: number;
   isLoading: boolean;
   error: string | null;
   _hasHydrated: boolean;
@@ -24,6 +26,7 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
     (set, get) => ({
       workspaces: [],
       currentWorkspace: null,
+      workspaceVersion: 0,
       isLoading: false,
       error: null,
       _hasHydrated: false,
@@ -50,14 +53,22 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
         set({ isLoading: true, error: null });
         try {
           const workspace = await api.getCurrentWorkspace();
-          set({ currentWorkspace: workspace, isLoading: false });
+          set((state) => ({
+            currentWorkspace: workspace,
+            workspaceVersion: state.workspaceVersion + 1,
+            isLoading: false,
+          }));
         } catch (err) {
           // If 404, user has no workspace set
           if (
             err instanceof Error &&
             err.message.includes("No workspace set")
           ) {
-            set({ currentWorkspace: null, isLoading: false });
+            set((state) => ({
+              currentWorkspace: null,
+              workspaceVersion: state.workspaceVersion + 1,
+              isLoading: false,
+            }));
           } else {
             set({
               error:
@@ -76,16 +87,22 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
       refreshCurrentWorkspace: async () => {
         const shown = get().currentWorkspace;
         if (!shown) return;
+        const version = get().workspaceVersion;
         try {
           const workspace = await api.getWorkspace(shown.id);
           const current = get().currentWorkspace;
-          // Unless the workspace was switched meanwhile.
+          // Unless the workspace changed meanwhile (switched, or a save
+          // stored a newer copy than this read may have seen).
           if (
+            get().workspaceVersion === version &&
             current &&
             current.id === workspace.id &&
             JSON.stringify(current) !== JSON.stringify(workspace)
           ) {
-            set({ currentWorkspace: workspace });
+            set((state) => ({
+              currentWorkspace: workspace,
+              workspaceVersion: state.workspaceVersion + 1,
+            }));
           }
         } catch {
           // The next read tries again.
@@ -98,7 +115,11 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
           await api.switchWorkspace(workspaceId);
           // Fetch the new current workspace details
           const workspace = await api.getWorkspace(workspaceId);
-          set({ currentWorkspace: workspace, isLoading: false });
+          set((state) => ({
+            currentWorkspace: workspace,
+            workspaceVersion: state.workspaceVersion + 1,
+            isLoading: false,
+          }));
         } catch (err) {
           set({
             error:
@@ -110,16 +131,20 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
       },
 
       setCurrentWorkspace: (workspace) => {
-        set({ currentWorkspace: workspace });
+        set((state) => ({
+          currentWorkspace: workspace,
+          workspaceVersion: state.workspaceVersion + 1,
+        }));
       },
 
       reset: () => {
-        set({
+        set((state) => ({
           workspaces: [],
           currentWorkspace: null,
+          workspaceVersion: state.workspaceVersion + 1,
           isLoading: false,
           error: null,
-        });
+        }));
       },
     }),
     {

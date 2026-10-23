@@ -68,7 +68,7 @@ export function SignalFunnel() {
       <CardHeader className="pb-3">
         <CardTitle className="flex items-center gap-2 text-base">
           <span>Signal Funnel</span>
-          <InfoTooltip content="Think of this as the system's decision pipeline: generated means an idea was found, executed means a trade was placed, skipped means it was rejected, expired means the opportunity got too old, and failed means the order could not be placed." />
+          <InfoTooltip content="Think of this as the system's decision pipeline: generated means an idea was found, executed means a trade was placed, skipped means it was rejected (a signal too stale to act on included), expired means it passed its expiry before the executor reached it, and failed means the order could not be placed." />
         </CardTitle>
       </CardHeader>
       <CardContent>

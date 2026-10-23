@@ -829,10 +829,12 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 ### Settings checked at start, the arb monitor and signal analytics
 
 - **A setting that cannot be read, or is out of its range, halts new
-  entries**: the API logs it, naming the setting and what it expects, and
-  its trading leader trips the circuit breaker (latched, as an operator
-  trip) while exits keep running; correct the setting, restart, and reset
-  the breaker. The arb monitor does not start. Refused: a yes/no value such
+  entries**: the API logs it, naming the setting and what it expects,
+  holds new entries in every API process (manual buys included), and its
+  trading leader trips the circuit breaker (latched, as an operator trip)
+  while exits keep running; correct the setting, restart, and reset the
+  breaker. A reset is refused (409) while the hold stands: it would clear
+  the trip and leave entries held. The arb monitor does not start. Refused: a yes/no value such
   as `disabled`, a money switch other than `true`/`false` (`TRUE`, `1`), a
   number with a comma or unit, a fraction written as a percentage, a
   decimal where a whole number goes, or a value that cannot be meant: a
@@ -934,7 +936,40 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   resting manual buys reserve at the exchange, so the second leg is not
   refused after the first has filled.
 
+### Entry holds, effective switches and removals
+
+- A new trading leader that cannot record the closes a stopped process left
+  uncounted (three tries) holds new entries and retries every 30 seconds;
+  entries resume once they are counted. Only closes made before it took
+  over are replayed (it records its own), and a resolution win counts only
+  when its close event says the payout was measured.
+- A close is queued for its mark together with the counters that hold it; a
+  mark that fails stays queued and is made by the next save (it used to be
+  dropped, so the next leader counted the close again). A close the
+  switched-off breaker does not count is marked at once.
+- The dashboard shows trading as the server runs it: switches the
+  environment holds on (`LIVE_TRADING`, `ARB_AUTO_EXECUTE`,
+  `EXIT_HANDLER_ENABLED`) read as on and cannot be switched off there, and
+  Pause/Resume wait until the server's switches are read.
+- Removed: the unfinished CEX latency arbitrage module (`LATENCY_ARB_*`
+  settings, `BINANCE_WS_URL`), which placed no orders, and the Kelly sizing
+  helper only it used. Its table `latency_arb_signals` (065) stays; drop it
+  with a new migration if its rows are not wanted.
+
 ### API contract changes
+
+- Service status adds `workspace_id` (the canonical workspace it describes)
+  and `environment_switches`. Risk status adds `entry_holds`; a breaker
+  reset answers 409 while any stands.
+- Positions add `execution_mode` (`live`, `paper`, `unknown`) and `source`
+  (`arb`, `quant`, `copy_trade`, `manual`); `outcome` is read from the legs
+  entered when none is stored (it was `both` for every position).
+- A placed order's response adds `rejection_reason` when it was rejected;
+  `filled_at` is set only on a complete fill, and `remaining_quantity` is
+  never negative.
+- Quant summaries count a signal skipped for its expiry as expired (the
+  status `expired` was never written), and a strategy's skip rate counts
+  both.
 
 - `GET .../risk/status` and the trip/reset responses add `drawdown_peak`
   (the soft drawdown trip's reference), `equity_seeded`, and

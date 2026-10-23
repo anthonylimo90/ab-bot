@@ -114,7 +114,7 @@ export default function PositionDetailPage() {
   const router = useRouter();
   const { data: position, isLoading, error } = usePositionQuery(params.id);
   const closeMutation = useClosePositionMutation();
-  const { exitHandler } = useTradingSwitches();
+  const { exitHandlerKnownOff } = useTradingSwitches();
 
   if (isLoading) {
     return (
@@ -151,7 +151,7 @@ export default function PositionDetailPage() {
   // Exits are queued for the exit handler: with it off, the server refuses
   // one for a position not already exiting.
   const exitRefused =
-    !exitHandler && position.state !== "exit_ready" && position.state !== "closing";
+    exitHandlerKnownOff && position.state !== "exit_ready" && position.state !== "closing";
 
   return (
     <ErrorBoundary>

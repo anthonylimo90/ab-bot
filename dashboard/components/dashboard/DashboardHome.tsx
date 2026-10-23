@@ -91,9 +91,14 @@ export function DashboardHome() {
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
   const { data: tradeFlowSummary } = useTradeFlowSummaryQuery({ limit: 100 });
   // As the server applies the switches: the environment can hold either on.
-  const { liveTrading, arbAutoExecute } = useTradingSwitches();
-  const isTradingManuallyPaused =
-    Boolean(currentWorkspace) && !liveTrading && !arbAutoExecute;
+  // Until its switches are read, "off in the workspace" is not "paused".
+  const { liveTrading, arbAutoExecute, environmentKnown } = useTradingSwitches();
+  const switchesOff = Boolean(currentWorkspace) && !liveTrading && !arbAutoExecute;
+  const isTradingManuallyPaused = switchesOff && environmentKnown;
+  const switchesUnknown = switchesOff && !environmentKnown;
+  // Holds the server keeps on new entries whatever the breaker says
+  // (settings it cannot read, closes not yet counted).
+  const entryHolds = riskStatus?.circuit_breaker?.entry_holds ?? [];
   const breaker = riskStatus?.circuit_breaker;
   const isHardKilled = breaker?.tripped === true && breaker.trip_reason === "hard_kill_switch";
   // A switched-off breaker stops its limits, not a latched trip (the hard
@@ -110,6 +115,13 @@ export function DashboardHome() {
         tooltip:
           "Hard kill switch activated \u2014 trading is permanently halted. Manual reset required via the Risk page.",
       }
+    : entryHolds.length > 0
+      ? {
+          label: "Entries held",
+          variant: "destructive" as const,
+          className: "text-xs",
+          tooltip: `New entries are held whatever the circuit breaker says: ${entryHolds.join("; ")}. Exits still run.`,
+        }
     : isCircuitBreakerPaused
       ? {
           label: "Paused",
@@ -117,6 +129,14 @@ export function DashboardHome() {
           className: "text-xs",
           tooltip:
             "The circuit breaker is active, so automated trading is paused until the risk controls allow it again.",
+        }
+      : switchesUnknown
+      ? {
+          label: "Switches unknown",
+          variant: "warning" as const,
+          className: "text-xs",
+          tooltip:
+            "Live trading and arb execution are off in workspace settings, but the server's environment could not be read yet: it may switch them on.",
         }
       : isTradingManuallyPaused
       ? {

@@ -68,16 +68,18 @@ export function jsonResponse(body, status = 200) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: new Headers({ 'content-type': 'application/json' }),
     json: async () => body,
     text: async () => JSON.stringify(body),
   };
 }
 
-/** A fetch Response whose body is plain text, as axum's extractor rejections are. */
-export function textResponse(body, status) {
+/** A fetch Response whose body is text: plain, as axum's extractor rejections are, or another type. */
+export function textResponse(body, status, contentType = 'text/plain; charset=utf-8') {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: new Headers({ 'content-type': contentType }),
     json: async () => {
       throw new SyntaxError('Unexpected token');
     },

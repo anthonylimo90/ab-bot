@@ -92,7 +92,8 @@ const SOURCE_LABELS: Record<Position["source"], string> = {
 
 /** Whether the position trades real funds. */
 function ModeBadge({ mode }: { mode: Position["execution_mode"] }) {
-  if (mode === "unknown") return null;
+  // Only a mode the API states: an older API sends none.
+  if (mode !== "live" && mode !== "paper") return null;
   return (
     <Badge
       variant="outline"
@@ -149,7 +150,7 @@ export default function PositionsPage() {
 
   const closeMutation = useClosePositionMutation();
   // Exits are queued for the exit handler: with it off, the server refuses them.
-  const { exitHandler } = useTradingSwitches();
+  const { exitHandlerKnownOff } = useTradingSwitches();
   const queryClient = useQueryClient();
   const router = useRouter();
 
@@ -477,12 +478,12 @@ export default function PositionsPage() {
                                     disabled={
                                       closeMutation.isPending ||
                                       pos.state === "pending" ||
-                                      (!exitHandler &&
+                                      (exitHandlerKnownOff &&
                                         pos.state !== "exit_ready" &&
                                         pos.state !== "closing")
                                     }
                                     title={
-                                      !exitHandler &&
+                                      exitHandlerKnownOff &&
                                       pos.state !== "exit_ready" &&
                                       pos.state !== "closing"
                                         ? "The exit handler is off, so a queued exit would not run; switch it on in Settings"

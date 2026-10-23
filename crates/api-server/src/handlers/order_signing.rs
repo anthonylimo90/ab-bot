@@ -501,7 +501,8 @@ pub async fn prepare_order(
     let summary = OrderSummary {
         side: side_str.clone(),
         outcome: outcome_label(&state, &req.token_id).await.to_string(),
-        price: format!("${:.2}", req.price),
+        // At the tick's scale: two decimals would show 0.004 as $0.00.
+        price: format!("${}", req.price.normalize()),
         size: format!("{} shares", req.size),
         total_cost: format!("${:.2}", req.size * req.price),
         potential_payout: format!("${:.2}", potential_payout),

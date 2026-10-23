@@ -524,17 +524,27 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      // Errors are JSON, except a body the server could not parse (a 422 in
-      // plain text): its text says which field was wrong, so it is kept.
+      // Errors are JSON objects, except a body the server could not parse
+      // (a 422 in plain text): its text says which field was wrong, so it is
+      // kept. Anything else (a proxy's HTML page) is reported by its status.
       const body = await response.text().catch(() => "");
-      let error: ApiError;
+      const contentType = response.headers.get("content-type") ?? "";
+      let error: ApiError = { code: "UNKNOWN_ERROR", message: `HTTP ${response.status}` };
+      let parsed: unknown = null;
       try {
-        error = JSON.parse(body) as ApiError;
+        parsed = JSON.parse(body);
       } catch {
+        // Not JSON.
+      }
+      if (parsed !== null && typeof parsed === "object") {
+        const fields = parsed as Partial<ApiError>;
         error = {
-          code: "UNKNOWN_ERROR",
-          message: body.trim().slice(0, 300) || `HTTP ${response.status}`,
+          code: typeof fields.code === "string" ? fields.code : error.code,
+          message: typeof fields.message === "string" ? fields.message : error.message,
+          details: fields.details,
         };
+      } else if (contentType.startsWith("text/plain") && body.trim()) {
+        error = { code: "UNKNOWN_ERROR", message: body.trim().slice(0, 300) };
       }
       if (
         response.status === 401 &&

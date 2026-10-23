@@ -214,18 +214,19 @@ export function Header() {
     title: isTradingActive ? "Pause automated trading?" : "Resume arb execution?",
     description: isTradingActive
       ? environmentHold
-        ? `Switches off what this workspace holds on. ${environmentHold} To stop new entries at once, trip the circuit breaker on the Risk page (exits and manual sales still run).`
-        : "Live trading and arb execution are switched off for this workspace. To stop new entries at once, trip the circuit breaker on the Risk page (exits and manual sales still run)."
-      : environmentKnown
-        ? "Arbitrage resumes on paper: live trading stays off in this workspace's settings."
-        : "Arbitrage resumes. Live trading stays off in this workspace's settings, so it trades on paper unless the server's environment switches live trading on (LIVE_TRADING).",
+        ? `Switches off what this workspace holds on. ${environmentHold} To stop new entries at once, trip the circuit breaker on the Risk page (a trip does not stop exits or manual sales).`
+        : "Live trading and arb execution are switched off for this workspace. To stop new entries at once, trip the circuit breaker on the Risk page (a trip does not stop exits or manual sales)."
+      : "Arbitrage resumes on paper: live trading stays off in this workspace's settings.",
     confirmLabel: isTradingActive ? "Pause" : "Resume",
   };
-  // Trading the environment holds on cannot be paused from here.
+  // Trading the environment holds on cannot be paused from here; until the
+  // environment's switches are read, neither can be decided.
   const pauseUnavailable = isTradingActive && !canPause;
-  const pauseUnavailableReason = pauseUnavailable
-    ? `${environmentHold} Trip the circuit breaker on the Risk page to stop new entries.`
-    : undefined;
+  const pauseUnavailableReason = !environmentKnown
+    ? "Checking the server's switches; they could not be read yet."
+    : pauseUnavailable
+      ? `${environmentHold} Trip the circuit breaker on the Risk page to stop new entries.`
+      : undefined;
   const toggleTrading = () =>
     toggleTradingMutation.mutate(isTradingActive ? "pause" : "resume");
 
@@ -285,7 +286,7 @@ export function Header() {
                   ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
                   : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
               )}
-              disabled={toggleTradingMutation.isPending || pauseUnavailable}
+              disabled={toggleTradingMutation.isPending || pauseUnavailableReason !== undefined}
               title={pauseUnavailableReason}
             >
               {toggleTradingMutation.isPending ? (

@@ -38,5 +38,13 @@ export function useTradingSwitches() {
     liveTrading: saved.live_trading_enabled || forced.live_trading_enabled,
     arbAutoExecute: saved.arb_auto_execute || forced.arb_auto_execute,
     exitHandler: saved.exit_handler_enabled || forced.exit_handler_enabled,
+    /**
+     * The exit handler is known to be off. Unknown (the environment not
+     * read yet) is not off: the environment may switch it on.
+     */
+    exitHandlerKnownOff:
+      environment !== undefined &&
+      !saved.exit_handler_enabled &&
+      !forced.exit_handler_enabled,
   };
 }

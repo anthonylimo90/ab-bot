@@ -308,6 +308,8 @@ pub struct CircuitBreaker {
     unsaved_closes: std::sync::Mutex<Vec<uuid::Uuid>>,
     /// When the stored state was last checked by [`Self::sync`].
     synced_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Holds on new entries in this process ([`Self::hold_entries`]), by key.
+    holds: std::sync::Mutex<std::collections::BTreeMap<&'static str, String>>,
 }
 
 /// How often a follower re-reads the stored state.
@@ -349,6 +351,7 @@ impl CircuitBreaker {
             unsaved: AtomicBool::new(false),
             unsaved_closes: std::sync::Mutex::new(Vec::new()),
             synced_at: std::sync::Mutex::new(None),
+            holds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -471,6 +474,53 @@ impl CircuitBreaker {
         Ok(true)
     }
 
+    /// Hold new entries in this process, under `key`, until
+    /// [`Self::release_entries`]: [`Self::can_trade`] refuses while any hold
+    /// stands. Unlike a trip, a hold is not stored and a reset does not lift
+    /// it: what it waits for (a setting read again at a restart, closes a
+    /// previous leader left uncounted) is not something a reset changes.
+    pub fn hold_entries(&self, key: &'static str, reason: impl Into<String>) {
+        let reason = reason.into();
+        warn!(key, %reason, "New entries held");
+        self.holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, reason);
+    }
+
+    /// Lift the hold [`Self::hold_entries`] set under `key`.
+    pub fn release_entries(&self, key: &'static str) {
+        if self
+            .holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key)
+            .is_some()
+        {
+            info!(key, "Hold on new entries lifted");
+        }
+    }
+
+    /// Whether this process counted the close and still owes its mark (a
+    /// save, or the mark within it, has not stored it yet): a replay of
+    /// unmarked closes must not count it again.
+    pub fn counted_unsaved(&self, position_id: uuid::Uuid) -> bool {
+        self.unsaved_closes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&position_id)
+    }
+
+    /// Why new entries are held in this process, if they are.
+    pub fn entry_holds(&self) -> Vec<String> {
+        self.holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Check if trading is currently halted (fast path).
     pub fn is_tripped(&self) -> bool {
         self.is_tripped.load(Ordering::SeqCst)
@@ -483,6 +533,14 @@ impl CircuitBreaker {
     /// recovery when enabled); recovery stages advance as their time comes.
     pub async fn can_trade(&self) -> bool {
         self.sync().await;
+        if !self
+            .holds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            return false;
+        }
         if !self.config.read().await.enabled {
             // Switching the breaker off stops its limits, not a latch the
             // hard kill or an operator set: only a reset lifts that.
@@ -676,16 +734,27 @@ impl CircuitBreaker {
         pnl: Decimal,
         position_id: uuid::Uuid,
     ) -> Result<Option<TripReason>> {
-        self.unsaved_closes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(position_id);
-        self.record_trade(pnl).await
+        self.record_result(pnl, Some(position_id)).await
     }
 
     pub async fn record_trade(&self, pnl: Decimal) -> Result<Option<TripReason>> {
+        self.record_result(pnl, None).await
+    }
+
+    async fn record_result(
+        &self,
+        pnl: Decimal,
+        close: Option<uuid::Uuid>,
+    ) -> Result<Option<TripReason>> {
         let config = self.config.read().await.clone();
         if !config.enabled {
+            // Not counted, so marked as seen: a new leader must not count
+            // it either.
+            if let (Some(close), Some(repo)) = (close, &self.repo) {
+                if let Err(error) = repo.mark_closes(&[close]).await {
+                    warn!(%error, position_id = %close, "Could not mark a close the switched-off breaker left out");
+                }
+            }
             return Ok(None);
         }
 
@@ -693,6 +762,14 @@ impl CircuitBreaker {
         state.roll_daily_counters(Utc::now().date_naive());
 
         state.daily_pnl += pnl;
+        // Queued under the state lock, with the counters that hold it: a
+        // save made by another task marks it only with them.
+        if let Some(close) = close {
+            self.unsaved_closes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(close);
+        }
         // A loss extends the streak and a win ends it; a break-even trade
         // does neither.
         let is_win = pnl > Decimal::ZERO;
@@ -996,7 +1073,7 @@ impl CircuitBreaker {
             .save(state, self.operator_epoch.load(Ordering::SeqCst), &closes)
             .await
         {
-            Ok(false) => match repo.load().await {
+            Ok(outcome) if !outcome.saved => match repo.load().await {
                 Ok(Some((stored, epoch))) => {
                     warn!(
                         tripped = stored.tripped,
@@ -1011,20 +1088,27 @@ impl CircuitBreaker {
                     self.operator_epoch.store(epoch, Ordering::SeqCst);
                     repo.save(state, epoch, &closes).await
                 }
-                Ok(None) => Ok(false),
+                Ok(None) => Ok(crate::circuit_breaker_repo::SaveOutcome {
+                    saved: false,
+                    marked: false,
+                }),
                 Err(error) => Err(error),
             },
             other => other,
         };
         match saved {
-            Ok(true) => {
+            Ok(outcome) if outcome.saved => {
                 self.unsaved.store(false, Ordering::SeqCst);
-                self.unsaved_closes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .retain(|close| !closes.contains(close));
+                // Closes whose marks failed stay queued: the next save marks
+                // them (the counters already hold them).
+                if outcome.marked {
+                    self.unsaved_closes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .retain(|close| !closes.contains(close));
+                }
             }
-            Ok(false) => {
+            Ok(_) => {
                 warn!("Circuit breaker state changed again while saving; retrying later");
                 self.unsaved.store(true, Ordering::SeqCst);
             }
@@ -1342,6 +1426,37 @@ mod tests {
         breaker.reset().await.unwrap();
         assert!(!breaker.is_tripped());
         assert!(breaker.can_trade().await);
+    }
+
+    #[tokio::test]
+    async fn a_hold_stops_entries_until_released_whatever_a_reset_does() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig::default());
+        breaker.hold_entries("settings", "ARB_MIN_NET_PROFIT cannot be read");
+        breaker.hold_entries("missed_closes", "closes not yet counted");
+        assert!(!breaker.can_trade().await);
+        assert_eq!(breaker.entry_holds().len(), 2);
+        // A reset lifts trips, not holds.
+        breaker.reset().await.unwrap();
+        assert!(!breaker.can_trade().await);
+        breaker.release_entries("missed_closes");
+        assert!(!breaker.can_trade().await);
+        breaker.release_entries("settings");
+        assert!(breaker.entry_holds().is_empty());
+        assert!(breaker.can_trade().await);
+    }
+
+    #[tokio::test]
+    async fn a_switched_off_breaker_queues_no_close() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        breaker
+            .record_close(Decimal::new(-10, 0), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(breaker.unsaved_closes.lock().unwrap().is_empty());
+        assert_eq!(breaker.state().await.daily_pnl, Decimal::ZERO);
     }
 
     #[tokio::test]

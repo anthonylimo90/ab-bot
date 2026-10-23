@@ -90,6 +90,10 @@ pub struct CircuitBreakerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_state: Option<RecoveryStateResponse>,
     pub config: CircuitBreakerConfigResponse,
+    /// Why new entries are held on the server answering, whatever the trip
+    /// says (settings it cannot read, closes it has not counted yet). A
+    /// reset does not lift these.
+    pub entry_holds: Vec<String>,
 }
 
 impl CircuitBreakerResponse {
@@ -121,6 +125,7 @@ impl CircuitBreakerResponse {
                     recovery_pnl: r.recovery_pnl,
                 }),
             config: CircuitBreakerConfigResponse::from(&cb_config),
+            entry_holds: state.circuit_breaker.entry_holds(),
         }
     }
 }
@@ -451,6 +456,7 @@ pub async fn update_circuit_breaker_config(
         (status = 200, description = "Circuit breaker reset", body = CircuitBreakerResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Not a member / insufficient role"),
+        (status = 409, description = "New entries are held on this server; nothing was reset"),
     ),
     security(("bearer_auth" = [])),
     tag = "risk"
@@ -467,6 +473,17 @@ pub async fn reset_circuit_breaker(
         return Err(ApiError::Forbidden(
             "Only workspace owners/admins can manage circuit breaker controls".into(),
         ));
+    }
+
+    // A reset would clear the trip and leave entries held: refused, so the
+    // breaker never reads as clear while nothing can trade.
+    let holds = state.circuit_breaker.entry_holds();
+    if !holds.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "New entries are held on this server whatever the breaker says: {}. Nothing was \
+             reset; correct the settings and restart, or wait for the closes to be counted",
+            holds.join("; ")
+        )));
     }
 
     let before = state.circuit_breaker.state().await;

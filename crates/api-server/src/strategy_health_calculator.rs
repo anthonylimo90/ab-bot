@@ -458,11 +458,13 @@ async fn load_latest_backtests(pool: &PgPool) -> Result<Vec<LatestBacktestRow>, 
     .await
 }
 
+/// Signals not acted on over those generated: skipped ones and those that
+/// expired first (counted apart, but no more traded).
 fn skip_rate(row: &StrategyHealthAggRow) -> Option<f64> {
     if row.generated_signals <= 0 {
         return None;
     }
-    Some(row.skipped_signals as f64 / row.generated_signals as f64)
+    Some((row.skipped_signals + row.expired_signals) as f64 / row.generated_signals as f64)
 }
 
 /// Failed entries and failed exits over the entries tried: those that got in

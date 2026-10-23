@@ -8,4 +8,4 @@ pub mod circuit_breaker_repo;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState, RecoveryState, TripReason,
 };
-pub use circuit_breaker_repo::CircuitBreakerRepository;
+pub use circuit_breaker_repo::{CircuitBreakerRepository, SaveOutcome};
