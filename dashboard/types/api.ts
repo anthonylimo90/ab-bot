@@ -1218,8 +1218,8 @@ export interface CircuitBreakerConfig {
   max_consecutive_losses: number;
   cooldown_minutes: number;
   enabled: boolean;
-  /** Drawdown from the all-time peak that halts until reset; 0 means off. */
-  hard_kill_drawdown_pct: number;
+  /** Drawdown from the all-time peak that halts until reset; 0 means off, null unknown. */
+  hard_kill_drawdown_pct: number | null;
 }
 
 export interface RecoveryState {
@@ -1243,8 +1243,8 @@ export interface CircuitBreakerStatus {
   /** Reference for the max-drawdown trip; rebased on resume and reset. */
   drawdown_peak: number;
   current_value: number;
-  /** False until real equity snapshots arrive; drawdown is not checked before. */
-  equity_seeded: boolean;
+  /** False until real equity snapshots arrive; drawdown is not checked before. Absent from older APIs. */
+  equity_seeded?: boolean;
   consecutive_losses: number;
   trips_today: number;
   recovery_state: RecoveryState | null;

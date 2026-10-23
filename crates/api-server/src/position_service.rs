@@ -59,6 +59,9 @@ pub struct CreatePositionParams {
     pub source_signal_id: Option<Uuid>,
     /// If Some, applies share-based fee model from the arb opportunity.
     pub arb_opportunity: Option<ArbOpportunity>,
+    /// Without an arb opportunity, the taker fee terms the position's fills
+    /// pay (share-based); `None` keeps the legacy flat model.
+    pub taker_fees: Option<polymarket_core::types::FeeSchedule>,
     /// Edge the entry was expected to earn, in the strategy's own unit (net
     /// USD per share for arb, basis points for quant signals). Recorded on
     /// the `entry_requested` event so realized results can be compared
@@ -151,6 +154,8 @@ impl PositionService {
 
         if let Some(ref arb) = params.arb_opportunity {
             position.apply_arb_fee_model(arb);
+        } else if let Some(terms) = params.taker_fees {
+            position.apply_taker_fee_terms(terms);
         }
 
         self.repo

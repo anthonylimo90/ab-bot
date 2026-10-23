@@ -220,6 +220,10 @@ test('risk status parsers convert Decimal fields and map a missing recovery_stat
   assert.equal(cb.peak_value, 10500);
   assert.equal(cb.current_value, 10200.25);
   assert.equal(cb.recovery_state, null);
+  // An API without the newer fields: unknown, not "off" or "unseeded".
+  assert.equal(cb.config.hard_kill_drawdown_pct, null);
+  assert.equal(cb.equity_seeded, undefined);
+  assert.equal(cb.drawdown_peak, 10500);
   assert.equal(cb.config.max_daily_loss, 2500);
   assert.equal(cb.config.max_drawdown_pct, 0.2);
   assert.equal(cb.config.max_consecutive_losses, 8);

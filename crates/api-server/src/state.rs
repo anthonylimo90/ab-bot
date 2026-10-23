@@ -272,7 +272,7 @@ impl AppState {
         let audit_logger = Arc::new(AuditLogger::new(audit_storage));
 
         // Create CLOB client
-        let clob_url = std::env::var("POLYMARKET_CLOB_URL").ok();
+        let clob_url = polymarket_core::config::env_set("POLYMARKET_CLOB_URL");
         let clob_client = Arc::new(ClobClient::new(clob_url, None));
 
         // Create order executor

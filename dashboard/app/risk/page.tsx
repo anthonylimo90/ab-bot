@@ -230,7 +230,9 @@ export default function RiskPage() {
                     )}
                     {cb.tripped && cb.resume_at && (
                       <p className="text-sm text-muted-foreground">
-                        Cooldown ends in {formatTimeRemaining(cb.resume_at)}
+                        {new Date(cb.resume_at).getTime() > Date.now()
+                          ? `Cooldown ends in ${formatTimeRemaining(cb.resume_at)}`
+                          : "Cooldown over"}
                       </p>
                     )}
                     {cb.trip_reason === "daily_loss_limit" && (
@@ -241,8 +243,9 @@ export default function RiskPage() {
                     )}
                     {breakerDisabled && (
                       <p className="text-sm text-muted-foreground">
-                        Loss limits are not enforced. Manual and hard kill
-                        trips still halt trading.
+                        No limit is checked, the hard kill included, and
+                        equity is not tracked. A manual trip still halts
+                        trading until reset.
                       </p>
                     )}
                     {cb.recovery_state && (
@@ -369,12 +372,19 @@ export default function RiskPage() {
               trend={cb.consecutive_losses > 0 ? "down" : "neutral"}
               changeLabel={`Limit: ${cb.config.max_consecutive_losses}`}
             />
-            {cb.equity_seeded ? (
+            {!cb.config.enabled ? (
+              <MetricCard
+                title="Drawdown"
+                value="Not tracked"
+                trend="neutral"
+                changeLabel="The breaker is off; equity is not followed"
+              />
+            ) : cb.equity_seeded !== false ? (
               <MetricCard
                 title="Drawdown"
                 value={formatPercent(drawdownPct)}
                 trend={drawdownPct > 0 ? "down" : "neutral"}
-                changeLabel={`Trip: ${formatPercent(cb.config.max_drawdown_pct * 100)}${cb.config.hard_kill_drawdown_pct > 0 ? ` | From peak: ${formatPercent(peakDrawdownPct)} of ${formatPercent(cb.config.hard_kill_drawdown_pct * 100)} kill` : ""}`}
+                changeLabel={`Trip: ${formatPercent(cb.config.max_drawdown_pct * 100)}${(cb.config.hard_kill_drawdown_pct ?? 0) > 0 ? ` | From peak: ${formatPercent(peakDrawdownPct)} of ${formatPercent((cb.config.hard_kill_drawdown_pct ?? 0) * 100)} kill` : ""}`}
               />
             ) : (
               <MetricCard

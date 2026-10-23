@@ -110,6 +110,12 @@ fn trades_and_tick_size_changes_leave_the_book_alone() {
     ] {
         let parsed = parse_ws_message(event, &mut state);
         assert!(parsed.updates.is_empty(), "{event}");
+        // Known events are not parse misses; a bare object still is.
+        assert_eq!(
+            parsed.kind.is_parse_miss(),
+            !event.contains("event_type"),
+            "{event}"
+        );
     }
     assert_eq!(prices(&state["a"].bids), vec![dec("0.40")]);
     assert_eq!(prices(&state["a"].asks), vec![dec("0.60")]);

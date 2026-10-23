@@ -72,7 +72,6 @@ pub struct RecoveryRunResponse {
 
 #[derive(Debug, FromRow)]
 struct WorkspaceRecoveryFlags {
-    live_trading_enabled: bool,
     exit_handler_enabled: bool,
 }
 
@@ -99,7 +98,8 @@ struct RuntimeSnapshot {
     live_running: bool,
     live_ready: bool,
     exit_handler_running: bool,
-    /// Operator-controlled workspace flags, reported but never modified here.
+    /// Whether live trading and the exit handler are switched on (by the
+    /// workspace, or forced by env), reported but never modified here.
     live_trading_enabled: bool,
     exit_handler_enabled: bool,
 }
@@ -296,13 +296,11 @@ pub async fn run_recovery(
         warnings.push("Live trading wallet/API credentials are not ready".to_string());
     }
     if !runtime.live_trading_enabled {
-        warnings.push(
-            "Live trading is disabled for this workspace; recovery does not enable it".to_string(),
-        );
+        warnings.push("Live trading is off; recovery does not turn it on".to_string());
     }
     if !runtime.exit_handler_enabled {
         warnings.push(
-            "Exit handler is disabled for this workspace; recovery does not enable it, so requeued exits will not execute until an owner turns it on"
+            "Exit handler is off; recovery does not turn it on, so requeued exits will not execute until an owner does"
                 .to_string(),
         );
     } else if !runtime.exit_handler_running {
@@ -489,9 +487,7 @@ async fn build_recovery_preview(
 async fn runtime_snapshot(state: &AppState, workspace_id: Uuid) -> ApiResult<RuntimeSnapshot> {
     let flags = sqlx::query_as::<_, WorkspaceRecoveryFlags>(
         r#"
-        SELECT
-            COALESCE(live_trading_enabled, FALSE) AS live_trading_enabled,
-            COALESCE(exit_handler_enabled, FALSE) AS exit_handler_enabled
+        SELECT COALESCE(exit_handler_enabled, FALSE) AS exit_handler_enabled
         FROM workspaces
         WHERE id = $1
         "#,
@@ -510,13 +506,17 @@ async fn runtime_snapshot(state: &AppState, workspace_id: Uuid) -> ApiResult<Run
         exit_heartbeat_ts > 0 && (now_epoch - exit_heartbeat_ts) < heartbeat_max_age_secs;
     let live_mode = state.order_executor.is_live();
     let live_ready = state.order_executor.is_live_ready().await;
+    let exit_handler_enabled = match &state.exit_handler_config {
+        Some(config) => config.read().await.enabled,
+        None => flags.exit_handler_enabled,
+    };
 
     Ok(RuntimeSnapshot {
         live_running: live_mode && live_ready,
         live_ready,
-        exit_handler_running: flags.exit_handler_enabled && exit_handler_alive,
-        live_trading_enabled: flags.live_trading_enabled,
-        exit_handler_enabled: flags.exit_handler_enabled,
+        exit_handler_running: exit_handler_enabled && exit_handler_alive,
+        live_trading_enabled: live_mode,
+        exit_handler_enabled,
     })
 }
 

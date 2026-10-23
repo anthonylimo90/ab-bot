@@ -9,7 +9,9 @@ use polymarket_core::db::positions::{
     PositionRepository, MARKET_TAKEN, QUANT_LIMIT_REACHED, SOURCE_RECOMMENDATION,
 };
 use polymarket_core::types::signal::{QuantSignal, QuantSignalKind, SignalDirection};
-use polymarket_core::types::{ExitStrategy, MarketOrder, OrderBook, OrderSide, Position};
+use polymarket_core::types::{
+    ExitStrategy, FeeSchedule, MarketOrder, OrderBook, OrderSide, Position,
+};
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
@@ -47,9 +49,10 @@ pub struct QuantSignalExecutorConfig {
     pub cache_refresh_secs: u64,
     /// Maximum simultaneous quant positions.
     pub max_quant_positions: usize,
-    /// How long after a quant position in a market closes before another
-    /// may enter it: a generator re-fires on its trailing window, which
-    /// still holds the evidence the closed position traded on.
+    /// How long after a quant position in a market closes, or fails to
+    /// enter, before another may enter it: a generator re-fires on its
+    /// trailing window, which still holds the evidence the last position
+    /// traded on (and a failed entry would meet the same book).
     pub reentry_cooldown_minutes: i64,
     /// Strategy allocation weights (should sum to ~1.0).
     pub flow_allocation_pct: f64,
@@ -385,6 +388,8 @@ struct QuantSignalExecutor {
     /// When set, live positions are entered only while the exit handler can
     /// take their profit, stop their loss and end their hold.
     exit_readiness: Option<crate::exit_handler::ExitReadiness>,
+    /// The exchange's fee terms by market, which entries book.
+    fee_terms: crate::fee_terms::FeeTermsCache,
 }
 
 impl QuantSignalExecutor {
@@ -436,6 +441,7 @@ impl QuantSignalExecutor {
             processed_outcomes_date: Utc::now().date_naive(),
             heartbeat,
             exit_readiness: None,
+            fee_terms: Default::default(),
         }
     }
 
@@ -798,7 +804,8 @@ impl QuantSignalExecutor {
             return Ok(());
         }
 
-        // Step 6a: not back into a market the executor just left.
+        // Step 6a: not back into a market the executor just left or just
+        // failed to enter.
         let recently_closed: Result<bool, sqlx::Error> = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM positions WHERE market_id = $1 AND source = $2 \
              AND state IN (4, 5) AND COALESCE(exit_timestamp, last_updated) \
@@ -962,13 +969,16 @@ impl QuantSignalExecutor {
             SignalDirection::BuyNo => (no_token_id, "No"),
         };
 
-        // Step 10: Orderbook depth check on target side
-        let book = match self
-            .order_executor
-            .clob_client()
-            .get_order_book(&target_token_id)
-            .await
-        {
+        // Step 10: Orderbook depth check on target side. The market's fee
+        // terms are read alongside: the position books the fees its fills
+        // pay (the highest published rate when they cannot be read).
+        let clob_client = self.order_executor.clob_client();
+        let (book, fee_terms) = tokio::join!(
+            clob_client.get_order_book(&target_token_id),
+            self.fee_terms.get(clob_client, &signal.condition_id)
+        );
+        let fee_terms = fee_terms.unwrap_or(FeeSchedule::CONSERVATIVE);
+        let book = match book {
             Ok(book) => book,
             Err(e) => {
                 warn!(
@@ -1270,6 +1280,7 @@ impl QuantSignalExecutor {
                     source: SOURCE_RECOMMENDATION,
                     source_signal_id: Some(signal.id),
                     arb_opportunity: None,
+                    taker_fees: Some(fee_terms),
                     expected_edge: expected_edge_from_signal(&signal),
                     observed_edge: None,
                     // One position per market, and the quant limit, decided

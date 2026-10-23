@@ -196,7 +196,8 @@ export function parseCircuitBreakerConfig(raw: CircuitBreakerConfig): CircuitBre
     ...raw,
     max_daily_loss: toNumberOr(raw.max_daily_loss),
     max_drawdown_pct: toNumberOr(raw.max_drawdown_pct),
-    hard_kill_drawdown_pct: toNumberOr(raw.hard_kill_drawdown_pct),
+    // An older API omits it: unknown, not off.
+    hard_kill_drawdown_pct: toNumber(raw.hard_kill_drawdown_pct),
   };
 }
 
@@ -213,9 +214,11 @@ export function parseCircuitBreakerStatus(raw: CircuitBreakerStatus): CircuitBre
     ...raw,
     daily_pnl: toNumberOr(raw.daily_pnl),
     peak_value: toNumberOr(raw.peak_value),
-    drawdown_peak: toNumberOr(raw.drawdown_peak),
+    // Older APIs send neither: fall back to the all-time peak, and leave
+    // seeding unknown rather than "not seeded".
+    drawdown_peak: toNumber(raw.drawdown_peak) ?? toNumberOr(raw.peak_value),
     current_value: toNumberOr(raw.current_value),
-    equity_seeded: raw.equity_seeded === true,
+    equity_seeded: typeof raw.equity_seeded === "boolean" ? raw.equity_seeded : undefined,
     // The API omits the field entirely when the breaker is not recovering.
     recovery_state: raw.recovery_state ? parseRecoveryState(raw.recovery_state) : null,
     config: parseCircuitBreakerConfig(raw.config),

@@ -69,6 +69,8 @@ enum WsParseKind {
     Snapshot,
     PriceChange,
     EmptyPriceChange,
+    /// A market-channel event that carries no book (trades, tick sizes).
+    OtherEvent,
     UnsupportedArray,
     UnsupportedObject,
     UnsupportedValue,
@@ -84,6 +86,7 @@ impl WsParseKind {
             Self::Snapshot => "snapshot",
             Self::PriceChange => "price_change",
             Self::EmptyPriceChange => "empty_price_change",
+            Self::OtherEvent => "other_event",
             Self::UnsupportedArray => "unsupported_array",
             Self::UnsupportedObject => "unsupported_object",
             Self::UnsupportedValue => "unsupported_value",
@@ -1172,6 +1175,7 @@ fn parse_ws_message(text: &str, book_state: &mut HashMap<String, OrderBook>) -> 
 
     match value {
         serde_json::Value::Array(items) => {
+            let only_other_events = !items.is_empty() && items.iter().all(is_non_book_event);
             let updates: Vec<OrderBookUpdate> = items
                 .into_iter()
                 .filter_map(parse_ws_book_from_value)
@@ -1179,14 +1183,22 @@ fn parse_ws_message(text: &str, book_state: &mut HashMap<String, OrderBook>) -> 
                     book_state.insert(update.asset_id.clone(), update_to_orderbook(update));
                 })
                 .collect();
-            let kind = if updates.is_empty() {
-                WsParseKind::UnsupportedArray
-            } else {
+            let kind = if !updates.is_empty() {
                 WsParseKind::Snapshot
+            } else if only_other_events {
+                WsParseKind::OtherEvent
+            } else {
+                WsParseKind::UnsupportedArray
             };
             ParsedWsMessage { updates, kind }
         }
         serde_json::Value::Object(_) => {
+            if is_non_book_event(&value) {
+                return ParsedWsMessage {
+                    updates: Vec::new(),
+                    kind: WsParseKind::OtherEvent,
+                };
+            }
             if let Some(update) = parse_ws_book_from_value(value.clone()) {
                 book_state.insert(update.asset_id.clone(), update_to_orderbook(&update));
                 return ParsedWsMessage {
@@ -1215,6 +1227,26 @@ fn parse_ws_message(text: &str, book_state: &mut HashMap<String, OrderBook>) -> 
             kind: WsParseKind::UnsupportedValue,
         },
     }
+}
+
+/// Market-channel events that are not about the book's levels.
+const NON_BOOK_WS_EVENTS: [&str; 5] = [
+    "last_trade_price",
+    "tick_size_change",
+    "best_bid_ask",
+    "new_market",
+    "market_resolved",
+];
+
+fn is_non_book_event(value: &serde_json::Value) -> bool {
+    value
+        .get("event_type")
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|kind| {
+            NON_BOOK_WS_EVENTS
+                .iter()
+                .any(|other| kind.eq_ignore_ascii_case(other))
+        })
 }
 
 fn parse_ws_book_from_value(value: serde_json::Value) -> Option<OrderBookUpdate> {

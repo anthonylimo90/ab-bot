@@ -556,15 +556,22 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - The order book stream applies only `book` events as whole books (and
   `price_change` events to them): trade, tick-size and best-bid/ask events
   no longer replace a token's book with an empty one.
-- An arbitrage is priced under the fee terms it was detected with (from the
-  market listing) and the exchange's own (`/clob-markets`, reread every ten
-  minutes), whichever leaves less edge; the highest published rate when the
-  exchange's cannot be read.
+- An arbitrage must clear its edge under both the fee terms it was detected
+  with (from the market listing) and the exchange's own (`/clob-markets`,
+  reread every ten minutes, read alongside the books with a 5 s limit); the
+  highest published rate stands in when the exchange's cannot be read. The
+  position books the exchange's terms, or the listing's when unread.
 - The arb monitor keeps its market universe when a refresh lists none, and
   does not start on an empty one.
-- After a quant position in a market closes, no quant entry is made there
-  for `QUANT_REENTRY_COOLDOWN_MINUTES` (default 60): the generators re-fire
-  on trailing windows that still hold the same evidence.
+- Quant positions book the taker fee each fill pays under the market's own
+  terms (read from the exchange; the highest published rate when they
+  cannot be read), as arbitrage positions do. Before, they deducted a flat
+  2% of cost on each side, which booked a winning buy of a favourite as a
+  loss; positions opened earlier keep the flat model. Arbitrage must clear
+  both its listed and the exchange's fee terms, and books the exchange's.
+- After a quant position in a market closes or fails to enter, no quant
+  entry is made there for `QUANT_REENTRY_COOLDOWN_MINUTES` (default 60): the
+  generators re-fire on trailing windows that still hold the same evidence.
 - The quant generators (flow, mean reversion, cross-market, resolution) read
   `orderbook_hourly`, the hourly aggregate of `orderbook_snapshots`. Nothing
   in this repository writes `orderbook_snapshots`: without an external feed
@@ -573,6 +580,10 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   with its runtime stats); depth and cooldown show a dash while the monitor
   is not reporting. `ARB_SIGNAL_COOLDOWN_SECS` and `ARB_TRADING_FEE_PCT`
   were never read by the monitor and are no longer reported.
+
+- A blank `VAULT_MASTER_KEY` counts as unset (it was used as an empty
+  key). A vault file written under an empty key no longer opens: reconnect
+  those wallets after setting a real key.
 
 ### API contract changes
 

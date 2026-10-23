@@ -187,6 +187,18 @@ const INSERT_PENDING_ORDER: &str = r#"
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 "#;
 
+/// Deletes a user's expired prepared orders, except a submitted one whose
+/// answer is in doubt or that expired less than a day ago.
+const PRUNE_PREPARED_ORDERS: &str = r#"
+    DELETE FROM pending_wallet_orders p
+    WHERE p.user_id = $1 AND p.expires_at < NOW()
+      AND NOT EXISTS (
+          SELECT 1 FROM execution_intents i
+          WHERE i.id = p.id
+            AND (i.status IN ('submitting', 'unknown')
+                 OR p.expires_at >= NOW() - INTERVAL '1 day'))
+"#;
+
 const SELECT_PENDING_ORDER: &str = r#"
     SELECT id, user_id, maker_address, token_id, side,
            maker_amount, taker_amount, salt, expiration, order_timestamp,
@@ -368,14 +380,12 @@ pub async fn prepare_order(
     // Prepared orders never submitted expire unused: they are cleared, and
     // each user keeps a bounded number awaiting a signature (each one costs
     // exchange lookups and a stored row). A submitted order (its intent
-    // shares its id) is neither: its row answers a retry of the submission.
-    sqlx::query(
-        "DELETE FROM pending_wallet_orders p WHERE p.user_id = $1 AND p.expires_at < NOW() \
-         AND NOT EXISTS (SELECT 1 FROM execution_intents i WHERE i.id = p.id)",
-    )
-    .bind(user_id)
-    .execute(&state.pool)
-    .await?;
+    // shares its id) is neither: its row answers a retry of the submission,
+    // until a day after it expired once the exchange's answer is settled.
+    sqlx::query(PRUNE_PREPARED_ORDERS)
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
     let awaiting: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pending_wallet_orders p WHERE p.user_id = $1 \
          AND NOT EXISTS (SELECT 1 FROM execution_intents i WHERE i.id = p.id)",
@@ -909,6 +919,76 @@ mod amount_tests {
             .await
             .unwrap();
         assert!(other.is_none());
+    }
+    #[sqlx::test(migrations = false)]
+    async fn expired_prepared_orders_are_pruned_once_settled(pool: sqlx::PgPool) {
+        crate::workspace_scope::test_fixture::real_schema(&pool).await;
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let user = crate::workspace_scope::test_fixture::user(&pool, auth::UserRole::Trader).await;
+        let mut kept = Vec::new();
+        let mut pruned = Vec::new();
+        for (expired_hours_ago, intent, keep) in [
+            (-1, None, true),                  // not yet expired
+            (1, None, false),                  // never submitted
+            (48, Some("acknowledged"), false), // settled long ago
+            (48, Some("rejected"), false),
+            (2, Some("acknowledged"), true), // a retry may still come
+            (48, Some("unknown"), true),     // answer in doubt
+            (48, Some("submitting"), true),
+        ] {
+            let id = Uuid::new_v4();
+            let expires_at = Utc::now() - Duration::hours(expired_hours_ago);
+            sqlx::query(INSERT_PENDING_ORDER)
+                .bind(id)
+                .bind(user)
+                .bind("0x0000000000000000000000000000000000000001")
+                .bind("123")
+                .bind(0i16)
+                .bind("4000000")
+                .bind("10000000")
+                .bind("42")
+                .bind(expires_at.timestamp())
+                .bind(Utc::now().timestamp_millis())
+                .bind(0i16)
+                .bind(false)
+                .bind(expires_at)
+                .bind(Utc::now())
+                .execute(&pool)
+                .await
+                .unwrap();
+            if let Some(status) = intent {
+                sqlx::query(
+                    "INSERT INTO execution_intents (id, market_id, signed_order, status) \
+                     VALUES ($1, 'token', '{}', $2)",
+                )
+                .bind(id)
+                .bind(status)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            if keep {
+                kept.push(id)
+            } else {
+                pruned.push(id)
+            }
+        }
+        sqlx::query(PRUNE_PREPARED_ORDERS)
+            .bind(user)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM pending_wallet_orders")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(kept.iter().all(|id| left.contains(id)));
+        assert!(pruned.iter().all(|id| !left.contains(id)));
     }
     #[sqlx::test(migrations = false)]
     async fn a_retry_of_an_answered_order_gets_the_recorded_answer(pool: sqlx::PgPool) {

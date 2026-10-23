@@ -111,17 +111,21 @@ fn pair_collateral(quantity: Decimal, yes_ask: Decimal, no_ask: Decimal) -> Deci
         .sum()
 }
 
-/// Re-prices an opportunity on fresh books under the fee terms it was
-/// detected with and the exchange's own (`exchange_terms`), whichever
-/// leaves less edge: the detected terms come from the market listing and can
-/// be stale or missing. `None` when it no longer clears `min_net_profit`.
+/// Re-prices an opportunity on fresh books. It must clear `min_net_profit`
+/// under both the fee terms it was detected with (from the market listing,
+/// which can be stale or missing) and the exchange's own (`exchange_terms`;
+/// the highest published rate when they could not be read). The opportunity
+/// returned is priced under the terms the exchange charges, which the
+/// position books: the exchange's when read, else the detected ones; with it
+/// comes the net profit under the worse terms, which sizing and slippage
+/// spend. `None` when the edge is gone.
 fn reprice_on_fresh_books(
     signal: &ArbOpportunity,
     yes_book: &OrderBook,
     no_book: &OrderBook,
     min_net_profit: Decimal,
-    exchange_terms: FeeSchedule,
-) -> Option<ArbOpportunity> {
+    exchange_terms: Option<FeeSchedule>,
+) -> Option<(ArbOpportunity, Decimal)> {
     let book = BinaryMarketBook {
         market_id: signal.market_id.clone(),
         timestamp: Utc::now(),
@@ -129,17 +133,13 @@ fn reprice_on_fresh_books(
         no_book: no_book.clone(),
     };
     let detected = signal.fee_schedule.unwrap_or(FeeSchedule::CONSERVATIVE);
-    [detected, exchange_terms]
-        .into_iter()
-        .map(|schedule| ArbOpportunity::calculate_with_fee_schedule(&book, schedule))
-        .collect::<Option<Vec<_>>>()?
-        .into_iter()
-        .min_by_key(|priced| priced.net_profit)
-        .filter(|fresh| fresh.net_profit >= min_net_profit)
+    let price = |schedule| ArbOpportunity::calculate_with_fee_schedule(&book, schedule);
+    let charged = price(exchange_terms.unwrap_or(detected))?;
+    let worst = price(detected)?
+        .net_profit
+        .min(price(exchange_terms.unwrap_or(FeeSchedule::CONSERVATIVE))?.net_profit);
+    (worst >= min_net_profit).then_some((charged, worst))
 }
-
-/// How long the exchange's fee terms for a market are reused.
-const FEE_TERMS_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Largest pair quantity (up to `desired`) that both legs can buy at their
 /// best ask under the executor's market-buy rules: at least `min_depth`
@@ -369,40 +369,11 @@ pub struct ArbAutoExecutor {
     /// When set, live pairs are entered only while the exit handler can
     /// flatten one whose second leg fails.
     exit_readiness: Option<crate::exit_handler::ExitReadiness>,
-    /// The exchange's fee terms by market, with when they were read.
-    fee_terms:
-        tokio::sync::Mutex<std::collections::HashMap<String, (FeeSchedule, std::time::Instant)>>,
+    /// The exchange's fee terms by market.
+    fee_terms: crate::fee_terms::FeeTermsCache,
 }
 
 impl ArbAutoExecutor {
-    /// The fee terms the exchange charges in `market_id`, read at most every
-    /// [`FEE_TERMS_TTL`]; the highest published rate when they cannot be read.
-    async fn exchange_fee_terms(&self, market_id: &str) -> FeeSchedule {
-        if let Some((terms, read_at)) = self.fee_terms.lock().await.get(market_id) {
-            if read_at.elapsed() < FEE_TERMS_TTL {
-                return *terms;
-            }
-        }
-        match self
-            .order_executor
-            .clob_client()
-            .get_fee_schedule(market_id)
-            .await
-        {
-            Ok(terms) => {
-                self.fee_terms
-                    .lock()
-                    .await
-                    .insert(market_id.to_string(), (terms, std::time::Instant::now()));
-                terms
-            }
-            Err(error) => {
-                warn!(%market_id, %error, "Could not read the market's fee terms; pricing at the highest rate");
-                FeeSchedule::CONSERVATIVE
-            }
-        }
-    }
-
     /// Enter live pairs only while `readiness` allows (see the field).
     pub fn with_exit_readiness(mut self, readiness: crate::exit_handler::ExitReadiness) -> Self {
         self.exit_readiness = Some(readiness);
@@ -972,9 +943,10 @@ impl ArbAutoExecutor {
         // 6. Market quality check — verify orderbook depth on both sides
         let depth_check_started_at = std::time::Instant::now();
         let clob_client = self.order_executor.clob_client();
-        let (yes_book, no_book) = tokio::join!(
+        let (yes_book, no_book, exchange_terms) = tokio::join!(
             clob_client.get_order_book(&yes_token_id),
-            clob_client.get_order_book(&no_token_id)
+            clob_client.get_order_book(&no_token_id),
+            self.fee_terms.get(clob_client, market_id)
         );
         let (yes_book, no_book) = match (yes_book, no_book) {
             (Ok(yes_book), Ok(no_book)) => (yes_book, no_book),
@@ -1026,10 +998,9 @@ impl ArbAutoExecutor {
         }
         telemetry.depth_check_ms = Some(depth_check_started_at.elapsed().as_millis() as i64);
 
-        // Re-price the opportunity on the books that will actually be traded,
-        // under the fee terms it was detected with: the signal may be stale.
-        let exchange_terms = self.exchange_fee_terms(market_id).await;
-        let Some(fresh) = reprice_on_fresh_books(
+        // Re-price the opportunity on the books that will actually be traded:
+        // the signal and its fee terms may be stale.
+        let Some((fresh, worst_net_profit)) = reprice_on_fresh_books(
             &arb,
             &yes_book,
             &no_book,
@@ -1074,7 +1045,7 @@ impl ArbAutoExecutor {
             let sized = if range.is_zero() {
                 cfg.min_position_size
             } else {
-                let t = (arb.net_profit - floor) / range;
+                let t = (worst_net_profit - floor) / range;
                 let t_clamped = t.max(Decimal::ZERO).min(Decimal::ONE);
                 let size_range = cfg.max_position_size - cfg.min_position_size;
                 cfg.min_position_size + size_range * t_clamped
@@ -1290,6 +1261,7 @@ impl ArbAutoExecutor {
                     source: SOURCE_ARBITRAGE,
                     source_signal_id: None,
                     arb_opportunity: Some(arb.clone()),
+                    taker_fees: None,
                     expected_edge: Some(arb.net_profit),
                     observed_edge: Some(arb.gross_profit),
                     exclusive_market: true,
@@ -1321,7 +1293,7 @@ impl ArbAutoExecutor {
 
         // 9. Execute YES market order. Its slippage may not consume more than
         // the edge left above the minimum, or the pair would be unprofitable.
-        let edge_headroom = (arb.net_profit - cfg.min_net_profit).max(Decimal::ZERO);
+        let edge_headroom = (worst_net_profit - cfg.min_net_profit).max(Decimal::ZERO);
         let yes_slippage = self.order_executor.default_slippage().min(
             edge_headroom
                 .checked_div(arb.yes_ask)
@@ -1753,8 +1725,8 @@ mod tests {
         let signal = signal(FeeSchedule::FREE);
         let min = Decimal::new(5, 3);
         // Asks moved up a cent each: 0.46 + 0.51 still leaves 3 cents.
-        let free = FeeSchedule::FREE;
-        let fresh =
+        let free = Some(FeeSchedule::FREE);
+        let (fresh, _) =
             reprice_on_fresh_books(&signal, &book(&[(46, 500)]), &book(&[(51, 500)]), min, free)
                 .unwrap();
         assert_eq!(fresh.yes_ask, Decimal::new(46, 2));
@@ -1770,9 +1742,9 @@ mod tests {
         .is_none());
         // Detected as fee-free, but the exchange charges: its fees are what
         // the pair pays.
-        let charged = FeeSchedule::CONSERVATIVE;
+        let charged = Some(FeeSchedule::CONSERVATIVE);
         // 0.40 + 0.50 leaves 10 cents gross, less 0.07 x p(1 - p) a leg.
-        let priced = reprice_on_fresh_books(
+        let (priced, worst) = reprice_on_fresh_books(
             &signal,
             &book(&[(40, 500)]),
             &book(&[(50, 500)]),
@@ -1781,7 +1753,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(priced.net_profit, Decimal::new(657, 4));
-        assert_eq!(priced.fee_schedule, Some(charged));
+        assert_eq!(worst, priced.net_profit);
+        assert_eq!(priced.fee_schedule, charged);
         // 2 cents gross does not survive 0.07 x p(1 - p) on both legs.
         assert!(reprice_on_fresh_books(
             &signal,
@@ -1806,7 +1779,7 @@ mod tests {
             &book(&[(45, 500)]),
             &book(&[(50, 500)]),
             Decimal::new(5, 3),
-            FeeSchedule::FREE
+            Some(FeeSchedule::FREE)
         )
         .is_some());
         // ...but 2% gross does not.
@@ -1815,7 +1788,53 @@ mod tests {
             &book(&[(48, 500)]),
             &book(&[(50, 500)]),
             Decimal::new(5, 3),
-            FeeSchedule::FREE
+            Some(FeeSchedule::FREE)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn repricing_books_the_exchange_terms_and_gates_on_the_worse() {
+        let min = Decimal::new(5, 3);
+        // Detected at the highest rate (the listing gave no terms), but the
+        // exchange charges nothing: the edge clears the 7% gate, and the
+        // position books the exchange's terms.
+        let unlisted = signal(FeeSchedule::CONSERVATIVE);
+        let (priced, worst) = reprice_on_fresh_books(
+            &unlisted,
+            &book(&[(40, 500)]),
+            &book(&[(50, 500)]),
+            min,
+            Some(FeeSchedule::FREE),
+        )
+        .unwrap();
+        assert_eq!(priced.fee_schedule, Some(FeeSchedule::FREE));
+        assert_eq!(priced.net_profit, Decimal::new(10, 2));
+        // Sizing and slippage spend the edge under the 7% terms.
+        assert_eq!(worst, Decimal::new(657, 4));
+        // 2 cents gross clears the exchange's terms but not the detected ones.
+        assert!(reprice_on_fresh_books(
+            &unlisted,
+            &book(&[(48, 500)]),
+            &book(&[(50, 500)]),
+            min,
+            Some(FeeSchedule::FREE),
+        )
+        .is_none());
+        // Exchange terms unknown: gate at the highest rate, book the detected.
+        let listed = signal(FeeSchedule::FREE);
+        let (priced, worst) =
+            reprice_on_fresh_books(&listed, &book(&[(40, 500)]), &book(&[(50, 500)]), min, None)
+                .unwrap();
+        assert_eq!(priced.fee_schedule, Some(FeeSchedule::FREE));
+        // ...but sizing and slippage spend only what the 7% gate leaves.
+        assert_eq!(worst, Decimal::new(657, 4));
+        assert!(reprice_on_fresh_books(
+            &listed,
+            &book(&[(48, 500)]),
+            &book(&[(50, 500)]),
+            min,
+            None
         )
         .is_none());
     }

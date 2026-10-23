@@ -30,6 +30,7 @@ pub mod dynamic_tuner;
 pub mod email;
 pub mod error;
 pub mod exit_handler;
+pub mod fee_terms;
 pub mod flow_feature_calculator;
 pub mod gamma_syncer;
 pub mod handlers;

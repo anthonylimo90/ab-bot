@@ -258,6 +258,17 @@ impl Position {
         self.taker_fees = arb.fee_schedule;
     }
 
+    /// Book fees as the exchange charges them, under `terms`, on a position
+    /// with no arbitrage opportunity to take them from: each fill pays its
+    /// taker fee in collateral, and resolution pays a full dollar a share.
+    pub fn apply_taker_fee_terms(&mut self, terms: FeeSchedule) {
+        self.fee_model = PositionFeeModel::ShareBased;
+        self.resolution_payout_per_share = Decimal::ONE;
+        self.yes_entry_fee_shares = Decimal::ZERO;
+        self.no_entry_fee_shares = Decimal::ZERO;
+        self.taker_fees = Some(terms);
+    }
+
     /// Charge the taker fee of a fill of `quantity` shares at `price` under
     /// the position's fee terms (none when they are unknown). Returns it.
     pub fn charge_taker_fee(&mut self, price: Decimal, quantity: Decimal) -> Decimal {
@@ -836,6 +847,33 @@ impl Position {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn taker_fee_terms_charge_each_fill_at_its_price() {
+        // A quant buy of a favourite: 0.07 x p(1 - p) at 0.99 is tiny, where
+        // the flat 2% model charged 2% of cost on each side.
+        let mut pos = Position::new(
+            "m".into(),
+            Decimal::new(99, 2),
+            Decimal::ZERO,
+            Decimal::from(2),
+            ExitStrategy::ExitOnCorrection,
+        );
+        pos.apply_taker_fee_terms(FeeSchedule::CONSERVATIVE);
+        assert_eq!(pos.fee_model, PositionFeeModel::ShareBased);
+        assert_eq!(pos.resolution_payout_per_share, Decimal::ONE);
+        let fee = pos.charge_taker_fee(Decimal::new(99, 2), Decimal::from(2));
+        assert_eq!(fee, Decimal::new(1386, 6));
+        // The flat rate passed in is ignored: what the fills paid is deducted.
+        assert_eq!(pos.fee_charges(Decimal::new(2, 2), Decimal::from(4)), fee);
+        let free = {
+            let mut pos = pos.clone();
+            pos.fees_paid = Decimal::ZERO;
+            pos.apply_taker_fee_terms(FeeSchedule::FREE);
+            pos.charge_taker_fee(Decimal::new(99, 2), Decimal::from(2))
+        };
+        assert_eq!(free, Decimal::ZERO);
+    }
 
     #[test]
     fn a_one_legged_entry_flattens_the_leg_it_holds() {

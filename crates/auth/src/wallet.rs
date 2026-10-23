@@ -31,6 +31,8 @@ impl TradingWallet {
     /// if the private key format is invalid.
     pub fn from_env() -> Result<Self> {
         let private_key = std::env::var("WALLET_PRIVATE_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
             .context("WALLET_PRIVATE_KEY environment variable not set")?;
 
         Self::from_private_key(&private_key)

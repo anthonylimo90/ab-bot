@@ -622,14 +622,33 @@ pub async fn update_workspace(
             "Runtime flags can only be enabled on the canonical workspace".into(),
         ));
     }
-    // A service the environment switches on stays on whatever the workspace
-    // says: switching it off here would report success and change nothing.
-    for (requested, variable) in [
-        (req.live_trading_enabled, "LIVE_TRADING"),
-        (req.exit_handler_enabled, "EXIT_HANDLER_ENABLED"),
-        (req.arb_auto_execute, "ARB_AUTO_EXECUTE"),
-    ] {
-        if requested == Some(false) && crate::runtime_sync::env_enabled(variable) {
+    // A service the environment switches on stays on whatever the canonical
+    // workspace says: switching it off there would report success and change
+    // nothing. (Another workspace's flags only feed the election, and a flag
+    // already off is no change, so both may go ahead.)
+    let forced_on = [
+        (
+            req.live_trading_enabled,
+            before_update.live_trading_enabled,
+            "LIVE_TRADING",
+        ),
+        (
+            req.exit_handler_enabled,
+            before_update.exit_handler_enabled,
+            "EXIT_HANDLER_ENABLED",
+        ),
+        (
+            req.arb_auto_execute,
+            before_update.arb_auto_execute,
+            "ARB_AUTO_EXECUTE",
+        ),
+    ]
+    .into_iter()
+    .find(|(requested, before, variable)| {
+        *requested == Some(false) && *before && crate::runtime_sync::env_enabled(variable)
+    });
+    if let Some((_, _, variable)) = forced_on {
+        if is_canonical_workspace(&state.pool, workspace_id).await? {
             return Err(ApiError::Conflict(format!(
                 "{variable}=true is set in the server's environment, so this cannot be \
                  switched off here; nothing was changed. Unset {variable} and restart, or \
@@ -2460,7 +2479,7 @@ pub async fn get_service_status(
         },
         live_trading: ServiceStatusItem {
             running: live_running,
-            reason: if !flags.live_trading_enabled {
+            reason: if !live_mode && !flags.live_trading_enabled {
                 Some("Workspace live_trading_enabled=false (simulation expected)".to_string())
             } else if !live_mode {
                 Some("Executor is running in simulation mode (set LIVE_TRADING=true)".to_string())
