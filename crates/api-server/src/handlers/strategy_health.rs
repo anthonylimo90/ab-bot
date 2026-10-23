@@ -104,9 +104,14 @@ pub async fn get_strategy_health(
     Query(query): Query<StrategyHealthQuery>,
 ) -> ApiResult<Json<StrategyHealthResponse>> {
     let period_days = query.period_days.unwrap_or(7).clamp(1, 90);
+    // The strategies of the calculator's latest cycle, while it is recent: a
+    // strategy missing from it (one that traded only in paper, once trading
+    // is live) is not shown with its old numbers.
+    let stale_after_secs = 2.0
+        * crate::strategy_health_calculator::StrategyHealthConfig::from_env().interval_secs as f64;
     let rows: Vec<StrategyHealthRow> = sqlx::query_as(
         r#"
-        SELECT DISTINCT ON (strategy)
+        SELECT
             strategy, period_end, period_days, generated_signals, executed_signals,
             skipped_signals, expired_signals, open_positions, exit_ready_positions,
             closed_positions, entry_failed_positions, exit_failed_positions,
@@ -116,10 +121,15 @@ pub async fn get_strategy_health(
             latest_backtest_return_pct, latest_backtest_created_at
         FROM strategy_health_snapshots
         WHERE period_days = $1
-        ORDER BY strategy, period_end DESC
+          AND period_end = (
+              SELECT MAX(period_end) FROM strategy_health_snapshots WHERE period_days = $1
+          )
+          AND period_end >= NOW() - make_interval(secs => $2)
+        ORDER BY strategy
         "#,
     )
     .bind(period_days)
+    .bind(stale_after_secs)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;

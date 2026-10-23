@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use redis::AsyncCommands;
 use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -443,7 +443,11 @@ impl DynamicTuner {
                 continue;
             }
 
-            let Some(new_value) = Decimal::from_f64_retain(bounded) else {
+            // At the column's scale, as the database stores it: the guards
+            // below compare against the stored value.
+            let Some(new_value) = Decimal::from_f64_retain(bounded).map(|value| {
+                value.round_dp_with_strategy(10, RoundingStrategy::MidpointAwayFromZero)
+            }) else {
                 continue;
             };
 
@@ -574,7 +578,7 @@ impl DynamicTuner {
                     metrics.recent_pnl
                 );
 
-                sqlx::query(
+                let rolled_back = sqlx::query(
                     r#"
                     UPDATE dynamic_config
                     SET current_value = $2,
@@ -590,7 +594,13 @@ impl DynamicTuner {
                 .bind(&reason)
                 .bind(row.current_value)
                 .execute(&self.pool)
-                .await?;
+                .await?
+                .rows_affected();
+                if rolled_back == 0 {
+                    // Changed since it was read (an operator's update): it
+                    // stands, and nothing is announced.
+                    continue;
+                }
 
                 self.record_history(
                     Some(&row.key),
@@ -624,19 +634,26 @@ impl DynamicTuner {
                     );
                 });
             } else {
-                sqlx::query(
+                let passed = sqlx::query(
                     r#"
                     UPDATE dynamic_config
                     SET pending_eval = FALSE,
                         pending_baseline = NULL,
                         last_good_value = current_value,
                         updated_by = 'dynamic_tuner'
-                    WHERE key = $1
+                    WHERE key = $1 AND pending_eval AND current_value = $2
                     "#,
                 )
                 .bind(&row.key)
+                .bind(row.current_value)
                 .execute(&self.pool)
-                .await?;
+                .await?
+                .rows_affected();
+                if passed == 0 {
+                    // An operator's update since the read ended the
+                    // evaluation; it keeps its own marker (and hold).
+                    continue;
+                }
 
                 self.record_history(
                     Some(&row.key),
@@ -1091,6 +1108,13 @@ impl DynamicTuner {
                         WHEN dynamic_config.updated_by = 'bootstrap' THEN EXCLUDED.default_value
                         ELSE LEAST(GREATEST(dynamic_config.last_good_value, EXCLUDED.min_value), EXCLUDED.max_value)
                     END
+                -- Untouched when nothing changed: an update would renew
+                -- updated_at, and with it an operator's hold.
+                WHERE (dynamic_config.min_value, dynamic_config.max_value,
+                       dynamic_config.max_step_pct, dynamic_config.default_value)
+                      IS DISTINCT FROM
+                      (EXCLUDED.min_value, EXCLUDED.max_value,
+                       EXCLUDED.max_step_pct, EXCLUDED.default_value)
                 "#,
             )
             .bind(seed.key)
@@ -1184,7 +1208,7 @@ impl DynamicTuner {
         let revert_reason = format!(
             "reverted unapplied change after publish failure: {publish_error}; original_reason={reason}"
         );
-        sqlx::query(
+        let reverted = sqlx::query(
             r#"
             UPDATE dynamic_config
             SET current_value = $2,
@@ -1201,7 +1225,14 @@ impl DynamicTuner {
         .bind(&revert_reason)
         .bind(attempted_value)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if reverted == 0 {
+            // An operator's update since then stands; processes re-read the
+            // stored config either way.
+            warn!(key = %row.key, "Unpublished dynamic config change was replaced before its revert");
+            return Ok(());
+        }
 
         self.record_history(
             Some(&row.key),

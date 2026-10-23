@@ -832,10 +832,10 @@ class ApiClient {
     );
   }
 
-  /** Capacity of `address` for one withdrawal, probed with the smallest amount. */
+  /** Capacity of `address` for one withdrawal (a preflight without an amount). */
   async getWithdrawalCapacity(address: string): Promise<WithdrawalPreflight> {
     const raw = await this.request<WithdrawalPreflight>(
-      `/api/v1/vault/withdrawals/preflight?address=${encodeURIComponent(address)}&amount=0.000001`,
+      `/api/v1/vault/withdrawals/preflight?address=${encodeURIComponent(address)}`,
     );
     return {
       ...raw,

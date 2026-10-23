@@ -673,11 +673,36 @@ pub async fn close_position(
 
     match position.state {
         PositionState::Open => {
-            state
-                .position_service
-                .mark_exit_ready(&mut position, "manual_close_request", &ctx)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            // The exit handler rewrites an open position's marks every pass,
+            // which moves its version on: a request that loses that race
+            // reads the position again and retries.
+            let mut attempts = 0;
+            loop {
+                match state
+                    .position_service
+                    .mark_exit_ready(&mut position, "manual_close_request", &ctx)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(e) if attempts < 3 && e.to_string().contains("Stale position update") => {
+                        attempts += 1;
+                        position = state
+                            .position_service
+                            .repo()
+                            .get(position_id)
+                            .await
+                            .map_err(|e| ApiError::Internal(e.to_string()))?
+                            .ok_or_else(|| {
+                                ApiError::NotFound(format!("Open position {position_id} not found"))
+                            })?;
+                        if position.state != PositionState::Open {
+                            // Moved on meanwhile (the exit handler queued it).
+                            break;
+                        }
+                    }
+                    Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+                }
+            }
         }
         // Already in the exit flow. Nothing is written: a write would bump
         // the row's version under a sale in progress and fail its booking.

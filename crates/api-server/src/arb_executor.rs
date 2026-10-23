@@ -115,10 +115,11 @@ fn pair_collateral(quantity: Decimal, yes_ask: Decimal, no_ask: Decimal) -> Deci
 /// under both the fee terms it was detected with (from the market listing,
 /// which can be stale or missing) and the exchange's own (`exchange_terms`;
 /// the highest published rate when they could not be read). The opportunity
-/// returned is priced under the terms the exchange charges, which the
-/// position books: the exchange's when read, else the detected ones; with it
-/// comes the net profit under the worse terms, which sizing and slippage
-/// spend. `None` when the edge is gone.
+/// returned is priced under the terms the position books: the exchange's
+/// when read, else the highest published rate (a listing can say a market is
+/// free when it is not, and booking fees too low would overstate the P&L the
+/// circuit breaker sees); with it comes the net profit under the worse terms,
+/// which sizing and slippage spend. `None` when the edge is gone.
 fn reprice_on_fresh_books(
     signal: &ArbOpportunity,
     yes_book: &OrderBook,
@@ -134,7 +135,7 @@ fn reprice_on_fresh_books(
     };
     let detected = signal.fee_schedule.unwrap_or(FeeSchedule::CONSERVATIVE);
     let price = |schedule| ArbOpportunity::calculate_with_fee_schedule(&book, schedule);
-    let charged = price(exchange_terms.unwrap_or(detected))?;
+    let charged = price(exchange_terms.unwrap_or(FeeSchedule::CONSERVATIVE))?;
     let worst = price(detected)?
         .net_profit
         .min(price(exchange_terms.unwrap_or(FeeSchedule::CONSERVATIVE))?.net_profit);
@@ -644,13 +645,7 @@ impl ArbAutoExecutor {
             .signed_duration_since(arb.timestamp)
             .num_milliseconds();
         let signal_age_ms = raw_age_ms.max(0);
-        // A signal stamped well in the future means the monitor's clock and
-        // this one disagree, so its age says nothing: it is not taken.
-        let age_secs = if raw_age_ms < -MAX_SIGNAL_CLOCK_SKEW_MS {
-            i64::MAX
-        } else {
-            signal_age_ms / 1000
-        };
+        let age_secs = signal_age_ms / 1000;
         let attempt_id = Uuid::new_v4();
         let mut telemetry = ArbExecutionTelemetry::new(attempt_id, signal_age_ms);
 
@@ -658,6 +653,28 @@ impl ArbAutoExecutor {
             let mut runtime = self.runtime_status.write().await;
             runtime.enabled = cfg.enabled;
             runtime.record_signal(&arb.market_id);
+        }
+
+        // A signal stamped well in the future means the monitor's clock and
+        // this one disagree, so its age says nothing: it is not taken.
+        if raw_age_ms < -MAX_SIGNAL_CLOCK_SKEW_MS {
+            let mut runtime = self.runtime_status.write().await;
+            runtime.stale_skips = runtime.stale_skips.saturating_add(1);
+            runtime.record_decision(
+                &arb.market_id,
+                format!("skipped: signal stamped {}ms in the future", -raw_age_ms),
+            );
+            warn!(
+                market_id = %arb.market_id,
+                ahead_ms = -raw_age_ms,
+                "Arb signal stamped in the future: the arb monitor's clock and this \
+                 process's disagree; skipping"
+            );
+            telemetry.finish_total(&process_started_at);
+            drop(runtime);
+            self.record_skip_event(&arb, "unknown", "clock_skew", &telemetry)
+                .await;
+            return Ok(());
         }
 
         // Fast-fail stale signals before any DB writes or shadow bookkeeping.
@@ -1834,12 +1851,14 @@ mod tests {
             Some(FeeSchedule::FREE),
         )
         .is_none());
-        // Exchange terms unknown: gate at the highest rate, book the detected.
+        // Exchange terms unknown: gate and book at the highest rate, whatever
+        // the listing says.
         let listed = signal(FeeSchedule::FREE);
         let (priced, worst) =
             reprice_on_fresh_books(&listed, &book(&[(40, 500)]), &book(&[(50, 500)]), min, None)
                 .unwrap();
-        assert_eq!(priced.fee_schedule, Some(FeeSchedule::FREE));
+        assert_eq!(priced.fee_schedule, Some(FeeSchedule::CONSERVATIVE));
+        assert_eq!(priced.net_profit, Decimal::new(657, 4));
         // ...but sizing and slippage spend only what the 7% gate leaves.
         assert_eq!(worst, Decimal::new(657, 4));
         assert!(reprice_on_fresh_books(

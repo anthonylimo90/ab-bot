@@ -378,6 +378,32 @@ async fn capacity_keeps_in_flight_withdrawals_and_live_buys_and_waits_for_trades
     assert_eq!(capacity.max_withdrawable, Decimal::new(893775, 4));
     assert!(capacity.blocking_reasons.is_empty());
 
+    // A buy of $12.50 matched a minute ago may not have moved its USDC yet;
+    // one matched 45 minutes ago, a sale, and another wallet's buy are not
+    // held.
+    for (maker, side, units, minutes) in [
+        (TRADING, "BUY", "12500000", 1),
+        (TRADING, "BUY", "30000000", 45),
+        (TRADING, "SELL", "9000000", 1),
+        (OTHER, "BUY", "7000000", 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO execution_intents (id, market_id, signed_order, status, updated_at) \
+             VALUES (gen_random_uuid(), 'market', $1, 'reconciled', \
+                     NOW() - make_interval(mins => $2))",
+        )
+        .bind(serde_json::json!({ "maker": maker, "side": side, "makerAmount": units }))
+        .bind(minutes)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let settling = WithdrawalHolds::load(&mut conn, TRADING).await.unwrap();
+    assert_eq!(
+        settling.capacity(balance_units).reserved_for_open_buys,
+        Decimal::new(181225, 4)
+    );
+
     // Another vault wallet carries no trading reserve.
     let other = WithdrawalHolds::load(&mut conn, OTHER).await.unwrap();
     assert!(!other.trading_wallet);

@@ -667,8 +667,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   without a message (the monitor publishes its runtime stats every minute).
 - The arb monitor re-reads its stored dynamic config every 30 s, so it
   catches up on a Redis update it missed.
-- An arb signal stamped more than 2 s in the future (clock skew) is treated
-  as stale.
+- An arb signal stamped more than 2 s in the future is skipped with reason
+  `clock_skew` and a warning: the arb monitor's and the API's clocks
+  disagree, so no arb trades until they are synced (NTP).
 - The dynamic tuner leaves a value set by hand for 24 hours, never changes a
   key while its previous change is being evaluated, and stores a change only
   if the value is still the one it read. It relaxes the minimum book depth
@@ -684,6 +685,47 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   pUSD, less withdrawals in flight and open buys) and what blocks it.
 - The trading leader's lock session also sets a 30 s TCP user timeout, so
   the server ends it when the host dies with data unacknowledged.
+
+### Settled fills, learning attempts and the equity feed (096)
+
+- Reading or cancelling a live manual order books its fills only from
+  trades that have settled (confirmed or failed), at their average price.
+  While its trades are still settling nothing is booked and the order stays
+  open, its cash reserved: a cancel then answers 409 "awaiting exchange
+  confirmation" and the reconciler books the fills. A manual market buy was
+  costed at $1 a share before, and never corrected.
+- Withdrawals hold back, besides open buy orders, the USDC of the trading
+  wallet's live buys matched in the last 30 minutes, whose trades may not
+  have settled on chain. The preflight takes `amount` as optional: without
+  it, it reports the wallet's capacity alone.
+- An arb entry whose exchange fee terms could not be read books fees at the
+  highest published rate (the entry gate already used it), not the
+  listing's.
+- The circuit breaker's equity feed scans the wallet's inventory afresh
+  each snapshot, and leaves out a reading when a live order was placed
+  during it (or within 30 s before): the scan and the cash read could
+  straddle its trade. After three such readings in a row the next one feeds
+  it regardless.
+- `canonical_arb_learning_attempts` (migration 096) takes each attempt's id
+  and telemetry from its entry request, so opened and failed arb attempts
+  join their shadow predictions and the rollout guardrails' failure and
+  one-legged rates see them. A failed entry later found holding a leg is one
+  one-legged attempt, here and in the arb telemetry.
+- Strategy performance and health show the strategies of the calculators'
+  latest cycle only, and nothing once that cycle is older than two
+  intervals: a strategy that traded only in paper no longer shows its old
+  numbers once trading is live. In live mode, quant signals acted on in
+  paper are left out of their counts. The health failure rate is failed
+  entries and exits over entries tried (failed entries were counted twice).
+- The dynamic tuner stores values at the column's scale, so the revert after
+  a failed publish matches; an evaluation or rollback that finds the value
+  changed since it read it leaves it (and announces nothing); and the
+  startup seed no longer rewrites an unchanged row, which renewed manual
+  holds at every restart.
+- After a failed or slow publish, the arb monitor waits 5 s before
+  publishing another entry signal.
+- A manual close that races the exit handler's update of the position
+  retries instead of answering 400.
 
 ### API contract changes
 

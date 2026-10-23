@@ -777,19 +777,46 @@ pub async fn get_order_status(
                 .map_err(|_| {
                     ApiError::ServiceUnavailable("Exchange order reconciliation unavailable".into())
                 })?;
-            apply_exchange_snapshot(&state.pool, &row, &snapshot).await?;
+            let fill = confirmed_fill(&state, &row, &snapshot).await;
+            apply_exchange_snapshot(&state.pool, &row, &snapshot, fill).await?;
             return Ok(Json(load_order(&state.pool, order_id).await?.into()));
         }
     }
     Ok(Json(row.into()))
 }
 
+/// What the order's settled trades filled and at what average price, or
+/// `None` while some of its trades are still settling (or cannot be read).
+async fn confirmed_fill(
+    state: &AppState,
+    row: &OrderRow,
+    snapshot: &polymarket_core::api::clob::ExchangeOrder,
+) -> Option<(Decimal, Decimal)> {
+    let maker = row.wallet_address.as_deref()?;
+    match state
+        .order_executor
+        .confirmed_exchange_fill(maker, snapshot)
+        .await
+    {
+        Ok(fill) => Some(fill),
+        Err(error) => {
+            tracing::debug!(%error, order_id = %row.id, "Order's trades are not settled yet");
+            None
+        }
+    }
+}
+
+/// Bring a live manual order up to the exchange's snapshot. Fills are booked
+/// only from settled trades, at their average price (`fill`); `None`, while
+/// some are still settling, books nothing and leaves the order as it is (its
+/// cash stays reserved): the reconciler or a later read books them.
 async fn apply_exchange_snapshot(
     pool: &PgPool,
     row: &OrderRow,
     snapshot: &polymarket_core::api::clob::ExchangeOrder,
+    fill: Option<(Decimal, Decimal)>,
 ) -> ApiResult<()> {
-    let filled = snapshot
+    let matched = snapshot
         .size_matched
         .parse::<Decimal>()
         .map_err(|_| ApiError::ServiceUnavailable("Invalid exchange fill quantity".into()))?;
@@ -797,13 +824,27 @@ async fn apply_exchange_snapshot(
         .original_size
         .parse::<Decimal>()
         .map_err(|_| ApiError::ServiceUnavailable("Invalid exchange size".into()))?;
+    let mismatch =
+        || ApiError::ServiceUnavailable("Exchange order does not match stored intent".into());
     if Some(snapshot.id.as_str()) != row.exchange_order_id.as_deref()
-        || !snapshot_fits(row, size, filled)
+        || !snapshot_fits(row, size, matched)
     {
-        return Err(ApiError::ServiceUnavailable(
-            "Exchange order does not match stored intent".into(),
-        ));
+        return Err(mismatch());
     }
+    let Some((confirmed, price)) = fill else {
+        return Ok(());
+    };
+    if confirmed > matched {
+        return Err(mismatch());
+    }
+    // Fills never decrease (the inventory trigger refuses it): one already
+    // booked when the order was placed stays, at its stored price.
+    let filled = confirmed.max(row.filled_quantity);
+    let avg_fill_price = if confirmed > Decimal::ZERO && confirmed >= row.filled_quantity {
+        Some(price)
+    } else {
+        row.avg_fill_price
+    };
     let state = snapshot.state();
     let status = match state.as_str() {
         _ if snapshot_complete(row, size, filled) => "filled",
@@ -817,8 +858,8 @@ async fn apply_exchange_snapshot(
             ))
         }
     };
-    sqlx::query("UPDATE orders SET status=$2, avg_fill_price=CASE WHEN $3>filled_quantity THEN NULL ELSE avg_fill_price END, filled_quantity=$3, filled_at=CASE WHEN $2='filled' THEN COALESCE(filled_at,NOW()) ELSE filled_at END, updated_at=NOW() WHERE id=$1 AND filled_quantity<=$3 AND (status NOT IN ('filled','cancelled','expired') OR $2='filled')")
-        .bind(row.id).bind(status).bind(filled).execute(pool).await?;
+    sqlx::query("UPDATE orders SET status=$2, avg_fill_price=$4, filled_quantity=$3, filled_at=CASE WHEN $2='filled' THEN COALESCE(filled_at,NOW()) ELSE filled_at END, updated_at=NOW() WHERE id=$1 AND filled_quantity<=$3 AND (status NOT IN ('filled','cancelled','expired') OR $2='filled')")
+        .bind(row.id).bind(status).bind(filled).bind(avg_fill_price).execute(pool).await?;
     Ok(())
 }
 
@@ -944,7 +985,8 @@ async fn cancel_order_inner(
                         "Cancellation outcome requires exchange reconciliation".into(),
                     )
                 })?;
-            apply_exchange_snapshot(&state.pool, &row, &snapshot).await?;
+            let fill = confirmed_fill(state, &row, &snapshot).await;
+            apply_exchange_snapshot(&state.pool, &row, &snapshot, fill).await?;
             let current = load_order(&state.pool, order_id).await?;
             if !matches!(current.status.as_str(), "cancelled" | "filled" | "expired") {
                 return Err(ApiError::Conflict(if cancel_result.is_err() {

@@ -1138,9 +1138,12 @@ async fn load_arb_execution_telemetry_summary(
         SELECT
             COUNT(*) FILTER (WHERE event_type = 'entry_requested')::bigint AS entry_requests,
             COUNT(*) FILTER (WHERE event_type = 'position_open')::bigint AS positions_opened,
-            (SELECT COUNT(*) FROM failures)::bigint AS position_failures,
+            -- Once per position: a failed entry later found holding a leg
+            -- has both a failure and a one-legged event.
+            (SELECT COUNT(DISTINCT COALESCE(position_id, id)) FROM failures)::bigint
+                AS position_failures,
             COUNT(*) FILTER (WHERE event_type = 'signal_skipped')::bigint AS signal_skipped,
-            (SELECT COUNT(*) FROM failures
+            (SELECT COUNT(DISTINCT COALESCE(position_id, id)) FROM failures
              WHERE event_type = 'one_legged_exit_ready'
                 OR COALESCE((metadata ->> 'one_legged')::boolean, FALSE))::bigint
                 AS one_legged_failures,
@@ -1151,7 +1154,7 @@ async fn load_arb_execution_telemetry_summary(
             END AS success_rate,
             CASE
                 WHEN COUNT(*) FILTER (WHERE event_type = 'entry_requested') = 0 THEN NULL
-                ELSE (SELECT COUNT(*) FROM failures)::double precision
+                ELSE (SELECT COUNT(DISTINCT COALESCE(position_id, id)) FROM failures)::double precision
                     / COUNT(*) FILTER (WHERE event_type = 'entry_requested')::double precision
             END AS failure_rate,
             CASE
@@ -1224,6 +1227,16 @@ async fn load_arb_execution_latency_breakdown(
               AND event_type IN (
                   'position_open', 'position_failed', 'entry_failed', 'one_legged_exit_ready',
                   'signal_skipped'
+              )
+              -- A failed entry later found holding a leg ends one-legged.
+              AND NOT (
+                  event_type = 'entry_failed'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM trade_events l
+                      WHERE l.position_id = trade_events.position_id
+                        AND l.event_type = 'one_legged_exit_ready'
+                  )
               )
         ),
         stage_values AS (
@@ -1305,6 +1318,16 @@ async fn load_arb_execution_outcome_breakdown(
                   'position_open', 'position_failed', 'entry_failed', 'one_legged_exit_ready',
                   'signal_skipped'
               )
+              -- A failed entry later found holding a leg ends one-legged.
+              AND NOT (
+                  event_type = 'entry_failed'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM trade_events l
+                      WHERE l.position_id = trade_events.position_id
+                        AND l.event_type = 'one_legged_exit_ready'
+                  )
+              )
         )
         SELECT outcome, reason, COUNT(*)::bigint AS count
         FROM attempts
@@ -1369,6 +1392,16 @@ async fn load_arb_execution_recent_attempts(
           AND event_type IN (
               'position_open', 'position_failed', 'entry_failed', 'one_legged_exit_ready',
               'signal_skipped'
+          )
+          -- A failed entry later found holding a leg ends one-legged.
+          AND NOT (
+              event_type = 'entry_failed'
+              AND EXISTS (
+                  SELECT 1
+                  FROM trade_events l
+                  WHERE l.position_id = trade_events.position_id
+                    AND l.event_type = 'one_legged_exit_ready'
+              )
           )
         ORDER BY occurred_at DESC, id DESC
         LIMIT $3
@@ -2252,6 +2285,8 @@ async fn load_derived_summary_rows(
          AND ($5 OR p.execution_mode <> 'paper')
         WHERE qs.generated_at >= $1
           AND qs.generated_at <= $2
+          -- A signal acted on in paper is left out whole, not only its position.
+          AND ($5 OR qs.position_id IS NULL OR p.id IS NOT NULL)
           AND ($3::text IS NULL OR qs.kind = $3)
           AND ($4::text IS NULL OR qs.condition_id = $4)
         GROUP BY qs.kind
@@ -4232,6 +4267,86 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn arb_learning_attempts_carry_the_entry_requests_attempt_id(pool: sqlx::PgPool) {
+        let schema = include_str!("../../../../migrations/048_trade_events.sql")
+            .replace("uuid_generate_v4()", "gen_random_uuid()");
+        sqlx::Executor::execute(&pool, schema.as_str())
+            .await
+            .unwrap();
+        sqlx::Executor::execute(
+            &pool,
+            "CREATE TABLE positions (id UUID PRIMARY KEY, state SMALLINT, \
+             realized_pnl NUMERIC, unrealized_pnl NUMERIC, entry_timestamp TIMESTAMPTZ, \
+             exit_timestamp TIMESTAMPTZ)",
+        )
+        .await
+        .unwrap();
+        sqlx::Executor::execute(
+            &pool,
+            include_str!("../../../../migrations/096_arb_learning_attempt_ids.sql"),
+        )
+        .await
+        .unwrap();
+        let event = |position: uuid::Uuid, event_type: &str, metadata: serde_json::Value| {
+            sqlx::query(
+                "INSERT INTO trade_events (strategy, execution_mode, source, market_id, \
+                 position_id, event_type, metadata) \
+                 VALUES ('arb', 'live', 'arb', 'm', $1, $2, $3)",
+            )
+            .bind(position)
+            .bind(event_type.to_string())
+            .bind(metadata)
+        };
+        let attempt = uuid::Uuid::new_v4().to_string();
+        // Opened: its terminal event carries no attempt id; the request does.
+        let opened = uuid::Uuid::new_v4();
+        event(
+            opened,
+            "entry_requested",
+            serde_json::json!({ "attempt_id": attempt, "signal_age_ms": 40 }),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        event(opened, "position_open", serde_json::json!({}))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Failed, then found holding a leg: one attempt, one-legged.
+        let recovered = uuid::Uuid::new_v4();
+        for event_type in ["entry_requested", "entry_failed", "one_legged_exit_ready"] {
+            event(recovered, event_type, serde_json::json!({}))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let rows: Vec<(String, String, bool, Option<f64>, uuid::Uuid)> = sqlx::query_as(
+            "SELECT attempt_id, outcome, one_legged, signal_age_ms, position_id \
+             FROM canonical_arb_learning_attempts ORDER BY attempt_time",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        let opened_row = rows.iter().find(|row| row.4 == opened).unwrap();
+        assert_eq!(
+            (
+                opened_row.0.as_str(),
+                opened_row.1.as_str(),
+                opened_row.2,
+                opened_row.3
+            ),
+            (attempt.as_str(), "opened", false, Some(40.0))
+        );
+        let recovered_row = rows.iter().find(|row| row.4 == recovered).unwrap();
+        assert_eq!(
+            (recovered_row.1.as_str(), recovered_row.2),
+            ("failed", true)
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn arb_telemetry_counts_failed_and_one_legged_entries(pool: sqlx::PgPool) {
         let schema = include_str!("../../../../migrations/048_trade_events.sql")
             .replace("uuid_generate_v4()", "gen_random_uuid()");
@@ -4261,18 +4376,38 @@ mod tests {
             .await
             .unwrap();
         }
+        // A fifth entry failed, then recovery found it holding a leg: one
+        // failure, one-legged.
+        let recovered = uuid::Uuid::new_v4();
+        for (event_type, state_to) in [
+            ("entry_requested", "pending"),
+            ("entry_failed", "entry_failed"),
+            ("one_legged_exit_ready", "exit_ready"),
+        ] {
+            sqlx::query(
+                "INSERT INTO trade_events (strategy, execution_mode, source, market_id, \
+                 position_id, event_type, state_to) \
+                 VALUES ('arb', 'paper', 'arb', 'm', $1, $2, $3)",
+            )
+            .bind(recovered)
+            .bind(event_type)
+            .bind(state_to)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
         let from = Utc::now() - chrono::Duration::hours(1);
         let to = Utc::now() + chrono::Duration::minutes(1);
 
         let summary = load_arb_execution_telemetry_summary(&pool, from, to)
             .await
             .unwrap();
-        assert_eq!(summary.entry_requests, 3);
+        assert_eq!(summary.entry_requests, 4);
         assert_eq!(summary.positions_opened, 1);
-        assert_eq!(summary.position_failures, 2);
-        assert_eq!(summary.one_legged_failures, 1);
+        assert_eq!(summary.position_failures, 3);
+        assert_eq!(summary.one_legged_failures, 2);
         assert_eq!(summary.signal_skipped, 1);
-        assert_eq!(summary.failure_rate, Some(2.0 / 3.0));
+        assert_eq!(summary.failure_rate, Some(0.75));
 
         let outcomes = load_arb_execution_outcome_breakdown(&pool, from, to)
             .await
@@ -4286,12 +4421,13 @@ mod tests {
         };
         assert_eq!(
             (count("opened"), count("failed"), count("skipped")),
-            (1, 2, 1)
+            (1, 3, 1)
         );
 
         let attempts = load_arb_execution_recent_attempts(&pool, from, to, 10)
             .await
             .unwrap();
-        assert_eq!(attempts.iter().filter(|a| a.one_legged).count(), 1);
+        assert_eq!(attempts.len(), 5);
+        assert_eq!(attempts.iter().filter(|a| a.one_legged).count(), 2);
     }
 }

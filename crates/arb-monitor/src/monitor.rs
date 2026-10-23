@@ -27,6 +27,10 @@ const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false
 const SIGNAL_COOLDOWN_SECS: i64 = 60;
 /// The longest publishing one entry signal may hold up the books.
 const SIGNAL_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// After a publish fails, how long entry signals wait before the next try:
+/// while Redis hangs, every profitable book would otherwise wait out the
+/// timeout.
+const SIGNAL_PUBLISH_BACKOFF_SECS: i64 = 5;
 
 /// Minimum number of market replacements before a periodic rerank triggers a resubscribe.
 const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
@@ -292,6 +296,8 @@ pub struct ArbMonitor {
     min_book_depth: Decimal,
     /// Last signal timestamp per market (for dedup/cooldown).
     last_signal_time: HashMap<String, DateTime<Utc>>,
+    /// No entry signal is published before this, after a publish failed.
+    publish_paused_until: Option<DateTime<Utc>>,
     /// Aggressiveness profile used for dynamic scoring.
     aggressiveness_profile: AggressivenessProfile,
     /// Scoring weights derived from aggressiveness profile.
@@ -462,6 +468,7 @@ impl ArbMonitor {
             min_profit_threshold,
             min_book_depth,
             last_signal_time: HashMap::new(),
+            publish_paused_until: None,
             aggressiveness_profile,
             scoring_weights,
             max_markets_cap,
@@ -1356,7 +1363,9 @@ impl ArbMonitor {
                                         (observed_at - *last).num_seconds() >= SIGNAL_COOLDOWN_SECS
                                     }
                                     None => true,
-                                };
+                                } && self
+                                    .publish_paused_until
+                                    .is_none_or(|until| observed_at >= until);
 
                                 if should_signal {
                                     // The cooldown starts only once the signal
@@ -1376,15 +1385,31 @@ impl ArbMonitor {
                                             arb_telemetry.entry_signals =
                                                 arb_telemetry.entry_signals.saturating_add(1);
                                         }
-                                        Ok(Err(error)) => warn!(
-                                            market_id = %arb.market_id,
-                                            %error,
-                                            "Could not publish an entry signal"
-                                        ),
-                                        Err(_) => warn!(
-                                            market_id = %arb.market_id,
-                                            "Publishing an entry signal timed out"
-                                        ),
+                                        Ok(Err(error)) => {
+                                            warn!(
+                                                market_id = %arb.market_id,
+                                                %error,
+                                                "Could not publish an entry signal"
+                                            );
+                                            self.publish_paused_until = Some(
+                                                observed_at
+                                                    + chrono::Duration::seconds(
+                                                        SIGNAL_PUBLISH_BACKOFF_SECS,
+                                                    ),
+                                            );
+                                        }
+                                        Err(_) => {
+                                            warn!(
+                                                market_id = %arb.market_id,
+                                                "Publishing an entry signal timed out"
+                                            );
+                                            self.publish_paused_until = Some(
+                                                observed_at
+                                                    + chrono::Duration::seconds(
+                                                        SIGNAL_PUBLISH_BACKOFF_SECS,
+                                                    ),
+                                            );
+                                        }
                                     }
                                 } else {
                                     arb_telemetry.filtered_by_cooldown =

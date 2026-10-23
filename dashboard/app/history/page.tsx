@@ -161,7 +161,7 @@ export default function HistoryPage() {
                 }
                 changeLabel={
                   summary.total_equity == null
-                    ? "The wallet's cash balance could not be read"
+                    ? "No cash balance: no trading wallet is set, or its balance could not be read"
                     : undefined
                 }
               />

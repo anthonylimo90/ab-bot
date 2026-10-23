@@ -1456,7 +1456,7 @@ fn exceeds_capacity(amount: Decimal, capacity: &crate::withdrawals::WithdrawalCa
     format!(
         "Withdrawal of {} USDC exceeds the {} USDC that can leave this wallet in one \
          withdrawal (balance {} in USDC.e and pUSD, drawn on one of them; unconfirmed \
-         withdrawals {}, open live buy orders {})",
+         withdrawals {}, open or settling live buys {})",
         amount,
         capacity.max_withdrawable,
         capacity.available_usdc,
@@ -1759,8 +1759,9 @@ const UNRESOLVED_BROADCAST_NOTE: &str =
 pub struct WithdrawalPreflightQuery {
     /// Wallet address, "primary", or "active". Defaults to the active wallet.
     pub address: Option<String>,
-    /// Proposed withdrawal amount in USDC.
-    pub amount: Decimal,
+    /// Proposed withdrawal amount in USDC; without one, only the wallet's
+    /// capacity is checked.
+    pub amount: Option<Decimal>,
 }
 
 /// Response from the withdrawal preflight check.
@@ -1770,7 +1771,8 @@ pub struct WithdrawalPreflightResponse {
     pub available_usdc: Decimal,
     /// Withdrawals from this wallet not yet confirmed or rejected.
     pub in_flight_withdrawals: Decimal,
-    /// USDC committed to the trading wallet's open live buy orders.
+    /// USDC committed to the trading wallet's open live buy orders and to
+    /// its buys matched in the last 30 minutes (not yet settled on chain).
     pub reserved_for_open_buys: Decimal,
     /// Market value of orphaned (untracked) inventory tokens.
     pub orphan_exposure: Decimal,
@@ -1822,7 +1824,7 @@ pub async fn withdrawal_preflight(
     }
 
     // Validate requested amount.
-    if params.amount <= Decimal::ZERO {
+    if params.amount.is_some_and(|amount| amount <= Decimal::ZERO) {
         return Err(ApiError::BadRequest(
             "amount must be greater than zero".into(),
         ));
@@ -1845,7 +1847,7 @@ pub async fn withdrawal_preflight(
             warn!(error = %chain_error_message(&e), "Failed to fetch source wallet balance");
             ApiError::ServiceUnavailable("Could not read the wallet's USDC balance".into())
         })?;
-    let (capacity, source) = withdrawal_plan(&holds, &cash, params.amount);
+    let (capacity, source) = withdrawal_plan(&holds, &cash, params.amount.unwrap_or(Decimal::ZERO));
 
     // Query orphan exposure from wallet_inventory.
     let orphan_exposure: Decimal = sqlx::query_scalar(
@@ -1874,8 +1876,20 @@ pub async fn withdrawal_preflight(
         .unwrap_or(false);
 
     let mut blocking_reasons = capacity.blocking_reasons.clone();
-    if source.is_none() {
-        blocking_reasons.push(exceeds_capacity(params.amount, &capacity));
+    match params.amount {
+        Some(amount) if source.is_none() => {
+            blocking_reasons.push(exceeds_capacity(amount, &capacity));
+        }
+        None if capacity.max_withdrawable <= Decimal::ZERO && blocking_reasons.is_empty() => {
+            blocking_reasons.push(format!(
+                "No USDC can leave this wallet now (balance {} in USDC.e and pUSD; \
+                 unconfirmed withdrawals {}, open or settling live buys {})",
+                capacity.available_usdc,
+                capacity.in_flight_withdrawals,
+                capacity.reserved_for_open_buys
+            ));
+        }
+        _ => {}
     }
     let can_withdraw = blocking_reasons.is_empty();
 

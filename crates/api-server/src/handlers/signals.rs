@@ -330,20 +330,29 @@ pub async fn get_strategy_performance(
 ) -> ApiResult<Json<Vec<StrategyPerformanceResponse>>> {
     let period = params.period_days.unwrap_or(7);
 
-    // Get the most recent snapshot for each strategy at the requested period
+    // The strategies of the calculator's latest cycle, while it is recent: a
+    // strategy missing from it (one that traded only in paper, once trading
+    // is live) is not shown with its old numbers.
+    let stale_after_secs =
+        2.0 * crate::strategy_pnl_calculator::StrategyPnlConfig::from_env().interval_secs as f64;
     let rows = sqlx::query_as::<_, PerformanceRow>(
         r#"
-        SELECT DISTINCT ON (strategy)
+        SELECT
             strategy, period_end, period_days,
             total_signals, executed, wins, losses,
             net_pnl, avg_pnl, win_rate, sharpe,
             max_drawdown_pct, avg_hold_hours
         FROM strategy_pnl_snapshots
         WHERE period_days = $1
-        ORDER BY strategy, period_end DESC
+          AND period_end = (
+              SELECT MAX(period_end) FROM strategy_pnl_snapshots WHERE period_days = $1
+          )
+          AND period_end >= NOW() - make_interval(secs => $2)
+        ORDER BY strategy
         "#,
     )
     .bind(period)
+    .bind(stale_after_secs)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| crate::error::ApiError::Internal(format!("DB error: {}", e)))?;

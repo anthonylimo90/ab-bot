@@ -289,9 +289,10 @@ async fn load_strategy_health(
             SELECT
                 strategy,
                 COUNT(DISTINCT signal_id) FILTER (WHERE event_type = 'signal_generated')::bigint AS generated_signals,
-                -- Arb entries carry no signal id: their position stands in.
+                -- Entries that got in (a failed one is counted apart). Arb
+                -- entries carry no signal id: their position stands in.
                 COUNT(DISTINCT COALESCE(signal_id, position_id)) FILTER (
-                    WHERE event_type IN ('entry_requested', 'entry_filled', 'position_open')
+                    WHERE event_type IN ('entry_filled', 'position_open')
                        OR state_to = 'open'
                 )::bigint AS executed_signals,
                 COUNT(DISTINCT signal_id) FILTER (WHERE event_type = 'signal_skipped')::bigint AS skipped_signals,
@@ -412,6 +413,8 @@ async fn load_derived_strategy_health(
          AND ($3 OR p.execution_mode <> 'paper')
         WHERE qs.generated_at >= $1
           AND qs.generated_at <= $2
+          -- A signal acted on in paper is left out whole, not only its position.
+          AND ($3 OR qs.position_id IS NULL OR p.id IS NOT NULL)
         GROUP BY qs.kind
         ORDER BY qs.kind ASC
         "#,
@@ -459,12 +462,17 @@ fn skip_rate(row: &StrategyHealthAggRow) -> Option<f64> {
     Some(row.skipped_signals as f64 / row.generated_signals as f64)
 }
 
+/// Failed entries and failed exits over the entries tried: those that got in
+/// (an exit can fail only on one of them) and those that failed. An exit
+/// failing in the window for an entry made before it can push the ratio over
+/// one: it is capped there.
 fn failure_rate(row: &StrategyHealthAggRow) -> Option<f64> {
-    let total = row.executed_signals + row.entry_failed_positions + row.exit_failed_positions;
+    let total = row.executed_signals + row.entry_failed_positions;
     if total <= 0 {
         return None;
     }
-    Some((row.entry_failed_positions + row.exit_failed_positions) as f64 / total as f64)
+    let failed = row.entry_failed_positions + row.exit_failed_positions;
+    Some((failed as f64 / total as f64).min(1.0))
 }
 
 const BASIS_POINTS: Decimal = Decimal::from_parts(10_000, 0, 0, false, 0);

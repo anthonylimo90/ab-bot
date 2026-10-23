@@ -119,39 +119,69 @@ async fn exchange_snapshots_record_only_confirmed_quantities_and_keep_progress(p
         size_matched: "0".into(),
     };
     let row = load_order(&pool, id).await.unwrap();
-    apply_exchange_snapshot(&pool, &row, &snapshot)
+    let zero = Some((Decimal::ZERO, Decimal::ZERO));
+    apply_exchange_snapshot(&pool, &row, &snapshot, zero)
         .await
         .unwrap();
     assert_eq!(
         load_order(&pool, id).await.unwrap().filled_quantity,
         Decimal::ZERO
     );
+    // Matched, but its trade is still settling: nothing is booked yet.
     snapshot.size_matched = "4".into();
-    apply_exchange_snapshot(&pool, &row, &snapshot)
+    apply_exchange_snapshot(&pool, &row, &snapshot, None)
+        .await
+        .unwrap();
+    let settling = load_order(&pool, id).await.unwrap();
+    assert_eq!(
+        (settling.status.as_str(), settling.filled_quantity),
+        ("open", Decimal::ZERO)
+    );
+    // Settled at 0.45: booked at that price, not at the 0.50 limit.
+    let price = Decimal::new(45, 2);
+    apply_exchange_snapshot(&pool, &row, &snapshot, Some((Decimal::from(4), price)))
         .await
         .unwrap();
     let partial = load_order(&pool, id).await.unwrap();
     assert_eq!(partial.status, "partially_filled");
     assert_eq!(partial.filled_quantity, Decimal::from(4));
-    assert!(partial.avg_fill_price.is_none());
-    // Fills of unknown price are costed at the 0.50 limit, not at $1.
-    let (quantity, cost_basis): (Decimal, Decimal) = sqlx::query_as(
-        "SELECT quantity, cost_basis FROM manual_inventory WHERE wallet_address = '0xreview'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!((quantity, cost_basis), (Decimal::from(4), Decimal::from(2)));
+    assert_eq!(partial.avg_fill_price, Some(price));
+    let inventory = || {
+        sqlx::query_as::<_, (Decimal, Decimal)>(
+            "SELECT quantity, cost_basis FROM manual_inventory WHERE wallet_address = '0xreview'",
+        )
+        .fetch_one(&pool)
+    };
+    assert_eq!(
+        inventory().await.unwrap(),
+        (Decimal::from(4), Decimal::new(18, 1))
+    );
+    // Settled trades never exceed what the exchange matched.
+    assert!(
+        apply_exchange_snapshot(&pool, &partial, &snapshot, Some((Decimal::from(5), price)))
+            .await
+            .is_err()
+    );
     snapshot.size_matched = "3".into();
-    assert!(apply_exchange_snapshot(&pool, &partial, &snapshot)
+    assert!(apply_exchange_snapshot(&pool, &partial, &snapshot, zero)
         .await
         .is_err());
     snapshot.size_matched = "10".into();
     snapshot.status = "CANCELED".into();
-    apply_exchange_snapshot(&pool, &partial, &snapshot)
-        .await
-        .unwrap();
+    apply_exchange_snapshot(
+        &pool,
+        &partial,
+        &snapshot,
+        Some((Decimal::TEN, Decimal::new(47, 2))),
+    )
+    .await
+    .unwrap();
     assert_eq!(load_order(&pool, id).await.unwrap().status, "filled");
+    // Ten at an average of 0.47 cost 4.70 in all.
+    assert_eq!(
+        inventory().await.unwrap(),
+        (Decimal::TEN, Decimal::new(47, 1))
+    );
 }
 
 #[sqlx::test(migrations = false)]
@@ -188,14 +218,21 @@ async fn a_rounded_market_buy_and_a_buy_given_more_shares_count_as_filled(pool: 
     let market = reserve("market-buy").await;
     let mut row = load_order(&pool, market).await.unwrap();
     row.order_type = "market".into();
-    apply_exchange_snapshot(&pool, &row, &snapshot("9.99", "9.99"))
-        .await
-        .unwrap();
+    let half = Decimal::new(5, 1);
+    apply_exchange_snapshot(
+        &pool,
+        &row,
+        &snapshot("9.99", "9.99"),
+        Some(("9.99".parse().unwrap(), half)),
+    )
+    .await
+    .unwrap();
     assert_eq!(load_order(&pool, market).await.unwrap().status, "filled");
     // A buy given a better price as more shares: filled, all of them kept.
     let limit = reserve("limit-buy").await;
     let row = load_order(&pool, limit).await.unwrap();
-    apply_exchange_snapshot(&pool, &row, &snapshot("10", "10.2"))
+    let more = "10.2".parse::<Decimal>().unwrap();
+    apply_exchange_snapshot(&pool, &row, &snapshot("10", "10.2"), Some((more, half)))
         .await
         .unwrap();
     let stored = load_order(&pool, limit).await.unwrap();
@@ -205,7 +242,7 @@ async fn a_rounded_market_buy_and_a_buy_given_more_shares_count_as_filled(pool: 
     let mut sell = load_order(&pool, reserve("sell").await).await.unwrap();
     sell.side = "sell".into();
     assert!(
-        apply_exchange_snapshot(&pool, &sell, &snapshot("10", "10.2"))
+        apply_exchange_snapshot(&pool, &sell, &snapshot("10", "10.2"), Some((more, half)))
             .await
             .is_err()
     );
@@ -240,7 +277,8 @@ async fn an_order_closed_by_the_exchange_keeps_its_fills_and_its_close(pool: PgP
             size_matched: "4".into(),
         };
         let row = load_order(&pool, id).await.unwrap();
-        apply_exchange_snapshot(&pool, &row, &snapshot)
+        let fill = Some((Decimal::from(4), Decimal::new(5, 1)));
+        apply_exchange_snapshot(&pool, &row, &snapshot, fill)
             .await
             .unwrap();
         let stored = load_order(&pool, id).await.unwrap();
@@ -248,7 +286,7 @@ async fn an_order_closed_by_the_exchange_keeps_its_fills_and_its_close(pool: PgP
         assert_eq!(stored.filled_quantity, Decimal::from(4));
         // A later, stale answer does not reopen it.
         snapshot.status = "LIVE".into();
-        apply_exchange_snapshot(&pool, &stored, &snapshot)
+        apply_exchange_snapshot(&pool, &stored, &snapshot, fill)
             .await
             .unwrap();
         assert_eq!(load_order(&pool, id).await.unwrap().status, "cancelled");

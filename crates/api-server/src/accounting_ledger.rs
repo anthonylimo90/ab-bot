@@ -7,7 +7,7 @@ use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -61,6 +61,10 @@ pub struct AccountSnapshotRecord {
     /// Taken before the cash balance read: cash flows recorded up to this
     /// instant are reflected in `cash_balance`.
     pub cash_observed_at: DateTime<Utc>,
+    /// Taken before the inventory scan (the database's clock): a trade made
+    /// from shortly before this instant on may be in one of the two reads
+    /// and not the other.
+    pub valuation_started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, FromRow)]
@@ -201,8 +205,18 @@ async fn run_loop(config: AccountSnapshotConfig, state: Arc<AppState>) {
 }
 
 /// How old an inventory scan the periodic snapshot (which feeds the circuit
-/// breaker) may reuse.
-const SNAPSHOT_INVENTORY_MAX_AGE: time::Duration = time::Duration::from_secs(30);
+/// breaker) may reuse: none. A scan taken before the cash read misses a trade
+/// that settles in between, which would read as a loss (or, for a sale, an
+/// inflated peak).
+const SNAPSHOT_INVENTORY_MAX_AGE: time::Duration = time::Duration::ZERO;
+/// How long before a valuation began a live order still counts as possibly
+/// settling while it was taken.
+const VALUATION_SETTLE_MARGIN_SECS: i32 = 30;
+/// Readings in a row left out for trading during them, after which one feeds
+/// the breaker anyway: a bot trading through every valuation must not leave
+/// its drawdown guard unfed.
+const MAX_HELD_READINGS: u32 = 3;
+static HELD_READINGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// A live account snapshot, reusing an inventory scan up to
 /// `inventory_max_age` old.
@@ -229,6 +243,9 @@ pub async fn load_live_account_snapshot(
         return Ok(None);
     };
 
+    let valuation_started_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&state.pool)
+        .await?;
     let live = state.order_executor.is_live_ready().await;
     let inventory_refreshed = if live {
         match refresh_canonical_wallet_inventory_within(state, inventory_max_age).await {
@@ -275,6 +292,7 @@ pub async fn load_live_account_snapshot(
         equity_complete: live && observed_cash.is_some() && inventory_refreshed,
         cash_observed: observed_cash.is_some(),
         cash_observed_at,
+        valuation_started_at,
     }))
 }
 
@@ -290,7 +308,17 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
         // an unobserved cash balance do not describe real equity. Trading
         // live without one leaves the breaker's drawdown guard blind: said so.
         if snapshot.equity_complete {
-            feed_circuit_breaker(state, &snapshot).await?;
+            use std::sync::atomic::Ordering;
+            if traded_during_valuation(&state.pool, snapshot.valuation_started_at).await?
+                && HELD_READINGS.fetch_add(1, Ordering::Relaxed) < MAX_HELD_READINGS
+            {
+                // The inventory and the cash may straddle a trade: this
+                // reading is left out, the next one feeds the breaker.
+                debug!("Live orders were placed during the account valuation; not feeding it");
+            } else {
+                HELD_READINGS.store(0, Ordering::Relaxed);
+                feed_circuit_breaker(state, &snapshot).await?;
+            }
         } else if state.order_executor.is_live_ready().await {
             warn!(
                 wallet = ?snapshot.wallet_address,
@@ -302,6 +330,19 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
     }
 
     Ok(())
+}
+
+/// Whether a live order was placed from shortly before `started` on, so that
+/// its trade may have settled between the inventory scan and the cash read.
+async fn traded_during_valuation(pool: &PgPool, started: DateTime<Utc>) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution_intents \
+         WHERE created_at >= $1 - make_interval(secs => $2))",
+    )
+    .bind(started)
+    .bind(f64::from(VALUATION_SETTLE_MARGIN_SECS))
+    .fetch_one(pool)
+    .await?)
 }
 
 /// Passes live equity to the circuit breaker together with the withdrawals
@@ -1006,5 +1047,35 @@ mod tests {
         // Sent from the trading wallet (or not known otherwise) and unresolved.
         withdrawal(None, "submitted", 2).await.unwrap();
         assert!(settling().await.unwrap());
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_valuation_with_orders_placed_during_it_is_flagged(pool: PgPool) {
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/069_execution_intents.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let started: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let place = |seconds_before: f64| {
+            sqlx::query(
+                "INSERT INTO execution_intents (id, market_id, signed_order, status, created_at) \
+                 VALUES (gen_random_uuid(), 'm', '{}', 'reconciled', \
+                         $1 - make_interval(secs => $2))",
+            )
+            .bind(started)
+            .bind(seconds_before)
+            .execute(&pool)
+        };
+        // An order placed a minute before is settled by then.
+        place(60.0).await.unwrap();
+        assert!(!traded_during_valuation(&pool, started).await.unwrap());
+        // One placed ten seconds before may settle between the two reads.
+        place(10.0).await.unwrap();
+        assert!(traded_during_valuation(&pool, started).await.unwrap());
     }
 }

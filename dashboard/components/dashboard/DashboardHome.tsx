@@ -293,7 +293,7 @@ export function DashboardHome() {
           change={stats.total_pnl_percent}
           changeLabel={
             (stats.cash_unavailable
-              ? `The wallet's cash balance could not be read. Reconciled exposure ${formatCurrency(stats.marked_position_value)}.`
+              ? `No cash balance: no trading wallet is set, or its balance could not be read. Reconciled exposure ${formatCurrency(stats.marked_position_value)}.`
               : `Cash ${formatCurrencyOrDash(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}.`) +
             ` Net cash flows 24h ${formatCurrency(stats.net_cash_flows_24h, { showSign: true })}.` +
             (stats.unpriced_open_positions > 0

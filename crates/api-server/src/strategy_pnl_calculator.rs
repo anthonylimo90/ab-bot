@@ -165,6 +165,8 @@ async fn compute_cycle(
              AND ($3 OR p.execution_mode <> 'paper')
             WHERE qs.generated_at >= $1
               AND qs.generated_at <= $2
+              -- A signal acted on in paper is left out whole, not only its position.
+              AND ($3 OR qs.position_id IS NULL OR p.id IS NOT NULL)
             GROUP BY qs.kind
             "#,
         )

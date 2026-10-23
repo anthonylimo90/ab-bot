@@ -282,7 +282,9 @@ pub(crate) async fn is_trading_wallet(
 pub(crate) struct WithdrawalHolds {
     /// Withdrawals from this wallet not yet resolved (they may still be mined).
     pub in_flight_withdrawals: Decimal,
-    /// USDC committed to the trading wallet's open live buy orders.
+    /// USDC committed to the trading wallet's open live buy orders, and to
+    /// its buys matched in the last `SETTLING_BUY_MINUTES` (their trades may
+    /// not have moved the USDC on chain yet).
     pub reserved_for_open_buys: Decimal,
     /// Whether `source` is the live trading wallet.
     pub trading_wallet: bool,
@@ -347,6 +349,23 @@ impl WithdrawalHolds {
                 .into_iter()
                 .map(|(remaining, price)| open_buy_cost(remaining, price))
                 .sum();
+            // A buy the exchange matched moves the wallet's USDC only when
+            // its trade settles on chain; a withdrawal mined first would make
+            // that settlement fail with the shares already booked.
+            let settling: Decimal = sqlx::query_scalar(
+                "SELECT COALESCE(SUM((signed_order->>'makerAmount')::numeric / 1000000), 0) \
+                 FROM execution_intents \
+                 WHERE status = 'reconciled' \
+                   AND LOWER(signed_order->>'maker') = LOWER($1) \
+                   AND UPPER(signed_order->>'side') = 'BUY' \
+                   AND signed_order->>'makerAmount' ~ '^[0-9]{1,30}$' \
+                   AND updated_at > NOW() - make_interval(mins => $2)",
+            )
+            .bind(source)
+            .bind(SETTLING_BUY_MINUTES)
+            .fetch_one(&mut *conn)
+            .await?;
+            reserved_for_open_buys += settling;
         }
         Ok(Self {
             in_flight_withdrawals,
@@ -371,6 +390,10 @@ impl WithdrawalHolds {
         }
     }
 }
+
+/// How long after a live buy is matched its USDC counts as still leaving the
+/// wallet: as long as the exit handler waits for a fill's shares to settle.
+const SETTLING_BUY_MINUTES: i32 = 30;
 
 /// What the unfilled rest of a live buy can still draw from the wallet: its
 /// amount and the taker fee on it. A market buy has no price and counts at
