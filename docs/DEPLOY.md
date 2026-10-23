@@ -108,7 +108,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    DYNAMIC_TUNER_REDIS_URL=${{Redis.REDIS_URL}}
    DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
    JWT_SECRET=<generate-32-char-secret>
-   RUST_LOG=info,api_server=debug
+   RUST_LOG=api_server=info,tower_http=error,polymarket_core=warn,sqlx=warn
    ENVIRONMENT=production
    CORS_ALLOWED_ORIGINS=https://<your-dashboard-domain>
    APP_DOMAIN=<your-dashboard-domain>
@@ -183,7 +183,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
 
 ```bash
 curl https://<your-api-server-url>.railway.app/health
-# Expected: {"status":"ok"}
+# Expected: {"status":"healthy",...}
 ```
 
 ### Test Dashboard
@@ -201,7 +201,7 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 | `DYNAMIC_TUNER_REDIS_URL` | Redis URL used by dynamic tuner publisher | `${{Redis.REDIS_URL}}` |
 | `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
 | `JWT_SECRET` | JWT signing key (32+ chars) | `your-secret-key` |
-| `RUST_LOG` | Log level | `info,api_server=debug` |
+| `RUST_LOG` | Log level | `api_server=info,tower_http=error,polymarket_core=warn,sqlx=warn` |
 | `ENVIRONMENT` | `production` enables the strict secret and sign-in checks | `production` |
 | `CORS_ALLOWED_ORIGINS` | Exact origins allowed to call the API (unset: all origins) | `https://app.example.com` |
 | `APP_DOMAIN` / `APP_URI` | Site wallet sign-in messages are bound to (required for wallet sign-in outside development) | `app.example.com` / `https://app.example.com` |
@@ -230,7 +230,8 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 
 Recommended production posture is:
 
-1. `dynamic_tuner` is the sole writer to `dynamic:config:update`.
+1. Only the API process writes `dynamic:config:update` (the dynamic tuner,
+   and the manual dynamic-config endpoints, which publish their changes).
 2. Subscribers use read-only pub/sub credentials.
 3. Redis is private-network only (no public ingress).
 
@@ -318,7 +319,6 @@ Path is set to its Dockerfile).
 
 Rust builds can be slow. Railway has a 2-hour build timeout which should be sufficient, but if builds are failing:
 1. Check for compilation errors in logs
-2. Ensure `cargo update home --precise 0.5.9` is in Dockerfile (compatibility fix)
 
 ## Updating the Application
 
@@ -550,6 +550,54 @@ conservative basis rather than guessing their remaining lot allocation.
 `0.10` is 10%. Review existing overrides before enabling exits. Stop-loss and
 take-profit API order types now return a validation error; they are not durable
 protective orders. Dashboard development, CI and Docker use Node 24.
+
+### Controls, audit and sessions
+
+- Circuit breaker limits are checked at startup: a drawdown or hard-kill
+  limit outside 0–1 (they are fractions: `CB_MAX_DRAWDOWN_PCT=0.20` is 20%;
+  a hard kill of 0 is off;
+  20 would never trip), a run-of-losses limit below 1, a negative daily loss
+  or cooldown, or a `CB_*` value that does not parse stops the start with
+  the reason. The API refuses the same values.
+- Switching the breaker off stops its limits but not a latched trip (manual
+  or hard kill): only a reset lifts that. Breaker settings are stored before
+  they take effect, and every change, trip and reset is written to the
+  audit log with who made it, as are wallet connects, disconnects and
+  primary changes, recovery runs, manual dynamic-config changes, and each
+  withdrawal's outcome. These audit records are written before the request
+  is answered (no longer queued, where a full queue or a crash lost them).
+- Workspace toggles for live trading, the exit handler and arb execution
+  change the running services only on the canonical workspace, and a
+  service the environment switches on (`LIVE_TRADING`,
+  `EXIT_HANDLER_ENABLED`, `ARB_AUTO_EXECUTE`) stays on, as at startup.
+- Stored dynamic-config values (manual overrides and tuned values) apply
+  before the executors start, whether or not Redis is reachable. With
+  dynamic arb sizing on (the default), the configured arb position size is
+  a ceiling on each pair. The tuner sizes on the results of the mode it
+  trades in only.
+- Deleting a user with connected wallets or withdrawal records, and
+  deleting the canonical workspace, are refused.
+- An account connects at most 20 wallets and holds at most 20 prepared
+  browser-wallet orders awaiting a signature; expired ones are cleared.
+- Rate limits are per minute as configured (auth 5, config 10, admin 30
+  per client), not one request a minute after the burst.
+- Request logs carry the matched route template (`/api/v1/invites/:token`),
+  never the request path or query, which can hold invite tokens.
+- A session renews by refresh for at most 7 days from sign-in; each refresh
+  revokes the token it replaces.
+- `PG_MEMORY_TUNING` (default on only with `ENVIRONMENT=production`) runs
+  the `ALTER SYSTEM` memory settings after migrations; a local database is
+  no longer reconfigured.
+- The dashboard asks before sending a withdrawal, disconnecting a wallet
+  (its key is erased), tripping or resetting the breaker, and saving it
+  switched off. It defaults to the API on port 3000 and runs on 3002
+  (`npm run dev`). `ENCRYPTION_KEY` (default `JWT_SECRET`) encrypts stored
+  workspace secrets: set it separately before rotating `JWT_SECRET`.
+  `DASHBOARD_URL` sets where invite links point.
+- `docker compose` passes the live trading settings (`EXIT_HANDLER_ENABLED`,
+  `TRADING_WALLET_ADDRESS`, `WALLET_PRIVATE_KEY`, `POLYGON_RPC_URL`,
+  `ALCHEMY_API_KEY`, `VAULT_*`) to the API and keeps a file vault in the
+  `api_data` volume.
 
 ### Restored tables, withdrawal and fee accounting (089–092)
 

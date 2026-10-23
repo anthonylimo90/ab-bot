@@ -1036,7 +1036,10 @@ impl ArbAutoExecutor {
                 dynamic_size = %sized,
                 "Dynamic arb position sizing"
             );
-            sized
+            // The configured position size (the one setting operators and
+            // the tuner change) is a ceiling here too: lowering it during
+            // an incident must lower what is traded.
+            sized.min(cfg.position_size)
         } else {
             cfg.position_size
         };

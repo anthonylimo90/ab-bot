@@ -19,7 +19,7 @@ export type ConnectionStatus =
   | 'disconnected'
   | 'error';
 
-const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001';
+const WS_BASE_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000';
 
 // Wire drift (a renamed variant, an unreadable price) would otherwise fail
 // silently, so say so once per message type instead of once per frame.

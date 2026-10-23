@@ -297,6 +297,22 @@ pub async fn run_recovery(
         ));
     }
 
+    if let Ok(user_id) = Uuid::parse_str(&claims.sub) {
+        super::audit_change(
+            &state,
+            user_id,
+            ::auth::AuditAction::Custom("recovery_run".into()),
+            format!("workspace/{workspace_id}"),
+            serde_json::json!({
+                "safe_exit_failures_requeued": safe_exit_failures_requeued,
+                "stalled_positions_reopened": stalled_positions_reopened,
+                "orphan_inventory_attempted": orphan_recovery.attempted,
+                "orphan_inventory_succeeded": orphan_recovery.succeeded,
+            }),
+        )
+        .await;
+    }
+
     Ok(Json(RecoveryRunResponse {
         workspace_id: workspace_id.to_string(),
         triggered_at: Utc::now(),

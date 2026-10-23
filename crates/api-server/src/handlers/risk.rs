@@ -359,6 +359,7 @@ pub async fn update_circuit_breaker_config(
         config.enabled = v;
     }
 
+    config.validate().map_err(ApiError::BadRequest)?;
     let previous = state.circuit_breaker.config().await;
     // Stored first, then applied: a failed write changes nothing.
     sqlx::query(

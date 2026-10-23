@@ -59,6 +59,10 @@ pub struct Claims {
     pub exp: i64,
     /// JWT ID (unique identifier for this token).
     pub jti: String,
+    /// When the session began (its sign-in), kept across refreshes so a
+    /// session has an end; zero in tokens issued before it was recorded.
+    #[serde(default)]
+    pub auth_time: i64,
 }
 
 impl Claims {
@@ -74,6 +78,16 @@ impl Claims {
             iat: now.timestamp(),
             exp: (now + Duration::hours(expiry_hours)).timestamp(),
             jti: Uuid::new_v4().to_string(),
+            auth_time: now.timestamp(),
+        }
+    }
+
+    /// When the session these claims continue began.
+    pub fn session_started_at(&self) -> i64 {
+        if self.auth_time > 0 {
+            self.auth_time
+        } else {
+            self.iat
         }
     }
 

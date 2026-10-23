@@ -4,7 +4,7 @@
   "private": true,
   "engines": { "node": ">=24 <25" },
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3002",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",

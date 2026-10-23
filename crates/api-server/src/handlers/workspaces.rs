@@ -795,9 +795,11 @@ pub async fn update_workspace(
     }
 
     // ── Propagate toggle changes to running services ──
-    if req.arb_auto_execute.is_some()
+    // Only the canonical workspace's flags drive them.
+    if (req.arb_auto_execute.is_some()
         || req.exit_handler_enabled.is_some()
-        || req.live_trading_enabled.is_some()
+        || req.live_trading_enabled.is_some())
+        && is_canonical_workspace(&state.pool, workspace_id).await?
     {
         reconcile_runtime_service_toggles(state.as_ref()).await;
     }
@@ -2862,6 +2864,19 @@ pub async fn update_opportunity_selection_settings(
         ));
     }
 
+    super::audit_change(
+        &state,
+        user_id,
+        ::auth::AuditAction::ConfigChange,
+        "dynamic_config",
+        serde_json::json!({
+            "requested_updates": updates
+                .iter()
+                .map(|(key, value, _)| serde_json::json!({ "key": key, "value": value }))
+                .collect::<Vec<_>>(),
+        }),
+    )
+    .await;
     for (key, value, reason) in &updates {
         let old_value: Option<Decimal> =
             sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")
@@ -3223,6 +3238,19 @@ pub async fn update_arb_executor_config(
     }
 
     // Write each update to DB + history
+    super::audit_change(
+        &state,
+        user_id,
+        ::auth::AuditAction::ConfigChange,
+        "dynamic_config",
+        serde_json::json!({
+            "requested_updates": updates
+                .iter()
+                .map(|(key, value, _)| serde_json::json!({ "key": key, "value": value }))
+                .collect::<Vec<_>>(),
+        }),
+    )
+    .await;
     for (key, value, reason) in &updates {
         let old_value: Option<Decimal> =
             sqlx::query_scalar("SELECT current_value FROM dynamic_config WHERE key = $1")

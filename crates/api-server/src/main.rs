@@ -93,7 +93,16 @@ async fn main() -> anyhow::Result<()> {
         sqlx::migrate!("../../migrations").run(&pool).await?;
         // ALTER SYSTEM cannot run inside a transaction (sqlx wraps migrations
         // in transactions), so we apply memory tuning here in autocommit mode.
-        apply_pg_memory_tuning(&pool).await;
+        // It rewrites the server's own settings (sized for the deployed 2 GB
+        // database), so it runs only where asked: PG_MEMORY_TUNING=true, or
+        // by default in production.
+        let tune = match std::env::var("PG_MEMORY_TUNING") {
+            Ok(value) => value == "true" || value == "1",
+            Err(_) => std::env::var("ENVIRONMENT").is_ok_and(|env| env == "production"),
+        };
+        if tune {
+            apply_pg_memory_tuning(&pool).await;
+        }
     } else {
         tracing::warn!("Skipping database migrations because SKIP_MIGRATIONS is enabled");
     }

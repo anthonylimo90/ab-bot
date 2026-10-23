@@ -83,6 +83,19 @@ services:
       ARB_MIN_NET_PROFIT: ${ARB_MIN_NET_PROFIT:-0.001}
       ARB_MIN_BOOK_DEPTH: ${ARB_MIN_BOOK_DEPTH:-100}
       LIVE_TRADING: ${LIVE_TRADING:-false}
+      # Live entries wait while the exit handler is off: it flattens failed
+      # pairs and exits quant positions.
+      EXIT_HANDLER_ENABLED: ${EXIT_HANDLER_ENABLED:-false}
+      # The live signer and the chain it reads (empty: paper only, or the
+      # workspace's saved RPC settings).
+      TRADING_WALLET_ADDRESS: ${TRADING_WALLET_ADDRESS:-}
+      WALLET_PRIVATE_KEY: ${WALLET_PRIVATE_KEY:-}
+      POLYGON_RPC_URL: ${POLYGON_RPC_URL:-}
+      ALCHEMY_API_KEY: ${ALCHEMY_API_KEY:-}
+      # The key vault: a file vault keeps its file in the api_data volume.
+      VAULT_PROVIDER: ${VAULT_PROVIDER:-}
+      VAULT_MASTER_KEY: ${VAULT_MASTER_KEY:-}
+      VAULT_FILE_PATH: ${VAULT_FILE_PATH:-/app/data/vault.enc}
       EXECUTOR_MIN_BOOK_DEPTH: ${EXECUTOR_MIN_BOOK_DEPTH:-100}
       DYNAMIC_TUNER_BOOTSTRAP_ENABLED: ${DYNAMIC_TUNER_BOOTSTRAP_ENABLED:-true}
       DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS: ${DYNAMIC_TUNER_BOOTSTRAP_MAX_ATTEMPTS:-100}
@@ -91,6 +104,8 @@ services:
       # Enables GET /metrics for this bearer token (16+ characters); the
       # monitoring profile's Prometheus scrapes with it.
       METRICS_TOKEN: ${METRICS_TOKEN:-}
+    volumes:
+      - api_data:/app/data
     ports:
       - "${API_PORT:-3000}:3000"
     # Room for open requests (15s) and, alongside them, started trading
@@ -267,6 +282,7 @@ networks:
     driver: bridge
 
 volumes:
+  api_data:
   postgres_data:
   redis_data:
   prometheus_data:

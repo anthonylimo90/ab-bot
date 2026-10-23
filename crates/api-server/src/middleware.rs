@@ -59,7 +59,25 @@ pub(crate) async fn issue_session_token(
     user: uuid::Uuid,
     role: UserRole,
 ) -> crate::error::ApiResult<String> {
-    let claims = session_claims(&state.pool, user, role, state.jwt_auth.expiry_hours()).await?;
+    issue_session_token_since(state, user, role, None).await
+}
+
+/// How long a session may be renewed from its sign-in before the user must
+/// sign in again.
+pub(crate) const MAX_SESSION_DAYS: i64 = 7;
+
+/// A token for a session that began at `session_started_at` (now, when
+/// `None`): a refresh carries its session's start forward.
+pub(crate) async fn issue_session_token_since(
+    state: &AppState,
+    user: uuid::Uuid,
+    role: UserRole,
+    session_started_at: Option<i64>,
+) -> crate::error::ApiResult<String> {
+    let mut claims = session_claims(&state.pool, user, role, state.jwt_auth.expiry_hours()).await?;
+    if let Some(started) = session_started_at {
+        claims.auth_time = started;
+    }
     state
         .jwt_auth
         .create_token_with_claims(&claims)

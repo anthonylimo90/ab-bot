@@ -488,32 +488,33 @@ impl AppState {
             );
         }
 
-        // Create circuit breaker for risk management
+        // Create circuit breaker for risk management. A value that does not
+        // parse is refused, not skipped: a limit the operator set must hold.
         let mut circuit_breaker_config = CircuitBreakerConfig::default();
-        if let Ok(v) = std::env::var("CB_MAX_DAILY_LOSS") {
-            if let Ok(d) = v.parse::<rust_decimal::Decimal>() {
-                circuit_breaker_config.max_daily_loss = d;
+        fn env_value<T: std::str::FromStr>(name: &str) -> anyhow::Result<Option<T>> {
+            match std::env::var(name) {
+                Ok(raw) => raw
+                    .trim()
+                    .parse::<T>()
+                    .map(Some)
+                    .map_err(|_| anyhow::anyhow!("{name}={raw} is not a valid value")),
+                Err(_) => Ok(None),
             }
         }
-        if let Ok(v) = std::env::var("CB_MAX_DRAWDOWN_PCT") {
-            if let Ok(d) = v.parse::<rust_decimal::Decimal>() {
-                circuit_breaker_config.max_drawdown_pct = d;
-            }
+        if let Some(d) = env_value("CB_MAX_DAILY_LOSS")? {
+            circuit_breaker_config.max_daily_loss = d;
         }
-        if let Ok(v) = std::env::var("CB_MAX_CONSECUTIVE_LOSSES") {
-            if let Ok(n) = v.parse::<u32>() {
-                circuit_breaker_config.max_consecutive_losses = n;
-            }
+        if let Some(d) = env_value("CB_MAX_DRAWDOWN_PCT")? {
+            circuit_breaker_config.max_drawdown_pct = d;
         }
-        if let Ok(v) = std::env::var("CB_COOLDOWN_MINUTES") {
-            if let Ok(n) = v.parse::<i64>() {
-                circuit_breaker_config.cooldown_minutes = n;
-            }
+        if let Some(n) = env_value("CB_MAX_CONSECUTIVE_LOSSES")? {
+            circuit_breaker_config.max_consecutive_losses = n;
         }
-        if let Ok(v) = std::env::var("CB_HARD_KILL_DRAWDOWN_PCT") {
-            if let Ok(d) = v.parse::<rust_decimal::Decimal>() {
-                circuit_breaker_config.hard_kill_drawdown_pct = d;
-            }
+        if let Some(n) = env_value("CB_COOLDOWN_MINUTES")? {
+            circuit_breaker_config.cooldown_minutes = n;
+        }
+        if let Some(d) = env_value("CB_HARD_KILL_DRAWDOWN_PCT")? {
+            circuit_breaker_config.hard_kill_drawdown_pct = d;
         }
 
         // Apply DB overrides (workspace-level CB config takes priority over env vars)
@@ -581,6 +582,14 @@ impl AppState {
             }
         }
 
+        // Limits that cannot guard trading (a drawdown of 20 meant as 20%
+        // never trips) stop the start rather than trade unguarded.
+        circuit_breaker_config.validate().map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid circuit breaker limits (CB_* environment or the workspace's saved \
+                 limits): {error}"
+            )
+        })?;
         let circuit_breaker = Arc::new(CircuitBreaker::with_persistence(
             circuit_breaker_config,
             pool.clone(),

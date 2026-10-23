@@ -487,6 +487,28 @@ pub async fn delete_user(
         .map(|(email,)| email.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Deleting a user cascades to their connected wallets (whose vault keys
+    // would be left behind) and to their withdrawals, the journal of money
+    // that left: neither may go with the account.
+    let (has_wallets, has_withdrawals): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM user_wallets WHERE user_id = $1), \
+                EXISTS(SELECT 1 FROM wallet_withdrawals WHERE user_id = $1)",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if has_wallets {
+        return Err(ApiError::Conflict(
+            "This user still has connected wallets; disconnect them first".into(),
+        ));
+    }
+    if has_withdrawals {
+        return Err(ApiError::Conflict(
+            "This user has withdrawal records, which are kept; the account cannot be deleted"
+                .into(),
+        ));
+    }
+
     let result = sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)
         .execute(&state.pool)

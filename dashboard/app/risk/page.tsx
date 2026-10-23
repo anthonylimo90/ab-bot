@@ -271,14 +271,34 @@ export default function RiskPage() {
                     </AlertDialog>
                   )}
                   {cb.tripped && (
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => resetMutation.mutate()}
-                      disabled={resetMutation.isPending}
-                    >
-                      Reset
-                    </Button>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={resetMutation.isPending}
+                        >
+                          Reset
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>Reset Circuit Breaker?</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            Trading resumes at once, ending this trip
+                            {cb.trip_reason ? ` (${cb.trip_reason})` : ""} and
+                            its cooldown. Reset only once the cause is
+                            understood.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>Cancel</AlertDialogCancel>
+                          <AlertDialogAction onClick={() => resetMutation.mutate()}>
+                            Reset and Resume Trading
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
                   )}
                 </div>
               </div>

@@ -42,3 +42,7 @@ secrets/
 *.gcda
 coverage/
 tarpaulin-report.html
+
+# Encrypted key vault files (VAULT_FILE_PATH); never commit one
+vault.enc
+*.vault

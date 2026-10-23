@@ -28,8 +28,8 @@ test('the CSP is report-only so wallet connectors cannot be broken by it', async
   assert.match(policy, /frame-ancestors 'none'/);
   assert.match(policy, /object-src 'none'/);
   // The API and WebSocket origins the app actually uses are listed.
-  assert.match(policy, /connect-src [^;]*http:\/\/localhost:3001/);
-  assert.match(policy, /connect-src [^;]*ws:\/\/localhost:3001/);
+  assert.match(policy, /connect-src [^;]*http:\/\/localhost:3000/);
+  assert.match(policy, /connect-src [^;]*ws:\/\/localhost:3000/);
 });
 
 test('the X-Powered-By header is disabled', () => {

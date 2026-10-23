@@ -611,6 +611,15 @@ pub async fn delete_workspace(
         .map(|(name,)| name.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // The canonical workspace holds the live trading settings, the signer
+    // pin and the cash-flow ledger and equity history (deleted with it).
+    if crate::workspace_scope::is_canonical_workspace(&state.pool, workspace_id).await? {
+        return Err(ApiError::Conflict(
+            "The canonical workspace runs live trading and holds its ledger; it cannot be deleted"
+                .into(),
+        ));
+    }
+
     let result = sqlx::query("DELETE FROM workspaces WHERE id = $1")
         .bind(workspace_id)
         .execute(&state.pool)

@@ -137,6 +137,15 @@ impl Default for ServerConfig {
 
 /// Split a comma-separated origin list, trimming blanks and trailing slashes
 /// (an Origin header never has a path).
+/// The route a request matched, as its template (`/invites/{token}`), for
+/// logs: the request's own path and query can carry secrets.
+fn route_template<B>(request: &Request<B>) -> String {
+    request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or_else(|| "unmatched".to_string(), |path| path.as_str().to_string())
+}
+
 fn parse_origin_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|origin| origin.trim().trim_end_matches('/'))
@@ -356,10 +365,19 @@ impl ApiServer {
         let router = router
             .layer(
                 TraceLayer::new_for_http()
+                    // The route template, never the request's own path or
+                    // query: invite tokens and other secrets travel in them.
+                    .make_span_with(|request: &Request<_>| {
+                        tracing::debug_span!(
+                            "request",
+                            method = %request.method(),
+                            route = route_template(request),
+                        )
+                    })
                     .on_request(|request: &Request<_>, _span: &tracing::Span| {
                         tracing::debug!(
                             method = %request.method(),
-                            uri = %request.uri(),
+                            route = route_template(request),
                             "Incoming request"
                         );
                     })
@@ -395,6 +413,15 @@ impl ApiServer {
             state.orderbook_tx.clone(),
             state.arb_entry_tx.clone(),
         );
+
+        // Stored overrides apply before any executor trades, whether or not
+        // Redis (which carries later updates) is reachable.
+        crate::dynamic_tuner::apply_dynamic_config_snapshot(
+            &state.pool,
+            Some(&arb_config_arc),
+            Some(&quant_config),
+        )
+        .await;
 
         // The exit handler's config, shared with the entry executors: a live
         // entry waits while the handler is off or not running.
@@ -449,11 +476,14 @@ impl ApiServer {
 
         // Spawn dynamic tuner (adaptive runtime configuration) after subscriber
         // so startup sync publications are not missed by local runtime.
-        let tuner = Arc::new(DynamicTuner::new(
-            state.pool.clone(),
-            state.current_regime.clone(),
-            state.circuit_breaker.clone(),
-        ));
+        let tuner = Arc::new(
+            DynamicTuner::new(
+                state.pool.clone(),
+                state.current_regime.clone(),
+                state.circuit_breaker.clone(),
+            )
+            .with_order_executor(state.order_executor.clone()),
+        );
         tokio::spawn(tuner.start());
 
         // Spawn wallet harvester (discovers wallets from CLOB trades)

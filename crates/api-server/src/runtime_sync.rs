@@ -29,10 +29,18 @@ pub async fn canonical_workspace_live_enabled(pool: &PgPool) -> Result<bool, sql
         .unwrap_or(false))
 }
 
-/// Reconcile runtime service toggles from workspace flags.
+/// Whether the environment switches `name` on (`name=true`), as startup reads it.
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "true")
+}
+
+/// Reconcile runtime service toggles from the canonical workspace's flags.
+/// As at startup, a service the environment switches on stays on: the
+/// workspace flag can add a service, not remove one the operator configured.
 pub async fn reconcile_runtime_service_toggles(state: &AppState) {
     match canonical_workspace_arb_enabled(&state.pool).await {
         Ok(enabled) => {
+            let enabled = enabled || env_enabled("ARB_AUTO_EXECUTE");
             if let Some(ref arb_config) = state.arb_executor_config {
                 arb_config.write().await.enabled = enabled;
                 tracing::info!(
@@ -51,6 +59,7 @@ pub async fn reconcile_runtime_service_toggles(state: &AppState) {
 
     match canonical_workspace_exit_handler_enabled(&state.pool).await {
         Ok(enabled) => {
+            let enabled = enabled || env_enabled("EXIT_HANDLER_ENABLED");
             if let Some(ref eh_config) = state.exit_handler_config {
                 eh_config.write().await.enabled = enabled;
                 tracing::info!(
@@ -69,6 +78,7 @@ pub async fn reconcile_runtime_service_toggles(state: &AppState) {
 
     match canonical_workspace_live_enabled(&state.pool).await {
         Ok(enabled) => {
+            let enabled = enabled || env_enabled("LIVE_TRADING");
             state.order_executor.set_live_mode(enabled);
             tracing::info!(
                 live_trading_enabled = enabled,

@@ -443,8 +443,19 @@ pub async fn store_wallet(
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
     let wallet = register_wallet(&state.pool, &state.key_vault, user_id, &req).await?;
+    super::audit_change(
+        &state,
+        user_id,
+        AuditAction::Custom("wallet_connected".into()),
+        format!("wallet/{}", wallet.address.to_lowercase()),
+        serde_json::json!({ "label": req.label }),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(wallet)))
 }
+
+/// Wallets one account may connect.
+const MAX_WALLETS_PER_USER: i64 = 20;
 
 async fn register_wallet(
     pool: &PgPool,
@@ -491,6 +502,13 @@ async fn register_wallet(
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await?;
+    // Every connected wallet's key is kept in the one vault file, rewritten
+    // on each change: no account may grow it without bound.
+    if wallet_count.0 >= MAX_WALLETS_PER_USER {
+        return Err(ApiError::Conflict(format!(
+            "An account can connect at most {MAX_WALLETS_PER_USER} wallets; disconnect one first"
+        )));
+    }
     let is_primary = wallet_count.0 == 0;
 
     // Save wallet metadata to database
@@ -647,6 +665,14 @@ pub async fn remove_wallet(
         &address,
     )
     .await?;
+    super::audit_change(
+        &state,
+        user_id,
+        AuditAction::Custom("wallet_disconnected".into()),
+        format!("wallet/{}", address.to_lowercase()),
+        serde_json::Value::Null,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -839,9 +865,16 @@ pub async fn set_primary_wallet(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
 
-    Ok(Json(
-        set_personal_primary_wallet(&state.pool, user_id, &address).await?,
-    ))
+    let wallet = set_personal_primary_wallet(&state.pool, user_id, &address).await?;
+    super::audit_change(
+        &state,
+        user_id,
+        AuditAction::Custom("wallet_set_primary".into()),
+        format!("wallet/{}", wallet.address.to_lowercase()),
+        serde_json::Value::Null,
+    )
+    .await;
+    Ok(Json(wallet))
 }
 
 async fn set_personal_primary_wallet(
@@ -1158,7 +1191,14 @@ struct WithdrawalRequest {
 }
 
 impl WithdrawalRequest {
-    fn audit(&self, state: &AppState, withdrawal_id: Uuid, status: &str, failure: Option<String>) {
+    /// Recorded before the request is answered: money left (or did not).
+    async fn audit(
+        &self,
+        state: &AppState,
+        withdrawal_id: Uuid,
+        status: &str,
+        failure: Option<String>,
+    ) {
         let mut event = AuditEvent::builder(
             AuditAction::Custom("wallet_withdrawal".to_string()),
             format!("wallet/{}", self.source),
@@ -1173,7 +1213,9 @@ impl WithdrawalRequest {
         if let Some(failure) = failure {
             event = event.failure(failure);
         }
-        state.audit_logger.log(event.build());
+        if let Err(error) = state.audit_logger.log_sync(event.build()).await {
+            tracing::error!(%error, %withdrawal_id, "Could not record a withdrawal's audit event");
+        }
     }
 }
 
@@ -1466,7 +1508,9 @@ async fn submit_withdrawal(
                 warn!(withdrawal_id = %withdrawal_id, error = %e, "Could not record an unsent withdrawal");
             }
             lock.release().await;
-            request.audit(&state, withdrawal_id, "failed", Some(error.clone()));
+            request
+                .audit(&state, withdrawal_id, "failed", Some(error.clone()))
+                .await;
             return Err(if error.contains("Insufficient POL") {
                 ApiError::BadRequest(error)
             } else if error.contains(CALL_WOULD_FAIL) {
@@ -1527,7 +1571,9 @@ async fn submit_withdrawal(
                     Ok(_) => {
                         status = "failed";
                         error = Some(message);
-                        request.audit(&state, withdrawal_id, "failed", Some(reason));
+                        request
+                            .audit(&state, withdrawal_id, "failed", Some(reason))
+                            .await;
                         None
                     }
                     Err(e) => {
@@ -1561,12 +1607,14 @@ async fn submit_withdrawal(
         None => Ok(()),
         Some(note) => {
             error = Some(note.to_string());
-            request.audit(
-                &state,
-                withdrawal_id,
-                "submission_requires_reconciliation",
-                None,
-            );
+            request
+                .audit(
+                    &state,
+                    withdrawal_id,
+                    "submission_requires_reconciliation",
+                    None,
+                )
+                .await;
             sqlx::query(
                 "UPDATE wallet_withdrawals SET error = $2, updated_at = NOW() \
                  WHERE id = $1 AND status = 'submitting'",
@@ -1600,16 +1648,18 @@ async fn submit_withdrawal(
                     match settled {
                         Ok(changed) => {
                             if changed {
-                                request.audit(
-                                    &state,
-                                    withdrawal_id,
-                                    if mined.success {
-                                        "confirmed"
-                                    } else {
-                                        "reverted"
-                                    },
-                                    None,
-                                );
+                                request
+                                    .audit(
+                                        &state,
+                                        withdrawal_id,
+                                        if mined.success {
+                                            "confirmed"
+                                        } else {
+                                            "reverted"
+                                        },
+                                        None,
+                                    )
+                                    .await;
                             }
                             if mined.success {
                                 (status, error, confirmed_at) =

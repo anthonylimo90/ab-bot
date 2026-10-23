@@ -175,6 +175,9 @@ const MIN_ORDER_LIFETIME_SECS: u64 = 300;
 /// submission itself (credentials, the order fence, the post) takes time.
 const GTD_MIN_REMAINING_SECS: i64 = 90;
 
+/// Prepared orders one user may hold awaiting a signature.
+const MAX_PREPARED_ORDERS_PER_USER: i64 = 20;
+
 const INSERT_PENDING_ORDER: &str = r#"
     INSERT INTO pending_wallet_orders (
         id, user_id, maker_address, token_id, side,
@@ -362,6 +365,24 @@ pub async fn prepare_order(
     req.token_id
         .parse::<alloy_primitives::U256>()
         .map_err(|_| ApiError::BadRequest("Invalid token ID".into()))?;
+    // Prepared orders never submitted expire unused: they are cleared, and
+    // each user keeps a bounded number awaiting a signature (each one costs
+    // exchange lookups and a stored row).
+    sqlx::query("DELETE FROM pending_wallet_orders WHERE user_id = $1 AND expires_at < NOW()")
+        .bind(user_id)
+        .execute(&state.pool)
+        .await?;
+    let awaiting: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pending_wallet_orders WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await?;
+    if awaiting >= MAX_PREPARED_ORDERS_PER_USER {
+        return Err(ApiError::Conflict(format!(
+            "{MAX_PREPARED_ORDERS_PER_USER} prepared orders already await a signature; submit \
+             them or let them expire"
+        )));
+    }
     let neg_risk = state
         .clob_client
         .get_neg_risk(&req.token_id)

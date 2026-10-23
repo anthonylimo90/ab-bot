@@ -38,6 +38,7 @@ import { MemberList } from '@/components/workspace/MemberList';
 import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
 import { InfoTooltip } from '@/components/shared/InfoTooltip';
 import { PageIntro } from '@/components/shared/PageIntro';
+import { ConfirmAction } from '@/components/shared/ConfirmAction';
 import { useWalletStore } from '@/stores/wallet-store';
 import {
   useCreateWalletWithdrawalMutation,
@@ -465,15 +466,22 @@ export default function SettingsPage() {
                             Make Primary
                           </Button>
                         )}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleDisconnectWallet(wallet.address)}
-                          disabled={walletLoading}
-                          aria-label={`Disconnect wallet ${wallet.label || shortAddress(wallet.address)}`}
+                        <ConfirmAction
+                          title="Disconnect this wallet?"
+                          description={`${wallet.address} is removed from your account and its private key is erased from the vault. Funds stay in the wallet; reach them only with your own copy of the key.`}
+                          confirmLabel="Disconnect and Erase Key"
+                          destructive
+                          onConfirm={() => handleDisconnectWallet(wallet.address)}
                         >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={walletLoading}
+                            aria-label={`Disconnect wallet ${wallet.label || shortAddress(wallet.address)}`}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </ConfirmAction>
                       </div>
                     </div>
                   );
@@ -554,18 +562,24 @@ export default function SettingsPage() {
                   <p className="text-xs text-muted-foreground">
                     If your MetaMask wallet already uses this same active address, the funds are already there and no withdrawal transfer is needed.
                   </p>
-                  <Button
-                    onClick={handleWithdraw}
-                    disabled={createWithdrawalMutation.isPending || !withdrawDestination || !withdrawAmount}
-                    className="w-full sm:w-auto"
+                  <ConfirmAction
+                    title="Send this withdrawal?"
+                    description={`${withdrawAmount} USDC to ${withdrawDestination.trim()}. A transfer on Polygon cannot be undone: check the address.`}
+                    confirmLabel="Send Withdrawal"
+                    onConfirm={handleWithdraw}
                   >
-                    {createWithdrawalMutation.isPending ? (
-                      <RefreshCw className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <ArrowUpRight className="h-4 w-4" />
-                    )}
-                    <span className="ml-2">Withdraw</span>
-                  </Button>
+                    <Button
+                      disabled={createWithdrawalMutation.isPending || !withdrawDestination || !withdrawAmount}
+                      className="w-full sm:w-auto"
+                    >
+                      {createWithdrawalMutation.isPending ? (
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <ArrowUpRight className="h-4 w-4" />
+                      )}
+                      <span className="ml-2">Withdraw</span>
+                    </Button>
+                  </ConfirmAction>
                 </div>
 
                 <div className="space-y-2">
@@ -1095,10 +1109,16 @@ export default function SettingsPage() {
                       </p>
                     </div>
                     <div className="flex gap-2">
+                      <ConfirmAction
+                        title="Trip the circuit breaker?"
+                        description="All automated trading stops at once and stays stopped until the breaker is reset."
+                        confirmLabel="Trip Circuit Breaker"
+                        destructive
+                        onConfirm={handleTripCircuitBreaker}
+                      >
                       <Button
                         variant="destructive"
                         size="sm"
-                        onClick={handleTripCircuitBreaker}
                         disabled={isTrippingCb || riskStatus?.circuit_breaker?.tripped}
                       >
                         {isTrippingCb ? (
@@ -1107,10 +1127,16 @@ export default function SettingsPage() {
                           <><AlertTriangle className="mr-1 h-3 w-3" />Trip</>
                         )}
                       </Button>
+                      </ConfirmAction>
+                      <ConfirmAction
+                        title="Reset the circuit breaker?"
+                        description="Trading resumes at once, ending the current trip and its cooldown. Reset only once its cause is understood."
+                        confirmLabel="Reset and Resume Trading"
+                        onConfirm={handleResetCircuitBreaker}
+                      >
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={handleResetCircuitBreaker}
                         disabled={isResettingCb || !riskStatus?.circuit_breaker?.tripped}
                       >
                         {isResettingCb ? (
@@ -1119,6 +1145,7 @@ export default function SettingsPage() {
                           <><Shield className="mr-1 h-3 w-3" />Reset</>
                         )}
                       </Button>
+                      </ConfirmAction>
                     </div>
                   </div>
                 )}
@@ -1142,8 +1169,39 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                {/* Save Button */}
-                {canManageRisk && (
+                {/* Save Button: switching the breaker off asks first */}
+                {canManageRisk &&
+                  (!riskEnabled && riskStatus?.circuit_breaker?.config?.enabled ? (
+                    <ConfirmAction
+                      title="Switch the circuit breaker off?"
+                      description="Its loss limits stop guarding trading until it is switched back on. A latched trip (manual or hard kill) still holds until it is reset."
+                      confirmLabel="Save and Switch Off"
+                      destructive
+                      onConfirm={handleSaveRisk}
+                    >
+                  <Button
+                    disabled={isSavingRisk || !riskDirty}
+                    className="w-full"
+                  >
+                    {isSavingRisk ? (
+                      <>
+                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        Saving...
+                      </>
+                    ) : riskDirty ? (
+                      <>
+                        <Save className="mr-2 h-4 w-4" />
+                        Save Risk Configuration
+                      </>
+                    ) : (
+                      <>
+                        <Check className="mr-2 h-4 w-4" />
+                        Saved
+                      </>
+                    )}
+                  </Button>
+                    </ConfirmAction>
+                  ) : (
                   <Button
                     onClick={handleSaveRisk}
                     disabled={isSavingRisk || !riskDirty}
@@ -1166,7 +1224,7 @@ export default function SettingsPage() {
                       </>
                     )}
                   </Button>
-                )}
+                  ))}
               </>
             )}
           </CardContent>

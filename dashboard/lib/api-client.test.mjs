@@ -51,7 +51,7 @@ test('getMarkets trims the search term and omits a blank one', async () => {
 
   const bare = loadApi(() => jsonResponse([]));
   await bare.api.getMarkets();
-  assert.equal(bare.requests[0].url, 'http://localhost:3001/api/v1/markets');
+  assert.equal(bare.requests[0].url, 'http://localhost:3000/api/v1/markets');
 });
 
 test('getMarkets encodes special characters in the search term', async () => {

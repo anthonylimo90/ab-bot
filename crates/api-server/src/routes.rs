@@ -332,9 +332,12 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
     // entries further left are client-controlled and never trusted.
     let key_extractor = TrustedProxyKeyExtractor::from_env();
     let mut janitor = LimiterJanitor::default();
+    // `burst_size` requests per minute per client: a burst of that many,
+    // each replenished a `burst_size`th of a minute later (the builder's
+    // period is the time to replenish one request, not the window).
     let mut rate_limit_config = |burst_size: u32| {
         let config = GovernorConfigBuilder::default()
-            .per_second(60)
+            .per_millisecond(60_000 / u64::from(burst_size.max(1)))
             .burst_size(burst_size)
             .key_extractor(key_extractor)
             .finish()

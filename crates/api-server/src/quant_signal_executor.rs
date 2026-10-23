@@ -2002,15 +2002,21 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO positions (id, source, state, realized_pnl, exit_timestamp, source_signal_id)
-             VALUES ($1, 3, 4, -250, NOW(), $2)",
-        )
-        .bind(uuid::Uuid::new_v4())
-        .bind(signal_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        // The executor trades on paper here: its loss counts, and a live
+        // win or an unknown-provenance one (another mode) does not.
+        for (mode, pnl) in [("paper", -250), ("live", 400), ("unknown", 400)] {
+            sqlx::query(
+                "INSERT INTO positions (id, source, state, realized_pnl, exit_timestamp, source_signal_id, execution_mode, wallet_address)
+                 VALUES ($1, 3, 4, $3, NOW(), $2, $4, '0xwallet')",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(signal_id)
+            .bind(Decimal::from(pnl))
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         let state = crate::state::AppState::for_tests(pool.clone());
         let mut executor = QuantSignalExecutor::new(

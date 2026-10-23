@@ -377,8 +377,24 @@ pub async fn refresh_token(
     let role = user.role_string();
     let user_role = user.user_role();
 
-    // Generate new token
-    let token = crate::middleware::issue_session_token(&state, user.id, user_role).await?;
+    // A session renews for a bounded time from its sign-in, so a token that
+    // leaked cannot be kept alive by refreshing it.
+    let started = claims.session_started_at();
+    if chrono::Utc::now().timestamp() - started
+        > chrono::Duration::days(crate::middleware::MAX_SESSION_DAYS).num_seconds()
+    {
+        return Err(ApiError::Unauthorized(
+            "The session has expired; sign in again".into(),
+        ));
+    }
+
+    // The refreshed token replaces this one: rotated, not multiplied.
+    let token =
+        crate::middleware::issue_session_token_since(&state, user.id, user_role, Some(started))
+            .await?;
+    sqlx::query("INSERT INTO revoked_sessions (jti,user_id,expires_at) VALUES ($1,$2,to_timestamp($3::bigint::double precision)) ON CONFLICT (jti) DO NOTHING")
+        .bind(&claims.jti).bind(user_id).bind(claims.exp).execute(&state.pool).await?;
+    state.jwt_auth.revoke_token(&claims.jti, claims.exp);
 
     let response = AuthResponse {
         token,

@@ -194,6 +194,9 @@ pub struct DynamicTuner {
     circuit_breaker: Arc<CircuitBreaker>,
     /// Cached Redis connection — created once on first use and reused across cycles.
     redis_conn: Mutex<Option<redis::aio::ConnectionManager>>,
+    /// The executor whose mode (live or paper) the results tuned on must
+    /// share: paper results never size live trades.
+    order_executor: Option<Arc<trading_engine::OrderExecutor>>,
 }
 
 impl DynamicTuner {
@@ -208,6 +211,21 @@ impl DynamicTuner {
             current_regime,
             circuit_breaker,
             redis_conn: Mutex::new(None),
+            order_executor: None,
+        }
+    }
+
+    /// Tune on the results of the mode `executor` trades in.
+    pub fn with_order_executor(mut self, executor: Arc<trading_engine::OrderExecutor>) -> Self {
+        self.order_executor = Some(executor);
+        self
+    }
+
+    /// The execution mode whose results are tuned on.
+    fn traded_mode(&self) -> &'static str {
+        match &self.order_executor {
+            Some(executor) if executor.is_live() => "live",
+            _ => "paper",
         }
     }
 
@@ -796,8 +814,10 @@ impl DynamicTuner {
             WHERE exit_timestamp >= NOW() - INTERVAL '6 hours'
               AND realized_pnl IS NOT NULL
               AND source IN (1, 2, 3)
+              AND execution_mode = $1
             "#,
         )
+        .bind(self.traded_mode())
         .fetch_one(&self.pool)
         .await?;
 
@@ -853,8 +873,10 @@ impl DynamicTuner {
             WHERE source = 3
               AND exit_timestamp >= NOW() - INTERVAL '7 days'
               AND realized_pnl IS NOT NULL
+              AND execution_mode = $1
             "#,
         )
+        .bind(self.traded_mode())
         .fetch_one(&self.pool)
         .await
         .unwrap_or(Decimal::ZERO);
@@ -1277,6 +1299,31 @@ pub fn spawn_dynamic_config_subscriber(
     info!("Dynamic config subscriber spawned");
 }
 
+/// Apply the stored dynamic config (manual overrides and tuned values) to
+/// the executors. Called before they start, so they never trade on
+/// environment defaults while Redis is unreachable, and on each subscriber
+/// (re)connect.
+pub async fn apply_dynamic_config_snapshot(
+    pool: &PgPool,
+    arb_executor_config: Option<&Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,
+    quant_executor_config: Option<
+        &Arc<RwLock<crate::quant_signal_executor::QuantSignalExecutorConfig>>,
+    >,
+) {
+    let bounds = load_dynamic_bounds(pool).await;
+    if let Some(arb_config) = arb_executor_config {
+        if let Err(e) = apply_startup_snapshot_to_arb_executor(pool, arb_config, &bounds).await {
+            warn!(error = %e, "Failed applying startup dynamic config snapshot to arb executor");
+        }
+    }
+    if let Some(quant_config) = quant_executor_config {
+        if let Err(e) = apply_startup_snapshot_to_quant_executor(pool, quant_config, &bounds).await
+        {
+            warn!(error = %e, "Failed applying startup dynamic config snapshot to quant executor");
+        }
+    }
+}
+
 async fn run_dynamic_config_subscriber(
     redis_url: &str,
     pool: PgPool,
@@ -1298,18 +1345,14 @@ async fn run_dynamic_config_subscriber(
         "Subscribed to dynamic config updates"
     );
 
-    // Apply startup snapshot to arb executor config
-    if let Some(ref arb_config) = arb_executor_config {
-        if let Err(e) = apply_startup_snapshot_to_arb_executor(&pool, arb_config, &bounds).await {
-            warn!(error = %e, "Failed applying startup dynamic config snapshot to arb executor");
-        }
-    }
-    if let Some(ref quant_config) = quant_executor_config {
-        if let Err(e) = apply_startup_snapshot_to_quant_executor(&pool, quant_config, &bounds).await
-        {
-            warn!(error = %e, "Failed applying startup dynamic config snapshot to quant executor");
-        }
-    }
+    // Updates published while disconnected were missed: the stored values
+    // are applied again on every (re)connect.
+    apply_dynamic_config_snapshot(
+        &pool,
+        arb_executor_config.as_ref(),
+        quant_executor_config.as_ref(),
+    )
+    .await;
 
     let mut stream = pubsub.on_message();
     while let Some(msg) = stream.next().await {

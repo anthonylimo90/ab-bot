@@ -3,8 +3,8 @@
 // plus HTTPS/WSS for WalletConnect relays and chain RPC providers.
 function configuredOrigins() {
   const urls = [
-    process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001',
-    process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001',
+    process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000',
+    process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000',
   ];
   const origins = [];
   for (const url of urls) {

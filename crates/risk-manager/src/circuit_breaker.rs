@@ -78,6 +78,38 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+impl CircuitBreakerConfig {
+    /// Why these limits cannot guard trading, if they cannot. Drawdowns are
+    /// fractions: 20 (meant as 20%) would never trip. A limit of 0 holds
+    /// trading back at once, which is safe, so it stands.
+    pub fn validate(&self) -> Result<(), String> {
+        let fraction = |value: Decimal| value >= Decimal::ZERO && value <= Decimal::ONE;
+        if self.max_daily_loss < Decimal::ZERO {
+            return Err("max_daily_loss must be at least 0".into());
+        }
+        if !fraction(self.max_drawdown_pct) {
+            return Err(format!(
+                "max_drawdown_pct must be a fraction from 0 to 1 (0.20 for 20%), not {}",
+                self.max_drawdown_pct
+            ));
+        }
+        if !fraction(self.hard_kill_drawdown_pct) {
+            return Err(format!(
+                "hard_kill_drawdown_pct must be 0 (off) or a fraction at most 1, not {}",
+                self.hard_kill_drawdown_pct
+            ));
+        }
+        if self.max_consecutive_losses < 1 {
+            return Err("max_consecutive_losses must be at least 1".into());
+        }
+        // A longer cooldown is held to a week when scheduled.
+        if self.cooldown_minutes < 0 {
+            return Err("cooldown_minutes must be at least 0".into());
+        }
+        Ok(())
+    }
+}
+
 /// Current state of the circuit breaker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerState {
@@ -1523,6 +1555,36 @@ mod tests {
         assert_eq!(later.resume_at, taken.resume_at);
         assert_eq!(later.tripped_at, first.tripped_at);
         assert_eq!(later.trips_today, 1);
+    }
+
+    #[test]
+    fn limits_that_cannot_guard_trading_are_refused() {
+        assert!(CircuitBreakerConfig::default().validate().is_ok());
+        let percent = CircuitBreakerConfig {
+            max_drawdown_pct: Decimal::from(20),
+            ..Default::default()
+        };
+        assert!(percent.validate().is_err());
+        let hard_kill_percent = CircuitBreakerConfig {
+            hard_kill_drawdown_pct: Decimal::from(40),
+            ..Default::default()
+        };
+        assert!(hard_kill_percent.validate().is_err());
+        let hard_kill_off = CircuitBreakerConfig {
+            hard_kill_drawdown_pct: Decimal::ZERO,
+            ..Default::default()
+        };
+        assert!(hard_kill_off.validate().is_ok());
+        let no_losses = CircuitBreakerConfig {
+            max_consecutive_losses: 0,
+            ..Default::default()
+        };
+        assert!(no_losses.validate().is_err());
+        let negative = CircuitBreakerConfig {
+            cooldown_minutes: -1,
+            ..Default::default()
+        };
+        assert!(negative.validate().is_err());
     }
 
     #[tokio::test]

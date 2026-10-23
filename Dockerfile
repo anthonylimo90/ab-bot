@@ -91,6 +91,10 @@ SERVICE=${SERVICE:-api-server}\n\
 echo "Starting service: $SERVICE"\n\
 exec ./$SERVICE' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
+# A writable directory for state kept across containers (a file key vault):
+# a volume mounted here starts with this owner.
+RUN mkdir -p /app/data
+
 # Set ownership
 RUN chown -R appuser:appuser /app
 

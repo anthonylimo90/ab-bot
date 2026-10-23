@@ -84,7 +84,8 @@ import {
   parseWorkspace,
 } from "@/lib/wire";
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
+// The API listens on 3000 by default (3001 is Grafana's).
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
 
 export class ApiHttpError extends Error {
   constructor(
