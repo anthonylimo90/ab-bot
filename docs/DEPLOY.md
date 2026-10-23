@@ -1123,6 +1123,15 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   even when its matched size is a rounding short of its size (it stayed
   unresolved, fencing every live order of the wallet), and measures order
   ages on the database's clock.
+- Quant entries skip a signal whose market already meets the strategy's own
+  exit at the bid (`target_already_reached`): a mean reversion already
+  reverted within the drift allowance, a resolution lean already decayed, a
+  cross-market lag already closed. They were bought and sold straight back.
+- Flow calibration counts entries whose fill the order reconciler settled
+  later (it counted only immediate fills).
+- A flow position's strategy exit reads only flow windows that ended after
+  its entry and within two windows of now (it read the newest row of any
+  age, including the windows the signal was made of).
 
 ### API contract changes
 

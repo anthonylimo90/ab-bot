@@ -1664,18 +1664,24 @@ impl ExitHandler {
         let entry_imbalance =
             json_decimal_abs(&quant_ctx.metadata, "imbalance_ratio").unwrap_or(Decimal::ZERO);
 
+        // Only flow measured since the entry, and recently: a window from
+        // before it (what the signal was made of) or one gone stale (the
+        // features stopped updating) says nothing about the flow now.
         let latest_row: Option<(Decimal,)> = sqlx::query_as(
             r#"
             SELECT imbalance_ratio
             FROM market_flow_features
             WHERE condition_id = $1
               AND window_minutes = $2
+              AND window_end > $3
+              AND window_end > NOW() - make_interval(mins => $2 * 2)
             ORDER BY window_end DESC
             LIMIT 1
             "#,
         )
         .bind(&position.market_id)
         .bind(window_minutes)
+        .bind(position.entry_timestamp)
         .fetch_optional(&self.pool)
         .await?;
 

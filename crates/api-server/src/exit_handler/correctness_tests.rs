@@ -2018,3 +2018,48 @@ async fn a_resolved_arbitrage_position_deducts_only_its_entry_fees(pool: PgPool)
     // The pair pays 10; it cost 9.40; redemption is not a trade, so no fee.
     assert_eq!(p.realized_pnl, Some(Decimal::new(25140, 5)));
 }
+
+/// A flow exit reads flow measured since the entry and recently: the
+/// windows the signal was made of, or features that stopped updating, say
+/// nothing about the flow now.
+#[sqlx::test(migrations = false)]
+async fn a_flow_exit_ignores_windows_from_before_the_entry_or_gone_stale(pool: PgPool) {
+    setup(&pool).await;
+    pool.execute(
+        "CREATE TABLE market_flow_features (condition_id TEXT, window_minutes INT, \
+         window_end TIMESTAMPTZ, imbalance_ratio NUMERIC)",
+    )
+    .await
+    .unwrap();
+    let (h, server) = handler(&pool).await;
+    let mut p = position();
+    p.entry_timestamp = Utc::now() - chrono::Duration::hours(5);
+    let ctx = QuantExitContext {
+        signal_id: uuid::Uuid::nil(),
+        kind: QuantSignalKind::Flow,
+        direction: SignalDirection::BuyYes,
+        metadata: serde_json::json!({"window_minutes": 60, "imbalance_ratio": 0.4}),
+    };
+    let cfg = ExitHandlerConfig::default();
+    let flipped = |minutes_ago: i64| {
+        let pool = pool.clone();
+        let market = p.market_id.clone();
+        async move {
+            sqlx::query("INSERT INTO market_flow_features VALUES ($1, 60, NOW() - make_interval(mins => $2::int), -0.5)")
+                .bind(market)
+                .bind(minutes_ago as i32)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    // Selling flow from before the entry, then from three hours ago.
+    flipped(6 * 60).await;
+    assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
+    flipped(3 * 60).await;
+    assert!(!h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
+    // Selling flow measured ten minutes ago turns the entry's thesis.
+    flipped(10).await;
+    assert!(h.flow_strategy_exit(&p, &ctx, &cfg).await.unwrap());
+    server.abort();
+}
