@@ -993,14 +993,27 @@ pub fn spawn_signer_keeper(state: Arc<AppState>) {
         loop {
             tokio::time::sleep(SIGNER_KEEPER_INTERVAL).await;
             // Wanted while live trading is on, or while live exposure
-            // remains (its exits need the signer whatever the switch).
-            if state.order_executor.has_live_signer().await
-                || (!state.order_executor.is_live() && !live_exposure_remains(&state.pool).await)
+            // remains (its exits need the signer whatever the switch). A
+            // signer loaded while live trading was off has not started its
+            // approvals and collateral sweeper: they start once it is on.
+            let loaded = state.order_executor.has_live_signer().await;
+            let services_due = loaded
+                && state.order_executor.is_live()
+                && !SIGNER_SERVICES_STARTED.load(std::sync::atomic::Ordering::SeqCst);
+            if (loaded && !services_due)
+                || (!loaded
+                    && !state.order_executor.is_live()
+                    && !live_exposure_remains(&state.pool).await)
             {
                 tries = 0;
                 continue;
             }
-            if tries.is_multiple_of(20) {
+            if services_due {
+                tracing::info!(
+                    "Live trading is on: starting the trading signer's approvals and collateral \
+                     sweeper"
+                );
+            } else if tries.is_multiple_of(20) {
                 tracing::warn!(
                     "Live trading is on, or live positions remain, without a loaded trading \
                      signer; loading it"

@@ -422,6 +422,7 @@ impl ApiServer {
 
         // Stored overrides apply before any executor trades, whether or not
         // Redis (which carries later updates) is reachable.
+        crate::dynamic_tuner::clear_untouched_seeds_when_disabled(&state.pool).await;
         crate::dynamic_tuner::apply_dynamic_config_snapshot(
             &state.pool,
             Some(&arb_config_arc),

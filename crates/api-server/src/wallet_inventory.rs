@@ -655,13 +655,10 @@ pub async fn recover_wallet_orphan_inventory(
         if let Some(recorder) = trade_event_recorder {
             recorder
                 .record_warn(
+                    // A live sale, whatever the live switch says now.
                     NewTradeEvent::new(
                         "inventory_recovery",
-                        if order_executor.is_live() {
-                            "live"
-                        } else {
-                            "paper"
-                        },
+                        "live",
                         "inventory",
                         market_id.clone(),
                         "orphan_inventory_exit_filled",

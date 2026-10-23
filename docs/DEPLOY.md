@@ -1008,11 +1008,13 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - A tuner change whose Redis publish fails stays stored (every process
   re-reads the stored config within seconds); it used to be reverted, so a
   Redis outage froze the tuner.
-- With `DYNAMIC_TUNER_ENABLED=false`, the API removes at start the dynamic
-  config rows still holding their seed (an earlier run's or a migration's,
-  such as `QUANT_BASE_POSITION_SIZE=30`), which every process applied over
-  its environment; the environment applies instead. Values an operator set,
-  or the tuner set when it ran, stay.
+- With `DYNAMIC_TUNER_ENABLED=false`, every API process removes at start,
+  before it applies the stored config, the dynamic config rows still
+  holding their seed (an earlier run's or a migration's, such as
+  `QUANT_BASE_POSITION_SIZE=30`), which it applied over its environment;
+  the environment applies instead. Values an operator set, or the tuner set
+  when it ran, stay. Restart the arb monitor after the API when switching
+  the tuner off: it keeps the values it read at start for removed rows.
 - Migration 101 deletes the `QUANT_MIN_CONFIDENCE`, `FLOW_MIN_IMBALANCE`
   and `MEAN_REV_MIN_MOVE_PCT` rows: nothing read them (their environment
   settings apply, unchanged), yet the tuner table listed them.

@@ -1121,16 +1121,39 @@ async fn switching_live_off_stops_an_entrys_first_buy_not_its_second_leg(pool: P
         .await
         .unwrap();
     assert_eq!(links, 0);
+    let first_leg = |status: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity,settled) \
+                 VALUES($1,$2,'yes','buy',10,TRUE)",
+            )
+            .bind(id)
+            .bind(p.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO execution_intents(id,market_id,signed_order,status) \
+                 VALUES($1,'market','{}'::jsonb,$2)",
+            )
+            .bind(id)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    // A first buy the exchange refused started nothing.
+    first_leg("rejected").await;
+    let refused = executor
+        .execute_market_order_for_position(buy(), &p, "no")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("switched off"), "{refused}");
     // A pair whose first leg went out still sends its second.
-    sqlx::query(
-        "INSERT INTO position_order_links(id,position_id,leg,side,requested_quantity,settled) \
-         VALUES($1,$2,'yes','buy',10,TRUE)",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .bind(p.id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    first_leg("acknowledged").await;
     let second = executor
         .execute_market_order_for_position(buy(), &p, "no")
         .await;

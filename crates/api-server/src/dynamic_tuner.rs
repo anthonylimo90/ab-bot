@@ -260,17 +260,6 @@ impl DynamicTuner {
     pub async fn start(self: Arc<Self>) {
         if !self.config.enabled {
             info!("Dynamic tuner is disabled");
-            // Rows nothing has changed hold the seed of an earlier run (or a
-            // migration's): left, every process would apply them over its
-            // environment, clamped to the tuning bounds. Without them the
-            // environment applies; an operator's values, and the tuner's
-            // own from when it ran, stay.
-            if let Err(e) = sqlx::query("DELETE FROM dynamic_config WHERE updated_by = 'bootstrap'")
-                .execute(&self.pool)
-                .await
-            {
-                warn!(error = %e, "Could not clear untouched dynamic config seeds");
-            }
             self.persist_runtime_state("disabled", "dynamic tuner disabled", None)
                 .await;
             return;
@@ -1397,6 +1386,30 @@ pub fn spawn_dynamic_config_subscriber(
 /// the executors. Called before they start, so they never trade on
 /// environment defaults while Redis is unreachable, and on each subscriber
 /// (re)connect.
+/// With the tuner switched off, remove the dynamic config rows still holding
+/// their seed (an earlier run's or a migration's): left, every process would
+/// apply them over its environment, clamped to the tuning bounds. Without
+/// them the environment applies; an operator's values, and the tuner's own
+/// from when it ran, stay. Run by every API process before its first
+/// snapshot.
+pub async fn clear_untouched_seeds_when_disabled(pool: &PgPool) {
+    // As the tuner reads it.
+    if polymarket_core::config::env_flag("DYNAMIC_TUNER_ENABLED", true) {
+        return;
+    }
+    match sqlx::query("DELETE FROM dynamic_config WHERE updated_by = 'bootstrap'")
+        .execute(pool)
+        .await
+    {
+        Ok(done) if done.rows_affected() > 0 => info!(
+            removed = done.rows_affected(),
+            "Dynamic tuner disabled: untouched dynamic config seeds removed; the environment applies"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "Could not clear untouched dynamic config seeds"),
+    }
+}
+
 pub async fn apply_dynamic_config_snapshot(
     pool: &PgPool,
     arb_executor_config: Option<&Arc<RwLock<crate::arb_executor::ArbExecutorConfig>>>,

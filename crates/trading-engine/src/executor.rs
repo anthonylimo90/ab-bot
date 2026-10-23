@@ -490,9 +490,12 @@ impl OrderExecutor {
             // whose entry has already sent one (the second leg of a pair),
             // never as an entry's first order. Sales always go out.
             if order.side == OrderSide::Buy && !self.is_live() {
+                // A buy the exchange refused, or that was never sent (no
+                // journaled submission), started nothing.
                 let started: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM position_order_links \
-                     WHERE position_id=$1 AND side='buy')",
+                    "SELECT EXISTS(SELECT 1 FROM position_order_links l \
+                     JOIN execution_intents i ON i.id = l.id \
+                     WHERE l.position_id=$1 AND l.side='buy' AND i.status <> 'rejected')",
                 )
                 .bind(position.id)
                 .fetch_one(&mut *tx)

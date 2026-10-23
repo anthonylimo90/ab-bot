@@ -199,7 +199,7 @@ async fn run_recovery_pass(
         .await
         .map_err(map_anyhow)?;
 
-    let allowance_cache_refreshed = if state.order_executor.is_live_ready().await {
+    let allowance_cache_refreshed = if state.order_executor.has_live_signer().await {
         state
             .order_executor
             .refresh_clob_allowance_cache()
@@ -209,14 +209,11 @@ async fn run_recovery_pass(
         false
     };
 
-    let execution_mode = if state.order_executor.is_live_ready().await {
-        "live"
-    } else {
-        "paper"
-    };
-    let ctx = EventContext {
+    // Each position's events carry its own mode, whatever the live switch
+    // says now.
+    let context_for = |position: &polymarket_core::types::Position| EventContext {
         wallet_address: None,
-        execution_mode: execution_mode.to_string(),
+        execution_mode: position.execution_mode.clone(),
         strategy: "recovery".to_string(),
         source_label: "recovery".to_string(),
     };
@@ -231,6 +228,7 @@ async fn run_recovery_pass(
         .await
         .map_err(map_anyhow)?
     {
+        let ctx = context_for(&position);
         // One failing row must not abandon the rest of the recovery run.
         let outcome = match position.state {
             PositionState::ExitFailed
