@@ -56,6 +56,11 @@ export default function TunerPage() {
     explSlots ?? String(tuner?.opportunity_selection?.exploration_slots ?? "");
   const effectiveMaxMarketsCap =
     maxMarketsCap ?? String(tuner?.opportunity_selection?.max_markets_cap ?? "");
+  // The range the server accepts for a key, so the field refuses the rest.
+  const configBounds = (key: string) => {
+    const item = tuner?.dynamic_config.find((c) => c.key === key);
+    return item ? { min: item.min_value, max: item.max_value } : {};
+  };
   const formatOptionalTimeAgo = (value: string | null | undefined) =>
     value ? formatTimeAgo(value) : "Never";
 
@@ -140,7 +145,7 @@ export default function TunerPage() {
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
               <MetricCard
                 title="Mode"
-                value={tuner.apply_changes ? "Apply" : "Shadow"}
+                value={!tuner.enabled ? "Off" : tuner.apply_changes ? "Apply" : "Shadow"}
                 trend="neutral"
               />
               <MetricCard
@@ -267,7 +272,9 @@ export default function TunerPage() {
                       value={effectiveSlots}
                       onChange={(e) => setExplSlots(e.target.value)}
                       className="w-full sm:w-24"
-                      min={0}
+                      min={1}
+                      max={500}
+                      step={1}
                     />
                   </div>
                   <div className="space-y-2">
@@ -283,6 +290,8 @@ export default function TunerPage() {
                       onChange={(e) => setMaxMarketsCap(e.target.value)}
                       className="w-full sm:w-28"
                       min={25}
+                      max={1500}
+                      step={1}
                     />
                   </div>
                   <Button
@@ -323,6 +332,7 @@ export default function TunerPage() {
                     </p>
                     <Input
                       type="number"
+                      {...configBounds("ARB_POSITION_SIZE")}
                       placeholder={formatDynamicConfigValue(
                         "ARB_POSITION_SIZE",
                         tuner.dynamic_config.find(
@@ -343,6 +353,7 @@ export default function TunerPage() {
                     <Input
                       type="number"
                       step="0.0001"
+                      {...configBounds("ARB_MIN_NET_PROFIT")}
                       placeholder={formatDynamicConfigValue(
                         "ARB_MIN_NET_PROFIT",
                         tuner.dynamic_config.find(
@@ -362,6 +373,7 @@ export default function TunerPage() {
                     </p>
                     <Input
                       type="number"
+                      {...configBounds("ARB_MIN_BOOK_DEPTH")}
                       placeholder={formatDynamicConfigValue(
                         "ARB_MIN_BOOK_DEPTH",
                         tuner.dynamic_config.find(
@@ -381,6 +393,8 @@ export default function TunerPage() {
                     </p>
                     <Input
                       type="number"
+                      {...configBounds("ARB_MAX_SIGNAL_AGE_SECS")}
+                      step={1}
                       placeholder={formatDynamicConfigValue(
                         "ARB_MAX_SIGNAL_AGE_SECS",
                         tuner.dynamic_config.find(

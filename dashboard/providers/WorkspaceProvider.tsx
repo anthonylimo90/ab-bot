@@ -45,6 +45,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     _hasHydrated: workspaceHydrated,
     fetchWorkspaces,
     fetchCurrentWorkspace,
+    refreshCurrentWorkspace,
   } = useWorkspaceStore();
   const { fetchWallets } = useWalletStore();
 
@@ -99,6 +100,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     fetchCurrentWorkspace,
     fetchWallets,
   ]);
+
+  // Keep the workspace's switches current: another owner, or the Header in
+  // another tab, may change them.
+  useEffect(() => {
+    if (!hasInitialized || !isAuthenticated || isPlatformAdmin) return;
+    const timer = setInterval(() => {
+      void refreshCurrentWorkspace();
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [hasInitialized, isAuthenticated, isPlatformAdmin, refreshCurrentWorkspace]);
 
   // Reset initialization when auth state changes
   useEffect(() => {

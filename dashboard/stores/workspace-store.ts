@@ -13,6 +13,7 @@ interface WorkspaceStore {
   setHasHydrated: (state: boolean) => void;
   fetchWorkspaces: () => Promise<void>;
   fetchCurrentWorkspace: () => Promise<void>;
+  refreshCurrentWorkspace: () => Promise<void>;
   switchWorkspace: (workspaceId: string) => Promise<void>;
   setCurrentWorkspace: (workspace: Workspace | null) => void;
   reset: () => void;
@@ -66,6 +67,28 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
               isLoading: false,
             });
           }
+        }
+      },
+
+      // Read the current workspace again, without the loading state, and
+      // store it only when it changed: another owner's save shows here, and a
+      // read that finds nothing new leaves the forms built from it alone.
+      refreshCurrentWorkspace: async () => {
+        const shown = get().currentWorkspace;
+        if (!shown) return;
+        try {
+          const workspace = await api.getWorkspace(shown.id);
+          const current = get().currentWorkspace;
+          // Unless the workspace was switched meanwhile.
+          if (
+            current &&
+            current.id === workspace.id &&
+            JSON.stringify(current) !== JSON.stringify(workspace)
+          ) {
+            set({ currentWorkspace: workspace });
+          }
+        } catch {
+          // The next read tries again.
         }
       },
 

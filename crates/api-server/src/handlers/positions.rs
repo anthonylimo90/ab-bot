@@ -79,6 +79,10 @@ pub struct PositionResponse {
     /// Whether the position still holds exposure the exit flow manages: every
     /// state but closed and entry_failed, plus a one-legged failed entry.
     pub is_open: bool,
+    /// "live" (real funds), "paper" or "unknown" (opened before this was kept).
+    pub execution_mode: String,
+    /// What opened the position: "arb", "quant", "copy_trade" or "manual".
+    pub source: String,
 }
 
 /// Summary response for dashboard/overview metrics.
@@ -187,6 +191,8 @@ struct PositionRow {
     resolution_winner: Option<String>,
     exit_strategy: i16,
     is_open: bool,
+    execution_mode: String,
+    source: i16,
 }
 
 /// The columns of a [`PositionRow`], ahead of a `WHERE` clause.
@@ -205,7 +211,8 @@ const POSITION_ROW_SELECT: &str = r#"
                held_yes_qty, held_no_qty, exited_yes_qty, exited_no_qty,
                yes_exit_price, no_exit_price, resolution_winner,
                COALESCE(exit_strategy, 0)::smallint AS exit_strategy,
-               is_open
+               is_open, execution_mode,
+               COALESCE(source, 0)::smallint AS source
         FROM positions
 "#;
 
@@ -236,6 +243,8 @@ impl From<PositionRow> for PositionResponse {
             resolution_winner: row.resolution_winner,
             exit_strategy: exit_strategy_name(row.exit_strategy).to_string(),
             is_open: row.is_open,
+            execution_mode: row.execution_mode,
+            source: trade_event_labels(row.source).1.to_string(),
         }
     }
 }
@@ -662,11 +671,16 @@ pub async fn close_position(
         ));
     }
 
-    let execution_mode = current_execution_mode(state.as_ref()).await;
+    // The exit is recorded in the position's own mode: a paper position
+    // stays paper while the executor trades live.
+    let execution_mode = match position.execution_mode.as_str() {
+        "live" | "paper" => position.execution_mode.clone(),
+        _ => current_execution_mode(state.as_ref()).await.to_string(),
+    };
     let (strategy, source_label) = trade_event_labels(row.source);
     let ctx = EventContext {
         wallet_address: None,
-        execution_mode: execution_mode.to_string(),
+        execution_mode,
         strategy: strategy.to_string(),
         source_label: source_label.to_string(),
     };
@@ -832,6 +846,8 @@ pub async fn close_position(
         }
         .to_string(),
         is_open: position.should_persist_as_open(),
+        execution_mode: position.execution_mode.clone(),
+        source: source_label.to_string(),
     }))
 }
 
@@ -912,7 +928,8 @@ mod tests {
             0::numeric AS held_yes_qty,0::numeric AS held_no_qty,
             10::numeric AS exited_yes_qty,0::numeric AS exited_no_qty,
             0.5::numeric AS yes_exit_price,NULL::numeric AS no_exit_price,
-            NULL::text AS resolution_winner,0::smallint AS exit_strategy,0::smallint AS source,(g>600) AS is_open
+            NULL::text AS resolution_winner,0::smallint AS exit_strategy,0::smallint AS source,(g>600) AS is_open,
+            'paper'::text AS execution_mode
             FROM generate_series(1,605) g",
         )
         .await
@@ -990,6 +1007,8 @@ mod tests {
             resolution_winner: None,
             exit_strategy: "hold_to_resolution".to_string(),
             is_open: true,
+            execution_mode: "live".to_string(),
+            source: "arb".to_string(),
         };
 
         let json = serde_json::to_string(&position).unwrap();

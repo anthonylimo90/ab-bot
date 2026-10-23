@@ -1940,12 +1940,26 @@ pub struct ServiceStatusItem {
 /// Aggregated service status response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ServiceStatusResponse {
+    /// The canonical workspace: the one whose switches drive this status.
+    pub workspace_id: String,
     pub harvester: ServiceStatusItem,
     pub metrics_calculator: ServiceStatusItem,
     pub arb_executor: ServiceStatusItem,
     pub exit_handler: ServiceStatusItem,
     pub live_trading: ServiceStatusItem,
     pub strategy_modes: Vec<StrategyModeStatus>,
+    /// The switches the server's environment turns on: each stays on whatever
+    /// the workspace says, and cannot be switched off from the dashboard.
+    pub environment_switches: EnvironmentSwitches,
+}
+
+/// Runtime switches the server's environment turns on (`LIVE_TRADING`,
+/// `ARB_AUTO_EXECUTE`, `EXIT_HANDLER_ENABLED` set to true).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnvironmentSwitches {
+    pub live_trading: bool,
+    pub arb_auto_execute: bool,
+    pub exit_handler: bool,
 }
 
 const KEY_ARB_MIN_PROFIT_THRESHOLD: &str = "ARB_MIN_PROFIT_THRESHOLD";
@@ -2452,6 +2466,7 @@ pub async fn get_service_status(
     });
 
     Ok(Json(ServiceStatusResponse {
+        workspace_id: workspace_id.to_string(),
         harvester: ServiceStatusItem {
             running: harvester_enabled,
             reason: if !harvester_enabled {
@@ -2505,6 +2520,11 @@ pub async fn get_service_status(
             },
         },
         strategy_modes,
+        environment_switches: EnvironmentSwitches {
+            live_trading: crate::runtime_sync::env_enabled("LIVE_TRADING"),
+            arb_auto_execute: crate::runtime_sync::env_enabled("ARB_AUTO_EXECUTE"),
+            exit_handler: crate::runtime_sync::env_enabled("EXIT_HANDLER_ENABLED"),
+        },
     }))
 }
 

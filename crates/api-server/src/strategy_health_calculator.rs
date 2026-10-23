@@ -377,8 +377,8 @@ async fn load_derived_strategy_health(
             qs.kind AS strategy,
             COUNT(*)::bigint AS generated_signals,
             COUNT(*) FILTER (WHERE qs.execution_status = 'executed')::bigint AS executed_signals,
-            COUNT(*) FILTER (WHERE qs.execution_status = 'skipped')::bigint AS skipped_signals,
-            COUNT(*) FILTER (WHERE qs.execution_status = 'expired')::bigint AS expired_signals,
+            COUNT(*) FILTER (WHERE qs.execution_status = 'skipped' AND qs.skip_reason IS DISTINCT FROM 'expired')::bigint AS skipped_signals,
+            COUNT(*) FILTER (WHERE qs.execution_status = 'skipped' AND qs.skip_reason = 'expired')::bigint AS expired_signals,
             COUNT(*) FILTER (WHERE p.state = 1)::bigint AS open_positions,
             COUNT(*) FILTER (WHERE p.state = 2)::bigint AS exit_ready_positions,
             COUNT(*) FILTER (WHERE p.state = 4)::bigint AS closed_positions,
@@ -1016,6 +1016,7 @@ mod edge_capture_tests {
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 kind TEXT NOT NULL,
                 execution_status TEXT,
+                skip_reason TEXT,
                 metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
                 generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 position_id UUID

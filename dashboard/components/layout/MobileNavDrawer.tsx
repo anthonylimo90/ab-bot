@@ -37,6 +37,8 @@ interface MobileNavDrawerProps {
   tradingToggleConfirm: { title: string; description: string; confirmLabel: string };
   /** Only the workspace owner may pause or resume trading. */
   canToggleTrading: boolean;
+  /** Why pausing is not possible here (the environment holds trading on). */
+  tradingToggleUnavailableReason?: string;
   onConnectWallet: () => void;
   onLogout: () => void;
 }
@@ -58,6 +60,7 @@ export function MobileNavDrawer({
   onToggleTrading,
   tradingToggleConfirm,
   canToggleTrading,
+  tradingToggleUnavailableReason,
   onConnectWallet,
   onLogout,
 }: MobileNavDrawerProps) {
@@ -147,6 +150,7 @@ export function MobileNavDrawer({
                     </div>
 
                     {canToggleTrading && (
+                    <>
                     <ConfirmAction {...tradingToggleConfirm} onConfirm={onToggleTrading}>
                     <Button
                       variant="outline"
@@ -156,7 +160,7 @@ export function MobileNavDrawer({
                           ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
                           : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
                       )}
-                      disabled={isTradingPending}
+                      disabled={isTradingPending || Boolean(tradingToggleUnavailableReason)}
                     >
                       {isTradingActive ? (
                         <Pause className="h-4 w-4" />
@@ -170,6 +174,12 @@ export function MobileNavDrawer({
                           : "Resume trading"}
                     </Button>
                     </ConfirmAction>
+                    {tradingToggleUnavailableReason && (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        {tradingToggleUnavailableReason}
+                      </p>
+                    )}
+                    </>
                     )}
                   </div>
                 </>

@@ -55,7 +55,8 @@ export interface UpdateUserRequest {
 
 // Position types
 export type PositionSide = "long" | "short";
-export type PositionOutcome = "yes" | "no";
+/** "both" is an arbitrage position holding the YES and NO legs. */
+export type PositionOutcome = "yes" | "no" | "both";
 export type PositionStatus = "open" | "closed" | "all";
 
 /** Full position lifecycle state from backend */
@@ -98,13 +99,12 @@ export interface Position {
   resolution_winner?: string;
   /** Exit strategy: "hold_to_resolution" or "exit_on_correction" */
   exit_strategy: string;
-  /** Fee breakdown (legacy, not currently populated) */
-  entry_fees?: number;
-  exit_fees?: number;
-  /** Source wallet (legacy, not currently populated) */
-  source_wallet?: string;
   /** Still holds exposure the exit flow manages (includes a one-legged failed entry). */
   is_open: boolean;
+  /** "live" (real funds), "paper", or "unknown" for positions opened before it was kept. */
+  execution_mode: "live" | "paper" | "unknown";
+  /** What opened the position. */
+  source: "arb" | "quant" | "copy_trade" | "manual";
 }
 
 export interface PositionsSummary {
@@ -1068,12 +1068,22 @@ export interface ServiceStatusItem {
 }
 
 export interface ServiceStatus {
+  /** The canonical workspace, whose switches drive this status. */
+  workspace_id: string;
   harvester: ServiceStatusItem;
   metrics_calculator: ServiceStatusItem;
   arb_executor: ServiceStatusItem;
   exit_handler: ServiceStatusItem;
   live_trading: ServiceStatusItem;
   strategy_modes: StrategyModeStatus[];
+  /** Switches the server's environment turns on: they stay on whatever the workspace says. */
+  environment_switches: EnvironmentSwitches;
+}
+
+export interface EnvironmentSwitches {
+  live_trading: boolean;
+  arb_auto_execute: boolean;
+  exit_handler: boolean;
 }
 
 export interface DynamicConfigItem {
@@ -1298,7 +1308,8 @@ export interface RiskStatus {
 // Quant Signal types
 export type QuantSignalKind = "flow" | "cross_market" | "mean_reversion" | "resolution_proximity" | "latency_arb";
 export type SignalDirection = "BuyYes" | "BuyNo";
-export type SignalExecutionStatus = "pending" | "executed" | "skipped" | "expired";
+/** A signal past its expiry is "skipped" with skip_reason "expired". */
+export type SignalExecutionStatus = "pending" | "executed" | "skipped" | "failed";
 
 export interface FlowFeatureResponse {
   condition_id: string;

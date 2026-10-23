@@ -10,6 +10,7 @@ import { useTradeFlowSummaryQuery } from "@/hooks/queries/useTradeFlowQuery";
 import { useActivity } from "@/hooks/useActivity";
 import { useWorkspaceStore } from "@/stores/workspace-store";
 import { useRiskStatusQuery, useDynamicTunerQuery } from "@/hooks/queries/useRiskQuery";
+import { useTradingSwitches } from "@/hooks/useTradingSwitches";
 import { InfoTooltip } from "@/components/shared/InfoTooltip";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { MarketRegimeBadge } from "@/components/shared/MarketRegimeBadge";
@@ -90,12 +91,18 @@ export function DashboardHome() {
   const { data: riskStatus } = useRiskStatusQuery(currentWorkspace?.id);
   const { data: dynamicTunerStatus } = useDynamicTunerQuery(currentWorkspace?.id);
   const { data: tradeFlowSummary } = useTradeFlowSummaryQuery({ limit: 100 });
+  // As the server applies the switches: the environment can hold either on.
+  const { liveTrading, arbAutoExecute } = useTradingSwitches();
   const isTradingManuallyPaused =
-    Boolean(currentWorkspace) &&
-    !currentWorkspace?.live_trading_enabled &&
-    !currentWorkspace?.arb_auto_execute;
-  const isHardKilled = riskStatus?.circuit_breaker?.trip_reason === "hard_kill_switch";
-  const isCircuitBreakerPaused = Boolean(riskStatus?.circuit_breaker?.tripped);
+    Boolean(currentWorkspace) && !liveTrading && !arbAutoExecute;
+  const breaker = riskStatus?.circuit_breaker;
+  const isHardKilled = breaker?.tripped === true && breaker.trip_reason === "hard_kill_switch";
+  // A switched-off breaker stops its limits, not a latched trip (the hard
+  // kill or a manual trip): only those still block.
+  const breakerOff = breaker?.config.enabled === false;
+  const isCircuitBreakerPaused =
+    breaker?.tripped === true &&
+    (!breakerOff || breaker.trip_reason === "manual" || isHardKilled);
   const automationStatus = isHardKilled
     ? {
         label: "HARD KILL",
@@ -118,7 +125,15 @@ export function DashboardHome() {
           variant: "warning" as const,
           className: "text-xs",
           tooltip:
-            "Automation is paused from workspace settings, even though the automatic safety stop is not currently tripped.",
+            "Live trading and arb execution are switched off, in workspace settings and in the server's environment, even though the automatic safety stop is not tripped.",
+        }
+      : breakerOff
+      ? {
+          label: "No safety stop",
+          variant: "warning" as const,
+          className: "text-xs",
+          tooltip:
+            "The circuit breaker is switched off, so its loss and drawdown limits do not stop trading. Switch it on in Settings.",
         }
       : {
           label: "Healthy",
@@ -131,29 +146,32 @@ export function DashboardHome() {
     // Null until the summary loads, and when the wallet's cash could not be
     // read: never shown as $0.
     const totalValue = accountSummary?.total_equity ?? null;
-    const totalUnrealizedPnl = accountSummary?.unrealized_pnl ?? 0;
+    const totalUnrealizedPnl = accountSummary?.unrealized_pnl ?? null;
     return {
       total_value: totalValue,
       cash_unavailable: accountSummary != null && accountSummary.cash_balance == null,
+      // A valuation the drawdown guard does not use: paper trading, or the
+      // wallet's inventory not yet scanned.
+      equity_partial:
+        accountSummary != null &&
+        accountSummary.cash_balance != null &&
+        !accountSummary.equity_complete,
       cash_balance: accountSummary?.cash_balance ?? null,
       marked_position_value: accountSummary?.position_value ?? 0,
       net_cash_flows_24h: accountSummary?.net_cash_flows_24h ?? 0,
-      realized_pnl_24h: accountSummary?.realized_pnl_24h ?? 0,
+      realized_pnl_24h: accountSummary?.realized_pnl_24h ?? null,
       unpriced_open_positions: accountSummary?.unpriced_open_positions ?? 0,
       unpriced_position_cost_basis:
         accountSummary?.unpriced_position_cost_basis ?? 0,
       total_pnl_percent:
-        totalValue != null && totalValue > 0 ? (totalUnrealizedPnl / totalValue) * 100 : 0,
+        totalValue != null && totalValue > 0 && totalUnrealizedPnl != null
+          ? (totalUnrealizedPnl / totalValue) * 100
+          : undefined,
       total_unrealized_pnl: totalUnrealizedPnl,
-      today_pnl: riskStatus?.circuit_breaker?.daily_pnl ?? 0,
-      today_pnl_percent:
-        totalValue != null && totalValue > 0
-          ? ((riskStatus?.circuit_breaker?.daily_pnl ?? 0) / totalValue) * 100
-          : 0,
-      active_positions: accountSummary?.open_positions ?? positionsSummary?.open_positions ?? 0,
-      win_rate: positionsSummary?.win_rate ?? 0,
+      active_positions: accountSummary?.open_positions ?? positionsSummary?.open_positions ?? null,
+      win_rate: positionsSummary?.win_rate ?? null,
     };
-  }, [accountSummary, positionsSummary, riskStatus]);
+  }, [accountSummary, positionsSummary]);
   const { activities, status: activityStatus, unreadCount } = useActivity();
 
   const equityCurve = useMemo(() => {
@@ -286,12 +304,15 @@ export function DashboardHome() {
       {/* Stats Grid */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <MetricCard
-          title="Account Equity"
+          title={stats.equity_partial ? "Account Equity (partial)" : "Account Equity"}
           value={
             stats.cash_unavailable ? "Unavailable" : formatCurrencyOrDash(stats.total_value)
           }
           change={stats.total_pnl_percent}
           changeLabel={
+            (stats.equity_partial
+              ? "Partial valuation: not trading live, or the wallet's inventory scan has not completed, so shares outside tracked positions may be missing and the drawdown guard does not use it. "
+              : "") +
             (stats.cash_unavailable
               ? `No cash balance: no trading wallet is set, or its balance could not be read. Reconciled exposure ${formatCurrency(stats.marked_position_value)}.`
               : `Cash ${formatCurrencyOrDash(stats.cash_balance)} + reconciled exposure ${formatCurrency(stats.marked_position_value)}.`) +
@@ -300,28 +321,44 @@ export function DashboardHome() {
               ? ` ${stats.unpriced_open_positions} item${stats.unpriced_open_positions === 1 ? "" : "s"} are valued from cost basis because no live mark is stored (cost basis ${formatCurrency(stats.unpriced_position_cost_basis)}).`
               : "")
           }
-          trend={stats.total_pnl_percent >= 0 ? "up" : "down"}
+          trend={
+            stats.total_pnl_percent == null
+              ? "neutral"
+              : stats.total_pnl_percent >= 0
+                ? "up"
+                : "down"
+          }
         />
         <MetricCard
           title="Realized P&L 24h"
-          value={formatCurrency(stats.realized_pnl_24h, { showSign: true })}
-          trend={stats.realized_pnl_24h >= 0 ? "up" : "down"}
+          value={formatCurrencyOrDash(stats.realized_pnl_24h, { showSign: true })}
+          trend={
+            stats.realized_pnl_24h == null
+              ? "neutral"
+              : stats.realized_pnl_24h >= 0
+                ? "up"
+                : "down"
+          }
         />
         <MetricCard
           title="Unrealized P&L"
-          value={formatCurrency(stats.total_unrealized_pnl, { showSign: true })}
+          value={formatCurrencyOrDash(stats.total_unrealized_pnl, { showSign: true })}
           trend={
-            stats.total_unrealized_pnl > 0
+            stats.total_unrealized_pnl != null && stats.total_unrealized_pnl > 0
               ? "up"
-              : stats.total_unrealized_pnl < 0
+              : stats.total_unrealized_pnl != null && stats.total_unrealized_pnl < 0
                 ? "down"
                 : "neutral"
           }
         />
         <MetricCard
           title="Active Exposure"
-          value={stats.active_positions.toString()}
-          changeLabel={`Win rate: ${formatWinRatePercent(stats.win_rate, { input: "percent" })}`}
+          value={stats.active_positions != null ? stats.active_positions.toString() : "—"}
+          changeLabel={
+            stats.win_rate != null
+              ? `Win rate: ${formatWinRatePercent(stats.win_rate, { input: "percent" })}`
+              : undefined
+          }
           trend="neutral"
         />
       </div>

@@ -27,8 +27,11 @@ import {
   selectHasConnectedWallet,
   selectPrimaryWallet,
 } from "@/stores/wallet-store";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useActivity } from "@/hooks/useActivity";
+import { useTradingSwitches } from "@/hooks/useTradingSwitches";
+import { queryKeys } from "@/lib/queryClient";
+import type { UpdateWorkspaceRequest } from "@/types/api";
 import { useWalletBalanceQuery } from "@/hooks/queries/useWalletsQuery";
 import { ConnectionStatus } from "@/components/shared/ConnectionStatus";
 import { ConnectWalletModal } from "@/components/wallet/ConnectWalletModal";
@@ -61,39 +64,57 @@ export function Header() {
   const [showConnectModal, setShowConnectModal] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const { user, logout } = useAuthStore();
-  const { currentWorkspace, setCurrentWorkspace } = useWorkspaceStore();
+  const { currentWorkspace, setCurrentWorkspace, refreshCurrentWorkspace } = useWorkspaceStore();
   const toast = useToastStore();
   const { status: wsStatus, activities, unreadCount, markAsRead } = useActivity();
   const [isSignalDropdownOpen, setIsSignalDropdownOpen] = useState(false);
   const signalDropdownRef = useRef<HTMLDivElement>(null);
 
-  const isTradingActive =
-    currentWorkspace?.live_trading_enabled ||
-    currentWorkspace?.arb_auto_execute ||
-    false;
+  const queryClient = useQueryClient();
+  const { saved, forced, environmentKnown, liveTrading, arbAutoExecute } =
+    useTradingSwitches();
+  const isTradingActive = liveTrading || arbAutoExecute;
+  // Pause switches off what this workspace holds on. A switch the server's
+  // environment holds on stays on (the server refuses to switch it off), so
+  // it is left out and named instead.
+  const pauseUpdate: UpdateWorkspaceRequest = {};
+  if (saved.live_trading_enabled && !forced.live_trading_enabled) {
+    pauseUpdate.live_trading_enabled = false;
+  }
+  if (saved.arb_auto_execute && !forced.arb_auto_execute) {
+    pauseUpdate.arb_auto_execute = false;
+  }
+  const canPause = Object.keys(pauseUpdate).length > 0;
+  const heldOnByEnvironment = [
+    forced.live_trading_enabled ? "LIVE_TRADING" : null,
+    forced.arb_auto_execute ? "ARB_AUTO_EXECUTE" : null,
+  ].filter((name): name is string => name !== null);
+  const environmentHold =
+    heldOnByEnvironment.length > 0
+      ? `${heldOnByEnvironment.join(" and ")}=true in the server's environment ${
+          heldOnByEnvironment.length === 1 ? "keeps it" : "keep them"
+        } on.`
+      : null;
 
   // Pause switches live trading and arb execution off. Resume switches arb
   // execution back on only: live trading is switched on in Settings, never
   // as a side effect of resuming.
   const toggleTradingMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (action: "pause" | "resume") => {
       if (!currentWorkspace) throw new Error("No workspace");
-      return isTradingActive
-        ? api.updateWorkspace(currentWorkspace.id, {
-            live_trading_enabled: false,
-            arb_auto_execute: false,
-          })
+      return action === "pause"
+        ? api.updateWorkspace(currentWorkspace.id, pauseUpdate)
         : api.updateWorkspace(currentWorkspace.id, { arb_auto_execute: true });
     },
-    onSuccess: (updatedWorkspace) => {
+    onSuccess: (updatedWorkspace, action) => {
       setCurrentWorkspace(updatedWorkspace);
-      const paused =
-        !updatedWorkspace.live_trading_enabled &&
-        !updatedWorkspace.arb_auto_execute;
-      if (paused) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.runtime.serviceStatus() });
+      if (action === "pause") {
         toast.warning(
-          "Trading paused",
-          "Live trading and arb execution are switched off for this workspace",
+          environmentHold ? "Paused what this workspace controls" : "Trading paused",
+          environmentHold
+            ? `${environmentHold} Trip the circuit breaker on the Risk page to stop new entries.`
+            : "Live trading and arb execution are switched off for this workspace",
         );
       } else {
         toast.success(
@@ -105,6 +126,8 @@ export function Header() {
       }
     },
     onError: (error) => {
+      // The saved switches may differ from what this page shows: read them again.
+      void refreshCurrentWorkspace();
       toast.error(
         "Failed to update trading state",
         error instanceof Error ? error.message : undefined,
@@ -190,12 +213,21 @@ export function Header() {
   const tradingToggleConfirm = {
     title: isTradingActive ? "Pause automated trading?" : "Resume arb execution?",
     description: isTradingActive
-      ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop new entries at once (exits and manual sales still run)."
-      : currentWorkspace?.live_trading_enabled
-        ? "Arbitrage resumes. Live trading is on, so it trades real funds once the server allows live arbitrage (ARB_ALLOW_LIVE_EXECUTION=true); until then live opportunities are skipped."
+      ? environmentHold
+        ? `Switches off what this workspace holds on. ${environmentHold} To stop new entries at once, trip the circuit breaker on the Risk page (exits and manual sales still run).`
+        : "Live trading and arb execution are switched off for this workspace. To stop new entries at once, trip the circuit breaker on the Risk page (exits and manual sales still run)."
+      : environmentKnown
+        ? "Arbitrage resumes on paper: live trading stays off in this workspace's settings."
         : "Arbitrage resumes. Live trading stays off in this workspace's settings, so it trades on paper unless the server's environment switches live trading on (LIVE_TRADING).",
     confirmLabel: isTradingActive ? "Pause" : "Resume",
   };
+  // Trading the environment holds on cannot be paused from here.
+  const pauseUnavailable = isTradingActive && !canPause;
+  const pauseUnavailableReason = pauseUnavailable
+    ? `${environmentHold} Trip the circuit breaker on the Risk page to stop new entries.`
+    : undefined;
+  const toggleTrading = () =>
+    toggleTradingMutation.mutate(isTradingActive ? "pause" : "resume");
 
   return (
     <header className="sticky top-0 z-40 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -242,7 +274,7 @@ export function Header() {
           {currentWorkspace?.my_role === "owner" && (
             <ConfirmAction
               {...tradingToggleConfirm}
-              onConfirm={() => toggleTradingMutation.mutate()}
+              onConfirm={toggleTrading}
             >
             <Button
               variant="ghost"
@@ -253,7 +285,8 @@ export function Header() {
                   ? "text-emerald-600 hover:text-amber-600 dark:text-emerald-400 dark:hover:text-amber-400"
                   : "text-amber-600 hover:text-emerald-600 dark:text-amber-400 dark:hover:text-emerald-400",
               )}
-              disabled={toggleTradingMutation.isPending}
+              disabled={toggleTradingMutation.isPending || pauseUnavailable}
+              title={pauseUnavailableReason}
             >
               {toggleTradingMutation.isPending ? (
                 <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
@@ -517,8 +550,9 @@ export function Header() {
         modeLabel={modeLabel}
         isTradingActive={isTradingActive}
         isTradingPending={toggleTradingMutation.isPending}
-        onToggleTrading={() => toggleTradingMutation.mutate()}
+        onToggleTrading={toggleTrading}
         tradingToggleConfirm={tradingToggleConfirm}
+        tradingToggleUnavailableReason={pauseUnavailableReason}
         canToggleTrading={currentWorkspace?.my_role === "owner"}
         onConnectWallet={() => setShowConnectModal(true)}
         onLogout={handleLogout}

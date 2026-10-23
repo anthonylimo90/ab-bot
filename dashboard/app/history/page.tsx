@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { MetricCard } from "@/components/shared/MetricCard";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { PageIntro } from "@/components/shared/PageIntro";
+import { ConfirmAction } from "@/components/shared/ConfirmAction";
 import { PositionTableSkeleton } from "@/components/shared/Skeletons";
 import { PortfolioChart } from "@/components/charts/PortfolioChart";
 import { useDynamicConfigHistoryQuery } from "@/hooks/queries/useHistoryQuery";
@@ -76,19 +77,26 @@ export default function HistoryPage() {
     [accountHistory],
   );
 
+  // Money in is positive and money out negative, whatever sign was typed;
+  // only an adjustment takes the sign as typed. A transfer out counts for
+  // the circuit breaker as a withdrawal does, so its direction is chosen,
+  // not inferred from a sign.
+  const enteredAmount = cashFlowAmount.trim() === "" ? NaN : Number(cashFlowAmount);
+  const cashFlowValid = Number.isFinite(enteredAmount) && enteredAmount !== 0;
+  const outflow = ["withdrawal", "transfer_out", "fee"].includes(cashFlowType);
+  const inflow = ["deposit", "transfer_in"].includes(cashFlowType);
+  const signedAmount = outflow
+    ? -Math.abs(enteredAmount)
+    : inflow
+      ? Math.abs(enteredAmount)
+      : enteredAmount;
+
   const handleCreateCashFlow = async () => {
-    const entered = Number(cashFlowAmount);
-    if (!Number.isFinite(entered) || entered === 0) {
+    if (!cashFlowValid) {
       toast.error("Invalid amount", "Enter a non-zero cash flow amount");
       return;
     }
-    // Money in is positive and money out negative, whatever sign was typed;
-    // only an adjustment takes the sign as typed. A transfer out counts for
-    // the circuit breaker as a withdrawal does, so its direction is chosen,
-    // not inferred from a sign.
-    const outflow = ["withdrawal", "transfer_out", "fee"].includes(cashFlowType);
-    const inflow = ["deposit", "transfer_in"].includes(cashFlowType);
-    const amount = outflow ? -Math.abs(entered) : inflow ? Math.abs(entered) : entered;
+    const amount = signedAmount;
     const eventType = cashFlowType.startsWith("transfer_") ? "transfer" : cashFlowType;
 
     try {
@@ -386,14 +394,25 @@ export default function HistoryPage() {
                         </p>
                       )}
                       <div className="md:col-span-2">
-                        <Button
-                          onClick={handleCreateCashFlow}
-                          disabled={createCashFlowMutation.isPending}
+                        {/* A recorded flow moves equity and the circuit
+                            breaker's drawdown references, and is not undone
+                            here: it is confirmed first. */}
+                        <ConfirmAction
+                          title={`Record ${cashFlowLabel(cashFlowType).toLowerCase()} of ${
+                            cashFlowValid ? formatCurrency(signedAmount, { showSign: true }) : ""
+                          }?`}
+                          description="It changes account equity and the circuit breaker's drawdown references, and cannot be edited or removed here. Record only money that moved outside this app."
+                          confirmLabel="Record"
+                          onConfirm={handleCreateCashFlow}
                         >
-                          {createCashFlowMutation.isPending
-                            ? "Recording..."
-                            : "Record Cash Flow"}
-                        </Button>
+                          <Button
+                            disabled={createCashFlowMutation.isPending || !cashFlowValid}
+                          >
+                            {createCashFlowMutation.isPending
+                              ? "Recording..."
+                              : "Record Cash Flow"}
+                          </Button>
+                        </ConfirmAction>
                       </div>
                     </CardContent>
                   </Card>

@@ -14,16 +14,20 @@ export function SignalFunnel() {
     const executed = signals.filter(
       (s) => s.execution_status === "executed",
     ).length;
-    const skipped = signals.filter(
-      (s) => s.execution_status === "skipped",
-    ).length;
+    // A signal past its expiry is skipped with reason "expired"; it is
+    // counted apart from the other skips.
     const expired = signals.filter(
-      (s) => s.execution_status === "expired",
+      (s) => s.execution_status === "skipped" && s.skip_reason === "expired",
+    ).length;
+    const skipped =
+      signals.filter((s) => s.execution_status === "skipped").length - expired;
+    const failed = signals.filter(
+      (s) => s.execution_status === "failed",
     ).length;
     const executionRate =
       generated > 0 ? ((executed / generated) * 100).toFixed(1) : "0";
 
-    return { generated, executed, skipped, expired, executionRate };
+    return { generated, executed, skipped, expired, failed, executionRate };
   }, [signals]);
 
   const items = [
@@ -49,6 +53,12 @@ export function SignalFunnel() {
       label: "Expired",
       value: stats.expired,
       sub: null,
+      color: "text-muted-foreground",
+    },
+    {
+      label: "Failed",
+      value: stats.failed,
+      sub: null,
       color: "text-red-600",
     },
   ];
@@ -58,11 +68,11 @@ export function SignalFunnel() {
       <CardHeader className="pb-3">
         <CardTitle className="flex items-center gap-2 text-base">
           <span>Signal Funnel</span>
-          <InfoTooltip content="Think of this as the system's decision pipeline: generated means an idea was found, executed means a trade was placed, skipped means it was rejected, and expired means the opportunity got too old." />
+          <InfoTooltip content="Think of this as the system's decision pipeline: generated means an idea was found, executed means a trade was placed, skipped means it was rejected, expired means the opportunity got too old, and failed means the order could not be placed." />
         </CardTitle>
       </CardHeader>
       <CardContent>
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-5">
           {items.map((item) => (
             <div
               key={item.label}

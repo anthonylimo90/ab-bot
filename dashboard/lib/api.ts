@@ -524,10 +524,18 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      const error: ApiError = await response.json().catch(() => ({
-        code: "UNKNOWN_ERROR",
-        message: `HTTP ${response.status}`,
-      }));
+      // Errors are JSON, except a body the server could not parse (a 422 in
+      // plain text): its text says which field was wrong, so it is kept.
+      const body = await response.text().catch(() => "");
+      let error: ApiError;
+      try {
+        error = JSON.parse(body) as ApiError;
+      } catch {
+        error = {
+          code: "UNKNOWN_ERROR",
+          message: body.trim().slice(0, 300) || `HTTP ${response.status}`,
+        };
+      }
       if (
         response.status === 401 &&
         sentToken &&

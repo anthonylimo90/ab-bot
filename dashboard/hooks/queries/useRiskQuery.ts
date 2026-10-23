@@ -45,6 +45,9 @@ export function useManualTripMutation(workspaceId: string | undefined) {
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.all() });
     },
     onError: (error: Error) => {
+      // The breaker may have changed anyway (another operator, a retry):
+      // show it as it is.
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.all() });
       toast.error("Circuit breaker trip failed", error.message);
     },
   });
@@ -61,6 +64,7 @@ export function useResetCircuitBreakerMutation(
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.all() });
     },
     onError: (error: Error) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.all() });
       toast.error("Circuit breaker reset failed", error.message);
     },
   });

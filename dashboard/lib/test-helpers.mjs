@@ -69,5 +69,18 @@ export function jsonResponse(body, status = 200) {
     ok: status >= 200 && status < 300,
     status,
     json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
+}
+
+/** A fetch Response whose body is plain text, as axum's extractor rejections are. */
+export function textResponse(body, status) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => {
+      throw new SyntaxError('Unexpected token');
+    },
+    text: async () => body,
   };
 }

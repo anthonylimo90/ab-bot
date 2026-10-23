@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTsModule, jsonResponse } from './test-helpers.mjs';
+import { loadTsModule, jsonResponse, textResponse } from './test-helpers.mjs';
 
 function loadApi(respond) {
   const requests = [];
@@ -126,6 +126,21 @@ test('requests without a token, other statuses and auth endpoints never trigger 
     await assert.rejects(other.api.getPositions());
     assert.deepEqual(other.rejected, [], String(status));
   }
+});
+
+test('an error body in plain text is the error message', async () => {
+  const plain = loadApi(() =>
+    textResponse('Failed to deserialize the JSON body into the target type: max_signal_age_secs: invalid type', 422),
+  );
+  await assert.rejects(plain.api.getPositions(), (error) => {
+    assert.equal(error.statusCode, 422);
+    assert.match(error.message, /max_signal_age_secs/);
+    return true;
+  });
+  const json = loadApi(() => jsonResponse({ code: 'BAD_REQUEST', message: 'limit must be 1–500' }, 400));
+  await assert.rejects(json.api.getPositions(), (error) => error.message === 'limit must be 1–500');
+  const empty = loadApi(() => textResponse('', 502));
+  await assert.rejects(empty.api.getPositions(), (error) => error.message === 'HTTP 502');
 });
 
 test('a throwing unauthorized handler does not mask the original 401', async () => {

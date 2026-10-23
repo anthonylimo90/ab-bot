@@ -24,6 +24,7 @@ import {
 import { cn, formatCurrency } from "@/lib/utils";
 import { ArrowLeft, Layers, ExternalLink } from "lucide-react";
 import type { Position, PositionState } from "@/types/api";
+import { useTradingSwitches } from "@/hooks/useTradingSwitches";
 
 const STATE_BADGE_STYLES: Record<
   PositionState,
@@ -113,6 +114,7 @@ export default function PositionDetailPage() {
   const router = useRouter();
   const { data: position, isLoading, error } = usePositionQuery(params.id);
   const closeMutation = useClosePositionMutation();
+  const { exitHandler } = useTradingSwitches();
 
   if (isLoading) {
     return (
@@ -138,11 +140,18 @@ export default function PositionDetailPage() {
   }
 
   const entryValue = position.entry_price * position.quantity;
+  // A closed position without a realized P&L shows a dash, never $0.
   const pnl = isOpen(position)
     ? position.unrealized_pnl
-    : (position.realized_pnl ?? 0);
-  const pnlPct =
-    entryValue > 0 ? (pnl / entryValue) * 100 : 0;
+    : (position.realized_pnl ?? null);
+  const pnlPct = pnl != null && entryValue > 0 ? (pnl / entryValue) * 100 : null;
+  const pnlText = pnl != null ? formatCurrency(pnl, { showSign: true }) : "-";
+  const pnlPctText =
+    pnlPct != null ? `${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%` : "-";
+  // Exits are queued for the exit handler: with it off, the server refuses
+  // one for a position not already exiting.
+  const exitRefused =
+    !exitHandler && position.state !== "exit_ready" && position.state !== "closing";
 
   return (
     <ErrorBoundary>
@@ -174,7 +183,12 @@ export default function PositionDetailPage() {
                   <Button
                     variant="destructive"
                     size="sm"
-                    disabled={closeMutation.isPending}
+                    disabled={closeMutation.isPending || exitRefused}
+                    title={
+                      exitRefused
+                        ? "The exit handler is off, so a queued exit would not run; switch it on in Settings"
+                        : undefined
+                    }
                   >
                     Request Exit
                   </Button>
@@ -210,9 +224,9 @@ export default function PositionDetailPage() {
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <MetricCard
             title={isOpen(position) ? "Unrealized P&L" : "Realized P&L"}
-            value={formatCurrency(pnl, { showSign: true })}
-            trend={pnl > 0 ? "up" : pnl < 0 ? "down" : "neutral"}
-            changeLabel={`${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`}
+            value={pnlText}
+            trend={pnl != null && pnl > 0 ? "up" : pnl != null && pnl < 0 ? "down" : "neutral"}
+            changeLabel={pnlPctText}
           />
           <MetricCard
             title="Entry Value"
@@ -257,11 +271,24 @@ export default function PositionDetailPage() {
                     "text-xs",
                     position.outcome === "yes"
                       ? "bg-green-500/10 text-green-600 border-green-500/20"
-                      : "bg-red-500/10 text-red-600 border-red-500/20",
+                      : position.outcome === "no"
+                        ? "bg-red-500/10 text-red-600 border-red-500/20"
+                        : "bg-muted text-muted-foreground border-muted-foreground/20",
                   )}
                 >
                   {position.outcome.toUpperCase()}
                 </Badge>
+              }
+            />
+            <DetailRow label="Opened By" value={position.source.replace(/_/g, " ")} />
+            <DetailRow
+              label="Funds"
+              value={
+                position.execution_mode === "live"
+                  ? "Live (real funds)"
+                  : position.execution_mode === "paper"
+                    ? "Paper"
+                    : "Unknown"
               }
             />
             <DetailRow label="Exit Strategy" value={position.exit_strategy.replace(/_/g, " ")} />
@@ -380,16 +407,20 @@ export default function PositionDetailPage() {
             />
             <DetailRow
               label={isOpen(position) ? "Unrealized P&L" : "Realized P&L"}
-              value={formatCurrency(pnl, { showSign: true })}
+              value={pnlText}
               className={cn(
-                pnl > 0 ? "text-profit" : pnl < 0 ? "text-loss" : "",
+                pnl != null && pnl > 0 ? "text-profit" : pnl != null && pnl < 0 ? "text-loss" : "",
               )}
             />
             <DetailRow
               label="P&L %"
-              value={`${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`}
+              value={pnlPctText}
               className={cn(
-                pnlPct > 0 ? "text-profit" : pnlPct < 0 ? "text-loss" : "",
+                pnlPct != null && pnlPct > 0
+                  ? "text-profit"
+                  : pnlPct != null && pnlPct < 0
+                    ? "text-loss"
+                    : "",
               )}
             />
             {position.stop_loss != null && (

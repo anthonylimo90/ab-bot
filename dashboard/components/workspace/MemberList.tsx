@@ -26,6 +26,7 @@ import { Badge } from '@/components/ui/badge';
 import api from '@/lib/api';
 import type { WorkspaceMember, WorkspaceRole } from '@/types/api';
 import { useAuthStore } from '@/stores/auth-store';
+import { useToastStore } from '@/stores/toast-store';
 
 interface MemberListProps {
   workspaceId: string;
@@ -37,6 +38,13 @@ export function MemberList({ workspaceId, members, currentUserRole }: MemberList
   const queryClient = useQueryClient();
   const { user: currentUser } = useAuthStore();
   const [removeMember, setRemoveMember] = useState<WorkspaceMember | null>(null);
+  // A role change is confirmed first: an admin can withdraw funds and lift the
+  // circuit breaker.
+  const [roleChange, setRoleChange] = useState<{
+    member: WorkspaceMember;
+    role: WorkspaceRole;
+  } | null>(null);
+  const toast = useToastStore();
 
   const canManageMembers = currentUserRole === 'owner' || currentUserRole === 'admin';
 
@@ -45,6 +53,12 @@ export function MemberList({ workspaceId, members, currentUserRole }: MemberList
       api.updateMemberRole(workspaceId, memberId, role),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', workspaceId, 'members'] });
+      setRoleChange(null);
+    },
+    onError: (error: Error) => {
+      queryClient.invalidateQueries({ queryKey: ['workspace', workspaceId, 'members'] });
+      setRoleChange(null);
+      toast.error('Role not changed', error.message);
     },
   });
 
@@ -53,6 +67,11 @@ export function MemberList({ workspaceId, members, currentUserRole }: MemberList
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workspace', workspaceId, 'members'] });
       setRemoveMember(null);
+    },
+    onError: (error: Error) => {
+      queryClient.invalidateQueries({ queryKey: ['workspace', workspaceId, 'members'] });
+      setRemoveMember(null);
+      toast.error('Member not removed', error.message);
     },
   });
 
@@ -142,25 +161,19 @@ export function MemberList({ workspaceId, members, currentUserRole }: MemberList
                   <DropdownMenuContent align="end">
                     <DropdownMenuLabel>Change Role</DropdownMenuLabel>
                     <DropdownMenuItem
-                      onClick={() =>
-                        updateRoleMutation.mutate({ memberId: member.user_id, role: 'admin' })
-                      }
+                      onClick={() => setRoleChange({ member, role: 'admin' })}
                       disabled={member.role === 'admin'}
                     >
                       Admin
                     </DropdownMenuItem>
                     <DropdownMenuItem
-                      onClick={() =>
-                        updateRoleMutation.mutate({ memberId: member.user_id, role: 'member' })
-                      }
+                      onClick={() => setRoleChange({ member, role: 'member' })}
                       disabled={member.role === 'member'}
                     >
                       Member
                     </DropdownMenuItem>
                     <DropdownMenuItem
-                      onClick={() =>
-                        updateRoleMutation.mutate({ memberId: member.user_id, role: 'viewer' })
-                      }
+                      onClick={() => setRoleChange({ member, role: 'viewer' })}
                       disabled={member.role === 'viewer'}
                     >
                       Viewer
@@ -199,6 +212,37 @@ export function MemberList({ workspaceId, members, currentUserRole }: MemberList
               disabled={removeMutation.isPending}
             >
               {removeMutation.isPending ? 'Removing...' : 'Remove'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Role Change Confirmation */}
+      <AlertDialog open={!!roleChange} onOpenChange={() => setRoleChange(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Make {roleChange?.member.email} {roleChange?.role === 'admin' ? 'an' : 'a'} {roleChange?.role}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {roleChange?.role === 'admin'
+                ? 'An admin can trade, withdraw funds from the trading wallet, change the risk settings, trip or reset the circuit breaker, and manage members.'
+                : roleChange?.role === 'member'
+                  ? 'A member can place and exit trades, but cannot withdraw funds, change risk settings or manage members.'
+                  : 'A viewer can only view the workspace: no trading, withdrawals or settings.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={updateRoleMutation.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() =>
+                roleChange &&
+                updateRoleMutation.mutate({
+                  memberId: roleChange.member.user_id,
+                  role: roleChange.role,
+                })
+              }
+              disabled={updateRoleMutation.isPending}
+            >
+              {updateRoleMutation.isPending ? 'Changing...' : 'Change Role'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

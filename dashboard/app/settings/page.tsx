@@ -33,6 +33,7 @@ import {
   withdrawalIntent,
 } from '@/lib/withdrawal-intent';
 import { useWorkspaceStore } from '@/stores/workspace-store';
+import { useTradingSwitches } from '@/hooks/useTradingSwitches';
 import { InviteMemberDialog } from '@/components/workspace/InviteMemberDialog';
 import { MemberList } from '@/components/workspace/MemberList';
 import { ConnectWalletModal } from '@/components/wallet/ConnectWalletModal';
@@ -71,6 +72,8 @@ export default function SettingsPage() {
   const [arbAutoExecuteDirty, setArbAutoExecuteDirty] = useState(false);
   const [liveTradingEnabledDirty, setLiveTradingEnabledDirty] = useState(false);
   const [exitHandlerEnabledDirty, setExitHandlerEnabledDirty] = useState(false);
+  // Why the last trading save was refused, until the next save.
+  const [tradingSaveError, setTradingSaveError] = useState<string | null>(null);
 
   // Risk management form state (backed by API, not localStorage)
   const [isSavingRisk, setIsSavingRisk] = useState(false);
@@ -98,7 +101,6 @@ export default function SettingsPage() {
   const currentUserRole = currentWorkspace?.my_role;
   const canInvite = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canManageRisk = currentUserRole === 'owner' || currentUserRole === 'admin';
-  const canConfigureWalletConnect = currentUserRole === 'owner' || currentUserRole === 'admin';
   const canManageWithdrawals = currentUserRole === 'owner' || currentUserRole === 'admin';
   // Workspace settings (wallet connection, trading switches) are the owner's.
   const canUpdateWorkspace = currentUserRole === 'owner';
@@ -117,13 +119,8 @@ export default function SettingsPage() {
     enabled: !!currentWorkspace?.id && canInvite,
   });
 
-  // Fetch service status
-  const { data: serviceStatus } = useQuery({
-    queryKey: queryKeys.runtime.serviceStatus(),
-    queryFn: () => api.getServiceStatus(currentWorkspace!.id),
-    enabled: !!currentWorkspace?.id && canConfigureWalletConnect,
-    refetchInterval: 30000,
-  });
+  // Service status, and the switches the server's environment holds on.
+  const { serviceStatus, forced: forcedOn } = useTradingSwitches();
 
   // Fetch risk status (real CB config from backend)
   const { data: riskStatus } = useQuery({
@@ -168,19 +165,32 @@ export default function SettingsPage() {
     }
   }, [currentWorkspace?.walletconnect_project_id]);
 
-  // Initialize trading config from workspace
+  // Initialize the trading config from the saved workspace, each field again
+  // only when its saved value changes: a poll that reads the same workspace
+  // keeps an unsaved edit.
+  const workspaceId = currentWorkspace?.id;
+  const savedRpcUrl = currentWorkspace?.polygon_rpc_url || '';
+  const savedArbAutoExecute = currentWorkspace?.arb_auto_execute ?? false;
+  const savedLiveTrading = currentWorkspace?.live_trading_enabled ?? false;
+  const savedExitHandler = currentWorkspace?.exit_handler_enabled ?? false;
   useEffect(() => {
-    if (currentWorkspace) {
-      setPolygonRpcUrl(currentWorkspace.polygon_rpc_url || '');
-      setAlchemyApiKey(''); // Never pre-fill masked key
-      setArbAutoExecute(currentWorkspace.arb_auto_execute ?? false);
-      setLiveTradingEnabled(currentWorkspace.live_trading_enabled ?? false);
-      setExitHandlerEnabled(currentWorkspace.exit_handler_enabled ?? false);
-      setArbAutoExecuteDirty(false);
-      setLiveTradingEnabledDirty(false);
-      setExitHandlerEnabledDirty(false);
-    }
-  }, [currentWorkspace]);
+    setPolygonRpcUrl(savedRpcUrl);
+  }, [workspaceId, savedRpcUrl]);
+  useEffect(() => {
+    setAlchemyApiKey(''); // Never pre-fill masked key
+  }, [workspaceId]);
+  useEffect(() => {
+    setArbAutoExecute(savedArbAutoExecute);
+    setArbAutoExecuteDirty(false);
+  }, [workspaceId, savedArbAutoExecute]);
+  useEffect(() => {
+    setLiveTradingEnabled(savedLiveTrading);
+    setLiveTradingEnabledDirty(false);
+  }, [workspaceId, savedLiveTrading]);
+  useEffect(() => {
+    setExitHandlerEnabled(savedExitHandler);
+    setExitHandlerEnabledDirty(false);
+  }, [workspaceId, savedExitHandler]);
 
   useEffect(() => {
     fetchWallets().catch(() => {
@@ -233,12 +243,34 @@ export default function SettingsPage() {
       }
       const updatedWorkspace = await api.updateWorkspace(currentWorkspace.id, updates);
       setCurrentWorkspace(updatedWorkspace);
+      // Saved: the form shows what is stored (the RPC URL masked again).
+      setPolygonRpcUrl(updatedWorkspace.polygon_rpc_url || '');
+      setArbAutoExecute(updatedWorkspace.arb_auto_execute ?? false);
+      setLiveTradingEnabled(updatedWorkspace.live_trading_enabled ?? false);
+      setExitHandlerEnabled(updatedWorkspace.exit_handler_enabled ?? false);
+      setArbAutoExecuteDirty(false);
+      setLiveTradingEnabledDirty(false);
+      setExitHandlerEnabledDirty(false);
+      setTradingSaveError(null);
       toast.success('Trading config saved', 'Your trading configuration has been updated');
       queryClient.invalidateQueries({ queryKey: ['workspace'] });
       queryClient.invalidateQueries({ queryKey: queryKeys.runtime.serviceStatus() });
       setAlchemyApiKey(''); // Clear after save
     } catch (err) {
-      toast.error('Failed to save', err instanceof Error ? err.message : 'Unknown error');
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      // A refused save changed nothing: show the switches as they are saved
+      // (read again, in case the save did land), not as they were asked for.
+      const saved = await api.getWorkspace(currentWorkspace.id).catch(() => null);
+      if (saved) setCurrentWorkspace(saved);
+      const source = saved ?? currentWorkspace;
+      setArbAutoExecute(source.arb_auto_execute ?? false);
+      setLiveTradingEnabled(source.live_trading_enabled ?? false);
+      setExitHandlerEnabled(source.exit_handler_enabled ?? false);
+      setArbAutoExecuteDirty(false);
+      setLiveTradingEnabledDirty(false);
+      setExitHandlerEnabledDirty(false);
+      setTradingSaveError(message);
+      toast.error('Failed to save', message);
     } finally {
       setIsSavingTradingConfig(false);
     }
@@ -269,6 +301,7 @@ export default function SettingsPage() {
       toast.success('Risk settings saved', 'Circuit breaker configuration has been updated');
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
       toast.error('Failed to save risk settings', err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsSavingRisk(false);
@@ -283,6 +316,7 @@ export default function SettingsPage() {
       toast.success('Circuit breaker tripped', 'All automated trading has been paused');
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
       toast.error('Failed to trip circuit breaker', err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsTrippingCb(false);
@@ -297,6 +331,7 @@ export default function SettingsPage() {
       toast.success('Circuit breaker reset', 'Automated trading has been resumed');
       queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
     } catch (err) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.risk.status() });
       toast.error('Failed to reset circuit breaker', err instanceof Error ? err.message : 'Unknown error');
     } finally {
       setIsResettingCb(false);
@@ -309,6 +344,36 @@ export default function SettingsPage() {
     liveTradingEnabledDirty && liveTradingEnabled && !currentWorkspace?.live_trading_enabled;
   const enablingArbAutoExecute =
     arbAutoExecuteDirty && arbAutoExecute && !currentWorkspace?.arb_auto_execute;
+  // Switching the exit handler off is confirmed too: open positions stop
+  // being sold, and live entries stop with it.
+  const disablingExitHandler =
+    exitHandlerEnabledDirty && !exitHandlerEnabled && Boolean(currentWorkspace?.exit_handler_enabled);
+  const tradingSaveConfirm =
+    enablingLiveTrading || enablingArbAutoExecute
+      ? {
+          title:
+            enablingLiveTrading && enablingArbAutoExecute
+              ? 'Turn on live trading and automatic arbitrage?'
+              : enablingLiveTrading
+                ? 'Turn on live trading?'
+                : 'Turn on automatic arbitrage?',
+          description:
+            (enablingLiveTrading
+              ? 'Orders will use real funds from the active wallet, including the automatic strategies that are on. Check the wallet and its balance first.'
+              : 'The bot will place arbitrage trades on its own; with live trading on, they use real funds from the active wallet.') +
+            (disablingExitHandler
+              ? ' The exit handler is also switched off, so open positions are not sold automatically and live entries do not start.'
+              : ''),
+          confirmLabel: 'Save and Turn On',
+        }
+      : disablingExitHandler
+        ? {
+            title: 'Switch the exit handler off?',
+            description:
+              'Open positions are no longer sold automatically: exit conditions and queued exits wait until it is back on. New live entries stop too, since a live entry needs the exit handler running. Resolved markets are still booked.',
+            confirmLabel: 'Save and Switch Off',
+          }
+        : null;
   const tradingSaveButton = (onClick?: () => void) => (
     <Button onClick={onClick} disabled={isSavingTradingConfig} className="w-full">
       {isSavingTradingConfig ? (
@@ -324,6 +389,18 @@ export default function SettingsPage() {
       )}
     </Button>
   );
+
+  // The drawdown limit must stay below the hard kill (the server refuses
+  // otherwise): a limit at or past it would never trip first.
+  const hardKillPct =
+    riskConfig?.hard_kill_drawdown_pct != null
+      ? Math.round(riskConfig.hard_kill_drawdown_pct * 10000) / 100
+      : null;
+  const drawdownAtHardKill =
+    hardKillPct != null &&
+    hardKillPct > 0 &&
+    riskMaxDrawdownPct !== '' &&
+    riskMaxDrawdownPct >= hardKillPct;
 
   // Check if risk form has changed from API baseline
   const riskDirty = riskStatus?.circuit_breaker?.config
@@ -510,7 +587,12 @@ export default function SettingsPage() {
                         )}
                         <ConfirmAction
                           title="Disconnect this wallet?"
-                          description={`${wallet.address} is removed from your account and its private key is erased from the vault. Funds stay in the wallet; reach them only with your own copy of the key.`}
+                          description={`${wallet.address} is removed from your account and its private key is erased from the vault. Funds stay in the wallet; reach them only with your own copy of the key.${
+                            wallet.address.toLowerCase() ===
+                            currentWorkspace?.trading_wallet_address?.toLowerCase()
+                              ? " This is the bot's trading wallet: once its key is erased, live trading cannot sign orders or withdrawals from it until the key is added again."
+                              : ''
+                          }`}
                           confirmLabel="Disconnect and Erase Key"
                           destructive
                           onConfirm={() => handleDisconnectWallet(wallet.address)}
@@ -571,7 +653,7 @@ export default function SettingsPage() {
                       {isPrimaryWalletBalancePending
                         ? 'Loading balance...'
                         : primaryWalletBalance
-                          ? `${formatCurrency(primaryWalletBalance.usdc_balance)} available`
+                          ? `Wallet cash ${formatCurrency(primaryWalletBalance.usdc_balance)}`
                           : 'Balance unavailable'}
                     </div>
                   </div>
@@ -625,7 +707,18 @@ export default function SettingsPage() {
                     onConfirm={handleWithdraw}
                   >
                     <Button
-                      disabled={createWithdrawalMutation.isPending || !withdrawDestination || !withdrawAmount}
+                      disabled={
+                        createWithdrawalMutation.isPending ||
+                        !withdrawDestination ||
+                        !withdrawAmount ||
+                        withdrawalCapacity?.can_withdraw === false
+                      }
+                      title={
+                        withdrawalCapacity?.can_withdraw === false
+                          ? withdrawalCapacity.blocking_reasons.join('; ') ||
+                            'A withdrawal cannot be sent now'
+                          : undefined
+                      }
                       className="w-full sm:w-auto"
                     >
                       {createWithdrawalMutation.isPending ? (
@@ -884,13 +977,19 @@ export default function SettingsPage() {
                 </p>
               </div>
               <Switch
-                checked={arbAutoExecute}
+                checked={arbAutoExecute || forcedOn.arb_auto_execute}
+                disabled={forcedOn.arb_auto_execute}
                 onCheckedChange={(checked) => {
                   setArbAutoExecute(checked);
                   setArbAutoExecuteDirty(true);
                 }}
               />
             </div>
+            {forcedOn.arb_auto_execute && (
+              <p className="text-xs text-muted-foreground">
+                On: ARB_AUTO_EXECUTE=true in the server&apos;s environment holds it on.
+              </p>
+            )}
 
             {/* Exit Handler Toggle */}
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -901,13 +1000,19 @@ export default function SettingsPage() {
                 </p>
               </div>
               <Switch
-                checked={exitHandlerEnabled}
+                checked={exitHandlerEnabled || forcedOn.exit_handler_enabled}
+                disabled={forcedOn.exit_handler_enabled}
                 onCheckedChange={(checked) => {
                   setExitHandlerEnabled(checked);
                   setExitHandlerEnabledDirty(true);
                 }}
               />
             </div>
+            {forcedOn.exit_handler_enabled && (
+              <p className="text-xs text-muted-foreground">
+                On: EXIT_HANDLER_ENABLED=true in the server&apos;s environment holds it on.
+              </p>
+            )}
 
             {/* Live Trading Toggle */}
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -918,14 +1023,20 @@ export default function SettingsPage() {
                 </p>
               </div>
               <Switch
-                checked={liveTradingEnabled}
+                checked={liveTradingEnabled || forcedOn.live_trading_enabled}
+                disabled={forcedOn.live_trading_enabled}
                 onCheckedChange={(checked) => {
                   setLiveTradingEnabled(checked);
                   setLiveTradingEnabledDirty(true);
                 }}
               />
             </div>
-            {liveTradingEnabled && (
+            {forcedOn.live_trading_enabled && (
+              <p className="text-xs text-muted-foreground">
+                On: LIVE_TRADING=true in the server&apos;s environment holds it on.
+              </p>
+            )}
+            {(liveTradingEnabled || forcedOn.live_trading_enabled) && (
               <div className="rounded-lg border border-yellow-500/20 bg-yellow-500/10 p-3">
                 <p className="text-sm text-yellow-500 flex items-center gap-2">
                   <AlertTriangle className="h-4 w-4" />
@@ -934,21 +1045,15 @@ export default function SettingsPage() {
               </div>
             )}
 
-            {enablingLiveTrading || enablingArbAutoExecute ? (
+            {tradingSaveError && (
+              <p role="alert" className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>Not saved: {tradingSaveError}</span>
+              </p>
+            )}
+            {tradingSaveConfirm ? (
               <ConfirmAction
-                title={
-                  enablingLiveTrading && enablingArbAutoExecute
-                    ? 'Turn on live trading and automatic arbitrage?'
-                    : enablingLiveTrading
-                      ? 'Turn on live trading?'
-                      : 'Turn on automatic arbitrage?'
-                }
-                description={
-                  enablingLiveTrading
-                    ? 'Orders will use real funds from the active wallet, including the automatic strategies that are on. Check the wallet and its balance first.'
-                    : 'The bot will place arbitrage trades on its own; with live trading on, they use real funds from the active wallet.'
-                }
-                confirmLabel="Save and Turn On"
+                {...tradingSaveConfirm}
                 destructive
                 onConfirm={handleSaveTradingConfig}
               >
@@ -1119,7 +1224,15 @@ export default function SettingsPage() {
                     </p>
                     <p className="text-sm text-muted-foreground">
                       Pause trading when portfolio value falls this far from its recent peak
+                      {hardKillPct != null && hardKillPct > 0 && (
+                        <> (below the {hardKillPct}% hard kill, which halts until reset)</>
+                      )}
                     </p>
+                    {drawdownAtHardKill && (
+                      <p className="text-xs text-destructive">
+                        Must be below the {hardKillPct}% hard kill: at or past it, the hard kill would trip first.
+                      </p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <input
@@ -1128,7 +1241,7 @@ export default function SettingsPage() {
                       onChange={(e) => setRiskMaxDrawdownPct(e.target.value === '' ? '' : Number(e.target.value))}
                       className="w-20 rounded border bg-background px-3 py-1 text-right"
                       min={1}
-                      max={100}
+                      max={hardKillPct != null && hardKillPct > 0 ? hardKillPct : 100}
                       step={1}
                       disabled={!canManageRisk}
                     />
@@ -1273,7 +1386,7 @@ export default function SettingsPage() {
                       onConfirm={handleSaveRisk}
                     >
                   <Button
-                    disabled={isSavingRisk || !riskDirty}
+                    disabled={isSavingRisk || !riskDirty || drawdownAtHardKill}
                     className="w-full"
                   >
                     {isSavingRisk ? (
@@ -1297,7 +1410,7 @@ export default function SettingsPage() {
                   ) : (
                   <Button
                     onClick={handleSaveRisk}
-                    disabled={isSavingRisk || !riskDirty}
+                    disabled={isSavingRisk || !riskDirty || drawdownAtHardKill}
                     className="w-full"
                   >
                     {isSavingRisk ? (

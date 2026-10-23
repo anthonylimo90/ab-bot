@@ -223,6 +223,7 @@ use crate::websocket;
             workspaces::UpdateMemberRoleRequest,
             workspaces::ServiceStatusResponse,
             workspaces::ServiceStatusItem,
+            workspaces::EnvironmentSwitches,
             crate::strategy_modes::StrategyModeStatus,
             crate::strategy_modes::ResolvedStrategyMode,
             workspaces::DynamicTunerStatusResponse,

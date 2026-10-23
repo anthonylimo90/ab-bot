@@ -33,6 +33,7 @@ import {
   useBatchedPositionUpdates,
 } from "@/hooks/useWebSocket";
 import { useQueryClient } from "@tanstack/react-query";
+import { useTradingSwitches } from "@/hooks/useTradingSwitches";
 import { queryKeys } from "@/lib/queryClient";
 import { cn, formatCurrency, formatWinRatePercent } from "@/lib/utils";
 import {
@@ -82,6 +83,31 @@ const STATE_BADGE_STYLES: Record<
   },
 };
 
+const SOURCE_LABELS: Record<Position["source"], string> = {
+  arb: "Arb",
+  quant: "Quant",
+  copy_trade: "Copy",
+  manual: "Manual",
+};
+
+/** Whether the position trades real funds. */
+function ModeBadge({ mode }: { mode: Position["execution_mode"] }) {
+  if (mode === "unknown") return null;
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        "text-[10px]",
+        mode === "live"
+          ? "border-red-500/30 bg-red-500/10 text-red-600"
+          : "border-muted-foreground/20 text-muted-foreground",
+      )}
+    >
+      {mode === "live" ? "LIVE" : "PAPER"}
+    </Badge>
+  );
+}
+
 function StateBadge({ state }: { state?: PositionState }) {
   const s = state ?? "open";
   const style = STATE_BADGE_STYLES[s] ?? STATE_BADGE_STYLES.open;
@@ -122,6 +148,8 @@ export default function PositionsPage() {
       {enabled: activeTab === "closed", keepPreviousData: true});
 
   const closeMutation = useClosePositionMutation();
+  // Exits are queued for the exit handler: with it off, the server refuses them.
+  const { exitHandler } = useTradingSwitches();
   const queryClient = useQueryClient();
   const router = useRouter();
 
@@ -361,10 +389,11 @@ export default function PositionsPage() {
                     </tr>
                   ) : (
                     positions.map((pos) => {
+                      // A closed row without a realized P&L shows a dash, never $0.
                       const pnl =
                         activeTab === "open"
                           ? pos.unrealized_pnl
-                          : (pos.realized_pnl ?? 0);
+                          : (pos.realized_pnl ?? null);
                       const exitPrice =
                         activeTab === "closed"
                           ? (pos.yes_exit_price ?? pos.no_exit_price ?? pos.current_price)
@@ -390,7 +419,9 @@ export default function PositionsPage() {
                                 "text-xs",
                                 pos.outcome === "yes"
                                   ? "bg-green-500/10 text-green-600 border-green-500/20"
-                                  : "bg-red-500/10 text-red-600 border-red-500/20",
+                                  : pos.outcome === "no"
+                                    ? "bg-red-500/10 text-red-600 border-red-500/20"
+                                    : "bg-muted text-muted-foreground border-muted-foreground/20",
                               )}
                             >
                               {pos.outcome.toUpperCase()}
@@ -411,29 +442,23 @@ export default function PositionsPage() {
                           <td
                             className={cn(
                               "px-4 py-3 text-right font-medium tabular-nums",
-                              pnl > 0
+                              pnl != null && pnl > 0
                                 ? "text-profit"
-                                : pnl < 0
+                                : pnl != null && pnl < 0
                                   ? "text-loss"
                                   : "text-muted-foreground",
                             )}
                           >
-                            {formatCurrency(pnl, { showSign: true })}
+                            {pnl != null ? formatCurrency(pnl, { showSign: true }) : "-"}
                           </td>
                           {activeTab === "open" && (
                             <td className="px-4 py-3 text-right">
-                              {pos.source_wallet ? (
-                                <span
-                                  className="font-mono text-xs text-muted-foreground"
-                                  title={pos.source_wallet}
-                                >
-                                  {pos.source_wallet.slice(0, 6)}...
-                                </span>
-                              ) : (
+                              <span className="inline-flex items-center justify-end gap-1.5">
                                 <span className="text-xs text-muted-foreground">
-                                  arb
+                                  {SOURCE_LABELS[pos.source] ?? pos.source}
                                 </span>
-                              )}
+                                <ModeBadge mode={pos.execution_mode} />
+                              </span>
                             </td>
                           )}
                           {activeTab === "closed" && (
@@ -449,7 +474,20 @@ export default function PositionsPage() {
                                     variant="ghost"
                                     size="sm"
                                     className="h-7 text-xs text-loss hover:text-loss hover:bg-loss/10"
-                                    disabled={closeMutation.isPending || pos.state === "pending"}
+                                    disabled={
+                                      closeMutation.isPending ||
+                                      pos.state === "pending" ||
+                                      (!exitHandler &&
+                                        pos.state !== "exit_ready" &&
+                                        pos.state !== "closing")
+                                    }
+                                    title={
+                                      !exitHandler &&
+                                      pos.state !== "exit_ready" &&
+                                      pos.state !== "closing"
+                                        ? "The exit handler is off, so a queued exit would not run; switch it on in Settings"
+                                        : undefined
+                                    }
                                   >
                                     Exit
                                   </Button>
@@ -495,7 +533,7 @@ export default function PositionsPage() {
             </div>
 
             {/* Pagination for closed tab */}
-            {activeTab === "closed" && closedCount > PAGE_SIZE && (
+            {activeTab === "closed" && closedListCount > PAGE_SIZE && (
               <div className="flex flex-col gap-2 border-t px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                 <span className="text-sm text-muted-foreground">
                   Page {closedPage + 1} of {totalClosedPages}{closedFetching ? " · Updating…" : ""}

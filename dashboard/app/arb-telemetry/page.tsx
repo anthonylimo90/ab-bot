@@ -289,8 +289,8 @@ export default function ArbTelemetryPage() {
                     <th className="px-3 py-2 font-medium">YES</th>
                     <th className="px-3 py-2 font-medium">NO</th>
                     <th className="px-3 py-2 font-medium">Total</th>
-                    <th className="px-3 py-2 font-medium">Expected</th>
-                    <th className="px-3 py-2 font-medium">Observed</th>
+                    <th className="px-3 py-2 font-medium" title="Edge per YES+NO share pair after fees, as the opportunity was priced">Net edge $/sh</th>
+                    <th className="px-3 py-2 font-medium" title="Edge per YES+NO share pair before fees: 1 minus the two asks">Gross edge $/sh</th>
                     <th className="px-3 py-2 font-medium">Slip</th>
                   </tr>
                 </thead>
@@ -326,7 +326,7 @@ export default function ArbTelemetryPage() {
                       <td className="px-3 py-3 text-xs tabular-nums">{formatMs(attempt.no_order_ms)}</td>
                       <td className="px-3 py-3 text-xs tabular-nums">{formatMs(attempt.total_time_ms)}</td>
                       <td className="px-3 py-3 text-xs tabular-nums">
-                        {attempt.expected_edge != null ? `$${attempt.expected_edge.toFixed(2)}` : "—"}
+                        {attempt.expected_edge != null ? `$${attempt.expected_edge.toFixed(4)}` : "—"}
                       </td>
                       <td
                         className={cn(
@@ -334,7 +334,7 @@ export default function ArbTelemetryPage() {
                           (attempt.observed_edge ?? 0) >= 0 ? "text-profit" : "text-loss",
                         )}
                       >
-                        {attempt.observed_edge != null ? `$${attempt.observed_edge.toFixed(2)}` : "—"}
+                        {attempt.observed_edge != null ? `$${attempt.observed_edge.toFixed(4)}` : "—"}
                       </td>
                       <td className="px-3 py-3 text-xs tabular-nums">
                         {attempt.execution_slippage_bps != null
