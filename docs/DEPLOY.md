@@ -1138,6 +1138,12 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   two windows since the entry (the market stopped trading) is itself an
   exit, but only while the flow calculator is writing that window for other
   markets: a stalled calculator or trade feed exits nothing.
+- Resolved shares are not redeemed by this system. The wallet inventory
+  refresh now logs a warning with the value of resolved-market shares still
+  in the wallet ("await redemption"), and values a pair closed at resolution
+  with no winner named at a dollar a pair (it used stale market prices). A
+  position whose resolved market has named no winner for over a day (legs
+  differ) is logged as an error for an operator to settle.
 
 ### API contract changes
 

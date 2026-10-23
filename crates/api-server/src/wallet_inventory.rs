@@ -418,7 +418,7 @@ async fn refresh_wallet_inventory(
 
     hydrate_condition_ids(&state.pool, &mut candidates).await?;
     hydrate_outcomes(state.market_catalog.as_ref(), &mut candidates).await?;
-    let market_prices = load_market_prices(&state.pool, &candidates).await?;
+    let (market_prices, resolved_markets) = load_market_prices(&state.pool, &candidates).await?;
 
     // Complete all reads before publishing any balances. A failed token read
     // retains the previous snapshot, including previously observed zero balances.
@@ -429,6 +429,9 @@ async fn refresh_wallet_inventory(
     let mut rows = Vec::with_capacity(candidates.len());
     let mut nonzero_tokens = 0_usize;
     let mut orphan_tokens = 0_usize;
+    // What resolved markets still owe the wallet: nothing here redeems
+    // winning shares, so they sit as tokens until an operator does.
+    let mut awaiting_redemption = Decimal::ZERO;
 
     for (_, candidate) in candidates {
         let quantity = balances[&candidate.token_id];
@@ -446,6 +449,13 @@ async fn refresh_wallet_inventory(
                 _ => None,
             });
         let marked_value = current_price.map(|price| price * quantity);
+        if candidate
+            .condition_id
+            .as_ref()
+            .is_some_and(|market| resolved_markets.contains(market))
+        {
+            awaiting_redemption += marked_value.unwrap_or_default();
+        }
         let is_manual = candidate
             .condition_id
             .as_ref()
@@ -500,6 +510,14 @@ async fn refresh_wallet_inventory(
 
     repo.upsert_entries(&rows).await?;
     save_phase2_cursor(&repo, wallet_address, phase2_cursor).await?;
+    if awaiting_redemption > Decimal::ZERO {
+        warn!(
+            wallet = %wallet_address,
+            value_usd = %awaiting_redemption.round_dp(2),
+            "Shares of resolved markets await redemption: redeem them on Polymarket to turn \
+             them into cash"
+        );
+    }
 
     Ok(Some(WalletInventoryRefreshResult {
         wallet_address: wallet_address.to_owned(),
@@ -1235,17 +1253,19 @@ async fn hydrate_outcomes(
     Ok(())
 }
 
+/// Prices of the candidates' markets, and the markets known to have
+/// resolved (their shares are worth their payout until redeemed).
 async fn load_market_prices(
     pool: &sqlx::PgPool,
     candidates: &HashMap<String, InventoryCandidate>,
-) -> anyhow::Result<HashMap<String, MarketPriceRow>> {
+) -> anyhow::Result<(HashMap<String, MarketPriceRow>, HashSet<String>)> {
     let market_ids = candidates
         .values()
         .filter_map(|candidate| candidate.condition_id.clone())
         .collect::<Vec<_>>();
 
     if market_ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashSet::new()));
     }
 
     let rows = sqlx::query_as::<_, MarketPriceRow>(
@@ -1272,12 +1292,36 @@ async fn load_market_prices(
     .bind(&market_ids)
     .fetch_all(pool)
     .await?;
+    let mut resolved_markets = HashSet::new();
+    // A pair a position closed at resolution with no winner named pays a
+    // dollar a pair: half each, until a winner is known.
+    let split: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT p.market_id FROM positions p \
+         JOIN trade_events te ON te.position_id = p.id AND te.event_type = 'closed_via_resolution' \
+         WHERE p.market_id = ANY($1) AND p.resolution_winner IS NULL",
+    )
+    .bind(&market_ids)
+    .fetch_all(pool)
+    .await?;
+    let half = Decimal::new(5, 1);
+    for (market_id,) in split {
+        resolved_markets.insert(market_id.clone());
+        prices.insert(
+            market_id.clone(),
+            MarketPriceRow {
+                id: market_id,
+                yes_price: Some(half),
+                no_price: Some(half),
+            },
+        );
+    }
     for (market_id, winner) in resolved {
         let (yes, no) = match winner.as_str() {
             "yes" => (Decimal::ONE, Decimal::ZERO),
             "no" => (Decimal::ZERO, Decimal::ONE),
             _ => continue,
         };
+        resolved_markets.insert(market_id.clone());
         prices.insert(
             market_id.clone(),
             MarketPriceRow {
@@ -1287,7 +1331,7 @@ async fn load_market_prices(
             },
         );
     }
-    Ok(prices)
+    Ok((prices, resolved_markets))
 }
 
 async fn load_expected_sell_price(
@@ -1408,6 +1452,61 @@ fn looks_like_token_id(token_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn resolved_markets_are_valued_at_their_payout(pool: sqlx::PgPool) {
+        sqlx::Executor::execute(
+            &pool,
+            "CREATE TABLE markets (id TEXT, yes_price NUMERIC, no_price NUMERIC); \
+             CREATE TABLE positions (id UUID, market_id TEXT, resolution_winner TEXT, \
+                 last_updated TIMESTAMPTZ); \
+             CREATE TABLE trade_events (position_id UUID, event_type TEXT); \
+             INSERT INTO markets VALUES ('won', 0.97, 0.03), ('split', 0.9, 0.1), ('open', 0.4, 0.6)",
+        )
+        .await
+        .unwrap();
+        let won = uuid::Uuid::new_v4();
+        let split = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO positions VALUES ($1, 'won', 'YES', NOW()), ($2, 'split', NULL, NOW())",
+        )
+        .bind(won)
+        .bind(split)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO trade_events VALUES ($1, 'closed_via_resolution'), ($2, 'closed_via_resolution')")
+            .bind(won)
+            .bind(split)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let candidates: HashMap<String, InventoryCandidate> = ["won", "split", "open"]
+            .into_iter()
+            .map(|market| {
+                (
+                    market.to_string(),
+                    InventoryCandidate {
+                        token_id: market.to_string(),
+                        condition_id: Some(market.to_string()),
+                        ..InventoryCandidate::default()
+                    },
+                )
+            })
+            .collect();
+        let (prices, resolved) = load_market_prices(&pool, &candidates).await.unwrap();
+        let price = |market: &str| (prices[market].yes_price, prices[market].no_price);
+        assert_eq!(price("won"), (Some(Decimal::ONE), Some(Decimal::ZERO)));
+        // A pair closed at resolution with no winner named: a dollar a pair.
+        let half = Some(Decimal::new(5, 1));
+        assert_eq!(price("split"), (half, half));
+        assert_eq!(
+            price("open"),
+            (Some(Decimal::new(4, 1)), Some(Decimal::new(6, 1)))
+        );
+        assert!(resolved.contains("won") && resolved.contains("split"));
+        assert!(!resolved.contains("open"));
+    }
 
     fn entry(
         linked_position_id: Option<Uuid>,

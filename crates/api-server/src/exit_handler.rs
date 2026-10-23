@@ -1359,12 +1359,24 @@ impl ExitHandler {
             // a split payout. Never booked at a guessed payout: the position
             // waits, the first such look recorded for an operator.
             let waited = self.waited_for_winner(position, &ctx).await?;
-            warn!(
-                position_id = %position.id,
-                market_id = %market_id,
-                waited_hours = waited.num_hours(),
-                "Resolved market has no single winner and the position's legs differ; waiting for the winner"
-            );
+            if waited > chrono::Duration::hours(24) {
+                // A day on, the winner is not coming by itself: a split or
+                // invalid payout, for an operator to settle.
+                error!(
+                    position_id = %position.id,
+                    market_id = %market_id,
+                    waited_hours = waited.num_hours(),
+                    "Resolved market has named no winner for over a day and the position's legs \
+                     differ; settle it by hand"
+                );
+            } else {
+                warn!(
+                    position_id = %position.id,
+                    market_id = %market_id,
+                    waited_hours = waited.num_hours(),
+                    "Resolved market has no single winner and the position's legs differ; waiting for the winner"
+                );
+            }
             return Ok(false);
         };
 
