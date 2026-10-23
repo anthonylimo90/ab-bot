@@ -15,7 +15,7 @@ use polymarket_core::types::{
 use risk_manager::circuit_breaker::CircuitBreaker;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
@@ -280,8 +280,12 @@ impl StrategyState {
     }
 
     /// Persist this strategy's state to the database.
-    async fn persist(&self, pool: &PgPool, strategy: &str) {
-        if let Err(e) = sqlx::query(
+    async fn persist<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        strategy: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
             r#"
             INSERT INTO strategy_risk_state (
                 strategy, daily_pnl, daily_pnl_date, consecutive_losses,
@@ -305,15 +309,9 @@ impl StrategyState {
         .bind(self.halted)
         .bind(self.halt_reason.as_deref())
         .bind(self.halted_at)
-        .execute(pool)
+        .execute(executor)
         .await
-        {
-            warn!(
-                strategy,
-                error = %e,
-                "Failed to persist strategy risk state"
-            );
-        }
+        .map(|_| ())
     }
 
     /// Load strategy state from the database. Returns default if not found.
@@ -370,9 +368,6 @@ struct QuantSignalExecutor {
     strategy_states: HashMap<QuantSignalKind, StrategyState>,
     /// Closed quant positions that have already been folded into strategy state.
     /// Cleared on UTC day rollover to prevent unbounded growth.
-    processed_strategy_outcomes: HashSet<uuid::Uuid>,
-    /// UTC date when processed_strategy_outcomes was last cleared.
-    processed_outcomes_date: chrono::NaiveDate,
     heartbeat: Arc<AtomicI64>,
     /// When set, live positions are entered only while the exit handler can
     /// take their profit, stop their loss and end their hold.
@@ -426,8 +421,6 @@ impl QuantSignalExecutor {
             shadow_prediction_recorder,
             rollout_controller,
             strategy_states,
-            processed_strategy_outcomes: HashSet::new(),
-            processed_outcomes_date: Utc::now().date_naive(),
             heartbeat,
             exit_readiness: None,
             fee_terms: Default::default(),
@@ -454,10 +447,8 @@ impl QuantSignalExecutor {
         self.heartbeat
             .store(Utc::now().timestamp(), Ordering::Relaxed);
 
-        // Rebuild today's per-strategy realized outcomes on startup.
-        self.sync_strategy_outcomes().await;
-
-        // Load persisted per-strategy risk state from DB (survives restarts).
+        // Load persisted per-strategy risk state from DB (survives restarts),
+        // then fold in the closes it has not counted yet.
         for (kind, state) in &mut self.strategy_states {
             let loaded = StrategyState::load(&self.pool, kind.as_str()).await;
             if loaded.daily_pnl != Decimal::ZERO || loaded.consecutive_losses > 0 || loaded.halted {
@@ -471,6 +462,7 @@ impl QuantSignalExecutor {
             }
             *state = loaded;
         }
+        self.sync_strategy_outcomes().await;
 
         let mut heartbeat_ticker = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -525,11 +517,6 @@ impl QuantSignalExecutor {
         }
 
         let today = Utc::now().date_naive();
-        // Clear the dedup set on UTC day rollover to prevent unbounded growth
-        if today != self.processed_outcomes_date {
-            self.processed_strategy_outcomes.clear();
-            self.processed_outcomes_date = today;
-        }
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
             today.and_hms_opt(0, 0, 0).expect("valid midnight"),
             Utc,
@@ -552,6 +539,7 @@ impl QuantSignalExecutor {
               AND p.realized_pnl IS NOT NULL
               AND p.exit_timestamp >= $1
               AND p.execution_mode = $2
+              AND p.strategy_breaker_recorded_at IS NULL
               AND NOT (p.realized_pnl > 0 AND NOT {})
             ORDER BY p.exit_timestamp ASC
             "#,
@@ -570,18 +558,20 @@ impl QuantSignalExecutor {
         };
 
         for row in rows {
-            if !self.processed_strategy_outcomes.insert(row.position_id) {
-                continue;
-            }
-
             if let Some(kind) = parse_quant_signal_kind(&row.kind) {
-                self.record_strategy_outcome(
-                    kind,
-                    row.realized_pnl,
-                    row.realized_pnl > Decimal::ZERO,
-                    &cfg,
-                )
-                .await;
+                if let Err(error) = self
+                    .record_strategy_outcome(
+                        kind,
+                        row.position_id,
+                        row.realized_pnl,
+                        row.realized_pnl > Decimal::ZERO,
+                        &cfg,
+                    )
+                    .await
+                {
+                    // Neither counted nor marked: the next pass retries it.
+                    warn!(%error, position_id = %row.position_id, "Failed recording a quant strategy outcome");
+                }
             } else {
                 warn!(kind = %row.kind, position_id = %row.position_id, "Unknown quant signal kind while syncing outcomes");
             }
@@ -1505,42 +1495,67 @@ impl QuantSignalExecutor {
     }
 
     /// Record an outcome with the per-strategy circuit breaker.
+    /// Count one close against its strategy's breaker: the close is marked
+    /// counted and the new state saved in one transaction, so each close
+    /// counts once whatever restarts or failures come between.
     async fn record_strategy_outcome(
         &mut self,
         kind: QuantSignalKind,
+        position_id: uuid::Uuid,
         pnl: Decimal,
         success: bool,
         cfg: &QuantSignalExecutorConfig,
-    ) {
+    ) -> Result<(), sqlx::Error> {
+        let Some(current) = self.strategy_states.get(&kind) else {
+            return Ok(());
+        };
+        let mut next = current.clone();
         // Entry submissions do not realize P&L. Treat zero-P&L events as
         // operational noise rather than strategy losses so client-side rejects
         // and startup retries do not trip the per-strategy breaker.
-        if pnl.is_zero() {
-            debug!(
-                kind = kind.as_str(),
-                success, "Skipping zero-PnL quant strategy outcome"
-            );
-            return;
-        }
-
-        if let Some(state) = self.strategy_states.get_mut(&kind) {
-            let halted = state.record_outcome(
+        let counted = !pnl.is_zero();
+        let halted = counted
+            && next.record_outcome(
                 pnl,
                 cfg.strategy_max_daily_loss_usd,
                 cfg.strategy_max_consecutive_losses,
             );
-            if halted {
-                warn!(
-                    kind = kind.as_str(),
-                    reason = state.halt_reason.as_deref().unwrap_or("unknown"),
-                    daily_pnl = %state.daily_pnl,
-                    consecutive_losses = state.consecutive_losses,
-                    "Per-strategy circuit breaker tripped — halting strategy"
-                );
-            }
-            // Persist to DB so state survives restarts
-            state.persist(&self.pool, kind.as_str()).await;
+        if !counted {
+            debug!(
+                kind = kind.as_str(),
+                success, "Skipping zero-PnL quant strategy outcome"
+            );
         }
+
+        let mut tx = self.pool.begin().await?;
+        let marked = sqlx::query(
+            "UPDATE positions SET strategy_breaker_recorded_at = NOW() \
+             WHERE id = $1 AND strategy_breaker_recorded_at IS NULL",
+        )
+        .bind(position_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if marked == 0 {
+            // Counted already (by another pass or process).
+            return Ok(());
+        }
+        if counted {
+            next.persist(&mut *tx, kind.as_str()).await?;
+        }
+        tx.commit().await?;
+
+        if halted {
+            warn!(
+                kind = kind.as_str(),
+                reason = next.halt_reason.as_deref().unwrap_or("unknown"),
+                daily_pnl = %next.daily_pnl,
+                consecutive_losses = next.consecutive_losses,
+                "Per-strategy circuit breaker tripped — halting strategy"
+            );
+        }
+        self.strategy_states.insert(kind, next);
+        Ok(())
     }
 
     /// Update the execution status of a signal in the DB.
@@ -2135,6 +2150,37 @@ mod tests {
         assert_eq!(flow.daily_pnl, Decimal::from(-250));
         // -$250 is past the default $200 per-strategy daily loss limit.
         assert!(flow.halted);
+
+        // Each close counts once: another pass adds nothing, and a restart
+        // loads the saved state rather than replaying the day over it.
+        executor.sync_strategy_outcomes().await;
+        assert_eq!(
+            executor.strategy_states[&QuantSignalKind::Flow].daily_pnl,
+            Decimal::from(-250)
+        );
+        // An operator cleared the halt meanwhile; a restart keeps that.
+        sqlx::query("UPDATE strategy_risk_state SET halted = false, halt_reason = NULL, halted_at = NULL WHERE strategy = 'flow'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut restarted = QuantSignalExecutor::new(
+            Arc::new(RwLock::new(QuantSignalExecutorConfig::from_env())),
+            broadcast::channel(1).1,
+            broadcast::channel(1).0,
+            broadcast::channel(1).0,
+            state.order_executor.clone(),
+            state.circuit_breaker.clone(),
+            state.market_catalog.clone(),
+            pool.clone(),
+            Arc::new(AtomicI64::new(0)),
+        );
+        for (kind, strategy) in &mut restarted.strategy_states {
+            *strategy = StrategyState::load(&pool, kind.as_str()).await;
+        }
+        restarted.sync_strategy_outcomes().await;
+        let flow = &restarted.strategy_states[&QuantSignalKind::Flow];
+        assert_eq!(flow.daily_pnl, Decimal::from(-250));
+        assert!(!flow.halted);
     }
 
     #[sqlx::test(migrations = false)]

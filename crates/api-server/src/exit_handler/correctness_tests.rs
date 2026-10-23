@@ -19,7 +19,8 @@ pub(crate) async fn setup(pool: &PgPool) -> PositionService {
             held_yes_qty NUMERIC, held_no_qty NUMERIC, exited_yes_qty NUMERIC,
             exited_no_qty NUMERIC, resolution_winner TEXT, is_open BOOLEAN,
             opened_at TIMESTAMPTZ, source SMALLINT, source_signal_id UUID,
-            current_price NUMERIC, breaker_recorded_at TIMESTAMPTZ
+            current_price NUMERIC, breaker_recorded_at TIMESTAMPTZ,
+            strategy_breaker_recorded_at TIMESTAMPTZ
         );
         CREATE TABLE markets(id TEXT, yes_price NUMERIC, no_price NUMERIC);
         CREATE TABLE orders(quantity NUMERIC, filled_quantity NUMERIC, price NUMERIC, side TEXT, status TEXT,id UUID, execution_mode TEXT NOT NULL DEFAULT 'unknown', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ, exchange_order_id TEXT);

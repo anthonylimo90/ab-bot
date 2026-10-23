@@ -1113,6 +1113,16 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   recorded, not only after a withdrawal. A quant entry or manual buy could
   take a pair's second-leg cash between its check and its second leg,
   leaving it one-legged; now the entry checking second refuses instead.
+- Per-strategy quant breakers (migration 103): each close is counted once,
+  marked on the position (`strategy_breaker_recorded_at`) in the same
+  transaction that saves the breaker state. The executor used to replay the
+  day's closes over the saved state on every start, which could re-halt a
+  strategy whose losing streak had already been reset and restarted a
+  halt's cooldown. The migration marks closes made before it as counted.
+- The order reconciler treats an order the exchange reports MATCHED as done
+  even when its matched size is a rounding short of its size (it stayed
+  unresolved, fencing every live order of the wallet), and measures order
+  ages on the database's clock.
 
 ### API contract changes
 
