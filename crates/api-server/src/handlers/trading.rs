@@ -412,15 +412,29 @@ async fn execute_reserved_order(
             )));
         }
         let cb_state = state.circuit_breaker.state().await;
-        let daily_loss =
-            cb_state.trip_reason == Some(risk_manager::circuit_breaker::TripReason::DailyLossLimit);
+        if !cb_state.tripped {
+            return Err(ApiError::ServiceUnavailable(
+                "The circuit breaker's trip has just been lifted; try again".into(),
+            ));
+        }
+        let max_daily_loss = state.circuit_breaker.config().await.max_daily_loss;
+        let day_loss_over_limit =
+            cb_state.daily_pnl < Decimal::ZERO && -cb_state.daily_pnl >= max_daily_loss;
         let resumes = match cb_state.resume_at {
             None => "Holds until an owner or admin resets it".to_string(),
-            Some(at) if daily_loss => format!(
-                "Holds until {} at the earliest, and while the day's loss exceeds the limit \
-                 (until the UTC day ends)",
-                at.to_rfc3339()
-            ),
+            // A trip holds while the day's loss is over the limit: until
+            // the UTC day ends.
+            Some(at) if day_loss_over_limit => {
+                let day_ends = Utc::now()
+                    .date_naive()
+                    .succ_opt()
+                    .map(|day| day.and_time(chrono::NaiveTime::MIN).and_utc())
+                    .unwrap_or(at);
+                format!(
+                    "Holds until {}: the day's loss is over the limit",
+                    at.max(day_ends).to_rfc3339()
+                )
+            }
             Some(at) if at > Utc::now() => format!("Resumes at {}", at.to_rfc3339()),
             // A process that does not lead follows the trading process
             // within seconds of it lifting the trip.

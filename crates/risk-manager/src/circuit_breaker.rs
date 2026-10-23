@@ -293,6 +293,9 @@ pub struct CircuitBreaker {
     is_tripped: AtomicBool,
     /// Consecutive equity snapshots at or beyond the hard-kill drawdown.
     hard_kill_breaches: AtomicU32,
+    /// The breaker's clock was stopped by a hold since the recovery stage
+    /// began: the stage restarts rather than counting the held time.
+    clock_held: AtomicBool,
     /// Database repository for persistence.
     repo: Option<CircuitBreakerRepository>,
     /// Whether this process keeps the persisted state. One process trades
@@ -350,6 +353,7 @@ impl CircuitBreaker {
             state: Arc::new(RwLock::new(CircuitBreakerState::default())),
             is_tripped: AtomicBool::new(false),
             hard_kill_breaches: AtomicU32::new(0),
+            clock_held: AtomicBool::new(false),
             repo: None,
             leader: AtomicBool::new(true),
             operator_epoch: AtomicI64::new(0),
@@ -634,6 +638,9 @@ impl CircuitBreaker {
     pub async fn can_trade(&self) -> bool {
         self.sync().await;
         if !self.entry_holds().is_empty() {
+            if self.keeps_course() {
+                self.clock_held.store(true, Ordering::SeqCst);
+            }
             return false;
         }
         if !self.config.read().await.enabled {
@@ -657,7 +664,8 @@ impl CircuitBreaker {
         if self.keeps_course() && self.state.read().await.recovery_state.is_some() {
             self.try_advance_recovery().await;
         }
-        true
+        // An operator's trip adopted by a save just now holds.
+        !self.is_tripped.load(Ordering::SeqCst)
     }
 
     /// Whether this process runs the breaker's clock (a cooldown's end,
@@ -675,10 +683,14 @@ impl CircuitBreaker {
     /// run out while nothing can trade (closes uncounted, settings unread).
     pub async fn tick(&self) {
         self.sync().await;
-        if !self.keeps_course()
-            || !self.entry_holds().is_empty()
-            || !self.config.read().await.enabled
-        {
+        if !self.keeps_course() {
+            return;
+        }
+        if !self.entry_holds().is_empty() {
+            self.clock_held.store(true, Ordering::SeqCst);
+            return;
+        }
+        if !self.config.read().await.enabled {
             return;
         }
         if self.is_tripped.load(Ordering::SeqCst) {
@@ -762,12 +774,14 @@ impl CircuitBreaker {
                 "Cooldown elapsed, starting gradual recovery mode"
             );
             state.recovery_state = Some(recovery);
+            self.clock_held.store(false, Ordering::SeqCst);
         } else {
             info!("Cooldown elapsed, circuit breaker reset");
         }
 
         self.persist_state(&mut state).await;
-        true
+        // An operator's trip adopted by the save holds.
+        !state.tripped
     }
 
     /// Advance recovery to next stage if conditions are met.
@@ -790,6 +804,18 @@ impl CircuitBreaker {
         }
 
         let now = Utc::now();
+        // Entries were held during the stage: nothing traded at its
+        // capacity, so it starts again rather than count the held time.
+        if self.clock_held.swap(false, Ordering::SeqCst) {
+            recovery.stage_started_at = now;
+            recovery.next_stage_at = Some(after_minutes(now, config.recovery_stage_minutes));
+            info!(
+                stage = recovery.current_stage,
+                "Entries were held during this recovery stage; it starts again"
+            );
+            self.persist_state(&mut state).await;
+            return false;
+        }
 
         // Check time requirement
         let time_ready = recovery.next_stage_at.map(|t| now >= t).unwrap_or(true);
@@ -1723,6 +1749,39 @@ mod tests {
 
         // Should be fully recovered now
         assert!(!breaker.is_in_recovery().await);
+    }
+
+    #[tokio::test]
+    async fn a_hold_restarts_the_recovery_stage_it_spans() {
+        let config = CircuitBreakerConfig {
+            max_consecutive_losses: 2,
+            max_daily_loss: Decimal::new(100000, 0),
+            cooldown_minutes: 0,
+            gradual_recovery_enabled: true,
+            recovery_stages: 4,
+            recovery_stage_minutes: 0,
+            require_profit_to_advance: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let breaker = CircuitBreaker::new(config);
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        assert!(breaker.can_trade().await);
+        assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
+
+        // Entries held: the clock stops.
+        breaker.hold_entries("missed_closes", "closes not yet counted");
+        breaker.tick().await;
+        assert!(!breaker.can_trade().await);
+        assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
+        breaker.release_entries("missed_closes");
+
+        // The stage the hold spanned starts again rather than ending.
+        assert!(!breaker.try_advance_recovery().await);
+        assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
+        assert!(breaker.try_advance_recovery().await);
+        assert_eq!(breaker.trading_capacity().await, Decimal::new(50, 2));
     }
 
     #[tokio::test]

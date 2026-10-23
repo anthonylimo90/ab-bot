@@ -939,6 +939,32 @@ mod tests {
     }
 
     #[sqlx::test(migrations = false)]
+    async fn a_resume_that_adopts_an_operators_trip_does_not_trade(pool: PgPool) {
+        use rust_decimal::Decimal;
+        create_schema(&pool).await;
+        create_positions(&pool).await;
+        let config = crate::CircuitBreakerConfig {
+            cooldown_minutes: 0,
+            ..config()
+        };
+        let leader = crate::CircuitBreaker::with_persistence(config.clone(), pool.clone());
+        leader.lead().await.unwrap();
+        for _ in 0..3 {
+            leader.record_trade(Decimal::from(-5)).await.unwrap();
+        }
+        assert!(leader.is_tripped());
+        // The leader has just synced, so it has not seen the operator's trip
+        // made through another process when its cooldown ends.
+        leader.state().await;
+        let follower = crate::CircuitBreaker::with_persistence(config, pool.clone()).following();
+        follower.manual_trip(Some("operator".into())).await.unwrap();
+        // The resume's save finds the trip and takes it: no trade.
+        assert!(!leader.can_trade().await);
+        assert!(leader.is_tripped());
+        assert_eq!(leader.state().await.trip_reason, Some(TripReason::Manual));
+    }
+
+    #[sqlx::test(migrations = false)]
     async fn a_trip_made_through_a_follower_is_adopted_not_overwritten(pool: PgPool) {
         use crate::CircuitBreaker;
         use rust_decimal::Decimal;
