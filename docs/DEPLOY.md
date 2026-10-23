@@ -969,6 +969,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   version booked without saving it is not counted. A hand edit of the row
   (anything but this version's code moving `updated_at`) is read the same
   way: the next claim marks rather than counts the closes left unmarked.
+- The bound of 20 wallet orders awaiting a signature per user now holds
+  for requests made at once (checked again under a per-user lock as the
+  order is stored).
 - Cancelling an order is no longer refused while the server shuts down
   (placing one still is); the shutdown waits for it.
 - A process that loses trading leadership stops saving the circuit breaker

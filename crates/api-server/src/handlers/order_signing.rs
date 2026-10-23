@@ -187,6 +187,28 @@ const INSERT_PENDING_ORDER: &str = r#"
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 "#;
 
+/// How many of the user's prepared orders await a signature (a submitted
+/// one has an intent of the same id).
+async fn prepared_awaiting(
+    executor: impl sqlx::PgExecutor<'_>,
+    user_id: Uuid,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_wallet_orders p WHERE p.user_id = $1 \
+         AND NOT EXISTS (SELECT 1 FROM execution_intents i WHERE i.id = p.id)",
+    )
+    .bind(user_id)
+    .fetch_one(executor)
+    .await
+}
+
+fn prepared_orders_full() -> ApiError {
+    ApiError::Conflict(format!(
+        "{MAX_PREPARED_ORDERS_PER_USER} prepared orders already await a signature; submit them \
+         or let them expire"
+    ))
+}
+
 /// Deletes a user's expired prepared orders, except a submitted one whose
 /// answer is in doubt or that expired less than a day ago.
 const PRUNE_PREPARED_ORDERS: &str = r#"
@@ -388,18 +410,10 @@ pub async fn prepare_order(
         .bind(user_id)
         .execute(&state.pool)
         .await?;
-    let awaiting: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pending_wallet_orders p WHERE p.user_id = $1 \
-         AND NOT EXISTS (SELECT 1 FROM execution_intents i WHERE i.id = p.id)",
-    )
-    .bind(user_id)
-    .fetch_one(&state.pool)
-    .await?;
-    if awaiting >= MAX_PREPARED_ORDERS_PER_USER {
-        return Err(ApiError::Conflict(format!(
-            "{MAX_PREPARED_ORDERS_PER_USER} prepared orders already await a signature; submit \
-             them or let them expire"
-        )));
+    // Checked again when the order is stored; this spares the exchange
+    // lookups below.
+    if prepared_awaiting(&state.pool, user_id).await? >= MAX_PREPARED_ORDERS_PER_USER {
+        return Err(prepared_orders_full());
     }
     let neg_risk = state
         .clob_client
@@ -441,7 +455,17 @@ pub async fn prepare_order(
     // Create pending order ID
     let pending_order_id = Uuid::new_v4();
 
-    // Store pending order in database
+    // Store the pending order, the bound checked again under a lock on the
+    // user's prepared orders: two requests at once cannot both take the
+    // last place.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("prepared-orders:{user_id}"))
+        .execute(&mut *tx)
+        .await?;
+    if prepared_awaiting(&mut *tx, user_id).await? >= MAX_PREPARED_ORDERS_PER_USER {
+        return Err(prepared_orders_full());
+    }
     sqlx::query(INSERT_PENDING_ORDER)
         .bind(pending_order_id)
         .bind(user_id)
@@ -457,8 +481,9 @@ pub async fn prepare_order(
         .bind(neg_risk)
         .bind(expires_at)
         .bind(now)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     // Build EIP-712 typed data
     let verifying_contract = if neg_risk {
