@@ -1098,6 +1098,14 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   stayed fresh, so the service looked healthy with no signals.
 - The periodic data hygiene run also deletes session revocations a day
   past their token's expiry (the table only grew).
+- Browser-wallet orders (`/api/v1/orders/prepare` and `/submit`) from the
+  bot's trading wallet (the loaded signer or a pinned trading wallet) are
+  refused (400), at prepare and again at submit. Their fills were recorded
+  nowhere the bot reads: a buy was sold as orphan inventory and its loss
+  booked against the circuit breaker, a sell took shares from under the
+  bot's positions. Use the trading page for that wallet. The submit answer
+  now says the app does not track fills for browser-wallet orders, and the
+  signing summary shows the exact cost.
 
 ### API contract changes
 

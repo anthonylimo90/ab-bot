@@ -360,6 +360,35 @@ fn build_eip712_types() -> Eip712Types {
     }
 }
 
+/// Refuse a browser-wallet order from the bot's trading wallet (the loaded
+/// signer, or any workspace's pinned trading wallet). Its fills would be
+/// recorded nowhere the bot reads them: a buy would be sold as orphan
+/// inventory and booked against the circuit breaker, and a sell would take
+/// shares out from under the bot's positions. Orders from that wallet go
+/// through the server-side order routes, which record them.
+async fn refuse_trading_wallet_maker(state: &AppState, maker: &str) -> ApiResult<()> {
+    let maker = maker.to_lowercase();
+    let loaded = state
+        .order_executor
+        .wallet_address()
+        .await
+        .is_some_and(|address| address.to_lowercase() == maker);
+    let pinned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspaces WHERE LOWER(trading_wallet_address) = $1)",
+    )
+    .bind(&maker)
+    .fetch_one(&state.pool)
+    .await?;
+    if loaded || pinned {
+        return Err(ApiError::BadRequest(
+            "This is the bot's trading wallet: place its orders from the trading page, not \
+             from a browser wallet"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Prepare an order for signing with MetaMask.
 ///
 /// Returns EIP-712 typed data that can be signed with signTypedData_v4.
@@ -398,6 +427,7 @@ pub async fn prepare_order(
     req.maker_address
         .parse::<Address>()
         .map_err(|_| ApiError::BadRequest("Invalid maker address".into()))?;
+    refuse_trading_wallet_maker(&state, &req.maker_address).await?;
     req.token_id
         .parse::<alloy_primitives::U256>()
         .map_err(|_| ApiError::BadRequest("Invalid token ID".into()))?;
@@ -536,7 +566,14 @@ pub async fn prepare_order(
             price
         }),
         size: format!("{} shares", req.size),
-        total_cost: format!("${:.2}", req.size * req.price),
+        // Exact, like the price: the amounts signed have six decimals.
+        total_cost: format!("${}", {
+            let mut cost = (req.size * req.price).normalize();
+            if cost.scale() < 2 {
+                cost.rescale(2);
+            }
+            cost
+        }),
         potential_payout: format!("${:.2}", potential_payout),
     };
 
@@ -622,6 +659,9 @@ pub async fn submit_order(
             "Order has expired or expires within a minute and a half; prepare it again".into(),
         ));
     }
+
+    // Checked again: the trading wallet may have changed since prepare.
+    refuse_trading_wallet_maker(&state, &pending_order.maker_address).await?;
 
     // Validate signature format
     if !req.signature.starts_with("0x") || req.signature.len() != 132 {
@@ -788,7 +828,9 @@ fn wallet_submission_response(
         success: !response.refused(),
         tx_hash: response.settlement_tx_hash(),
         order_id: (!response.order_id.is_empty()).then_some(response.order_id),
-        message: "Exchange response recorded; check order status for confirmed fills".into(),
+        message: "Exchange response recorded. This app does not track fills for browser-wallet \
+                  orders; check the order on Polymarket"
+            .into(),
     }
 }
 
@@ -1047,6 +1089,82 @@ mod amount_tests {
         assert!(kept.iter().all(|id| left.contains(id)));
         assert!(pruned.iter().all(|id| !left.contains(id)));
     }
+    #[sqlx::test(migrations = false)]
+    async fn the_trading_wallet_cannot_place_browser_wallet_orders(pool: sqlx::PgPool) {
+        use crate::workspace_scope::test_fixture as fx;
+        fx::real_schema(&pool).await;
+        let user = fx::user(&pool, auth::UserRole::Trader).await;
+        let workspace = fx::workspace(&pool, "w", 0).await;
+        fx::add_member(&pool, workspace, user, "member").await;
+        let bot = "0x00000000000000000000000000000000000000Ab";
+        sqlx::query("UPDATE workspaces SET trading_wallet_address = $1 WHERE id = $2")
+            .bind(bot.to_lowercase())
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = AppState::for_tests(pool.clone());
+        assert!(matches!(
+            refuse_trading_wallet_maker(&state, bot).await,
+            Err(ApiError::BadRequest(_))
+        ));
+        refuse_trading_wallet_maker(&state, "0x0000000000000000000000000000000000000001")
+            .await
+            .unwrap();
+
+        // A pending order prepared before the wallet was pinned is refused at
+        // submit, before anything is journaled or sent.
+        let id = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::hours(1);
+        sqlx::query(INSERT_PENDING_ORDER)
+            .bind(id)
+            .bind(user)
+            .bind(bot)
+            .bind("123")
+            .bind(0i16)
+            .bind("4000000")
+            .bind("10000000")
+            .bind("42")
+            .bind(expires_at.timestamp())
+            .bind(Utc::now().timestamp_millis())
+            .bind(0i16)
+            .bind(false)
+            .bind(expires_at)
+            .bind(Utc::now())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result = submit_order(
+            State(state),
+            Extension(Claims::new(user.to_string(), auth::UserRole::Trader, 1)),
+            Json(SubmitOrderRequest {
+                auth: WalletAuthProof {
+                    timestamp: 0,
+                    nonce: 0,
+                    signature: String::new(),
+                },
+                pending_order_id: id.to_string(),
+                signature: String::new(),
+            }),
+        )
+        .await;
+        match result {
+            Err(ApiError::BadRequest(message)) => assert!(message.contains("trading wallet")),
+            other => panic!("{:?}", other.map(|answer| answer.0)),
+        }
+        let journaled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution_intents")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(journaled, 0);
+    }
+
     #[sqlx::test(migrations = false)]
     async fn a_retry_of_an_answered_order_gets_the_recorded_answer(pool: sqlx::PgPool) {
         crate::workspace_scope::test_fixture::real_schema(&pool).await;
