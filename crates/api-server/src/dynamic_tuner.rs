@@ -80,6 +80,10 @@ struct TuningMetrics {
     quant_pnl_7d: f64,
     #[serde(default)]
     quant_closed_7d: f64,
+    /// Whether the no-trade watchdog was active this cycle (as the tuner
+    /// judged it, for the dashboard to show).
+    #[serde(default)]
+    no_trade_watchdog: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,15 +258,17 @@ impl DynamicTuner {
     }
 
     pub async fn start(self: Arc<Self>) {
+        // Seeded whether or not the tuner runs: every process applies the
+        // stored values, so a row nothing has changed must follow the
+        // environment's default rather than an old seed.
+        if let Err(e) = self.seed_defaults().await {
+            warn!(error = %e, "Failed seeding dynamic defaults");
+        }
         if !self.config.enabled {
             info!("Dynamic tuner is disabled");
             self.persist_runtime_state("disabled", "dynamic tuner disabled", None)
                 .await;
             return;
-        }
-
-        if let Err(e) = self.seed_defaults().await {
-            warn!(error = %e, "Failed seeding dynamic defaults");
         }
         if let Err(e) = self.publish_current_snapshot().await {
             warn!(error = %e, "Failed publishing startup dynamic config snapshot");
@@ -402,6 +408,7 @@ impl DynamicTuner {
         let no_trade_watchdog = metrics.attempts_last_window
             >= self.config.no_trade_min_attempts as f64
             && metrics.fills_last_window <= EPSILON;
+        metrics.no_trade_watchdog = no_trade_watchdog;
         let top_skip_reason = metrics
             .top_skip_reason
             .clone()
@@ -484,15 +491,15 @@ impl DynamicTuner {
                     )
                     .await;
                 if let Err(e) = publish_result {
+                    // Stored is applied: every process re-reads the stored
+                    // config within seconds (the API every 5 s, the arb
+                    // monitor every 30 s); the publish only speeds it up.
                     warn!(
                         key = %key,
-                        attempted_value = %new_value,
+                        value = %new_value,
                         error = %e,
-                        "Dynamic config publish failed; reverting DB change to preserve runtime/DB consistency"
+                        "Dynamic config publish failed; processes take the stored change on their next re-read"
                     );
-                    self.rollback_unpublished_change(row, new_value, &reason, &e)
-                        .await?;
-                    continue;
                 }
                 applied_count += 1;
             } else {
@@ -1000,6 +1007,7 @@ impl DynamicTuner {
             current_regime: "Uncertain".to_string(),
             quant_pnl_7d: decimal_to_f64(quant_pnl_7d),
             quant_closed_7d: quant_closed_7d as f64,
+            no_trade_watchdog: false,
         })
     }
 
@@ -1235,56 +1243,6 @@ impl DynamicTuner {
         );
 
         Ok(true)
-    }
-
-    async fn rollback_unpublished_change(
-        &self,
-        row: &DynamicConfigRow,
-        attempted_value: Decimal,
-        reason: &str,
-        publish_error: &anyhow::Error,
-    ) -> anyhow::Result<()> {
-        let revert_reason = format!(
-            "reverted unapplied change after publish failure: {publish_error}; original_reason={reason}"
-        );
-        let reverted = sqlx::query(
-            r#"
-            UPDATE dynamic_config
-            SET current_value = $2,
-                pending_eval = FALSE,
-                pending_baseline = NULL,
-                last_applied_at = NULL,
-                last_reason = $3,
-                updated_by = 'dynamic_tuner'
-            WHERE key = $1 AND current_value = $4 AND pending_eval
-            "#,
-        )
-        .bind(&row.key)
-        .bind(row.current_value)
-        .bind(&revert_reason)
-        .bind(attempted_value)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if reverted == 0 {
-            // An operator's update since then stands; processes re-read the
-            // stored config either way.
-            warn!(key = %row.key, "Unpublished dynamic config change was replaced before its revert");
-            return Ok(());
-        }
-
-        self.record_history(
-            Some(&row.key),
-            Some(attempted_value),
-            Some(row.current_value),
-            "skipped",
-            "reverted dynamic update because publish to subscribers failed",
-            None,
-            None,
-        )
-        .await?;
-
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

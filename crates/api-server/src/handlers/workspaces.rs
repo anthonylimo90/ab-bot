@@ -922,56 +922,6 @@ pub async fn update_workspace(
     .await
 }
 
-/// Switch to a workspace (set as current).
-#[utoipa::path(
-    post,
-    path = "/api/v1/workspaces/{workspace_id}/switch",
-    params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
-    ),
-    responses(
-        (status = 200, description = "Switched to workspace", body = WorkspaceResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Not a member of this workspace"),
-        (status = 404, description = "Workspace not found"),
-    ),
-    security(("bearer_auth" = [])),
-    tag = "workspaces"
-)]
-pub async fn switch_workspace(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Path(_workspace_id): Path<String>,
-) -> ApiResult<Json<WorkspaceResponse>> {
-    let user_id =
-        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".into()))?;
-    let (workspace_id, _) = require_canonical_workspace_member(&state.pool, user_id).await?;
-
-    // Update user settings
-    let now = Utc::now();
-    sqlx::query(
-        r#"
-        INSERT INTO user_settings (user_id, default_workspace_id, created_at, updated_at)
-        VALUES ($1, $2, $3, $3)
-        ON CONFLICT (user_id) DO UPDATE SET
-            default_workspace_id = $2,
-            updated_at = $3
-        "#,
-    )
-    .bind(user_id)
-    .bind(workspace_id)
-    .bind(now)
-    .execute(&state.pool)
-    .await?;
-
-    get_workspace(
-        State(state),
-        Extension(claims),
-        Path(workspace_id.to_string()),
-    )
-    .await
-}
-
 /// List members of a workspace.
 #[utoipa::path(
     get,
@@ -1947,6 +1897,11 @@ pub struct ServiceStatusResponse {
     pub arb_executor: ServiceStatusItem,
     pub exit_handler: ServiceStatusItem,
     pub live_trading: ServiceStatusItem,
+    /// Why new live entries wait now whatever the switches say, if they do
+    /// (the rule the executors apply): the exit handler is off or not
+    /// running, or live exits keep failing. Known in the trading process
+    /// only; null elsewhere.
+    pub live_entries_held: Option<String>,
     pub strategy_modes: Vec<StrategyModeStatus>,
     /// The switches the server's environment turns on: each stays on whatever
     /// the workspace says, and cannot be switched off from the dashboard.
@@ -2430,6 +2385,29 @@ pub async fn get_service_status(
     // What the executor does, whatever the workspace flag says (the
     // environment can switch live trading on by itself).
     let live_running = live_mode && live_ready;
+    // As the executors judge it, in the process that trades.
+    let live_entries_held = if live_running && state.circuit_breaker.is_leader() {
+        let config = state.exit_handler_config.clone().unwrap_or_else(|| {
+            Arc::new(tokio::sync::RwLock::new(
+                crate::exit_handler::ExitHandlerConfig::from_env(),
+            ))
+        });
+        crate::exit_handler::ExitReadiness::new(config, state.exit_handler_heartbeat.clone())
+            .watching_exits(state.pool.clone())
+            .refusal()
+            .await
+            .map(|reason| {
+                match reason {
+                    "exit_handler_disabled" => "the exit handler is switched off",
+                    "exit_handler_not_running" => "the exit handler is not running",
+                    "live_exits_failing" => "live exits keep failing",
+                    other => other,
+                }
+                .to_string()
+            })
+    } else {
+        None
+    };
     let quant_executor_enabled = if let Some(ref quant_config) = state.quant_executor_config {
         quant_config.read().await.enabled
     } else {
@@ -2464,6 +2442,23 @@ pub async fn get_service_status(
             true,
         ),
     });
+    // A live strategy whose new entries wait says why.
+    let strategy_modes = match &live_entries_held {
+        Some(held) => strategy_modes
+            .into_iter()
+            .map(|mut status| {
+                if matches!(
+                    status.mode,
+                    crate::strategy_modes::ResolvedStrategyMode::Live
+                ) && status.reason.is_none()
+                {
+                    status.reason = Some(format!("New live entries wait: {held}"));
+                }
+                status
+            })
+            .collect(),
+        None => strategy_modes,
+    };
 
     Ok(Json(ServiceStatusResponse {
         workspace_id: workspace_id.to_string(),
@@ -2519,6 +2514,7 @@ pub async fn get_service_status(
                 None
             },
         },
+        live_entries_held,
         strategy_modes,
         environment_switches: EnvironmentSwitches {
             live_trading: crate::runtime_sync::env_enabled("LIVE_TRADING"),
@@ -2688,13 +2684,20 @@ pub async fn get_dynamic_tuner_status(
     // Derive watchdog fields from last_metrics JSON
     let (watchdog_active, watchdog_fill_rate, watchdog_attempts, watchdog_top_skip) = {
         if let Some(ref metrics) = last_metrics {
-            let attempts = metrics.get("attempts").and_then(|v| v.as_i64());
-            let fill_rate = metrics.get("fill_rate").and_then(|v| v.as_f64());
+            // As the tuner stores them (TuningMetrics), and its own verdict.
+            let attempts = metrics
+                .get("attempts_last_window")
+                .and_then(|v| v.as_f64())
+                .map(|v| v.round() as i64);
+            let fill_rate = metrics.get("successful_fill_rate").and_then(|v| v.as_f64());
             let top_skip = metrics
                 .get("top_skip_reason")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let active = attempts.unwrap_or(0) >= 5 && fill_rate.unwrap_or(1.0) <= 0.0;
+            let active = metrics
+                .get("no_trade_watchdog")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             (active, fill_rate, attempts, top_skip)
         } else {
             (false, None, None, None)
@@ -3408,7 +3411,7 @@ pub async fn update_arb_executor_config(
         max_signal_age_secs: rows
             .iter()
             .find(|r| r.key == KEY_ARB_MAX_SIGNAL_AGE_SECS)
-            .and_then(|r| r.current_value.to_string().parse::<i64>().ok()),
+            .and_then(|r| r.current_value.round().to_i64()),
     }))
 }
 

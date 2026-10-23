@@ -88,7 +88,6 @@ use crate::websocket;
         workspaces::get_current_workspace,
         workspaces::get_workspace,
         workspaces::update_workspace,
-        workspaces::switch_workspace,
         workspaces::list_members,
         workspaces::list_workspace_invites,
         workspaces::create_workspace_invite,
@@ -280,8 +279,6 @@ use crate::websocket;
             risk::CircuitBreakerResponse,
             risk::CircuitBreakerConfigResponse,
             risk::RecoveryStateResponse,
-            risk::StopLossStatsResponse,
-            risk::RecentStopExecution,
             risk::UpdateCircuitBreakerConfigRequest,
             workspaces::UpdateArbExecutorConfigRequest,
             workspaces::ArbExecutorConfigResponse,
@@ -615,10 +612,6 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
         .route("/api/v1/vault/withdrawals", post(vault::create_withdrawal))
         // Workspace operations (owner/admin can modify)
         // NOTE: PUT /workspaces/:id is in config_routes with stricter rate limiting
-        .route(
-            "/api/v1/workspaces/:workspace_id/switch",
-            post(workspaces::switch_workspace),
-        )
         .route(
             "/api/v1/workspaces/:workspace_id/members/:member_id",
             put(workspaces::update_member_role),

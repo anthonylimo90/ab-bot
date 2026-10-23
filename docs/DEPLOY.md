@@ -1003,6 +1003,18 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   helper only it used. Its table `latency_arb_signals` (065) stays; drop it
   with a new migration if its rows are not wanted.
 
+### Dynamic config
+
+- A tuner change whose Redis publish fails stays stored (every process
+  re-reads the stored config within seconds); it used to be reverted, so a
+  Redis outage froze the tuner.
+- Untouched dynamic config rows follow the environment's defaults even
+  with `DYNAMIC_TUNER_ENABLED=false` (the stored seed, such as
+  `QUANT_BASE_POSITION_SIZE=30`, overrode the environment).
+- Migration 101 deletes the `QUANT_MIN_CONFIDENCE`, `FLOW_MIN_IMBALANCE`
+  and `MEAN_REV_MIN_MOVE_PCT` rows: nothing read them (their environment
+  settings apply, unchanged), yet the tuner table listed them.
+
 ### Positions trade in their own mode; replay proof; paper fidelity
 
 - Switching live trading off (Pause) stops new live entries only. Exits,
@@ -1035,6 +1047,16 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 
 ### API contract changes
 
+- Service status adds `live_entries_held`: why the trading process refuses
+  new live entries now whatever the switches say (exit handler off or not
+  running, live exits failing), null otherwise; live strategy modes carry
+  the same reason. Risk status drops `stop_loss` (always zeros since the
+  stop-loss rules were removed). `POST /workspaces/:id/switch` is removed
+  (there is one canonical workspace; nothing called it).
+- The tuner status's watchdog fields read what the tuner stores
+  (`attempts_last_window`, `successful_fill_rate`) and its own verdict (the
+  card always showed idle). `GET .../dynamic-tuning/arb-executor` returns
+  `max_signal_age_secs` (it was always null).
 - Service status adds `workspace_id` (the canonical workspace it describes)
   and `environment_switches`. Risk status adds `entry_holds`; a breaker
   reset answers 409 while any stands.

@@ -130,34 +130,10 @@ impl CircuitBreakerResponse {
     }
 }
 
-/// A recently executed stop-loss rule.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct RecentStopExecution {
-    pub id: String,
-    pub position_id: String,
-    pub market_id: String,
-    pub stop_type: String,
-    pub executed_at: DateTime<Utc>,
-}
-
-/// Stop-loss aggregate statistics.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct StopLossStatsResponse {
-    pub total_rules: i64,
-    pub active_rules: i64,
-    pub executed_rules: i64,
-    pub fixed_stops: i64,
-    pub percentage_stops: i64,
-    pub trailing_stops: i64,
-    pub time_based_stops: i64,
-    pub recent_executions: Vec<RecentStopExecution>,
-}
-
 /// Combined risk status response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RiskStatusResponse {
     pub circuit_breaker: CircuitBreakerResponse,
-    pub stop_loss: StopLossStatsResponse,
 }
 
 fn trip_reason_to_string(reason: &risk_manager::circuit_breaker::TripReason) -> String {
@@ -203,23 +179,7 @@ pub async fn get_risk_status(
     // Read circuit breaker state from AppState (in-memory, no DB hit)
     let circuit_breaker = CircuitBreakerResponse::current(&state).await;
 
-    // TODO: stop_loss_rules table has been dropped with the copy-trading system.
-    // Return zeroed stats until a replacement stop-loss mechanism is implemented.
-    let stop_loss = StopLossStatsResponse {
-        total_rules: 0,
-        active_rules: 0,
-        executed_rules: 0,
-        fixed_stops: 0,
-        percentage_stops: 0,
-        trailing_stops: 0,
-        time_based_stops: 0,
-        recent_executions: vec![],
-    };
-
-    Ok(Json(RiskStatusResponse {
-        circuit_breaker,
-        stop_loss,
-    }))
+    Ok(Json(RiskStatusResponse { circuit_breaker }))
 }
 
 /// Manually trip the circuit breaker.
