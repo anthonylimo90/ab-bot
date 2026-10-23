@@ -113,10 +113,10 @@ impl FlowSignalConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
-            base_position_size_usd: std::env::var("QUANT_BASE_POSITION_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Decimal::new(30, 0)),
+            base_position_size_usd: polymarket_core::config::env_decimal(
+                "QUANT_BASE_POSITION_SIZE",
+                Decimal::new(30, 0),
+            ),
             expiry_minutes: 30,
             calibration_lookback_days: std::env::var("FLOW_CALIBRATION_LOOKBACK_DAYS")
                 .ok()
@@ -673,19 +673,34 @@ async fn load_flow_calibration(
 ) -> Result<FlowCalibrationSnapshot, sqlx::Error> {
     let rows: Vec<FlowCalibrationRow> = sqlx::query_as(
         r#"
+        -- Returns are measured on what the position cost, not the signal's
+        -- suggested size (the executor scales that down), and against the
+        -- raw edge the calibration scales: the emitted edge is already
+        -- calibrated, and measuring against it would feed calibration back
+        -- into itself. A win a resolution close could not confirm in the
+        -- wallet is left out, as the executor's strategy tally leaves it out.
         WITH closed_flow AS (
             SELECT
                 qs.direction,
-                qs.size_usd,
+                p.quantity * (p.yes_entry_price + p.no_entry_price) AS size_usd,
                 p.realized_pnl,
-                NULLIF(qs.metadata ->> 'expected_edge_bps', '')::double precision AS predicted_edge_bps
+                COALESCE(
+                    NULLIF(qs.metadata ->> 'raw_expected_edge_bps', ''),
+                    NULLIF(qs.metadata ->> 'expected_edge_bps', '')
+                )::double precision AS predicted_edge_bps
             FROM quant_signals qs
             JOIN positions p
               ON p.source_signal_id = qs.id
             WHERE qs.kind = 'flow'
               AND qs.execution_status = 'executed'
               AND p.state = 4
+              AND p.realized_pnl IS NOT NULL
               AND qs.generated_at >= $1
+              AND NOT (p.realized_pnl > 0 AND EXISTS (
+                  SELECT 1 FROM trade_events te
+                  WHERE te.position_id = p.id
+                    AND te.event_type = 'closed_via_resolution'
+                    AND te.metadata ? 'unmeasured'))
         ),
         grouped AS (
             SELECT direction, size_usd, realized_pnl, predicted_edge_bps
@@ -859,6 +874,78 @@ mod tests {
         );
     }
 
+    async fn create_calibration_tables(pool: &PgPool) {
+        sqlx::Executor::execute(
+            pool,
+            r#"
+            CREATE TABLE positions (
+                id UUID, state SMALLINT, realized_pnl NUMERIC, source_signal_id UUID,
+                quantity NUMERIC, yes_entry_price NUMERIC, no_entry_price NUMERIC
+            );
+            CREATE TABLE quant_signals (
+                id UUID, kind TEXT, direction TEXT, size_usd NUMERIC, metadata JSONB,
+                execution_status TEXT, generated_at TIMESTAMPTZ
+            );
+            CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB);
+            "#,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn calibration_measures_returns_on_cost_against_the_raw_edge(pool: PgPool) {
+        create_calibration_tables(&pool).await;
+        let closed = |pnl: Decimal, raw_edge: f64, calibrated_edge: f64| {
+            let pool = pool.clone();
+            async move {
+                let signal_id = uuid::Uuid::new_v4();
+                let position_id = uuid::Uuid::new_v4();
+                // The signal suggested $30; the position cost 10 x 0.90 = $9.
+                sqlx::query(
+                    "INSERT INTO quant_signals VALUES
+                     ($1, 'flow', 'buy_yes', 30, $2, 'executed', NOW())",
+                )
+                .bind(signal_id)
+                .bind(serde_json::json!({
+                    "raw_expected_edge_bps": raw_edge,
+                    "expected_edge_bps": calibrated_edge,
+                }))
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query("INSERT INTO positions VALUES ($1, 4, $2, $3, 10, 0.90, 0)")
+                    .bind(position_id)
+                    .bind(pnl)
+                    .bind(signal_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                position_id
+            }
+        };
+        // +$0.36 on $9 is +400 bps, exactly the raw edge predicted.
+        closed(Decimal::new(36, 2), 400.0, 120.0).await;
+        // A resolution win the wallet could not confirm does not count.
+        let unmeasured = closed(Decimal::new(900, 2), 400.0, 120.0).await;
+        sqlx::query(
+            "INSERT INTO trade_events VALUES
+             ($1, 'closed_via_resolution', '{\"unmeasured\": true}')",
+        )
+        .bind(unmeasured)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let snapshot = load_flow_calibration(&pool, Utc::now() - Duration::days(1))
+            .await
+            .unwrap();
+        let stats = snapshot.buy_yes.unwrap();
+        assert_eq!(stats.closed_trades, 1);
+        assert!((stats.avg_realized_return_bps - 400.0).abs() < 1e-6);
+        assert!((stats.edge_capture_ratio - 1.0).abs() < 1e-9);
+    }
+
     #[sqlx::test(migrations = false)]
     async fn scan_follows_only_each_market_newest_agreeing_window(pool: PgPool) {
         use crate::signals::hourly_bars;
@@ -875,17 +962,11 @@ mod tests {
                 condition_id TEXT, wallet_address TEXT, outcome TEXT, timestamp TIMESTAMPTZ
             );
             CREATE TABLE bot_scores (address TEXT, total_score INT, computed_at TIMESTAMPTZ);
-            CREATE TABLE positions (
-                id UUID, state SMALLINT, realized_pnl NUMERIC, source_signal_id UUID
-            );
-            CREATE TABLE quant_signals (
-                id UUID, kind TEXT, direction TEXT, size_usd NUMERIC, metadata JSONB,
-                execution_status TEXT, generated_at TIMESTAMPTZ
-            );
             "#,
         )
         .await
         .unwrap();
+        create_calibration_tables(&pool).await;
         sqlx::Executor::execute(
             &pool,
             include_str!("../../../../migrations/038_market_metadata.sql"),

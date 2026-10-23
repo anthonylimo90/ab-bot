@@ -170,9 +170,7 @@ impl ArbExecutorConfig {
     pub fn from_env() -> Self {
         Self {
             enabled: polymarket_core::config::env_switch("ARB_AUTO_EXECUTE"),
-            allow_live_execution: std::env::var("ARB_ALLOW_LIVE_EXECUTION")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false),
+            allow_live_execution: polymarket_core::config::env_switch("ARB_ALLOW_LIVE_EXECUTION"),
             // The dynamic config's default, inside its $5-$25 bounds.
             position_size: polymarket_core::config::env_decimal(
                 "ARB_POSITION_SIZE",

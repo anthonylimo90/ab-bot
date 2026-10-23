@@ -20,7 +20,6 @@ use uuid::Uuid;
 
 use auth::{AuditAction, Claims, UserRole};
 
-use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::strategy_modes::{resolve_strategy_modes, StrategyModeInputs, StrategyModeStatus};
@@ -486,10 +485,8 @@ pub async fn get_workspace(
 
     // Decrypt then mask: show only last 4 chars of alchemy key
     let masked_alchemy_key = workspace.alchemy_api_key.as_ref().map(|stored| {
-        // Try to decrypt (encrypted values); fall back to treating as plaintext
-        // for backward compatibility with pre-encryption rows.
-        let plaintext =
-            crypto::decrypt_field(stored, &state.encryption_key).unwrap_or_else(|| stored.clone());
+        // A key that cannot be decrypted shows no characters of the ciphertext.
+        let plaintext = state.field_keys.read_secret(stored).unwrap_or_default();
         if plaintext.len() > 4 {
             format!("••••••{}", &plaintext[plaintext.len() - 4..])
         } else {
@@ -652,7 +649,7 @@ pub async fn update_workspace(
             return Err(ApiError::Conflict(format!(
                 "{variable}=true is set in the server's environment, so this cannot be \
                  switched off here; nothing was changed. Unset {variable} and restart, or \
-                 trip the circuit breaker to stop trading now"
+                 trip the circuit breaker to stop new entries now"
             )));
         }
     }
@@ -804,7 +801,9 @@ pub async fn update_workspace(
         q = q.bind(polygon_rpc_url);
     }
     if let Some(ref alchemy_api_key) = req.alchemy_api_key {
-        let encrypted = crypto::encrypt_field(alchemy_api_key, &state.encryption_key)
+        let encrypted = state
+            .field_keys
+            .encrypt(alchemy_api_key)
             .ok_or_else(|| ApiError::Internal("Failed to encrypt API key".into()))?;
         q = q.bind(encrypted);
     }

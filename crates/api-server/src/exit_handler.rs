@@ -192,7 +192,8 @@ impl ExitHandlerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(300),
-            quant_take_profit_pct: polymarket_core::config::env_fraction(
+            // A gain can exceed the cost: 1.5 takes profit at +150%.
+            quant_take_profit_pct: polymarket_core::config::env_positive_decimal(
                 "QUANT_TAKE_PROFIT_PCT",
                 Decimal::new(15, 2),
             ),
@@ -524,13 +525,17 @@ impl ExitHandler {
     /// gone unsent for `MAX_EXIT_DEFERRAL` in a row: whatever holds them
     /// (an order stuck unresolved, a book that cannot be read) is not passing.
     async fn defer_sale(&self, position: &mut Position, reason: &str, ctx: &EventContext) -> bool {
+        // A run lasts while sales go unsent pass after pass: the gap that
+        // ends one is several passes, however long a pass is set to be.
+        let poll_secs = self.config.read().await.exit_poll_interval_secs;
+        let gap = DEFERRAL_GAP.max(std::time::Duration::from_secs(poll_secs.saturating_mul(3)));
         let now = std::time::Instant::now();
         let first = {
             let mut deferred = self
                 .deferred_since
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            deferred.retain(|_, (_, last)| now.duration_since(*last) <= DEFERRAL_GAP);
+            deferred.retain(|_, (_, last)| now.duration_since(*last) <= gap);
             let run = deferred.entry(position.id).or_insert((now, now));
             run.1 = now;
             run.0

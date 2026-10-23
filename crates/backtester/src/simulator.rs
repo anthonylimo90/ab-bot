@@ -746,8 +746,8 @@ impl BacktestSimulator {
         let trade_value = fill_quantity * execution_price;
         let fees = self.config.fee_model.calculate(
             trade_value,
-            false,            // taker order
-            state.total_fees, // cumulative volume for tiered fees
+            false,               // taker order
+            state.traded_volume, // cumulative volume for tiered fees
         );
 
         // Check if we have enough cash
@@ -765,6 +765,7 @@ impl BacktestSimulator {
         // Execute trade
         state.cash -= total_cost;
         state.total_fees += fees;
+        state.traded_volume += trade_value;
         state.total_slippage += slippage * fill_quantity;
 
         let key = position_key(&signal.market_id, &signal.outcome_id);
@@ -876,8 +877,8 @@ impl BacktestSimulator {
         let trade_value = position.quantity * execution_price;
         let fees = self.config.fee_model.calculate(
             trade_value,
-            false,            // taker order
-            state.total_fees, // cumulative volume for tiered fees
+            false,               // taker order
+            state.traded_volume, // cumulative volume for tiered fees
         );
         let proceeds = trade_value - fees;
 
@@ -896,6 +897,7 @@ impl BacktestSimulator {
         // Update state
         state.cash += proceeds;
         state.total_fees += fees;
+        state.traded_volume += trade_value;
         state.total_slippage += slippage * position.quantity;
         state.realized_pnl += pnl;
 
@@ -1338,8 +1340,9 @@ fn sharpe_sortino(returns: &[f64]) -> (f64, f64) {
         .filter(|&&r| r < 0.0)
         .map(|&r| r * r)
         .collect();
+    // Over every day, not only the losing ones.
     let downside_dev = if !downside_returns.is_empty() {
-        (downside_returns.iter().sum::<f64>() / downside_returns.len() as f64).sqrt()
+        (downside_returns.iter().sum::<f64>() / returns.len() as f64).sqrt()
     } else {
         0.0
     };
@@ -1389,6 +1392,8 @@ struct SimulationState {
     open_lots: HashMap<String, Vec<usize>>,
     equity_curve: Vec<(DateTime<Utc>, Decimal)>,
     total_fees: Decimal,
+    /// Value traded so far, buys and sells: the volume fee tiers are set by.
+    traded_volume: Decimal,
     total_slippage: Decimal,
     realized_pnl: Decimal,
     winning_trades: usize,
@@ -1410,6 +1415,7 @@ impl SimulationState {
             open_lots: HashMap::new(),
             equity_curve: Vec::new(),
             total_fees: Decimal::ZERO,
+            traded_volume: Decimal::ZERO,
             total_slippage: Decimal::ZERO,
             realized_pnl: Decimal::ZERO,
             winning_trades: 0,
@@ -2010,7 +2016,8 @@ mod risk_metric_tests {
 
     #[test]
     fn sharpe_and_sortino_match_hand_computed_daily_values() {
-        // mean 1%, population std 2%, downside deviation 1%.
+        // mean 1%, population std 2%, downside deviation over all four days
+        // sqrt(2 x 1%^2 / 4) = 1% / sqrt(2).
         let returns = [0.03, -0.01, 0.03, -0.01];
         let annualization = 365.0_f64.sqrt();
 
@@ -2020,7 +2027,10 @@ mod risk_metric_tests {
         ] {
             let (sharpe, sortino) = sharpe_sortino(&daily_returns(&curve));
             assert!(approx(sharpe, 0.5 * annualization), "sharpe {sharpe}");
-            assert!(approx(sortino, 1.0 * annualization), "sortino {sortino}");
+            assert!(
+                approx(sortino, 2.0_f64.sqrt() * annualization),
+                "sortino {sortino}"
+            );
         }
     }
 
@@ -2047,7 +2057,7 @@ mod risk_metric_tests {
         let (sharpe, sortino) = simulator.calculate_risk_metrics(&curve);
         let annualization = 365.0_f64.sqrt();
         assert!(approx(sharpe, 0.5 * annualization));
-        assert!(approx(sortino, annualization));
+        assert!(approx(sortino, 2.0_f64.sqrt() * annualization));
 
         let (var_95, cvar_95) = simulator.calculate_var_cvar(&curve);
         // Four daily returns -> tail of one: the worst day (-1%).

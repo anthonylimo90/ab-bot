@@ -48,10 +48,10 @@ impl MeanReversionSignalConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.10),
-            base_position_size_usd: std::env::var("QUANT_BASE_POSITION_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Decimal::new(30, 0)),
+            base_position_size_usd: polymarket_core::config::env_decimal(
+                "QUANT_BASE_POSITION_SIZE",
+                Decimal::new(30, 0),
+            ),
             expiry_minutes: 20,
         }
     }
@@ -134,13 +134,19 @@ async fn scan_and_emit(
     let now = Utc::now();
 
     // Find markets where the most recent hourly price moved > min_move_pct
-    // compared to the previous hour, and current volume is below 24h median.
+    // compared to the previous hour, and the market's rolling 24h volume is
+    // not above its median over the day (the move did not come with a surge
+    // of trading).
+    //
+    // Only active markets that are not about to end, priced inside
+    // 0.08-0.92 on both hours: a market jumping towards 0 or 1 is resolving,
+    // not overshooting, and buying against it buys a near-worthless side.
     //
     // Uses `orderbook_hourly` continuous aggregate:
     //   - market_id: condition ID
     //   - bucket: hourly timestamp
     //   - close: last yes_mid price
-    //   - avg_volume: average 24h volume
+    //   - avg_volume: average rolling 24h volume
     let rows = sqlx::query_as::<_, MeanReversionRow>(
         r#"
         WITH recent AS (
@@ -166,9 +172,12 @@ async fn scan_and_emit(
                 c.avg_volume::float8 AS current_volume
             FROM recent c
             JOIN recent p ON c.condition_id = p.condition_id AND p.rn = 2
+            JOIN market_metadata mm ON mm.condition_id = c.condition_id
             WHERE c.rn = 1
-              AND p.mid_price > 0.05
-              AND c.mid_price > 0.05
+              AND p.mid_price BETWEEN 0.08 AND 0.92
+              AND c.mid_price BETWEEN 0.08 AND 0.92
+              AND mm.active
+              AND (mm.end_date IS NULL OR mm.end_date > $1 + INTERVAL '24 hours')
         ),
         vol_median AS (
             SELECT
@@ -299,24 +308,46 @@ mod tests {
     async fn scan_decodes_hourly_bars_and_references_the_latest_close(pool: PgPool) {
         use crate::signals::hourly_bars;
         hourly_bars::create(&pool).await;
+        sqlx::Executor::execute(
+            &pool,
+            include_str!("../../../../migrations/038_market_metadata.sql"),
+        )
+        .await
+        .unwrap();
         let now = Utc::now();
         let current_bucket = now - Duration::minutes(40);
-        hourly_bars::insert(
-            &pool,
-            "0xspike",
-            now - Duration::minutes(100),
-            Decimal::new(50, 2),
-            Decimal::from(1000),
-        )
-        .await;
-        hourly_bars::insert(
-            &pool,
-            "0xspike",
-            current_bucket,
-            Decimal::new(60, 2),
-            Decimal::from(1000),
-        )
-        .await;
+        // A spike, and moves that are resolution, an ended market, and an
+        // unknown market.
+        for (market, previous, current, active, ends_in_hours) in [
+            ("0xspike", 50, 60, true, Some(240)),
+            ("0xresolving", 90, 99, true, Some(240)),
+            ("0xclosed", 50, 60, false, Some(240)),
+            ("0xending", 50, 60, true, Some(2)),
+            ("0xunknown", 50, 60, true, None),
+        ] {
+            for (minutes_ago, price) in [(100, previous), (40, current)] {
+                hourly_bars::insert(
+                    &pool,
+                    market,
+                    now - Duration::minutes(minutes_ago),
+                    Decimal::new(price, 2),
+                    Decimal::from(1000),
+                )
+                .await;
+            }
+            if market != "0xunknown" {
+                sqlx::query(
+                    "INSERT INTO market_metadata (condition_id, question, end_date, active)
+                     VALUES ($1, 'q', $2, $3)",
+                )
+                .bind(market)
+                .bind(ends_in_hours.map(|hours| now + Duration::hours(hours)))
+                .bind(active)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
 
         let config = MeanReversionSignalConfig::from_env();
         let (tx, mut rx) = broadcast::channel(8);

@@ -211,8 +211,13 @@ impl SignalPublisher {
         entry_signal.timestamp = observed_at;
         let payload = serde_json::to_string(&entry_signal)?;
 
-        // Publish to Redis
-        let _: () = self.redis.publish(channels::ENTRY, &payload).await?;
+        // Publish to Redis. Nothing subscribed means nothing will act on it:
+        // reported as a failure, so the market is not held in its cooldown
+        // and no alert claims an entry.
+        let receivers: i64 = self.redis.publish(channels::ENTRY, &payload).await?;
+        if receivers == 0 {
+            anyhow::bail!("no API server is subscribed to entry signals");
+        }
         debug!(
             "Published entry signal to Redis: {}",
             entry_signal.market_id

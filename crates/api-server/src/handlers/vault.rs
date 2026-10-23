@@ -17,7 +17,6 @@ use uuid::Uuid;
 use auth::jwt::Claims;
 use auth::{AuditAction, AuditEvent};
 
-use crate::crypto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::workspace_scope::{
@@ -100,7 +99,7 @@ async fn workspace_polygon_client(
     state: &AppState,
     workspace_id: Option<Uuid>,
 ) -> Result<PolygonClient, ApiError> {
-    match workspace_rpc_url(&state.pool, &state.encryption_key, workspace_id).await? {
+    match workspace_rpc_url(&state.pool, &state.field_keys, workspace_id).await? {
         Some(rpc_url) => Ok(PolygonClient::new(rpc_url)),
         None => Err(ApiError::ServiceUnavailable(
             "Polygon RPC not configured. Set polygon_rpc_url or alchemy_api_key in workspace settings."
@@ -114,7 +113,7 @@ async fn workspace_polygon_client(
 /// neither.
 pub(crate) async fn workspace_rpc_url(
     pool: &PgPool,
-    encryption_key: &str,
+    field_keys: &crate::crypto::FieldKeys,
     workspace_id: Option<Uuid>,
 ) -> Result<Option<String>, sqlx::Error> {
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
@@ -136,11 +135,11 @@ pub(crate) async fn workspace_rpc_url(
         return Ok(Some(rpc_url));
     }
 
-    if let Some(encrypted_key) = alchemy_key_opt.filter(|s| !s.is_empty()) {
-        // Decrypt the stored Alchemy key (AES-256-GCM).
-        // Fall back to treating value as plaintext for backward compat with pre-encryption rows.
-        let plaintext =
-            crypto::decrypt_field(&encrypted_key, encryption_key).unwrap_or(encrypted_key);
+    // A key that cannot be decrypted names no endpoint (it is logged).
+    if let Some(plaintext) = alchemy_key_opt
+        .filter(|s| !s.is_empty())
+        .and_then(|stored| field_keys.read_secret(&stored))
+    {
         return Ok(Some(format!(
             "https://polygon-mainnet.g.alchemy.com/v2/{plaintext}"
         )));

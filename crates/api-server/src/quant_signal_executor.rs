@@ -127,9 +127,12 @@ impl QuantSignalExecutorConfig {
                 "QUANT_MEAN_REVERSION_ALLOCATION_PCT",
                 0.20,
             ),
+            // Off unless chosen: the resolution signal follows the favourite
+            // at its market price with no estimate of its own to say the
+            // price is wrong, so it has no modelled edge to pay its fees.
             resolution_allocation_pct: polymarket_core::config::env_share_f64(
                 "QUANT_RESOLUTION_ALLOCATION_PCT",
-                0.10,
+                0.0,
             ),
             min_book_depth: polymarket_core::config::env_decimal(
                 "QUANT_MIN_BOOK_DEPTH",
@@ -1914,15 +1917,8 @@ mod tests {
         assert_eq!(config.allocation_for(QuantSignalKind::MeanReversion), 0.20);
         assert_eq!(
             config.allocation_for(QuantSignalKind::ResolutionProximity),
-            0.10
+            0.0
         );
-
-        // Weights should approximately sum to 1.0
-        let total = config.flow_allocation_pct
-            + config.cross_market_allocation_pct
-            + config.mean_reversion_allocation_pct
-            + config.resolution_allocation_pct;
-        assert!((total - 1.0).abs() < 0.01);
     }
 
     fn quoted_book(bid: Option<i64>, ask: i64) -> OrderBook {

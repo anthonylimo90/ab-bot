@@ -796,8 +796,10 @@ impl ProfitabilityAnalyzer {
             return f64::INFINITY;
         }
 
+        // Over every day, not only the losing ones: a single bad day among
+        // many good ones is a small downside, not the whole of it.
         let downside_dev =
-            (downside_returns.iter().sum::<f64>() / downside_returns.len() as f64).sqrt();
+            (downside_returns.iter().sum::<f64>() / return_values.len() as f64).sqrt();
 
         if downside_dev == 0.0 {
             return f64::INFINITY;
@@ -874,8 +876,8 @@ impl ProfitabilityAnalyzer {
             return 0.0;
         }
 
-        (negative_returns.iter().sum::<f64>() / negative_returns.len() as f64).sqrt()
-            * (365.0_f64).sqrt()
+        // Over every day, as the Sortino ratio measures it.
+        (negative_returns.iter().sum::<f64>() / returns.len() as f64).sqrt() * (365.0_f64).sqrt()
     }
 
     fn calculate_consistency_score(&self, pnls: &[f64]) -> f64 {

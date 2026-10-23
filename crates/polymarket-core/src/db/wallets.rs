@@ -179,41 +179,6 @@ impl WalletRepository {
         Ok(())
     }
 
-    /// Get wallets flagged as likely bots.
-    pub async fn get_flagged_wallets(&self, limit: i64) -> Result<Vec<BotScore>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT DISTINCT ON (address)
-                address, total_score, signals, classification, computed_at
-            FROM bot_scores
-            WHERE classification = 2
-            ORDER BY address, computed_at DESC
-            LIMIT $1
-            "#,
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let signals_json: serde_json::Value = r.get("signals");
-                Some(BotScore {
-                    address: r.get("address"),
-                    total_score: r.get::<i32, _>("total_score") as u32,
-                    signals: serde_json::from_value(signals_json).ok()?,
-                    classification: match r.get::<i16, _>("classification") {
-                        0 => WalletClassification::LikelyHuman,
-                        1 => WalletClassification::Suspicious,
-                        _ => WalletClassification::LikelyBot,
-                    },
-                    computed_at: r.get("computed_at"),
-                })
-            })
-            .collect())
-    }
-
     /// Get the latest score for a wallet.
     pub async fn get_latest_score(&self, address: &str) -> Result<Option<BotScore>> {
         let row = sqlx::query(

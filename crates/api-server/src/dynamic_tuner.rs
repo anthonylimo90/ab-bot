@@ -880,11 +880,21 @@ impl DynamicTuner {
         .fetch_one(&self.pool)
         .await?;
 
+        // How much prices move hour to hour (a price is a probability, so
+        // this is in price units): per market, the spread of its hourly
+        // closes over the last day, averaged across markets, at most 0.10.
+        // Wallets' annualized return volatility is far larger and would hold
+        // the threshold at its ceiling.
         let volatility_proxy: f64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(AVG(volatility_30d::double precision), 0)
-            FROM wallet_success_metrics
-            WHERE last_computed >= NOW() - INTERVAL '48 hours'
+            SELECT LEAST(COALESCE(AVG(price_volatility), 0), 0.10)
+            FROM (
+                SELECT STDDEV_POP(close::double precision) AS price_volatility
+                FROM orderbook_hourly
+                WHERE bucket >= NOW() - INTERVAL '24 hours'
+                GROUP BY market_id
+                HAVING COUNT(*) >= 3
+            ) per_market
             "#,
         )
         .fetch_one(&self.pool)

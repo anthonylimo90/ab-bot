@@ -45,15 +45,42 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing with production-friendly defaults
     // Filter out noisy crates to avoid hitting Railway's 500 logs/sec limit
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "api_server=info,tower_http=error,polymarket_core=warn,auth=info,sqlx=warn,hyper=warn,tungstenite=warn,h2=warn".into()
-            }),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // Every crate's warnings and errors, and the trading crates'
+            // decisions: a target left out of the filter is not logged
+            // at all, errors included.
+            "warn,api_server=info,auth=info,risk_manager=info,trading_engine=info,tower_http=error"
+                .into()
+        }))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let cli = Cli::parse();
+    let serving = matches!(cli.command, Some(Commands::Serve) | None);
+
+    // A setting that cannot be read stops the start: run on a default the
+    // operator did not choose, a service meant off could trade.
+    if serving {
+        let unreadable = polymarket_core::config::unreadable_settings();
+        if !unreadable.is_empty() {
+            anyhow::bail!(
+                "Settings that cannot be read (correct or unset them): {}",
+                unreadable.join("; ")
+            );
+        }
+        use polymarket_core::config::env_switch;
+        tracing::info!(
+            live_trading = env_switch("LIVE_TRADING"),
+            arb_auto_execute = env_switch("ARB_AUTO_EXECUTE"),
+            arb_allow_live_execution = env_switch("ARB_ALLOW_LIVE_EXECUTION"),
+            quant_executor_enabled = env_switch("QUANT_EXECUTOR_ENABLED"),
+            exit_handler_enabled = env_switch("EXIT_HANDLER_ENABLED"),
+            latency_arb_enabled = env_switch("LATENCY_ARB_ENABLED"),
+            cross_market_signal_enabled = env_switch("CROSS_MARKET_SIGNAL_ENABLED"),
+            "Trading switches set in the environment (the workspace's settings can also \
+             switch services on)"
+        );
+    }
 
     // Create database connection pool with retry
     let db_config = DatabaseConfig {
@@ -87,7 +114,6 @@ async fn main() -> anyhow::Result<()> {
     // database is back. A one-off command gives up as before.
     // As PID 1 the process ignores SIGTERM unless it listens: a stop while
     // waiting ends the wait.
-    let serving = matches!(cli.command, Some(Commands::Serve) | None);
     // An unreadable URL is a configuration error, not an outage: no wait.
     db_config
         .url
@@ -116,30 +142,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    drop(stop);
 
-    // Run migrations
-    let skip_migrations = std::env::var("SKIP_MIGRATIONS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-
-    if !skip_migrations {
-        tracing::info!("Running database migrations...");
-        sqlx::migrate!("../../migrations").run(&pool).await?;
-        // ALTER SYSTEM cannot run inside a transaction (sqlx wraps migrations
-        // in transactions), so we apply memory tuning here in autocommit mode.
-        // It rewrites the server's own settings (sized for the deployed 2 GB
-        // database), so it runs only where asked: PG_MEMORY_TUNING=true, or
-        // by default in production.
-        let tune = match std::env::var("PG_MEMORY_TUNING") {
-            Ok(value) => value == "true" || value == "1",
-            Err(_) => std::env::var("ENVIRONMENT").is_ok_and(|env| env == "production"),
-        };
-        if tune {
-            apply_pg_memory_tuning(&pool).await;
+    // A stop while migrating or starting ends the start.
+    tokio::select! {
+        migrated = migrate(&pool) => migrated?,
+        () = stop.recv() => {
+            tracing::info!("Stop requested while migrating");
+            return Ok(());
         }
-    } else {
-        tracing::warn!("Skipping database migrations because SKIP_MIGRATIONS is enabled");
     }
 
     match cli.command {
@@ -147,10 +157,38 @@ async fn main() -> anyhow::Result<()> {
             seed::seed_admin(&pool, &email, &password).await?;
         }
         Some(Commands::Serve) | None => {
-            run_server(pool).await?;
+            let server = tokio::select! {
+                server = build_server(pool) => server?,
+                () = stop.recv() => {
+                    tracing::info!("Stop requested while starting");
+                    return Ok(());
+                }
+            };
+            // The server listens for stop signals itself from its first step.
+            drop(stop);
+            server.run().await?;
         }
     }
 
+    Ok(())
+}
+
+async fn migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    if !polymarket_core::config::env_flag("SKIP_MIGRATIONS", false) {
+        tracing::info!("Running database migrations...");
+        sqlx::migrate!("../../migrations").run(pool).await?;
+        // ALTER SYSTEM cannot run inside a transaction (sqlx wraps migrations
+        // in transactions), so we apply memory tuning here in autocommit mode.
+        // It rewrites the server's own settings (sized for the deployed 2 GB
+        // database), so it runs only where asked: PG_MEMORY_TUNING=true, or
+        // by default in production.
+        let production = std::env::var("ENVIRONMENT").is_ok_and(|env| env == "production");
+        if polymarket_core::config::env_flag("PG_MEMORY_TUNING", production) {
+            apply_pg_memory_tuning(pool).await;
+        }
+    } else {
+        tracing::warn!("Skipping database migrations because SKIP_MIGRATIONS is enabled");
+    }
     Ok(())
 }
 
@@ -273,7 +311,7 @@ fn validate_jwt_secret(secret: &str, environment: &str) -> Result<Option<String>
     }
 }
 
-async fn run_server(pool: sqlx::PgPool) -> anyhow::Result<()> {
+async fn build_server(pool: sqlx::PgPool) -> anyhow::Result<ApiServer> {
     tracing::info!("API Server starting up...");
 
     // Validate JWT_SECRET for security
@@ -312,12 +350,8 @@ async fn run_server(pool: sqlx::PgPool) -> anyhow::Result<()> {
         "Server configuration loaded"
     );
 
-    // Create and run server
     tracing::info!("Starting API server...");
-    let server = ApiServer::new(config, pool).await?;
-    server.run().await?;
-
-    Ok(())
+    ApiServer::new(config, pool).await
 }
 
 #[cfg(test)]

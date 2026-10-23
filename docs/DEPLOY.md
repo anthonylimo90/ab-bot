@@ -108,7 +108,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    DYNAMIC_TUNER_REDIS_URL=${{Redis.REDIS_URL}}
    DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
    JWT_SECRET=<generate-32-char-secret>
-   RUST_LOG=api_server=info,tower_http=error,polymarket_core=warn,sqlx=warn
+   RUST_LOG=warn,api_server=info,auth=info,risk_manager=info,trading_engine=info,tower_http=error
    ENVIRONMENT=production
    CORS_ALLOWED_ORIGINS=https://<your-dashboard-domain>
    APP_DOMAIN=<your-dashboard-domain>
@@ -147,7 +147,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    DATABASE_URL=${{TimescaleDB.DATABASE_URL}}
    REDIS_URL=${{Redis.REDIS_URL}}
    DYNAMIC_CONFIG_REDIS_URL=${{Redis.REDIS_URL}}
-   RUST_LOG=arb_monitor=info,polymarket_core=warn
+   RUST_LOG=warn,arb_monitor=info
    POLYMARKET_CLOB_URL=https://clob.polymarket.com
    ```
 
@@ -201,7 +201,7 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 | `DYNAMIC_TUNER_REDIS_URL` | Redis URL used by dynamic tuner publisher | `${{Redis.REDIS_URL}}` |
 | `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
 | `JWT_SECRET` | JWT signing key (32+ chars) | `your-secret-key` |
-| `RUST_LOG` | Log level | `api_server=info,tower_http=error,polymarket_core=warn,sqlx=warn` |
+| `RUST_LOG` | Log filter. Start with `warn`: a crate the filter leaves out is not logged at all, errors included | `warn,api_server=info,auth=info,risk_manager=info,trading_engine=info,tower_http=error` |
 | `ENVIRONMENT` | `production` enables the strict secret and sign-in checks | `production` |
 | `CORS_ALLOWED_ORIGINS` | Exact origins allowed to call the API (unset: all origins) | `https://app.example.com` |
 | `APP_DOMAIN` / `APP_URI` | Site wallet sign-in messages are bound to (required for wallet sign-in outside development) | `app.example.com` / `https://app.example.com` |
@@ -216,7 +216,7 @@ Open `https://<your-dashboard-url>.railway.app` in browser.
 | `DATABASE_URL` | TimescaleDB connection | `${{TimescaleDB.DATABASE_URL}}` |
 | `REDIS_URL` | Redis connection | `${{Redis.REDIS_URL}}` |
 | `DYNAMIC_CONFIG_REDIS_URL` | Redis URL used by dynamic-config subscribers | `${{Redis.REDIS_URL}}` |
-| `RUST_LOG` | Log level (debug floods Railway's log limit) | `arb_monitor=info,polymarket_core=warn` |
+| `RUST_LOG` | Log filter (debug floods Railway's log limit) | `warn,arb_monitor=info` |
 | `POLYMARKET_CLOB_URL` | Polymarket API | `https://clob.polymarket.com` |
 
 ### Dashboard
@@ -391,7 +391,7 @@ Railway supports multiple environments within a single project, allowing you to 
    | api-server | `DATABASE_URL` | `${{TimescaleDB.DATABASE_URL}}` |
    | api-server | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
    | api-server | `JWT_SECRET` | New unique 32+ char secret |
-   | api-server | `RUST_LOG` | `api_server=debug,tower_http=error,polymarket_core=warn,sqlx=warn` |
+   | api-server | `RUST_LOG` | `warn,api_server=debug,auth=info,risk_manager=info,trading_engine=info,tower_http=error` |
    | dashboard | `NEXT_PUBLIC_API_URL` | `https://<staging-api>.railway.app` |
 
 5. **Keep staging off the production wallet.** The trading lock is held
@@ -782,20 +782,24 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 ### Configuration and operator safeguards
 
 - Settings are read the same way everywhere. Yes/no settings take true, 1,
-  yes or on and false, 0, no or off; any other value keeps the default and
-  is logged as an error (before, `1` or `TRUE` switched off settings that
-  default on, among them `FLOW_REQUIRE_CALIBRATION` and the account
-  snapshot that feeds the circuit breaker). The switches that let the bot
-  spend money (`LIVE_TRADING`, `ARB_AUTO_EXECUTE`, `QUANT_EXECUTOR_ENABLED`,
-  `EXIT_HANDLER_ENABLED`) still turn on only for exactly `true`; another
-  value is logged. A number that cannot be read keeps its default and is
-  logged (scientific notation such as `1e3` is read). `QUANT_STOP_LOSS_PCT`
-  and `QUANT_TAKE_PROFIT_PCT` must be fractions above 0 and at most 1, and
-  the `QUANT_*_ALLOCATION_PCT` shares 0 to 1; a value out of range (10
-  written for 10%) keeps the default and is logged.
-- docker-compose passes every setting in `.env` to the API and the arb
-  monitor (`env_file`); it used to pass a fixed list, dropping the circuit
-  breaker's `CB_*`, the quant and tuner settings among others.
+  yes or on and false, 0, no or off (before, `1` or `TRUE` switched off
+  settings that default on, among them `FLOW_REQUIRE_CALIBRATION` and the
+  account snapshot that feeds the circuit breaker). The switches that let
+  the bot spend money (`LIVE_TRADING`, `ARB_AUTO_EXECUTE`,
+  `ARB_ALLOW_LIVE_EXECUTION`, `QUANT_EXECUTOR_ENABLED`,
+  `EXIT_HANDLER_ENABLED`, ...) take only exactly `true` or `false`.
+  Scientific notation such as `1e3` is read. `QUANT_STOP_LOSS_PCT` must be
+  a fraction above 0 and at most 1, `QUANT_TAKE_PROFIT_PCT` a number above
+  0 (1.5 takes profit at +150%), and the `QUANT_*_ALLOCATION_PCT` shares 0
+  to 1. A value that cannot be read stops the start (see below).
+- docker-compose passes every setting in `.env` to the API (`env_file`); it
+  used to pass a fixed list, dropping the circuit breaker's `CB_*`, the
+  quant and tuner settings among others. **Before upgrading, read `.env`
+  through**: a setting that compose used to drop now applies, such as a
+  `QUANT_EXECUTOR_ENABLED=true`, an `ARB_ALLOW_LIVE_EXECUTION=true`, a
+  `CB_*` limit or an `ENCRYPTION_KEY` left there. The API logs the trading
+  switches and the circuit breaker limits in effect at start. `env_file`
+  with `required: false` needs Docker Compose 2.24 or later.
 - `.env.example` documents `ARB_ALLOW_LIVE_EXECUTION` (live arbitrage is
   skipped without it), `ARB_MAX_TOTAL_EXPOSURE`, the `CB_*` limits and the
   quant allocations, and no longer ships a placeholder Alchemy key that
@@ -821,6 +825,64 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   longer set `RUST_LOG=info`, which logged every database query.
 - An `ENCRYPTION_KEY` set but empty is logged as an error at start.
 - Staging: see "Keep staging off the production wallet" above.
+
+### Settings checked at start, the arb monitor and signal analytics
+
+- **A setting that cannot be read stops the API and the arb monitor at
+  start**, naming it and what it expects: a yes/no value such as
+  `disabled`, a money switch other than `true`/`false` (`TRUE`, `1`), a
+  number with a comma or unit, a fraction written as a percentage. Before,
+  such a value fell back to the setting's default, which left a service
+  meant off running. `ARB_ALLOW_LIVE_EXECUTION=1` was accepted as on and is
+  now refused: write `true`. Check every service's settings before
+  upgrading: a service that refuses to start leaves open positions without
+  their exits until it is corrected.
+- The default log filters now start with `warn`
+  (`warn,api_server=info,auth=info,risk_manager=info,trading_engine=info,...`):
+  the old filters dropped the circuit breaker's and the order executor's
+  messages entirely, errors included. Update a `RUST_LOG` set on a service
+  the same way.
+- `ENCRYPTION_KEY` can be set after secrets were saved: a workspace secret
+  saved under `JWT_SECRET` is still read (and logged; save it again to move
+  it to the new key). A secret that neither key decrypts is reported and
+  not used, rather than its ciphertext being sent as the Alchemy key.
+- docker-compose passes the arb monitor only the settings it reads (it had
+  every `.env` secret). The arb monitor exits when its loop stops for five
+  minutes (Railway and compose restart it), and its compose health check
+  fails when the health file is five minutes old. A stop signal during
+  migrations or startup ends the API's start.
+- `.env.example` no longer sets `TRUSTED_PROXY_HOPS=1`: copied as is under
+  compose, which publishes the API directly, it let clients choose the
+  address they are rate limited by.
+- Arb monitor: YES and NO books are paired only from the same websocket
+  connection (after a reconnect, a fresh side no longer pairs with the other
+  side's pre-gap book); a book that turns crossed is dropped until the next
+  snapshot; each price-change event is applied whole before it is
+  published; an entry signal no API is subscribed to counts as not sent; a
+  failed market listing is retried after two minutes, and one under half
+  the size of the last is applied only once a second listing confirms it;
+  one malformed Gamma market no longer fails its page.
+- Quant: the flow strategy's calibration measures returns on what each
+  position cost (it used the signal's suggested $30, reading a 4% gain as
+  1.2%) against the uncalibrated edge, and leaves out unconfirmed
+  resolution wins. Calibrated flow edges were understated in proportion
+  to how far positions were sized below $30; expect more flow signals to
+  clear the minimum edge. Mean reversion trades only active
+  markets that do not end within a day, priced 0.08-0.92. The resolution
+  strategy's default allocation is 0: it follows the favourite with no
+  estimate of its own, so it has no modelled edge. Set
+  `QUANT_RESOLUTION_ALLOCATION_PCT` to trade it.
+- Bot scores: a wallet is scored again a day after its last score, and one
+  with too few transfers (or a failed analysis) after an hour; before, each
+  wallet was scored once per process.
+- The market regime averages only wallets with five or more closed trades
+  in 30 days (buy-only wallets read as losers and held it bearish), and the
+  tuner's volatility term uses hourly price movement rather than wallets'
+  annualized return volatility, which held the arbitrage threshold at its
+  ceiling.
+- Backtests: volume fee tiers advance with traded volume (they used fees),
+  and Sortino ratios divide downside over every day, as wallet metrics now
+  do.
 
 ### API contract changes
 

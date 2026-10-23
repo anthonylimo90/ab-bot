@@ -1,7 +1,10 @@
 //! Resolution proximity signal generator.
 //!
 //! Polls `market_metadata` every 15 minutes for markets approaching their
-//! end date. Uses a binary time-decay model to identify underpriced outcomes.
+//! end date, and follows the side the market already favours. It has no
+//! probability estimate of its own, so nothing says the favourite is
+//! underpriced: the executor gives it no allocation unless
+//! `QUANT_RESOLUTION_ALLOCATION_PCT` is set.
 //!
 //! Trigger conditions:
 //!   - Market end_date is 1–7 days away
@@ -58,10 +61,10 @@ impl ResolutionSignalConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(Decimal::new(1000, 0)),
-            base_position_size_usd: std::env::var("QUANT_BASE_POSITION_SIZE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(Decimal::new(30, 0)),
+            base_position_size_usd: polymarket_core::config::env_decimal(
+                "QUANT_BASE_POSITION_SIZE",
+                Decimal::new(30, 0),
+            ),
             expiry_minutes: 60,
         }
     }

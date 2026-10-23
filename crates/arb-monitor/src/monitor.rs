@@ -27,10 +27,14 @@ const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false
 const SIGNAL_COOLDOWN_SECS: i64 = 60;
 /// The longest publishing one entry signal may hold up the books.
 const SIGNAL_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The longest the minute's position refresh may hold up the books.
+const POSITION_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// After a publish fails, how long entry signals wait before the next try:
 /// while Redis hangs, every profitable book would otherwise wait out the
 /// timeout.
 const SIGNAL_PUBLISH_BACKOFF_SECS: i64 = 5;
+/// How soon a failed or doubtful universe refresh is tried again.
+const UNIVERSE_RETRY_AFTER: StdDuration = StdDuration::from_secs(120);
 
 /// Minimum number of market replacements before a periodic rerank triggers a resubscribe.
 const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
@@ -286,8 +290,9 @@ pub struct ArbMonitor {
     gamma_client: Arc<GammaClient>,
     position_tracker: PositionTracker,
     signal_publisher: SignalPublisher,
-    /// Current order books by (market_id, outcome_id).
-    order_books: HashMap<(String, String), OrderBook>,
+    /// The latest book per (market_id, outcome_id), with the websocket
+    /// connection that delivered it.
+    order_books: HashMap<(String, String), (u64, OrderBook)>,
     /// Market outcome pairings (market_id -> (yes_outcome_id, no_outcome_id)).
     market_outcomes: HashMap<String, (String, String)>,
     /// Minimum net profit threshold for entry signals.
@@ -351,6 +356,16 @@ pub struct ArbMonitor {
 /// Fetch the tradable markets from Gamma, which is authoritative for active
 /// discovery: CLOB `/markets?active=true` includes many closed historical
 /// markets and starves the websocket selection.
+/// Distinct two-outcome markets in a listing, as `apply_universe` keeps them.
+fn binary_market_count(markets: &[polymarket_core::types::Market]) -> usize {
+    markets
+        .iter()
+        .filter(|m| m.outcomes.len() == 2)
+        .map(|m| m.id.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 async fn fetch_universe(gamma: &GammaClient) -> Result<Vec<polymarket_core::types::Market>> {
     let gamma_page_size = std::env::var("GAMMA_ARB_MARKET_PAGE_SIZE")
         .ok()
@@ -516,7 +531,13 @@ impl ArbMonitor {
 
     /// Replace the market universe with `markets`.
     fn apply_universe(&mut self, markets: Vec<polymarket_core::types::Market>) {
-        let binary_markets: Vec<_> = markets.iter().filter(|m| m.outcomes.len() == 2).collect();
+        // A market listed twice (pages shift while they are read) is kept once.
+        let mut seen = HashSet::new();
+        let binary_markets: Vec<_> = markets
+            .iter()
+            .filter(|m| m.outcomes.len() == 2)
+            .filter(|m| seen.insert(m.id.as_str()))
+            .collect();
 
         let mut profiles = HashMap::new();
         let mut fee_schedules = HashMap::new();
@@ -537,6 +558,11 @@ impl ArbMonitor {
         self.market_profiles = profiles;
         self.market_fee_schedules = fee_schedules;
         self.market_outcomes = outcomes;
+        // Statistics of markets that left the universe would otherwise stay
+        // for the life of the process.
+        let listed = &self.market_profiles;
+        self.market_stats
+            .retain(|market_id, _| listed.contains_key(market_id));
 
         self.all_market_ids = binary_markets.iter().map(|m| m.id.clone()).collect();
         self.all_market_ids.sort_by(|a, b| {
@@ -550,7 +576,6 @@ impl ArbMonitor {
     pub async fn run(&mut self) -> Result<()> {
         info!("Fetching active markets...");
         self.load_universe().await?;
-        let mut last_universe_refresh = tokio::time::Instant::now();
         // A refresh downloads the whole universe; it runs on its own task so
         // this loop keeps draining order book updates meanwhile.
         let mut universe_fetch: Option<
@@ -563,6 +588,11 @@ impl ArbMonitor {
                 .filter(|secs| *secs > 0)
                 .unwrap_or(1800),
         );
+        let mut next_universe_refresh = tokio::time::Instant::now() + universe_refresh_interval;
+        // A listing under half the size of the one in use is more likely a
+        // partial answer than half the markets closing at once: it is applied
+        // only when the next refresh confirms it.
+        let mut shrunken_listing_seen = false;
         self.position_tracker.load_active_positions().await?;
         self.position_tracker.log_summary();
         let _ = self.rebuild_eligible_markets(SelectionRebuildReason::Startup);
@@ -630,6 +660,9 @@ impl ArbMonitor {
         let update_timeout = StdDuration::from_secs(update_timeout_secs);
         let mut last_update_at = tokio::time::Instant::now();
 
+        // Arms the watchdog: from here the loop shows life each minute.
+        crate::touch_health_file();
+
         const MAX_RESUBSCRIBE_RETRIES: u32 = 10;
         const RESUBSCRIBE_BASE_DELAY_SECS: u64 = 3;
         const RESUBSCRIBE_MAX_DELAY_SECS: u64 = 60;
@@ -651,6 +684,7 @@ impl ArbMonitor {
                     {
                         Ok(new_updates) => {
                             updates = new_updates;
+                            self.order_books.clear();
                             resets_since_tick += 1;
                             resubscribe_requested = false;
                             self.last_resubscribe_at = Some(Utc::now());
@@ -690,13 +724,30 @@ impl ArbMonitor {
                     if universe_fetch.is_some() =>
                 {
                     universe_fetch = None;
+                    // A failed refresh is retried soon rather than after a
+                    // whole interval on the previous set.
+                    next_universe_refresh = tokio::time::Instant::now() + UNIVERSE_RETRY_AFTER;
                     match fetched {
                         // An empty answer is a failed listing, not a market
                         // with nothing to trade: it would unsubscribe every book.
                         Ok(Ok(markets)) if markets.is_empty() => warn!(
                             "Arb market universe refresh returned no markets; keeping previous set"
                         ),
+                        Ok(Ok(markets))
+                            if !shrunken_listing_seen
+                                && binary_market_count(&markets) * 2 < self.all_market_ids.len() =>
+                        {
+                            shrunken_listing_seen = true;
+                            warn!(
+                                listed = binary_market_count(&markets),
+                                in_use = self.all_market_ids.len(),
+                                "Arb market universe refresh listed under half the markets in use; \
+                                 keeping previous set until a refresh confirms it"
+                            );
+                        }
                         Ok(Ok(markets)) => {
+                            shrunken_listing_seen = false;
+                            next_universe_refresh = tokio::time::Instant::now() + universe_refresh_interval;
                             self.apply_universe(markets);
                             info!(total_markets = self.all_market_ids.len(), "Refreshed arb market universe");
                         }
@@ -869,16 +920,24 @@ impl ArbMonitor {
                         debug!(evicted = ob_evicted, remaining = self.order_books.len(), "Pruned stale order books");
                     }
                     if universe_fetch.is_none()
-                        && last_universe_refresh.elapsed() >= universe_refresh_interval
+                        && tokio::time::Instant::now() >= next_universe_refresh
                     {
-                        last_universe_refresh = tokio::time::Instant::now();
                         let gamma = self.gamma_client.clone();
                         universe_fetch =
                             Some(tokio::spawn(async move { fetch_universe(&gamma).await }));
                     }
-                    // Keep markets that hold positions subscribed as positions open and close.
-                    if let Err(e) = self.position_tracker.load_active_positions().await {
-                        warn!(error = %e, "Failed to refresh active positions; keeping previous set");
+                    // Keep markets that hold positions subscribed as positions
+                    // open and close. Bounded: a hung database must not stall
+                    // the books.
+                    match tokio::time::timeout(
+                        POSITION_REFRESH_TIMEOUT,
+                        self.position_tracker.load_active_positions(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => warn!(error = %e, "Failed to refresh active positions; keeping previous set"),
+                        Err(_) => warn!("Refreshing active positions timed out; keeping previous set"),
                     }
                     let outcome = self.rebuild_eligible_markets(SelectionRebuildReason::PeriodicRerank);
                     if outcome.applied {
@@ -911,6 +970,7 @@ impl ArbMonitor {
                         match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
                             Ok(new_updates) => {
                                 updates = new_updates;
+                                self.order_books.clear();
                                 resets_since_tick += 1;
                                 self.last_resubscribe_at = Some(Utc::now());
                                 break;
@@ -931,6 +991,7 @@ impl ArbMonitor {
                             match self.clob_client.subscribe_orderbook(self.active_subscription_asset_ids()).await {
                                 Ok(new_updates) => {
                                     updates = new_updates;
+                                    self.order_books.clear();
                                     resets_since_tick += 1;
                                     self.last_resubscribe_at = Some(Utc::now());
                                     break;
@@ -1258,18 +1319,25 @@ impl ArbMonitor {
             bids: update.bids,
             asks: update.asks,
         };
-        self.order_books
-            .insert((update.market_id.clone(), update.asset_id.clone()), book);
+        self.order_books.insert(
+            (update.market_id.clone(), update.asset_id.clone()),
+            (update.connection, book),
+        );
 
-        // Check if we have both sides for this market
+        // Check if we have both sides for this market. After a reconnect one
+        // side can still be the book from before the gap; it pairs only once
+        // the new connection has sent its own snapshot of that side.
         if let Some((yes_id, no_id)) = self.market_outcomes.get(&update.market_id).cloned() {
             let yes_key = (update.market_id.clone(), yes_id);
             let no_key = (update.market_id.clone(), no_id);
 
-            if let (Some(yes_book), Some(no_book)) = (
+            if let (Some((yes_connection, yes_book)), Some((no_connection, no_book))) = (
                 self.order_books.get(&yes_key),
                 self.order_books.get(&no_key),
             ) {
+                if yes_connection != no_connection {
+                    return Ok(());
+                }
                 let binary_book = BinaryMarketBook {
                     market_id: update.market_id.clone(),
                     timestamp: update.timestamp,

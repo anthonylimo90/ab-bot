@@ -190,9 +190,9 @@ export function Header() {
   const tradingToggleConfirm = {
     title: isTradingActive ? "Pause automated trading?" : "Resume arb execution?",
     description: isTradingActive
-      ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop all trading at once."
+      ? "Live trading and arb execution are switched off for this workspace. A service the server's environment switches on cannot be paused here; trip the circuit breaker to stop new entries at once (exits and manual sales still run)."
       : currentWorkspace?.live_trading_enabled
-        ? "Arbitrage resumes with real funds: live trading is on."
+        ? "Arbitrage resumes. Live trading is on, so it trades real funds once the server allows live arbitrage (ARB_ALLOW_LIVE_EXECUTION=true); until then live opportunities are skipped."
         : "Arbitrage resumes. Live trading stays off in this workspace's settings, so it trades on paper unless the server's environment switches live trading on (LIVE_TRADING).",
     confirmLabel: isTradingActive ? "Pause" : "Resume",
   };

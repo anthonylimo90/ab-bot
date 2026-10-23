@@ -9,7 +9,7 @@ use polymarket_core::db::wallets::WalletRepository;
 use polymarket_core::types::BotScore;
 use sqlx::PgPool;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Polymarket contract addresses for trade event monitoring.
@@ -148,13 +148,20 @@ fn is_non_trader(address: &str) -> bool {
             .any(|exchange| address.eq_ignore_ascii_case(exchange))
 }
 
+/// How soon a scored wallet is analyzed again: its behaviour can change, and
+/// a score from its first trades would otherwise stand for good.
+const RESCORE_AFTER: Duration = Duration::from_secs(24 * 3600);
+/// How soon a wallet that could not be scored (too few transfers, or a failed
+/// analysis) is tried again: it may have enough soon.
+const RECHECK_AFTER: Duration = Duration::from_secs(3600);
+
 /// Bounded set of recently seen wallet addresses with least-recently-seen
-/// eviction.
+/// eviction, each with when it is next due for analysis.
 #[derive(Debug)]
 pub struct RecentWallets {
     capacity: usize,
     tick: u64,
-    by_address: HashMap<String, u64>,
+    by_address: HashMap<String, (u64, Instant)>,
     by_tick: BTreeMap<u64, String>,
 }
 
@@ -168,18 +175,24 @@ impl RecentWallets {
         }
     }
 
-    /// Record that `address` was seen. Returns `true` if it was not tracked yet
-    /// (the caller should analyze it). A known address becomes the most recently
-    /// seen; when full, the least recently seen address is evicted first.
-    pub fn observe(&mut self, address: &str) -> bool {
+    /// Record that `address` was seen at `now`. Returns `true` if it was not
+    /// tracked yet or is due for analysis again (the caller should analyze
+    /// it); it is then next due after `RECHECK_AFTER`, unless `scored`
+    /// pushes that back. A known address becomes the most recently seen; when
+    /// full, the least recently seen address is evicted first.
+    pub fn observe(&mut self, address: &str, now: Instant) -> bool {
         self.tick += 1;
         let tick = self.tick;
 
-        if let Some(previous) = self.by_address.get_mut(address) {
+        if let Some((previous, due)) = self.by_address.get_mut(address) {
             self.by_tick.remove(previous);
             *previous = tick;
             self.by_tick.insert(tick, address.to_string());
-            return false;
+            if now < *due {
+                return false;
+            }
+            *due = now + RECHECK_AFTER;
+            return true;
         }
 
         if self.by_address.len() >= self.capacity {
@@ -187,9 +200,18 @@ impl RecentWallets {
                 self.by_address.remove(&oldest);
             }
         }
-        self.by_address.insert(address.to_string(), tick);
+        self.by_address
+            .insert(address.to_string(), (tick, now + RECHECK_AFTER));
         self.by_tick.insert(tick, address.to_string());
         true
+    }
+
+    /// Record that `address` was scored at `now`: it is next due after
+    /// `RESCORE_AFTER`.
+    pub fn scored(&mut self, address: &str, now: Instant) {
+        if let Some((_, due)) = self.by_address.get_mut(address) {
+            *due = now + RESCORE_AFTER;
+        }
     }
 
     #[cfg(test)]
@@ -313,11 +335,13 @@ impl TradeIndexer {
             .flat_map(|log| self.topics.trader_addresses(&log.topics))
             .collect();
 
-        // Analyze new wallets
+        // Analyze new wallets, and known ones due again
         for wallet in wallets {
-            if self.analyzed_wallets.observe(&wallet) {
-                if let Err(e) = self.analyze_wallet(&wallet).await {
-                    warn!("Failed to analyze wallet {}: {}", wallet, e);
+            if self.analyzed_wallets.observe(&wallet, Instant::now()) {
+                match self.analyze_wallet(&wallet).await {
+                    Ok(true) => self.analyzed_wallets.scored(&wallet, Instant::now()),
+                    Ok(false) => {}
+                    Err(e) => warn!("Failed to analyze wallet {}: {}", wallet, e),
                 }
             }
         }
@@ -327,8 +351,8 @@ impl TradeIndexer {
         Ok(())
     }
 
-    /// Analyze a single wallet.
-    async fn analyze_wallet(&self, address: &str) -> Result<()> {
+    /// Analyze a single wallet; true when a score was stored.
+    async fn analyze_wallet(&self, address: &str) -> Result<bool> {
         debug!("Analyzing wallet: {}", address);
 
         // Fetch wallet transactions (both directions)
@@ -338,8 +362,8 @@ impl TradeIndexer {
             .await?;
 
         if transfers.len() < 10 {
-            // Skip wallets with too few trades
-            return Ok(());
+            // Too few trades to score yet
+            return Ok(false);
         }
 
         // Extract features, then add the realized win rate from trade history
@@ -362,7 +386,7 @@ impl TradeIndexer {
         self.wallet_repo.upsert_features(&features).await?;
         self.wallet_repo.insert_score(&score).await?;
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -557,43 +581,61 @@ mod tests {
     #[test]
     fn recent_wallets_flags_new_addresses_once() {
         let mut set = RecentWallets::new(10);
-        assert!(set.observe("0xa"));
-        assert!(!set.observe("0xa"));
-        assert!(set.observe("0xb"));
+        let now = Instant::now();
+        assert!(set.observe("0xa", now));
+        assert!(!set.observe("0xa", now));
+        assert!(set.observe("0xb", now));
         assert_eq!(set.len(), 2);
     }
 
     #[test]
+    fn wallets_are_analyzed_again_when_due() {
+        let mut set = RecentWallets::new(10);
+        let start = Instant::now();
+        // Not scored (too few transfers): tried again after an hour.
+        assert!(set.observe("0xa", start));
+        assert!(!set.observe("0xa", start + RECHECK_AFTER - Duration::from_secs(1)));
+        assert!(set.observe("0xa", start + RECHECK_AFTER));
+        // Scored: not again for a day.
+        let scored_at = start + RECHECK_AFTER;
+        set.scored("0xa", scored_at);
+        assert!(!set.observe("0xa", scored_at + RECHECK_AFTER));
+        assert!(set.observe("0xa", scored_at + RESCORE_AFTER));
+    }
+
+    #[test]
     fn recent_wallets_is_bounded_and_evicts_least_recently_seen() {
+        let now = Instant::now();
         let mut set = RecentWallets::new(3);
         for a in ["0xa", "0xb", "0xc"] {
-            assert!(set.observe(a));
+            assert!(set.observe(a, now));
         }
         // Touch 0xa so 0xb becomes the least recently seen.
-        assert!(!set.observe("0xa"));
+        assert!(!set.observe("0xa", now));
         // Inserting a fourth evicts 0xb, not 0xa.
-        assert!(set.observe("0xd"));
+        assert!(set.observe("0xd", now));
         assert_eq!(set.len(), 3);
         assert!(set.contains("0xa") && set.contains("0xc") && set.contains("0xd"));
         assert!(!set.contains("0xb"));
         // The evicted wallet is treated as new again.
-        assert!(set.observe("0xb"));
+        assert!(set.observe("0xb", now));
         assert_eq!(set.len(), 3);
     }
 
     #[test]
     fn recent_wallets_never_grows_past_capacity() {
+        let now = Instant::now();
         let mut set = RecentWallets::new(100);
         for i in 0..10_000 {
-            set.observe(&format!("0x{i:040x}"));
+            set.observe(&format!("0x{i:040x}"), now);
             assert!(set.len() <= 100);
             assert_eq!(set.by_tick.len(), set.by_address.len());
         }
         assert_eq!(set.len(), 100);
         // Zero capacity is clamped to one slot.
         let mut tiny = RecentWallets::new(0);
-        assert!(tiny.observe("0xa"));
-        assert!(tiny.observe("0xb"));
+        assert!(tiny.observe("0xa", now));
+        assert!(tiny.observe("0xb", now));
         assert_eq!(tiny.len(), 1);
     }
 }

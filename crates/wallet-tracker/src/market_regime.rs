@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::debug;
 
+/// Closed trades (wins plus losses) a wallet needs in 30 days to count
+/// towards the regime's average win rate and ROI spread.
+const MIN_CLOSED_TRADES_FOR_REGIME: i32 = 5;
+
 /// Market regime for context-aware prediction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,27 +142,20 @@ impl MarketConditionAnalyzer {
     /// Used as a tiebreaker when wallet metrics alone fall into the ambiguous zone.
     pub async fn detect_regime_from_metrics(&self) -> Result<MarketRegime> {
         // ── Layer 1: Wallet performance aggregates ──
+        // Only wallets with closed trades to judge: one that has only bought
+        // has a stored win rate of 0, not a losing record. Both columns are
+        // fractions (an ROI of 1.5 is +150%).
         let row: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
             r#"
             SELECT
-                AVG(
-                    CASE
-                        WHEN ABS(COALESCE(win_rate_30d, 0)) > 1
-                            THEN COALESCE(win_rate_30d, 0)::FLOAT8 / 100.0
-                        ELSE COALESCE(win_rate_30d, 0)::FLOAT8
-                    END
-                ) AS avg_win_rate,
-                STDDEV_POP(
-                    CASE
-                        WHEN ABS(COALESCE(roi_30d, 0)) > 1
-                            THEN COALESCE(roi_30d, 0)::FLOAT8 / 100.0
-                        ELSE COALESCE(roi_30d, 0)::FLOAT8
-                    END
-                ) AS roi_stddev
+                AVG(win_rate_30d::FLOAT8) AS avg_win_rate,
+                STDDEV_POP(roi_30d::FLOAT8) AS roi_stddev
             FROM wallet_success_metrics
             WHERE last_computed > NOW() - INTERVAL '7 days'
+              AND winning_trades_30d + losing_trades_30d >= $1
             "#,
         )
+        .bind(MIN_CLOSED_TRADES_FOR_REGIME)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -167,19 +164,26 @@ impl MarketConditionAnalyzer {
         let roi_stddev = roi_stddev.unwrap_or(0.15);
 
         // ── Layer 2: Orderbook microstructure (24h momentum + spread volatility) ──
-        // Query the hourly continuous aggregate for the last 24h.
-        // momentum: average (close - open) / open across all markets with data
-        // spread_vol: stddev of avg_spread across all hourly buckets
+        // Query the hourly continuous aggregate for the last 24h, per market:
+        // momentum: average hourly (close - open) / open
+        // spread_vol: how much the market's hourly spread moved over the day
+        // (not how spreads differ between markets), averaged across markets
         let ob_row: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
             r#"
             SELECT
-                AVG(
-                    CASE WHEN open > 0 THEN (close - open)::FLOAT8 / open::FLOAT8 ELSE 0 END
-                ) AS avg_momentum,
-                STDDEV_POP(avg_spread::FLOAT8) AS spread_volatility
-            FROM orderbook_hourly
-            WHERE bucket >= NOW() - INTERVAL '24 hours'
-              AND tick_count >= 2
+                AVG(momentum) AS avg_momentum,
+                AVG(spread_volatility) AS spread_volatility
+            FROM (
+                SELECT
+                    AVG(
+                        CASE WHEN open > 0 THEN (close - open)::FLOAT8 / open::FLOAT8 ELSE 0 END
+                    ) AS momentum,
+                    STDDEV_POP(avg_spread::FLOAT8) AS spread_volatility
+                FROM orderbook_hourly
+                WHERE bucket >= NOW() - INTERVAL '24 hours'
+                  AND tick_count >= 2
+                GROUP BY market_id
+            ) per_market
             "#,
         )
         .fetch_optional(&self.pool)

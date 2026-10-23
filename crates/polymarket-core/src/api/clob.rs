@@ -15,6 +15,7 @@ use rust_decimal::RoundingStrategy;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration as StdDuration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,6 +25,7 @@ use tracing::{debug, info, warn};
 
 const COLLATERAL_DECIMALS: u32 = 6;
 const MARKET_ORDER_SIZE_SCALE: u32 = 2;
+const WS_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[derive(Debug, Clone, Default)]
 pub struct WebSocketRuntimeStatsSnapshot {
@@ -43,6 +45,9 @@ pub struct WebSocketRuntimeStatsSnapshot {
     pub last_parse_miss_kind: Option<String>,
     pub last_message_kind: Option<String>,
 }
+
+/// Numbers websocket connections across every subscription in the process.
+static NEXT_WS_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
 static WS_RUNTIME_STATS: LazyLock<Mutex<WebSocketRuntimeStatsSnapshot>> =
     LazyLock::new(|| Mutex::new(WebSocketRuntimeStatsSnapshot::default()));
@@ -672,7 +677,17 @@ impl ClobClient {
             });
         }
 
-        let (ws_stream, _) = connect_async(ws_url).await?;
+        // A handshake that never completes would hold the reconnect loop.
+        let (ws_stream, _) = tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url))
+            .await
+            .map_err(|_| Error::Api {
+                message: format!(
+                    "WebSocket connect timed out after {}s",
+                    WS_CONNECT_TIMEOUT.as_secs()
+                ),
+                status: None,
+            })??;
+        let connection = NEXT_WS_CONNECTION.fetch_add(1, Ordering::Relaxed);
         let (mut write, mut read) = ws_stream.split();
         let read_timeout_secs = std::env::var("CLOB_WS_READ_TIMEOUT_SECS")
             .ok()
@@ -713,6 +728,12 @@ impl ClobClient {
         // Process incoming messages
         loop {
             tokio::select! {
+                // A replaced subscription drops its receiver; a quiet market
+                // would otherwise keep this connection open indefinitely.
+                _ = tx.closed() => {
+                    debug!("Receiver dropped, closing WebSocket");
+                    return Ok(());
+                }
                 _ = ping_tick.tick() => {
                     write.send(Message::Text("PING".to_string())).await?;
                 }
@@ -790,7 +811,8 @@ impl ClobClient {
                                 }
                             });
 
-                            for update in parsed.updates {
+                            for mut update in parsed.updates {
+                                update.connection = connection;
                                 if tx.send(update).await.is_err() {
                                     warn!("Receiver dropped, closing WebSocket");
                                     return Ok(());
@@ -988,6 +1010,10 @@ pub struct OrderBookUpdate {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
+    /// The websocket connection that delivered this book. Each connection
+    /// starts again from snapshots, so books from different connections
+    /// may not describe the same moment and must not be paired.
+    pub connection: u64,
 }
 
 // Internal API response types
@@ -1087,7 +1113,7 @@ impl From<ClobOrderBook> for OrderBook {
         OrderBook {
             market_id: b.market,
             outcome_id: b.asset_id,
-            timestamp: b.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
+            timestamp: parse_ws_timestamp(&b.timestamp),
             bids: parse_book_levels(b.bids, true),
             asks: parse_book_levels(b.asks, false),
         }
@@ -1272,6 +1298,7 @@ fn parse_ws_book_from_value(value: serde_json::Value) -> Option<OrderBookUpdate>
         timestamp: parse_ws_timestamp(&ws_book.timestamp),
         bids: parse_book_levels(ws_book.bids, true),
         asks: parse_book_levels(ws_book.asks, false),
+        connection: 0,
     })
 }
 
@@ -1285,7 +1312,9 @@ fn apply_price_changes(
         .map(parse_ws_timestamp)
         .unwrap_or_else(chrono::Utc::now);
 
-    let mut updates = Vec::new();
+    // Every change in an event is applied before any book is published: a
+    // book part-way through an event need not be one the exchange ever held.
+    let mut touched: Vec<String> = Vec::new();
     for change in event.price_changes {
         let price = match change.price.parse::<Decimal>() {
             Ok(price) => price,
@@ -1298,35 +1327,67 @@ fn apply_price_changes(
 
         // A delta without its snapshot would publish a partial book whose
         // first level need not be the real best price; wait for the snapshot.
-        let Some(mut book) = book_state.remove(&change.asset_id) else {
+        let Some(book) = book_state.get_mut(&change.asset_id) else {
             debug!(asset_id = %change.asset_id, "Ignoring price change before book snapshot");
             continue;
         };
-
-        book.market_id = event.market.clone();
-        book.timestamp = timestamp;
 
         if change.side.eq_ignore_ascii_case("BUY") {
             upsert_level(&mut book.bids, price, size, true);
         } else if change.side.eq_ignore_ascii_case("SELL") {
             upsert_level(&mut book.asks, price, size, false);
         } else {
-            book_state.insert(change.asset_id, book);
             continue;
         }
+        book.market_id = event.market.clone();
+        book.timestamp = timestamp;
+        if !touched.contains(&change.asset_id) {
+            touched.push(change.asset_id);
+        }
+    }
 
-        let update = OrderBookUpdate {
+    let mut updates = Vec::with_capacity(touched.len());
+    for asset_id in touched {
+        // The exchange matches crossing orders, so a crossed book means a
+        // delta was missed. Publish an empty book in its place and wait for
+        // the next snapshot rather than price from a book that is wrong.
+        if book_state.get(&asset_id).is_some_and(is_crossed) {
+            debug!(asset_id = %asset_id, "Dropping crossed book until the next snapshot");
+            let Some(book) = book_state.remove(&asset_id) else {
+                continue;
+            };
+            updates.push(OrderBookUpdate {
+                market_id: book.market_id,
+                asset_id: book.outcome_id,
+                timestamp: book.timestamp,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                connection: 0,
+            });
+            continue;
+        }
+        let Some(book) = book_state.get(&asset_id) else {
+            continue;
+        };
+        updates.push(OrderBookUpdate {
             market_id: book.market_id.clone(),
             asset_id: book.outcome_id.clone(),
             timestamp: book.timestamp,
             bids: book.bids.clone(),
             asks: book.asks.clone(),
-        };
-        book_state.insert(change.asset_id, book);
-        updates.push(update);
+            connection: 0,
+        });
     }
 
     updates
+}
+
+/// Both sides are kept best-first, so the first levels are the touch.
+fn is_crossed(book: &OrderBook) -> bool {
+    match (book.bids.first(), book.asks.first()) {
+        (Some(bid), Some(ask)) => bid.price >= ask.price,
+        _ => false,
+    }
 }
 
 fn parse_ws_timestamp(raw: &str) -> chrono::DateTime<chrono::Utc> {

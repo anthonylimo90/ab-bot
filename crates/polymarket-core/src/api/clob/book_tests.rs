@@ -161,3 +161,73 @@ fn price_changes_keep_the_snapshot_best_first() {
     );
     assert_eq!(prices(&last.bids), vec![dec("0.35"), dec("0.30")]);
 }
+
+#[test]
+fn an_event_publishes_each_book_once_in_its_final_state() {
+    let mut state = HashMap::new();
+    parse_ws_message(
+        r#"{"event_type":"book","market":"m","asset_id":"a","timestamp":"1",
+            "bids":[{"price":"0.40","size":"2"}],"asks":[{"price":"0.60","size":"4"}]}"#,
+        &mut state,
+    );
+
+    // Part-way through, the book is crossed (bid 0.40 against ask 0.39); the
+    // event as a whole leaves it at bid 0.38 and ask 0.39.
+    let parsed = parse_ws_message(
+        r#"{"event_type":"price_change","market":"m","timestamp":"2",
+            "price_changes":[
+                {"asset_id":"a","price":"0.39","size":"5","side":"SELL"},
+                {"asset_id":"a","price":"0.40","size":"0","side":"BUY"},
+                {"asset_id":"a","price":"0.38","size":"1","side":"BUY"}
+            ]}"#,
+        &mut state,
+    );
+
+    assert_eq!(parsed.updates.len(), 1);
+    assert_eq!(prices(&parsed.updates[0].bids), vec![dec("0.38")]);
+    assert_eq!(
+        prices(&parsed.updates[0].asks),
+        vec![dec("0.39"), dec("0.60")]
+    );
+}
+
+#[test]
+fn a_crossed_book_is_published_empty_until_the_next_snapshot() {
+    let mut state = HashMap::new();
+    parse_ws_message(
+        r#"{"event_type":"book","market":"m","asset_id":"a","timestamp":"1",
+            "bids":[{"price":"0.40","size":"2"}],"asks":[{"price":"0.60","size":"4"}]}"#,
+        &mut state,
+    );
+
+    let parsed = parse_ws_message(
+        r#"{"event_type":"price_change","market":"m","timestamp":"2",
+            "price_changes":[{"asset_id":"a","price":"0.35","size":"5","side":"SELL"}]}"#,
+        &mut state,
+    );
+    assert_eq!(parsed.updates.len(), 1);
+    assert!(parsed.updates[0].bids.is_empty());
+    assert!(parsed.updates[0].asks.is_empty());
+
+    // Deltas wait for the snapshot again.
+    let parsed = parse_ws_message(
+        r#"{"event_type":"price_change","market":"m","timestamp":"3",
+            "price_changes":[{"asset_id":"a","price":"0.50","size":"5","side":"SELL"}]}"#,
+        &mut state,
+    );
+    assert!(parsed.updates.is_empty());
+
+    let parsed = parse_ws_message(
+        r#"{"event_type":"book","market":"m","asset_id":"a","timestamp":"4",
+            "bids":[{"price":"0.30","size":"2"}],"asks":[{"price":"0.35","size":"4"}]}"#,
+        &mut state,
+    );
+    assert_eq!(prices(&parsed.updates[0].asks), vec![dec("0.35")]);
+}
+
+#[test]
+fn rest_book_time_is_read_from_milliseconds() {
+    let raw: ClobOrderBook = serde_json::from_str(WORST_FIRST_BOOK).unwrap();
+    let book: OrderBook = raw.into();
+    assert_eq!(book.timestamp.timestamp_millis(), 1_792_618_777_423);
+}

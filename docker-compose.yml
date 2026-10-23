@@ -58,7 +58,8 @@ services:
     container_name: ab-bot-api
     # Every setting in .env reaches the service (the circuit breaker's CB_*,
     # the quant, signal and tuner settings, ...); the entries under
-    # `environment` take precedence over it.
+    # `environment` take precedence over it. Needs Docker Compose 2.24 or
+    # later (`required: false`).
     env_file:
       - path: .env
         required: false
@@ -82,7 +83,7 @@ services:
       # This file publishes the API port directly, so no proxy's X-Forwarded-For
       # is trusted. Set it to the number of reverse proxies when behind them.
       TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
-      RUST_LOG: ${RUST_LOG:-api_server=info,tower_http=info}
+      RUST_LOG: ${RUST_LOG:-warn,api_server=info,auth=info,risk_manager=info,trading_engine=info,tower_http=info}
       SKIP_MIGRATIONS: ${SKIP_MIGRATIONS:-false}
       ARB_AUTO_EXECUTE: ${ARB_AUTO_EXECUTE:-false}
       ARB_POSITION_SIZE: ${ARB_POSITION_SIZE:-10}
@@ -141,18 +142,40 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ab-bot-arb-monitor
-    # Every setting in .env reaches the service (the circuit breaker's CB_*,
-    # the quant, signal and tuner settings, ...); the entries under
-    # `environment` take precedence over it.
-    env_file:
-      - path: .env
-        required: false
+    # Only the settings the monitor reads: it parses outside feeds and needs
+    # none of the API's secrets. A name without a value is passed from .env
+    # (or the shell) when set there, and left unset otherwise.
     environment:
       SERVICE: arb-monitor
       DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
       REDIS_URL: redis://app:${REDIS_APP_PASSWORD:-app_secret_change_me}@redis:6379
       DYNAMIC_CONFIG_REDIS_URL: redis://dynamic_subscriber:${REDIS_DYNAMIC_SUBSCRIBER_PASSWORD:-dynamic_subscriber_secret_change_me}@redis:6379
-      RUST_LOG: ${RUST_LOG:-arb_monitor=info}
+      RUST_LOG: ${RUST_LOG:-warn,arb_monitor=info}
+      ARB_MIN_PROFIT_THRESHOLD:
+      ARB_MIN_BOOK_DEPTH:
+      ARB_MONITOR_MIN_BOOK_DEPTH:
+      ARB_MONITOR_MAX_MARKETS:
+      ARB_MONITOR_EXPLORATION_SLOTS:
+      ARB_MONITOR_AGGRESSIVENESS:
+      ARB_MONITOR_AGGRESSIVENESS_LEVEL:
+      ARB_EXPLORATION_HOLD_SECS:
+      ARB_EXPLORATION_SWAP_MIN_SCORE_DELTA:
+      ARB_SELECTION_FORCE_REFRESH_SECS:
+      ARB_SELECTION_RESUBSCRIBE_MIN_DELTA_RATIO:
+      ARB_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA:
+      ARB_UNIVERSE_REFRESH_SECS:
+      ARB_UPDATE_TIMEOUT_SECS:
+      DYNAMIC_CONFIG_ALLOWED_SOURCES:
+      GAMMA_ARB_MARKET_PAGE_SIZE:
+      GAMMA_MAX_PAGE_SIZE:
+      GAMMA_PAGE_DELAY_MS:
+      CLOB_WS_PING_INTERVAL_SECS:
+      CLOB_WS_READ_TIMEOUT_SECS:
+      POLYMARKET_CLOB_URL:
+      POLYMARKET_WS_URL:
+      TELEGRAM_BOT_TOKEN:
+      TELEGRAM_CHAT_ID:
+      DISCORD_WEBHOOK_URL:
     depends_on:
       # The API server applies the schema this service reads.
       api-server:
@@ -162,7 +185,8 @@ services:
     mem_limit: 2g
     memswap_limit: 2g
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      # The monitor rewrites the file at least each minute while its loop runs.
+      test: ["CMD-SHELL", "test -f /tmp/healthy && [ $$(( $$(date +%s) - $$(cat /tmp/healthy) )) -lt 300 ]"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -179,7 +203,7 @@ services:
     environment:
       SERVICE: bot-scanner
       DATABASE_URL: postgres://${POSTGRES_USER:-abbot}:${POSTGRES_PASSWORD:-abbot_secret}@postgres:5432/${POSTGRES_DB:-ab_bot}
-      RUST_LOG: ${RUST_LOG:-bot_scanner=info}
+      RUST_LOG: ${RUST_LOG:-warn,bot_scanner=info}
       POLYGON_RPC_URL: ${POLYGON_RPC_URL:-}
     depends_on:
       # The API server applies the schema this service writes.

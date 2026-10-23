@@ -148,8 +148,8 @@ pub struct AppState {
     pub pool: PgPool,
     /// JWT secret for token validation.
     pub jwt_secret: String,
-    /// Encryption key for sensitive DB fields (alchemy keys, etc.).
-    pub encryption_key: String,
+    /// Keys for sensitive DB fields (alchemy keys, etc.).
+    pub field_keys: crate::crypto::FieldKeys,
     /// JWT authentication handler.
     pub jwt_auth: Arc<JwtAuth>,
     /// Key vault for secure wallet key storage.
@@ -310,6 +310,15 @@ pub(crate) async fn circuit_breaker_config(pool: &PgPool) -> anyhow::Result<Circ
              limits): {error}"
         )
     })?;
+    tracing::info!(
+        enabled = config.enabled,
+        max_daily_loss = %config.max_daily_loss,
+        max_drawdown_pct = %config.max_drawdown_pct,
+        hard_kill_drawdown_pct = %config.hard_kill_drawdown_pct,
+        max_consecutive_losses = config.max_consecutive_losses,
+        cooldown_minutes = config.cooldown_minutes,
+        "Circuit breaker limits in effect"
+    );
     Ok(config)
 }
 
@@ -327,8 +336,9 @@ impl AppState {
         quant_signal_tx: broadcast::Sender<QuantSignal>,
     ) -> anyhow::Result<Self> {
         // Resolve encryption key for sensitive DB fields
-        let encryption_key = std::env::var("ENCRYPTION_KEY").unwrap_or_else(|_| jwt_secret.clone());
-        if encryption_key.trim().is_empty() {
+        let field_keys =
+            crate::crypto::FieldKeys::new(std::env::var("ENCRYPTION_KEY").ok(), &jwt_secret);
+        if field_keys.current().trim().is_empty() {
             // Kept as is: secrets already saved under it must still decrypt.
             tracing::error!(
                 "ENCRYPTION_KEY is set but empty: saved workspace secrets (RPC URLs, API keys) \
@@ -425,7 +435,7 @@ impl AppState {
                 live_workspace = live_trading_workspace,
                 "Live trading enabled — initializing wallet"
             );
-            initialize_trading_signer(&pool, &key_vault, &encryption_key, &order_executor).await?;
+            initialize_trading_signer(&pool, &key_vault, &field_keys, &order_executor).await?;
         } else {
             tracing::info!(
                 live_env = live_trading_env,
@@ -543,7 +553,7 @@ impl AppState {
             inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
             pool,
             jwt_secret,
-            encryption_key,
+            field_keys,
             jwt_auth,
             key_vault,
             audit_logger,
@@ -579,7 +589,7 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn for_tests(pool: PgPool) -> Arc<Self> {
         let jwt_secret = "isolated-http-test-secret-not-production".to_string();
-        let encryption_key = jwt_secret.clone();
+        let field_keys = crate::crypto::FieldKeys::new(None, &jwt_secret);
         let jwt_auth = Arc::new(JwtAuth::new(JwtConfig {
             secret: jwt_secret.clone(),
             issuer: None,
@@ -624,7 +634,7 @@ impl AppState {
             inventory_refresh: Arc::new(tokio::sync::Mutex::new(())),
             pool,
             jwt_secret,
-            encryption_key,
+            field_keys,
             jwt_auth,
             key_vault,
             audit_logger,
@@ -749,7 +759,7 @@ impl AppState {
 pub(crate) async fn initialize_trading_signer(
     pool: &PgPool,
     key_vault: &KeyVault,
-    encryption_key: &str,
+    field_keys: &crate::crypto::FieldKeys,
     order_executor: &Arc<OrderExecutor>,
 ) -> anyhow::Result<()> {
     let pool = pool.clone();
@@ -804,7 +814,7 @@ pub(crate) async fn initialize_trading_signer(
         {
             Ok(workspace_id) => crate::handlers::vault::workspace_rpc_url(
                 &pool,
-                encryption_key,
+                field_keys,
                 workspace_id,
             )
             .await
@@ -963,7 +973,7 @@ pub fn spawn_signer_keeper(state: Arc<AppState>) {
             if let Err(error) = initialize_trading_signer(
                 &state.pool,
                 &state.key_vault,
-                &state.encryption_key,
+                &state.field_keys,
                 &state.order_executor,
             )
             .await

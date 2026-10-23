@@ -58,10 +58,10 @@ pub struct GammaMarket {
     #[serde(default)]
     pub category: Option<String>,
     /// Market tags for finer classification.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
     /// Whether the market currently has trading fees enabled.
-    #[serde(default, alias = "feesEnabled")]
+    #[serde(default, alias = "feesEnabled", deserialize_with = "null_as_default")]
     pub fees_enabled: bool,
     /// Optional fee type label from Gamma.
     #[serde(default, alias = "feeType")]
@@ -79,19 +79,27 @@ pub struct GammaMarket {
     #[serde(default)]
     pub liquidity: Option<String>,
     /// Whether the market is currently active.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "null_as_true")]
     pub active: bool,
     /// Whether the market is closed/resolved.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub closed: bool,
     /// Whether the market is archived.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub archived: bool,
     /// Whether the market accepts orders right now.
-    #[serde(default, alias = "acceptingOrders")]
+    #[serde(
+        default,
+        alias = "acceptingOrders",
+        deserialize_with = "null_as_default"
+    )]
     pub accepting_orders: bool,
     /// Whether the market has an order book enabled.
-    #[serde(default, alias = "enableOrderBook")]
+    #[serde(
+        default,
+        alias = "enableOrderBook",
+        deserialize_with = "null_as_default"
+    )]
     pub enable_order_book: bool,
     /// Market description / resolution criteria.
     #[serde(default)]
@@ -112,6 +120,27 @@ pub struct GammaMarket {
 
 fn default_true() -> bool {
     true
+}
+
+/// Reads an explicit `null` as the field's default, as a missing field is.
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn null_as_true<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(true))
+}
+
+struct GammaMarketsPage {
+    markets: Vec<GammaMarket>,
+    rows_returned: usize,
 }
 
 /// Parsed market metadata ready for storage.
@@ -347,20 +376,42 @@ impl GammaClient {
     ///
     /// Returns raw `GammaMarket` structs. Use `ParsedGammaMarket::from()` to convert.
     pub async fn get_markets(&self, limit: u32, offset: u32) -> Result<Vec<GammaMarket>> {
+        Ok(self.get_markets_page(limit, offset).await?.markets)
+    }
+
+    /// One page of markets, with the number of rows the API returned. A row
+    /// that cannot be read is skipped rather than failing the whole page:
+    /// one malformed market must not hide every other one.
+    async fn get_markets_page(&self, limit: u32, offset: u32) -> Result<GammaMarketsPage> {
+        // Ordered by id so that pages do not shift as markets change.
         let url = format!(
-            "{}/markets?limit={}&offset={}&active=true&closed=false",
+            "{}/markets?limit={}&offset={}&active=true&closed=false&order=id&ascending=true",
             self.base_url, limit, offset
         );
         debug!(url = %url, "Fetching Gamma markets");
 
         let response = self.get_with_retry(&url).await?;
-        let markets: Vec<GammaMarket> = response.json().await.map_err(|e| Error::Api {
+        let rows: Vec<serde_json::Value> = response.json().await.map_err(|e| Error::Api {
             message: format!("Failed to parse Gamma markets response: {}", e),
             status: None,
         })?;
+        let rows_returned = rows.len();
+        let mut markets = Vec::with_capacity(rows_returned);
+        for row in rows {
+            match serde_json::from_value::<GammaMarket>(row) {
+                Ok(market) => markets.push(market),
+                Err(error) => warn!(%error, offset, "Skipping a Gamma market that cannot be read"),
+            }
+        }
 
-        debug!(count = markets.len(), "Fetched Gamma markets");
-        Ok(markets)
+        debug!(
+            count = markets.len(),
+            rows_returned, "Fetched Gamma markets"
+        );
+        Ok(GammaMarketsPage {
+            markets,
+            rows_returned,
+        })
     }
 
     /// Fetch all active markets by paginating through the Gamma API.
@@ -381,9 +432,10 @@ impl GammaClient {
         let page_delay = Self::page_delay();
 
         loop {
-            let page = self.get_markets(capped_page_size, offset).await?;
-            let page_len = page.len() as u32;
-            all_markets.extend(page);
+            let page = self.get_markets_page(capped_page_size, offset).await?;
+            // Rows returned, not rows read: a skipped row is not the end.
+            let page_len = page.rows_returned as u32;
+            all_markets.extend(page.markets);
 
             if page_len < capped_page_size {
                 break;
@@ -517,6 +569,28 @@ mod tests {
         assert!(market.end_date.is_none());
         assert!(market.volume.is_none());
         assert!(market.active); // defaults to true
+    }
+
+    #[test]
+    fn explicit_nulls_read_as_missing_fields() {
+        let json = r#"{
+            "conditionId": "0xabcd",
+            "question": "Test market",
+            "tags": null,
+            "feesEnabled": null,
+            "active": null,
+            "closed": null,
+            "archived": null,
+            "acceptingOrders": null,
+            "enableOrderBook": null
+        }"#;
+
+        let market: GammaMarket = serde_json::from_str(json).unwrap();
+        assert!(market.tags.is_empty());
+        assert!(!market.fees_enabled);
+        assert!(market.active);
+        assert!(!market.closed);
+        assert!(!market.accepting_orders);
     }
 
     #[test]
