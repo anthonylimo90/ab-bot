@@ -44,6 +44,9 @@ export default function HistoryPage() {
   const [cashFlowAmount, setCashFlowAmount] = useState("");
   const [cashFlowNote, setCashFlowNote] = useState("");
   const [cashFlowOccurredAt, setCashFlowOccurredAt] = useState("");
+  // One key per entry: a submission sent again (a retry, a second click)
+  // records it once. A new key is taken once it is recorded.
+  const [cashFlowKey, setCashFlowKey] = useState(() => crypto.randomUUID());
 
   const {
     data: accountHistory,
@@ -88,7 +91,9 @@ export default function HistoryPage() {
         occurred_at: cashFlowOccurredAt
           ? new Date(cashFlowOccurredAt).toISOString()
           : undefined,
+        idempotency_key: cashFlowKey,
       });
+      setCashFlowKey(crypto.randomUUID());
       setCashFlowAmount("");
       setCashFlowNote("");
       setCashFlowOccurredAt("");

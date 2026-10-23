@@ -1280,6 +1280,7 @@ class ApiClient {
       amount: number;
       note?: string;
       occurred_at?: string;
+      idempotency_key?: string;
     },
   ): Promise<CashFlowEvent> {
     const raw = await this.request<CashFlowEvent>(

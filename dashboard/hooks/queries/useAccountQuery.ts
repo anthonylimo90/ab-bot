@@ -53,6 +53,7 @@ export function useCreateCashFlowMutation(workspaceId?: string | null) {
       amount: number;
       note?: string;
       occurred_at?: string;
+      idempotency_key?: string;
     }) => api.createCashFlow(workspaceId!, params),
     onSuccess: () => {
       if (!workspaceId) return;

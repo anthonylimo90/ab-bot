@@ -355,76 +355,86 @@ impl AppState {
             // Ensure on-chain Polymarket approvals are set for the trading wallet.
             // This is a one-time operation per wallet; existing approvals are detected and skipped.
             if order_executor.is_live_ready().await {
+                // The environment's RPC, else the canonical workspace's (as
+                // withdrawals and the equity feed read it), else a public one.
+                let workspace_rpc = match crate::workspace_scope::resolve_canonical_workspace_id(&pool).await {
+                    Ok(workspace_id) => crate::handlers::vault::workspace_rpc_url(&pool, &encryption_key, workspace_id)
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(%error, "Could not read the canonical workspace's RPC settings");
+                            None
+                        }),
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not resolve the canonical workspace for its RPC settings");
+                        None
+                    }
+                };
                 let rpc_url = std::env::var("POLYGON_RPC_URL")
                     .or_else(|_| {
                         std::env::var("ALCHEMY_API_KEY")
                             .map(|k| format!("https://polygon-mainnet.g.alchemy.com/v2/{}", k))
                     })
-                    .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+                    .ok()
+                    .or(workspace_rpc)
+                    .unwrap_or_else(|| {
+                        tracing::warn!("No Polygon RPC configured; approvals and wraps use the public endpoint");
+                        "https://polygon-rpc.com".to_string()
+                    });
 
                 // Build a signer from the same key the executor used
                 let approval_wallet = startup_wallet.as_ref();
 
                 if let Some(wallet) = approval_wallet {
-                    let signer = wallet.signer();
                     // Under the wallet's spend lock, so an approval never takes
                     // the nonce of a withdrawal or wrap another replica is
-                    // signing. Waited for briefly: past that, its holder keeps
-                    // it for a wrap the node holds, whose nonce the pending
-                    // count an approval is signed at already includes.
-                    let spend_lock = match crate::withdrawals::SpendLock::acquire_within(
+                    // signing. Waited for briefly at startup; a lock that stays
+                    // held is waited for in the background instead, never
+                    // gone without.
+                    match crate::withdrawals::SpendLock::acquire_within(
                         &pool,
                         &wallet.address_string(),
                         std::time::Duration::from_secs(30),
                     )
                     .await
                     {
-                        Ok(Some(lock)) => Some(lock),
-                        Ok(None) => {
-                            tracing::warn!("The trading wallet's spend lock stayed held; checking approvals without it");
-                            None
+                        Ok(Some(lock)) => {
+                            set_approvals(wallet, &rpc_url, &order_executor).await;
+                            lock.release().await;
                         }
-                        Err(error) => {
-                            tracing::warn!(error = %error, "Could not take the trading wallet's spend lock; checking approvals without it");
-                            None
-                        }
-                    };
-                    let approvals = polymarket_core::api::approvals::ensure_polymarket_approvals(
-                        signer, &rpc_url,
-                    )
-                    .await;
-                    if let Some(lock) = spend_lock {
-                        lock.release().await;
-                    }
-                    match approvals {
-                        Ok(count) => {
-                            if count > 0 {
-                                tracing::info!(
-                                    approvals_sent = count,
-                                    "Set Polymarket contract approvals, refreshing CLOB cache"
-                                );
-                                // Tell the CLOB server to re-read the on-chain allowance state
-                                if let Err(e) = order_executor.refresh_clob_allowance_cache().await
-                                {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "Failed to refresh CLOB allowance cache after approvals"
-                                    );
-                                }
-                            } else {
-                                tracing::info!("All Polymarket approvals already set");
-                                // Still refresh the CLOB cache in case it's stale
-                                let _ = order_executor.refresh_clob_allowance_cache().await;
+                        held => {
+                            if let Err(error) = held {
+                                tracing::warn!(%error, "Could not take the trading wallet's spend lock");
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                wallet = %signer.address(),
-                                "Failed to set Polymarket approvals. \
-                                 If the error mentions insufficient POL for gas, \
-                                 send 0.1 POL to the wallet address above on Polygon."
+                            tracing::warn!("The trading wallet's spend lock is held; approvals wait for it in the background");
+                            let (pool, wallet, rpc_url, executor) = (
+                                pool.clone(),
+                                wallet.clone(),
+                                rpc_url.clone(),
+                                order_executor.clone(),
                             );
+                            tokio::spawn(async move {
+                                loop {
+                                    match crate::withdrawals::SpendLock::acquire_within(
+                                        &pool,
+                                        &wallet.address_string(),
+                                        std::time::Duration::from_secs(60),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(lock)) => {
+                                            set_approvals(&wallet, &rpc_url, &executor).await;
+                                            lock.release().await;
+                                            break;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            tracing::warn!(%error, "Could not take the trading wallet's spend lock for approvals");
+                                            tokio::time::sleep(std::time::Duration::from_secs(30))
+                                                .await;
+                                        }
+                                    }
+                                }
+                            });
                         }
                     }
                     // The exchange settles in pUSD: keep the wallet's USDC.e wrapped.
@@ -873,6 +883,38 @@ impl AppState {
     /// Create an Arc-wrapped state.
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
+    }
+}
+
+/// Send the Polymarket approvals the trading wallet lacks (the caller holds
+/// its spend lock), then have the exchange re-read its allowances.
+async fn set_approvals(wallet: &TradingWallet, rpc_url: &str, executor: &OrderExecutor) {
+    let signer = wallet.signer();
+    match polymarket_core::api::approvals::ensure_polymarket_approvals(signer, rpc_url).await {
+        Ok(count) => {
+            if count > 0 {
+                tracing::info!(
+                    approvals_sent = count,
+                    "Set Polymarket contract approvals, refreshing CLOB cache"
+                );
+            } else {
+                tracing::info!("All Polymarket approvals already set");
+            }
+            // Tell the CLOB server to re-read the on-chain allowance state
+            // (it may be stale even when nothing was sent).
+            if let Err(e) = executor.refresh_clob_allowance_cache().await {
+                tracing::warn!(error = %e, "Failed to refresh CLOB allowance cache after approvals");
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                wallet = %signer.address(),
+                "Failed to set Polymarket approvals. \
+                 If the error mentions insufficient POL for gas, \
+                 send 0.1 POL to the wallet address above on Polygon."
+            );
+        }
     }
 }
 

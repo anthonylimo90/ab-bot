@@ -109,6 +109,10 @@ pub struct CreateCashFlowRequest {
     pub amount: Decimal,
     pub note: Option<String>,
     pub occurred_at: Option<DateTime<Utc>>,
+    /// The entry's id, chosen by the client: a request sent again with the
+    /// same key records nothing more and answers the entry already stored.
+    #[serde(default)]
+    pub idempotency_key: Option<Uuid>,
 }
 
 fn default_hours() -> i64 {
@@ -430,37 +434,105 @@ pub async fn create_cash_flow(
         return Err(ApiError::BadRequest("amount must be non-zero".into()));
     }
 
-    let id = Uuid::new_v4();
-    let occurred_at = req.occurred_at.unwrap_or_else(Utc::now);
-    let created_at = Utc::now();
+    let entry = NewCashFlow {
+        id: req.idempotency_key.unwrap_or_else(Uuid::new_v4),
+        workspace_id,
+        event_type,
+        amount: req.amount,
+        note: req.note,
+        occurred_at: req.occurred_at.unwrap_or_else(Utc::now),
+        created_by: user_id,
+    };
+    Ok(Json(record_cash_flow(&state.pool, entry).await?))
+}
 
-    sqlx::query(
+/// A manually recorded cash flow.
+struct NewCashFlow {
+    id: Uuid,
+    workspace_id: Uuid,
+    event_type: String,
+    amount: Decimal,
+    note: Option<String>,
+    occurred_at: DateTime<Utc>,
+    created_by: Uuid,
+}
+
+/// Record a cash flow once. Each entry moves the circuit breaker's
+/// references, so one sent again under its id (a retried request) records
+/// nothing more and answers the entry stored; an id already naming another
+/// entry is a conflict.
+async fn record_cash_flow(
+    pool: &sqlx::PgPool,
+    entry: NewCashFlow,
+) -> ApiResult<CashFlowEventResponse> {
+    let inserted = sqlx::query(
         r#"
         INSERT INTO cash_flow_events (
             id, workspace_id, event_type, amount, currency, note, occurred_at, created_by
         )
         VALUES ($1, $2, $3, $4, 'USDC', $5, $6, $7)
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(entry.id)
+    .bind(entry.workspace_id)
+    .bind(&entry.event_type)
+    .bind(entry.amount)
+    .bind(entry.note.as_deref())
+    .bind(entry.occurred_at)
+    .bind(entry.created_by)
+    .execute(pool)
+    .await?;
+    let stored = load_cash_flow_event(pool, entry.workspace_id, entry.id).await?;
+    match stored {
+        Some(stored) if inserted.rows_affected() == 1 => Ok(stored),
+        // A replay: the same entry (its amount as stored: to 8 places,
+        // halves away from zero as the database rounds them).
+        Some(stored)
+            if stored.event_type == entry.event_type
+                && stored.amount
+                    == entry.amount.round_dp_with_strategy(
+                        8,
+                        rust_decimal::RoundingStrategy::MidpointAwayFromZero,
+                    ) =>
+        {
+            Ok(stored)
+        }
+        _ => Err(ApiError::Conflict(
+            "This idempotency key already names another cash flow".into(),
+        )),
+    }
+}
+
+async fn load_cash_flow_event(
+    pool: &sqlx::PgPool,
+    workspace_id: Uuid,
+    id: Uuid,
+) -> Result<Option<CashFlowEventResponse>, sqlx::Error> {
+    let row: Option<CashFlowRow> = sqlx::query_as(
+        r#"
+        SELECT id, event_type, amount, currency, note, occurred_at, created_at
+        FROM cash_flow_events
+        WHERE id = $1 AND workspace_id = $2
         "#,
     )
     .bind(id)
     .bind(workspace_id)
-    .bind(&event_type)
-    .bind(req.amount)
-    .bind(req.note.as_deref())
-    .bind(occurred_at)
-    .bind(user_id)
-    .execute(&state.pool)
+    .fetch_optional(pool)
     .await?;
+    Ok(row.map(cash_flow_response))
+}
 
-    Ok(Json(CashFlowEventResponse {
-        id: id.to_string(),
-        event_type,
-        amount: req.amount,
-        currency: "USDC".to_string(),
-        note: req.note,
-        occurred_at,
-        created_at,
-    }))
+fn cash_flow_response(row: CashFlowRow) -> CashFlowEventResponse {
+    CashFlowEventResponse {
+        id: row.id.to_string(),
+        event_type: row.event_type,
+        amount: row.amount,
+        currency: row.currency,
+        note: row.note,
+        occurred_at: row.occurred_at,
+        created_at: row.created_at,
+    }
 }
 
 async fn load_cash_flow_events(
@@ -482,18 +554,7 @@ async fn load_cash_flow_events(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| CashFlowEventResponse {
-            id: row.id.to_string(),
-            event_type: row.event_type,
-            amount: row.amount,
-            currency: row.currency,
-            note: row.note,
-            occurred_at: row.occurred_at,
-            created_at: row.created_at,
-        })
-        .collect())
+    Ok(rows.into_iter().map(cash_flow_response).collect())
 }
 
 async fn load_recent_trade_events(
@@ -542,4 +603,52 @@ async fn load_recent_trade_events(
             unrealized_pnl: row.unrealized_pnl,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod cash_flow_tests {
+    use super::*;
+    use sqlx::Executor;
+
+    #[sqlx::test(migrations = false)]
+    async fn a_cash_flow_sent_again_is_recorded_once(pool: sqlx::PgPool) {
+        pool.execute(
+            "CREATE TABLE workspaces (id UUID PRIMARY KEY); \
+             CREATE TABLE cash_flow_events (id UUID PRIMARY KEY, workspace_id UUID NOT NULL, \
+                event_type TEXT NOT NULL, amount DECIMAL(18, 8) NOT NULL, \
+                currency TEXT NOT NULL DEFAULT 'USDC', note TEXT, occurred_at TIMESTAMPTZ NOT NULL, \
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_by UUID)",
+        )
+        .await
+        .unwrap();
+        let workspace = Uuid::new_v4();
+        let entry = |amount: &str| NewCashFlow {
+            id: Uuid::nil(),
+            workspace_id: workspace,
+            event_type: "withdrawal".into(),
+            amount: amount.parse().unwrap(),
+            note: Some("off-app transfer".into()),
+            occurred_at: Utc::now(),
+            created_by: Uuid::new_v4(),
+        };
+        let first = record_cash_flow(&pool, entry("-12.5")).await.unwrap();
+        // Sent again under its key: answered, not recorded twice.
+        let again = record_cash_flow(&pool, entry("-12.5")).await.unwrap();
+        assert_eq!(first.id, again.id);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cash_flow_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        // The key naming another entry is refused.
+        assert!(matches!(
+            record_cash_flow(&pool, entry("-20")).await,
+            Err(ApiError::Conflict(_))
+        ));
+        // An amount with more places than stored is still the same entry.
+        let mut fine = entry("-1.123456789");
+        fine.id = Uuid::new_v4();
+        let stored = record_cash_flow(&pool, fine).await.unwrap();
+        assert_eq!(stored.amount, "-1.12345679".parse::<Decimal>().unwrap());
+    }
 }

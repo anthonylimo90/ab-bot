@@ -235,7 +235,11 @@ pub async fn load_live_account_snapshot(
     let valuation = load_account_valuation(state, inventory_refreshed).await?;
     let realized_pnl_24h = load_realized_pnl_24h(&state.pool).await?;
     let net_cash_flows_24h = load_net_cash_flows_24h(&state.pool, workspace_id).await?;
-    let cash_observed_at = Utc::now();
+    // On the database's clock, as cash flows are stamped: the cursor of
+    // applied flows is never compared across two clocks.
+    let cash_observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&state.pool)
+        .await?;
     let observed_cash =
         load_wallet_balance(state, target.trading_wallet_address.as_deref()).await?;
     let cash_balance = observed_cash.unwrap_or(Decimal::ZERO);
@@ -265,9 +269,16 @@ async fn snapshot_canonical_workspace(state: &Arc<AppState>) -> anyhow::Result<(
         persist_snapshot(&state.pool, &snapshot).await?;
 
         // Only a complete live valuation may drive drawdown: paper fills and
-        // an unobserved cash balance do not describe real equity.
+        // an unobserved cash balance do not describe real equity. Trading
+        // live without one leaves the breaker's drawdown guard blind: said so.
         if snapshot.equity_complete {
             feed_circuit_breaker(state, &snapshot).await?;
+        } else if state.order_executor.is_live_ready().await {
+            warn!(
+                wallet = ?snapshot.wallet_address,
+                "Trading live without an observed wallet balance: the circuit breaker's \
+                 drawdown guard is not fed (configure a Polygon RPC)"
+            );
         }
     }
 
@@ -400,8 +411,8 @@ const WITHDRAWAL_MINED_HOLD_MINUTES: i32 = 120;
 
 /// Whether cash may have left the trading wallet without a cash flow the
 /// breaker has applied through `through`: a withdrawal not yet resolved that
-/// is recent or has been seen mined, or an outbound flow recorded after
-/// `through`.
+/// is recent or has been seen mined (one failed by an earlier verdict and
+/// then seen mined included), or an outbound flow recorded after `through`.
 async fn withdrawal_settling(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -413,10 +424,12 @@ async fn withdrawal_settling(
             SELECT 1 FROM wallet_withdrawals
             WHERE workspace_id = $1
               AND COALESCE(trading_wallet, TRUE)
-              AND status IN ('submitting', 'submitted')
               AND tx_hash IS NOT NULL
-              AND (requested_at > NOW() - make_interval(mins => $3)
-                   OR mined_seen_at > NOW() - make_interval(mins => $4))
+              AND ((status IN ('submitting', 'submitted')
+                    AND (requested_at > NOW() - make_interval(mins => $3)
+                         OR mined_seen_at > NOW() - make_interval(mins => $4)))
+                   OR (status = 'failed'
+                       AND mined_seen_at > NOW() - make_interval(mins => $4)))
         ) OR EXISTS(
             SELECT 1 FROM cash_flow_events
             WHERE workspace_id = $1
@@ -527,7 +540,9 @@ async fn load_wallet_balance(
         return Ok(None);
     };
 
-    let Some(polygon_client) = state.polygon_client.as_ref() else {
+    // The same chain withdrawals read: the environment's RPC, else the
+    // canonical workspace's.
+    let Ok(polygon_client) = crate::handlers::vault::canonical_polygon_client(state).await else {
         return Ok(None);
     };
 

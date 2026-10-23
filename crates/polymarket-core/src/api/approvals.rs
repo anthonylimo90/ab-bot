@@ -115,7 +115,12 @@ async fn get_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
 /// faster inclusion.
 async fn offered_gas_price(http: &reqwest::Client, rpc_url: &str) -> Result<u128> {
     let network = get_gas_price(http, rpc_url).await?;
-    Ok(network + network / 5)
+    let offered = network + network / 5;
+    anyhow::ensure!(
+        offered <= crate::api::polygon::MAX_GAS_PRICE_WEI,
+        "Gas price {offered} wei is above the ceiling; no approval was signed"
+    );
+    Ok(offered)
 }
 
 /// Extract hex string from JSON-RPC result, surfacing provider errors explicitly.
@@ -234,7 +239,9 @@ where
                     }
                 };
                 let price = (tx.gas_price + tx.gas_price / 10 + 1).max(network + network / 5);
-                if price > network.saturating_mul(MAX_GAS_OVER_NETWORK) {
+                if price > network.saturating_mul(MAX_GAS_OVER_NETWORK)
+                    || price > crate::api::polygon::MAX_GAS_PRICE_WEI
+                {
                     continue;
                 }
                 tx.gas_price = price;

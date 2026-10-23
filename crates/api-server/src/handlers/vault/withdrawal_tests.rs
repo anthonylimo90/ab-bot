@@ -380,3 +380,13 @@ async fn only_the_wallets_own_unresolved_orders_hold_its_withdrawals(pool: PgPoo
     ));
     assert_eq!(f.broadcasts(), 1);
 }
+
+#[test]
+fn an_amount_too_large_to_scale_is_refused_not_a_panic() {
+    assert_eq!(
+        decimal_to_usdc_units("12.5".parse().unwrap()).unwrap(),
+        12_500_000
+    );
+    assert!(decimal_to_usdc_units(Decimal::MAX).is_err());
+    assert!(decimal_to_usdc_units("80000000000000000000000".parse().unwrap()).is_err());
+}

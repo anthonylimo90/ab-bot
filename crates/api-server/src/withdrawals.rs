@@ -621,7 +621,8 @@ pub(crate) async fn reconcile_withdrawals(state: &AppState) -> anyhow::Result<()
 }
 
 /// Whether a stalled trading-wallet transfer of `workspace_id` (unresolved,
-/// requested more than `stalled_minutes` ago and not yet seen mined) has a
+/// or failed by a verdict its receipt may still overturn; requested more
+/// than `stalled_minutes` ago and not yet seen mined) has a
 /// receipt now, which is then recorded as `mined_seen_at`. The reconciler
 /// notices a mined transfer only on its next pass; a caller that read the
 /// wallet balance before calling this learns whether that balance may lack
@@ -638,13 +639,17 @@ pub(crate) async fn stalled_transfer_mined(
     let stalled: Vec<(Uuid, String, Vec<String>)> = sqlx::query_as(
         "SELECT id, tx_hash, replaced_tx_hashes FROM wallet_withdrawals \
          WHERE workspace_id = $1 AND COALESCE(trading_wallet, TRUE) \
-           AND status IN ('submitting', 'submitted') AND tx_hash IS NOT NULL \
-           AND mined_seen_at IS NULL \
+           AND tx_hash IS NOT NULL AND mined_seen_at IS NULL \
            AND requested_at <= NOW() - make_interval(mins => $2) \
+           AND (status IN ('submitting', 'submitted') \
+                OR (status = 'failed' AND error IS DISTINCT FROM $3 \
+                    AND updated_at > NOW() - make_interval(hours => $4))) \
          ORDER BY requested_at DESC LIMIT 10",
     )
     .bind(workspace_id)
     .bind(stalled_minutes)
+    .bind(REVERTED_ERROR)
+    .bind(SECOND_CHANCE_HOURS)
     .fetch_all(pool)
     .await?;
     for (id, tx_hash, replaced) in stalled {

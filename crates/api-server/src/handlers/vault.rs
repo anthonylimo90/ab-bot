@@ -100,6 +100,23 @@ async fn workspace_polygon_client(
     state: &AppState,
     workspace_id: Option<Uuid>,
 ) -> Result<PolygonClient, ApiError> {
+    match workspace_rpc_url(&state.pool, &state.encryption_key, workspace_id).await? {
+        Some(rpc_url) => Ok(PolygonClient::new(rpc_url)),
+        None => Err(ApiError::ServiceUnavailable(
+            "Polygon RPC not configured. Set polygon_rpc_url or alchemy_api_key in workspace settings."
+                .into(),
+        )),
+    }
+}
+
+/// The Polygon RPC endpoint a workspace's settings name: its explicit RPC
+/// URL, else its (decrypted) Alchemy key's endpoint. `None` when it names
+/// neither.
+pub(crate) async fn workspace_rpc_url(
+    pool: &PgPool,
+    encryption_key: &str,
+    workspace_id: Option<Uuid>,
+) -> Result<Option<String>, sqlx::Error> {
     let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT w.polygon_rpc_url, w.alchemy_api_key
@@ -109,28 +126,27 @@ async fn workspace_polygon_client(
         "#,
     )
     .bind(workspace_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(pool)
     .await?;
 
     let (rpc_url_opt, alchemy_key_opt) = row.unwrap_or((None, None));
 
     // Priority: explicit RPC URL > Alchemy key.
     if let Some(rpc_url) = rpc_url_opt.filter(|s| !s.is_empty()) {
-        return Ok(PolygonClient::new(rpc_url));
+        return Ok(Some(rpc_url));
     }
 
     if let Some(encrypted_key) = alchemy_key_opt.filter(|s| !s.is_empty()) {
         // Decrypt the stored Alchemy key (AES-256-GCM).
         // Fall back to treating value as plaintext for backward compat with pre-encryption rows.
         let plaintext =
-            crypto::decrypt_field(&encrypted_key, &state.encryption_key).unwrap_or(encrypted_key);
-        return Ok(PolygonClient::with_alchemy(&plaintext));
+            crypto::decrypt_field(&encrypted_key, encryption_key).unwrap_or(encrypted_key);
+        return Ok(Some(format!(
+            "https://polygon-mainnet.g.alchemy.com/v2/{plaintext}"
+        )));
     }
 
-    Err(ApiError::ServiceUnavailable(
-        "Polygon RPC not configured. Set polygon_rpc_url or alchemy_api_key in workspace settings."
-            .into(),
-    ))
+    Ok(None)
 }
 
 async fn require_canonical_workspace_member(
@@ -208,9 +224,9 @@ fn decimal_to_usdc_units(amount: Decimal) -> ApiResult<u128> {
         ));
     }
 
-    let scaled = amount * Decimal::from(1_000_000u64);
-    scaled
-        .to_u128()
+    amount
+        .checked_mul(Decimal::from(1_000_000u64))
+        .and_then(|scaled| scaled.to_u128())
         .ok_or_else(|| ApiError::BadRequest("Withdrawal amount is too large or invalid".into()))
 }
 

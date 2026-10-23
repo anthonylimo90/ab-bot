@@ -602,10 +602,15 @@ unsigned). Fees are set by the exchange when an order matches.
   Tokens for both V2 exchanges and the Neg Risk Adapter, USDC.e for the
   Collateral Onramp and pUSD for the Collateral Offramp. Fund the wallet with
   a little more POL than before (eight approvals on a fresh wallet).
-  Approvals are sent under the wallet's spend lock (waited for up to 30
-  seconds); one left unmined is signed again at its nonce for more gas (up
-  to three times the network's price), but only while the node holds one of
-  its transactions or counts nothing pending at its nonce.
+  Approvals are sent only under the wallet's spend lock: waited for up to 30
+  seconds at startup, then in the background (startup goes on); one left
+  unmined is signed again at its nonce for more gas (up to three times the
+  network's price), but only while the node holds one of its transactions
+  or counts nothing pending at its nonce. Approvals and wraps read the chain
+  through `POLYGON_RPC_URL`/`ALCHEMY_API_KEY`, else the canonical
+  workspace's RPC settings, else the public endpoint (with a warning).
+- Nothing the API signs pays more than 10,000 gwei per unit of gas: a node
+  reporting more (a unit error) gets nothing signed.
 - The API then wraps the trading wallet's USDC.e into pUSD, at startup and
   every five minutes, so deposits become tradable without a restart. A wrap
   waits until no withdrawal from the wallet is unresolved and nothing it sent
@@ -708,7 +713,28 @@ unsigned). Fees are set by the exchange when an order matches.
   latched trip and overwrite it.
 - An arb signal is skipped while any position in its market is still active,
   read from the database (an entry still settling included), so a restart
-  or a reconciled entry never lets a second pair into the same market.
+  or a reconciled entry never lets a second pair into the same market. The
+  entry itself is refused under the lock every entry takes when its market
+  is taken meanwhile, so two API processes acting on one signal open one
+  pair. Each leg must be at least the exchange's one-dollar minimum market
+  buy at its ask, or the pair is skipped.
+- A buy the exchange fills with more shares than it signed for (a better
+  price passed on to the taker) counts as filled with every share; a sell
+  never fills beyond its size. A manual market order matched in full reads
+  as filled though its signed size was rounded.
+- An order of unknown outcome holds back the wallet's live orders until it
+  is reconciled; one still unresolved after a quarter of an hour is warned
+  about every ten minutes. A live entry stopped before linking its first
+  order (it never sent one) fails after five minutes.
+- The circuit breaker's equity feed reads the wallet through the same chain
+  client as withdrawals (environment, else the canonical workspace); trading
+  live without an observed balance is warned about at every snapshot. A
+  withdrawal failed by an earlier verdict and then seen mined holds the
+  feed like an unsettled one.
+- Manual cash-flow entries take an `idempotency_key` (the dashboard sends
+  one per entry): an entry sent again records nothing more. Withdrawals made
+  through the API are recorded automatically; recording them by hand too
+  counts them twice.
 - Preparing a browser-wallet order reads the market's tick size and refuses
   a price outside one tick of either end or with more decimals than the
   tick has (as Polymarket's own clients round), before the wallet signs.

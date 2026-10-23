@@ -28,6 +28,11 @@ const MIN_RAMP_GAS_LIMIT: u64 = 150_000;
 /// What the error of a transaction the node expects to revert starts with.
 pub const CALL_WOULD_FAIL: &str = "The node expects the call to fail";
 
+/// The most any transaction the app signs pays per unit of gas (10,000
+/// gwei): above Polygon's worst spikes, below what a misreporting node (a
+/// unit error) could make it pay. Nothing is signed at a higher price.
+pub const MAX_GAS_PRICE_WEI: u128 = 10_000_000_000_000;
+
 /// How far behind the head balances are read, so every node behind a load
 /// balancer already has the block.
 pub const BALANCE_BLOCK_LAG: u64 = 2;
@@ -145,7 +150,17 @@ fn classify_send_error(message: &str) -> BroadcastOutcome {
         "invalid chain id",
         "oversized data",
     ];
-    if HELD.iter().any(|pattern| lower.contains(pattern)) {
+    // A pattern counts only from the start of a word: "unknown transaction"
+    // is no "known transaction".
+    let names = |pattern: &str| {
+        lower.match_indices(pattern).any(|(at, _)| {
+            !lower[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|before| before.is_ascii_alphanumeric())
+        })
+    };
+    if HELD.iter().any(|pattern| names(pattern)) {
         BroadcastOutcome::Accepted
     } else if REFUSED.iter().any(|pattern| lower.contains(pattern)) {
         BroadcastOutcome::Rejected(message.to_string())
@@ -568,6 +583,16 @@ impl PolygonClient {
         };
         let gas_price = self.get_gas_price_wei().await?;
         let gas_price = (gas_price + gas_price / 5).max(min_gas_price);
+        if gas_price > MAX_GAS_PRICE_WEI {
+            return Err(Error::Api {
+                message: format!(
+                    "Gas price {} gwei is above the {} gwei ceiling; nothing was signed",
+                    gas_price / 1_000_000_000,
+                    MAX_GAS_PRICE_WEI / 1_000_000_000
+                ),
+                status: None,
+            });
+        }
         let required_gas = gas_price.saturating_mul(gas_limit as u128);
 
         if pol_balance < required_gas {
@@ -1448,6 +1473,7 @@ mod tests {
             "Your app has exceeded its compute units per second capacity",
             "internal error",
             "unknown RPC error",
+            "unknown transaction",
         ] {
             assert!(
                 matches!(classify_send_error(unclear), BroadcastOutcome::Uncertain(_)),

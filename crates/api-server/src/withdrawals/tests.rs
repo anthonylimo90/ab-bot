@@ -560,6 +560,29 @@ async fn the_chain_is_read_through_the_canonical_workspace_with_no_member_needed
 }
 
 #[tokio::test]
+async fn nothing_is_signed_above_the_gas_price_ceiling() {
+    let chain = Arc::new(Mutex::new(Chain {
+        pol_wei: u128::MAX / 4,
+        // A node answering in the wrong unit: 20,000 gwei.
+        gas_price: 20_000_000_000_000,
+        ..Default::default()
+    }));
+    let client = mock_node(chain.clone()).await;
+    let wallet = auth::TradingWallet::from_private_key(&format!("{:064x}", 1)).unwrap();
+    let error = client
+        .prepare_wrap(wallet.signer(), 5_000_000, 0)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ceiling"), "{error}");
+    // At a sane price the same wrap is signed.
+    chain.lock().unwrap().gas_price = 30_000_000_000;
+    assert!(client
+        .prepare_wrap(wallet.signer(), 5_000_000, 0)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
 async fn a_safe_block_is_never_past_the_block_balances_are_read_at() {
     let chain = Arc::new(Mutex::new(Chain {
         finalized: Some(199),
@@ -907,6 +930,34 @@ async fn a_stalled_transfer_is_found_mined_before_the_reconciler_looks(pool: PgP
     assert!(seen().await.is_some());
     // Seen once, it is the reconciler's to settle; it is not read again.
     assert!(!mined().await.unwrap());
+
+    // A transfer failed by an earlier verdict whose receipt then appears:
+    // found too, so the breaker holds for it; a reverted one never mines.
+    let failed = sent("0xf1", 45, Some(true)).await;
+    let reverted = sent("0xf2", 45, Some(true)).await;
+    for (id, error) in [
+        (failed, "Another transaction used this transfer's nonce"),
+        (reverted, REVERTED_ERROR),
+    ] {
+        sqlx::query("UPDATE wallet_withdrawals SET status = 'failed', error = $2 WHERE id = $1")
+            .bind(id)
+            .bind(error)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    chain.lock().unwrap().mine("0xf2", false);
+    assert!(!mined().await.unwrap());
+    chain.lock().unwrap().mine("0xf1", true);
+    assert!(mined().await.unwrap());
+    let held: bool = sqlx::query_scalar(
+        "SELECT mined_seen_at IS NOT NULL FROM wallet_withdrawals WHERE id = $1",
+    )
+    .bind(failed)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(held);
 }
 
 /// A transfer of 10 USDC from the wallet of private key 1 to `DEST`, signed
