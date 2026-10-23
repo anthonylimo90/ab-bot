@@ -798,6 +798,11 @@ async fn take_over_trading(state: &AppState) -> anyhow::Result<()> {
     }
     let limits = crate::state::circuit_breaker_config(&state.pool).await?;
     state.circuit_breaker.update_config(limits).await;
+    // Closes a stopped process booked but never recorded count before any
+    // new trade does.
+    crate::exit_handler::record_missed_closes(&state.pool, &state.circuit_breaker)
+        .await
+        .map_err(|error| error.context("recording closes the circuit breaker missed"))?;
     crate::dynamic_tuner::apply_dynamic_config_snapshot(
         &state.pool,
         state.arb_executor_config.as_ref(),

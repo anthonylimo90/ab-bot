@@ -34,3 +34,4 @@ sqlx.workspace = true
 [dev-dependencies]
 axum = "0.7"
 chrono.workspace = true
+reqwest.workspace = true

@@ -901,6 +901,27 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   and Sortino ratios divide downside over every day, as wallet metrics now
   do.
 
+### Live order and close safeguards (098)
+
+- A live order whose connection to the exchange never opened is recorded as
+  not sent (it was recorded as of unknown outcome, which held every live
+  order of the wallet, exits included, for at least ten minutes until the
+  reconciler cleared it). An exit sale not sent this way is retried next pass.
+- Migration 098 adds `positions.breaker_recorded_at`. Each close is marked
+  once the circuit breaker has taken it in; a new trading leader records the
+  closes a stopped process booked but never recorded (those after the
+  breaker's last save, on the current day) before it trades. Existing closes
+  are marked by the migration.
+- Orphan recovery no longer sells tokens a position sold in the last 30
+  minutes (the balance can still show them until the sale settles), nor
+  tokens of a market a position closed at resolution with equal legs.
+- An exit whose market tokens cannot be read stays ExitReady for the next
+  pass instead of sitting in Closing until housekeeping; one that cannot be
+  put back in the queue is recorded as a failed exit.
+- An arbitrage pair's buying-power check holds back the cash the wallet's
+  resting manual buys reserve at the exchange, so the second leg is not
+  refused after the first has filled.
+
 ### API contract changes
 
 - `GET .../risk/status` and the trip/reset responses add `drawdown_peak`

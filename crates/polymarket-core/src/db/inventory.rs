@@ -188,12 +188,19 @@ impl WalletInventoryRepository {
                     AND o.market_id=wallet_inventory.condition_id AND o.outcome=wallet_inventory.outcome)
               AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.market_id=wallet_inventory.condition_id
                   AND p.execution_mode<>'paper' AND (LOWER(p.wallet_address)=LOWER(wallet_inventory.wallet_address) OR p.execution_mode='unknown')
-                  AND (p.state=0 OR (wallet_inventory.outcome='yes' AND p.held_yes_qty>0) OR (wallet_inventory.outcome='no' AND p.held_no_qty>0)))
+                  AND (p.state=0 OR (wallet_inventory.outcome='yes' AND p.held_yes_qty>0) OR (wallet_inventory.outcome='no' AND p.held_no_qty>0)
+                       -- Shares a position sold lately can still show in the
+                       -- balance until the sale settles: they are not ours.
+                       OR (((wallet_inventory.outcome='yes' AND p.exited_yes_qty>0) OR (wallet_inventory.outcome='no' AND p.exited_no_qty>0))
+                           AND COALESCE(p.exit_timestamp, p.last_updated) > NOW() - INTERVAL '30 minutes')))
               -- A resolved market has no book to sell into: its winning
               -- tokens are redeemed for a dollar, its losing ones are worth
-              -- nothing.
+              -- nothing. A position closed at resolution without a named
+              -- winner (equal legs, booked at a dollar a pair) counts too.
               AND NOT EXISTS (SELECT 1 FROM positions p WHERE p.market_id=wallet_inventory.condition_id
-                  AND p.resolution_winner IS NOT NULL)
+                  AND (p.resolution_winner IS NOT NULL
+                       OR EXISTS (SELECT 1 FROM trade_events te WHERE te.position_id=p.id
+                           AND te.event_type='closed_via_resolution')))
               AND (
                     last_exit_attempted_at IS NULL
                     OR last_exit_attempted_at <= NOW() - ($2 * INTERVAL '1 second')

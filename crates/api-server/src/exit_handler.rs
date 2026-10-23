@@ -520,7 +520,8 @@ impl ExitHandler {
     /// exit queue for the next pass, without counting a failed exit. False,
     /// leaving the caller to fail the exit (and alert), once its sales have
     /// gone unsent for `MAX_EXIT_DEFERRAL` in a row: whatever holds them
-    /// (an order stuck unresolved, a book that cannot be read) is not passing.
+    /// (an order stuck unresolved, a book that cannot be read) is not passing;
+    /// or when the position could not be put back.
     async fn defer_sale(&self, position: &mut Position, reason: &str, ctx: &EventContext) -> bool {
         // A run lasts while sales go unsent pass after pass: the gap that
         // ends one is several passes, however long a pass is set to be.
@@ -555,7 +556,10 @@ impl ExitHandler {
             .defer_exit(position, reason, ctx)
             .await
         {
+            // Still Closing: the caller records a failed exit instead, which
+            // also takes it out of Closing for a retry.
             warn!(position_id = %position.id, %error, "Could not return the position to the exit queue");
+            return false;
         }
         true
     }
@@ -588,13 +592,22 @@ impl ExitHandler {
             SOURCE_ARBITRAGE
         };
         let ctx = Self::event_context(&execution_mode, source, quant_ctx.as_ref());
+        // Token IDs are read before the position is marked Closing: a lookup
+        // that fails leaves it ExitReady for the next pass, not Closing until
+        // housekeeping finds it.
+        let tokens = match self.resolve_market_tokens(&market_id).await {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                warn!(position_id = %position.id, %error, "Could not read the market's tokens; the exit goes again next pass");
+                return Ok(());
+            }
+        };
         if let Err(e) = self.position_service.mark_closing(position, &ctx).await {
             warn!(error = %e, "mark_closing failed");
             return Ok(());
         }
 
-        // Resolve token IDs
-        let (yes_token_id, no_token_id) = match self.resolve_market_tokens(&market_id).await? {
+        let (yes_token_id, no_token_id) = match tokens {
             Some(ids) => ids,
             None => {
                 let _ = self
@@ -900,7 +913,7 @@ impl ExitHandler {
         let no_price = position.no_exit_price.unwrap_or(Decimal::ZERO);
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        record_close_with_breaker(&self.circuit_breaker, position, true).await;
+        record_close_with_breaker(&self.pool, &self.circuit_breaker, position, true).await;
 
         // Publish success signal
         let signal = SignalUpdate {
@@ -1392,7 +1405,13 @@ impl ExitHandler {
         }
 
         let realized_pnl = position.realized_pnl.unwrap_or_default();
-        record_close_with_breaker(&self.circuit_breaker, position, unmeasured.is_empty()).await;
+        record_close_with_breaker(
+            &self.pool,
+            &self.circuit_breaker,
+            position,
+            unmeasured.is_empty(),
+        )
+        .await;
 
         let signal = SignalUpdate {
             signal_id: uuid::Uuid::new_v4(),
@@ -2305,23 +2324,109 @@ fn resolution_lean_decay(quant_ctx: &QuantExitContext, current_yes: Decimal) -> 
 /// A result the wallet did not confirm (`confirmed` false: a resolution
 /// close at the record) counts as a loss, never as a win.
 pub(crate) async fn record_close_with_breaker(
+    pool: &PgPool,
     breaker: &CircuitBreaker,
     position: &Position,
     confirmed: bool,
 ) {
     let pnl = position.realized_pnl.unwrap_or_default();
-    if position.execution_mode != "live" || (!confirmed && pnl > Decimal::ZERO) {
+    if breaker_counts_close(&position.execution_mode, pnl, confirmed) {
+        if let Err(error) = breaker.record_trade(pnl).await {
+            // Left unmarked: the next trading leader records it.
+            warn!(%error, position_id = %position.id, "Failed to record a close with the circuit breaker");
+            return;
+        }
+    } else {
         debug!(
             position_id = %position.id,
             position_mode = %position.execution_mode,
             confirmed,
             "Close left out of the circuit breaker"
         );
-        return;
     }
-    if let Err(error) = breaker.record_trade(pnl).await {
-        warn!(%error, position_id = %position.id, "Failed to record a close with the circuit breaker");
+    mark_breaker_recorded(pool, position.id).await;
+}
+
+/// Whether a close counts with the circuit breaker: live ones only, and
+/// never a win a resolution close could not confirm in the wallet.
+fn breaker_counts_close(execution_mode: &str, pnl: Decimal, confirmed: bool) -> bool {
+    execution_mode == "live" && (confirmed || pnl <= Decimal::ZERO)
+}
+
+async fn mark_breaker_recorded(pool: &PgPool, position_id: uuid::Uuid) {
+    if let Err(error) =
+        sqlx::query("UPDATE positions SET breaker_recorded_at = NOW() WHERE id = $1")
+            .bind(position_id)
+            .execute(pool)
+            .await
+    {
+        // Recorded but not marked: the next leader records it again, which
+        // errs towards tripping.
+        warn!(%error, %position_id, "Could not mark a close as recorded with the circuit breaker");
     }
+}
+
+/// Records with the circuit breaker the closes it never took in: a process
+/// that stopped between booking a close and recording it. Counted, in close
+/// order: closes after the breaker's last save (one before it was recorded
+/// in that save, by a process that did not mark it, such as the previous
+/// version during an upgrade), on the current UTC day (the breaker's daily
+/// counters have moved past earlier ones). The rest are only marked. Run by
+/// a new trading leader before it trades.
+pub(crate) async fn record_missed_closes(
+    pool: &PgPool,
+    breaker: &CircuitBreaker,
+) -> anyhow::Result<()> {
+    #[derive(sqlx::FromRow)]
+    struct MissedClose {
+        id: uuid::Uuid,
+        realized_pnl: Option<Decimal>,
+        execution_mode: String,
+        exit_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+        confirmed: bool,
+    }
+    let missed: Vec<MissedClose> = sqlx::query_as(
+        r#"
+        SELECT p.id, p.realized_pnl, p.execution_mode, p.exit_timestamp,
+               NOT EXISTS (
+                   SELECT 1 FROM trade_events te
+                   WHERE te.position_id = p.id
+                     AND te.event_type = 'closed_via_resolution'
+                     AND te.metadata ? 'unmeasured'
+               ) AS confirmed
+        FROM positions p
+        WHERE p.state = 4 AND p.breaker_recorded_at IS NULL
+        ORDER BY p.exit_timestamp NULLS FIRST, p.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    if missed.is_empty() {
+        return Ok(());
+    }
+    let saved_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT updated_at FROM circuit_breaker_state WHERE id = 1")
+            .fetch_optional(pool)
+            .await?;
+    let today = chrono::Utc::now().date_naive();
+    for close in missed {
+        let pnl = close.realized_pnl.unwrap_or_default();
+        let unsaved_today = close
+            .exit_timestamp
+            .is_some_and(|at| at.date_naive() == today && saved_at.is_none_or(|saved| at > saved));
+        if unsaved_today && breaker_counts_close(&close.execution_mode, pnl, close.confirmed) {
+            breaker.record_trade(pnl).await?;
+            warn!(position_id = %close.id, %pnl, "Recorded a close the circuit breaker had missed");
+        } else if close.execution_mode == "live" {
+            warn!(
+                position_id = %close.id,
+                %pnl,
+                "A close from an earlier day was never recorded with the circuit breaker"
+            );
+        }
+        mark_breaker_recorded(pool, close.id).await;
+    }
+    Ok(())
 }
 
 /// Spawn the exit handler as a background task.
@@ -2434,6 +2539,74 @@ mod strategy_exit_tests {
 mod tests {
     use super::*;
 
+    #[sqlx::test(migrations = false)]
+    async fn closes_the_breaker_missed_are_recorded_once_by_the_next_leader(pool: PgPool) {
+        sqlx::raw_sql(
+            "CREATE TABLE positions (id UUID PRIMARY KEY, state SMALLINT, realized_pnl NUMERIC, \
+                 execution_mode TEXT, exit_timestamp TIMESTAMPTZ, breaker_recorded_at TIMESTAMPTZ); \
+             CREATE TABLE trade_events (position_id UUID, event_type TEXT, metadata JSONB); \
+             CREATE TABLE circuit_breaker_state (id INT, updated_at TIMESTAMPTZ); \
+             INSERT INTO circuit_breaker_state VALUES (1, NOW() - INTERVAL '30 minutes');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let close = |pnl: i64, mode: &str, minutes_ago: i64, recorded: bool| {
+            let pool = pool.clone();
+            let mode = mode.to_string();
+            async move {
+                let id = uuid::Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO positions VALUES ($1, 4, $2, $3, $4, \
+                     CASE WHEN $5 THEN NOW() END)",
+                )
+                .bind(id)
+                .bind(Decimal::from(pnl))
+                .bind(mode)
+                .bind(chrono::Utc::now() - chrono::Duration::minutes(minutes_ago))
+                .bind(recorded)
+                .execute(&pool)
+                .await
+                .unwrap();
+                id
+            }
+        };
+        // Missed today: a live loss counts; a live win the wallet could not
+        // confirm and a paper loss do not.
+        close(-30, "live", 0, false).await;
+        let unconfirmed = close(50, "live", 0, false).await;
+        sqlx::query(
+            "INSERT INTO trade_events VALUES ($1, 'closed_via_resolution', '{\"unmeasured\": []}')",
+        )
+        .bind(unconfirmed)
+        .execute(&pool)
+        .await
+        .unwrap();
+        close(-40, "paper", 0, false).await;
+        // Unmarked but before the breaker's last save (recorded in it by a
+        // process that did not mark it), missed on an earlier day, and marked
+        // already: none counts.
+        close(-60, "live", 45, false).await;
+        close(-70, "live", 2 * 24 * 60, false).await;
+        close(-90, "live", 0, true).await;
+
+        let breaker = CircuitBreaker::new(Default::default());
+        record_missed_closes(&pool, &breaker).await.unwrap();
+        let state = breaker.state().await;
+        assert_eq!(state.daily_pnl, Decimal::from(-30));
+        assert_eq!(state.consecutive_losses, 1);
+        let unmarked: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM positions WHERE breaker_recorded_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unmarked, 0);
+
+        // A second leader finds nothing left to record.
+        record_missed_closes(&pool, &breaker).await.unwrap();
+        assert_eq!(breaker.state().await.daily_pnl, Decimal::from(-30));
+    }
+
     #[test]
     fn sales_refused_before_sending_are_told_apart() {
         // The executor's words for a sale it never sent.
@@ -2442,6 +2615,10 @@ mod tests {
         ));
         assert!(nothing_was_sent(
             "Live order preparation exceeded its deadline; nothing was sent"
+        ));
+        assert!(nothing_was_sent(
+            "HTTP request error: connection refused: the connection to the exchange failed, so \
+             nothing was sent"
         ));
         // A rejection or an unknown outcome is a failed exit.
         assert!(!nothing_was_sent("not enough balance / allowance"));

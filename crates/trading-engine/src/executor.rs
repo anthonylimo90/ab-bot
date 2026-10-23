@@ -862,7 +862,8 @@ impl OrderExecutor {
             ));
         };
 
-        let withheld = self.collateral_withheld(&client.address()).await?;
+        let withheld = self.collateral_withheld(&client.address()).await?
+            + self.collateral_resting_buys(&client.address()).await?;
         Self::ensure_live_order_capacity(
             client,
             Uuid::new_v4(),
@@ -871,6 +872,29 @@ impl OrderExecutor {
             required_collateral + withheld,
         )
         .await
+    }
+
+    /// USDC the wallet's resting live buys (manual orders) hold at the
+    /// exchange, which takes it from what a new order may spend. Checked for
+    /// a pair before its first leg: a second leg refused for want of cash
+    /// would leave the first unhedged. A single order is checked by the
+    /// exchange itself.
+    async fn collateral_resting_buys(&self, wallet: &str) -> Result<Decimal> {
+        let Some(pool) = &self.database else {
+            return Ok(Decimal::ZERO);
+        };
+        let resting: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM((quantity - COALESCE(filled_quantity, 0)) * COALESCE(price, 1)), 0) \
+             FROM orders \
+             WHERE execution_mode = 'live' AND side = 'buy' \
+               AND status IN ('pending', 'open', 'partially_filled') \
+               AND (wallet_address IS NULL OR LOWER(wallet_address) = LOWER($1))",
+        )
+        .bind(wallet)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Could not read resting buys for the pair preflight: {e}"))?;
+        Ok(resting.max(Decimal::ZERO))
     }
 
     /// USDC that withdrawals from `wallet` still being settled may take: the
@@ -1963,6 +1987,31 @@ mod tests {
             .unwrap();
         let _ = executor.execute_live_market_order(&buy(), None).await;
         assert_eq!(maker_amount().as_deref(), Some("5000000"));
+
+        // A pair's preflight also holds back what resting buys reserve: 44.8
+        // in flight and 5 for the pair fit in 50; a resting 10 @ 0.50 does not.
+        pool.execute(
+            "ALTER TABLE orders ADD COLUMN execution_mode TEXT, ADD COLUMN side TEXT, \
+             ADD COLUMN quantity NUMERIC, ADD COLUMN filled_quantity NUMERIC, \
+             ADD COLUMN price NUMERIC, ADD COLUMN wallet_address TEXT",
+        )
+        .await
+        .unwrap();
+        assert!(executor
+            .ensure_live_buying_power(Decimal::from(5))
+            .await
+            .is_ok());
+        sqlx::query(
+            "INSERT INTO orders VALUES (gen_random_uuid(), 'open', 'live', 'buy', 10, 0, 0.50, $1)",
+        )
+        .bind(&address)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(executor
+            .ensure_live_buying_power(Decimal::from(5))
+            .await
+            .is_err());
     }
 
     #[sqlx::test(migrations = false)]

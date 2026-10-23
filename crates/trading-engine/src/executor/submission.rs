@@ -178,9 +178,14 @@ impl OrderExecutor {
                 Ok(response)
             }
             Err(error) => {
-                // An explicit 4xx rejection confirms no order was accepted. All
-                // transport, decode, gateway and server failures are ambiguous.
-                let rejected = matches!(&error, polymarket_core::Error::Api { status: Some(code), .. } if (400..500).contains(code) && *code != 408);
+                // An explicit 4xx rejection confirms no order was accepted, and
+                // a connection that never opened carried no request. All other
+                // transport, decode, gateway and server failures are
+                // ambiguous: the order may have reached the exchange.
+                let unsent =
+                    matches!(&error, polymarket_core::Error::Http(http) if http.is_connect());
+                let rejected = unsent
+                    || matches!(&error, polymarket_core::Error::Api { status: Some(code), .. } if (400..500).contains(code) && *code != 408);
                 let status = if rejected { "rejected" } else { "unknown" };
                 if let Err(db_error) = sqlx::query(
                     "UPDATE execution_intents SET status = $2, updated_at = NOW() \
@@ -196,7 +201,11 @@ impl OrderExecutor {
                         "{SUBMISSION_UNKNOWN}: {error}; outcome persistence failed: {db_error}"
                     );
                 }
-                if rejected {
+                if unsent {
+                    Err(anyhow::anyhow!(
+                        "{error}: the connection to the exchange failed, so nothing was sent"
+                    ))
+                } else if rejected {
                     Err(anyhow::anyhow!(error.to_string()))
                 } else {
                     Err(anyhow::anyhow!("{SUBMISSION_UNKNOWN}: {error}"))
@@ -285,6 +294,66 @@ mod tests {
                 .unwrap();
         assert_eq!(row.0, "unknown");
         assert_eq!(Some(row.1), signed.order_hash);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_post_whose_connection_never_opened_is_not_sent(pool: sqlx::PgPool) {
+        pool.execute(include_str!(
+            "../../../../migrations/069_execution_intents.sql"
+        ))
+        .await
+        .unwrap();
+        pool.execute("CREATE TABLE position_order_links(id UUID,settled BOOLEAN)")
+            .await
+            .unwrap();
+        pool.execute("CREATE TABLE orders(id UUID,status TEXT)")
+            .await
+            .unwrap();
+        let executor = OrderExecutor::new(
+            Arc::new(ClobClient::new(None, None)),
+            ExecutorConfig::default(),
+        )
+        .with_database(pool.clone());
+        let signer = OrderSigner::new(
+            TradingWallet::from_private_key(&format!("{:064x}", 1))
+                .unwrap()
+                .signer()
+                .clone(),
+        );
+        let order = signer
+            .order_builder()
+            .token_id_str("1")
+            .side(SigningOrderSide::Buy)
+            .price(Decimal::new(5, 1))
+            .size(Decimal::ONE)
+            .expires_at(0)
+            .build()
+            .unwrap();
+        let signed = signer.sign_order(&order).await.unwrap();
+        // Nothing listens on port 1: the connection is refused.
+        let refused = reqwest::Client::new()
+            .post("http://127.0.0.1:1/order")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(refused.is_connect());
+        let id = Uuid::new_v4();
+        let error = executor
+            .submit_once(id, "market", &signed, FENCE_WAIT, || async {
+                Err(polymarket_core::Error::from(refused))
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nothing was sent"), "{error}");
+        assert!(!error.contains(SUBMISSION_UNKNOWN), "{error}");
+        let status: String = sqlx::query_scalar("SELECT status FROM execution_intents WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        // Rejected, not unknown: the wallet's next order is not fenced.
+        assert_eq!(status, "rejected");
     }
 
     #[sqlx::test(migrations = false)]
