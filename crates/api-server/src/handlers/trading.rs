@@ -418,8 +418,13 @@ async fn execute_reserved_order(
             ));
         }
         let max_daily_loss = state.circuit_breaker.config().await.max_daily_loss;
-        let day_loss_over_limit =
-            cb_state.daily_pnl < Decimal::ZERO && -cb_state.daily_pnl >= max_daily_loss;
+        // Counters of a day that has ended are not this day's loss.
+        let day_pnl = if cb_state.last_reset_date < Utc::now().date_naive() {
+            Decimal::ZERO
+        } else {
+            cb_state.daily_pnl
+        };
+        let day_loss_over_limit = day_pnl < Decimal::ZERO && -day_pnl >= max_daily_loss;
         let resumes = match cb_state.resume_at {
             None => "Holds until an owner or admin resets it".to_string(),
             // A trip holds while the day's loss is over the limit: until

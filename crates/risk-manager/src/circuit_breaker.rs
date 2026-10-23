@@ -416,6 +416,11 @@ impl CircuitBreaker {
             .clear();
         let loaded = self.adopt_stored(&mut state, stored);
         self.leader.store(true, Ordering::SeqCst);
+        // Entries held through the takeover (closes not yet counted) stop
+        // the clock from here, however soon they are released.
+        if !self.own_holds().is_empty() {
+            self.clock_held.store(true, Ordering::SeqCst);
+        }
         if loaded {
             self.persist_state(&mut state).await;
         }
@@ -661,11 +666,13 @@ impl CircuitBreaker {
         }
 
         // Recovery stages likewise advance in the leader only.
-        if self.keeps_course() && self.state.read().await.recovery_state.is_some() {
+        let leading = self.keeps_course();
+        if leading && self.state.read().await.recovery_state.is_some() {
             self.try_advance_recovery().await;
         }
-        // An operator's trip adopted by a save just now holds.
-        !self.is_tripped.load(Ordering::SeqCst)
+        // An operator's trip adopted by a save just now holds, and a leader
+        // fenced by it no longer answers for the state.
+        !self.is_tripped.load(Ordering::SeqCst) && (!leading || self.keeps_course())
     }
 
     /// Whether this process runs the breaker's clock (a cooldown's end,
@@ -780,8 +787,9 @@ impl CircuitBreaker {
         }
 
         self.persist_state(&mut state).await;
-        // An operator's trip adopted by the save holds.
-        !state.tripped
+        // An operator's trip adopted by the save holds, and a leader fenced
+        // by it no longer answers for the state.
+        self.keeps_course() && !state.tripped
     }
 
     /// Advance recovery to next stage if conditions are met.
@@ -809,6 +817,10 @@ impl CircuitBreaker {
         if self.clock_held.swap(false, Ordering::SeqCst) {
             recovery.stage_started_at = now;
             recovery.next_stage_at = Some(after_minutes(now, config.recovery_stage_minutes));
+            // Closes booked under the hold (a replay's) were not trades at
+            // this stage's capacity.
+            recovery.had_profit_this_stage = false;
+            recovery.trades_this_stage = 0;
             info!(
                 stage = recovery.current_stage,
                 "Entries were held during this recovery stage; it starts again"
@@ -1770,8 +1782,10 @@ mod tests {
         assert!(breaker.can_trade().await);
         assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
 
-        // Entries held: the clock stops.
+        // Entries held: the clock stops. A close booked meanwhile (a
+        // replay's win) was no trade at this stage's capacity.
         breaker.hold_entries("missed_closes", "closes not yet counted");
+        breaker.record_trade(Decimal::new(1, 0)).await.unwrap();
         breaker.tick().await;
         assert!(!breaker.can_trade().await);
         assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
@@ -1780,6 +1794,9 @@ mod tests {
         // The stage the hold spanned starts again rather than ending.
         assert!(!breaker.try_advance_recovery().await);
         assert_eq!(breaker.trading_capacity().await, Decimal::new(25, 2));
+        let recovery = breaker.recovery_state().await.unwrap();
+        assert!(!recovery.had_profit_this_stage);
+        assert_eq!(recovery.trades_this_stage, 0);
         assert!(breaker.try_advance_recovery().await);
         assert_eq!(breaker.trading_capacity().await, Decimal::new(50, 2));
     }

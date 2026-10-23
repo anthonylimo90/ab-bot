@@ -982,8 +982,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   own it could resume while the leader stays tripped. The leader does both
   on time (every 5 s, after re-reading the limits), whether or not anything
   asks it to trade (it used to wait for a trade attempt, which never came
-  with the executors off), except while it holds entries or cannot read the
-  limits; a recovery stage that entries were held during starts again.
+  with the executors off), except while it holds entries (the 5 s pass also
+  skips it when it cannot read the limits); a recovery stage that entries
+  were held during starts again, its trades and profit not counted.
 - The bound of 20 wallet orders awaiting a signature per user now holds
   for requests made at once (checked again under a per-user lock as the
   order is stored).
