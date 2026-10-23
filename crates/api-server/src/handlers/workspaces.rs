@@ -241,9 +241,82 @@ struct InviteLookupRow {
     workspace_name: String,
     email: String,
     role: String,
+    invited_by: Uuid,
     inviter_email: String,
     expires_at: DateTime<Utc>,
     accepted_at: Option<DateTime<Utc>>,
+}
+
+/// An invite carries its sender's authority: it lapses once the sender no
+/// longer holds a role that could issue it (removed, or demoted below admin;
+/// an admin invite needs the owner). `lock` holds the sender's membership row
+/// until the caller's transaction ends.
+async fn require_inviter_authority<'e, E>(
+    executor: E,
+    invite: &InviteLookupRow,
+    lock: bool,
+) -> ApiResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let sql = if lock {
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR SHARE"
+    } else {
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2"
+    };
+    let inviter_role: Option<String> = sqlx::query_scalar(sql)
+        .bind(invite.workspace_id)
+        .bind(invite.invited_by)
+        .fetch_optional(executor)
+        .await?;
+    if !inviter_may_issue(inviter_role.as_deref(), &invite.role) {
+        return Err(ApiError::Gone(
+            "Invite is no longer valid: its sender can no longer invite to this workspace".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Delete the pending invites `inviter` sent in `workspace` whose role
+/// `withdraw` selects; returns how many went.
+async fn withdraw_pending_invites(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: Uuid,
+    inviter: Uuid,
+    withdraw: impl Fn(&str) -> bool,
+) -> ApiResult<u64> {
+    let pending: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, role FROM workspace_invites \
+         WHERE workspace_id = $1 AND invited_by = $2 AND accepted_at IS NULL",
+    )
+    .bind(workspace_id)
+    .bind(inviter)
+    .fetch_all(&mut **tx)
+    .await?;
+    let ids: Vec<Uuid> = pending
+        .into_iter()
+        .filter(|(_, role)| withdraw(role))
+        .map(|(id, _)| id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let deleted =
+        sqlx::query("DELETE FROM workspace_invites WHERE id = ANY($1) AND accepted_at IS NULL")
+            .bind(&ids)
+            .execute(&mut **tx)
+            .await?;
+    Ok(deleted.rows_affected())
+}
+
+/// Whether a member with `inviter_role` may issue an invite for `role`, as
+/// create_invite decides it.
+fn inviter_may_issue(inviter_role: Option<&str>, role: &str) -> bool {
+    match inviter_role {
+        Some("owner") => true,
+        Some("admin") => role != "admin",
+        _ => false,
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1361,6 +1434,7 @@ pub async fn get_invite_info(
             w.name AS workspace_name,
             wi.email,
             wi.role,
+            wi.invited_by,
             COALESCE(inviter.email, '') AS inviter_email,
             wi.expires_at,
             wi.accepted_at
@@ -1382,6 +1456,8 @@ pub async fn get_invite_info(
     if invite.expires_at <= Utc::now() {
         return Err(ApiError::Gone("Invite has expired".into()));
     }
+
+    require_inviter_authority(&state.pool, &invite, false).await?;
 
     let user_exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM users WHERE email = $1")
         .bind(&invite.email)
@@ -1438,6 +1514,7 @@ pub async fn accept_invite(
             w.name AS workspace_name,
             wi.email,
             wi.role,
+            wi.invited_by,
             COALESCE(inviter.email, '') AS inviter_email,
             wi.expires_at,
             wi.accepted_at
@@ -1599,6 +1676,10 @@ pub async fn accept_invite(
         ));
     }
 
+    // Held until commit, so the inviter cannot be removed or demoted between
+    // this check and the membership it grants.
+    require_inviter_authority(&mut *tx, &invite, true).await?;
+
     sqlx::query(
         r#"
         INSERT INTO workspace_members (workspace_id, user_id, role, joined_at)
@@ -1739,13 +1820,20 @@ pub async fn update_member_role(
         ));
     }
 
-    // Update role
+    // Update role, withdrawing the pending invites the member may no longer
+    // issue (acceptance checks the sender's role too).
+    let mut tx = state.pool.begin().await?;
     sqlx::query("UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3")
         .bind(&new_role)
         .bind(workspace_id)
         .bind(member_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
+    let withdrawn_invites = withdraw_pending_invites(&mut tx, workspace_id, member_id, |role| {
+        !inviter_may_issue(Some(&new_role), role)
+    })
+    .await?;
+    tx.commit().await?;
 
     // Audit log
     state.audit_logger.log_user_action(
@@ -1755,7 +1843,8 @@ pub async fn update_member_role(
         serde_json::json!({
             "workspace_id": workspace_id.to_string(),
             "old_role": target_role,
-            "new_role": &new_role
+            "new_role": &new_role,
+            "withdrawn_invites": withdrawn_invites,
         }),
     );
 
@@ -1845,12 +1934,17 @@ pub async fn remove_member(
         return Err(ApiError::Forbidden("Only owner can remove admins".into()));
     }
 
-    // Remove member
+    // Remove member, withdrawing the invites they sent that are still pending
+    // (acceptance checks the sender's membership too).
+    let mut tx = state.pool.begin().await?;
     sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
         .bind(workspace_id)
         .bind(member_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
+    let withdrawn_invites =
+        withdraw_pending_invites(&mut tx, workspace_id, member_id, |_| true).await?;
+    tx.commit().await?;
 
     // Clear default workspace if this was it
     sqlx::query(
@@ -1872,7 +1966,8 @@ pub async fn remove_member(
         &member_id.to_string(),
         serde_json::json!({
             "workspace_id": workspace_id.to_string(),
-            "removed_role": target_role
+            "removed_role": target_role,
+            "withdrawn_invites": withdrawn_invites,
         }),
     );
 

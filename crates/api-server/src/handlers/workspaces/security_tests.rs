@@ -74,7 +74,7 @@ async fn fixture(pool: &PgPool) -> Fixture {
         )
         .route(
             "/api/v1/workspaces/:workspace_id/members/:member_id",
-            put(update_member_role),
+            put(update_member_role).delete(remove_member),
         )
         .route(
             "/api/v1/workspaces/:workspace_id/dynamic-tuning/opportunity-selection",
@@ -563,6 +563,16 @@ async fn admins_can_still_manage_non_admin_members(pool: PgPool) {
 /// Store an invite with the statement `create_workspace_invite` runs (that
 /// handler also needs an email client) and return its token.
 async fn stored_invite(pool: &PgPool, workspace: Uuid, email: &str, invited_by: Uuid) -> String {
+    stored_invite_for(pool, workspace, email, invited_by, "member").await
+}
+
+async fn stored_invite_for(
+    pool: &PgPool,
+    workspace: Uuid,
+    email: &str,
+    invited_by: Uuid,
+    role: &str,
+) -> String {
     let token = generate_invite_token();
     sqlx::query(
         r#"
@@ -573,7 +583,7 @@ async fn stored_invite(pool: &PgPool, workspace: Uuid, email: &str, invited_by: 
     .bind(Uuid::new_v4())
     .bind(workspace)
     .bind(email)
-    .bind("member")
+    .bind(role)
     .bind(hash_token(&token))
     .bind(invited_by)
     .bind(Utc::now() + Duration::days(7))
@@ -667,4 +677,147 @@ async fn invites_work_on_the_migrated_schema(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::OK, "{accepted}");
     assert_eq!(accepted["is_new_user"], json!(true), "{accepted}");
+}
+
+async fn pending_invites_from(pool: &PgPool, inviter: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workspace_invites WHERE invited_by = $1 AND accepted_at IS NULL",
+    )
+    .bind(inviter)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// An invite carries its sender's authority. A removed or demoted admin's
+/// pending invites are withdrawn, and one that survives anyway (here, a role
+/// changed outside the handlers) cannot be accepted.
+#[sqlx::test(migrations = false)]
+async fn an_invite_lapses_when_its_sender_can_no_longer_send_it(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let state = AppState::for_tests(pool.clone());
+    let invites = Router::new()
+        .route("/api/v1/invites/:token", get(get_invite_info))
+        .route(
+            "/api/v1/invites/:token/accept",
+            axum::routing::post(accept_invite),
+        )
+        .with_state(state.clone());
+    let accept = |token: String, invitee_token: String| {
+        let invites = invites.clone();
+        async move {
+            fx::call(
+                &invites,
+                "POST",
+                &format!("/api/v1/invites/{token}/accept"),
+                Some(&invitee_token),
+                Some(json!({})),
+            )
+            .await
+        }
+    };
+    let invitee = fx::user(&pool, UserRole::Trader).await;
+    let invitee_token = fx::token(&state, invitee, UserRole::Trader).await;
+    let invitee_email = format!("{invitee}@example.test");
+    let is_member = |user: Uuid| {
+        let pool = pool.clone();
+        let workspace = f.canonical;
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+            )
+            .bind(workspace)
+            .bind(user)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    // Demoted outside the handlers: the invite is still stored but lapsed.
+    let token = stored_invite(&pool, f.canonical, &invitee_email, f.user_ids["admin_a2"]).await;
+    sqlx::query("UPDATE workspace_members SET role = 'member' WHERE user_id = $1")
+        .bind(f.user_ids["admin_a2"])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = fx::call(
+        &invites,
+        "GET",
+        &format!("/api/v1/invites/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    let (status, body) = accept(token, invitee_token.clone()).await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert!(!is_member(invitee).await);
+
+    // An admin invite needs the owner: one stored from an admin is refused.
+    let token = stored_invite_for(
+        &pool,
+        f.canonical,
+        &invitee_email,
+        f.user_ids["admin_a"],
+        "admin",
+    )
+    .await;
+    let (status, body) = accept(token, invitee_token.clone()).await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert!(!is_member(invitee).await);
+    sqlx::query("DELETE FROM workspace_invites")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The owner demotes an admin: the admin's pending invites are withdrawn.
+    stored_invite(
+        &pool,
+        f.canonical,
+        "one@example.test",
+        f.user_ids["admin_a"],
+    )
+    .await;
+    stored_invite(
+        &pool,
+        f.canonical,
+        "two@example.test",
+        f.user_ids["admin_a"],
+    )
+    .await;
+    let owner_invite =
+        stored_invite(&pool, f.canonical, &invitee_email, f.user_ids["owner_a"]).await;
+    assert_eq!(pending_invites_from(&pool, f.user_ids["admin_a"]).await, 2);
+    assert_eq!(
+        f.set_role("owner_a", "admin_a", "member").await,
+        StatusCode::OK
+    );
+    assert_eq!(pending_invites_from(&pool, f.user_ids["admin_a"]).await, 0);
+
+    // The owner removes a member who sent invites while an admin: withdrawn too.
+    sqlx::query("UPDATE workspace_members SET role = 'admin' WHERE user_id = $1")
+        .bind(f.user_ids["admin_a"])
+        .execute(&pool)
+        .await
+        .unwrap();
+    stored_invite(
+        &pool,
+        f.canonical,
+        "three@example.test",
+        f.user_ids["admin_a"],
+    )
+    .await;
+    let uri = format!(
+        "/api/v1/workspaces/{}/members/{}",
+        f.canonical, f.user_ids["admin_a"]
+    );
+    let (status, _) = fx::call(&f.app, "DELETE", &uri, Some(&f.tokens["owner_a"]), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(pending_invites_from(&pool, f.user_ids["admin_a"]).await, 0);
+
+    // The owner's own invite is untouched and still works.
+    let (status, body) = accept(owner_invite, invitee_token).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(is_member(invitee).await);
 }

@@ -1072,6 +1072,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   sign-in and workspace membership; they were public, and live trades read
   the exchange's data API on every request. `/api/v1/regime/current` stays
   public. The dashboard does not call the discover endpoints.
+- A workspace invite lapses (410) once its sender could no longer send it:
+  removed from the workspace, demoted below admin, or (for an admin invite)
+  not the owner. Removing or demoting a member also withdraws the invites
+  they sent that are still pending. An invite from a removed admin used to
+  grant membership for its full seven days.
 
 ### API contract changes
 
