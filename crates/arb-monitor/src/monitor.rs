@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Default minimum depth (in USD) at best ask for both sides.
 const DEFAULT_MIN_BOOK_DEPTH_USD: Decimal = Decimal::from_parts(100, 0, 0, false, 0); // $100
@@ -35,6 +35,18 @@ const POSITION_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const SIGNAL_PUBLISH_BACKOFF_SECS: i64 = 5;
 /// How soon a failed or doubtful universe refresh is tried again.
 const UNIVERSE_RETRY_AFTER: StdDuration = StdDuration::from_secs(120);
+/// How many update timeouts in a row, each followed by a fresh subscription,
+/// may pass without any order book data before the monitor exits for its
+/// supervisor to start it afresh.
+const STALLS_BEFORE_EXIT: u32 = 5;
+
+/// Whether the monitor has gone without order book data for too long: a
+/// subscription that delivers nothing through `STALLS_BEFORE_EXIT`
+/// reconnects is not recovering on its own, and a live loop alone would keep
+/// the health check green with no signals.
+fn starved_of_book_data(since_last_book: StdDuration, update_timeout: StdDuration) -> bool {
+    since_last_book > update_timeout.saturating_mul(STALLS_BEFORE_EXIT)
+}
 
 /// Minimum number of market replacements before a periodic rerank triggers a resubscribe.
 const DEFAULT_SELECTION_RESUBSCRIBE_MIN_MARKET_DELTA: usize = 8;
@@ -660,6 +672,8 @@ impl ArbMonitor {
         // recreated per iteration would be reset by every tick and never fire.
         let update_timeout = StdDuration::from_secs(update_timeout_secs);
         let mut last_update_at = tokio::time::Instant::now();
+        // When order book data last arrived; reconnects do not reset it.
+        let mut last_book_at = tokio::time::Instant::now();
 
         // Arms the watchdog: from here the loop shows life each minute.
         crate::touch_health_file();
@@ -781,6 +795,17 @@ impl ArbMonitor {
                     }
                 }
                 _ = heartbeat_tick.tick() => {
+                    if self.active_subscription_asset_count() == 0 {
+                        // Nothing subscribed: no data is due.
+                        last_book_at = tokio::time::Instant::now();
+                    } else if starved_of_book_data(last_book_at.elapsed(), update_timeout) {
+                        error!(
+                            silent_secs = last_book_at.elapsed().as_secs(),
+                            "No order book data through repeated reconnects; exiting so the \
+                             monitor is restarted"
+                        );
+                        anyhow::bail!("no order book data through repeated reconnects");
+                    }
                     crate::touch_health_file();
                 }
                 _ = stats_tick.tick() => {
@@ -1014,6 +1039,7 @@ impl ArbMonitor {
                     };
 
                     last_update_at = tokio::time::Instant::now();
+                    last_book_at = last_update_at;
                     updates_since_tick += 1;
                     // A failed publish or database call affects one update; it
                     // must not stop monitoring every other market.
@@ -2128,6 +2154,16 @@ async fn run_dynamic_config_listener_once(
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn the_monitor_gives_up_on_a_subscription_that_never_delivers() {
+        let timeout = StdDuration::from_secs(120);
+        // Silence across fewer timeouts is left to reconnecting.
+        assert!(!starved_of_book_data(StdDuration::from_secs(599), timeout));
+        assert!(!starved_of_book_data(StdDuration::from_secs(600), timeout));
+        // Beyond STALLS_BEFORE_EXIT timeouts the process exits.
+        assert!(starved_of_book_data(StdDuration::from_secs(601), timeout));
+    }
 
     fn profile(liquidity: f64, volume: f64) -> MarketProfile {
         MarketProfile { liquidity, volume }

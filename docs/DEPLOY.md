@@ -1089,6 +1089,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   from NOW(), which left one or two bars, so a market with a single bar read
   as "did not move"; each move is now the four hours to the market's newest
   bar, needs both bars, and a pair compares the same hours.
+- The arbitrage monitor exits (to be restarted by its supervisor) when no
+  order book data has arrived for five `ARB_UPDATE_TIMEOUT_SECS` periods
+  (ten minutes by default) while it is subscribed to markets. A subscription
+  that delivered nothing was resubscribed forever while the health file
+  stayed fresh, so the service looked healthy with no signals.
 
 ### API contract changes
 
