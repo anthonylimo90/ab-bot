@@ -393,8 +393,10 @@ async fn execute_reserved_order(
         }
     }
 
-    // Check circuit breaker before processing any orders
-    if !state.circuit_breaker.can_trade().await {
+    // A tripped circuit breaker refuses buys. A sale only reduces exposure,
+    // and manual holdings have no automatic exit: during a trip (a latched
+    // one holds until reset) selling them is how an operator de-risks.
+    if request.side == OrderSide::Buy && !state.circuit_breaker.can_trade().await {
         let cb_state = state.circuit_breaker.state().await;
         return Err(ApiError::ServiceUnavailable(format!(
             "Trading halted: {:?}. Resumes at {:?}",

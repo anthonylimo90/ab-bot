@@ -389,7 +389,10 @@ impl OrderExecutor {
         self.report_tx.subscribe()
     }
 
-    /// Execute a market order with timeout and retry logic.
+    /// Execute a market order with timeout and retry logic. Tests only: it
+    /// names no wallet or position, so production orders go through the
+    /// reserved and per-position entry points.
+    #[cfg(test)]
     pub async fn execute_market_order(&self, order: MarketOrder) -> Result<ExecutionReport> {
         self.execute_market_order_bound(order, self.is_live(), None)
             .await
@@ -727,7 +730,9 @@ impl OrderExecutor {
         )
     }
 
-    /// Execute a limit order with timeout and retry logic.
+    /// Execute a limit order with timeout and retry logic. Tests only, as
+    /// `execute_market_order`.
+    #[cfg(test)]
     pub async fn execute_limit_order(&self, order: LimitOrder) -> Result<ExecutionReport> {
         self.execute_limit_order_bound(order, self.is_live(), None)
             .await
