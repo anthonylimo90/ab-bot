@@ -249,8 +249,10 @@ struct InviteLookupRow {
 
 /// An invite carries its sender's authority: it lapses once the sender no
 /// longer holds a role that could issue it (removed, or demoted below admin;
-/// an admin invite needs the owner). `lock` holds the sender's membership row
-/// until the caller's transaction ends.
+/// an admin invite needs the owner). An owner invite comes from a platform
+/// admin creating the workspace, who is not a member of it: it lapses once
+/// the sender is no longer a platform admin. `lock` holds the row the
+/// authority rests on until the caller's transaction ends.
 async fn require_inviter_authority<'e, E>(
     executor: E,
     invite: &InviteLookupRow,
@@ -259,17 +261,26 @@ async fn require_inviter_authority<'e, E>(
 where
     E: sqlx::PgExecutor<'e>,
 {
-    let sql = if lock {
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR SHARE"
+    let lock_clause = if lock { " FOR SHARE" } else { "" };
+    let authorised = if invite.role == "owner" {
+        let sql = format!("SELECT role::integer = 2 FROM users WHERE id = $1{lock_clause}");
+        sqlx::query_scalar::<_, bool>(&sql)
+            .bind(invite.invited_by)
+            .fetch_optional(executor)
+            .await?
+            .unwrap_or(false)
     } else {
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2"
+        let sql = format!(
+            "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2{lock_clause}"
+        );
+        let inviter_role: Option<String> = sqlx::query_scalar(&sql)
+            .bind(invite.workspace_id)
+            .bind(invite.invited_by)
+            .fetch_optional(executor)
+            .await?;
+        inviter_may_issue(inviter_role.as_deref(), &invite.role)
     };
-    let inviter_role: Option<String> = sqlx::query_scalar(sql)
-        .bind(invite.workspace_id)
-        .bind(invite.invited_by)
-        .fetch_optional(executor)
-        .await?;
-    if !inviter_may_issue(inviter_role.as_deref(), &invite.role) {
+    if !authorised {
         return Err(ApiError::Gone(
             "Invite is no longer valid: its sender can no longer invite to this workspace".into(),
         ));

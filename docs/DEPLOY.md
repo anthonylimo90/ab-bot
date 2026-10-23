@@ -1076,7 +1076,9 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   removed from the workspace, demoted below admin, or (for an admin invite)
   not the owner. Removing or demoting a member also withdraws the invites
   they sent that are still pending. An invite from a removed admin used to
-  grant membership for its full seven days.
+  grant membership for its full seven days. An owner invite (sent by a
+  platform admin creating a workspace for someone without an account) lapses
+  once its sender is no longer a platform admin.
 - Outside development (`ENVIRONMENT` other than development/dev/local/test),
   a startup with no `CORS_ALLOWED_ORIGINS` logs an error: every origin may
   call the API. Set it to the dashboard's origin.

@@ -821,3 +821,58 @@ async fn an_invite_lapses_when_its_sender_can_no_longer_send_it(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(is_member(invitee).await);
 }
+
+/// A workspace created by a platform admin for an owner without an account
+/// gets an owner invite from that admin, who is not a member: it rests on the
+/// sender being a platform admin, and lapses once they are not.
+#[sqlx::test(migrations = false)]
+async fn an_owner_invite_rests_on_its_sender_being_a_platform_admin(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let state = AppState::for_tests(pool.clone());
+    let invites = Router::new()
+        .route("/api/v1/invites/:token", get(get_invite_info))
+        .route(
+            "/api/v1/invites/:token/accept",
+            axum::routing::post(accept_invite),
+        )
+        .with_state(state.clone());
+    let fresh = fx::workspace(&pool, "fresh", 0).await;
+    let admin = f.user_ids["platform_admin"];
+    let accept = |token: String, email: &'static str| {
+        let invites = invites.clone();
+        async move {
+            fx::call(
+                &invites,
+                "POST",
+                &format!("/api/v1/invites/{token}/accept"),
+                None,
+                Some(json!({ "email": email, "password": "long enough password" })),
+            )
+            .await
+        }
+    };
+
+    let token = stored_invite_for(&pool, fresh, "owner.one@example.test", admin, "owner").await;
+    let (status, body) = fx::call(
+        &invites,
+        "GET",
+        &format!("/api/v1/invites/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = accept(token, "owner.one@example.test").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["role"], json!("owner"), "{body}");
+
+    // Once the sender is no longer a platform admin, their owner invite lapses.
+    let token = stored_invite_for(&pool, fresh, "owner.two@example.test", admin, "owner").await;
+    sqlx::query("UPDATE users SET role = 1 WHERE id = $1")
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = accept(token, "owner.two@example.test").await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
+}
