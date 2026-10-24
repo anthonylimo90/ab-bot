@@ -103,7 +103,7 @@ DYNAMIC_CONFIG_REDIS_URL=redis://dynamic_subscriber:<subscriber_password>@redis:
 
 # External APIs
 POLYMARKET_CLOB_URL=https://clob.polymarket.com
-POLYGON_RPC_URL=https://polygon-rpc.com
+POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/<key>
 
 # Email
 RESEND_API_KEY=re_...

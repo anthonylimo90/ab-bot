@@ -936,7 +936,7 @@ pub(crate) async fn initialize_trading_signer(
                      cannot be valued, so the circuit breaker trips on connectivity after three \
                      snapshots"
                 );
-                "https://polygon-rpc.com".to_string()
+                polymarket_core::api::polygon::PUBLIC_POLYGON_RPC_URL.to_string()
             });
 
         // Build a signer from the same key the executor used

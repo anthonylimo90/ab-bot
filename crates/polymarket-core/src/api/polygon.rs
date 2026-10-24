@@ -106,6 +106,11 @@ pub enum WithdrawalSource {
     Pusd,
 }
 
+/// A keyless public Polygon node, the last resort when none is configured.
+/// Public nodes rate-limit and refuse some calls; production configures its
+/// own. (`polygon-rpc.com`, the earlier default, now refuses every call.)
+pub const PUBLIC_POLYGON_RPC_URL: &str = "https://polygon.drpc.org";
+
 /// Polygon RPC client for querying blockchain data.
 #[derive(Clone)]
 pub struct PolygonClient {
