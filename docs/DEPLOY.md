@@ -221,7 +221,8 @@ cargo test -p polymarket-core --lib live_ -- --ignored
 ```
 
 They confirm that markets, books, tick sizes, fees, trades and settled
-winners parse, and that chain reads work. Both exchanges must publish the
+winners parse, that chain reads work, and that the exchange accepts the
+bot's sign-in (L1) signature and refuses a corrupted one. Both exchanges must publish the
 signing domain the bot uses, hash its orders as it does, and accept its
 signatures, and must reject corrupted ones. The withdrawal transfer, the
 Offramp unwrap and the Onramp wrap must pass the node's preflight from

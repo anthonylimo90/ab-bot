@@ -228,3 +228,53 @@ async fn chain_reads_parse() {
         .is_none());
     println!("head {head}, safe {safe}, gas {gas} wei, balances {balances:?}");
 }
+
+/// The exchange's answer to a key-derivation request for a fresh wallet,
+/// signed by the bot (`valid`) or with its signature corrupted. GET only:
+/// derivation finds an existing key and never creates one.
+async fn derive_answer(valid: bool) -> (u16, String) {
+    use alloy_signer_local::PrivateKeySigner;
+    use polymarket_core::signing::OrderSigner;
+    let key = PrivateKeySigner::random();
+    let address = format!("{:#x}", key.address());
+    let signer = OrderSigner::new(key);
+    let timestamp = chrono::Utc::now().timestamp() as u64;
+    let mut signature = signer
+        .sign_clob_auth_message(timestamp, 0)
+        .await
+        .expect("signature");
+    if !valid {
+        // Flip a byte of r.
+        let flipped = if &signature[10..12] == "00" {
+            "11"
+        } else {
+            "00"
+        };
+        signature.replace_range(10..12, flipped);
+    }
+    let response = reqwest::Client::new()
+        .get("https://clob.polymarket.com/auth/derive-api-key")
+        .header("POLY_ADDRESS", address)
+        .header("POLY_SIGNATURE", signature)
+        .header("POLY_TIMESTAMP", timestamp.to_string())
+        .header("POLY_NONCE", "0")
+        .send()
+        .await
+        .expect("exchange reachable");
+    let status = response.status().as_u16();
+    (status, response.text().await.unwrap_or_default())
+}
+
+#[tokio::test]
+#[ignore = "reaches the real Polymarket API"]
+async fn exchange_accepts_the_bots_l1_auth_signature() {
+    // Signed by the bot: authenticated, and refused only because the new
+    // wallet has no key to derive.
+    let (status, body) = derive_answer(true).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("Could not derive api key"), "{body}");
+    // The same request with a corrupted signature fails authentication.
+    let (status, body) = derive_answer(false).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("Invalid L1 Request headers"), "{body}");
+}
