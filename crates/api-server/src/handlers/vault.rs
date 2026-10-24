@@ -1837,6 +1837,37 @@ pub struct WithdrawalPreflightResponse {
     pub withdrawn_last_24h: Decimal,
 }
 
+/// Why the daily limit stops a withdrawal of `amount` (or, with no amount,
+/// any withdrawal) after `withdrawn` in the last 24 hours, if it does.
+fn daily_cap_reason(
+    amount: Option<Decimal>,
+    daily_cap: Decimal,
+    withdrawn: Decimal,
+) -> Option<String> {
+    match amount {
+        Some(amount) if withdrawn + amount > daily_cap => Some(format!(
+            "Withdrawal of {amount} USDC would exceed the daily limit of {daily_cap} USDC \
+             ({withdrawn} USDC withdrawn in the last 24 hours)"
+        )),
+        None if withdrawn >= daily_cap => Some(format!(
+            "The daily withdrawal limit of {daily_cap} USDC is used up \
+             ({withdrawn} USDC in the last 24 hours)"
+        )),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_daily_limit_blocks_a_preflight_with_or_without_an_amount() {
+    let d = Decimal::from;
+    assert!(daily_cap_reason(Some(d(10)), d(1000), d(995)).is_some());
+    assert!(daily_cap_reason(Some(d(5)), d(1000), d(995)).is_none());
+    // Used up: nothing can go, so say so even without an amount.
+    assert!(daily_cap_reason(None, d(1000), d(1000)).is_some());
+    assert!(daily_cap_reason(None, d(1000), d(999)).is_none());
+}
+
 /// Check whether a proposed withdrawal is safe before submitting it.
 ///
 /// Applies the same capacity rules as a withdrawal (balance less unconfirmed
@@ -1923,7 +1954,18 @@ pub async fn withdrawal_preflight(
         })
         .unwrap_or(false);
 
+    let withdrawn_last_24h = {
+        let mut conn = state.pool.acquire().await?;
+        crate::withdrawals::withdrawn_last_day(&mut conn, workspace_id).await?
+    };
+    let daily_cap = state.withdrawal_policy.daily_cap;
+    let cap_left = (daily_cap - withdrawn_last_24h).max(Decimal::ZERO);
     let mut blocking_reasons = capacity.blocking_reasons.clone();
+    blocking_reasons.extend(daily_cap_reason(
+        params.amount,
+        daily_cap,
+        withdrawn_last_24h,
+    ));
     match params.amount {
         Some(amount) if source.is_none() => {
             blocking_reasons.push(exceeds_capacity(amount, &capacity));
@@ -1939,19 +1981,6 @@ pub async fn withdrawal_preflight(
         }
         _ => {}
     }
-    let withdrawn_last_24h = {
-        let mut conn = state.pool.acquire().await?;
-        crate::withdrawals::withdrawn_last_day(&mut conn, workspace_id).await?
-    };
-    let daily_cap = state.withdrawal_policy.daily_cap;
-    if let Some(amount) = params.amount {
-        if withdrawn_last_24h + amount > daily_cap {
-            blocking_reasons.push(format!(
-                "Withdrawal of {amount} USDC would exceed the daily limit of {daily_cap} USDC \
-                 ({withdrawn_last_24h} USDC withdrawn in the last 24 hours)"
-            ));
-        }
-    }
     let can_withdraw = blocking_reasons.is_empty();
 
     Ok(Json(WithdrawalPreflightResponse {
@@ -1961,9 +1990,7 @@ pub async fn withdrawal_preflight(
         orphan_exposure,
         // What one withdrawal may take now: the wallet's capacity, within
         // what the daily limit has left.
-        max_withdrawable: capacity
-            .max_withdrawable
-            .min((daily_cap - withdrawn_last_24h).max(Decimal::ZERO)),
+        max_withdrawable: capacity.max_withdrawable.min(cap_left),
         inventory_fresh,
         inventory_synced_at,
         can_withdraw,

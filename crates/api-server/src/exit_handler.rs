@@ -1857,6 +1857,11 @@ impl ExitHandler {
         .fetch_all(&self.pool)
         .await?;
         let now = std::time::Instant::now();
+        // Only markets still held keep a backoff.
+        self.manual_resolution_next_check
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|market, _| markets.contains(market));
         for market_id in markets {
             let due = self
                 .manual_resolution_next_check
