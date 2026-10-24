@@ -1513,4 +1513,124 @@ mod tests {
             );
         }
     }
+
+    /// Read-only, against a real Polygon node: the bot's withdrawal and wrap
+    /// call data, sent from wallets that hold the funds and the allowance
+    /// the bot sets, passes the same `eth_estimateGas` preflight a real
+    /// withdrawal or wrap goes through; from a wallet without the funds it is
+    /// refused as a call that would fail. Nothing is signed or sent. Finding
+    /// approved wallets reads logs, which some public nodes refuse, so
+    /// `LIVE_POLYGON_LOGS_RPC_URL` picks a node that serves them. Run with
+    /// `cargo test -p polymarket-core --lib live_ -- --ignored`.
+    #[tokio::test]
+    #[ignore = "reaches a real Polygon node"]
+    async fn live_withdrawal_and_wrap_calls_pass_the_node_preflight() {
+        use super::*;
+        const APPROVAL_TOPIC: &str =
+            "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+        const UNITS: u128 = 1_000_000;
+        let client = PolygonClient::new(
+            std::env::var("LIVE_POLYGON_LOGS_RPC_URL")
+                .unwrap_or_else(|_| "https://polygon-bor-rpc.publicnode.com".into()),
+        );
+
+        async fn allowance(
+            client: &PolygonClient,
+            token: &str,
+            owner: &str,
+            spender: &str,
+        ) -> u128 {
+            let data = format!(
+                "0xdd62ed3e{:0>64}{:0>64}",
+                owner.trim_start_matches("0x"),
+                spender.trim_start_matches("0x").to_lowercase()
+            );
+            let answer: JsonRpcResponse<String> = client
+                .rpc_call(
+                    "eth_call",
+                    serde_json::json!([{ "to": token, "data": data }, "latest"]),
+                )
+                .await
+                .expect("allowance");
+            let value = answer.result.expect("allowance result");
+            U256::from_str_radix(value.trim_start_matches("0x"), 16)
+                .expect("allowance value")
+                .saturating_to::<u128>()
+        }
+
+        // A wallet that approved `spender` for `token` and still holds and
+        // allows at least `UNITS` of it.
+        async fn approved_holder(client: &PolygonClient, token: &str, spender: &str) -> Address {
+            let head = client.safe_block_number().await.expect("safe block");
+            let topics = serde_json::json!([APPROVAL_TOPIC, null, topic_for_address(spender)]);
+            let mut to = head;
+            for _ in 0..200 {
+                let from = to.saturating_sub(1_999);
+                let logs = client
+                    .get_logs_with_topics(&[token], from, to, topics.clone())
+                    .await
+                    .expect("approval logs");
+                for log in logs.iter().rev() {
+                    let owner = format!("0x{}", &log.topics[1][26..]);
+                    let balance = client
+                        .get_erc20_balance_units_at(&owner, token, "latest".into())
+                        .await
+                        .expect("balance");
+                    if balance >= UNITS && allowance(client, token, &owner, spender).await >= UNITS
+                    {
+                        return owner.parse().expect("owner");
+                    }
+                }
+                to = from - 1;
+            }
+            panic!("no wallet holding {token} approved for {spender} in recent blocks");
+        }
+
+        let usdc: Address = POLYGON_USDC_ADDRESS.parse().unwrap();
+        let offramp: Address = COLLATERAL_OFFRAMP_ADDRESS.parse().unwrap();
+        let onramp: Address = COLLATERAL_ONRAMP_ADDRESS.parse().unwrap();
+        let recipient: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let amount = U256::from(UNITS);
+
+        // A USDC.e withdrawal: an ERC-20 transfer from a wallet holding it
+        // (the Conditional Tokens contract holds all the collateral).
+        let transfer = encode_erc20_transfer(recipient, amount);
+        let holder: Address = CTF_ADDRESS.parse().unwrap();
+        let gas = client
+            .gas_limit(holder, usdc, &transfer, DEFAULT_ERC20_TRANSFER_GAS_LIMIT)
+            .await
+            .expect("USDC.e transfer preflight");
+        assert!(gas >= DEFAULT_ERC20_TRANSFER_GAS_LIMIT);
+
+        // The same transfer from a new, empty wallet would fail.
+        let empty = Address::from_slice(
+            &alloy_primitives::keccak256(format!("{:?}", std::time::SystemTime::now()))[12..],
+        );
+        let refused = client
+            .gas_limit(empty, usdc, &transfer, DEFAULT_ERC20_TRANSFER_GAS_LIMIT)
+            .await
+            .expect_err("a transfer without funds passed");
+        assert!(refused.to_string().contains(CALL_WOULD_FAIL), "{refused}");
+
+        // A pUSD withdrawal: the Offramp unwraps and pays out USDC.e.
+        let pusd_holder =
+            approved_holder(&client, COLLATERAL_ADDRESS, COLLATERAL_OFFRAMP_ADDRESS).await;
+        let unwrap = encode_ramp_call("unwrap", usdc, recipient, amount);
+        client
+            .gas_limit(pusd_holder, offramp, &unwrap, MIN_RAMP_GAS_LIMIT)
+            .await
+            .unwrap_or_else(|e| panic!("unwrap preflight from {pusd_holder}: {e}"));
+
+        // The collateral sweeper's wrap of USDC.e into pUSD for itself.
+        let usdc_holder =
+            approved_holder(&client, POLYGON_USDC_ADDRESS, COLLATERAL_ONRAMP_ADDRESS).await;
+        let wrap = encode_ramp_call("wrap", usdc, usdc_holder, amount);
+        client
+            .gas_limit(usdc_holder, onramp, &wrap, MIN_RAMP_GAS_LIMIT)
+            .await
+            .unwrap_or_else(|e| panic!("wrap preflight from {usdc_holder}: {e}"));
+        println!("transfer gas {gas}; pUSD holder {pusd_holder}; USDC.e holder {usdc_holder}");
+    }
 }

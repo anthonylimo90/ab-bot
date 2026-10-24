@@ -51,6 +51,12 @@ pub mod events {
 /// catching up at 250 blocks per poll is much faster than the chain advances.
 pub const MAX_BLOCKS_PER_POLL: u64 = 250;
 
+/// How far behind the head the indexer reads. Load-balanced RPC providers
+/// serve some requests from nodes a block or two behind, which refuse a range
+/// ending at the head or answer it without the newest blocks' logs; once
+/// passed, those blocks would never be read again.
+const HEAD_LAG_BLOCKS: u64 = 5;
+
 /// Maximum number of distinct wallets remembered as already analyzed.
 ///
 /// Bounds memory for a process that runs indefinitely; the least recently
@@ -282,7 +288,10 @@ impl TradeIndexer {
         };
 
         // Get current block as starting point
-        let current_block = polygon.get_block_number().await?;
+        let current_block = polygon
+            .get_block_number()
+            .await?
+            .saturating_sub(HEAD_LAG_BLOCKS);
 
         Ok(Self {
             polygon,
@@ -311,7 +320,11 @@ impl TradeIndexer {
 
     /// Poll for new blocks and process trades.
     async fn poll_new_blocks(&mut self) -> Result<()> {
-        let current_block = self.polygon.get_block_number().await?;
+        let current_block = self
+            .polygon
+            .get_block_number()
+            .await?
+            .saturating_sub(HEAD_LAG_BLOCKS);
 
         let Some((from_block, to_block)) =
             next_block_range(self.last_block, current_block, MAX_BLOCKS_PER_POLL)

@@ -210,6 +210,25 @@ curl https://<your-api-server-url>.railway.app/health
 
 Open `https://<your-dashboard-url>.railway.app` in browser.
 
+### Check the bot against the live exchange and chain
+
+Before live trading, and after any Polymarket contract or API change, run
+the read-only live checks. They sign nothing that is sent and write nothing:
+
+```bash
+cargo test -p polymarket-core --test live_endpoints --test live_contracts -- --ignored --test-threads=1
+cargo test -p polymarket-core --lib live_ -- --ignored
+```
+
+They confirm that markets, books, tick sizes, fees, trades and settled
+winners parse, and that chain reads work. Both exchanges must publish the
+signing domain the bot uses, hash its orders as it does, and accept its
+signatures, and must reject corrupted ones. The withdrawal transfer, the
+Offramp unwrap and the Onramp wrap must pass the node's preflight from
+funded wallets. `LIVE_POLYGON_RPC_URL` and `LIVE_POLYGON_LOGS_RPC_URL` pick
+the nodes; public nodes refuse some calls, so a refusal there is the node's
+limit, not a bot fault.
+
 ## Environment Variables Reference
 
 ### API Server
