@@ -44,20 +44,6 @@ impl OrderExecutor {
         .await
     }
 
-    pub async fn submit_wallet_order(
-        &self,
-        client: &ClobClient,
-        id: Uuid,
-        signed: SignedOrder,
-        credentials: &polymarket_core::api::clob::ApiCredentials,
-    ) -> Result<PostOrderResponse> {
-        let address = signed.maker.clone();
-        self.submit_once(id, &signed.token_id, &signed, FENCE_WAIT, || {
-            client.post_signed_order(&address, credentials, signed.clone(), OrderType::Gtd)
-        })
-        .await
-    }
-
     // The durable fence is committed before executing the HTTP operation. A row
     // left in submitting/unknown blocks further live submissions across replicas.
     async fn submit_once<F, Fut>(

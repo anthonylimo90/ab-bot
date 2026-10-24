@@ -10,7 +10,6 @@ pub mod discover;
 pub mod health;
 pub mod markets;
 pub mod metrics;
-pub mod order_signing;
 pub mod positions;
 pub mod recovery;
 pub mod risk;

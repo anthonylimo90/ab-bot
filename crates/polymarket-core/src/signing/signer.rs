@@ -159,14 +159,6 @@ fn compute_typed_data_hash(domain_separator: B256, struct_hash: B256) -> B256 {
     alloy_primitives::keccak256(&data)
 }
 
-/// Digest signed by browser wallets to derive their own exchange credentials.
-pub fn clob_auth_digest(address: Address, timestamp: u64, nonce: u64) -> B256 {
-    compute_typed_data_hash(
-        ClobAuthDomain::polygon().separator(),
-        clob_auth_struct_hash(address, timestamp, nonce),
-    )
-}
-
 /// Compute the EIP-712 struct hash for ClobAuth.
 ///
 /// ClobAuth(address address, string timestamp, uint256 nonce, string message)

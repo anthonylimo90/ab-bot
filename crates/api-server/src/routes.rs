@@ -10,8 +10,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     accounting, activity, admin_workspaces, auth, backtest, discover, health, markets, metrics,
-    order_signing, positions, recovery, risk, signals, strategy_health, trade_flow, trading, users,
-    vault, wallet_auth, wallets, workspaces,
+    positions, recovery, risk, signals, strategy_health, trade_flow, trading, users, vault,
+    wallet_auth, wallets, workspaces,
 };
 use crate::middleware::rate_limit::{LimiterJanitor, TrustedProxyKeyExtractor};
 use crate::middleware::{require_admin, require_auth, require_trader};
@@ -104,8 +104,6 @@ use crate::websocket;
         workspaces::update_opportunity_selection_settings,
         workspaces::get_dynamic_tuning_history,
         // Order signing (MetaMask)
-        order_signing::prepare_order,
-        order_signing::submit_order,
         // Activity
         activity::list_activity,
         accounting::get_account_summary,
@@ -236,17 +234,6 @@ use crate::websocket;
             workspaces::DynamicConfigItemResponse,
             workspaces::DynamicConfigHistoryEntryResponse,
             // Order signing
-            order_signing::PrepareOrderRequest,
-            order_signing::PrepareOrderResponse,
-            order_signing::SubmitOrderRequest,
-            order_signing::WalletAuthProof,
-            order_signing::SubmitOrderResponse,
-            order_signing::Eip712TypedData,
-            order_signing::Eip712Domain,
-            order_signing::Eip712Order,
-            order_signing::Eip712Types,
-            order_signing::TypeDefinition,
-            order_signing::OrderSummary,
             // Activity
             activity::ActivityResponse,
             accounting::AccountSummaryResponse,
@@ -310,7 +297,6 @@ use crate::websocket;
         (name = "users", description = "User management (admin only)"),
         (name = "admin_workspaces", description = "Workspace management (platform admin only)"),
         (name = "workspaces", description = "User workspace operations"),
-        (name = "order_signing", description = "MetaMask/wallet-based order signing"),
         (name = "activity", description = "Activity feed from the trade event log"),
         (name = "trade_flow", description = "Derived trade lifecycle and conversion analytics"),
         (name = "risk", description = "Risk monitoring and circuit breaker management"),
@@ -588,8 +574,6 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
             post(trading::cancel_order),
         )
         // Wallet-based order signing (MetaMask)
-        .route("/api/v1/orders/prepare", post(order_signing::prepare_order))
-        .route("/api/v1/orders/submit", post(order_signing::submit_order))
         // Position operations
         .route(
             "/api/v1/positions/:position_id/close",

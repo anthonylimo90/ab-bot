@@ -7,7 +7,7 @@ A Rust-based Polymarket trading platform focused on arbitrage execution, quantit
 ### Live trading paths
 - **Arbitrage engine**: `arb-monitor` detects mispriced binary markets, `api-server` executes two-leg entries, and the exit handler closes or resolves positions.
 - **Quant signal engine**: flow, mean reversion, resolution proximity, and cross-market generators emit `QuantSignal`s that the quant executor evaluates and trades.
-- **Manual trading**: authenticated users can place orders directly and prepare Wallet / MetaMask signed orders through the API and dashboard.
+- **Manual trading**: authenticated users can place orders directly through the API and dashboard; they are signed with the trading wallet.
 
 ### Supporting systems
 - **Risk management**: circuit breaker, recovery logic, and manual risk controls per workspace.
@@ -148,7 +148,6 @@ WALLET_PRIVATE_KEY=0x... cargo run -p api-server --example test_wallet
 - markets list, detail, orderbook
 - positions list, detail, manual close
 - order placement, cancel, status
-- order prepare / submit for wallet signing
 
 ### Wallets / vault
 - wallet metrics and wallet trades

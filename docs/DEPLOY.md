@@ -1066,6 +1066,15 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 - Paper manual sales reach no breaker. Deploy stop-then-start: 105
   replaces the fill trigger.
 
+### Browser-wallet order endpoints removed (107)
+
+- `POST /api/v1/orders/prepare` and `/api/v1/orders/submit` are gone, with
+  migration 107 dropping `pending_wallet_orders` (orders prepared and never
+  submitted). The dashboard never used them; the bot and manual orders sign
+  with the trading wallet as before. Browser-wallet orders already
+  submitted stay journaled and are still resolved by the intent reconciler,
+  or released once expired.
+
 ### Withdrawal address list and daily limit (106)
 
 - Withdrawals go only to addresses on the workspace's withdrawal address
