@@ -1084,7 +1084,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   named winner (it checks every market where live manual shares are held),
   it records that result too, once per holding (migration 108), and the
   breaker counts it like a sale's. It waits while a manual order is still
-  open in the market. A resolution with no single winner (a split) records
+  open in the market. Holdings already held at deploy (migration 109 lists
+  them) whose market is found resolved on the first look are recorded as
+  seen, not counted: they may have resolved weeks ago and would otherwise
+  land on today's loss limit at once. Each market is asked at most every
+  10 minutes (hourly once resolved without a single winner). A resolution with no single winner (a split) records
   nothing; its value still reaches the breaker through the equity
   valuation (drawdown).
 - Paper manual sales reach no breaker. Deploy stop-then-start: 105

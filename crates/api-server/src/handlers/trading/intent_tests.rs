@@ -42,6 +42,11 @@ async fn setup(pool: &PgPool) {
     ))
     .await
     .unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/109_manual_resolution_backlog.sql"
+    ))
+    .await
+    .unwrap();
 }
 
 /// A manual order of `mode`, filled by later updates.
@@ -123,6 +128,15 @@ async fn manual_holdings_record_their_result_at_resolution_once(pool: PgPool) {
     assert_eq!(results[1].0, "yes");
     assert_eq!(results[1].1.normalize(), Decimal::from(10));
     assert_eq!(results[1].2.normalize(), Decimal::from(5));
+    // New holdings: left for the circuit breaker to count.
+    let uncounted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM manual_realized_results \
+         WHERE kind = 'resolution' AND breaker_recorded_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(uncounted, 2);
     // Once only.
     assert_eq!(
         crate::exit_handler::record_manual_resolution(&pool, "m", "yes")
@@ -130,6 +144,41 @@ async fn manual_holdings_record_their_result_at_resolution_once(pool: PgPool) {
             .unwrap(),
         0
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn holdings_from_before_results_were_recorded_are_seen_not_counted(pool: PgPool) {
+    setup(&pool).await;
+    let old = manual_order(&pool, "live", "buy", Some(Decimal::new(5, 1))).await;
+    fill(&pool, old, 10, Some(Decimal::new(5, 1))).await;
+    sqlx::query("UPDATE orders SET status = 'filled'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Held when the backlog was taken (as migration 109 does at deploy).
+    sqlx::query(
+        "INSERT INTO manual_resolution_backlog \
+         SELECT wallet_address, market_id, outcome FROM manual_inventory WHERE quantity > 0",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::exit_handler::record_manual_resolution(&pool, "m", "no")
+            .await
+            .unwrap(),
+        1
+    );
+    let (pnl, seen): (Decimal, bool) = sqlx::query_as(
+        "SELECT realized_pnl, breaker_recorded_at IS NOT NULL FROM manual_realized_results \
+         WHERE kind = 'resolution'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // A $5 loss, possibly weeks old: recorded, but not for today's limit.
+    assert_eq!(pnl.normalize(), Decimal::from(-5));
+    assert!(seen);
 }
 
 #[sqlx::test(migrations = false)]

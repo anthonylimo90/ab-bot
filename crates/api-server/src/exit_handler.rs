@@ -236,7 +236,14 @@ pub struct ExitHandler {
     balance_unreadable_since: std::sync::Mutex<HashMap<(uuid::Uuid, bool), std::time::Instant>>,
     /// When a position's sales started being deferred unsent, and when last.
     deferred_since: std::sync::Mutex<HashMap<uuid::Uuid, (std::time::Instant, std::time::Instant)>>,
+    /// When a market with manual holdings is next asked whether it resolved.
+    manual_resolution_next_check: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
+
+/// How often a market with manual holdings is asked whether it resolved.
+const MANUAL_RESOLUTION_RECHECK: std::time::Duration = std::time::Duration::from_secs(600);
+/// How often one resolved without a single winner is asked again.
+const MANUAL_RESOLUTION_SPLIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 struct QuantExitContext {
@@ -277,6 +284,7 @@ impl ExitHandler {
             passes_clean: std::sync::atomic::AtomicBool::new(true),
             balance_unreadable_since: Default::default(),
             deferred_since: Default::default(),
+            manual_resolution_next_check: Default::default(),
         }
     }
 
@@ -1833,8 +1841,6 @@ impl ExitHandler {
         Ok(chrono::Duration::zero())
     }
 
-    /// Settle every position still holding shares in a resolved market,
-    /// including exits that failed or stalled, whatever their exit strategy.
     /// Records the result of live manual shares held to their market's
     /// resolution (`manual_realized_results`, kind `resolution`), for the
     /// circuit breaker: the winner's payout less the cost basis held. Only
@@ -1850,17 +1856,43 @@ impl ExitHandler {
         )
         .fetch_all(&self.pool)
         .await?;
+        let now = std::time::Instant::now();
         for market_id in markets {
+            let due = self
+                .manual_resolution_next_check
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&market_id)
+                .is_none_or(|next| *next <= now);
+            if !due {
+                continue;
+            }
             self.touch_heartbeat();
+            let back_off = |delay: std::time::Duration| {
+                self.manual_resolution_next_check
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(market_id.clone(), now + delay);
+            };
             let market = match self.clob_client.get_market_by_id(&market_id).await {
                 Ok(market) if market.resolved => market,
-                Ok(_) => continue,
+                Ok(_) => {
+                    // Seen unresolved: its resolution, when it comes, is new.
+                    sqlx::query("DELETE FROM manual_resolution_backlog WHERE market_id = $1")
+                        .bind(&market_id)
+                        .execute(&self.pool)
+                        .await?;
+                    back_off(MANUAL_RESOLUTION_RECHECK);
+                    continue;
+                }
                 Err(e) => {
                     warn!(market_id = %market_id, error = %e, "Failed to fetch market for a manual holding's resolution");
                     continue;
                 }
             };
             let Some(yes_wins) = self.resolved_yes_winner(&market).await else {
+                // Resolved without a single winner: rarely changes.
+                back_off(MANUAL_RESOLUTION_SPLIT_RECHECK);
                 continue;
             };
             let recorded = record_manual_resolution(
@@ -1876,6 +1908,8 @@ impl ExitHandler {
         Ok(())
     }
 
+    /// Settle every position still holding shares in a resolved market,
+    /// including exits that failed or stalled, whatever their exit strategy.
     async fn check_market_resolutions(&self) -> anyhow::Result<()> {
         let positions = self.position_repo.get_resolution_candidates().await?;
         if positions.is_empty() {
@@ -2596,6 +2630,10 @@ pub(crate) async fn record_missed_closes(
 /// Records the resolution result of every live manual holding in
 /// `market_id` (resolved for `winner`, `yes` or `no`) not yet recorded, unless
 /// a manual order is still open in the market. Returns how many it recorded.
+///
+/// A holding in `manual_resolution_backlog` (held from before results were
+/// recorded, and not seen unresolved since) is recorded as already seen by
+/// the circuit breaker, not counted: its market may have resolved weeks ago.
 pub(crate) async fn record_manual_resolution(
     pool: &PgPool,
     market_id: &str,
@@ -2604,10 +2642,13 @@ pub(crate) async fn record_manual_resolution(
     Ok(sqlx::query(
         "INSERT INTO manual_realized_results \
              (kind, wallet_address, market_id, outcome, quantity, proceeds, released_cost, \
-              realized_pnl, priced) \
+              realized_pnl, priced, breaker_recorded_at) \
          SELECT 'resolution', mi.wallet_address, mi.market_id, mi.outcome, mi.quantity, \
                 CASE WHEN mi.outcome = $2 THEN mi.quantity ELSE 0 END, mi.cost_basis, \
-                CASE WHEN mi.outcome = $2 THEN mi.quantity ELSE 0 END - mi.cost_basis, TRUE \
+                CASE WHEN mi.outcome = $2 THEN mi.quantity ELSE 0 END - mi.cost_basis, TRUE, \
+                CASE WHEN EXISTS (SELECT 1 FROM manual_resolution_backlog b \
+                    WHERE b.wallet_address = mi.wallet_address AND b.market_id = mi.market_id \
+                      AND b.outcome = mi.outcome) THEN NOW() END \
          FROM manual_inventory mi \
          WHERE mi.execution_mode = 'live' AND mi.market_id = $1 AND mi.quantity > 0 \
            AND NOT EXISTS (SELECT 1 FROM orders o \
