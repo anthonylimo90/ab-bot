@@ -369,7 +369,7 @@ async fn extract_optional_claims(
     state: &AppState,
     headers: &HeaderMap,
 ) -> ApiResult<Option<Claims>> {
-    let Some((token, source)) = crate::session_cookie::request_token(headers)
+    let Some((token, source)) = crate::session_cookie::request_token(headers, state.secure_cookies)
         .map_err(|message| ApiError::Unauthorized(message.into()))?
     else {
         return Ok(None);

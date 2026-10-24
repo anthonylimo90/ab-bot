@@ -1089,9 +1089,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
 
 - The dashboard no longer keeps the session token where scripts can read it
   (it was in `localStorage`). Signing in through the dashboard (its requests
-  carry `X-Requested-With: ab-bot-dashboard`) sets an `abbot_session` cookie:
-  `HttpOnly`, `SameSite=Strict`, `Secure` outside development, for the
-  token's lifetime; the response body then carries no token. Logout clears
+  carry `X-Requested-With: ab-bot-dashboard`) sets a session cookie:
+  `__Host-abbot_session` (`Secure`, which a sibling subdomain cannot
+  overwrite), or `abbot_session` in development over plain HTTP; `HttpOnly`,
+  `SameSite=Strict`, for the token's lifetime. The response body then
+  carries no token, and a request with two session cookies is refused. Logout clears
   it. Everyone signs in once more after this deploy.
 - The browser calls the API through the dashboard's own origin
   (`/api/v1/*`, `/health`, `/ready` are forwarded by the dashboard's

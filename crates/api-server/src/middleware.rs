@@ -143,11 +143,12 @@ pub async fn require_auth(
     next: Next,
 ) -> Response {
     // The Authorization header, else the dashboard's session cookie.
-    let (token, source) = match crate::session_cookie::request_token(request.headers()) {
-        Ok(Some(found)) => found,
-        Ok(None) => return unauthorized_response("Missing authorization header"),
-        Err(message) => return unauthorized_response(message),
-    };
+    let (token, source) =
+        match crate::session_cookie::request_token(request.headers(), state.secure_cookies) {
+            Ok(Some(found)) => found,
+            Ok(None) => return unauthorized_response("Missing authorization header"),
+            Err(message) => return unauthorized_response(message),
+        };
     if !crate::session_cookie::csrf_ok(
         request.method(),
         source,

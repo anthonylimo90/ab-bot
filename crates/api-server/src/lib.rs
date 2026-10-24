@@ -262,11 +262,14 @@ impl ServerConfig {
         }
     }
 
-    /// Get the socket address.
+    /// Get the socket address (`API_HOST` may be IPv6, such as `::`).
     pub fn socket_addr(&self) -> SocketAddr {
-        format!("{}:{}", self.host, self.port)
+        let host: std::net::IpAddr = self
+            .host
+            .trim_matches(|c| c == '[' || c == ']')
             .parse()
-            .expect("Invalid socket address")
+            .expect("API_HOST must be an IP address");
+        SocketAddr::new(host, self.port)
     }
 }
 
@@ -1173,5 +1176,21 @@ mod cors_tests {
         )
         .await;
         assert_eq!(allow_origin(&response).as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn the_server_listens_on_ipv4_or_ipv6_hosts() {
+        let at = |host: &str| {
+            ServerConfig {
+                host: host.to_string(),
+                ..ServerConfig::default()
+            }
+            .socket_addr()
+            .to_string()
+        };
+        assert_eq!(at("0.0.0.0"), "0.0.0.0:3000");
+        // Railway's private network is IPv6: `API_HOST=::`.
+        assert_eq!(at("::"), "[::]:3000");
+        assert_eq!(at("[::]"), "[::]:3000");
     }
 }

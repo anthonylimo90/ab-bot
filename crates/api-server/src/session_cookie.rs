@@ -11,8 +11,21 @@
 
 use axum::http::{header, HeaderMap, HeaderValue, Method};
 
-/// The session cookie's name.
+/// The session cookie's name over plain HTTP (development).
 pub const SESSION_COOKIE: &str = "abbot_session";
+/// Its name over HTTPS. The `__Host-` prefix makes the browser refuse one set
+/// with a `Domain` (as a sibling subdomain could, to plant its own session)
+/// or without `Secure` and `Path=/`.
+pub const SECURE_SESSION_COOKIE: &str = "__Host-abbot_session";
+
+/// The cookie's name for a deployment that does (or does not) use HTTPS.
+pub fn cookie_name(secure: bool) -> &'static str {
+    if secure {
+        SECURE_SESSION_COOKIE
+    } else {
+        SESSION_COOKIE
+    }
+}
 /// The header the dashboard sends on every request.
 pub const BROWSER_HEADER: &str = "x-requested-with";
 /// Its value.
@@ -34,8 +47,13 @@ pub fn is_browser(headers: &HeaderMap) -> bool {
 }
 
 /// The request's session token: the `Authorization: Bearer` header when
-/// present, else the session cookie. `Err` for a malformed header.
-pub fn request_token(headers: &HeaderMap) -> Result<Option<(String, TokenSource)>, &'static str> {
+/// present, else the session cookie (named for `secure`). `Err` for a
+/// malformed header, or more than one session cookie (one may have been
+/// planted).
+pub fn request_token(
+    headers: &HeaderMap,
+    secure: bool,
+) -> Result<Option<(String, TokenSource)>, &'static str> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
         let value = value
             .to_str()
@@ -45,7 +63,11 @@ pub fn request_token(headers: &HeaderMap) -> Result<Option<(String, TokenSource)
             .ok_or("Invalid authorization format, expected 'Bearer <token>'")?;
         return Ok(Some((token.to_string(), TokenSource::Bearer)));
     }
-    Ok(cookie_value(headers, SESSION_COOKIE).map(|token| (token, TokenSource::Cookie)))
+    let mut found = cookie_values(headers, cookie_name(secure));
+    if found.len() > 1 {
+        return Err("More than one session cookie");
+    }
+    Ok(found.pop().map(|token| (token, TokenSource::Cookie)))
 }
 
 /// Whether a request authenticated from `source` may go ahead: one made with
@@ -78,9 +100,10 @@ pub fn csrf_ok(
 
 /// `Set-Cookie` for a new session token that lasts `max_age_secs`.
 pub fn set_cookie(token: &str, max_age_secs: i64, secure: bool) -> HeaderValue {
+    let name = cookie_name(secure);
     let secure = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
-        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
+        "{name}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}",
         max_age_secs.max(0)
     ))
     .expect("a JWT is a valid header value")
@@ -88,9 +111,10 @@ pub fn set_cookie(token: &str, max_age_secs: i64, secure: bool) -> HeaderValue {
 
 /// `Set-Cookie` that removes the session cookie.
 pub fn clear_cookie(secure: bool) -> HeaderValue {
+    let name = cookie_name(secure);
     let secure = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
-        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
+        "{name}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
     ))
     .expect("a valid header value")
 }
@@ -120,17 +144,18 @@ pub fn deliver(
     response
 }
 
-/// The value of cookie `name`, if the request carries it.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+/// The non-empty values of every cookie `name` the request carries.
+fn cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(key, _)| *key == name)
+        .filter(|(key, _)| *key == name)
         .map(|(_, value)| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -152,24 +177,55 @@ mod tests {
             ("cookie", "theme=dark; abbot_session=from-cookie"),
         ]);
         assert_eq!(
-            request_token(&both).unwrap(),
+            request_token(&both, false).unwrap(),
             Some(("from-header".into(), TokenSource::Bearer))
         );
         let cookie = headers(&[("cookie", "theme=dark; abbot_session=from-cookie; x=y")]);
         assert_eq!(
-            request_token(&cookie).unwrap(),
+            request_token(&cookie, false).unwrap(),
             Some(("from-cookie".into(), TokenSource::Cookie))
         );
         assert_eq!(
-            request_token(&headers(&[("cookie", "abbot_session=")])).unwrap(),
+            request_token(&headers(&[("cookie", "abbot_session=")]), false).unwrap(),
             None
         );
-        assert!(request_token(&headers(&[("authorization", "Basic x")])).is_err());
+        assert!(request_token(&headers(&[("authorization", "Basic x")]), false).is_err());
         // Another cookie that merely ends in the name does not count.
         assert_eq!(
-            request_token(&headers(&[("cookie", "not_abbot_session=x")])).unwrap(),
+            request_token(&headers(&[("cookie", "not_abbot_session=x")]), false).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn over_https_only_the_host_prefixed_cookie_counts_and_only_once() {
+        // Over HTTPS the plain name is ignored: a sibling subdomain can set
+        // that one for the whole domain, not a __Host- one.
+        let plain = headers(&[("cookie", "abbot_session=planted")]);
+        assert_eq!(request_token(&plain, true).unwrap(), None);
+        let host = headers(&[("cookie", "__Host-abbot_session=mine")]);
+        assert_eq!(
+            request_token(&host, true).unwrap(),
+            Some(("mine".into(), TokenSource::Cookie))
+        );
+        // Two of them: one was planted somehow; neither is trusted.
+        let two = headers(&[("cookie", "abbot_session=a; abbot_session=b")]);
+        assert!(request_token(&two, false).is_err());
+        let split = headers(&[
+            ("cookie", "__Host-abbot_session=a"),
+            ("cookie", "__Host-abbot_session=b"),
+        ]);
+        assert!(request_token(&split, true).is_err());
+        let set = set_cookie("tok", 60, true);
+        assert!(set
+            .to_str()
+            .unwrap()
+            .starts_with("__Host-abbot_session=tok;"));
+        assert!(!set.to_str().unwrap().contains("Domain"));
+        assert!(clear_cookie(true)
+            .to_str()
+            .unwrap()
+            .starts_with("__Host-abbot_session=;"));
     }
 
     #[test]
@@ -215,7 +271,7 @@ mod tests {
     fn the_cookie_is_http_only_and_strict() {
         let set = set_cookie("tok", 3600, true);
         let set = set.to_str().unwrap();
-        assert!(set.starts_with("abbot_session=tok;"));
+        assert!(set.starts_with("__Host-abbot_session=tok;"));
         for part in [
             "HttpOnly",
             "SameSite=Strict",
