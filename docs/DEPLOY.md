@@ -1130,6 +1130,14 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   submitted stay journaled and are still resolved by the intent reconciler,
   or released once expired.
 
+### Known and accepted
+
+- When the bot and a manual trade hold the same outcome in the trading
+  wallet, the exchange reports one balance for both, so a fee-sized
+  difference in it can be credited to the wrong one. It is bookkeeping only
+  (no order or transfer follows from it) and at most the fee; accepted as
+  is rather than keeping manual trades out of the trading wallet.
+
 ### Withdrawal address list and daily limit (106)
 
 - Withdrawals go only to addresses on the workspace's withdrawal address
