@@ -1557,9 +1557,7 @@ async fn submit_withdrawal(
             return Err(if error.contains("Insufficient POL") {
                 ApiError::BadRequest(error)
             } else if error.contains(CALL_WOULD_FAIL) {
-                ApiError::Conflict(format!(
-                    "The transfer would fail on chain now, so nothing was sent ({error})"
-                ))
+                ApiError::Conflict(would_fail_message(source, &error))
             } else {
                 ApiError::ServiceUnavailable(
                     "Could not prepare the transfer; nothing was sent".into(),
@@ -1751,6 +1749,21 @@ async fn submit_withdrawal(
     }))
 }
 
+/// Why a transfer the node expects to fail was not sent. A pUSD withdrawal
+/// also needs the wallet's pUSD allowance for the Collateral Offramp, which
+/// the bot sets at start only for its own trading wallet.
+fn would_fail_message(source: WithdrawalSource, error: &str) -> String {
+    let hint = match source {
+        WithdrawalSource::Usdc => "",
+        WithdrawalSource::Pusd => {
+            " This withdrawal pays out the wallet's pUSD through the Collateral Offramp, \
+             which needs the wallet's pUSD approval for the Offramp: the bot sets it at start \
+             for its trading wallet only."
+        }
+    };
+    format!("The transfer would fail on chain now, so nothing was sent ({error}).{hint}")
+}
+
 /// Sign the request's transfer as a transaction no other withdrawal has
 /// recorded. Signing is deterministic, so a retry of a transfer that was
 /// refused at the same nonce would repeat the refused one's hash exactly; it
@@ -1866,6 +1879,16 @@ fn the_daily_limit_blocks_a_preflight_with_or_without_an_amount() {
     // Used up: nothing can go, so say so even without an amount.
     assert!(daily_cap_reason(None, d(1000), d(1000)).is_some());
     assert!(daily_cap_reason(None, d(1000), d(999)).is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn a_refused_pusd_withdrawal_names_the_offramp_approval() {
+    let error = "The node expects the call to fail: execution reverted";
+    let pusd = would_fail_message(WithdrawalSource::Pusd, error);
+    assert!(pusd.contains(error) && pusd.contains("Offramp"), "{pusd}");
+    let usdc = would_fail_message(WithdrawalSource::Usdc, error);
+    assert!(usdc.contains(error) && !usdc.contains("Offramp"), "{usdc}");
 }
 
 /// Check whether a proposed withdrawal is safe before submitting it.

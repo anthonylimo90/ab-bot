@@ -229,6 +229,11 @@ funded wallets. `LIVE_POLYGON_RPC_URL` and `LIVE_POLYGON_LOGS_RPC_URL` pick
 the nodes; public nodes refuse some calls, so a refusal there is the node's
 limit, not a bot fault.
 
+Then run the money paths for real against a local fork of Polygon:
+approvals, the collateral wrap, USDC.e and pUSD withdrawals through the API,
+the daily limit, the destination allowlist, and the fee bump of a stuck
+withdrawal. See `scripts/polygon-fork/README.md`.
+
 ## Environment Variables Reference
 
 ### API Server

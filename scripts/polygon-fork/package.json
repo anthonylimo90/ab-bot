@@ -1,0 +1,12 @@
+{
+  "name": "ab-bot-polygon-fork",
+  "private": true,
+  "description": "A local fork of Polygon mainnet for exercising the bot's money paths",
+  "scripts": {
+    "relay": "python3 -I retrying_relay.py ${UPSTREAM:-https://polygon.drpc.org} 8546",
+    "fork": "hardhat node --port 8545"
+  },
+  "devDependencies": {
+    "hardhat": "2.22.17"
+  }
+}
