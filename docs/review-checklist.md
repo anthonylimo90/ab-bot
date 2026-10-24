@@ -134,6 +134,9 @@ Verification: BUY/SELL/fractional-share amount regressions and dashboard TypeScr
 
 ## F11 Wallet-specific exchange authentication
 
+(Since removed: the browser-wallet order endpoints are gone, migration 107.
+This records the review of the flow while it existed.)
+
 Browser wallets sign a fresh ClobAuth proof. The backend verifies its signer/freshness, derives credentials for that wallet, and submits the signed order with the exact L2 HMAC and API-key owner. No shared bot credentials or server private key are substituted. Submission uses the durable journal, scoped to the wallet, and acknowledged results can be replayed. The client retains signed intent through errors/reloads. Related blockers were fixed: safe 53-bit salts, canonical EIP-712 address padding/domains, exchange-derived contract/fee metadata, bounded expiry, and GTD submission matching the signed expiration.
 
 Verification: 150 API, 95 core and 26 engine tests passed. Known public test keys verify standard/neg-risk order recovery, auth proof identity/freshness and tamper rejection. A local HTTP fixture verifies wallet identity, owner, exact body and L2 signature. Dashboard TypeScript passed. The linker ran out of disk during an extra standalone test; generated crate artifacts were cleaned with Cargo and the combined suite reran successfully.

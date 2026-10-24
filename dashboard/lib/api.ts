@@ -459,6 +459,8 @@ export type UnauthorizedHandler = (rejectedSession: number) => void;
 // session (wrong password, bad signature, already-revoked logout) and are handled
 // by their callers, so they never trigger the global handler.
 const AUTH_ENDPOINT_PREFIX = "/api/v1/auth/";
+// Except this one: it answers 401 only when the session has ended.
+const STREAM_TOKEN_ENDPOINT = "/api/v1/auth/stream-token";
 
 class ApiClient {
   private baseUrl: string;
@@ -563,7 +565,7 @@ class ApiClient {
       if (
         response.status === 401 &&
         requestOptions?.auth !== false &&
-        !endpoint.startsWith(AUTH_ENDPOINT_PREFIX)
+        (!endpoint.startsWith(AUTH_ENDPOINT_PREFIX) || endpoint === STREAM_TOKEN_ENDPOINT)
       ) {
         try {
           this.unauthorizedHandler?.(sentSession);

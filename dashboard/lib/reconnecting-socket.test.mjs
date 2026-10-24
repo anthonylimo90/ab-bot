@@ -133,6 +133,20 @@ test('a token provider is asked at every open, and a failure closes the socket t
   assert.equal(sockets[2].closeCalls, 1);
 });
 
+test('with a token provider a policy close retries with a fresh token', async () => {
+  let issued = 0;
+  const { controller, sockets } = setup({ authToken: async () => `stream-${++issued}` });
+  controller.connect();
+  sockets[0].open();
+  await Promise.resolve();
+  sockets[0].serverClose(1008);
+  mock.timers.tick(1500);
+  assert.equal(sockets.length, 2);
+  sockets[1].open();
+  await Promise.resolve();
+  assert.deepEqual(sockets[1].sent, [{ action: 'authenticate', token: 'stream-2' }]);
+});
+
 test('regression: connect() while a socket is still CONNECTING does not create a duplicate', () => {
   const { controller, sockets } = setup();
   controller.connect();

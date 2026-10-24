@@ -215,12 +215,15 @@ export function createReconnectingSocket(options: ReconnectingSocketOptions): Re
       const policyViolation = event.code === CLOSE_POLICY_VIOLATION;
       onStatus?.(policyViolation ? 'error' : 'disconnected');
       onDisconnect?.();
-      if (policyViolation) {
+      if (policyViolation && typeof authToken !== 'function') {
         // The server rejected our credentials; retrying with the same token only
         // repeats the rejection. A new token (re-render) or an explicit resume retries.
         halted = true;
         return;
       }
+      // With a token provider the next attempt gets a fresh token (the last
+      // one expired, or came too late); a session that has ended answers the
+      // token request with 401, which signs the page out.
       scheduleReconnect();
     };
 

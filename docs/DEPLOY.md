@@ -113,7 +113,9 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    CORS_ALLOWED_ORIGINS=https://<your-dashboard-domain>
    APP_DOMAIN=<your-dashboard-domain>
    APP_URI=https://<your-dashboard-domain>
-   TRUSTED_PROXY_HOPS=2
+   API_HOST=::
+   PORT=3000
+   TRUSTED_PROXY_HOPS=1
    SKIP_MIGRATIONS=false
    RAILWAY_DEPLOYMENT_DRAINING_SECONDS=50
    ```
@@ -129,11 +131,14 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    dashboard: the dashboard's signed-in requests that change anything are
    refused from any other origin. Wallet sign-in stays disabled outside
    development until `APP_DOMAIN` and `APP_URI` are set.
-   The dashboard reaches the API through its own server, over the API's
-   public URL: a request passes Railway's proxy in front of the dashboard,
-   then the one in front of the API, hence `TRUSTED_PROXY_HOPS=2` (with 1,
-   every dashboard user would share one rate-limit bucket). API clients that
-   call the API directly then share the proxy's bucket.
+   Railway puts one proxy in front of the service, hence
+   `TRUSTED_PROXY_HOPS=1`. `PORT` is set so the dashboard can name it in
+   `API_PROXY_URL`. `API_HOST=::` also listens on Railway's private
+   network (IPv6), which the dashboard uses to reach the API (below): its
+   requests then pass only the proxy in front of the dashboard, so the
+   client's address is still the last `X-Forwarded-For` entry. Do not raise
+   `TRUSTED_PROXY_HOPS` instead: a client calling the API's public URL could
+   then choose the address it is rate limited by.
 
 6. In **Networking**, click **"Generate Domain"** for public URL
 
@@ -173,13 +178,16 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    ```
    NEXT_PUBLIC_API_URL=https://<api-server-url>.railway.app
    NEXT_PUBLIC_WS_URL=wss://<api-server-url>.railway.app
+   API_PROXY_URL=http://${{api-server.RAILWAY_PRIVATE_DOMAIN}}:${{api-server.PORT}}
    ```
-   Replace `<api-server-url>` with your actual API server domain from step 4.1.
-   Both are build-time values (changing one needs a redeploy). The browser
-   calls `/api/v1` on the dashboard's own domain, and the dashboard's server
-   forwards it to `NEXT_PUBLIC_API_URL` (or `API_PROXY_URL`, if set), so the
-   session cookie belongs to the dashboard's domain. The live stream still
-   connects to `NEXT_PUBLIC_WS_URL` directly.
+   Replace `<api-server-url>` with your actual API server domain from step 4.1
+   (and `api-server` with the API service's name). All are build-time values
+   (changing one needs a redeploy). The browser calls `/api/v1` on the
+   dashboard's own domain, and the dashboard's server forwards it to
+   `API_PROXY_URL` (else `NEXT_PUBLIC_API_URL`), so the session cookie belongs
+   to the dashboard's domain. Forwarding over the private network keeps each
+   user's own rate limit; over the public URL every dashboard user would share
+   one. The live stream still connects to `NEXT_PUBLIC_WS_URL` directly.
 
 6. In **Networking**, click **"Generate Domain"** for public URL
 
@@ -499,7 +507,7 @@ The file vault replaces `VAULT_FILE_PATH` by writing a sibling file and renaming
 
 Apply the repository's migrations before starting the updated API. Migrations 069–072 add durable signed-order intents, exchange order identity/provenance, recovery of closed rows with explicit holdings, and persistent session revocation. Migration 068 now preserves unresolved positions instead of closing them by age. If a deployment already recorded the original 068 checksum, SQLx will require a reviewed migration-history repair; back up the database, reconcile the affected positions, and review migration 071 before accepting the revised checksum. Do not disable checksum validation globally.
 
-REST order placement requires a stable `client_order_id`; withdrawals require a stable `client_request_id`. Reuse the same key and original payload through retries, including lost responses. An order refused before it was sent (its error says nothing was sent) stays refused under its key: send it again under a new one. A changed payload requires a new intent. Private WebSocket clients must send `{"action":"authenticate","token":"<JWT>"}` as their first frame within five seconds; only orderbook-only streams remain public. Browser wallet orders also require a fresh wallet-signed ClobAuth proof, which the dashboard supplies.
+REST order placement requires a stable `client_order_id`; withdrawals require a stable `client_request_id`. Reuse the same key and original payload through retries, including lost responses. An order refused before it was sent (its error says nothing was sent) stays refused under its key: send it again under a new one. A changed payload requires a new intent. Private WebSocket clients must send `{"action":"authenticate","token":"<JWT>"}` as their first frame within five seconds; only orderbook-only streams remain public. (The dashboard sends a stream token from `POST /api/v1/auth/stream-token`.)
 
 Stop all trading workers before changing the pinned signer. A permitted startup selection is saved to the workspace so later restarts recognize the same signer after positions are opened.
 
@@ -1100,8 +1108,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   revoked with it) and every other endpoint refuses it.
 - API clients are unchanged: `Authorization: Bearer` works as before, and
   takes precedence over a cookie.
-- Requests now reach the API through two proxies on Railway: set
-  `TRUSTED_PROXY_HOPS=2` there (see the API's variables above).
+- On Railway, set the dashboard's `API_PROXY_URL` to the API's private
+  address and the API's `API_HOST=::` (see the variables above), keeping
+  `TRUSTED_PROXY_HOPS=1`. Next's forwarding adds no `X-Forwarded-For`
+  entry, so over the public URL the API would see the dashboard's address
+  for every user.
 
 ### Browser-wallet order endpoints removed (107)
 
@@ -1682,7 +1693,7 @@ unsigned). Fees are set by the exchange when an order matches.
   panel, manual positions) and their wallet-signing hook were removed: no
   page used them, and the form could not run without the wallet provider.
   The browser-wallet order endpoints (`/api/v1/orders/prepare`, `/submit`)
-  remain for API clients and sign V2 orders.
+  remained for API clients then; they have since been removed (107).
 - Polymarket's documentation says a plain EOA trades on the CLOB "if your EOA
   is allowlisted for trading". The bot signs as an EOA (signature type 0);
   confirm the trading wallet is allowed before enabling live trading. Markets

@@ -124,7 +124,6 @@ test('unauthenticated requests, other statuses and auth endpoints never trigger 
   await assert.rejects(auth.api.getCurrentUser());
   await assert.rejects(auth.api.walletVerify('msg', 'sig'));
   await assert.rejects(auth.api.logout());
-  await assert.rejects(auth.api.getStreamToken());
   assert.deepEqual(auth.rejected, []);
 
   // Other failures are not session problems.
@@ -159,6 +158,12 @@ test('an error body in plain text is the error message', async () => {
   await assert.rejects(untypedPage.api.getPositions(), (error) => error.message === 'HTTP 504');
   const bare = loadApi(() => jsonResponse(null, 500));
   await assert.rejects(bare.api.getPositions(), (error) => error.name === 'ApiHttpError' && error.message === 'HTTP 500');
+});
+
+test('a 401 for the stream token ends the session (the live stream is all an idle page sends)', async () => {
+  const { api, rejected } = loadApiWithHandler(unauthorized);
+  await assert.rejects(api.getStreamToken());
+  assert.deepEqual(rejected, [api.currentSession()]);
 });
 
 test('a throwing unauthorized handler does not mask the original 401', async () => {
