@@ -345,7 +345,7 @@ async fn reconcile_signing(
     client: &PolygonClient,
     signer: Option<&auth::TradingWallet>,
 ) {
-    reconcile_with(pool, Some(client), |_| {
+    reconcile_with(pool, Some(client), None, |_| {
         let signer = signer.cloned();
         async move { signer }
     })
@@ -780,6 +780,55 @@ async fn a_held_transfer_whose_nonce_is_used_is_still_failed(pool: PgPool) {
     .await
     .unwrap();
     reconcile(&pool, &client).await;
+    let (superseded_status, superseded_error) = status(&pool, superseded).await;
+    assert_eq!(superseded_status, "failed");
+    assert!(superseded_error.unwrap().contains("nonce"));
+}
+
+/// With a second node configured, a transfer is failed as superseded only
+/// once that node also sees its nonce used: one node answering wrongly
+/// cannot fail a transfer that may still be mined.
+#[sqlx::test(migrations = false)]
+async fn a_second_node_must_agree_before_a_transfer_is_failed_as_superseded(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    let used = || Chain {
+        final_nonce: 6,
+        latest_nonce: 6,
+        pending_nonce: 6,
+        ..Default::default()
+    };
+    let client = mock_node(Arc::new(Mutex::new(used()))).await;
+    // The second node has not seen the nonce used.
+    let second = Arc::new(Mutex::new(Chain {
+        final_nonce: 5,
+        latest_nonce: 5,
+        pending_nonce: 5,
+        ..Default::default()
+    }));
+    let verifier = mock_node(second.clone()).await;
+    let superseded = insert(
+        &pool,
+        user,
+        workspace,
+        row(TRADING, "submitting", Some("0xs1"), Some(5), 1),
+    )
+    .await;
+    let verified = |pool: PgPool, client: PolygonClient, verifier: PolygonClient| async move {
+        reconcile_with(&pool, Some(&client), Some(&verifier), |_| async { None })
+            .await
+            .unwrap();
+    };
+    verified(pool.clone(), client.clone(), verifier.clone()).await;
+    pool.execute(
+        "UPDATE wallet_withdrawals SET superseded_seen_at = superseded_seen_at - INTERVAL '6 minutes'",
+    )
+    .await
+    .unwrap();
+    verified(pool.clone(), client.clone(), verifier.clone()).await;
+    assert_eq!(status(&pool, superseded).await.0, "submitting");
+    // Once it agrees, the transfer is failed.
+    *second.lock().unwrap() = used();
+    verified(pool.clone(), client, verifier).await;
     let (superseded_status, superseded_error) = status(&pool, superseded).await;
     assert_eq!(superseded_status, "failed");
     assert!(superseded_error.unwrap().contains("nonce"));

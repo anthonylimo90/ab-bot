@@ -224,6 +224,10 @@ pub struct AppState {
     /// cookie may come from (`CORS_ALLOWED_ORIGINS`, the dashboard's);
     /// `None` (development without a list) takes any.
     pub cookie_origins: Option<Vec<String>>,
+    /// A second, independent Polygon node (`WITHDRAWAL_VERIFY_RPC_URL`) that
+    /// must agree before a withdrawal is failed as superseded; `None` trusts
+    /// the main node alone.
+    pub withdrawal_verifier: Option<polymarket_core::api::PolygonClient>,
 }
 
 /// The circuit breaker's limits: the defaults, then the `CB_*` environment,
@@ -622,6 +626,24 @@ impl AppState {
             secure_cookies: !crate::is_development_environment(
                 &std::env::var("ENVIRONMENT").unwrap_or_default(),
             ),
+            withdrawal_verifier: {
+                let verifier = std::env::var("WITHDRAWAL_VERIFY_RPC_URL")
+                    .ok()
+                    .map(|url| url.trim().to_string())
+                    .filter(|url| !url.is_empty())
+                    .map(polymarket_core::api::PolygonClient::new);
+                if verifier.is_none()
+                    && !crate::is_development_environment(
+                        &std::env::var("ENVIRONMENT").unwrap_or_default(),
+                    )
+                {
+                    tracing::warn!(
+                        "WITHDRAWAL_VERIFY_RPC_URL is not set: a withdrawal is failed as \
+                         superseded on one node's word; set it to a second provider's RPC"
+                    );
+                }
+                verifier
+            },
             cookie_origins: {
                 let origins = crate::parse_origin_list(
                     &std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),
@@ -728,6 +750,7 @@ impl AppState {
             },
             secure_cookies: false,
             cookie_origins: None,
+            withdrawal_verifier: None,
         })
     }
 

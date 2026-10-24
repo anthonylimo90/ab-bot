@@ -1144,6 +1144,11 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   still be mined, so it counts). The list and the
   limit are checked when the withdrawal is reserved, under a workspace lock,
   so two at once cannot both pass on room for one.
+- `WITHDRAWAL_VERIFY_RPC_URL` (recommended: a second provider's Polygon
+  RPC): before a stuck withdrawal is failed as superseded, this node must
+  also find its nonce used deep enough and none of its transactions mined.
+  Unset, the main node decides alone (a warning at start outside
+  development), as before.
 - After deploying, the list is empty: no withdrawal can go until an address
   is added and its delay has passed. Add the addresses you withdraw to
   first. Set both settings in the API's environment; the dashboard cannot

@@ -179,6 +179,30 @@ pub(crate) async fn lock_workspace_withdrawals(
     Ok(())
 }
 
+/// Whether `verifier` (a second node) also finds `nonce` used by a
+/// transaction deep enough not to be reorganized, and none of `hashes`
+/// mined. Any error reads as "not confirmed": the transfer waits.
+async fn independently_superseded(
+    verifier: &PolygonClient,
+    row: &UnresolvedWithdrawal,
+    hashes: &[&str],
+    nonce: u64,
+) -> bool {
+    for hash in hashes {
+        match verifier.transaction_receipt(hash).await {
+            Ok(None) => {}
+            _ => return false,
+        }
+    }
+    let Ok(safe_block) = verifier.safe_block_number().await else {
+        return false;
+    };
+    verifier
+        .transaction_count_at(&row.wallet_address, safe_block)
+        .await
+        .is_ok_and(|count| count > nonce)
+}
+
 /// Advisory lock key for everything that spends from `address`'s nonces.
 pub(crate) fn wallet_lock_key(address: &str) -> String {
     format!("wallet-withdrawal:{}", address.to_lowercase())
@@ -808,13 +832,18 @@ pub(crate) async fn reconcile_withdrawals(state: &AppState) -> anyhow::Result<()
     let client = crate::handlers::vault::canonical_polygon_client(state)
         .await
         .ok();
-    reconcile_with(&state.pool, client.as_ref(), |address| async move {
-        state
-            .load_wallet_from_vault(&address)
-            .await
-            .map_err(|error| warn!(%error, "No signer to raise a withdrawal's gas price"))
-            .ok()
-    })
+    reconcile_with(
+        &state.pool,
+        client.as_ref(),
+        state.withdrawal_verifier.as_ref(),
+        |address| async move {
+            state
+                .load_wallet_from_vault(&address)
+                .await
+                .map_err(|error| warn!(%error, "No signer to raise a withdrawal's gas price"))
+                .ok()
+        },
+    )
     .await
 }
 
@@ -878,6 +907,7 @@ pub(crate) async fn stalled_transfer_mined(
 async fn reconcile_with<S, SFut>(
     pool: &PgPool,
     client: Option<&PolygonClient>,
+    verifier: Option<&PolygonClient>,
     signer_for: S,
 ) -> anyhow::Result<()>
 where
@@ -928,7 +958,7 @@ where
             None => fail_unsigned(lock.conn(), &row).await,
             Some(tx_hash) => match client {
                 Some(client) => {
-                    match reconcile_on_chain(lock.conn(), client, &row, tx_hash).await {
+                    match reconcile_on_chain(lock.conn(), client, verifier, &row, tx_hash).await {
                         // Waiting at its nonce: perhaps for a gas price it does not pay.
                         Ok(true) if fee_bump_due(&row) => match underpriced(client, &row).await {
                             Ok(Some(latest)) => {
@@ -988,6 +1018,7 @@ async fn fail_unsigned(conn: &mut PgConnection, row: &UnresolvedWithdrawal) -> a
 async fn reconcile_on_chain(
     conn: &mut PgConnection,
     client: &PolygonClient,
+    verifier: Option<&PolygonClient>,
     row: &UnresolvedWithdrawal,
     tx_hash: &str,
 ) -> anyhow::Result<bool> {
@@ -1086,6 +1117,18 @@ async fn reconcile_on_chain(
                 // for any receipt, then none of them can ever be mined.
                 for hash in &hashes {
                     if client.transaction_receipt(hash).await?.is_some() {
+                        return Ok(false);
+                    }
+                }
+                // With a second, independent node configured, it must agree:
+                // a node that answers wrongly twice cannot fail a transfer
+                // that may still be mined alone.
+                if let Some(verifier) = verifier {
+                    if !independently_superseded(verifier, row, &hashes, nonce).await {
+                        warn!(
+                            withdrawal_id = %row.id,
+                            "The verifying node does not confirm the transfer was superseded; waiting"
+                        );
                         return Ok(false);
                     }
                 }
