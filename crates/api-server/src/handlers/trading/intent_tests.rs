@@ -47,6 +47,11 @@ async fn setup(pool: &PgPool) {
     ))
     .await
     .unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/110_sale_after_resolution.sql"
+    ))
+    .await
+    .unwrap();
 }
 
 /// A manual order of `mode`, filled by later updates.
@@ -144,6 +149,18 @@ async fn manual_holdings_record_their_result_at_resolution_once(pool: PgPool) {
             .unwrap(),
         0
     );
+    // A sale of those shares booked afterwards: counted at the resolution
+    // already, so recorded as seen.
+    let late = manual_order(&pool, "live", "sell", Some(Decimal::new(9, 1))).await;
+    fill(&pool, late, 2, Some(Decimal::new(9, 1))).await;
+    let seen: bool = sqlx::query_scalar(
+        "SELECT breaker_recorded_at IS NOT NULL FROM manual_realized_results WHERE order_id = $1",
+    )
+    .bind(late)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(seen);
 }
 
 #[sqlx::test(migrations = false)]

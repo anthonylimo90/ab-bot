@@ -964,11 +964,17 @@ impl CircuitBreaker {
             state.consecutive_losses += 1;
         }
 
+        // A recovery stage advances on the bot's own trades at the reduced
+        // capacity: a manual result counts toward the limits (it can re-trip)
+        // but not toward a stage's trades or its profit.
+        let bot_trade = !matches!(close, Some(RecordedClose::ManualFill(_)));
         let reason = if let Some(recovery) = state.recovery_state.as_mut() {
-            recovery.trades_this_stage += 1;
-            recovery.recovery_pnl += pnl;
-            if is_win {
-                recovery.had_profit_this_stage = true;
+            if bot_trade {
+                recovery.trades_this_stage += 1;
+                recovery.recovery_pnl += pnl;
+                if is_win {
+                    recovery.had_profit_this_stage = true;
+                }
             }
 
             // During recovery, use stricter thresholds (scaled by capacity)
@@ -1778,6 +1784,37 @@ mod tests {
 
         // Should be fully recovered now
         assert!(!breaker.is_in_recovery().await);
+    }
+
+    #[tokio::test]
+    async fn a_manual_profit_does_not_advance_a_recovery_stage() {
+        let config = CircuitBreakerConfig {
+            max_consecutive_losses: 2,
+            max_daily_loss: Decimal::new(100000, 0),
+            cooldown_minutes: 0,
+            gradual_recovery_enabled: true,
+            recovery_stages: 4,
+            recovery_stage_minutes: 0,
+            require_profit_to_advance: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let breaker = CircuitBreaker::new(config);
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.record_trade(Decimal::new(-1, 0)).await.unwrap();
+        breaker.can_trade().await;
+        assert!(breaker.is_in_recovery().await);
+
+        // A winning manual sale: counted in the day, not in the stage.
+        breaker
+            .record_manual_fill(Decimal::from(5), uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(breaker.state().await.daily_pnl, Decimal::from(3));
+        assert!(!breaker.try_advance_recovery().await);
+        // The bot's own profit at reduced capacity does advance it.
+        breaker.record_trade(Decimal::ONE).await.unwrap();
+        assert!(breaker.try_advance_recovery().await);
     }
 
     #[tokio::test]

@@ -1088,7 +1088,12 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   them) whose market is found resolved on the first look are recorded as
   seen, not counted: they may have resolved weeks ago and would otherwise
   land on today's loss limit at once. Each market is asked at most every
-  10 minutes (hourly once resolved without a single winner). A resolution with no single winner (a split) records
+  10 minutes (hourly once resolved without a single winner). A sale of
+  shares whose resolution was already recorded (migration 110) is recorded
+  as seen, not counted again.
+- During a recovery after a trip, manual results count toward the day's
+  limits (they can trip it again) but not toward a stage's trades or its
+  required profit: stages advance on the bot's own trades. A resolution with no single winner (a split) records
   nothing; its value still reaches the breaker through the equity
   valuation (drawdown).
 - Paper manual sales reach no breaker. Deploy stop-then-start: 105
@@ -1150,6 +1155,12 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   default), time to notice an address added by someone who took over a
   session. Removing one takes effect at once. Additions and removals are in
   the audit log (`withdrawal_destination_added`, `_removed`).
+- The dashboard's forwarding waits up to two minutes for an answer (a
+  withdrawal waits up to about a minute for its receipt). If an answer
+  still does not arrive, the form says to check Recent Withdrawals before
+  retrying (a retry repeats the same request, never a second transfer).
+  The preflight's "can be withdrawn" amount includes the daily limit.
+- A dashboard built without `API_PROXY_URL` warns in its build log.
 - A workspace withdraws at most `WITHDRAWAL_DAILY_CAP_USD` (1000 by default)
   in any 24 hours, counting every withdrawal but those that failed and
   moved nothing (a failed transfer that was signed and did not revert may

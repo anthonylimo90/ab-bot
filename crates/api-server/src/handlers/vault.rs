@@ -1959,7 +1959,11 @@ pub async fn withdrawal_preflight(
         in_flight_withdrawals: capacity.in_flight_withdrawals,
         reserved_for_open_buys: capacity.reserved_for_open_buys,
         orphan_exposure,
-        max_withdrawable: capacity.max_withdrawable,
+        // What one withdrawal may take now: the wallet's capacity, within
+        // what the daily limit has left.
+        max_withdrawable: capacity
+            .max_withdrawable
+            .min((daily_cap - withdrawn_last_24h).max(Decimal::ZERO)),
         inventory_fresh,
         inventory_synced_at,
         can_withdraw,

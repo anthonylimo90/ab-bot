@@ -60,6 +60,12 @@ export function useCreateWalletWithdrawalMutation() {
         toast.info("Withdrawal pending", "Check withdrawal history. Retry with the same request; do not start another transfer.");
       }
     },
+    onError: () => {
+      // The transfer may have gone out though the answer did not arrive:
+      // show what the server recorded.
+      queryClient.invalidateQueries({ queryKey: queryKeys.wallets.all() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.account.all() });
+    },
   });
 }
 

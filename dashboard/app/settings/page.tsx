@@ -519,8 +519,8 @@ export default function SettingsPage() {
       }
     } catch (err) {
       toast.error(
-        'Withdrawal failed',
-        err instanceof Error ? err.message : 'Unable to submit withdrawal',
+        'Withdrawal not confirmed',
+        `${err instanceof Error ? err.message : 'Unable to submit withdrawal'}. Check Recent Withdrawals before trying again: retrying sends the same request, not a second transfer.`,
       );
     }
   };
