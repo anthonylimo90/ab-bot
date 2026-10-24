@@ -273,6 +273,20 @@ impl ServerConfig {
     }
 }
 
+/// Bind `addr`. `::` (every IPv6 and, dual-stack, IPv4 address) on a host
+/// without IPv6 falls back to `0.0.0.0`, with a warning, instead of failing
+/// to start.
+async fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Err(error) if addr.ip() == std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED) => {
+            let fallback = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), addr.port());
+            tracing::warn!(%error, %fallback, "Cannot listen on IPv6 here; listening on IPv4 only");
+            tokio::net::TcpListener::bind(fallback).await
+        }
+        other => other,
+    }
+}
+
 /// The API server.
 pub struct ApiServer {
     config: ServerConfig,
@@ -609,7 +623,7 @@ impl ApiServer {
         let addr = self.config.socket_addr();
         info!(address = %addr, "Starting API server");
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = bind_listener(addr).await?;
         let stop_accepting = Arc::new(tokio::sync::Notify::new());
         // ConnectInfo gives the rate limiter the TCP peer address to fall back on.
         let server = {

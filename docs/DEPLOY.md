@@ -133,7 +133,8 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    development until `APP_DOMAIN` and `APP_URI` are set.
    Railway puts one proxy in front of the service, hence
    `TRUSTED_PROXY_HOPS=1`. `PORT` is set so the dashboard can name it in
-   `API_PROXY_URL`. `API_HOST=::` also listens on Railway's private
+   `API_PROXY_URL`. (On a host without IPv6, `::` falls back to IPv4 with a
+   warning instead of failing to start.) `API_HOST=::` also listens on Railway's private
    network (IPv6), which the dashboard uses to reach the API (below): its
    requests then pass only the proxy in front of the dashboard, so the
    client's address is still the last `X-Forwarded-For` entry. Do not raise
