@@ -33,6 +33,7 @@ use crate::websocket;
         auth::login,
         auth::refresh_token,
         auth::logout,
+        auth::stream_token,
         auth::get_current_user,
         auth::forgot_password,
         auth::reset_password,
@@ -150,6 +151,7 @@ use crate::websocket;
             auth::RegisterRequest,
             auth::LoginRequest,
             auth::AuthResponse,
+            auth::StreamTokenResponse,
             auth::UserInfo,
             auth::ForgotPasswordRequest,
             auth::ForgotPasswordResponse,
@@ -391,6 +393,7 @@ pub fn create_router_with_janitor(state: Arc<AppState>) -> (Router, LimiterJanit
         // Auth endpoints (protected)
         .route("/api/v1/auth/refresh", post(auth::refresh_token))
         .route("/api/v1/auth/logout", post(auth::logout))
+        .route("/api/v1/auth/stream-token", post(auth::stream_token))
         .route("/api/v1/auth/me", get(auth::get_current_user))
         // Wallet linking (requires auth)
         .route("/api/v1/auth/wallet/link", post(wallet_auth::link_wallet))

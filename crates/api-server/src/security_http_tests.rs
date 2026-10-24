@@ -142,3 +142,117 @@ async fn logout_and_password_reset_tokens_cannot_accept_invites_on_another_insta
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[sqlx::test(migrations = false)]
+async fn the_dashboard_session_cookie_is_guarded_and_scoped(pool: PgPool) {
+    let (user, workspace) = setup(&pool).await;
+    sqlx::query("INSERT INTO workspace_members VALUES($1,$2,'member')")
+        .bind(workspace)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut state = AppState::for_tests(pool.clone());
+    std::sync::Arc::get_mut(&mut state).unwrap().cookie_origins =
+        Some(vec!["https://app.example.com".to_string()]);
+    let session = middleware::issue_session_token(&state, user, ::auth::UserRole::Trader)
+        .await
+        .unwrap();
+    let app = Router::new()
+        .route("/stream", post(auth::stream_token))
+        .route("/logout", post(auth::logout))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::require_auth,
+        ))
+        .with_state(state.clone());
+    let send = |path: &str, auth: (&str, &str), dashboard: bool, origin: Option<&str>| {
+        let mut builder = Request::builder()
+            .uri(path)
+            .method("POST")
+            .header(auth.0, auth.1.to_string());
+        if dashboard {
+            builder = builder.header("x-requested-with", "ab-bot-dashboard");
+        }
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        app.clone().oneshot(builder.body(Body::empty()).unwrap())
+    };
+    let cookie = format!("abbot_session={session}");
+    let good = Some("https://app.example.com");
+    // A cookie alone, or from another origin (a sibling subdomain sends it
+    // too), changes nothing.
+    let refused = send("/stream", ("cookie", &cookie), false, good)
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let sibling = send(
+        "/stream",
+        ("cookie", &cookie),
+        true,
+        Some("https://evil.example.com"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sibling.status(), StatusCode::FORBIDDEN);
+    // From the dashboard it works.
+    let issued = send("/stream", ("cookie", &cookie), true, good)
+        .await
+        .unwrap();
+    assert_eq!(issued.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(issued.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stream: String = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The stream token opens the streams, and nothing else.
+    crate::workspace_scope::authorize_workspace_session(&pool, &state.jwt_auth, &stream)
+        .await
+        .unwrap();
+    let as_bearer = send(
+        "/stream",
+        ("authorization", &format!("Bearer {stream}")),
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(as_bearer.status(), StatusCode::UNAUTHORIZED);
+    // Logging out clears the cookie and ends the stream token with the session.
+    let out = send("/logout", ("cookie", &cookie), true, good)
+        .await
+        .unwrap();
+    assert_eq!(out.status(), StatusCode::OK);
+    let cleared = out.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(cleared.starts_with("abbot_session=;") && cleared.contains("Max-Age=0"));
+    assert!(
+        crate::workspace_scope::authorize_workspace_session(&pool, &state.jwt_auth, &stream)
+            .await
+            .is_err()
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_new_session_goes_to_the_dashboard_only_in_the_cookie(pool: PgPool) {
+    let (user, _) = setup(&pool).await;
+    let state = AppState::for_tests(pool.clone());
+    let issued = middleware::issue_session_token(&state, user, ::auth::UserRole::Trader)
+        .await
+        .unwrap();
+    let mut api_client = issued.clone();
+    let none =
+        crate::session_cookie::deliver(&state, &axum::http::HeaderMap::new(), &mut api_client);
+    assert!(none.is_empty());
+    assert_eq!(api_client, issued);
+    let mut dashboard = axum::http::HeaderMap::new();
+    dashboard.insert("x-requested-with", "ab-bot-dashboard".parse().unwrap());
+    let mut browser = issued.clone();
+    let cookie = crate::session_cookie::deliver(&state, &dashboard, &mut browser);
+    assert!(browser.is_empty());
+    let set = cookie.get("set-cookie").unwrap().to_str().unwrap();
+    assert!(set.starts_with(&format!("abbot_session={issued};")));
+    assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"));
+}

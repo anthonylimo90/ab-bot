@@ -87,8 +87,12 @@ import {
   parseWorkspace,
 } from "@/lib/wire";
 
-// The API listens on 3000 by default (3001 is Grafana's).
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
+// Requests go to the dashboard's own origin, which forwards them to the API
+// (next.config.js rewrites): the session cookie is then first-party, HttpOnly
+// and SameSite=Strict, and no script ever holds the session token.
+const API_BASE_URL = "";
+/** Sent on every request: marks it as the dashboard's (the API's CSRF check). */
+const DASHBOARD_HEADER = { "X-Requested-With": "ab-bot-dashboard" };
 
 export class ApiHttpError extends Error {
   constructor(
@@ -445,10 +449,11 @@ function parseLearningRolloutObservation(
 
 /**
  * Called when an authenticated request is rejected with 401, i.e. the session
- * token we sent is expired or revoked. Receives the token that was rejected so the
- * owner can ignore a stale response that races a newer sign-in.
+ * cookie it carried is expired or revoked. Receives the session (see
+ * `ApiClient.currentSession`) the request was sent in, so the owner can
+ * ignore a stale response that races a newer sign-in.
  */
-export type UnauthorizedHandler = (rejectedToken: string) => void;
+export type UnauthorizedHandler = (rejectedSession: number) => void;
 
 // Credential and session endpoints answer 401 for reasons other than an expired
 // session (wrong password, bad signature, already-revoked logout) and are handled
@@ -457,19 +462,22 @@ const AUTH_ENDPOINT_PREFIX = "/api/v1/auth/";
 
 class ApiClient {
   private baseUrl: string;
-  private token?: string;
+  // Counts sign-ins and sign-outs: a 401 answered to a request sent in an
+  // earlier session must not end the current one.
+  private session = 0;
   private unauthorizedHandler: UnauthorizedHandler | null = null;
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
   }
 
-  setToken(token: string) {
-    this.token = token;
+  /** Start a new session (a sign-in or a sign-out). */
+  beginSession() {
+    this.session += 1;
   }
 
-  clearToken() {
-    this.token = undefined;
+  currentSession(): number {
+    return this.session;
   }
 
   setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
@@ -510,19 +518,16 @@ class ApiClient {
   ): Promise<T> {
     const headers: HeadersInit = {
       "Content-Type": "application/json",
+      ...DASHBOARD_HEADER,
       ...options.headers,
     };
 
-    const sentToken =
-      requestOptions?.auth !== false ? this.token : undefined;
-    if (sentToken) {
-      (headers as Record<string, string>)["Authorization"] =
-        `Bearer ${sentToken}`;
-    }
-
+    // The session cookie goes with every same-origin request.
+    const sentSession = this.session;
     const response = await fetch(`${this.baseUrl}${endpoint}`, {
       ...options,
       headers,
+      credentials: "same-origin",
     });
 
     if (!response.ok) {
@@ -557,11 +562,11 @@ class ApiClient {
       }
       if (
         response.status === 401 &&
-        sentToken &&
+        requestOptions?.auth !== false &&
         !endpoint.startsWith(AUTH_ENDPOINT_PREFIX)
       ) {
         try {
-          this.unauthorizedHandler?.(sentToken);
+          this.unauthorizedHandler?.(sentSession);
         } catch (handlerError) {
           // The caller still needs the original 401 below.
           console.error("Unauthorized handler failed:", handlerError);
@@ -597,16 +602,22 @@ class ApiClient {
       method: "POST",
       body: JSON.stringify({ email, password }),
     });
-    this.setToken(response.token);
+    // The session is in the cookie the API just set; the body has no token.
     return response;
   }
 
   async refreshToken(): Promise<AuthResponse> {
-    const response = await this.request<AuthResponse>("/api/v1/auth/refresh", {
+    return this.request<AuthResponse>("/api/v1/auth/refresh", {
       method: "POST",
     });
-    this.setToken(response.token);
-    return response;
+  }
+
+  /** A token that opens the live data streams only (the WebSocket). */
+  async getStreamToken(): Promise<string> {
+    const response = await this.request<{ token: string }>("/api/v1/auth/stream-token", {
+      method: "POST",
+    });
+    return response.token;
   }
 
   async logout(): Promise<void> {
@@ -665,7 +676,6 @@ class ApiClient {
       method: "POST",
       body: JSON.stringify({ message, signature }),
     });
-    this.setToken(response.token);
     return response;
   }
 

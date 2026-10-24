@@ -49,7 +49,7 @@ export default function LoginPage() {
         return;
       }
 
-      setAuth(response.token, response.user);
+      setAuth(response.user);
       addToast({
         type: 'success',
         title: 'Welcome back!',

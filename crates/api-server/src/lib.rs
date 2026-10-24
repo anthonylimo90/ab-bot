@@ -51,6 +51,7 @@ pub mod routes;
 pub mod runtime_sync;
 #[cfg(test)]
 mod security_http_tests;
+pub mod session_cookie;
 pub mod signals;
 pub mod state;
 pub mod strategy_health_calculator;
@@ -138,8 +139,6 @@ impl Default for ServerConfig {
     }
 }
 
-/// Split a comma-separated origin list, trimming blanks and trailing slashes
-/// (an Origin header never has a path).
 /// The route a request matched, as its template (`/invites/{token}`), for
 /// logs: the request's own path and query can carry secrets.
 fn route_template<B>(request: &Request<B>) -> String {
@@ -149,7 +148,9 @@ fn route_template<B>(request: &Request<B>) -> String {
         .map_or_else(|| "unmatched".to_string(), |path| path.as_str().to_string())
 }
 
-fn parse_origin_list(raw: &str) -> Vec<String> {
+/// Split a comma-separated origin list, trimming blanks and trailing slashes
+/// (an Origin header never has a path).
+pub(crate) fn parse_origin_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|origin| origin.trim().trim_end_matches('/'))
         .filter(|origin| !origin.is_empty())

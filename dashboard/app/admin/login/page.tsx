@@ -44,7 +44,7 @@ export default function AdminLoginPage() {
         return;
       }
 
-      setAuth(response.token, response.user);
+      setAuth(response.user);
       addToast({
         type: 'success',
         title: 'Welcome back!',

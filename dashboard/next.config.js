@@ -43,10 +43,26 @@ const securityHeaders = [
   { key: 'Content-Security-Policy-Report-Only', value: contentSecurityPolicyReportOnly },
 ];
 
+// The browser reaches the API through the dashboard's own origin, so the
+// session cookie the API sets is first-party (HttpOnly, SameSite=Strict) and
+// never readable by scripts. Fixed at build time, like NEXT_PUBLIC_API_URL.
+const API_PROXY_TARGET = (
+  process.env.API_PROXY_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  'http://localhost:3000'
+).replace(/\/+$/, '');
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
   poweredByHeader: false,
+  async rewrites() {
+    return [
+      { source: '/api/v1/:path*', destination: `${API_PROXY_TARGET}/api/v1/:path*` },
+      { source: '/health', destination: `${API_PROXY_TARGET}/health` },
+      { source: '/ready', destination: `${API_PROXY_TARGET}/ready` },
+    ];
+  },
   experimental: {
     serverActions: {
       bodySizeLimit: '2mb',

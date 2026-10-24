@@ -9,9 +9,10 @@ const require = createRequire(import.meta.url);
 function loadStore(revoke) {
   const calls = [];
   class ApiHttpError extends Error { get isUnauthorized() { return true; } }
+  let session = 0;
   const api = {
-    setToken: () => {},
-    clearToken: () => calls.push('clear'),
+    beginSession: () => { session += 1; calls.push('new-session'); },
+    currentSession: () => session,
     logout: async () => { calls.push('revoke'); await revoke(); },
   };
   const resetStore = { getState: () => ({ reset() {} }) };
@@ -28,7 +29,7 @@ function loadStore(revoke) {
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} } };
   vm.runInNewContext(source, context);
   const store = context.exports.useAuthStore;
-  store.getState().setAuth('copied-token', { id: 'user' });
+  store.getState().setAuth({ id: 'user' });
   calls.length = 0;
   return { store, calls };
 }
@@ -37,17 +38,18 @@ test('actual auth store revokes before clearing browser session', async () => {
   let finish;
   const { store, calls } = loadStore(() => new Promise(resolve => { finish = resolve; }));
   const pending = store.getState().logout();
-  assert.equal(store.getState().token, 'copied-token');
+  assert.equal(store.getState().isAuthenticated, true);
   assert.deepEqual(calls, ['revoke']);
   finish();
   assert.equal(await pending, true);
-  assert.deepEqual(calls, ['revoke', 'clear', 'reset']);
-  assert.equal(store.getState().token, null);
+  assert.deepEqual(calls, ['revoke', 'new-session', 'reset']);
+  assert.equal(store.getState().isAuthenticated, false);
+  assert.equal(store.getState().user, null);
 });
 
 test('failed server revocation keeps session available for retry and reports failure', async () => {
   const { store, calls } = loadStore(async () => { throw new Error('network'); });
   assert.equal(await store.getState().logout(), false);
-  assert.equal(store.getState().token, 'copied-token');
+  assert.equal(store.getState().isAuthenticated, true);
   assert.deepEqual(calls, ['revoke', 'error']);
 });

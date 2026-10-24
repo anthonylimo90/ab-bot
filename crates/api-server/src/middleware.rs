@@ -3,7 +3,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{header::AUTHORIZATION, Request, StatusCode},
+    http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -90,6 +90,12 @@ pub(crate) async fn authorize_session(
     token: &str,
 ) -> crate::error::ApiResult<Claims> {
     let claims = validate_session_token(jwt, token)?;
+    // A token scoped to the live streams opens nothing else.
+    if claims.scope.is_some() {
+        return Err(crate::error::ApiError::Unauthorized(
+            "This token is limited to the live data streams".into(),
+        ));
+    }
     let user = uuid::Uuid::parse_str(&claims.sub)
         .map_err(|_| crate::error::ApiError::Unauthorized("Invalid subject".into()))?;
     let current: Option<(i64,i32,bool)> = sqlx::query_as("SELECT auth_version, role::integer, EXISTS(SELECT 1 FROM revoked_sessions WHERE jti=$2) FROM users WHERE id=$1")
@@ -136,31 +142,25 @@ pub async fn require_auth(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Extract Authorization header
-    let auth_header = match request.headers().get(AUTHORIZATION) {
-        Some(header) => match header.to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                return unauthorized_response("Invalid authorization header encoding");
-            }
-        },
-        None => {
-            return unauthorized_response("Missing authorization header");
-        }
+    // The Authorization header, else the dashboard's session cookie.
+    let (token, source) = match crate::session_cookie::request_token(request.headers()) {
+        Ok(Some(found)) => found,
+        Ok(None) => return unauthorized_response("Missing authorization header"),
+        Err(message) => return unauthorized_response(message),
     };
-
-    // Check for Bearer prefix
-    let token = match auth_header.strip_prefix("Bearer ") {
-        Some(t) => t,
-        None => {
-            return unauthorized_response(
-                "Invalid authorization format, expected 'Bearer <token>'",
-            );
-        }
-    };
+    if !crate::session_cookie::csrf_ok(
+        request.method(),
+        source,
+        request.headers(),
+        state.cookie_origins.as_deref(),
+    ) {
+        return forbidden_response(
+            "A request authenticated by the session cookie must come from the dashboard",
+        );
+    }
 
     // Validate token
-    let claims = match authorize_session(&state.pool, &state.jwt_auth, token).await {
+    let claims = match authorize_session(&state.pool, &state.jwt_auth, &token).await {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(error = %e, "Token validation failed");

@@ -6,7 +6,7 @@ use argon2::{
 };
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
@@ -147,8 +147,9 @@ impl UserRow {
 )]
 pub async fn register(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     payload: Result<Json<RegisterRequest>, JsonRejection>,
-) -> ApiResult<(StatusCode, Json<AuthResponse>)> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<AuthResponse>)> {
     // Handle JSON parsing errors explicitly
     let Json(req) = payload.map_err(|e| {
         tracing::warn!(error = %e, "Register request JSON parsing failed");
@@ -239,7 +240,9 @@ pub async fn register(
         },
     };
 
-    Ok((StatusCode::CREATED, Json(response)))
+    let mut response = response;
+    let cookie = crate::session_cookie::deliver(&state, &headers, &mut response.token);
+    Ok((StatusCode::CREATED, cookie, Json(response)))
 }
 
 /// Login with email and password.
@@ -255,8 +258,9 @@ pub async fn register(
 )]
 pub async fn login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     payload: Result<Json<LoginRequest>, JsonRejection>,
-) -> ApiResult<Json<AuthResponse>> {
+) -> ApiResult<(HeaderMap, Json<AuthResponse>)> {
     // Handle JSON parsing errors explicitly
     let Json(req) = payload.map_err(|e| {
         tracing::warn!(error = %e, "Login request JSON parsing failed");
@@ -345,7 +349,9 @@ pub async fn login(
         },
     };
 
-    Ok(Json(response))
+    let mut response = response;
+    let cookie = crate::session_cookie::deliver(&state, &headers, &mut response.token);
+    Ok((cookie, Json(response)))
 }
 
 /// Refresh the current JWT token.
@@ -363,8 +369,9 @@ pub async fn login(
 )]
 pub async fn refresh_token(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Extension(claims): Extension<Claims>,
-) -> ApiResult<Json<AuthResponse>> {
+) -> ApiResult<(HeaderMap, Json<AuthResponse>)> {
     // Get user from database
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Internal("Invalid user ID in token".into()))?;
@@ -415,7 +422,48 @@ pub async fn refresh_token(
         },
     };
 
-    Ok(Json(response))
+    let mut response = response;
+    let cookie = crate::session_cookie::deliver(&state, &headers, &mut response.token);
+    Ok((cookie, Json(response)))
+}
+
+/// A token for the live data streams (WebSocket), which the dashboard
+/// cannot otherwise send: its session token is in an `HttpOnly` cookie.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StreamTokenResponse {
+    /// Opens the streams only; refused by every other endpoint. It ends with
+    /// the session (same expiry, revoked with it).
+    pub token: String,
+}
+
+/// Issue a token for the live data streams.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/stream-token",
+    responses(
+        (status = 200, description = "Stream token", body = StreamTokenResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "auth"
+)]
+pub async fn stream_token(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> ApiResult<Json<StreamTokenResponse>> {
+    // The session's own claims (its id included, so revoking the session
+    // revokes this), limited to the streams.
+    let streamed = Claims {
+        scope: Some(auth::jwt::STREAM_SCOPE.to_string()),
+        ..claims
+    };
+    let token = state
+        .jwt_auth
+        .create_token_with_claims(&streamed)
+        .map_err(|e| ApiError::Internal(format!("Token generation failed: {e}")))?;
+    Ok(Json(StreamTokenResponse { token }))
 }
 
 /// Logout and revoke the current JWT token.
@@ -434,7 +482,7 @@ pub async fn refresh_token(
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<(HeaderMap, Json<serde_json::Value>)> {
     let user = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("Invalid subject".into()))?;
     sqlx::query("INSERT INTO revoked_sessions (jti,user_id,expires_at) VALUES ($1,$2,to_timestamp($3::bigint::double precision)) ON CONFLICT (jti) DO NOTHING")
@@ -444,7 +492,13 @@ pub async fn logout(
 
     tracing::info!(user_id = %claims.sub, "User logged out, token revoked");
 
-    Ok(Json(serde_json::json!({ "status": "logged_out" })))
+    // The cookie goes too (harmless for a client that never had one).
+    let mut cookie = HeaderMap::new();
+    cookie.insert(
+        axum::http::header::SET_COOKIE,
+        crate::session_cookie::clear_cookie(state.secure_cookies),
+    );
+    Ok((cookie, Json(serde_json::json!({ "status": "logged_out" }))))
 }
 
 /// Get the current authenticated user's information.

@@ -20,12 +20,15 @@ const marketFixture = {
   created_at: '2026-01-01T00:00:00Z',
 };
 
+// Requests go to the dashboard's own origin (next.config.js forwards them).
+const at = (url) => new URL(url, 'http://dashboard.test');
+
 test('getMarkets sends the search term to the backend and parses Decimal strings', async () => {
   const { api, requests } = loadApi(() => jsonResponse([marketFixture]));
   const markets = await api.getMarkets({ search: 'fed rate', category: 'politics', active: true, limit: 25, offset: 50 });
 
   assert.equal(requests.length, 1);
-  const url = new URL(requests[0].url);
+  const url = at(requests[0].url);
   assert.equal(url.pathname, '/api/v1/markets');
   assert.equal(url.searchParams.get('search'), 'fed rate');
   assert.equal(url.searchParams.get('category'), 'politics');
@@ -39,26 +42,37 @@ test('getMarkets sends the search term to the backend and parses Decimal strings
 test('getMarkets trims the search term and omits a blank one', async () => {
   const trimmed = loadApi(() => jsonResponse([]));
   await trimmed.api.getMarkets({ search: '  btc  ' });
-  assert.equal(new URL(trimmed.requests[0].url).searchParams.get('search'), 'btc');
+  assert.equal(at(trimmed.requests[0].url).searchParams.get('search'), 'btc');
 
   for (const search of ['', '   ', undefined]) {
     const { api, requests } = loadApi(() => jsonResponse([]));
     await api.getMarkets({ search, limit: 10 });
-    const url = new URL(requests[0].url);
+    const url = at(requests[0].url);
     assert.equal(url.searchParams.has('search'), false, JSON.stringify(search));
     assert.equal(url.searchParams.get('limit'), '10');
   }
 
   const bare = loadApi(() => jsonResponse([]));
   await bare.api.getMarkets();
-  assert.equal(bare.requests[0].url, 'http://localhost:3000/api/v1/markets');
+  assert.equal(bare.requests[0].url, '/api/v1/markets');
 });
 
 test('getMarkets encodes special characters in the search term', async () => {
   const { api, requests } = loadApi(() => jsonResponse([]));
   await api.getMarkets({ search: 'a&b=c#d' });
   assert.match(requests[0].url, /search=a%26b%3Dc%23d/);
-  assert.equal(new URL(requests[0].url).searchParams.get('search'), 'a&b=c#d');
+  assert.equal(at(requests[0].url).searchParams.get('search'), 'a&b=c#d');
+});
+
+test('requests carry the session cookie and the dashboard header, never a token', async () => {
+  const { api, requests } = loadApi(() => jsonResponse([]));
+  await api.getPositions().catch(() => {});
+  await api.login('a@example.com', 'secret').catch(() => {});
+  for (const { init } of requests) {
+    assert.equal(init.credentials, 'same-origin');
+    assert.equal(init.headers['X-Requested-With'], 'ab-bot-dashboard');
+    assert.equal(init.headers.Authorization, undefined);
+  }
 });
 
 // ---- global 401 handling --------------------------------------------------
@@ -66,63 +80,56 @@ test('getMarkets encodes special characters in the search term', async () => {
 function loadApiWithHandler(respond) {
   const loaded = loadApi(respond);
   const rejected = [];
-  loaded.api.setUnauthorizedHandler((token) => rejected.push(token));
+  loaded.api.setUnauthorizedHandler((session) => rejected.push(session));
   return { ...loaded, rejected };
 }
 
 const unauthorized = () => jsonResponse({ code: 'UNAUTHORIZED', message: 'Token expired' }, 401);
 
-test('a 401 on an authenticated request reports the rejected token and still throws', async () => {
+test('a 401 on an authenticated request reports the session it was sent in and still throws', async () => {
   const { api, rejected } = loadApiWithHandler(unauthorized);
-  api.setToken('expired-token');
+  api.beginSession();
   await assert.rejects(api.getPositions(), (error) => {
     assert.equal(error.name, 'ApiHttpError');
     assert.equal(error.statusCode, 401);
     assert.equal(error.isUnauthorized, true);
     return true;
   });
-  assert.deepEqual(rejected, ['expired-token']);
+  assert.deepEqual(rejected, [api.currentSession()]);
 });
 
-test('the handler receives the token the request was sent with, not a newer one', async () => {
+test('the handler receives the session the request was sent in, not a newer one', async () => {
   const state = { api: null };
   const loaded = loadApiWithHandler(() => {
     // A sign-in lands while the request is in flight.
-    state.api.setToken('new-token');
+    state.api.beginSession();
     return unauthorized();
   });
   state.api = loaded.api;
-  loaded.api.setToken('old-token');
+  const sent = loaded.api.currentSession();
   await assert.rejects(loaded.api.getPositions());
-  assert.deepEqual(loaded.rejected, ['old-token']);
+  assert.deepEqual(loaded.rejected, [sent]);
+  assert.notEqual(loaded.api.currentSession(), sent);
 });
 
-test('requests without a token, other statuses and auth endpoints never trigger the handler', async () => {
-  // No token sent.
-  const anonymous = loadApiWithHandler(unauthorized);
-  await assert.rejects(anonymous.api.getMarkets());
-  assert.deepEqual(anonymous.rejected, []);
-
+test('unauthenticated requests, other statuses and auth endpoints never trigger the handler', async () => {
   // Explicitly unauthenticated request (invite acceptance for a signed-out visitor).
   const noAuth = loadApiWithHandler(unauthorized);
-  noAuth.api.setToken('some-token');
   await assert.rejects(noAuth.api.acceptInvite('invite-token', {}, { auth: false }));
-  assert.equal(noAuth.requests[0].init.headers.Authorization, undefined);
   assert.deepEqual(noAuth.rejected, []);
 
   // Credential/session endpoints answer 401 for ordinary reasons (wrong password, bad signature).
   const auth = loadApiWithHandler(unauthorized);
-  auth.api.setToken('stale-token');
   await assert.rejects(auth.api.login('a@example.com', 'wrong'));
   await assert.rejects(auth.api.getCurrentUser());
   await assert.rejects(auth.api.walletVerify('msg', 'sig'));
   await assert.rejects(auth.api.logout());
+  await assert.rejects(auth.api.getStreamToken());
   assert.deepEqual(auth.rejected, []);
 
   // Other failures are not session problems.
   for (const status of [400, 403, 404, 429, 500, 503]) {
     const other = loadApiWithHandler(() => jsonResponse({ code: 'X', message: 'nope' }, status));
-    other.api.setToken('good-token');
     await assert.rejects(other.api.getPositions());
     assert.deepEqual(other.rejected, [], String(status));
   }
@@ -156,14 +163,12 @@ test('an error body in plain text is the error message', async () => {
 
 test('a throwing unauthorized handler does not mask the original 401', async () => {
   const { api } = loadApi(unauthorized);
-  api.setToken('expired-token');
   api.setUnauthorizedHandler(() => { throw new Error('handler bug'); });
   await assert.rejects(api.getPositions(), (error) => error.statusCode === 401);
 });
 
 test('clearing the handler stops notifications', async () => {
   const { api, rejected } = loadApiWithHandler(unauthorized);
-  api.setToken('expired-token');
   api.setUnauthorizedHandler(null);
   await assert.rejects(api.getPositions());
   assert.deepEqual(rejected, []);

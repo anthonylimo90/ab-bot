@@ -43,7 +43,7 @@ export function useWalletAuth(): UseWalletAuthReturn {
       const signature = await signMessageAsync({ message: siweMessage });
 
       // Step 3: Verify signature and get JWT
-      const { token, user, is_new_user } = await api.walletVerify(
+      const { user, is_new_user } = await api.walletVerify(
         siweMessage,
         signature
       );
@@ -58,7 +58,7 @@ export function useWalletAuth(): UseWalletAuthReturn {
         created_at: user.created_at,
       };
 
-      setAuth(token, authUser);
+      setAuth(authUser);
 
       addToast({
         type: 'success',

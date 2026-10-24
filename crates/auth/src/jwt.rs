@@ -63,7 +63,15 @@ pub struct Claims {
     /// session has an end; zero in tokens issued before it was recorded.
     #[serde(default)]
     pub auth_time: i64,
+    /// What the token is limited to: `None` for a session token, which the
+    /// API accepts everywhere; [`STREAM_SCOPE`] for one that only opens the
+    /// live data streams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
+
+/// The scope of a token that only opens the live data streams.
+pub const STREAM_SCOPE: &str = "stream";
 
 impl Claims {
     /// Create new claims for a user.
@@ -79,6 +87,7 @@ impl Claims {
             exp: (now + Duration::hours(expiry_hours)).timestamp(),
             jti: Uuid::new_v4().to_string(),
             auth_time: now.timestamp(),
+            scope: None,
         }
     }
 

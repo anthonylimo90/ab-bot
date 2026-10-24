@@ -113,7 +113,7 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    CORS_ALLOWED_ORIGINS=https://<your-dashboard-domain>
    APP_DOMAIN=<your-dashboard-domain>
    APP_URI=https://<your-dashboard-domain>
-   TRUSTED_PROXY_HOPS=1
+   TRUSTED_PROXY_HOPS=2
    SKIP_MIGRATIONS=false
    RAILWAY_DEPLOYMENT_DRAINING_SECONDS=50
    ```
@@ -125,9 +125,15 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    wait. Railway's default drain is only a few seconds, so give it 50.
 
    `CORS_ALLOWED_ORIGINS` is what restricts cross-origin access; without it all
-   origins are allowed whatever `CORS_PERMISSIVE` says. Wallet sign-in stays
-   disabled outside development until `APP_DOMAIN` and `APP_URI` are set.
-   Railway puts one proxy in front of the service, hence `TRUSTED_PROXY_HOPS=1`.
+   origins are allowed whatever `CORS_PERMISSIVE` says. It must name the
+   dashboard: the dashboard's signed-in requests that change anything are
+   refused from any other origin. Wallet sign-in stays disabled outside
+   development until `APP_DOMAIN` and `APP_URI` are set.
+   The dashboard reaches the API through its own server, over the API's
+   public URL: a request passes Railway's proxy in front of the dashboard,
+   then the one in front of the API, hence `TRUSTED_PROXY_HOPS=2` (with 1,
+   every dashboard user would share one rate-limit bucket). API clients that
+   call the API directly then share the proxy's bucket.
 
 6. In **Networking**, click **"Generate Domain"** for public URL
 
@@ -169,6 +175,11 @@ Complete guide for deploying AB-Bot to [Railway](https://railway.app) with GitHu
    NEXT_PUBLIC_WS_URL=wss://<api-server-url>.railway.app
    ```
    Replace `<api-server-url>` with your actual API server domain from step 4.1.
+   Both are build-time values (changing one needs a redeploy). The browser
+   calls `/api/v1` on the dashboard's own domain, and the dashboard's server
+   forwards it to `NEXT_PUBLIC_API_URL` (or `API_PROXY_URL`, if set), so the
+   session cookie belongs to the dashboard's domain. The live stream still
+   connects to `NEXT_PUBLIC_WS_URL` directly.
 
 6. In **Networking**, click **"Generate Domain"** for public URL
 
@@ -1065,6 +1076,32 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   (drawdown), not the daily loss limit.
 - Paper manual sales reach no breaker. Deploy stop-then-start: 105
   replaces the fill trigger.
+
+### Dashboard sessions in an HttpOnly cookie
+
+- The dashboard no longer keeps the session token where scripts can read it
+  (it was in `localStorage`). Signing in through the dashboard (its requests
+  carry `X-Requested-With: ab-bot-dashboard`) sets an `abbot_session` cookie:
+  `HttpOnly`, `SameSite=Strict`, `Secure` outside development, for the
+  token's lifetime; the response body then carries no token. Logout clears
+  it. Everyone signs in once more after this deploy.
+- The browser calls the API through the dashboard's own origin
+  (`/api/v1/*`, `/health`, `/ready` are forwarded by the dashboard's
+  server, `next.config.js`), so the cookie is first-party. The forward
+  target is `API_PROXY_URL`, else `NEXT_PUBLIC_API_URL`, fixed at build.
+- A request authenticated by the cookie that changes anything must carry
+  `X-Requested-With: ab-bot-dashboard` and an `Origin` in
+  `CORS_ALLOWED_ORIGINS` (any origin in development without the list):
+  a page on a sibling subdomain, which counts as the same site and so sends
+  the cookie, is refused. Outside development, set `CORS_ALLOWED_ORIGINS`
+  to the dashboard's origin or the dashboard cannot change anything.
+- The live stream (WebSocket) is opened with a stream token from
+  `POST /api/v1/auth/stream-token`: it ends with the session (same expiry,
+  revoked with it) and every other endpoint refuses it.
+- API clients are unchanged: `Authorization: Bearer` works as before, and
+  takes precedence over a cookie.
+- Requests now reach the API through two proxies on Railway: set
+  `TRUSTED_PROXY_HOPS=2` there (see the API's variables above).
 
 ### Browser-wallet order endpoints removed (107)
 

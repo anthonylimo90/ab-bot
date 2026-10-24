@@ -217,6 +217,13 @@ pub struct AppState {
     pub open_registration: bool,
     /// Where and how much withdrawals may go.
     pub withdrawal_policy: crate::withdrawals::WithdrawalPolicy,
+    /// Whether the session cookie is sent only over HTTPS (`Secure`):
+    /// everywhere but development, which runs on plain `http://localhost`.
+    pub secure_cookies: bool,
+    /// The origins a state-changing request authenticated by the session
+    /// cookie may come from (`CORS_ALLOWED_ORIGINS`, the dashboard's);
+    /// `None` (development without a list) takes any.
+    pub cookie_origins: Option<Vec<String>>,
 }
 
 /// The circuit breaker's limits: the defaults, then the `CB_*` environment,
@@ -612,6 +619,27 @@ impl AppState {
                 &std::env::var("ENVIRONMENT").unwrap_or_default(),
             ),
             withdrawal_policy: crate::withdrawals::WithdrawalPolicy::from_env(),
+            secure_cookies: !crate::is_development_environment(
+                &std::env::var("ENVIRONMENT").unwrap_or_default(),
+            ),
+            cookie_origins: {
+                let origins = crate::parse_origin_list(
+                    &std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default(),
+                );
+                if !origins.is_empty() {
+                    Some(origins)
+                } else if crate::is_development_environment(
+                    &std::env::var("ENVIRONMENT").unwrap_or_default(),
+                ) {
+                    None
+                } else {
+                    tracing::error!(
+                        "CORS_ALLOWED_ORIGINS is not set: the dashboard's signed-in requests \
+                         that change anything are refused until it names the dashboard's origin"
+                    );
+                    Some(Vec::new())
+                }
+            },
         })
     }
 
@@ -698,6 +726,8 @@ impl AppState {
                 destination_delay: chrono::Duration::hours(24),
                 daily_cap: rust_decimal::Decimal::from(1000),
             },
+            secure_cookies: false,
+            cookie_origins: None,
         })
     }
 

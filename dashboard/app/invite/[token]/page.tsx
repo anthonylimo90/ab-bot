@@ -69,9 +69,9 @@ export default function InviteAcceptPage() {
         auth: isMatchingSignedInUser,
       });
 
-      // If new user, set auth
-      if (response.token && response.user) {
-        setAuth(response.token, response.user);
+      // A new account is signed in: its session is in the cookie the API set.
+      if (response.user) {
+        setAuth(response.user);
       }
 
       await fetchCurrentWorkspace();

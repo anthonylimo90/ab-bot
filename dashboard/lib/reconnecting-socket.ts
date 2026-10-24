@@ -39,8 +39,12 @@ export function reconnectDelayMs(
 
 export interface ReconnectingSocketOptions {
   url: string;
-  /** Sent as `{ action: 'authenticate', token }` the moment the socket opens. */
-  authToken?: string | null;
+  /**
+   * Sent as `{ action: 'authenticate', token }` the moment the socket opens. A
+   * function is asked for a fresh token at every open (a stream token, issued
+   * per connection); if it fails the socket is closed and retried.
+   */
+  authToken?: string | null | (() => Promise<string | null>);
   reconnect?: boolean;
   baseDelayMs?: number;
   maxDelayMs?: number;
@@ -176,8 +180,20 @@ export function createReconnectingSocket(options: ReconnectingSocketOptions): Re
 
     next.onopen = () => {
       if (socket !== next) return;
-      if (authToken) {
-        next.send(JSON.stringify({ action: 'authenticate', token: authToken }));
+      const authenticate = (token: string | null) => {
+        if (token && socket === next && next.readyState === SOCKET_OPEN) {
+          next.send(JSON.stringify({ action: 'authenticate', token }));
+        }
+      };
+      if (typeof authToken === 'function') {
+        authToken().then(authenticate, (error) => {
+          if (socket !== next) return;
+          console.error('Could not get a token for the live stream:', error);
+          // Closed, so onclose schedules a retry with backoff.
+          next.close();
+        });
+      } else {
+        authenticate(authToken);
       }
       stopPing();
       pingTimer = setInterval(() => {

@@ -2,7 +2,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
@@ -369,15 +369,23 @@ async fn extract_optional_claims(
     state: &AppState,
     headers: &HeaderMap,
 ) -> ApiResult<Option<Claims>> {
-    let Some(header) = headers.get(AUTHORIZATION) else {
+    let Some((token, source)) = crate::session_cookie::request_token(headers)
+        .map_err(|message| ApiError::Unauthorized(message.into()))?
+    else {
         return Ok(None);
     };
-    let token = header
-        .to_str()
-        .ok()
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::Unauthorized("Invalid authorization header".into()))?;
-    crate::middleware::authorize_session(&state.pool, &state.jwt_auth, token)
+    // Only accepting an invite reads these, by POST.
+    if !crate::session_cookie::csrf_ok(
+        &axum::http::Method::POST,
+        source,
+        headers,
+        state.cookie_origins.as_deref(),
+    ) {
+        return Err(ApiError::Forbidden(
+            "A request authenticated by the session cookie must come from the dashboard".into(),
+        ));
+    }
+    crate::middleware::authorize_session(&state.pool, &state.jwt_auth, &token)
         .await
         .map(Some)
 }
@@ -1510,13 +1518,23 @@ pub async fn accept_invite(
     headers: HeaderMap,
     Path(token): Path<String>,
     payload: Result<Json<AcceptInviteRequest>, JsonRejection>,
-) -> ApiResult<Json<AcceptInviteResponse>> {
+) -> ApiResult<(HeaderMap, Json<AcceptInviteResponse>)> {
     let Json(req) = payload.map_err(|e| {
         tracing::warn!(error = %e, "Accept invite request JSON parsing failed");
         ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
     })?;
 
-    let claims = extract_optional_claims(&state, &headers).await?;
+    // Creating an account (a password given) needs no session: a stale one
+    // the browser still sends must not stop it.
+    let creating = req
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.is_empty());
+    let claims = if creating {
+        None
+    } else {
+        extract_optional_claims(&state, &headers).await?
+    };
 
     let invite = sqlx::query_as::<_, InviteLookupRow>(
         r#"
@@ -1747,14 +1765,23 @@ pub async fn accept_invite(
         }),
     );
 
-    Ok(Json(AcceptInviteResponse {
-        workspace_id: invite.workspace_id.to_string(),
-        workspace_name: invite.workspace_name,
-        role: invite.role,
-        is_new_user,
-        token: auth_token,
-        user: auth_user,
-    }))
+    // A new account's session: to the dashboard in the cookie.
+    let mut cookie = HeaderMap::new();
+    let auth_token = auth_token.map(|mut token| {
+        cookie = crate::session_cookie::deliver(&state, &headers, &mut token);
+        token
+    });
+    Ok((
+        cookie,
+        Json(AcceptInviteResponse {
+            workspace_id: invite.workspace_id.to_string(),
+            workspace_name: invite.workspace_name,
+            role: invite.role,
+            is_new_user,
+            token: auth_token,
+            user: auth_user,
+        }),
+    ))
 }
 
 /// Update a member's role (owner/admin only).

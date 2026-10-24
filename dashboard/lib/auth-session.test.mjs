@@ -8,9 +8,10 @@ const { ApiHttpError } = loadTsModule('lib/api.ts', { globals: { fetch: async ()
 function loadStore({ getCurrentUser }) {
   const calls = [];
   const toasts = [];
+  let session = 0;
   const api = {
-    setToken: (token) => calls.push(`setToken:${token}`),
-    clearToken: () => calls.push('clearToken'),
+    beginSession: () => { session += 1; calls.push('new-session'); },
+    currentSession: () => session,
     logout: async () => {},
     getCurrentUser,
   };
@@ -37,14 +38,22 @@ function loadStore({ getCurrentUser }) {
   };
   const { useAuthStore } = loadTsModule('stores/auth-store.ts', { mocks, globals: { localStorage } });
   const user = { id: 'u1', email: 'a@example.com', role: 'Trader' };
-  useAuthStore.getState().setAuth('token-1', user);
+  useAuthStore.getState().setAuth(user);
   calls.length = 0;
-  return { store: useAuthStore, calls, toasts, user, memory };
+  return { store: useAuthStore, calls, toasts, user, memory, api };
 }
 
 const failWith = (error) => async () => { throw error; };
 
-test('checkAuth keeps the persisted session on transient failures (network, 5xx, 429)', async () => {
+test('the browser keeps who is signed in, never a token', () => {
+  const { store, memory } = loadStore({ getCurrentUser: async () => ({}) });
+  store.setState({ token: 'leaked' });
+  store.getState().setAuth({ id: 'u2', email: 'b@example.com', role: 'Trader' });
+  const saved = JSON.parse(memory.get('ab-bot-auth')).state;
+  assert.deepEqual(Object.keys(saved), ['user']);
+});
+
+test('checkAuth keeps the remembered user on transient failures (network, 5xx, 429)', async () => {
   const failures = [
     new TypeError('fetch failed'),
     new ApiHttpError(500, 'boom'),
@@ -55,33 +64,38 @@ test('checkAuth keeps the persisted session on transient failures (network, 5xx,
     const { store, calls, user } = loadStore({ getCurrentUser: failWith(failure) });
     await store.getState().checkAuth();
     const state = store.getState();
-    assert.equal(state.token, 'token-1', String(failure));
     assert.deepEqual(state.user, user, String(failure));
     assert.equal(state.isAuthenticated, true, String(failure));
     assert.equal(state.isLoading, false, String(failure));
-    assert.equal(calls.includes('clearToken'), false, String(failure));
+    assert.equal(calls.includes('new-session'), false, String(failure));
     assert.equal(calls.includes('clear-queries'), false, String(failure));
   }
 });
 
-test('checkAuth without a cached user stays signed out but keeps the token after a transient failure', async () => {
+test('checkAuth without a remembered user stays signed out after a transient failure', async () => {
   const { store } = loadStore({ getCurrentUser: failWith(new ApiHttpError(500, 'boom')) });
   store.setState({ user: null, isAuthenticated: false });
   await store.getState().checkAuth();
-  assert.equal(store.getState().token, 'token-1');
   assert.equal(store.getState().isAuthenticated, false);
   assert.equal(store.getState().isLoading, false);
+});
+
+test('checkAuth asks the server even with nobody remembered (the cookie may hold a session)', async () => {
+  const fresh = { id: 'u1', email: 'a@example.com', role: 'Trader' };
+  const { store } = loadStore({ getCurrentUser: async () => fresh });
+  store.setState({ user: null, isAuthenticated: false });
+  await store.getState().checkAuth();
+  assert.deepEqual(store.getState().user, fresh);
+  assert.equal(store.getState().isAuthenticated, true);
 });
 
 test('checkAuth clears the session only when the server answers 401', async () => {
   const { store, calls } = loadStore({ getCurrentUser: failWith(new ApiHttpError(401, 'Token expired')) });
   await store.getState().checkAuth();
   const state = store.getState();
-  assert.equal(state.token, null);
   assert.equal(state.user, null);
   assert.equal(state.isAuthenticated, false);
   assert.equal(state.isLoading, false);
-  assert.ok(calls.includes('clearToken'));
   assert.ok(calls.includes('clear-queries'));
 });
 
@@ -91,11 +105,10 @@ test('a 401 for an older check does not clear a newer sign-in', async () => {
     getCurrentUser: () => new Promise((_, rejectCheck) => { reject = rejectCheck; }),
   });
   const pending = store.getState().checkAuth();
-  // The user signs in again while the old token is still being checked.
-  store.getState().setAuth('token-2', user);
+  // The user signs in again while the old session is still being checked.
+  store.getState().setAuth(user);
   reject(new ApiHttpError(401, 'Token expired'));
   await pending;
-  assert.equal(store.getState().token, 'token-2');
   assert.equal(store.getState().isAuthenticated, true);
   assert.equal(store.getState().isLoading, false);
 });
@@ -108,26 +121,25 @@ test('checkAuth success records the fresh user', async () => {
   assert.equal(store.getState().isAuthenticated, true);
 });
 
-test('sessionExpired signs out for the rejected token, resets session context and warns once', () => {
-  const { store, calls, toasts } = loadStore({ getCurrentUser: async () => ({}) });
-  store.getState().sessionExpired('token-1');
+test('sessionExpired signs out for the rejected session, resets session context and warns once', () => {
+  const { store, calls, toasts, api } = loadStore({ getCurrentUser: async () => ({}) });
+  store.getState().sessionExpired(api.currentSession());
   const state = store.getState();
-  assert.equal(state.token, null);
   assert.equal(state.user, null);
   assert.equal(state.isAuthenticated, false);
-  assert.deepEqual(calls.filter((c) => c === 'clearToken' || c === 'clear-queries'), ['clearToken', 'clear-queries']);
+  assert.deepEqual(calls.filter((c) => c === 'new-session' || c === 'clear-queries'), ['new-session', 'clear-queries']);
   assert.deepEqual(toasts, ['warning:Session expired']);
 
   // Concurrent 401s from other in-flight requests are no-ops.
-  store.getState().sessionExpired('token-1');
+  store.getState().sessionExpired(api.currentSession());
   assert.deepEqual(toasts, ['warning:Session expired']);
 });
 
-test('sessionExpired ignores a 401 for a token that is no longer current', () => {
-  const { store, toasts, user } = loadStore({ getCurrentUser: async () => ({}) });
-  store.getState().setAuth('token-2', user);
-  store.getState().sessionExpired('token-1');
-  assert.equal(store.getState().token, 'token-2');
+test('sessionExpired ignores a 401 for a session that is no longer current', () => {
+  const { store, toasts, user, api } = loadStore({ getCurrentUser: async () => ({}) });
+  const old = api.currentSession();
+  store.getState().setAuth(user);
+  store.getState().sessionExpired(old);
   assert.equal(store.getState().isAuthenticated, true);
   assert.deepEqual(toasts, []);
 });

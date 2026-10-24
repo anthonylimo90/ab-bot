@@ -412,8 +412,9 @@ pub async fn challenge(
 )]
 pub async fn verify(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     payload: Result<Json<VerifyRequest>, JsonRejection>,
-) -> ApiResult<Json<VerifyResponse>> {
+) -> ApiResult<(axum::http::HeaderMap, Json<VerifyResponse>)> {
     let Json(req) = payload.map_err(|e| {
         tracing::warn!(error = %e, "Wallet verify request JSON parsing failed");
         ApiError::BadRequest(format!("Invalid request body: {}", e.body_text()))
@@ -559,7 +560,9 @@ pub async fn verify(
         is_new_user,
     };
 
-    Ok(Json(response))
+    let mut response = response;
+    let cookie = crate::session_cookie::deliver(&state, &headers, &mut response.token);
+    Ok((cookie, Json(response)))
 }
 
 /// Link a wallet to an existing authenticated user.

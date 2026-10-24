@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import type { WebSocketMessage } from '@/types/api';
 import { useAuthStore } from '@/stores/auth-store';
+import api from '@/lib/api';
 import { normalizeWsMessage } from '@/lib/wire';
 import {
   createReconnectingSocket,
@@ -83,7 +84,9 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     batchInterval = 100,
   } = options;
 
-  const token = useAuthStore((state) => state.token);
+  // The session is an HttpOnly cookie: private channels authenticate with a
+  // stream-only token, fetched for each connection.
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const privateChannel = channel !== 'orderbook';
   const socketRef = useRef<ReconnectingSocket | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
@@ -158,18 +161,18 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
   const handleMessageRef = useRef(handleMessage);
   useEffect(() => { handleMessageRef.current = handleMessage; }, [handleMessage]);
 
-  // One ReconnectingSocket per (url, token, enabled) combination. The connection
+  // One ReconnectingSocket per (url, session, enabled) combination. The connection
   // itself (connect guard, backoff, pings, replacing dead sockets) lives in
   // lib/reconnecting-socket.ts; this effect only wires it to React state.
   useEffect(() => {
-    if (!enabled || (privateChannel && !token)) {
+    if (!enabled || (privateChannel && !isAuthenticated)) {
       setStatus('disconnected');
       return;
     }
 
     const socket = createReconnectingSocket({
       url,
-      authToken: privateChannel ? token : null,
+      authToken: privateChannel ? () => api.getStreamToken() : null,
       reconnect,
       baseDelayMs: reconnectInterval,
       maxAttempts: maxReconnectAttempts,
@@ -229,7 +232,7 @@ export function useWebSocket(options: WebSocketOptions): UseWebSocketReturn {
     };
   }, [
     url,
-    token,
+    isAuthenticated,
     privateChannel,
     enabled,
     reconnect,

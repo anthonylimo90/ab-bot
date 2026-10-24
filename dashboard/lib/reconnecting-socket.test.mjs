@@ -100,6 +100,39 @@ test('a public channel sends no authenticate frame', () => {
   assert.deepEqual(sockets[0].sent, []);
 });
 
+test('a token provider is asked at every open, and a failure closes the socket to retry', async () => {
+  let issued = 0;
+  let fail = false;
+  const { controller, sockets } = setup({
+    authToken: async () => {
+      if (fail) throw new Error('401');
+      issued += 1;
+      return `stream-${issued}`;
+    },
+  });
+  controller.connect();
+  sockets[0].open();
+  await Promise.resolve();
+  assert.deepEqual(sockets[0].sent, [{ action: 'authenticate', token: 'stream-1' }]);
+
+  // The next connection gets a fresh token.
+  sockets[0].serverClose(1006);
+  mock.timers.tick(1500);
+  sockets[1].open();
+  await Promise.resolve();
+  assert.deepEqual(sockets[1].sent, [{ action: 'authenticate', token: 'stream-2' }]);
+
+  // No token: nothing is sent, the socket is closed (and onclose retries).
+  sockets[1].serverClose(1006);
+  fail = true;
+  mock.timers.tick(3000); // the second retry's backoff
+  sockets[2].open();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(sockets[2].sent.filter((frame) => frame.action === 'authenticate'), []);
+  assert.equal(sockets[2].closeCalls, 1);
+});
+
 test('regression: connect() while a socket is still CONNECTING does not create a duplicate', () => {
   const { controller, sockets } = setup();
   controller.connect();
