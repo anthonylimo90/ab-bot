@@ -3,7 +3,9 @@
 use anyhow::Result;
 use auth::TradingWallet;
 use dashmap::DashMap;
-use polymarket_core::api::clob::{AuthenticatedClobClient, BalanceAllowanceResponse, OrderType};
+use polymarket_core::api::clob::{
+    AuthenticatedClobClient, BalanceAllowanceResponse, OrderType, SUPPORTED_EXCHANGE_VERSION,
+};
 use polymarket_core::api::ClobClient;
 use polymarket_core::signing::{OrderSide as SigningOrderSide, OrderSigner};
 use polymarket_core::types::{
@@ -342,6 +344,17 @@ impl OrderExecutor {
             .create_or_derive_api_key()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to derive API credentials: {}", e))?;
+
+        match self.clob_client.exchange_version().await {
+            Ok(version) if version == SUPPORTED_EXCHANGE_VERSION => {}
+            Ok(version) => error!(
+                exchange_version = version,
+                supported = SUPPORTED_EXCHANGE_VERSION,
+                "Polymarket's exchange takes orders of another version than this build signs: \
+                 every order (exits included) will be refused until the bot is upgraded"
+            ),
+            Err(error) => warn!(%error, "Could not read the exchange's order version"),
+        }
 
         let mut slot = self.auth_client.write().await;
         *slot = Some(auth_client);

@@ -146,6 +146,17 @@ async fn open_market_book_and_trading_terms_parse() {
 
 #[tokio::test]
 #[ignore = "reaches the real Polymarket API"]
+async fn exchange_takes_the_order_version_the_bot_signs() {
+    use polymarket_core::api::clob::SUPPORTED_EXCHANGE_VERSION;
+    let version = clob().exchange_version().await.expect("exchange version");
+    assert_eq!(
+        version, SUPPORTED_EXCHANGE_VERSION,
+        "the exchange moved to order version {version}: upgrade the bot's signing"
+    );
+}
+
+#[tokio::test]
+#[ignore = "reaches the real Polymarket API"]
 async fn settled_market_names_its_winner() {
     let market = clob()
         .get_market_by_id(SETTLED_MARKET)

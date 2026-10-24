@@ -222,7 +222,13 @@ cargo test -p polymarket-core --lib live_ -- --ignored
 
 They confirm that markets, books, tick sizes, fees, trades and settled
 winners parse, that chain reads work, and that the exchange accepts the
-bot's sign-in (L1) signature and refuses a corrupted one. Both exchanges must publish the
+bot's sign-in (L1) signature and refuses a corrupted one.
+They also check that the exchange still takes the order version the bot
+signs (`/version` reports 2). Polymarket's own client already knows a
+version 3 exchange. When it switches, every order is refused, exits
+included, until the bot's signing is upgraded. The API logs it as an error
+when the wallet loads ("takes orders of another version") and on every
+refused order ("order_version_mismatch"). Both exchanges must publish the
 signing domain the bot uses, hash its orders as it does, and accept its
 signatures, and must reject corrupted ones. The withdrawal transfer, the
 Offramp unwrap and the Onramp wrap must pass the node's preflight from

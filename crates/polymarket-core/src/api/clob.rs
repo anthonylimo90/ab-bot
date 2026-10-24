@@ -21,7 +21,7 @@ use std::time::Duration as StdDuration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const COLLATERAL_DECIMALS: u32 = 6;
 const MARKET_ORDER_SIZE_SCALE: u32 = 2;
@@ -152,6 +152,23 @@ impl ClobClient {
         }
     }
 
+    /// The order version the exchange takes now (its `/version`): orders
+    /// signed for another version are refused.
+    pub async fn exchange_version(&self) -> Result<u64> {
+        let answer: serde_json::Value = self
+            .get_with_retry(&format!("{}/version", self.base_url))
+            .await?
+            .json()
+            .await?;
+        answer
+            .get("version")
+            .and_then(|version| version.as_u64())
+            .ok_or_else(|| Error::Api {
+                message: format!("Unreadable exchange version: {answer}"),
+                status: None,
+            })
+    }
+
     /// Submit an already signed order using credentials derived for its maker.
     /// No private key or bot trading identity is used for external wallet orders.
     pub async fn post_signed_order(
@@ -204,13 +221,16 @@ impl ClobClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
+            report_version_mismatch(&text);
             return Err(Error::Api {
                 message: format!("Failed to post order: {} - {}", status, text),
                 status: Some(status),
             });
         }
 
-        let result: PostOrderResponse = response.json().await?;
+        let text = response.text().await?;
+        report_version_mismatch(&text);
+        let result: PostOrderResponse = serde_json::from_str(&text)?;
         info!(order_id = %result.order_id, "Order posted successfully");
 
         Ok(result)
@@ -2711,6 +2731,24 @@ fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// The exchange order version this build signs for: the CLOB's `/version`
+/// must report it, or every order is refused.
+pub const SUPPORTED_EXCHANGE_VERSION: u64 = 2;
+
+/// Logs, as an error an operator must act on, an exchange answer saying the
+/// order was signed for an exchange version it no longer takes.
+fn report_version_mismatch(body: &str) {
+    if body.contains("order_version_mismatch") {
+        error!(
+            supported = SUPPORTED_EXCHANGE_VERSION,
+            answer = %body,
+            "Polymarket refused an order signed for exchange version {SUPPORTED_EXCHANGE_VERSION}: \
+             it has moved to another version, and every order (exits included) is refused \
+             until the bot is upgraded"
+        );
+    }
 }
 
 /// Sign a request with HMAC-SHA256 for L2 authentication.
