@@ -169,6 +169,20 @@ impl ClobClient {
             })
     }
 
+    /// Whether Polymarket takes orders from this server's location: its
+    /// geoblock endpoint judges the requesting IP. A blocked location may
+    /// still close positions where Polymarket allows that, but opens none.
+    pub async fn geoblock(&self) -> Result<Geoblock> {
+        Ok(self
+            .http_client
+            .get(GEOBLOCK_URL)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     /// Submit an already signed order using credentials derived for its maker.
     /// No private key or bot trading identity is used for external wallet orders.
     pub async fn post_signed_order(
@@ -221,7 +235,7 @@ impl ClobClient {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let text = response.text().await.unwrap_or_default();
-            report_version_mismatch(&text);
+            report_order_refusal(&text);
             return Err(Error::Api {
                 message: format!("Failed to post order: {} - {}", status, text),
                 status: Some(status),
@@ -229,7 +243,7 @@ impl ClobClient {
         }
 
         let text = response.text().await?;
-        report_version_mismatch(&text);
+        report_order_refusal(&text);
         let result: PostOrderResponse = serde_json::from_str(&text)?;
         info!(order_id = %result.order_id, "Order posted successfully");
 
@@ -1771,19 +1785,6 @@ impl ExchangeOrder {
     }
 }
 
-/// Open order information.
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpenOrder {
-    pub id: String,
-    pub asset_id: String,
-    pub market: String,
-    pub side: String,
-    pub price: String,
-    pub size: String,
-    pub status: String,
-    pub created_at: Option<String>,
-}
-
 /// Response from deriving API credentials.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeriveApiKeyResponse {
@@ -2529,86 +2530,6 @@ impl AuthenticatedClobClient {
         }
         Ok(())
     }
-
-    /// Get open orders for the authenticated user.
-    pub async fn get_open_orders(&self, market: Option<&str>) -> Result<Vec<OpenOrder>> {
-        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
-            message: "API credentials not set - call derive_api_key() first".to_string(),
-        })?;
-
-        let url = match market {
-            Some(m) => format!("{}/orders?market={}", self.client.base_url, m),
-            None => format!("{}/orders", self.client.base_url),
-        };
-        let timestamp = current_timestamp().to_string();
-        let method = "GET";
-        // L2 HMAC signs only the path (no query string) per the official SDK
-        let path = "/orders";
-
-        let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
-
-        let response = self
-            .client
-            .http_client
-            .get(&url)
-            .header("POLY_ADDRESS", self.address())
-            .header("POLY_SIGNATURE", signature)
-            .header("POLY_TIMESTAMP", &timestamp)
-            .header("POLY_API_KEY", &credentials.api_key)
-            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                message: format!("Failed to get open orders: {} - {}", status, text),
-                status: Some(status),
-            });
-        }
-
-        let orders: Vec<OpenOrder> = response.json().await?;
-        Ok(orders)
-    }
-
-    /// Cancel all open orders.
-    pub async fn cancel_all_orders(&self) -> Result<()> {
-        let credentials = self.credentials.as_ref().ok_or_else(|| Error::Auth {
-            message: "API credentials not set - call derive_api_key() first".to_string(),
-        })?;
-
-        let url = format!("{}/orders", self.client.base_url);
-        let timestamp = current_timestamp().to_string();
-        let method = "DELETE";
-        let path = "/orders";
-
-        let signature = sign_l2_request(credentials, method, path, &timestamp, None)?;
-
-        let response = self
-            .client
-            .http_client
-            .delete(&url)
-            .header("POLY_ADDRESS", self.address())
-            .header("POLY_SIGNATURE", signature)
-            .header("POLY_TIMESTAMP", &timestamp)
-            .header("POLY_API_KEY", &credentials.api_key)
-            .header("POLY_PASSPHRASE", &credentials.api_passphrase)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                message: format!("Failed to cancel all orders: {} - {}", status, text),
-                status: Some(status),
-            });
-        }
-
-        info!("All orders cancelled successfully");
-        Ok(())
-    }
 }
 
 fn market_price_scale(price: Decimal) -> u32 {
@@ -2733,13 +2654,35 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Polymarket's verdict on where orders come from (on polymarket.com, not
+/// the CLOB).
+const GEOBLOCK_URL: &str = "https://polymarket.com/api/geoblock";
+
+/// Whether Polymarket refuses orders from the requesting location.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Geoblock {
+    pub blocked: bool,
+    #[serde(default)]
+    pub country: String,
+    #[serde(default)]
+    pub region: String,
+}
+
 /// The exchange order version this build signs for: the CLOB's `/version`
 /// must report it, or every order is refused.
 pub const SUPPORTED_EXCHANGE_VERSION: u64 = 2;
 
-/// Logs, as an error an operator must act on, an exchange answer saying the
-/// order was signed for an exchange version it no longer takes.
-fn report_version_mismatch(body: &str) {
+/// Logs, as an error an operator must act on, an exchange answer refusing
+/// an order for where it came from or for the exchange version it was
+/// signed for.
+fn report_order_refusal(body: &str) {
+    if body.contains("restricted in your region") {
+        error!(
+            answer = %body,
+            "Polymarket refused an order because of where this server is: it takes no new \
+             orders from this location (see DEPLOY.md, Trading location)"
+        );
+    }
     if body.contains("order_version_mismatch") {
         error!(
             supported = SUPPORTED_EXCHANGE_VERSION,

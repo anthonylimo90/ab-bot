@@ -289,3 +289,105 @@ async fn exchange_accepts_the_bots_l1_auth_signature() {
     assert_eq!(status, 401, "{body}");
     assert!(body.contains("Invalid L1 Request headers"), "{body}");
 }
+
+/// Places one real order through the bot's own client, from a fresh wallet
+/// that holds nothing, so the exchange refuses it for lack of balance (or,
+/// from a location Polymarket restricts, for the location). It
+/// creates an API key for that throwaway wallet on Polymarket: run it only
+/// on purpose. The order is a buy at the market's lowest price, so even an
+/// accepted one could not fill.
+#[tokio::test]
+#[ignore = "creates an exchange API key and posts an order: run on purpose"]
+async fn unfunded_order_is_authenticated_and_refused_for_balance() {
+    use alloy_signer_local::PrivateKeySigner;
+    use polymarket_core::api::clob::{AuthenticatedClobClient, OrderType};
+    use polymarket_core::signing::{OrderSide, OrderSigner};
+
+    let clob = clob();
+    let (market, book) = open_market(&clob).await;
+    let token = book.outcome_id.clone();
+    let tick = clob.get_tick_size(&token).await.expect("tick size");
+    println!(
+        "market {} {:?}, token {token}, tick {tick}",
+        market.id, market.question
+    );
+
+    let mut client =
+        AuthenticatedClobClient::new(clob.clone(), OrderSigner::new(PrivateKeySigner::random()));
+    client
+        .create_or_derive_api_key()
+        .await
+        .expect("API key for a new wallet");
+
+    // An L2-authenticated read: HMAC over a GET.
+    let allowance = client
+        .get_balance_allowance(None, "COLLATERAL")
+        .await
+        .expect("balance and allowance");
+    println!("balance/allowance: {allowance:?}");
+    client
+        .update_balance_allowance("COLLATERAL")
+        .await
+        .expect("balance refresh");
+
+    // The order lookups and cancellation the reconciler relies on, for an
+    // order that does not exist: absent, without trades, not cancelled.
+    let unknown = format!("0x{}", "ab".repeat(32));
+    let found = client.find_order(&unknown).await;
+    println!("find_order(unknown): {found:?}");
+    assert!(
+        matches!(found, Ok(None)),
+        "an unknown order must read as absent: {found:?}"
+    );
+    let traded = client
+        .order_has_trades(&unknown, &token, chrono::Utc::now().timestamp() - 3600)
+        .await;
+    println!("order_has_trades(unknown): {traded:?}");
+    assert!(matches!(traded, Ok(false)), "{traded:?}");
+    let cancelled = client.cancel_order(&unknown).await;
+    println!("cancel_order(unknown): {cancelled:?}");
+    assert!(
+        matches!(&cancelled, Err(polymarket_core::Error::Order { .. })),
+        "an unknown order is not confirmed cancelled: {cancelled:?}"
+    );
+
+    // L2-authenticated write: the order body and its HMAC.
+    let order = client
+        .create_order(
+            &token,
+            OrderSide::Buy,
+            tick,
+            Decimal::from(100),
+            OrderType::Gtc,
+        )
+        .await
+        .expect("signed order");
+    let answer = client.post_order(order, OrderType::Gtc).await;
+    println!("post_order answer: {answer:?}");
+    let message = match &answer {
+        Err(error) => error.to_string(),
+        Ok(response) => format!("{response:?}"),
+    };
+    let lower = message.to_ascii_lowercase();
+    if clob.geoblock().await.expect("geoblock").blocked {
+        // Refused for where this runs, before the order itself is judged.
+        assert!(lower.contains("restricted in your region"), "{message}");
+        println!(
+            "INCONCLUSIVE: this location may not place orders; the body and its \
+             signature are judged only from an unrestricted one"
+        );
+        return;
+    }
+    assert!(
+        lower.contains("balance") || lower.contains("allowance"),
+        "expected a refusal for lack of balance, got: {message}"
+    );
+    for wrong in [
+        "unauthorized",
+        "invalid signature",
+        "order_version_mismatch",
+        "invalid order payload",
+    ] {
+        assert!(!lower.contains(wrong), "{message}");
+    }
+}

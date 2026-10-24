@@ -488,6 +488,32 @@ Adding staging roughly doubles costs (~$60-100/month total) due to separate data
 - Stopping staging services when not in use
 - Using smaller database instances for staging
 
+## Trading location
+
+Polymarket judges every order by the IP address it comes from: the API
+server's, not the dashboard user's. It refuses orders from restricted
+locations (https://docs.polymarket.com/developers/CLOB/geoblock).
+
+- **Sanctioned locations:** block everything.
+- **Close-only locations:** take no new orders. Positions can still be
+  closed where Polymarket allows that. This list includes the United States
+  and the United Kingdom, so Railway's US regions are close-only.
+- **Primary servers:** in eu-west-2 (London, itself restricted).
+  Polymarket names eu-west-1 (Ireland) as the closest unrestricted region.
+
+The bot checks this when its trading wallet loads, and logs an error if
+Polymarket takes no new orders from where it runs ("takes no new orders from
+this server's location"). Every order refused for its location is also
+logged as an error. Check the location before turning on live trading:
+
+```bash
+curl -s https://polymarket.com/api/geoblock   # from the API server
+```
+
+Polymarket's terms also apply to whoever operates the bot, wherever the
+server runs. Hosting it elsewhere does not make a restricted operator
+eligible.
+
 ## Trading wallet selection
 
 The bot selects its shared trading signer at API startup. Adding or removing a personal wallet, or changing a user's primary wallet, does not change that signer. Personal primary wallets control balance lookups and withdrawals.

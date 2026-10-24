@@ -355,6 +355,16 @@ impl OrderExecutor {
             ),
             Err(error) => warn!(%error, "Could not read the exchange's order version"),
         }
+        match self.clob_client.geoblock().await {
+            Ok(verdict) if verdict.blocked => error!(
+                country = %verdict.country,
+                region = %verdict.region,
+                "Polymarket takes no new orders from this server's location: entries are \
+                 refused (see DEPLOY.md, Trading location)"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Could not check where Polymarket takes orders from"),
+        }
 
         let mut slot = self.auth_client.write().await;
         *slot = Some(auth_client);
