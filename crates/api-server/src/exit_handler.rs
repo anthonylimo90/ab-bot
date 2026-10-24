@@ -365,6 +365,9 @@ impl ExitHandler {
                         if let Err(e) = self.check_market_resolutions().await {
                             error!(error = %e, "Failed to check market resolutions");
                         }
+                        if let Err(e) = self.record_manual_resolutions().await {
+                            error!(error = %e, "Failed to record manual holdings' resolutions");
+                        }
                     })
                     .await;
                 }
@@ -1832,6 +1835,47 @@ impl ExitHandler {
 
     /// Settle every position still holding shares in a resolved market,
     /// including exits that failed or stalled, whatever their exit strategy.
+    /// Records the result of live manual shares held to their market's
+    /// resolution (`manual_realized_results`, kind `resolution`), for the
+    /// circuit breaker: the winner's payout less the cost basis held. Only
+    /// once a winner is named, and only while no manual order is open in the
+    /// market (its fill, booked later, would count the same shares again).
+    async fn record_manual_resolutions(&self) -> anyhow::Result<()> {
+        let markets: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT mi.market_id FROM manual_inventory mi \
+             WHERE mi.execution_mode = 'live' AND mi.quantity > 0 \
+               AND NOT EXISTS (SELECT 1 FROM manual_realized_results r \
+                   WHERE r.kind = 'resolution' AND r.wallet_address = mi.wallet_address \
+                     AND r.market_id = mi.market_id AND r.outcome = mi.outcome)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for market_id in markets {
+            self.touch_heartbeat();
+            let market = match self.clob_client.get_market_by_id(&market_id).await {
+                Ok(market) if market.resolved => market,
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!(market_id = %market_id, error = %e, "Failed to fetch market for a manual holding's resolution");
+                    continue;
+                }
+            };
+            let Some(yes_wins) = self.resolved_yes_winner(&market).await else {
+                continue;
+            };
+            let recorded = record_manual_resolution(
+                &self.pool,
+                &market_id,
+                if yes_wins { "yes" } else { "no" },
+            )
+            .await?;
+            if recorded > 0 {
+                info!(market_id = %market_id, holdings = recorded, "Recorded manual holdings' results at resolution");
+            }
+        }
+        Ok(())
+    }
+
     async fn check_market_resolutions(&self) -> anyhow::Result<()> {
         let positions = self.position_repo.get_resolution_candidates().await?;
         if positions.is_empty() {
@@ -2547,6 +2591,35 @@ pub(crate) async fn record_missed_closes(
     }
     // Manual sales are only ever recorded by a scan, so no cutoff applies.
     record_manual_results(pool, breaker).await
+}
+
+/// Records the resolution result of every live manual holding in
+/// `market_id` (resolved for `winner`, `yes` or `no`) not yet recorded, unless
+/// a manual order is still open in the market. Returns how many it recorded.
+pub(crate) async fn record_manual_resolution(
+    pool: &PgPool,
+    market_id: &str,
+    winner: &str,
+) -> anyhow::Result<u64> {
+    Ok(sqlx::query(
+        "INSERT INTO manual_realized_results \
+             (kind, wallet_address, market_id, outcome, quantity, proceeds, released_cost, \
+              realized_pnl, priced) \
+         SELECT 'resolution', mi.wallet_address, mi.market_id, mi.outcome, mi.quantity, \
+                CASE WHEN mi.outcome = $2 THEN mi.quantity ELSE 0 END, mi.cost_basis, \
+                CASE WHEN mi.outcome = $2 THEN mi.quantity ELSE 0 END - mi.cost_basis, TRUE \
+         FROM manual_inventory mi \
+         WHERE mi.execution_mode = 'live' AND mi.market_id = $1 AND mi.quantity > 0 \
+           AND NOT EXISTS (SELECT 1 FROM orders o \
+               WHERE o.execution_mode = 'live' AND o.market_id = mi.market_id \
+                 AND o.status IN ('pending', 'open', 'partially_filled')) \
+         ON CONFLICT (wallet_address, market_id, outcome) WHERE kind = 'resolution' DO NOTHING",
+    )
+    .bind(market_id)
+    .bind(winner)
+    .execute(pool)
+    .await?
+    .rows_affected())
 }
 
 /// How old a manual sale's result may be and still count after midnight:

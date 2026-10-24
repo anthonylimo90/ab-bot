@@ -37,6 +37,11 @@ async fn setup(pool: &PgPool) {
     ))
     .await
     .unwrap();
+    pool.execute(include_str!(
+        "../../../../../migrations/108_manual_resolution_results.sql"
+    ))
+    .await
+    .unwrap();
 }
 
 /// A manual order of `mode`, filled by later updates.
@@ -65,6 +70,66 @@ async fn fill(pool: &PgPool, id: uuid::Uuid, filled: i64, avg: Option<Decimal>) 
         .execute(pool)
         .await
         .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn manual_holdings_record_their_result_at_resolution_once(pool: PgPool) {
+    setup(&pool).await;
+    // 10 YES at 0.50 ($5) and 4 NO at 0.50 ($2), both live.
+    let yes = manual_order(&pool, "live", "buy", Some(Decimal::new(5, 1))).await;
+    fill(&pool, yes, 10, Some(Decimal::new(5, 1))).await;
+    let no = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO orders (id, execution_mode, wallet_address, market_id, outcome, side, \
+         order_type, status, quantity, price) \
+         VALUES ($1, 'live', '0xw', 'm', 'no', 'buy', 'limit', 'open', 4, 0.5)",
+    )
+    .bind(no)
+    .execute(&pool)
+    .await
+    .unwrap();
+    fill(&pool, no, 4, Some(Decimal::new(5, 1))).await;
+    // An order still open in the market: its fill could still change the
+    // holdings, so nothing is recorded yet.
+    let resting = manual_order(&pool, "live", "sell", Some(Decimal::new(9, 1))).await;
+    assert_eq!(
+        crate::exit_handler::record_manual_resolution(&pool, "m", "yes")
+            .await
+            .unwrap(),
+        0
+    );
+    sqlx::query("UPDATE orders SET status = 'filled' WHERE status = 'open'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _ = resting;
+    assert_eq!(
+        crate::exit_handler::record_manual_resolution(&pool, "m", "yes")
+            .await
+            .unwrap(),
+        2
+    );
+    let results: Vec<(String, Decimal, Decimal)> = sqlx::query_as(
+        "SELECT outcome, proceeds, realized_pnl FROM manual_realized_results \
+         WHERE kind = 'resolution' ORDER BY outcome",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(results.len(), 2);
+    // NO lost its $2; YES paid $10 for $5.
+    assert_eq!(results[0].0, "no");
+    assert_eq!(results[0].2.normalize(), Decimal::from(-2));
+    assert_eq!(results[1].0, "yes");
+    assert_eq!(results[1].1.normalize(), Decimal::from(10));
+    assert_eq!(results[1].2.normalize(), Decimal::from(5));
+    // Once only.
+    assert_eq!(
+        crate::exit_handler::record_manual_resolution(&pool, "m", "yes")
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[sqlx::test(migrations = false)]

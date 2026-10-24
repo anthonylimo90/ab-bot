@@ -1079,9 +1079,14 @@ protective orders. Dashboard development, CI and Docker use Node 24.
   a loss is never understated. A result from an earlier day is marked
   without counting, with a warning, unless it is under ten minutes old
   (a sale just before midnight UTC found just after counts today).
-- Manual shares held to resolution are not sold, so they record no
-  result: their value reaches the breaker through the equity valuation
-  (drawdown), not the daily loss limit.
+- Manual shares held to resolution realize its payout less their cost
+  without a sale: once the exit handler finds the market resolved with a
+  named winner (it checks every market where live manual shares are held),
+  it records that result too, once per holding (migration 108), and the
+  breaker counts it like a sale's. It waits while a manual order is still
+  open in the market. A resolution with no single winner (a split) records
+  nothing; its value still reaches the breaker through the equity
+  valuation (drawdown).
 - Paper manual sales reach no breaker. Deploy stop-then-start: 105
   replaces the fill trigger.
 
